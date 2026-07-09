@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Progress } from '@/components/ui/progress'
 import {
   Dialog,
   DialogContent,
@@ -32,6 +33,7 @@ import {
   useSetCredentialConcurrency,
   useSetCredentialRpm,
   useSetCredentialRateLimitAutoDisable,
+  useSetCredentialOverage,
   useSetCredentialSupportedModels,
   useDiscoverCredentialSupportedModels,
 } from '@/hooks/use-credentials'
@@ -260,6 +262,7 @@ export function CredentialCard({
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
+  const setCredentialOverage = useSetCredentialOverage()
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
   const discoverCredentialSupportedModels = useDiscoverCredentialSupportedModels()
@@ -270,6 +273,30 @@ export function CredentialCard({
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
   const accountInfo = balance || credential.accountInfo
   const subscriptionTitle = balance?.subscriptionTitle || credential.accountInfo?.subscriptionTitle || credential.subscriptionTitle || '未知'
+  const quotaUsagePercent = accountInfo && accountInfo.usageLimit > 0
+    ? Math.min(100, Math.max(0, (accountInfo.currentUsage / accountInfo.usageLimit) * 100))
+    : 0
+  const overageStatus = (accountInfo?.overageStatus || '').toUpperCase()
+  const overageCapability = (accountInfo?.overageCapability || '').toUpperCase()
+  const overageEnabled = overageStatus === 'ENABLED'
+  const overageCapable = overageCapability === '' || overageCapability === 'OVERAGE_CAPABLE'
+  const overageKnown = overageStatus === 'ENABLED' || overageStatus === 'DISABLED'
+  const overageLabel = accountInfo
+    ? !overageCapable
+      ? '不支持'
+      : overageEnabled
+        ? '已开启'
+        : overageStatus === 'DISABLED'
+          ? '已关闭'
+          : '未知'
+    : '未查询'
+  const overageDetail = accountInfo
+    ? [
+        accountInfo.overageCap > 0 ? `上限 ${formatUsd(accountInfo.overageCap)}` : null,
+        accountInfo.overageRate > 0 ? `单价 ${formatUsd(accountInfo.overageRate)}` : null,
+        accountInfo.currentOverages > 0 ? `已用 ${formatUsd(accountInfo.currentOverages)}` : null,
+      ].filter(Boolean).join(' · ') || (overageKnown ? '额度耗尽后是否继续计费' : '查询额度后同步状态')
+    : undefined
   const transientFailureStreak = numberOrZero(credential.transientFailureStreak)
   const probationRemainingSecs = numberOrZero(credential.probationRemainingSecs)
   const recentErrorRate = numberOrZero(credential.recentErrorRate)
@@ -526,6 +553,16 @@ export function CredentialCard({
       {
         onSuccess: (res) => toast.success(res.message),
         onError: (err) => toast.error('429 自动禁用设置失败: ' + extractErrorMessage(err)),
+      }
+    )
+  }
+
+  const handleOverageToggle = (enabled: boolean) => {
+    setCredentialOverage.mutate(
+      { id: credential.id, enabled },
+      {
+        onSuccess: () => toast.success(`超额调用已${enabled ? '开启' : '关闭'}`),
+        onError: (err) => toast.error('超额开关设置失败: ' + extractErrorMessage(err)),
       }
     )
   }
@@ -915,6 +952,10 @@ export function CredentialCard({
               <span className="font-medium">{formatUsd(credential.estimatedCostUsd || 0)}</span>
             </div>
             <div>
+              <span className="text-muted-foreground">原始计费：</span>
+              <span className="font-medium">{formatUsd(credential.originalCostUsd || 0)}</span>
+            </div>
+            <div>
               <span className="text-muted-foreground">Kiro计量：</span>
               <span className="font-medium">{formatMeteringUsage(credential.kiroMeteringUsage || 0)}</span>
             </div>
@@ -1000,13 +1041,41 @@ export function CredentialCard({
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
               ) : accountInfo ? (
-                <span className="font-medium ml-1">
-                  {formatQuota(accountInfo.currentUsage)}/{formatQuota(accountInfo.usageLimit)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    {formatDateTime(accountInfo.checkedAt)}
-                    {accountInfo.nextResetAt ? ` · 重置 ${new Date(accountInfo.nextResetAt * 1000).toLocaleString('zh-CN', { hour12: false })}` : ''}
-                  </span>
-                </span>
+                <div className="mt-1 space-y-1">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="font-medium">
+                      {formatQuota(accountInfo.currentUsage)} / {formatQuota(accountInfo.usageLimit)}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      剩余 {formatQuota(accountInfo.remaining)}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      检查 {formatDateTime(accountInfo.checkedAt)}
+                    </span>
+                    {accountInfo.nextResetAt && (
+                      <span className="text-xs text-muted-foreground">
+                        重置 {new Date(accountInfo.nextResetAt * 1000).toLocaleString('zh-CN', { hour12: false })}
+                      </span>
+                    )}
+                  </div>
+                  <Progress value={quotaUsagePercent} className="h-1.5" aria-label="用量额度已用比例" />
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                    <span className="text-muted-foreground">超额调用：</span>
+                    {setCredentialOverage.isPending ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Switch
+                        checked={overageEnabled}
+                        disabled={!accountInfo || !overageCapable}
+                        onCheckedChange={handleOverageToggle}
+                      />
+                    )}
+                    <span className={overageEnabled ? 'font-medium text-amber-600' : 'font-medium'}>
+                      {overageLabel}
+                    </span>
+                    {overageDetail && <span className="text-muted-foreground">{overageDetail}</span>}
+                  </div>
+                </div>
               ) : (
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}

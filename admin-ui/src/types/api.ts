@@ -177,6 +177,7 @@ export interface CredentialAccountInfoItem extends CredentialAccountInfo {
 export interface CredentialUsageSummaryItem {
   id: number
   estimatedCostUsd: number
+  originalCostUsd: number
   kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
@@ -264,6 +265,7 @@ export interface CredentialStatusItem {
   schedulerSelectionPressure?: number
   schedulerScore?: number
   estimatedCostUsd: number
+  originalCostUsd: number
   kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
@@ -286,6 +288,11 @@ export interface CredentialAccountInfo {
   creditRemaining: number
   creditBase: number
   creditBonus: number
+  overageStatus?: string | null
+  overageCapability?: string | null
+  overageCap: number
+  overageRate: number
+  currentOverages: number
   nextResetAt: number | null
   checkedAt: string
 }
@@ -303,6 +310,11 @@ export interface BalanceResponse {
   creditRemaining: number
   creditBase: number
   creditBonus: number
+  overageStatus?: string | null
+  overageCapability?: string | null
+  overageCap: number
+  overageRate: number
+  currentOverages: number
   nextResetAt: number | null
 }
 
@@ -527,6 +539,7 @@ export interface AddCredentialRequest {
   rpm?: number | null
   rateLimitAutoDisableEnabled?: boolean | null
   disabled?: boolean | null
+  enableOverageAfterImport?: boolean | null
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -683,7 +696,9 @@ export interface UsageRecord {
   endpoint: string
   stream: boolean
   model: string
+  requestedMaxTokens?: number
   upstreamModel?: string
+  externalOutboundModel?: string
   modelResolutionSource?: string
   modelResolutionNote?: string
   conversationId?: string
@@ -700,6 +715,7 @@ export interface UsageRecord {
   cacheCreation5mInputTokens: number
   cacheCreation1hInputTokens: number
   estimatedCostUsd: number
+  originalCostUsd: number
   kiroMeteringUsage: number
   pricingAvailable: boolean
   pricingModel?: string
@@ -725,6 +741,10 @@ export interface UsageRecord {
   errorType?: string
   errorMessage?: string
   errorDetail?: string
+  errorStatusCode?: number
+  errorSource?: string
+  errorId?: string
+  errorMetadata?: unknown
   publicErrorStatusCode?: number
   publicErrorType?: string
   publicErrorMessage?: string
@@ -775,12 +795,14 @@ export interface ExternalPoolBilling {
   pricingAvailable: boolean
   pricingModel?: string
   usageProjectionMode: string
+  streamResponseMode?: ExternalPoolStreamResponseMode
 }
 
 export interface ExternalPoolAttempt {
   attempt: number
   poolId: number
   poolName: string
+  outboundModel?: string
   status?: number
   action: string
   durationMs: number
@@ -807,6 +829,7 @@ export interface UsageAggregate {
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
   estimatedCostUsd: number
+  originalCostUsd: number
 }
 
 export interface UsageRealtimeStats {
@@ -829,6 +852,7 @@ export interface UsageSummary {
   totalCacheReadInputTokens: number
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
   pricedRequests: number
   unpricedRequests: number
   localPromptCacheRequests: number
@@ -925,6 +949,7 @@ export interface UsageDashboardSummary {
   totalCacheCreationInputTokens: number
   cacheReadRatio: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
   pricedRequests: number
   unpricedRequests: number
   averageDurationMs: number
@@ -963,6 +988,7 @@ export interface UsageSeriesPoint {
   billableInputTokens: number
   totalOutputTokens: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
 }
 
 export interface UsageDashboardTop {
@@ -984,6 +1010,7 @@ export interface UsageTopAggregate {
   totalCacheReadInputTokens: number
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
 }
 
 export interface UsageRecordsQuery {
@@ -1382,6 +1409,13 @@ export interface WeightedCapacityConfig {
   tiers: WeightedCapacityTier[]
 }
 
+export type MissingMaxTokensPolicy = 'reject' | 'default_value'
+
+export interface MissingMaxTokensConfig {
+  policy: MissingMaxTokensPolicy
+  defaultValue: number
+}
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -1427,6 +1461,7 @@ export interface RuntimeConfig {
   whitespaceCompression: boolean
   imageProcessing: ImageProcessingConfig
   bodyConversion: BodyConversionConfig
+  missingMaxTokens: MissingMaxTokensConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Eye, EyeOff } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Checkbox } from '@/components/ui/checkbox'
 import type { AddCredentialRequest, ProxyResource } from '@/types/api'
 
 export interface CredentialParameterDefaults {
@@ -18,6 +19,7 @@ export interface CredentialParameterDefaults {
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
+  enableOverageAfterImport: boolean
 }
 
 export function initialParameterDefaults(): CredentialParameterDefaults {
@@ -35,6 +37,7 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
     proxyUrl: '',
     proxyUsername: '',
     proxyPassword: '',
+    enableOverageAfterImport: false,
   }
 }
 
@@ -90,6 +93,10 @@ export function mergeCredentialDefaults(
     apiRegion: optionalTrimmed(credential.apiRegion) || optionalTrimmed(defaults.apiRegion),
     machineId: optionalTrimmed(credential.machineId) || optionalTrimmed(defaults.machineId),
     endpoint: optionalTrimmed(credential.endpoint) || optionalTrimmed(defaults.endpoint),
+    enableOverageAfterImport:
+      typeof credential.enableOverageAfterImport === 'undefined' || credential.enableOverageAfterImport === null
+        ? defaults.enableOverageAfterImport
+        : credential.enableOverageAfterImport,
     proxyResourceId,
     proxyUrl: optionalTrimmed(credential.proxyUrl) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUrl)),
     proxyUsername: optionalTrimmed(credential.proxyUsername) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUsername)),
@@ -179,7 +186,9 @@ export function CredentialParameterDefaultsPanel({
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
 
-  const update = (key: keyof CredentialParameterDefaults, value: string) => {
+  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport'>
+
+  const update = (key: StringDefaultKey, value: string) => {
     if (key === 'proxyResourceId' && value) {
       onChange(clearDirectProxyDraft({ ...defaults, proxyResourceId: value }))
       return
@@ -223,6 +232,17 @@ export function CredentialParameterDefaultsPanel({
             <option value="true">禁用</option>
           </select>
         </FieldLabel>
+        <div className="flex items-center gap-2 rounded-md bg-background/60 px-3 py-2">
+          <Checkbox
+            id="default-enable-overage"
+            checked={defaults.enableOverageAfterImport}
+            disabled={disabled}
+            onCheckedChange={(checked) => onChange({ ...defaults, enableOverageAfterImport: checked === true })}
+          />
+          <label htmlFor="default-enable-overage" className="cursor-pointer text-sm">
+            导入后尝试开启超额
+          </label>
+        </div>
         <FieldLabel title="默认优先级" description="留空时使用凭据自身值或 0">
           <Input type="number" min="0" value={defaults.priority} disabled={disabled} onChange={(event) => update('priority', event.target.value)} />
         </FieldLabel>

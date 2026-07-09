@@ -127,6 +127,7 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     schedulerSelectionPressure: 0,
     schedulerScore: 0,
     estimatedCostUsd: 0,
+    originalCostUsd: 0,
     kiroMeteringUsage: 0,
     pricedRequests: 0,
     unpricedRequests: 0,
@@ -341,6 +342,11 @@ export async function getCredentialInfo(id: number, force = true): Promise<Balan
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/info`, {
     params: { force },
   })
+  return data
+}
+
+export async function setCredentialOverage(id: number, enabled: boolean): Promise<BalanceResponse> {
+  const { data } = await api.post<BalanceResponse>(`/credentials/${id}/overage`, { enabled })
   return data
 }
 

@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Checkbox } from '@/components/ui/checkbox'
 import { useAddCredential, useProxyResources } from '@/hooks/use-credentials'
 import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -88,6 +89,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [endpoint, setEndpoint] = useState('')
+  const [enableOverageAfterImport, setEnableOverageAfterImport] = useState(false)
 
   const { mutate, isPending } = useAddCredential()
   const proxyResources = useProxyResources()
@@ -119,6 +121,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setShowProxyUsername(false)
     setShowProxyPassword(false)
     setEndpoint('')
+    setEnableOverageAfterImport(false)
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -147,6 +150,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     proxyPassword?: string
     proxyResourceId?: number | null
     endpoint?: string
+    enableOverageAfterImport?: boolean | null
   }) => {
     setAuthMethod(credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
     setRefreshToken(credential.refreshToken || '')
@@ -180,6 +184,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setShowProxyUsername(false)
     setShowProxyPassword(false)
     setEndpoint(credential.endpoint || '')
+    setEnableOverageAfterImport(credential.enableOverageAfterImport === true)
   }
 
   const handleAuthMethodChange = (nextAuthMethod: AuthMethod) => {
@@ -335,6 +340,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUsername: proxyResourceId ? undefined : directProxyUsername || undefined,
         proxyPassword: proxyResourceId ? undefined : directProxyPassword || undefined,
         endpoint: endpoint.trim() || undefined,
+        enableOverageAfterImport,
       },
       {
         onSuccess: async (data) => {
@@ -377,6 +383,18 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            <div className="flex items-center gap-2 rounded-md bg-muted/30 px-3 py-2">
+              <Checkbox
+                id="add-enable-overage"
+                checked={enableOverageAfterImport}
+                disabled={isPending}
+                onCheckedChange={(checked) => setEnableOverageAfterImport(checked === true)}
+              />
+              <label htmlFor="add-enable-overage" className="cursor-pointer text-sm">
+                添加后尝试开启超额
+              </label>
+            </div>
+
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">

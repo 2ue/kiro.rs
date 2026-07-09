@@ -49,6 +49,16 @@ function numberField(value: unknown): number | undefined {
   return undefined
 }
 
+function booleanField(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string' && value.trim()) {
+    const compact = value.trim().toLowerCase()
+    if (['true', '1', 'yes', 'on'].includes(compact)) return true
+    if (['false', '0', 'no', 'off'].includes(compact)) return false
+  }
+  return undefined
+}
+
 function authMethodField(value: unknown): AddCredentialRequest['authMethod'] | undefined {
   const method = stringField(value)
   if (!method) return undefined
@@ -148,6 +158,9 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     proxyPassword: stringField(normalized.proxyPassword) ?? stringField(nested?.proxyPassword),
     proxyResourceId: numberField(normalized.proxyResourceId) ?? numberField(nested?.proxyResourceId),
     endpoint: stringField(normalized.endpoint) ?? stringField(nested?.endpoint),
+    enableOverageAfterImport:
+      booleanField(normalized.enableOverageAfterImport) ??
+      booleanField(nested?.enableOverageAfterImport),
   }
 }
 

@@ -151,6 +151,18 @@ const normalizeBodyConversion = (
   ...(input ?? {}),
 })
 
+const defaultMissingMaxTokens = (): RuntimeConfig['missingMaxTokens'] => ({
+  policy: 'default_value',
+  defaultValue: 20480,
+})
+
+const normalizeMissingMaxTokens = (
+  input?: Partial<RuntimeConfig['missingMaxTokens']> | null,
+): RuntimeConfig['missingMaxTokens'] => ({
+  policy: input?.policy === 'reject' ? 'reject' : 'default_value',
+  defaultValue: toWhole(input?.defaultValue ?? 20480, 1, 200000),
+})
+
 const normalizeImageProcessing = (input?: Partial<ImageProcessingConfig> | null): ImageProcessingConfig => {
   const next: ImageProcessingConfig = {
     ...defaultImageProcessing(),
@@ -398,6 +410,7 @@ const emptyConfig: RuntimeConfig = {
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
   bodyConversion: defaultBodyConversion(),
+  missingMaxTokens: defaultMissingMaxTokens(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
@@ -2506,6 +2519,7 @@ export function RuntimeConfigPanel() {
         },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
         bodyConversion: normalizeBodyConversion(config.data.bodyConversion),
+        missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity),
         externalPools: {
           ...defaultExternalPoolsConfig(),
@@ -2572,6 +2586,7 @@ export function RuntimeConfigPanel() {
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       imageProcessing: normalizeImageProcessing(draft.imageProcessing),
       bodyConversion: normalizeBodyConversion(draft.bodyConversion),
+      missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -3472,6 +3487,50 @@ export function RuntimeConfigPanel() {
               defaultRules={defaultModelMappingRules}
               capabilitiesLoading={modelCapabilities.isLoading}
               onChange={(modelMapping) => setDraft((prev) => ({ ...prev, modelMapping }))}
+            />
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">缺失 max_tokens</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  自动补全只处理顶层缺少 max_tokens 的 Messages 请求；无效 JSON 和空模型仍会拒绝并记录到用量日志。
+                </div>
+              </div>
+              <select
+                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={draft.missingMaxTokens.policy}
+                onChange={(event) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    missingMaxTokens: {
+                      ...defaultMissingMaxTokens(),
+                      ...prev.missingMaxTokens,
+                      policy: event.target.value as RuntimeConfig['missingMaxTokens']['policy'],
+                    },
+                  }))
+                }
+              >
+                <option value="default_value">自动补全</option>
+                <option value="reject">直接拒绝</option>
+              </select>
+            </label>
+            <NumberField
+              title="max_tokens 补充值"
+              description="自动补全时写入的输出上限；默认 20480，避免补 0 或过大值改变客户端语义。"
+              value={draft.missingMaxTokens.defaultValue}
+              min={1}
+              max={200000}
+              suffix="tokens"
+              disabled={draft.missingMaxTokens.policy === 'reject'}
+              onChange={(defaultValue) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  missingMaxTokens: {
+                    ...defaultMissingMaxTokens(),
+                    ...prev.missingMaxTokens,
+                    defaultValue,
+                  },
+                }))
+              }
             />
             <label className="block rounded-md border bg-background p-4">
               <div className="mb-3">

@@ -16,6 +16,7 @@ import {
   setCredentialConcurrency,
   setCredentialRpm,
   setCredentialRateLimitAutoDisable,
+  setCredentialOverage,
   setCredentialRegions,
   setCredentialSupportedModels,
   setCredentialWarmup,
@@ -285,6 +286,17 @@ export function useSetCredentialRateLimitAutoDisable() {
   return useMutation({
     mutationFn: ({ id, request }: { id: number; request: SetCredentialRateLimitAutoDisableRequest }) =>
       setCredentialRateLimitAutoDisable(id, request),
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+export function useSetCredentialOverage() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      setCredentialOverage(id, enabled),
     onSuccess: (_data, variables) => {
       invalidateCredentialCaches(queryClient, variables.id)
     },

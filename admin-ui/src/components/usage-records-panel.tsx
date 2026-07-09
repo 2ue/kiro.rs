@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { DollarSign, Info, RefreshCw, Trash2, X } from 'lucide-react'
+import { DollarSign, Download, Info, RefreshCw, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -22,11 +22,13 @@ import {
   useUsageSummary,
 } from '@/hooks/use-usage'
 import { getExternalPools } from '@/api/credentials'
+import { getUsageRecords } from '@/api/usage'
 import { extractErrorMessage } from '@/lib/utils'
 import type { ExternalPoolUsageSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 
 const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
+const EXPORT_LIMIT = 10_000
 
 type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -89,6 +91,91 @@ function formatUpstreamEventTypeCounts(counts?: Record<string, number>): string 
 function formatPercent(value: number): string {
   if (!Number.isFinite(value)) return '-'
   return `${(value * 100).toFixed(1)}%`
+}
+
+function csvCell(value: unknown): string {
+  if (value === null || typeof value === 'undefined') return ''
+  const text = String(value)
+  if (!/[",\n\r]/.test(text)) return text
+  return `"${text.replace(/"/g, '""')}"`
+}
+
+function usageRecordsToCsv(records: UsageRecord[]): string {
+  const headers = [
+    'created_at',
+    'request_id',
+    'conversation_id',
+    'status',
+    'stream',
+    'endpoint',
+    'requested_model',
+    'upstream_model',
+    'route_kind',
+    'route_subtype',
+    'credential_id',
+    'credential_label',
+    'external_pool_id',
+    'external_pool_name',
+    'usage_source',
+    'total_input_tokens',
+    'compat_input_tokens',
+    'billable_input_tokens',
+    'output_tokens',
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens',
+    'estimated_cost_usd',
+    'original_cost_usd',
+    'kiro_metering_usage',
+    'pricing_model',
+    'duration_ms',
+    'first_token_latency_ms',
+    'error_type',
+    'error_message',
+  ]
+  const rows = records.map((record) => [
+    record.createdAt,
+    record.id,
+    record.conversationId,
+    record.status,
+    record.stream ? 'stream' : 'non_stream',
+    record.endpoint,
+    record.model,
+    upstreamModelLabel(record) === '-' ? '' : upstreamModelLabel(record),
+    record.routeKind,
+    record.routeSubtype,
+    record.credentialId,
+    record.credentialLabel,
+    record.externalPoolId,
+    record.externalPoolName,
+    record.usageSource,
+    record.totalInputTokens,
+    record.compatInputTokens,
+    record.billableInputTokens,
+    record.outputTokens,
+    record.cacheReadInputTokens,
+    record.cacheCreationInputTokens,
+    record.estimatedCostUsd,
+    record.originalCostUsd,
+    record.kiroMeteringUsage,
+    record.pricingModel,
+    record.durationMs,
+    record.firstTokenLatencyMs,
+    record.publicErrorType || record.errorType,
+    record.publicErrorMessage || record.errorMessage,
+  ])
+  return [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\n')
+}
+
+function downloadTextFile(content: string, filename: string, type: string) {
+  const blob = new Blob([content], { type })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
 }
 
 function formatUsd(value: number): string {
@@ -197,10 +284,16 @@ function routeVariant(record: UsageRecord): 'success' | 'secondary' | 'outline' 
 }
 
 function upstreamModel(record: UsageRecord): string {
+  if (record.routeKind === 'external_pool') {
+    return record.externalOutboundModel || record.upstreamModel || record.model || '-'
+  }
   return record.upstreamModel || record.model || '-'
 }
 
 function upstreamModelLabel(record: UsageRecord): string {
+  if (record.routeKind === 'external_pool' && record.externalOutboundModel) {
+    return upstreamModel(record)
+  }
   const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
   return `${upstreamModel(record)}${source}`
 }
@@ -256,7 +349,10 @@ function formatAttemptSummary(record: UsageRecord): string {
 
 function formatExternalAttemptChain(record: UsageRecord): string {
   return (record.externalAttempts || [])
-    .map((attempt) => `外部池 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`)
+    .map((attempt) => {
+      const model = attempt.outboundModel ? ` ${attempt.outboundModel}` : ''
+      return `外部池 #${attempt.poolId}${model}(${attempt.status ?? attempt.errorType ?? attempt.action})`
+    })
     .join(' > ')
 }
 
@@ -343,6 +439,7 @@ export function UsageRecordsPanel() {
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [currentPage, setCurrentPage] = useState(1)
+  const [exporting, setExporting] = useState(false)
   const itemsPerPage = 20
   const autoRefresh = useAutoRefreshPreference(USAGE_AUTO_REFRESH_KEY)
 
@@ -427,6 +524,31 @@ export function UsageRecordsPanel() {
     })
   }
 
+  const handleExportCsv = async () => {
+    setExporting(true)
+    try {
+      const { page: _page, ...queryWithoutPage } = query
+      const result = await getUsageRecords({ ...queryWithoutPage, limit: EXPORT_LIMIT })
+      if (result.records.length === 0) {
+        toast.warning('当前筛选条件下没有可导出的用量记录')
+        return
+      }
+      downloadTextFile(
+        usageRecordsToCsv(result.records),
+        `kiro-usage-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`,
+        'text/csv;charset=utf-8'
+      )
+      const suffix = result.total > result.records.length
+        ? `（最多导出 ${result.records.length}/${result.total} 条）`
+        : ''
+      toast.success(`已导出 ${result.records.length} 条用量记录${suffix}`)
+    } catch (error) {
+      toast.error(`导出失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const hasFilters = Boolean(
     searchText.trim() ||
     model.trim() ||
@@ -472,7 +594,7 @@ export function UsageRecordsPanel() {
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-7">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">请求总数</CardTitle>
@@ -529,6 +651,15 @@ export function UsageRecordsPanel() {
           <CardContent>
             <div className="text-2xl font-bold">{formatUsd(summaryData?.totalEstimatedCostUsd || 0)}</div>
             <div className="text-xs text-muted-foreground">已计价 {formatPercent(pricedRatio)}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">原始计费</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{formatUsd(summaryData?.totalOriginalCostUsd || 0)}</div>
+            <div className="text-xs text-muted-foreground">按上游原始 usage 估算</div>
           </CardContent>
         </Card>
       </div>
@@ -677,6 +808,10 @@ export function UsageRecordsPanel() {
           <Button variant="outline" size="sm" onClick={handleRefresh}>
             <RefreshCw className="h-4 w-4" />
             刷新
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleExportCsv} disabled={exporting}>
+            <Download className="h-4 w-4" />
+            {exporting ? '导出中' : '导出 CSV'}
           </Button>
           <Button variant="outline" size="sm" onClick={() => setCleanupOpen(true)}>
             <Trash2 className="h-4 w-4" />
@@ -843,6 +978,9 @@ export function UsageRecordsPanel() {
                         >
                           {formatUsd(record.estimatedCostUsd || 0)}
                         </button>
+                        <div className="text-xs text-amber-600">
+                          原始 {formatUsd(record.originalCostUsd || 0)}
+                        </div>
                         <div className="text-xs text-muted-foreground">
                           Kiro {formatMeteringUsage(record.kiroMeteringUsage || 0)}
                         </div>
@@ -917,6 +1055,12 @@ export function UsageRecordsPanel() {
                   <div className="text-xs text-muted-foreground">请求模型</div>
                   <div className="break-all">{selectedRecord.model || '-'}</div>
                 </div>
+                {selectedRecord.requestedMaxTokens != null && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">请求 max_tokens</div>
+                    <div>{formatNumber(selectedRecord.requestedMaxTokens)}</div>
+                  </div>
+                )}
                 <div>
                   <div className="text-xs text-muted-foreground">上游模型</div>
                   <div className="break-all">{upstreamModel(selectedRecord)}</div>
@@ -978,6 +1122,10 @@ export function UsageRecordsPanel() {
                   </div>
                 </div>
                 <div>
+                  <div className="text-xs text-muted-foreground">原始计费</div>
+                  <div>{formatUsd(selectedRecord.originalCostUsd || 0)}</div>
+                </div>
+                <div>
                   <div className="text-xs text-muted-foreground">Kiro计量</div>
                   <div>{formatMeteringUsage(selectedRecord.kiroMeteringUsage || 0)}</div>
                 </div>
@@ -1001,6 +1149,30 @@ export function UsageRecordsPanel() {
                   <div className="md:col-span-2">
                     <div className="text-xs text-muted-foreground">客户端收到的错误</div>
                     <div className="break-all">{selectedRecord.publicErrorMessage}</div>
+                  </div>
+                )}
+                {selectedRecord.errorType && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">内部错误类型</div>
+                    <div className="break-all">{selectedRecord.errorType}</div>
+                  </div>
+                )}
+                {selectedRecord.errorStatusCode != null && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">内部状态码</div>
+                    <div>{selectedRecord.errorStatusCode}</div>
+                  </div>
+                )}
+                {selectedRecord.errorSource && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">错误阶段</div>
+                    <div className="break-all">{selectedRecord.errorSource}</div>
+                  </div>
+                )}
+                {selectedRecord.errorId && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">错误 ID</div>
+                    <div className="break-all font-mono">{selectedRecord.errorId}</div>
                   </div>
                 )}
               </div>
@@ -1176,6 +1348,14 @@ export function UsageRecordsPanel() {
                   {selectedRecord.errorDetail || selectedRecord.errorMessage || '-'}
                 </pre>
               </div>
+              {selectedRecord.errorMetadata != null && (
+                <div>
+                  <div className="mb-2 text-sm font-medium">错误元数据</div>
+                  <pre className="max-h-[360px] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap break-words">
+                    {formatJsonBlock(selectedRecord.errorMetadata)}
+                  </pre>
+                </div>
+              )}
               {Boolean(selectedRecord.payloadBreakdown || selectedRecord.payloadGuardReport) && (
                 <div>
                   <div className="mb-2 text-sm font-medium">Payload 诊断</div>

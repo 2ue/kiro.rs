@@ -319,6 +319,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyPassword: optionalTrimmed(cred.proxyPassword),
               proxyResourceId: cred.proxyResourceId || undefined,
               endpoint: optionalTrimmed(cred.endpoint),
+              enableOverageAfterImport: cred.enableOverageAfterImport ?? undefined,
             })
 
             addedCredId = addedCred.credentialId
@@ -392,6 +393,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             proxyPassword: optionalTrimmed(cred.proxyPassword),
             proxyResourceId: cred.proxyResourceId || undefined,
             endpoint: optionalTrimmed(cred.endpoint),
+            enableOverageAfterImport: cred.enableOverageAfterImport ?? undefined,
           })
 
           addedCredId = addedCred.credentialId

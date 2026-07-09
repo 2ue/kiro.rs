@@ -76,6 +76,13 @@ function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
+function profileArnRegion(profileArn: string | undefined): string | undefined {
+  if (!profileArn) return undefined
+  const parts = profileArn.trim().split(':')
+  if (parts.length < 6 || parts[0] !== 'arn' || parts[2] !== 'codewhisperer') return undefined
+  return parts[3]?.trim() || undefined
+}
+
 function stringLikeField(value: unknown): string | undefined {
   if (typeof value === 'string' && value.trim()) {
     const trimmed = value.trim()
@@ -133,6 +140,7 @@ function normalizeKamAccount(item: unknown): unknown {
   if (!refreshToken) {
     return normalized
   }
+  const profileArn = stringField(source.profileArn)
 
   return {
     email: stringField(obj.email),
@@ -149,9 +157,9 @@ function normalizeKamAccount(item: unknown): unknown {
       tokenEndpoint: stringField(source.tokenEndpoint),
       issuerUrl: stringField(source.issuerUrl),
       scopes: stringField(source.scopes) ?? stringField(source.scope),
-      profileArn: stringField(source.profileArn),
+      profileArn,
       region: stringField(source.region),
-      apiRegion: stringField(source.apiRegion),
+      apiRegion: stringField(source.apiRegion) ?? profileArnRegion(profileArn),
       authMethod: stringField(source.authMethod),
       startUrl: stringField(source.startUrl),
     },
