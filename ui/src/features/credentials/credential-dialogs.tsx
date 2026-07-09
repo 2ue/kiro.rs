@@ -84,6 +84,7 @@ function ImportProgressList({
             {r.status === 'success' && r.model && (
               <div className="text-muted-foreground truncate">{r.model}: {r.response?.slice(0, 60)}</div>
             )}
+            {r.warning && <div className="text-warning">{r.warning}</div>}
             {r.error && <div className="text-destructive">{r.error}</div>}
             {r.status === 'verifying' && <div className="text-primary">验活中…</div>}
             {r.status === 'importing' && <div className="text-primary">导入中…</div>}
@@ -167,14 +168,15 @@ interface CredentialParameterDefaults {
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
+  enableOverageAfterImport: boolean
 }
 
 function initialParameterDefaults(): CredentialParameterDefaults {
-  return { disabled: 'false', priority: '', maxConcurrentRequests: '', rpm: '', region: '', authRegion: '', apiRegion: '', machineId: '', endpoint: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '' }
+  return { disabled: 'false', priority: '', maxConcurrentRequests: '', rpm: '', region: '', authRegion: '', apiRegion: '', machineId: '', endpoint: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', enableOverageAfterImport: false }
 }
 
 function initialCredentialForm() {
-  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '' }
+  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false }
 }
 
 function formFromCredential(c: AddCredentialRequest) {
@@ -191,6 +193,7 @@ function formFromCredential(c: AddCredentialRequest) {
     machineId: c.machineId || '', proxyUrl: c.proxyUrl || '', proxyUsername: c.proxyUsername || '',
     proxyPassword: c.proxyPassword || '', proxyResourceId: c.proxyResourceId ? String(c.proxyResourceId) : '',
     endpoint: c.endpoint || '',
+    enableOverageAfterImport: c.enableOverageAfterImport === true,
   }
 }
 
@@ -244,6 +247,7 @@ function mergeCredentialDefaults(cred: AddCredentialRequest, defaults: Credentia
     apiRegion: optionalTrimmed(cred.apiRegion) || optionalTrimmed(defaults.apiRegion),
     machineId: optionalTrimmed(cred.machineId) || optionalTrimmed(defaults.machineId),
     endpoint: optionalTrimmed(cred.endpoint) || optionalTrimmed(defaults.endpoint),
+    enableOverageAfterImport: typeof cred.enableOverageAfterImport === 'undefined' || cred.enableOverageAfterImport === null ? defaults.enableOverageAfterImport : cred.enableOverageAfterImport,
     proxyResourceId,
     proxyUrl: optionalTrimmed(cred.proxyUrl) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUrl)),
     proxyUsername: optionalTrimmed(cred.proxyUsername) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUsername)),
@@ -289,10 +293,12 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
 }) {
   const [showPu, setShowPu] = useState(false)
   const [showPp, setShowPp] = useState(false)
-  const update = (key: keyof CredentialParameterDefaults, value: string) => {
+  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport'>
+  const update = (key: StringDefaultKey, value: string) => {
+    const text = value
     if (key === 'proxyResourceId' && value && value !== '__none__') { onChange({ ...defaults, proxyResourceId: value, proxyUrl: '', proxyUsername: '', proxyPassword: '' }); return }
-    if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && value.trim()) { onChange({ ...defaults, [key]: value, proxyResourceId: '' }); return }
-    if (key === 'region' && value.trim() && !defaults.authRegion.trim()) { onChange({ ...defaults, region: value, authRegion: value }); return }
+    if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && text.trim()) { onChange({ ...defaults, [key]: text, proxyResourceId: '' }); return }
+    if (key === 'region' && text.trim() && !defaults.authRegion.trim()) { onChange({ ...defaults, region: text, authRegion: text }); return }
     onChange({ ...defaults, [key]: value })
   }
   const proxyLocked = Boolean(defaults.proxyResourceId)
@@ -315,6 +321,17 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
             </SelectContent>
           </Select>
         </Field>
+        <div className="flex items-center gap-2 rounded-md bg-background/60 px-3 py-2">
+          <Checkbox
+            id="default-enable-overage"
+            checked={defaults.enableOverageAfterImport}
+            disabled={disabled}
+            onCheckedChange={(v) => onChange({ ...defaults, enableOverageAfterImport: Boolean(v) })}
+          />
+          <label htmlFor="default-enable-overage" className="text-sm cursor-pointer">
+            导入后尝试开启超额
+          </label>
+        </div>
         <Field label="默认优先级"><Input type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(e) => update('priority', e.target.value)} /></Field>
         <Field label="默认账号并发" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
         <Field label="默认账号 RPM" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(e) => update('rpm', e.target.value)} /></Field>
@@ -421,8 +438,10 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       proxyUsername: form.proxyUsername.trim() || undefined,
       proxyPassword: form.proxyPassword.trim() || undefined,
       endpoint: form.endpoint.trim() || undefined,
+      enableOverageAfterImport: form.enableOverageAfterImport,
     }, {
       onSuccess: async (data) => {
+        if (data.warning) toast.warning(data.warning)
         try {
           const info = await getCredentialBalance(data.credentialId)
           toast.success(`${data.message}，订阅: ${info.subscriptionTitle || '未知'}`)
@@ -457,6 +476,15 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
             <input type="file" className="sr-only" accept=".json,.jsonl,.txt" multiple onChange={handleFile} />
             <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件填充</span></Button>
           </label>
+        </div>
+        <div className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2">
+          <Checkbox
+            id="add-enable-overage"
+            checked={form.enableOverageAfterImport}
+            disabled={add.isPending}
+            onCheckedChange={(v) => setForm((prev) => ({ ...prev, enableOverageAfterImport: Boolean(v) }))}
+          />
+          <label htmlFor="add-enable-overage" className="text-sm cursor-pointer">添加后尝试开启超额</label>
         </div>
 
         <FieldGrid>
@@ -525,6 +553,7 @@ interface ImportResult {
   email?: string
   status: 'pending' | 'importing' | 'verifying' | 'success' | 'failed' | 'skipped'
   error?: string
+  warning?: string
   model?: string
   response?: string
 }
@@ -618,7 +647,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
         const dup = !isRetry && await isDuplicate(cred)
         if (dup) { newResults[i] = { ...newResults[i], status: 'skipped', error: '重复账号' }; if (!isRetry) setResults([...newResults]); continue }
         const res = await addCredential(cred)
-        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email }
+        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
         if (!skipVerify) {
           newResults[i].status = 'verifying'
           if (!isRetry) setResults([...newResults])
@@ -831,7 +860,7 @@ export function KamImportModal({ open, onClose, onDone }: {
           machineId: optionalTrimmed(acc.machineId),
         }, defaults)
         const res = await addCredential(cred)
-        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, status: 'verifying' }
+        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning, status: 'verifying' }
         setResults([...newResults])
         try {
           const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel)
@@ -1068,8 +1097,8 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
               <Button type="button" variant="ghost" size="xs" onClick={clearSchedulingDraft} disabled={batchUpdate.isPending}>
                 清理优先级/并发/RPM
               </Button>
-            </div>
-            <FieldGrid>
+        </div>
+        <FieldGrid>
               <Field label="优先级" description="数字越小越优先；留空重置为默认 0">
                 <div className="flex items-center gap-2">
                   <Checkbox checked={enableFields.priority} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, priority: Boolean(v) }))} id="batch-priority" />

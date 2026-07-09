@@ -33,8 +33,9 @@ import {
   useSetCredentialRpm,
   useSetCredentialRateLimitAutoDisable,
   useSetCredentialSupportedModels,
-  useSyncCredentialSupportedModels,
+  useDiscoverCredentialSupportedModels,
 } from '@/hooks/use-credentials'
+import { SupportedModelTagsEditor, mergeSupportedModels } from '@/components/supported-model-tags-editor'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -163,24 +164,6 @@ function rpmLimitLabel(credential: CredentialStatusItem): string {
   return `继承全局：${effective}`
 }
 
-function parseSupportedModelsText(value: string): string[] {
-  const seen = new Set<string>()
-  const models: string[] = []
-  for (const item of value.split(/[\n,\t]+/)) {
-    const model = item.trim()
-    if (!model) continue
-    const key = model.toLowerCase()
-    if (seen.has(key)) continue
-    seen.add(key)
-    models.push(model)
-  }
-  return models
-}
-
-function supportedModelsText(models?: string[]) {
-  return (models || []).join('\n')
-}
-
 function supportedModelsSummary(models?: string[]) {
   if (!models || models.length === 0) return '不限制'
   if (models.length <= 2) return models.join(', ')
@@ -263,7 +246,7 @@ export function CredentialCard({
       ? String(credential.rpmOverride)
       : ''
   )
-  const [supportedModelsValue, setSupportedModelsValue] = useState(supportedModelsText(supportedModels))
+  const [supportedModelsDraft, setSupportedModelsDraft] = useState<string[]>(supportedModels)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -279,7 +262,7 @@ export function CredentialCard({
   const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
-  const syncCredentialSupportedModels = useSyncCredentialSupportedModels()
+  const discoverCredentialSupportedModels = useDiscoverCredentialSupportedModels()
   const proxyResources = useProxyResources()
   const runtimeConfig = useRuntimeConfig()
   const proxyResourceOptions = proxyResources.data?.resources || []
@@ -389,7 +372,7 @@ export function CredentialCard({
   }, [credential.id, credential.rpmOverride])
 
   useEffect(() => {
-    setSupportedModelsValue(supportedModelsText(supportedModels))
+    setSupportedModelsDraft(supportedModels)
   }, [credential.id, supportedModels])
 
   const handleToggleDisabled = () => {
@@ -548,13 +531,13 @@ export function CredentialCard({
   }
 
   const handleSupportedModelsSave = () => {
-    const supportedModels = parseSupportedModelsText(supportedModelsValue)
+    const supportedModels = mergeSupportedModels([], supportedModelsDraft)
     setCredentialSupportedModels.mutate(
       { id: credential.id, request: { supportedModels } },
       {
         onSuccess: (res) => {
           toast.success(`已保存 ${res.count} 个支持模型`)
-          setSupportedModelsValue(supportedModelsText(res.supportedModels))
+          setSupportedModelsDraft(res.supportedModels)
           setEditingSupportedModels(false)
         },
         onError: (err) => {
@@ -564,14 +547,14 @@ export function CredentialCard({
     )
   }
 
-  const handleSupportedModelsSync = () => {
-    syncCredentialSupportedModels.mutate(credential.id, {
+  const handleSupportedModelsDiscover = () => {
+    discoverCredentialSupportedModels.mutate(credential.id, {
       onSuccess: (res) => {
-        toast.success(`已同步 ${res.count} 个支持模型`)
-        setSupportedModelsValue(supportedModelsText(res.supportedModels))
+        toast.success(`已拉取并生成 ${res.count} 个支持模型，保存后生效`)
+        setSupportedModelsDraft(res.supportedModels)
       },
       onError: (err) => {
-        toast.error('模型同步失败: ' + extractErrorMessage(err))
+        toast.error('模型发现失败: ' + extractErrorMessage(err))
       },
     })
   }
@@ -1513,10 +1496,10 @@ export function CredentialCard({
       <Dialog
         open={editingSupportedModels}
         onOpenChange={(open) => {
-          if (!open && (setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending)) return
+          if (!open && (setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending)) return
           setEditingSupportedModels(open)
           if (open) {
-            setSupportedModelsValue(supportedModelsText(supportedModels))
+            setSupportedModelsDraft(supportedModels)
           }
         }}
       >
@@ -1534,14 +1517,13 @@ export function CredentialCard({
             </div>
             <label className="block space-y-2">
               <span className="text-sm font-medium">支持模型</span>
-              <textarea
-                className="min-h-36 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
-                value={supportedModelsValue}
-                disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending}
-                onChange={(event) => setSupportedModelsValue(event.target.value)}
+              <SupportedModelTagsEditor
+                value={supportedModelsDraft}
+                disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}
+                onChange={setSupportedModelsDraft}
                 placeholder={'claude-sonnet-4.5\nclaude-haiku-4.5'}
               />
-              <span className="text-xs text-muted-foreground">一行一个模型，也可以用逗号分隔。</span>
+              <span className="text-xs text-muted-foreground">可以粘贴多个模型，空格、逗号、分号或换行都会自动拆分。</span>
             </label>
           </div>
 
@@ -1549,32 +1531,32 @@ export function CredentialCard({
             <Button
               variant="outline"
               onClick={() => {
-                setSupportedModelsValue('')
+                setSupportedModelsDraft([])
                 setCredentialSupportedModels.mutate(
                   { id: credential.id, request: { supportedModels: [] } },
                   {
                     onSuccess: (res) => {
                       toast.success('已清空模型限制')
-                      setSupportedModelsValue(supportedModelsText(res.supportedModels))
+                      setSupportedModelsDraft(res.supportedModels)
                       setEditingSupportedModels(false)
                     },
                     onError: (err) => toast.error('清空失败: ' + extractErrorMessage(err)),
                   }
                 )
               }}
-              disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending || supportedModels.length === 0}
+              disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || supportedModels.length === 0}
             >
               不限制
             </Button>
             <Button
               variant="outline"
-              onClick={handleSupportedModelsSync}
-              disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending || credential.authMethod === 'api_key'}
+              onClick={handleSupportedModelsDiscover}
+              disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || credential.authMethod === 'api_key'}
             >
-              {syncCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
-              同步上游
+              {discoverCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              拉取并生成官方写法
             </Button>
-            <Button onClick={handleSupportedModelsSave} disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending}>
+            <Button onClick={handleSupportedModelsSave} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}>
               {setCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
               保存
             </Button>

@@ -195,6 +195,7 @@ fn record_entry_request_error(
         cache_creation_5m_input_tokens: 0,
         cache_creation_1h_input_tokens: 0,
         estimated_cost_usd: 0.0,
+        original_cost_usd: 0.0,
         kiro_metering_usage: 0.0,
         pricing_available: false,
         pricing_model: None,

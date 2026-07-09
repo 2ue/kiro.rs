@@ -3006,6 +3006,15 @@ impl CredentialUsageContext {
                 .unwrap_or(&self.request.model),
             usage,
         );
+        let original_pricing = raw_usage.map(|usage| {
+            self.request.pricing_catalog.estimate(
+                self.request
+                    .upstream_model
+                    .as_deref()
+                    .unwrap_or(&self.request.model),
+                usage,
+            )
+        });
         let include_payload_diagnostics =
             should_persist_payload_diagnostics(status, self.request.payload_guard_report.as_ref());
         let payload_breakdown = if include_payload_diagnostics {
@@ -3078,6 +3087,10 @@ impl CredentialUsageContext {
             cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
             estimated_cost_usd: pricing.cost_usd,
+            original_cost_usd: original_pricing
+                .filter(|estimate| estimate.available)
+                .map(|estimate| estimate.cost_usd)
+                .unwrap_or(pricing.cost_usd),
             kiro_metering_usage: kiro_metering_usage
                 .filter(|usage| usage.is_finite())
                 .unwrap_or(0.0),
@@ -4494,23 +4507,26 @@ async fn call_api_stream_maybe_fail_fast(
     request_id: Option<&str>,
     external_fallback: Option<&ExternalFallbackContext>,
     capacity_weight_units: u32,
+    dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
     if let Some(external) = external_fallback {
         if external.should_fail_fast_local().await {
             return provider
-                .call_api_stream_with_request_id_fail_fast_and_capacity_weight(
+                .call_api_stream_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
                     request_body,
                     request_id,
                     capacity_weight_units,
+                    dispatch_model_filter,
                 )
                 .await;
         }
     }
     provider
-        .call_api_stream_with_request_id_and_capacity_weight(
+        .call_api_stream_with_request_id_and_capacity_weight_and_model_filter(
             request_body,
             request_id,
             capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
 }
@@ -4521,23 +4537,26 @@ async fn call_api_maybe_fail_fast(
     request_id: Option<&str>,
     external_fallback: Option<&ExternalFallbackContext>,
     capacity_weight_units: u32,
+    dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
     if let Some(external) = external_fallback {
         if external.should_fail_fast_local().await {
             return provider
-                .call_api_with_context_with_request_id_fail_fast_and_capacity_weight(
+                .call_api_with_context_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
                     request_body,
                     request_id,
                     capacity_weight_units,
+                    dispatch_model_filter,
                 )
                 .await;
         }
     }
     provider
-        .call_api_with_context_with_request_id_and_capacity_weight(
+        .call_api_with_context_with_request_id_and_capacity_weight_and_model_filter(
             request_body,
             request_id,
             capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
 }
@@ -4639,13 +4658,15 @@ async fn call_stream_local_rescue_after_external_error(
     request_id: &str,
     external: &ExternalFallbackContext,
     capacity_weight_units: u32,
+    dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
     provider
-        .call_api_stream_with_request_id_max_wait_and_capacity_weight(
+        .call_api_stream_with_request_id_max_wait_and_capacity_weight_and_model_filter(
             request_body,
             Some(request_id),
             Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
             capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
 }
@@ -4661,13 +4682,15 @@ async fn call_non_stream_local_rescue_after_external_error(
     request_id: &str,
     external: &ExternalFallbackContext,
     capacity_weight_units: u32,
+    dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
     provider
-        .call_api_with_context_with_request_id_max_wait_and_capacity_weight(
+        .call_api_with_context_with_request_id_max_wait_and_capacity_weight_and_model_filter(
             request_body,
             Some(request_id),
             Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
             capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
 }
@@ -4718,7 +4741,7 @@ async fn handle_stream_request(
         external_fallback.as_ref(),
         provider.as_ref(),
         &request_id,
-        Some(preflight_model),
+        Some(model),
     )
     .await
     {
@@ -4730,6 +4753,7 @@ async fn handle_stream_request(
         Some(&request_id),
         external_fallback.as_ref(),
         capacity_weight_units,
+        Some(model),
     )
     .await
     {
@@ -4783,6 +4807,7 @@ async fn handle_stream_request(
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
+                    Some(model),
                 )
                 .await
                 {
@@ -4875,6 +4900,7 @@ async fn handle_stream_request(
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
+                    Some(model),
                 )
                 .await
                 {
@@ -4943,6 +4969,7 @@ async fn handle_stream_request(
                                                 &request_id,
                                                 external,
                                                 capacity_weight_units,
+                                                Some(model),
                                             )
                                             .await
                                             {
@@ -5059,6 +5086,7 @@ async fn handle_stream_request(
                                         &request_id,
                                         external,
                                         capacity_weight_units,
+                                        Some(model),
                                     )
                                     .await
                                     {
@@ -5868,7 +5896,7 @@ async fn handle_non_stream_request(
         external_fallback.as_ref(),
         provider.as_ref(),
         &request_id,
-        Some(preflight_model),
+        Some(model),
     )
     .await
     {
@@ -5880,6 +5908,7 @@ async fn handle_non_stream_request(
         Some(&request_id),
         external_fallback.as_ref(),
         capacity_weight_units,
+        Some(model),
     )
     .await
     {
@@ -5933,6 +5962,7 @@ async fn handle_non_stream_request(
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
+                    Some(model),
                 )
                 .await
                 {
@@ -6025,6 +6055,7 @@ async fn handle_non_stream_request(
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
+                    Some(model),
                 )
                 .await
                 {
@@ -6093,6 +6124,7 @@ async fn handle_non_stream_request(
                                                 &request_id,
                                                 external,
                                                 capacity_weight_units,
+                                                Some(model),
                                             )
                                             .await
                                             {
@@ -6209,6 +6241,7 @@ async fn handle_non_stream_request(
                                         &request_id,
                                         external,
                                         capacity_weight_units,
+                                        Some(model),
                                     )
                                     .await
                                     {

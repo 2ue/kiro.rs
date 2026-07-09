@@ -1458,6 +1458,24 @@ impl KiroProvider {
             request_id,
             AcquireMode::WaitForCapacity,
             capacity_weight_units,
+            None,
+        )
+        .await
+    }
+
+    pub async fn call_api_with_context_with_request_id_and_capacity_weight_and_model_filter(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
+    ) -> anyhow::Result<KiroApiResponse> {
+        self.call_api_with_context_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacity,
+            capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
     }
@@ -1473,10 +1491,12 @@ impl KiroProvider {
             request_id,
             AcquireMode::FailFastOnCapacity,
             1,
+            None,
         )
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn call_api_with_context_with_request_id_fail_fast_and_capacity_weight(
         &self,
         request_body: &str,
@@ -1488,6 +1508,24 @@ impl KiroProvider {
             request_id,
             AcquireMode::FailFastOnCapacity,
             capacity_weight_units,
+            None,
+        )
+        .await
+    }
+
+    pub async fn call_api_with_context_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
+    ) -> anyhow::Result<KiroApiResponse> {
+        self.call_api_with_context_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::FailFastOnCapacity,
+            capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
     }
@@ -1504,10 +1542,12 @@ impl KiroProvider {
             request_id,
             AcquireMode::WaitForCapacityMax(max_wait),
             1,
+            None,
         )
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn call_api_with_context_with_request_id_max_wait_and_capacity_weight(
         &self,
         request_body: &str,
@@ -1520,6 +1560,25 @@ impl KiroProvider {
             request_id,
             AcquireMode::WaitForCapacityMax(max_wait),
             capacity_weight_units,
+            None,
+        )
+        .await
+    }
+
+    pub async fn call_api_with_context_with_request_id_max_wait_and_capacity_weight_and_model_filter(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        max_wait: Duration,
+        capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
+    ) -> anyhow::Result<KiroApiResponse> {
+        self.call_api_with_context_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacityMax(max_wait),
+            capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
     }
@@ -1530,6 +1589,7 @@ impl KiroProvider {
         request_id: Option<&str>,
         acquire_mode: AcquireMode,
         capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
     ) -> anyhow::Result<KiroApiResponse> {
         let result = self
             .call_api_with_retry(
@@ -1538,6 +1598,7 @@ impl KiroProvider {
                 request_id,
                 acquire_mode,
                 capacity_weight_units,
+                dispatch_model_filter,
             )
             .await?;
         Ok(KiroApiResponse {
@@ -1852,6 +1913,24 @@ impl KiroProvider {
             request_id,
             AcquireMode::WaitForCapacity,
             capacity_weight_units,
+            None,
+        )
+        .await
+    }
+
+    pub async fn call_api_stream_with_request_id_and_capacity_weight_and_model_filter(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
+    ) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_stream_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacity,
+            capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
     }
@@ -1867,10 +1946,12 @@ impl KiroProvider {
             request_id,
             AcquireMode::FailFastOnCapacity,
             1,
+            None,
         )
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn call_api_stream_with_request_id_fail_fast_and_capacity_weight(
         &self,
         request_body: &str,
@@ -1882,6 +1963,24 @@ impl KiroProvider {
             request_id,
             AcquireMode::FailFastOnCapacity,
             capacity_weight_units,
+            None,
+        )
+        .await
+    }
+
+    pub async fn call_api_stream_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
+    ) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_stream_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::FailFastOnCapacity,
+            capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
     }
@@ -1898,10 +1997,12 @@ impl KiroProvider {
             request_id,
             AcquireMode::WaitForCapacityMax(max_wait),
             1,
+            None,
         )
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn call_api_stream_with_request_id_max_wait_and_capacity_weight(
         &self,
         request_body: &str,
@@ -1914,6 +2015,25 @@ impl KiroProvider {
             request_id,
             AcquireMode::WaitForCapacityMax(max_wait),
             capacity_weight_units,
+            None,
+        )
+        .await
+    }
+
+    pub async fn call_api_stream_with_request_id_max_wait_and_capacity_weight_and_model_filter(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        max_wait: Duration,
+        capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
+    ) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_stream_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacityMax(max_wait),
+            capacity_weight_units,
+            dispatch_model_filter,
         )
         .await
     }
@@ -1924,6 +2044,7 @@ impl KiroProvider {
         request_id: Option<&str>,
         acquire_mode: AcquireMode,
         capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
     ) -> anyhow::Result<KiroStreamResponse> {
         let result = self
             .call_api_with_retry(
@@ -1932,6 +2053,7 @@ impl KiroProvider {
                 request_id,
                 acquire_mode,
                 capacity_weight_units,
+                dispatch_model_filter,
             )
             .await?;
         Ok(KiroStreamResponse {
@@ -2450,6 +2572,7 @@ impl KiroProvider {
         request_id: Option<&str>,
         acquire_mode: AcquireMode,
         capacity_weight_units: u32,
+        dispatch_model_filter: Option<&str>,
     ) -> anyhow::Result<ApiCallResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries =
@@ -2460,8 +2583,9 @@ impl KiroProvider {
         let api_type = if is_stream { "流式" } else { "非流式" };
         let mut attempts: Vec<KiroCredentialAttempt> = Vec::new();
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
+        let model = dispatch_model_filter
+            .map(str::to_string)
+            .or_else(|| Self::extract_model_from_request(request_body));
         let conversation_id = Self::extract_conversation_id_from_request(request_body);
         let mut excluded_ids: HashSet<u64> = HashSet::new();
         let mut prompt_logic_retry_count = 0usize;

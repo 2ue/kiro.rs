@@ -55,8 +55,8 @@ import type {
   ExternalPoolsStatusResponse,
   ExternalPoolTestRequest,
   ExternalPoolTestResponse,
+  DiscoverExternalPoolSupportedModelsRequest,
   SupportedModelsResponse,
-  SyncSupportedModelsFromCredentialRequest,
   UpdateExternalPoolRequest,
 } from '@/types/api'
 
@@ -278,6 +278,11 @@ export async function setCredentialSupportedModels(
 
 export async function syncCredentialSupportedModels(id: number): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>(`/credentials/${id}/supported-models/sync`)
+  return data
+}
+
+export async function discoverCredentialSupportedModels(id: number): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/credentials/${id}/supported-models/discover`)
   return data
 }
 
@@ -552,9 +557,24 @@ export async function setExternalPoolSupportedModels(
 
 export async function syncExternalPoolSupportedModels(
   id: number,
-  req: SyncSupportedModelsFromCredentialRequest
+  req: DiscoverExternalPoolSupportedModelsRequest = {}
 ): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models/sync`, req)
+  return data
+}
+
+export async function discoverExternalPoolSupportedModels(
+  req: DiscoverExternalPoolSupportedModelsRequest
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>('/external-pools/supported-models/discover', req)
+  return data
+}
+
+export async function discoverStoredExternalPoolSupportedModels(
+  id: number,
+  req: DiscoverExternalPoolSupportedModelsRequest = {}
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models/discover`, req)
   return data
 }
 

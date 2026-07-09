@@ -27,17 +27,18 @@ use super::types::{
     CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
     CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
     CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
-    ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
-    ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
-    RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
-    SetCredentialConcurrencyRequest, SetCredentialProxyRequest,
+    DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest, LoadBalancingModeResponse,
+    ManualModelResponse, ProxyResourceResponse, ProxyResourceTestRequest,
+    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
+    RequestApiKeyItem, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
+    SetCredentialOverageRequest, SetCredentialProxyRequest,
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
     SetLoadBalancingModeRequest, SetSupportedModelsRequest, SetWarmupRequest,
-    SupportedModelsResponse, SyncSupportedModelsFromCredentialRequest, TestCredentialRequest,
-    TestCredentialResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
-    UsageCleanupRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
+    SupportedModelsResponse, TestCredentialRequest, TestCredentialResponse,
+    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
     ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
@@ -55,9 +56,9 @@ use crate::anthropic::{
 };
 use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolManager, ExternalPoolTestResponse,
-    ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
-    external_pool_messages_url, external_pool_models_url,
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolManager,
+    ExternalPoolTestResponse, ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest,
+    UpdateExternalPoolRequest, external_pool_messages_url, external_pool_models_url,
 };
 use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_body_timeout, response_text_with_body_timeout,
@@ -75,7 +76,9 @@ use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
 use crate::model::config::{ExternalPoolsConfig, normalize_defined_cache_routes};
-use crate::model::model_support::normalize_supported_models;
+use crate::model::model_support::{
+    expand_claude_supported_model_variants, normalize_supported_models,
+};
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
     PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
@@ -925,28 +928,16 @@ impl AdminService {
     pub async fn sync_external_pool_supported_models(
         &self,
         id: u64,
-        request: SyncSupportedModelsFromCredentialRequest,
+        request: DiscoverExternalPoolSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
-        let models = self
-            .kiro_provider
-            .list_available_models_for_credential(request.credential_id)
-            .await
-            .map_err(|err| {
-                AdminServiceError::InvalidCredential(format!(
-                    "同步外部池 #{} 支持模型失败，账号 #{} 拉取模型失败: {}",
-                    id, request.credential_id, err
-                ))
-            })?;
-        let supported_models = normalize_supported_models(
-            models
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect::<Vec<_>>(),
-        );
+        let supported_models = self
+            .discover_external_pool_supported_model_ids(Some(id), request)
+            .await?;
         let store = self.postgres_store.clone();
+        let supported_models_for_store = supported_models.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models(id, supported_models)
+                .set_external_pool_supported_models(id, supported_models_for_store)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -958,7 +949,6 @@ impl AdminService {
             true,
             None,
             json!({
-                "credentialId": request.credential_id,
                 "supportedModels": pool.supported_models.clone(),
             }),
         );
@@ -967,6 +957,111 @@ impl AdminService {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
         })
+    }
+
+    /// 使用外部池自身的兼容 /v1/models 接口发现模型，只返回可编辑建议，不写回。
+    pub async fn discover_external_pool_supported_models(
+        &self,
+        id: Option<u64>,
+        request: DiscoverExternalPoolSupportedModelsRequest,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let supported_models = self
+            .discover_external_pool_supported_model_ids(id, request)
+            .await?;
+        Ok(SupportedModelsResponse {
+            count: supported_models.len(),
+            supported_models,
+        })
+    }
+
+    async fn discover_external_pool_supported_model_ids(
+        &self,
+        id: Option<u64>,
+        request: DiscoverExternalPoolSupportedModelsRequest,
+    ) -> Result<Vec<String>, AdminServiceError> {
+        let saved_pool = if let Some(id) = id {
+            let store = self.postgres_store.clone();
+            Some(
+                block_on_admin_store(async move { store.get_external_pool(id, false).await })
+                    .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+                    .ok_or(AdminServiceError::NotFound { id })?,
+            )
+        } else {
+            None
+        };
+
+        let base_url = request
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| saved_pool.as_ref().map(|pool| pool.base_url.clone()))
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("外部池 Base URL 不能为空".to_string())
+            })?;
+        let api_key = request
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| saved_pool.as_ref().and_then(|pool| pool.api_key.clone()))
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("外部池 Key 不能为空".to_string())
+            })?;
+        let auth_type = request
+            .auth_type
+            .or_else(|| saved_pool.as_ref().map(|pool| pool.auth_type))
+            .unwrap_or(ExternalPoolAuthType::Bearer);
+        let url = external_pool_models_url(&base_url).map_err(|err| {
+            AdminServiceError::InvalidCredential(format!("外部池模型列表 URL 无效: {err}"))
+        })?;
+        let config = self.token_manager.runtime_config();
+        let timeout_secs = config
+            .external_pools
+            .external_pool_request_timeout_secs
+            .clamp(1, 60);
+        let client = build_client(None, timeout_secs, config.tls_backend)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let mut request_builder = client
+            .get(url)
+            .header("accept", "application/json")
+            .header("anthropic-version", "2023-06-01");
+        match auth_type {
+            ExternalPoolAuthType::Bearer => {
+                request_builder = request_builder.bearer_auth(api_key);
+            }
+            ExternalPoolAuthType::XApiKey => {
+                request_builder = request_builder.header("x-api-key", api_key);
+            }
+        }
+        let response = send_with_response_header_timeout(request_builder, timeout_secs)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InvalidCredential(format!("外部池模型列表请求失败: {err}"))
+            })?;
+        let status = response.status();
+        let body = response_text_with_body_timeout(response, timeout_secs)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InvalidCredential(format!("读取外部池模型列表失败: {err}"))
+            })?;
+        if !status.is_success() {
+            let suffix = body.chars().take(500).collect::<String>();
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "外部池模型列表请求失败: {} {}",
+                status, suffix
+            )));
+        }
+        let supported_models =
+            normalize_supported_models(extract_model_ids_from_models_response(&body));
+        if supported_models.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "外部池模型列表响应中没有可识别的模型 ID".to_string(),
+            ));
+        }
+        Ok(supported_models)
     }
 
     pub fn delete_external_pool(&self, id: u64) -> Result<(), AdminServiceError> {
@@ -1529,6 +1624,7 @@ impl AdminService {
                     summaries.get(id).map(|summary| CredentialUsageSummaryItem {
                         id: *id,
                         estimated_cost_usd: summary.estimated_cost_usd,
+                        original_cost_usd: summary.original_cost_usd,
                         kiro_metering_usage: summary.kiro_metering_usage,
                         priced_requests: summary.priced_requests,
                         unpriced_requests: summary.unpriced_requests,
@@ -1810,22 +1906,9 @@ impl AdminService {
         &self,
         id: u64,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
-        let models = self
-            .kiro_provider
-            .list_available_models_for_credential(id)
-            .await
-            .map_err(|err| {
-                AdminServiceError::InvalidCredential(format!(
-                    "同步账号 #{} 支持模型失败: {}",
-                    id, err
-                ))
-            })?;
-        let supported_models = normalize_supported_models(
-            models
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect::<Vec<_>>(),
-        );
+        let supported_models = self
+            .discover_credential_supported_model_variants(id)
+            .await?;
         let supported_models = self
             .token_manager
             .set_credential_supported_models(id, supported_models)
@@ -1842,6 +1925,47 @@ impl AdminService {
             count: supported_models.len(),
             supported_models,
         })
+    }
+
+    /// 使用指定凭据调用上游模型列表接口，只返回可编辑建议，不写回。
+    pub async fn discover_credential_supported_models(
+        &self,
+        id: u64,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let supported_models = self
+            .discover_credential_supported_model_variants(id)
+            .await?;
+        Ok(SupportedModelsResponse {
+            count: supported_models.len(),
+            supported_models,
+        })
+    }
+
+    async fn discover_credential_supported_model_variants(
+        &self,
+        id: u64,
+    ) -> Result<Vec<String>, AdminServiceError> {
+        let models = self
+            .kiro_provider
+            .list_available_models_for_credential(id)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InvalidCredential(format!(
+                    "同步账号 #{} 支持模型失败: {}",
+                    id, err
+                ))
+            })?;
+        let kiro_model_ids = normalize_supported_models(
+            models
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect::<Vec<_>>(),
+        );
+        let supported_models = expand_claude_supported_model_variants(kiro_model_ids.clone());
+        if supported_models.is_empty() {
+            return Ok(kiro_model_ids);
+        }
+        Ok(supported_models)
     }
 
     pub fn set_credential_regions(
@@ -2435,34 +2559,23 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-        let credit = credit_snapshot_for_subscription(
-            usage.subscription_title(),
-            current_usage,
-            usage_limit,
-            usage.active_bonus_limit(),
-        );
-        Ok(BalanceResponse {
-            id,
-            checked_at: Utc::now().to_rfc3339(),
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-            current_usage,
-            usage_limit,
-            remaining,
-            usage_percentage,
-            credit_limit: credit.limit,
-            credit_remaining: credit.remaining,
-            credit_base: credit.base,
-            credit_bonus: credit.bonus,
-            next_reset_at: usage.next_date_reset,
-        })
+        Ok(balance_response_from_usage(id, usage))
+    }
+
+    pub async fn set_credential_overage(
+        &self,
+        id: u64,
+        req: SetCredentialOverageRequest,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        let usage = self
+            .token_manager
+            .set_overage_status_for(id, req.enabled)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        let balance = balance_response_from_usage(id, usage);
+        self.save_account_info_snapshot(&balance).await?;
+        self.invalidate_balance_cache(id);
+        Ok(balance)
     }
 
     async fn save_account_info_snapshot(
@@ -2480,6 +2593,11 @@ impl AdminService {
             credit_remaining: balance.credit_remaining,
             credit_base: balance.credit_base,
             credit_bonus: balance.credit_bonus,
+            overage_status: balance.overage_status.clone(),
+            overage_capability: balance.overage_capability.clone(),
+            overage_cap: balance.overage_cap,
+            overage_rate: balance.overage_rate,
+            current_overages: balance.current_overages,
             next_reset_at: balance.next_reset_at,
             checked_at: balance.checked_at.clone(),
         };
@@ -2502,6 +2620,7 @@ impl AdminService {
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         let email = req.email.clone();
         let warmup_remaining = req.warmup_remaining;
+        let enable_overage_after_import = req.enable_overage_after_import.unwrap_or(false);
         let disabled = req.disabled.unwrap_or(false);
         let new_cred = self.credential_from_request(req, disabled)?;
 
@@ -2516,7 +2635,20 @@ impl AdminService {
                 .map_err(|e| self.classify_error(e, credential_id))?;
         }
 
-        // 主动获取订阅等级并保存账号信息快照，避免首次请求时 Free 账号绕过 Opus 模型过滤
+        let mut warning = None;
+        if enable_overage_after_import {
+            if let Err(err) = self
+                .set_credential_overage(
+                    credential_id,
+                    SetCredentialOverageRequest { enabled: true },
+                )
+                .await
+            {
+                warning = Some(format!("超额开启失败: {}", err));
+            }
+        }
+
+        // 主动获取订阅等级并保存账号信息快照，避免首次请求时 Free 账号绕过 Opus 模型过滤。
         if let Err(e) = self.get_balance(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
@@ -2534,6 +2666,7 @@ impl AdminService {
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
             email,
+            warning,
         })
     }
 
@@ -2619,6 +2752,7 @@ impl AdminService {
                     credential_id: Some(response.credential_id),
                     email: response.email.or(email),
                     error: None,
+                    warning: response.warning,
                 }),
                 Err(err)
                     if req.duplicate_mode == BatchCredentialImportDuplicateMode::Skip
@@ -2631,6 +2765,7 @@ impl AdminService {
                         credential_id: None,
                         email,
                         error: Some(err.to_string()),
+                        warning: None,
                     });
                 }
                 Err(err) => {
@@ -2642,6 +2777,7 @@ impl AdminService {
                         credential_id: None,
                         email,
                         error: Some(message.clone()),
+                        warning: None,
                     });
                     if !req.continue_on_error {
                         break;
@@ -4898,6 +5034,9 @@ fn apply_batch_import_defaults(
             credential.rate_limit_auto_disable_enabled = Some(enabled);
         }
     }
+    if credential.enable_overage_after_import.is_none() {
+        credential.enable_overage_after_import = defaults.enable_overage_after_import;
+    }
     if credential.provider.as_deref().is_none_or(str::is_empty) {
         credential.provider = defaults.provider.clone();
     }
@@ -5043,6 +5182,11 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
         credit_remaining: credit.remaining,
         credit_base: credit.base,
         credit_bonus: credit.bonus,
+        overage_status: row.overage_status.clone(),
+        overage_capability: row.overage_capability.clone(),
+        overage_cap: row.overage_cap,
+        overage_rate: row.overage_rate,
+        current_overages: row.current_overages,
         next_reset_at: row.next_reset_at,
         checked_at: row.checked_at.clone(),
     }
@@ -5240,8 +5384,49 @@ fn credential_account_info_item_from_row(
         credit_remaining: info.credit_remaining,
         credit_base: info.credit_base,
         credit_bonus: info.credit_bonus,
+        overage_status: info.overage_status,
+        overage_capability: info.overage_capability,
+        overage_cap: info.overage_cap,
+        overage_rate: info.overage_rate,
+        current_overages: info.current_overages,
         next_reset_at: info.next_reset_at,
         checked_at: info.checked_at,
+    }
+}
+
+fn balance_response_from_usage(id: u64, usage: UsageLimitsResponse) -> BalanceResponse {
+    let current_usage = usage.current_usage();
+    let usage_limit = usage.usage_limit();
+    let remaining = (usage_limit - current_usage).max(0.0);
+    let usage_percentage = if usage_limit > 0.0 {
+        (current_usage / usage_limit * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let credit = credit_snapshot_for_subscription(
+        usage.subscription_title(),
+        current_usage,
+        usage_limit,
+        usage.active_bonus_limit(),
+    );
+    BalanceResponse {
+        id,
+        checked_at: Utc::now().to_rfc3339(),
+        subscription_title: usage.subscription_title().map(|s| s.to_string()),
+        current_usage,
+        usage_limit,
+        remaining,
+        usage_percentage,
+        credit_limit: credit.limit,
+        credit_remaining: credit.remaining,
+        credit_base: credit.base,
+        credit_bonus: credit.bonus,
+        overage_status: usage.overage_status(),
+        overage_capability: usage.overage_capability().map(str::to_string),
+        overage_cap: usage.overage_cap(),
+        overage_rate: usage.overage_rate(),
+        current_overages: usage.current_overages(),
+        next_reset_at: usage.next_date_reset,
     }
 }
 
@@ -5267,6 +5452,11 @@ fn normalize_balance_credit_snapshot(balance: &BalanceResponse) -> BalanceRespon
         credit_remaining: credit.remaining,
         credit_base: credit.base,
         credit_bonus: credit.bonus,
+        overage_status: balance.overage_status.clone(),
+        overage_capability: balance.overage_capability.clone(),
+        overage_cap: balance.overage_cap,
+        overage_rate: balance.overage_rate,
+        current_overages: balance.current_overages,
         next_reset_at: balance.next_reset_at,
     }
 }
@@ -6329,6 +6519,54 @@ fn update_usage_cleanup_progress(
     }
 }
 
+fn extract_model_ids_from_models_response(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_model_ids_from_value(&value, &mut out);
+    out
+}
+
+fn collect_model_ids_from_value(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_model_id_item(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["data", "models", "modelList", "items"] {
+                if let Some(items) = map.get(key).and_then(|value| value.as_array()) {
+                    for item in items {
+                        collect_model_id_item(item, out);
+                    }
+                }
+            }
+            if let Some(default_model) = map.get("defaultModel") {
+                collect_model_id_item(default_model, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_model_id_item(value: &Value, out: &mut Vec<String>) {
+    if let Some(model) = value.as_str() {
+        out.push(model.to_string());
+        return;
+    }
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    for key in ["id", "model", "modelId", "model_id"] {
+        if let Some(model) = map.get(key).and_then(|value| value.as_str()) {
+            out.push(model.to_string());
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6566,6 +6804,11 @@ mod tests {
                 credit_remaining: (11_000.0 - usage_percentage).max(0.0),
                 credit_base: 1_000.0,
                 credit_bonus: 10_000.0,
+                overage_status: Some("ENABLED".to_string()),
+                overage_capability: Some("OVERAGE_CAPABLE".to_string()),
+                overage_cap: 10.0,
+                overage_rate: 0.04,
+                current_overages: 0.0,
                 next_reset_at: None,
                 checked_at: "2026-01-01T00:00:00Z".to_string(),
             }),
@@ -6832,6 +7075,43 @@ mod tests {
 
         assert!(matches!(err, AdminServiceError::Conflict(_)));
         assert_eq!(keys, vec!["sk-one".to_string()]);
+    }
+
+    #[test]
+    fn extracts_model_ids_from_anthropic_and_openai_models_response() {
+        let body = r#"{
+            "data": [
+                {"id": "claude-sonnet-5"},
+                {"id": "claude-opus-4-8"}
+            ]
+        }"#;
+
+        assert_eq!(
+            extract_model_ids_from_models_response(body),
+            vec!["claude-sonnet-5", "claude-opus-4-8"]
+        );
+    }
+
+    #[test]
+    fn extracts_model_ids_from_kiro_compatible_models_response() {
+        let body = r#"{
+            "defaultModel": {"modelId": "auto"},
+            "models": [
+                {"modelId": "claude-sonnet-4.5"},
+                {"model": "claude-opus-4.8"},
+                "claude-haiku-4.5"
+            ]
+        }"#;
+
+        assert_eq!(
+            extract_model_ids_from_models_response(body),
+            vec![
+                "claude-sonnet-4.5",
+                "claude-opus-4.8",
+                "claude-haiku-4.5",
+                "auto",
+            ]
+        );
     }
 }
 

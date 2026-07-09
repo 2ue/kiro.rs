@@ -560,9 +560,9 @@ impl ExternalRouteRequest {
 
     fn model_candidates_for_support(&self) -> [Option<&str>; 3] {
         [
-            self.upstream_model.as_deref(),
             self.payload.as_ref().map(|payload| payload.model.as_str()),
             self.model_hint.as_deref(),
+            None,
         ]
     }
 
@@ -2759,6 +2759,12 @@ impl ExternalPoolManager {
             cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens,
             estimated_cost_usd,
+            original_cost_usd: billing
+                .as_ref()
+                .filter(|_| status == UsageRecordStatus::Success)
+                .filter(|billing| billing.pricing_available)
+                .map(|billing| billing.raw_cost_usd)
+                .unwrap_or(estimated_cost_usd),
             kiro_metering_usage: 0.0,
             pricing_available,
             pricing_model,
@@ -3254,7 +3260,7 @@ fn external_pool_matches_supported_models(
         return true;
     }
     let Some(model_candidates) = model_candidates else {
-        return true;
+        return false;
     };
     model_is_supported_by_list(&pool.supported_models, model_candidates)
 }
@@ -5745,13 +5751,13 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
-    fn supported_model_filter_matches_upstream_payload_and_raw_model_candidates() {
+    fn supported_model_filter_uses_original_payload_and_raw_model_candidates() {
         let mut pool = test_pool("https://example.com/v1", true);
         let mut route = test_route("client-alias");
         route.upstream_model = Some("claude-sonnet-4.5".to_string());
 
         pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
-        assert!(external_pool_matches_supported_models(
+        assert!(!external_pool_matches_supported_models(
             &pool,
             Some(&route.model_candidates_for_support())
         ));
@@ -5779,11 +5785,30 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
+    fn supported_model_filter_empty_list_allows_future_model_without_fallback() {
+        let mut pool = test_pool("https://example.com/v1", true);
+        let mut route = test_route("claude-sonnet-5");
+        route.upstream_model = Some("claude-sonnet-4.6".to_string());
+
+        pool.supported_models = vec!["claude-sonnet-4.6".to_string()];
+        assert!(!external_pool_matches_supported_models(
+            &pool,
+            Some(&route.model_candidates_for_support())
+        ));
+
+        pool.supported_models = Vec::new();
+        assert!(external_pool_matches_supported_models(
+            &pool,
+            Some(&route.model_candidates_for_support())
+        ));
+    }
+
+    #[test]
     fn supported_model_filter_requires_a_candidate_when_list_is_restricted() {
         let mut pool = test_pool("https://example.com/v1", true);
         pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
 
-        assert!(external_pool_matches_supported_models(&pool, None));
+        assert!(!external_pool_matches_supported_models(&pool, None));
         assert!(!external_pool_matches_supported_models(
             &pool,
             Some(&[None, None, None])

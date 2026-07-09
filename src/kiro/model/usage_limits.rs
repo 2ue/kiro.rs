@@ -12,6 +12,10 @@ pub struct UsageLimitsResponse {
     #[serde(default)]
     pub next_date_reset: Option<f64>,
 
+    /// 超额调用配置
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+
     /// 订阅信息
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
@@ -28,6 +32,22 @@ pub struct SubscriptionInfo {
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 是否支持超额调用
+    #[serde(default)]
+    pub overage_capability: Option<String>,
+}
+
+/// 超额调用配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    /// ENABLED / DISABLED
+    #[serde(default)]
+    pub overage_status: Option<String>,
+    /// 部分响应用 boolean 表示开关状态
+    #[serde(default)]
+    pub overage_enabled: Option<bool>,
 }
 
 /// 使用量明细
@@ -62,6 +82,18 @@ pub struct UsageBreakdown {
     /// 使用限额（精确值）
     #[serde(default)]
     pub usage_limit_with_precision: f64,
+
+    /// 超额计费上限（美元）
+    #[serde(default)]
+    pub overage_cap: f64,
+
+    /// 超额调用单价（美元）
+    #[serde(default)]
+    pub overage_rate: f64,
+
+    /// 已产生超额费用（美元）
+    #[serde(default)]
+    pub current_overages: f64,
 }
 
 /// 奖励额度
@@ -141,6 +173,54 @@ impl UsageLimitsResponse {
             .and_then(|info| info.subscription_title.as_deref())
     }
 
+    /// 获取超额能力。
+    pub fn overage_capability(&self) -> Option<&str> {
+        self.subscription_info
+            .as_ref()
+            .and_then(|info| info.overage_capability.as_deref())
+    }
+
+    /// 获取超额开关状态。
+    pub fn overage_status(&self) -> Option<String> {
+        if let Some(status) = self
+            .overage_configuration
+            .as_ref()
+            .and_then(|config| config.overage_status.as_deref())
+            .map(|status| status.trim().to_ascii_uppercase())
+            .filter(|status| !status.is_empty())
+        {
+            return Some(status);
+        }
+        self.overage_configuration
+            .as_ref()
+            .and_then(|config| config.overage_enabled)
+            .map(|enabled| {
+                if enabled {
+                    "ENABLED".to_string()
+                } else {
+                    "DISABLED".to_string()
+                }
+            })
+    }
+
+    pub fn overage_cap(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| breakdown.overage_cap)
+            .unwrap_or_default()
+    }
+
+    pub fn overage_rate(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| breakdown.overage_rate)
+            .unwrap_or_default()
+    }
+
+    pub fn current_overages(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|breakdown| breakdown.current_overages)
+            .unwrap_or_default()
+    }
+
     /// 获取第一个使用量明细
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
         self.usage_breakdown_list.first()
@@ -212,5 +292,45 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UsageLimitsResponse;
+
+    #[test]
+    fn parses_overage_status_and_breakdown_fields() {
+        let raw = r#"{
+            "overageConfiguration": {"overageStatus": "ENABLED"},
+            "subscriptionInfo": {
+                "subscriptionTitle": "KIRO PRO",
+                "overageCapability": "OVERAGE_CAPABLE"
+            },
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 125.5,
+                "usageLimitWithPrecision": 1000.0,
+                "overageCap": 10.0,
+                "overageRate": 0.04,
+                "currentOverages": 0.12
+            }]
+        }"#;
+
+        let parsed: UsageLimitsResponse = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.subscription_title(), Some("KIRO PRO"));
+        assert_eq!(parsed.overage_capability(), Some("OVERAGE_CAPABLE"));
+        assert_eq!(parsed.overage_status().as_deref(), Some("ENABLED"));
+        assert_eq!(parsed.overage_cap(), 10.0);
+        assert_eq!(parsed.overage_rate(), 0.04);
+        assert_eq!(parsed.current_overages(), 0.12);
+    }
+
+    #[test]
+    fn parses_boolean_overage_enabled_as_status() {
+        let raw = r#"{"overageConfiguration": {"overageEnabled": false}}"#;
+        let parsed: UsageLimitsResponse = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.overage_status().as_deref(), Some("DISABLED"));
     }
 }

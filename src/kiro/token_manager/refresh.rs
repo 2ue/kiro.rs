@@ -1,5 +1,6 @@
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
+use serde_json::json;
 use std::fmt;
 
 use crate::http_client::{ProxyConfig, build_client, send_with_response_header_timeout};
@@ -464,6 +465,66 @@ pub(crate) async fn get_usage_limits(
 
     let data: UsageLimitsResponse = response.json().await?;
     Ok(data)
+}
+
+/// 设置 Kiro/AWS Q Overages 开关。
+pub(crate) async fn set_overage_status(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+    let status = if enabled { "ENABLED" } else { "DISABLED" };
+    let profile_arn = resolve_profile_arn(credentials, config)
+        .ok_or_else(|| anyhow::anyhow!("当前凭据缺少可用于设置超额的 profileArn"))?;
+
+    let url = format!("https://{}/setUserPreference", host);
+    let user_agent = usage_limits_user_agent(os_name, node_version, kiro_version, &machine_id);
+    let amz_user_agent = usage_limits_amz_user_agent(kiro_version, &machine_id);
+    let payload = json!({
+        "overageConfiguration": {
+            "overageStatus": status,
+        },
+        "profileArn": profile_arn,
+    });
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut request = client
+        .post(&url)
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .json(&payload);
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+    if is_external_idp_credentials(credentials) {
+        request = request.header("TokenType", "EXTERNAL_IDP");
+    }
+
+    let response =
+        send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+            .await?;
+    let status_code = response.status();
+    if !status_code.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!("设置超额开关失败: {} {}", status_code, body_text);
+    }
+    Ok(())
 }
 
 pub(super) fn usage_limits_user_agent(

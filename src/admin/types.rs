@@ -42,6 +42,21 @@ pub struct CredentialAccountInfo {
     /// 开启超额后的额外积分。
     #[serde(default)]
     pub credit_bonus: f64,
+    /// 上游 Overages 开关状态：ENABLED / DISABLED / UNKNOWN。
+    #[serde(default)]
+    pub overage_status: Option<String>,
+    /// 上游 Overages 能力：OVERAGE_CAPABLE / NOT_OVERAGE_CAPABLE 等。
+    #[serde(default)]
+    pub overage_capability: Option<String>,
+    /// Overage 上限（美元）。
+    #[serde(default)]
+    pub overage_cap: f64,
+    /// Overage 单价（美元）。
+    #[serde(default)]
+    pub overage_rate: f64,
+    /// 已产生 Overage 费用（美元）。
+    #[serde(default)]
+    pub current_overages: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
     /// 上次查询时间（RFC3339 格式）
@@ -119,6 +134,11 @@ pub struct CredentialAccountInfoItem {
     pub credit_remaining: f64,
     pub credit_base: f64,
     pub credit_bonus: f64,
+    pub overage_status: Option<String>,
+    pub overage_capability: Option<String>,
+    pub overage_cap: f64,
+    pub overage_rate: f64,
+    pub current_overages: f64,
     pub next_reset_at: Option<f64>,
     pub checked_at: String,
 }
@@ -189,6 +209,7 @@ pub struct CredentialUsageSummaryResponse {
 pub struct CredentialUsageSummaryItem {
     pub id: u64,
     pub estimated_cost_usd: f64,
+    pub original_cost_usd: f64,
     pub kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
@@ -539,11 +560,17 @@ pub struct SetSupportedModelsRequest {
     pub supported_models: Vec<String>,
 }
 
-/// 基于一个本地凭据同步支持模型列表。
-#[derive(Debug, Clone, Deserialize)]
+/// 使用外部池兼容 /v1/models 接口发现支持模型。创建态需要传 baseUrl/apiKey；
+/// 编辑态可只传覆盖项，空 key 表示使用已保存 key。
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SyncSupportedModelsFromCredentialRequest {
-    pub credential_id: u64,
+pub struct DiscoverExternalPoolSupportedModelsRequest {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub auth_type: Option<crate::external_pool::ExternalPoolAuthType>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -794,6 +821,10 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub warmup_remaining: Option<u32>,
 
+    /// 新增后尝试开启上游 Overages。失败不会回滚账号导入，但会在响应中返回 warning。
+    #[serde(default)]
+    pub enable_overage_after_import: Option<bool>,
+
     /// 凭据支持的模型列表。空列表表示不限制模型调度。
     #[serde(default)]
     pub supported_models: Vec<String>,
@@ -859,6 +890,8 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -892,6 +925,8 @@ pub struct BatchCredentialImportDefaults {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub warmup_remaining: Option<u32>,
+    #[serde(default)]
+    pub enable_overage_after_import: Option<bool>,
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
 }
@@ -933,6 +968,8 @@ pub struct BatchCredentialImportItem {
     pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1136,8 +1173,29 @@ pub struct BalanceResponse {
     /// 开启超额后的额外积分。
     #[serde(default)]
     pub credit_bonus: f64,
+    /// 上游 Overages 开关状态：ENABLED / DISABLED / UNKNOWN。
+    #[serde(default)]
+    pub overage_status: Option<String>,
+    /// 上游 Overages 能力：OVERAGE_CAPABLE / NOT_OVERAGE_CAPABLE 等。
+    #[serde(default)]
+    pub overage_capability: Option<String>,
+    /// Overage 上限（美元）。
+    #[serde(default)]
+    pub overage_cap: f64,
+    /// Overage 单价（美元）。
+    #[serde(default)]
+    pub overage_rate: f64,
+    /// 已产生 Overage 费用（美元）。
+    #[serde(default)]
+    pub current_overages: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialOverageRequest {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

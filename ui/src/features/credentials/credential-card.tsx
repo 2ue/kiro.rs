@@ -22,9 +22,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   Input,
+  Progress,
   Spinner,
   Switch,
-  Textarea,
 } from '@/components/ui'
 import { EmptyState, Field, FieldGrid, LoadingState, ModalShell, useConfirm } from '@/components/patterns'
 import { ProgressRing } from '@/components/charts'
@@ -38,6 +38,7 @@ import {
   formatNumber,
   formatQuota,
   formatUsd,
+  formatUsdFixed2,
 } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -50,12 +51,13 @@ import {
   useSetCredentialConcurrency,
   useSetCredentialProxy,
   useSetCredentialRegions,
+  useSetCredentialOverage,
   useSetCredentialRpm,
   useSetCredentialRateLimitAutoDisable,
   useSetCredentialSupportedModels,
   useSetDisabled,
+  useDiscoverCredentialSupportedModels,
   useSetPriority,
-  useSyncCredentialSupportedModels,
   useSetWarmup,
 } from '@/hooks/use-credentials'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
@@ -71,6 +73,7 @@ import {
   subscriptionBadgeMeta,
 } from './credential-utils'
 import { SecretInput } from './credential-inputs'
+import { SupportedModelTagsEditor, mergeSupportedModels } from '@/features/shared/supported-model-tags'
 
 // ============================================================================
 // Sub-components
@@ -106,24 +109,6 @@ function MetaItem({ label, value, detail, error }: {
       {detail && <span className="text-xs text-muted-foreground truncate">{detail}</span>}
     </div>
   )
-}
-
-function parseSupportedModelsText(value: string): string[] {
-  const seen = new Set<string>()
-  const models: string[] = []
-  for (const item of value.split(/[\n,\t]+/)) {
-    const model = item.trim()
-    if (!model) continue
-    const key = model.toLowerCase()
-    if (seen.has(key)) continue
-    seen.add(key)
-    models.push(model)
-  }
-  return models
-}
-
-function supportedModelsText(models?: string[]) {
-  return (models || []).join('\n')
 }
 
 function supportedModelsSummary(models?: string[]) {
@@ -175,7 +160,7 @@ export function CredentialCard({
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
   const [proxyUsername, setProxyUsername] = useState(credential.proxyUsername || '')
   const [proxyPassword, setProxyPassword] = useState(credential.proxyPassword || '')
-  const [supportedModelsValue, setSupportedModelsValue] = useState(supportedModelsText(supportedModels))
+  const [supportedModelsDraft, setSupportedModelsDraft] = useState<string[]>(supportedModels)
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
 
@@ -185,9 +170,10 @@ export function CredentialCard({
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
+  const setCredentialOverage = useSetCredentialOverage()
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
-  const syncCredentialSupportedModels = useSyncCredentialSupportedModels()
+  const discoverCredentialSupportedModels = useDiscoverCredentialSupportedModels()
   const proxyResources = useProxyResources()
   const proxyResourceOptions = proxyResources.data?.resources || []
   const resetFailure = useResetFailure()
@@ -218,7 +204,32 @@ export function CredentialCard({
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const canClearInFlight = credential.inFlightRequests > 0
   const quotaDetail = accountInfo
-    ? `检查 ${formatFullDate(accountInfo.checkedAt)}${accountInfo.nextResetAt ? ` · 重置 ${formatResetAt(accountInfo.nextResetAt)}` : ''}`
+    ? `剩余 ${formatCredits(accountInfo.remaining)} · 检查 ${formatFullDate(accountInfo.checkedAt)}${accountInfo.nextResetAt ? ` · 重置 ${formatResetAt(accountInfo.nextResetAt)}` : ''}`
+    : undefined
+  const quotaUsagePercent = accountInfo && accountInfo.usageLimit > 0
+    ? Math.min(100, Math.max(0, (accountInfo.currentUsage / accountInfo.usageLimit) * 100))
+    : 0
+  const quotaProgressTone = quotaUsagePercent >= 95 ? 'error' : quotaUsagePercent >= 80 ? 'warning' : 'success'
+  const overageStatus = (accountInfo?.overageStatus || '').toUpperCase()
+  const overageCapability = (accountInfo?.overageCapability || '').toUpperCase()
+  const overageEnabled = overageStatus === 'ENABLED'
+  const overageCapable = overageCapability === '' || overageCapability === 'OVERAGE_CAPABLE'
+  const overageKnown = overageStatus === 'ENABLED' || overageStatus === 'DISABLED'
+  const overageLabel = accountInfo
+    ? !overageCapable
+      ? '不支持'
+      : overageStatus === 'ENABLED'
+        ? '已开启'
+        : overageStatus === 'DISABLED'
+          ? '已关闭'
+          : '未知'
+    : '未查询'
+  const overageDetail = accountInfo
+    ? [
+        accountInfo.overageCap > 0 ? `上限 ${formatUsd(accountInfo.overageCap)}` : null,
+        accountInfo.overageRate > 0 ? `单价 ${formatUsd(accountInfo.overageRate)}` : null,
+        accountInfo.currentOverages > 0 ? `已用 ${formatUsd(accountInfo.currentOverages)}` : null,
+      ].filter(Boolean).join(' · ') || (overageKnown ? '额度耗尽后是否继续计费' : '查询额度后同步状态')
     : undefined
 
   const concurrencyPct =
@@ -254,7 +265,7 @@ export function CredentialCard({
     setApiRegionValue(credential.apiRegion || '')
   }, [credential.id, credential.region, credential.authRegion, credential.apiRegion])
   useEffect(() => {
-    setSupportedModelsValue(supportedModelsText(supportedModels))
+    setSupportedModelsDraft(supportedModels)
   }, [credential.id, supportedModels])
   useEffect(() => { resetProxyDraft() }, [credential.id, credential.proxyResourceId, credential.proxyUrl, credential.proxyUsername, credential.proxyPassword])
 
@@ -332,6 +343,13 @@ export function CredentialCard({
     })
   }
 
+  const toggleOverage = (enabled: boolean) => {
+    setCredentialOverage.mutate({ id: credential.id, enabled }, {
+      onSuccess: () => toast.success(`超额调用已${enabled ? '开启' : '关闭'}`),
+      onError: (e) => toast.error(`超额开关设置失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
   const saveRegions = () => {
     setCredentialRegions.mutate({
       id: credential.id,
@@ -343,24 +361,24 @@ export function CredentialCard({
   }
 
   const saveSupportedModels = () => {
-    const supportedModels = parseSupportedModelsText(supportedModelsValue)
+    const supportedModels = mergeSupportedModels([], supportedModelsDraft)
     setCredentialSupportedModels.mutate({ id: credential.id, request: { supportedModels } }, {
       onSuccess: (res) => {
         toast.success(`已保存 ${res.count} 个支持模型`)
-        setSupportedModelsValue(supportedModelsText(res.supportedModels))
+        setSupportedModelsDraft(res.supportedModels)
         setEditingSupportedModels(false)
       },
       onError: (e) => toast.error(`支持模型保存失败: ${extractErrorMessage(e)}`),
     })
   }
 
-  const syncSupportedModels = () => {
-    syncCredentialSupportedModels.mutate(credential.id, {
+  const discoverSupportedModels = () => {
+    discoverCredentialSupportedModels.mutate(credential.id, {
       onSuccess: (res) => {
-        toast.success(`已同步 ${res.count} 个支持模型`)
-        setSupportedModelsValue(supportedModelsText(res.supportedModels))
+        toast.success(`已生成 ${res.count} 个模型标签`)
+        setSupportedModelsDraft(res.supportedModels)
       },
-      onError: (e) => toast.error(`模型同步失败: ${extractErrorMessage(e)}`),
+      onError: (e) => toast.error(`模型发现失败: ${extractErrorMessage(e)}`),
     })
   }
 
@@ -696,21 +714,44 @@ export function CredentialCard({
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">额度与费用</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              <MetaItem
-                label="用量额度"
-                value={loadingBalance ? <Spinner size="sm" /> : accountInfo
-                  ? `${formatQuota(accountInfo.currentUsage)} / ${formatQuota(accountInfo.usageLimit)}`
-                  : '未查询'}
-                detail={quotaDetail}
-              />
-              <MetaItem
-                label="剩余积分"
-                value={loadingBalance ? <Spinner size="sm" /> : accountInfo
-                  ? formatCredits(accountInfo.creditRemaining)
-                  : '未查询'}
-                detail={accountInfo ? `总额 ${formatCredits(accountInfo.creditLimit)}` : undefined}
-              />
-              <MetaItem label="估算成本" value={formatUsd(credential.estimatedCostUsd)} />
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[0.68rem] font-medium text-muted-foreground">用量额度</span>
+                <span className="text-sm font-semibold truncate">
+                  {loadingBalance ? <Spinner size="sm" /> : accountInfo
+                    ? `${formatQuota(accountInfo.currentUsage)} / ${formatQuota(accountInfo.usageLimit)}`
+                    : '未查询'}
+                </span>
+                {accountInfo && (
+                  <Progress
+                    value={quotaUsagePercent}
+                    tone={quotaProgressTone}
+                    className="h-1.5"
+                    aria-label="用量额度已用比例"
+                  />
+                )}
+                {quotaDetail && <span className="text-xs text-muted-foreground truncate">{quotaDetail}</span>}
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-[0.68rem] font-medium text-muted-foreground">超额调用</span>
+                <div className="flex min-h-6 items-center gap-2">
+                  {setCredentialOverage.isPending ? (
+                    <Spinner size="sm" />
+                  ) : (
+                    <Switch
+                      checked={overageEnabled}
+                      disabled={!accountInfo || !overageCapable}
+                      onCheckedChange={toggleOverage}
+                      aria-label="切换超额调用"
+                    />
+                  )}
+                  <span className={`text-sm font-semibold ${overageEnabled ? 'text-warning' : !overageCapable ? 'text-muted-foreground' : ''}`}>
+                    {overageLabel}
+                  </span>
+                </div>
+                {overageDetail && <span className="text-xs text-muted-foreground truncate">{overageDetail}</span>}
+              </div>
+              <MetaItem label="估算成本" value={formatUsdFixed2(credential.estimatedCostUsd)} />
+              <MetaItem label="原始计费" value={formatUsdFixed2(credential.originalCostUsd)} />
               <MetaItem label="Kiro计量" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
             </div>
           </div>
@@ -865,45 +906,43 @@ export function CredentialCard({
       {/* ── Supported Models Modal ── */}
       <ModalShell open={editingSupportedModels} title={`支持模型：${credentialLabel(credential)}`} width="max-w-xl"
         onClose={() => {
-          if (setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending) return
-          setSupportedModelsValue(supportedModelsText(supportedModels))
+          if (setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending) return
+          setSupportedModelsDraft(supportedModels)
           setEditingSupportedModels(false)
         }}>
         <div className="space-y-3">
           <div className="rounded-lg bg-muted/30 px-3 py-2 text-sm">
             <div className="flex justify-between gap-2">
               <span className="text-muted-foreground">当前限制</span>
-              <span className="font-semibold">{supportedModels.length > 0 ? `${supportedModels.length} 个模型` : '不限制'}</span>
+              <span className="font-semibold">{supportedModelsDraft.length > 0 ? `${supportedModelsDraft.length} 个模型` : '不限制'}</span>
             </div>
-            <div className="mt-1 text-xs text-muted-foreground">保存空列表表示该账号可参与任意模型调度；非空时只允许匹配模型调用该账号。</div>
+            <div className="mt-1 text-xs text-muted-foreground">保存空列表表示该账号可参与任意模型调度；非空时只允许精确匹配模型调用该账号。</div>
           </div>
-          <Field label="支持模型" description="一行一个模型，也可以用逗号分隔。">
-            <Textarea
-              className="min-h-36 font-mono text-xs"
-              value={supportedModelsValue}
-              disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending}
-              onChange={(e) => setSupportedModelsValue(e.target.value)}
-              placeholder={'claude-sonnet-4.5\nclaude-haiku-4.5'}
+          <Field label="支持模型" description="点击自动生成会先拉取当前 Kiro 账号支持模型，再生成可靠的 Claude/Claude Code 常用请求名；也可以手工添加或删除标签。">
+            <SupportedModelTagsEditor
+              value={supportedModelsDraft}
+              disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}
+              onChange={setSupportedModelsDraft}
             />
           </Field>
           <div className="flex flex-wrap justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={() => {
-              setSupportedModelsValue('')
+              setSupportedModelsDraft([])
               setCredentialSupportedModels.mutate({ id: credential.id, request: { supportedModels: [] } }, {
                 onSuccess: (res) => {
                   toast.success('已清空模型限制')
-                  setSupportedModelsValue(supportedModelsText(res.supportedModels))
+                  setSupportedModelsDraft(res.supportedModels)
                   setEditingSupportedModels(false)
                 },
                 onError: (e) => toast.error(`清空失败: ${extractErrorMessage(e)}`),
               })
-            }} disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending || supportedModels.length === 0}>
+            }} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || supportedModels.length === 0}>
               不限制
             </Button>
-            <Button variant="outline" size="sm" onClick={syncSupportedModels} disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending || credential.authMethod === 'api_key'}>
-              {syncCredentialSupportedModels.isPending && <Spinner size="sm" />}同步上游
+            <Button variant="outline" size="sm" onClick={discoverSupportedModels} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || credential.authMethod === 'api_key'}>
+              {discoverCredentialSupportedModels.isPending && <Spinner size="sm" />}拉取并生成官方写法
             </Button>
-            <Button size="sm" onClick={saveSupportedModels} disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending}>
+            <Button size="sm" onClick={saveSupportedModels} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}>
               {setCredentialSupportedModels.isPending && <Spinner size="sm" />}保存
             </Button>
           </div>

@@ -7,7 +7,7 @@ export const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number
 export const parseSupportedModelsText = (value: string): string[] => {
   const seen = new Set<string>()
   const models: string[] = []
-  for (const item of value.split(/[\n,\t]+/)) {
+  for (const item of value.split(/[\s,，;；]+/)) {
     const model = item.trim()
     if (!model) continue
     const key = model.toLowerCase()

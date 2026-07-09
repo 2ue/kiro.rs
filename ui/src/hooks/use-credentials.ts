@@ -6,6 +6,7 @@ import {
   createProxyResource,
   deleteCredential,
   deleteDisabledCredentials,
+  discoverCredentialSupportedModels,
   deleteProxyResource,
   forceRefreshToken,
   getCredentialAccountInfo,
@@ -24,6 +25,7 @@ import {
   resetCredentialFailure,
   setCredentialDisabled,
   setCredentialConcurrency,
+  setCredentialOverage,
   setCredentialPriority,
   setCredentialProxy,
   setCredentialRegions,
@@ -258,6 +260,14 @@ export function useSetCredentialRateLimitAutoDisable() {
   })
 }
 
+export function useSetCredentialOverage() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) => setCredentialOverage(id, enabled),
+    onSuccess: (_data, variables) => invalidateCredentialCaches(queryClient, variables.id),
+  })
+}
+
 export function useSetCredentialRegions() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -279,6 +289,12 @@ export function useSyncCredentialSupportedModels() {
   return useMutation({
     mutationFn: (id: number) => syncCredentialSupportedModels(id),
     onSuccess: (_data, id) => invalidateCredentialCaches(queryClient, id),
+  })
+}
+
+export function useDiscoverCredentialSupportedModels() {
+  return useMutation({
+    mutationFn: (id: number) => discoverCredentialSupportedModels(id),
   })
 }
 

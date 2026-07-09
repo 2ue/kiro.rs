@@ -29,7 +29,7 @@ import {
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
 import { getCredentialList, getExternalPools } from '@/api/credentials'
-import { formatDate, formatCompact, formatMeteringUsage, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
+import { formatDate, formatCompact, formatNumber, formatPercent, formatUsdFixed2, ratio } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { CredentialListItem, ExternalPool, UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageRecordsQuery, UsageRouteKindFilter, UsageSource, UsageSeriesPoint } from '@/types/api'
 import {
@@ -78,6 +78,7 @@ import {
 } from './usage-helpers'
 import { UsageDetailModal } from './usage-detail-modal'
 import { UsageCleanupModal } from './usage-cleanup-modal'
+import { UsageCostInline, usageRecordCostModel } from './usage-billing'
 
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
@@ -103,6 +104,7 @@ function seriesPointToRow(p: UsageSeriesPoint): Record<string, number | string> 
     requests: p.requests,
     errors: p.errorRequests,
     cost: p.totalEstimatedCostUsd,
+    originalCost: p.totalOriginalCostUsd,
     inputTokens: p.totalInputTokens,
     outputTokens: p.totalOutputTokens,
   }
@@ -232,6 +234,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'cache_read_input_tokens',
     'cache_creation_input_tokens',
     'estimated_cost_usd',
+    'original_cost_usd',
     'kiro_metering_usage',
     'pricing_model',
     'duration_ms',
@@ -262,6 +265,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.cacheReadInputTokens,
     record.cacheCreationInputTokens,
     record.estimatedCostUsd,
+    record.originalCostUsd,
     record.kiroMeteringUsage,
     record.pricingModel,
     record.durationMs,
@@ -526,10 +530,10 @@ function TrendView() {
 
         <SectionCard
           title="最近 7 天（按天）"
-          description="估算费用趋势"
+          description="估算费用与原始计费趋势"
           actions={
             dailyData.length > 0
-              ? <Badge tone="neutral">{formatUsd(dailyData.reduce((s, r) => s + Number(r.cost), 0))}</Badge>
+              ? <Badge tone="neutral">{formatUsdFixed2(dailyData.reduce((s, r) => s + Number(r.originalCost), 0))}</Badge>
               : undefined
           }
         >
@@ -539,12 +543,12 @@ function TrendView() {
                 data={dailyData}
                 xKey="label"
                 series={[
-                  { key: 'requests', name: '请求', color: CHART_COLORS[0] },
-                  { key: 'cost', name: '费用(USD)', color: CHART_COLORS[2] },
+                  { key: 'cost', name: '估算费用', color: CHART_COLORS[2] },
+                  { key: 'originalCost', name: '原始计费', color: CHART_COLORS[4] },
                 ]}
                 height={200}
                 valueFormatter={(v, key) =>
-                  key === 'cost' ? formatUsd(Number(v)) : formatNumber(Number(v))
+                  key === 'cost' || key === 'originalCost' ? formatUsdFixed2(Number(v)) : formatNumber(Number(v))
                 }
               />
           }
@@ -1013,21 +1017,7 @@ function RecordsView({
                         </TableCell>
                         {/* 费用 */}
                         <TableCell className="text-right font-mono text-xs tabular-nums" onClick={(e) => e.stopPropagation()}>
-                          <Button
-                            variant="link"
-                            size="xs"
-                            className="h-auto p-0 font-mono text-xs font-semibold tabular-nums"
-                            onClick={() => onViewDetail(record)}
-                            title="查看计费明细"
-                          >
-                            {formatUsd(record.estimatedCostUsd)}
-                          </Button>
-                          <div className="text-[0.62rem] text-muted-foreground/60">
-                            {record.pricingAvailable ? record.pricingModel || '已计价' : '未计价'}
-                          </div>
-                          <div className="text-[0.62rem] text-muted-foreground/60">
-                            Kiro {formatMeteringUsage(record.kiroMeteringUsage)}
-                          </div>
+                          <UsageCostInline model={usageRecordCostModel(record)} onViewDetail={() => onViewDetail(record)} />
                         </TableCell>
                         {/* 耗时 */}
                         <TableCell className="text-right font-mono text-xs tabular-nums">
@@ -1221,10 +1211,17 @@ export function UsagePage() {
         />
         <StatCard
           title="估算费用"
-          value={formatUsd(data?.totalEstimatedCostUsd ?? 0)}
+          value={formatUsdFixed2(data?.totalEstimatedCostUsd ?? 0)}
           desc={`计价覆盖 ${formatPercent(ratio(data?.pricedRequests ?? 0, data?.totalRequests ?? 1))}`}
           icon={<Clock3 />}
           tone="primary"
+        />
+        <StatCard
+          title="原始计费"
+          value={formatUsdFixed2(data?.totalOriginalCostUsd ?? 0)}
+          desc="按上游原始 usage 估算"
+          icon={<Clock3 />}
+          tone="warning"
         />
       </div>
 

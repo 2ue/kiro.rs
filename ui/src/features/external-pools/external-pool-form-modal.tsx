@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Loader2, Plus, Save } from 'lucide-react'
 import { toast } from 'sonner'
-import type { CredentialListItem, ExternalPool } from '@/types/api'
+import type { ExternalPool } from '@/types/api'
 import { ModalShell } from '@/components/patterns'
 import { Button } from '@/components/ui'
 import { SelectItem } from '@/components/ui'
 import { cn } from '@/lib/utils'
+import { SupportedModelTagsEditor, parseSupportedModelItems } from '@/features/shared/supported-model-tags'
 import {
   type ExternalPoolFormDraft,
   type ExternalPoolModelMappingPreset,
@@ -29,8 +30,6 @@ import {
   TextBox,
   ToggleRow,
 } from './external-pool-components'
-
-const NO_SYNC_CREDENTIAL = '__select_credential__'
 
 function ModelMappingPresetTags({ presets, disabled, onSelect }: {
   presets: ExternalPoolModelMappingPreset[]; disabled?: boolean; onSelect: (p: ExternalPoolModelMappingPreset) => void
@@ -57,18 +56,17 @@ function ModelMappingPresetTags({ presets, disabled, onSelect }: {
 // --- Main modal ---
 
 export function ExternalPoolFormModal({
-  mode, pool, open, draft, saving, credentialOptions = [], onDraftChange, onClose, onSubmit, onSyncSupportedModels,
+  mode, pool, open, draft, saving, onDraftChange, onClose, onSubmit, onDiscoverSupportedModels,
 }: {
   mode: 'create' | 'edit'
   pool?: ExternalPool | null
   open: boolean
   draft: ExternalPoolFormDraft
   saving: boolean
-  credentialOptions?: CredentialListItem[]
   onDraftChange: (value: ExternalPoolFormDraft | ((prev: ExternalPoolFormDraft) => ExternalPoolFormDraft)) => void
   onClose: () => void
   onSubmit: () => void
-  onSyncSupportedModels?: (credentialId: number) => Promise<string[]>
+  onDiscoverSupportedModels?: () => Promise<string[]>
 }) {
   const isEdit = mode === 'edit'
   const title = isEdit ? `编辑外部账号${pool ? ` #${pool.id}` : ''}` : '添加外部账号'
@@ -77,14 +75,12 @@ export function ExternalPoolFormModal({
     ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}`
     : '外部账号的请求密钥，保存后只显示脱敏值。'
   const [quickImportText, setQuickImportText] = useState('')
-  const [syncCredentialId, setSyncCredentialId] = useState(NO_SYNC_CREDENTIAL)
   const [syncingModels, setSyncingModels] = useState(false)
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
 
   useEffect(() => {
     if (!open) {
       setQuickImportText('')
-      setSyncCredentialId(NO_SYNC_CREDENTIAL)
     }
   }, [open])
 
@@ -115,17 +111,12 @@ export function ExternalPoolFormModal({
   }
 
   const syncSupportedModels = async () => {
-    if (!onSyncSupportedModels) return
-    const credentialId = Number(syncCredentialId)
-    if (!Number.isInteger(credentialId) || credentialId <= 0) {
-      toast.error('请选择要同步的本地账号')
-      return
-    }
+    if (!onDiscoverSupportedModels) return
     setSyncingModels(true)
     try {
-      const supportedModels = await onSyncSupportedModels(credentialId)
+      const supportedModels = await onDiscoverSupportedModels()
       onDraftChange((prev) => ({ ...prev, supportedModelsText: supportedModels.join('\n') }))
-      toast.success(`已同步 ${supportedModels.length} 个支持模型`)
+      toast.success(`已发现 ${supportedModels.length} 个支持模型`)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '同步失败')
     } finally {
@@ -202,32 +193,20 @@ export function ExternalPoolFormModal({
         </div>
 
         <FormSection title="调度资格" description="只决定该外部账号是否允许承接某些模型；不改变请求体里的 model，也不影响模型映射规则。">
-          <div className="grid gap-3 md:grid-cols-[1fr_220px]">
-            <TextAreaBox
-              label="支持模型"
-              description="空列表表示不限制；非空时，请求模型必须命中这里的列表才会调度到该外部账号。"
-              value={draft.supportedModelsText}
+          <div className="space-y-3">
+            <SupportedModelTagsEditor
+              value={parseSupportedModelItems(draft.supportedModelsText)}
               disabled={saving || syncingModels}
-              onChange={(v) => set('supportedModelsText', v)}
+              placeholder="claude-sonnet-5"
+              onChange={(models) => set('supportedModelsText', models.join('\n'))}
             />
-            <div className="space-y-2">
-              <SelectBox
-                label="从本地账号同步"
-                value={syncCredentialId}
-                disabled={saving || syncingModels || !isEdit || !onSyncSupportedModels}
-                onChange={setSyncCredentialId}
-              >
-                <SelectItem value={NO_SYNC_CREDENTIAL}>选择账号</SelectItem>
-                {credentialOptions.map((credential) => (
-                  <SelectItem key={credential.id} value={String(credential.id)}>
-                    #{credential.id} {credential.email || credential.maskedApiKey || credential.authMethod || '账号'}
-                  </SelectItem>
-                ))}
-              </SelectBox>
-              <Button type="button" variant="outline" size="sm" className="w-full" disabled={saving || syncingModels || !isEdit || syncCredentialId === NO_SYNC_CREDENTIAL || !onSyncSupportedModels} onClick={syncSupportedModels}>
-                {syncingModels && <Loader2 className="h-4 w-4 animate-spin" />}同步支持模型
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs leading-5 text-muted-foreground">
+                空列表表示不限制；非空时，请求模型必须精确命中这里的标签才会调度到该外部账号。
+              </div>
+              <Button type="button" variant="outline" size="sm" disabled={saving || syncingModels || !onDiscoverSupportedModels} onClick={syncSupportedModels}>
+                {syncingModels && <Loader2 className="h-4 w-4 animate-spin" />}发现模型
               </Button>
-              {!isEdit && <div className="text-xs text-muted-foreground">创建后编辑外部账号可从本地账号同步。</div>}
             </div>
           </div>
         </FormSection>

@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { cn } from '@/lib/utils'
-import { formatDate, formatMeteringUsage, formatNumber, formatUsd } from '@/lib/format'
-import type { ExternalPoolUsageSnapshot, UsageRecord } from '@/types/api'
+import { formatDate, formatNumber } from '@/lib/format'
+import type { UsageRecord } from '@/types/api'
 import { Badge } from '@/components/ui'
 import {
   Table,
@@ -26,6 +26,7 @@ import {
   statusTone,
   upstreamModelLabel,
 } from './usage-helpers'
+import { UsageCostBreakdown, UsageCostTiles, usageRecordCostModel } from './usage-billing'
 
 function MetricTile({
   label,
@@ -62,16 +63,6 @@ function DetailField({ label, value, mono }: { label: string; value: string; mon
 
 function SectionTitle({ children }: { children: ReactNode }) {
   return <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{children}</div>
-}
-
-function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
-  if (!snapshot) return '-'
-  return [
-    `输入 ${formatNumber(snapshot.inputTokens)}`,
-    `输出 ${formatNumber(snapshot.outputTokens)}`,
-    `读 ${formatNumber(snapshot.cacheReadInputTokens)}`,
-    `写 ${formatNumber(snapshot.cacheCreationInputTokens)}`,
-  ].join(' / ')
 }
 
 function formatJsonBlock(value: unknown): string {
@@ -118,8 +109,7 @@ export function UsageDetailModal({
 
   const hasLocalAttempts = (record.credentialAttempts?.length ?? 0) > 0
   const hasExternalAttempts = (record.externalAttempts?.length ?? 0) > 0
-  const hasExternalBilling = !!record.externalPoolBilling
-  const billing = record.externalPoolBilling
+  const costModel = usageRecordCostModel(record)
   const showExternalResolvedModel =
     record.routeKind === 'external_pool'
     && !!record.upstreamModel
@@ -204,13 +194,13 @@ export function UsageDetailModal({
           <div className="mt-2 text-xs leading-5 text-muted-foreground">
             成本估算输入 = 展示输入 + 展示缓存写入，仅用于本系统费用估算和历史兼容，不是返回给客户端的独立字段。
           </div>
-          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+          <div className="mt-2">
             <MetricTile label="用量来源" value={sourceLabel(record.usageSource)} />
-            <MetricTile label="估算费用" value={formatUsd(record.estimatedCostUsd)} tone={record.estimatedCostUsd > 0 ? 'warning' : 'default'} />
-            <MetricTile label="Kiro计量" value={formatMeteringUsage(record.kiroMeteringUsage)} />
-            <MetricTile label="有定价" value={record.pricingAvailable ? `是（${record.pricingModel || 'priced'}）` : '否'} />
+            <UsageCostTiles model={costModel} className="mt-2" />
           </div>
         </div>
+
+        <UsageCostBreakdown model={costModel} />
 
         {/* 耗时 */}
         <div>
@@ -370,49 +360,6 @@ export function UsageDetailModal({
                   ))}
                 </TableBody>
               </Table>
-            </div>
-          </div>
-        )}
-
-        {/* 外部池计费 */}
-        {hasExternalBilling && billing && (
-          <div>
-            <SectionTitle>外部池计费拆分</SectionTitle>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              <div>
-                <div className="text-xs text-muted-foreground">上游原始 usage 成本</div>
-                <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
-                <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd)}</div>
-                <div className="text-xs text-muted-foreground">按外部上游返回 usage 估算</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">展示计费（shaped）</div>
-                <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
-                <div className="mt-1 font-medium">{formatUsd(billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0)}</div>
-                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">补偿后计费（uplifted）</div>
-                <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
-                <div className="mt-1 font-medium">{formatUsd(billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0)}</div>
-              </div>
-              <div>
-                <div className="text-xs text-muted-foreground">上报费用 / 可计费</div>
-                <div className="mt-1 font-medium">{formatUsd(billing.reportedCostUsd)} / {formatUsd(billing.billableCostUsd)}</div>
-              </div>
-              {billing.profitUsd !== undefined && (
-                <div>
-                  <div className="text-xs text-muted-foreground">净盈亏</div>
-                  <div className={`mt-1 font-medium ${billing.profitUsd >= 0 ? 'text-success' : 'text-destructive'}`}>
-                    {billing.profitUsd >= 0 ? '+' : ''}{formatUsd(billing.profitUsd)}
-                  </div>
-                </div>
-              )}
-              <div>
-                <div className="text-xs text-muted-foreground">计价模型 / 用量模式</div>
-                <div className="mt-0.5 text-xs">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
-                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
-              </div>
             </div>
           </div>
         )}

@@ -68,7 +68,7 @@ use super::redis_runtime::{
 };
 use super::refresh::{
     RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
-    refresh_token, validate_refresh_token,
+    refresh_token, set_overage_status, validate_refresh_token,
 };
 use super::route_state::{
     CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind,
@@ -5451,6 +5451,32 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
+    /// 设置指定凭据的上游 Overages 开关并返回刷新后的 usageLimits。
+    pub async fn set_overage_status_for(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> anyhow::Result<UsageLimitsResponse> {
+        let ctx = self.acquire_context_for_credential(id).await?;
+        let token = ctx.token;
+        let credentials = ctx.credentials;
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let config = self.runtime_config();
+        set_overage_status(
+            &credentials,
+            &config,
+            &token,
+            effective_proxy.as_ref(),
+            enabled,
+        )
+        .await?;
+
+        let usage_limits =
+            get_usage_limits(&credentials, &config, &token, effective_proxy.as_ref()).await?;
+        Ok(usage_limits)
+    }
+
     /// 使用一份外部凭据临时查询账号信息，不加入凭据池、不改变调度状态。
     ///
     /// 这个方法用于 Admin 的外部 JSON 订阅校验。它允许使用凭据绑定的代理资源，
@@ -7013,7 +7039,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_supported_model_alias_allows_local_scheduler_selection() {
+    async fn test_supported_model_exact_match_allows_local_scheduler_selection() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.supported_models = vec!["claude-sonnet-4".to_string()];
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let mut ctx = manager
+            .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 1);
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_supported_model_filter_does_not_alias_local_scheduler_selection() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -7023,12 +7069,38 @@ mod tests {
         cred.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let mut ctx = manager
+        let err = manager
             .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(err.contains("没有支持当前模型的可用账号"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_empty_supported_models_allows_future_model_when_restricted_credential_does_not() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut restricted = test_access_token_credential("restricted", "Pro");
+        restricted.priority = 0;
+        restricted.supported_models = vec!["claude-sonnet-4.6".to_string()];
+
+        let mut unrestricted = test_access_token_credential("unrestricted", "Pro");
+        unrestricted.priority = 1;
+        unrestricted.supported_models = Vec::new();
+
+        let manager =
+            MultiTokenManager::new(config, vec![restricted, unrestricted], None, None, false)
+                .unwrap();
+        let mut ctx = manager
+            .acquire_context_for_session(Some("claude-sonnet-5"), None, &HashSet::new())
             .await
             .unwrap();
 
-        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.id, 2);
         ctx.release_in_flight();
     }
 

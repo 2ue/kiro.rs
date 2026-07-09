@@ -34,13 +34,13 @@ import type {
   SetWarmupRequest,
   SuccessResponse,
   SupportedModelsResponse,
-  SyncSupportedModelsFromCredentialRequest,
   SystemVersionResponse,
   TestCredentialRequest,
   TestCredentialResponse,
   ValidateExistingCredentialsRequest,
   ValidateExternalCredentialsRequest,
   CredentialValidationResponse,
+  DiscoverExternalPoolSupportedModelsRequest,
   ProxyResource,
   ProxyResourceTestRequest,
   ProxyResourceTestResponse,
@@ -95,6 +95,7 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     schedulerSelectionPressure: 0,
     schedulerScore: 0,
     estimatedCostUsd: 0,
+    originalCostUsd: 0,
     kiroMeteringUsage: 0,
     pricedRequests: 0,
     unpricedRequests: 0,
@@ -197,6 +198,11 @@ export async function syncCredentialSupportedModels(id: number): Promise<Support
   return data
 }
 
+export async function discoverCredentialSupportedModels(id: number): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/credentials/${id}/supported-models/discover`)
+  return data
+}
+
 export async function batchUpdateCredentials(req: BatchUpdateCredentialsRequest): Promise<BatchUpdateCredentialsResponse> {
   const { data } = await api.post<BatchUpdateCredentialsResponse>('/credentials/batch-update', req)
   return data
@@ -229,6 +235,11 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
 
 export async function getCredentialInfo(id: number, force = true): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/info`, { params: { force } })
+  return data
+}
+
+export async function setCredentialOverage(id: number, enabled: boolean): Promise<BalanceResponse> {
+  const { data } = await api.post<BalanceResponse>(`/credentials/${id}/overage`, { enabled })
   return data
 }
 
@@ -399,9 +410,24 @@ export async function setExternalPoolSupportedModels(id: number, req: SetSupport
 
 export async function syncExternalPoolSupportedModels(
   id: number,
-  req: SyncSupportedModelsFromCredentialRequest
+  req: DiscoverExternalPoolSupportedModelsRequest = {}
 ): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models/sync`, req)
+  return data
+}
+
+export async function discoverExternalPoolSupportedModels(
+  req: DiscoverExternalPoolSupportedModelsRequest
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>('/external-pools/supported-models/discover', req)
+  return data
+}
+
+export async function discoverStoredExternalPoolSupportedModels(
+  id: number,
+  req: DiscoverExternalPoolSupportedModelsRequest = {}
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models/discover`, req)
   return data
 }
 

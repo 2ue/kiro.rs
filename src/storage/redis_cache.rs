@@ -426,6 +426,7 @@ impl RedisStore {
                 billable_input_tokens: usage_i64(&totals, "billable_input_tokens"),
                 total_output_tokens: usage_i64(&totals, "total_output_tokens"),
                 total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
+                total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
             });
         }
         points
@@ -697,6 +698,10 @@ impl RedisStore {
             .arg(&totals_key)
             .arg("total_estimated_cost_usd")
             .arg(record.estimated_cost_usd)
+            .cmd("HINCRBYFLOAT")
+            .arg(&totals_key)
+            .arg("total_original_cost_usd")
+            .arg(record.original_cost_usd)
             .cmd("HINCRBY")
             .arg(&totals_key)
             .arg(if record.pricing_available {
@@ -1101,6 +1106,7 @@ impl RedisStore {
                 "total_cache_creation_input_tokens",
             ),
             total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
+            total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
             priced_requests: usage_usize(&totals, "priced_requests"),
             unpriced_requests: usage_usize(&totals, "unpriced_requests"),
             local_prompt_cache_requests: usage_usize(&totals, "local_prompt_cache_requests"),
@@ -1566,6 +1572,7 @@ impl RedisStore {
                 cache_read_input_tokens: usage_i64(&metrics, "cache_read_input_tokens"),
                 cache_creation_input_tokens: usage_i64(&metrics, "cache_creation_input_tokens"),
                 estimated_cost_usd: usage_f64(&metrics, "estimated_cost_usd"),
+                original_cost_usd: usage_f64(&metrics, "original_cost_usd"),
             });
         }
         Ok(items)
@@ -1684,6 +1691,7 @@ impl RedisStore {
                     "total_cache_creation_input_tokens",
                 ),
                 total_estimated_cost_usd: usage_f64(&metrics, "total_estimated_cost_usd"),
+                total_original_cost_usd: usage_f64(&metrics, "total_original_cost_usd"),
             });
         }
         items.sort_by_key(|item| {
@@ -3725,6 +3733,10 @@ fn append_usage_dashboard_bucket_aggregate(
         .arg(key)
         .arg("total_estimated_cost_usd")
         .arg(record.estimated_cost_usd)
+        .cmd("HINCRBYFLOAT")
+        .arg(key)
+        .arg("total_original_cost_usd")
+        .arg(record.original_cost_usd)
         .cmd("HINCRBY")
         .arg(key)
         .arg(if record.pricing_available {
@@ -3901,7 +3913,11 @@ fn append_usage_dashboard_top_aggregate(
         .cmd("HINCRBYFLOAT")
         .arg(&metrics_key)
         .arg("total_estimated_cost_usd")
-        .arg(record.estimated_cost_usd);
+        .arg(record.estimated_cost_usd)
+        .cmd("HINCRBYFLOAT")
+        .arg(&metrics_key)
+        .arg("total_original_cost_usd")
+        .arg(record.original_cost_usd);
     if let Some(label) = label.filter(|label| !label.trim().is_empty()) {
         pipe.cmd("HSET").arg(&metrics_key).arg("label").arg(label);
     }
@@ -3945,7 +3961,11 @@ fn append_usage_top_aggregate(
         .cmd("HINCRBYFLOAT")
         .arg(&metrics_key)
         .arg("estimated_cost_usd")
-        .arg(record.estimated_cost_usd);
+        .arg(record.estimated_cost_usd)
+        .cmd("HINCRBYFLOAT")
+        .arg(&metrics_key)
+        .arg("original_cost_usd")
+        .arg(record.original_cost_usd);
     if let Some(label) = label.filter(|label| !label.trim().is_empty()) {
         pipe.cmd("HSET").arg(&metrics_key).arg("label").arg(label);
     }
@@ -3981,6 +4001,7 @@ fn dashboard_summary_from_values(
         total_cache_creation_input_tokens: usage_i64(values, "total_cache_creation_input_tokens"),
         cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
         total_estimated_cost_usd: usage_f64(values, "total_estimated_cost_usd"),
+        total_original_cost_usd: usage_f64(values, "total_original_cost_usd"),
         priced_requests: usage_usize(values, "priced_requests"),
         unpriced_requests: usage_usize(values, "unpriced_requests"),
         average_duration_ms,
@@ -4583,6 +4604,7 @@ mod tests {
             cache_creation_5m_input_tokens: 5,
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd,
+            original_cost_usd: estimated_cost_usd,
             kiro_metering_usage: 0.0,
             pricing_available: status == UsageRecordStatus::Success,
             pricing_model: Some("claude-sonnet-4-5".to_string()),

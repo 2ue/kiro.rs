@@ -21,13 +21,12 @@ import {
   useUsageDashboardWindows,
 } from '@/hooks/use-usage'
 import { useCredentialSummary } from '@/hooks/use-credentials'
-import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
+import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import { billingDeltaTone, billingDeltaTextClass } from '../usage/usage-helpers'
+import { ExternalPoolBillingPanel } from '../usage/usage-billing'
 import type {
   UsageBreakdownItem,
   UsageDashboardWindow,
-  UsageExternalPoolBillingByPool,
   UsageExternalPoolBillingSummary,
   UsageSeriesPoint,
   UsageTopAggregate,
@@ -109,6 +108,7 @@ function seriesPointToChartRow(p: UsageSeriesPoint): Record<string, number | str
     requests: p.requests,
     errors: p.errorRequests,
     cost: p.totalEstimatedCostUsd,
+    originalCost: p.totalOriginalCostUsd,
     inputTokens: p.totalInputTokens,
     outputTokens: p.totalOutputTokens,
   }
@@ -346,10 +346,11 @@ function ErrorSummaryPanel({
                 </div>
                 <Badge tone="error" title={formatNumber(item.requests)}>{formatCompact(item.requests)}</Badge>
               </div>
-              <div className="mt-1.5 grid grid-cols-3 gap-1 pl-1.5 text-[0.62rem] text-muted-foreground/60">
+              <div className="mt-1.5 grid grid-cols-4 gap-1 pl-1.5 text-[0.62rem] text-muted-foreground/60">
                 <span title={formatNumber(item.totalInputTokens)}>输入 {formatCompact(item.totalInputTokens)}</span>
                 <span title={formatNumber(item.totalOutputTokens)}>输出 {formatCompact(item.totalOutputTokens)}</span>
-                <span className="text-right">{formatUsd(item.totalEstimatedCostUsd)}</span>
+                <span className="text-right">估 {formatUsdFixed2(item.totalEstimatedCostUsd)}</span>
+                <span className="text-right">原 {formatUsdFixed2(item.totalOriginalCostUsd)}</span>
               </div>
             </div>
           ))
@@ -498,7 +499,7 @@ function DimensionRankPanel({
         <div className="px-4 py-3 text-xs text-muted-foreground/60">暂无排行数据</div>
       ) : (
         <div className="scrollbar-thin overflow-x-auto">
-          <Table className="min-w-[560px]">
+          <Table className="min-w-[660px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="w-8">#</TableHead>
@@ -508,6 +509,7 @@ function DimensionRankPanel({
                 <TableHead className="text-right">输入 Token</TableHead>
                 <TableHead className="text-right">输出 Token</TableHead>
                 <TableHead className="text-right">估算费用</TableHead>
+                <TableHead className="text-right">原始计费</TableHead>
                 <TableHead className="w-28">占比</TableHead>
               </TableRow>
             </TableHeader>
@@ -533,7 +535,8 @@ function DimensionRankPanel({
                   </TableCell>
                   <TableCell className="text-right font-mono text-xs" title={formatNumber(item.totalInputTokens)}>{formatCompact(item.totalInputTokens)}</TableCell>
                   <TableCell className="text-right font-mono text-xs" title={formatNumber(item.totalOutputTokens)}>{formatCompact(item.totalOutputTokens)}</TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatUsd(item.totalEstimatedCostUsd)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(item.totalEstimatedCostUsd)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs text-warning">{formatUsdFixed2(item.totalOriginalCostUsd)}</TableCell>
                   <TableCell>
                     <div className="h-1.5 overflow-hidden rounded-full bg-muted">
                       <div
@@ -551,141 +554,6 @@ function DimensionRankPanel({
           </Table>
         </div>
       )}
-    </SectionCard>
-  )
-}
-
-// ─── 子组件：外部账号计费拆分 ──────────────────────────────────────────────────
-
-function ExternalPoolBillingPanel({
-  billing,
-  billingByPool,
-}: {
-  billing: UsageExternalPoolBillingSummary
-  billingByPool: UsageExternalPoolBillingByPool[]
-}) {
-  const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
-  const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
-  const profit = billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
-  const profitRatio = billing.rawCostUsd > 0 ? profit / billing.rawCostUsd : 0
-  const deltaTone = billingDeltaTone(profit)
-  const hasLoss = deltaTone === 'loss'
-  const hasProfit = deltaTone === 'profit'
-  const visiblePools = billingByPool.filter((pool) => pool.requests > 0).slice(0, 20)
-
-  return (
-    <SectionCard
-      title="外部账号计费拆分"
-      description="展示外部账号的成本、计费金额和差额，便于判断外部账号是否划算"
-      icon={<DollarSign />}
-      actions={
-        <span className={cn(
-          'rounded px-2 py-0.5 text-[0.68rem] font-semibold',
-          hasLoss
-            ? 'bg-destructive/10 text-destructive'
-            : hasProfit
-              ? 'bg-warning/10 text-warning'
-              : 'bg-muted text-muted-foreground/70'
-        )}>
-          {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
-        </span>
-      }
-    >
-      <div className="space-y-4">
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <div className="rounded-lg bg-muted/30 p-3">
-            <div className="text-xs text-muted-foreground">外部账号请求</div>
-            <div className="mt-1 text-lg font-semibold" title={formatNumber(billing.requests)}>{formatCompact(billing.requests)}</div>
-            <div className="mt-1 text-xs text-muted-foreground/60">
-              可计价 <span title={formatNumber(billing.pricedRequests)}>{formatCompact(billing.pricedRequests)}</span> / 未计价 <span title={formatNumber(billing.unpricedRequests)}>{formatCompact(billing.unpricedRequests)}</span>
-            </div>
-          </div>
-          <div className="rounded-lg bg-muted/30 p-3">
-            <div className="text-xs text-muted-foreground">上游原始成本</div>
-            <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
-            <div className="mt-1 text-xs text-muted-foreground/60">按外部上游返回 usage 估算</div>
-          </div>
-          <div className="rounded-lg bg-muted/30 p-3">
-            <div className="text-xs text-muted-foreground">展示计费</div>
-            <div className="mt-1 text-lg font-semibold">{formatUsd(shapedCost)}</div>
-            <div className="mt-1 text-xs text-muted-foreground/60">按当前展示规则计算</div>
-          </div>
-          <div className="rounded-lg bg-muted/30 p-3">
-            <div className="text-xs text-muted-foreground">补偿后计费</div>
-            <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
-            <div className={cn('mt-1 text-xs', billingDeltaTextClass(deltaTone))}>
-              盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
-            </div>
-          </div>
-        </div>
-
-        <div className="space-y-1.5">
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="truncate font-medium text-foreground/75">盈利占上游原始成本</span>
-            <span className="shrink-0 font-mono text-muted-foreground">
-              {profit >= 0 ? '+' : ''}{formatUsd(profit)} · {formatPercent(profitRatio)}
-            </span>
-          </div>
-          <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-            <div
-              className={cn('h-full rounded-full', hasLoss ? 'bg-warning/80' : 'bg-success/80')}
-              style={{ width: `${Math.min(100, Math.abs(profitRatio) * 100)}%` }}
-            />
-          </div>
-        </div>
-
-        <div className="pt-1">
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <div className="text-xs font-semibold text-foreground/70">外部账号成本与盈亏</div>
-            <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
-          </div>
-          {visiblePools.length === 0 ? (
-            <div className="rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground/60">
-              当前窗口没有外部账号计费样本。
-            </div>
-          ) : (
-            <div className="scrollbar-thin overflow-x-auto rounded-lg bg-card">
-              <table className="w-full min-w-[640px] text-xs">
-                <thead>
-                  <tr className="bg-muted/40 text-muted-foreground">
-                    <th className="px-3 py-2 text-left font-medium">外部账号</th>
-                    <th className="px-3 py-2 text-right font-medium">请求</th>
-                    <th className="px-3 py-2 text-right font-medium">上游原始成本</th>
-                    <th className="px-3 py-2 text-right font-medium">展示计费</th>
-                    <th className="px-3 py-2 text-right font-medium">补偿后</th>
-                    <th className="px-3 py-2 text-right font-medium">盈亏</th>
-                    <th className="px-3 py-2 text-right font-medium">未计价</th>
-                    <th className="px-3 py-2 text-right font-medium">兜底</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {visiblePools.map((pool) => {
-                    const poolProfit = pool.profitUsd ?? ((pool.upliftedCostUsd ?? pool.reportedCostUsd ?? 0) - pool.rawCostUsd)
-                    const poolTone = billingDeltaTone(poolProfit)
-                    return (
-                      <tr key={pool.poolId} className="bg-card hover:bg-muted/30 transition-colors">
-                        <td className="px-3 py-2">
-                          <div className="max-w-[200px] truncate font-medium" title={pool.poolName}>{pool.poolName}</div>
-                          <div className="font-mono text-[0.62rem] text-muted-foreground/45">#{pool.poolId}</div>
-                        </td>
-                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.requests)}>{formatCompact(pool.requests)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.rawCostUsd)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.shapedCostUsd ?? pool.reportedCostUsd)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.upliftedCostUsd ?? pool.reportedCostUsd)}</td>
-                        <td className={cn('px-3 py-2 text-right font-mono', billingDeltaTextClass(poolTone))}>
-                          {poolProfit >= 0 ? '+' : ''}{formatUsd(poolProfit)}
-                        </td>
-                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.unpricedRequests)}>{formatCompact(pool.unpricedRequests)}</td>
-                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.costFloorAppliedRequests)}>{formatCompact(pool.costFloorAppliedRequests)}</td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
     </SectionCard>
   )
 }
@@ -978,10 +846,17 @@ export function OverviewPage() {
         {/* 估算费用 */}
         <StatCard
           title="估算费用"
-          value={formatUsd(summary.totalEstimatedCostUsd)}
+          value={formatUsdFixed2(summary.totalEstimatedCostUsd)}
           desc={`计价覆盖 ${formatPercent(pricedRatio)}`}
           icon={<DollarSign />}
           tone="primary"
+        />
+        <StatCard
+          title="原始计费"
+          value={formatUsdFixed2(summary.totalOriginalCostUsd)}
+          desc="按原始 usage 估算"
+          icon={<DollarSign />}
+          tone="warning"
         />
       </div>
 

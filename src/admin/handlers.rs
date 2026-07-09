@@ -15,16 +15,17 @@ use super::{
     types::{
         AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
-        CreateRequestApiKeyRequest, ExportCredentialsQuery, ExternalPoolTestRequest,
-        ProxyResourceTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
+        CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
+        ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
+        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
         SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
         SetCredentialRegionsRequest, SetCredentialRpmRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
-        SetWarmupRequest, SuccessResponse, SyncSupportedModelsFromCredentialRequest,
-        SystemVersionResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
-        UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-        UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
-        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+        SetWarmupRequest, SuccessResponse, SystemVersionResponse, TestCredentialRequest,
+        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+        UsageCleanupRequest, ValidateExistingCredentialsRequest,
+        ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageRouteKind, UsageSource};
@@ -517,6 +518,18 @@ pub async fn sync_credential_supported_models(
     }
 }
 
+/// POST /api/admin/credentials/:id/supported-models/discover
+/// 使用该凭据拉取上游模型并生成可编辑的 Claude/Claude Code 支持模型建议，不写回。
+pub async fn discover_credential_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.discover_credential_supported_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/external-pools/:id/supported-models
 /// 设置外部池支持模型列表
 pub async fn set_external_pool_supported_models(
@@ -534,15 +547,48 @@ pub async fn set_external_pool_supported_models(
 }
 
 /// POST /api/admin/external-pools/:id/supported-models/sync
-/// 使用指定本地凭据同步并写回外部池支持模型列表
+/// 使用外部池自身的兼容 /v1/models 接口同步并写回支持模型列表
 pub async fn sync_external_pool_supported_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<SyncSupportedModelsFromCredentialRequest>,
+    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
 ) -> impl IntoResponse {
     match state
         .service
         .sync_external_pool_supported_models(id, payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/external-pools/supported-models/discover
+/// 使用未保存的外部池配置发现支持模型，不写回。
+pub async fn discover_external_pool_supported_models_from_request(
+    State(state): State<AdminState>,
+    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .discover_external_pool_supported_models(None, payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/external-pools/:id/supported-models/discover
+/// 使用已保存外部池配置发现支持模型，不写回。
+pub async fn discover_external_pool_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .discover_external_pool_supported_models(Some(id), payload)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -633,6 +679,19 @@ pub async fn get_credential_info(
         .get_account_info(id, params.force.unwrap_or(false))
         .await
     {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/overage
+/// 设置指定凭据的上游 Overages 开关，并返回刷新后的账号信息。
+pub async fn set_credential_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialOverageRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_overage(id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

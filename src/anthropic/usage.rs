@@ -332,6 +332,8 @@ pub struct UsageRecord {
     #[serde(default)]
     pub estimated_cost_usd: f64,
     #[serde(default)]
+    pub original_cost_usd: f64,
+    #[serde(default)]
     pub kiro_metering_usage: f64,
     #[serde(default)]
     pub pricing_available: bool,
@@ -468,6 +470,8 @@ pub struct UsageAggregate {
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
     pub estimated_cost_usd: f64,
+    #[serde(default)]
+    pub original_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -533,6 +537,8 @@ pub struct UsageSummary {
     pub total_cache_read_input_tokens: i64,
     pub total_cache_creation_input_tokens: i64,
     pub total_estimated_cost_usd: f64,
+    #[serde(default)]
+    pub total_original_cost_usd: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
     pub local_prompt_cache_requests: usize,
@@ -660,6 +666,8 @@ pub struct UsageDashboardSummary {
     pub total_cache_creation_input_tokens: i64,
     pub cache_read_ratio: f64,
     pub total_estimated_cost_usd: f64,
+    #[serde(default)]
+    pub total_original_cost_usd: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
     pub average_duration_ms: f64,
@@ -705,6 +713,8 @@ pub struct UsageSeriesPoint {
     pub billable_input_tokens: i64,
     pub total_output_tokens: i64,
     pub total_estimated_cost_usd: f64,
+    #[serde(default)]
+    pub total_original_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,6 +741,8 @@ pub struct UsageTopAggregate {
     pub total_cache_read_input_tokens: i64,
     pub total_cache_creation_input_tokens: i64,
     pub total_estimated_cost_usd: f64,
+    #[serde(default)]
+    pub total_original_cost_usd: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1173,6 +1185,7 @@ fn ensure_metadata_object_flags(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CredentialCostSummary {
     pub estimated_cost_usd: f64,
+    pub original_cost_usd: f64,
     pub kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
@@ -1761,6 +1774,7 @@ impl UsageRecorder {
             total_cache_read_input_tokens: 0,
             total_cache_creation_input_tokens: 0,
             total_estimated_cost_usd: 0.0,
+            total_original_cost_usd: 0.0,
             priced_requests: 0,
             unpriced_requests: 0,
             local_prompt_cache_requests: 0,
@@ -1828,6 +1842,7 @@ impl UsageRecorder {
             summary.total_cache_read_input_tokens += record.cache_read_input_tokens as i64;
             summary.total_cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
             summary.total_estimated_cost_usd += record.estimated_cost_usd;
+            summary.total_original_cost_usd += record.original_cost_usd;
             if record.pricing_available {
                 summary.priced_requests += 1;
             } else {
@@ -1860,11 +1875,13 @@ impl UsageRecorder {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     estimated_cost_usd: 0.0,
+                    original_cost_usd: 0.0,
                 });
                 entry.requests += 1;
                 entry.cache_read_input_tokens += record.cache_read_input_tokens as i64;
                 entry.cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
                 entry.estimated_cost_usd += record.estimated_cost_usd;
+                entry.original_cost_usd += record.original_cost_usd;
                 if entry.label.is_none() {
                     entry.label = record.credential_label.clone();
                 }
@@ -1881,11 +1898,13 @@ impl UsageRecorder {
                             cache_read_input_tokens: 0,
                             cache_creation_input_tokens: 0,
                             estimated_cost_usd: 0.0,
+                            original_cost_usd: 0.0,
                         });
                 entry.requests += 1;
                 entry.cache_read_input_tokens += record.cache_read_input_tokens as i64;
                 entry.cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
                 entry.estimated_cost_usd += record.estimated_cost_usd;
+                entry.original_cost_usd += record.original_cost_usd;
             }
         }
 
@@ -1943,6 +1962,7 @@ impl UsageRecorder {
             };
             let entry = summaries.entry(credential_id).or_default();
             entry.estimated_cost_usd += record.estimated_cost_usd;
+            entry.original_cost_usd += record.original_cost_usd;
             entry.kiro_metering_usage += record.kiro_metering_usage;
             if record.pricing_available {
                 entry.priced_requests += 1;
@@ -1968,6 +1988,7 @@ impl UsageRecorder {
             }
             let entry = summaries.entry(credential_id).or_default();
             entry.estimated_cost_usd += record.estimated_cost_usd;
+            entry.original_cost_usd += record.original_cost_usd;
             entry.kiro_metering_usage += record.kiro_metering_usage;
             if record.pricing_available {
                 entry.priced_requests += 1;
@@ -2342,6 +2363,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let credential_id = record.credential_id.map(|id| id.to_string());
     let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
+    let original_cost = record.original_cost_usd.to_string();
     let kiro_metering_usage = record.kiro_metering_usage.to_string();
     let attempt_chain = summarize_attempts(&record.credential_attempts);
 
@@ -2357,6 +2379,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.conversation_id.as_deref(),
         external_pool_id.as_deref(),
         record.external_pool_name.as_deref(),
+        Some(original_cost.as_str()),
         record.credential_label.as_deref(),
         Some(status),
         Some(source),
@@ -2451,6 +2474,7 @@ mod tests {
             cache_creation_5m_input_tokens: 5,
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
+            original_cost_usd: 0.001,
             kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
@@ -2858,7 +2882,9 @@ mod tests {
     fn summary_counts_high_cache_and_sources() {
         let recorder = UsageRecorder::new(10);
         recorder.record(record("1", 5, UsageSource::UpstreamMetadata));
-        recorder.record(record("2", 20_000, UsageSource::LocalPromptCache));
+        let mut second = record("2", 20_000, UsageSource::LocalPromptCache);
+        second.original_cost_usd = 0.009;
+        recorder.record(second);
 
         let summary = recorder.summary(10_000);
         assert_eq!(summary.total_requests, 2);
@@ -2875,6 +2901,7 @@ mod tests {
         assert_eq!(summary.realtime.rpm, 2.0);
         assert_eq!(summary.realtime.total_tpm, 220.0);
         assert_eq!(summary.realtime.billable_tpm, 120.0);
+        assert!((summary.total_original_cost_usd - 0.010).abs() < f64::EPSILON);
         assert_eq!(summary.top_credentials[0].key, "1");
     }
 
@@ -2884,6 +2911,7 @@ mod tests {
         let mut first = record("1", 5, UsageSource::UpstreamMetadata);
         first.credential_id = Some(7);
         first.estimated_cost_usd = 0.25;
+        first.original_cost_usd = 0.50;
         first.kiro_metering_usage = 1.5;
         first.pricing_available = true;
         recorder.record(first);
@@ -2891,6 +2919,7 @@ mod tests {
         let mut second = record("2", 5, UsageSource::UpstreamMetadata);
         second.credential_id = Some(7);
         second.estimated_cost_usd = 0.75;
+        second.original_cost_usd = 1.25;
         second.kiro_metering_usage = 2.25;
         second.pricing_available = false;
         recorder.record(second);
@@ -2899,6 +2928,7 @@ mod tests {
         let credential = summary.get(&7).expect("credential summary");
 
         assert_eq!(credential.estimated_cost_usd, 1.0);
+        assert_eq!(credential.original_cost_usd, 1.75);
         assert_eq!(credential.kiro_metering_usage, 3.75);
         assert_eq!(credential.priced_requests, 1);
         assert_eq!(credential.unpriced_requests, 1);

@@ -1340,8 +1340,10 @@ export interface SetSupportedModelsRequest {
   supportedModels: string[]
 }
 
-export interface SyncSupportedModelsFromCredentialRequest {
-  credentialId: number
+export interface DiscoverExternalPoolSupportedModelsRequest {
+  baseUrl?: string | null
+  apiKey?: string | null
+  authType?: ExternalPoolAuthType | null
 }
 
 export interface SupportedModelsResponse {

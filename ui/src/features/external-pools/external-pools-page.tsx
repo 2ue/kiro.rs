@@ -15,11 +15,11 @@ import {
   clearExternalPoolAutoDisabled,
   createExternalPool,
   deleteExternalPool,
-  getCredentialList,
+  discoverExternalPoolSupportedModels,
+  discoverStoredExternalPoolSupportedModels,
   getExternalPools,
   getExternalPoolsStatus,
   setExternalPoolEnabled,
-  syncExternalPoolSupportedModels,
   updateExternalPool,
   updateRuntimeConfig,
 } from '@/api/credentials'
@@ -100,15 +100,6 @@ export function ExternalPoolsPage() {
   const runtimeConfig = useRuntimeConfig()
   const pools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools })
   const status = useQuery({ queryKey: ['external-pools-status'], queryFn: getExternalPoolsStatus, refetchInterval: 5000 })
-  const credentialOptions = useQuery({
-    queryKey: ['external-pool-sync-credentials'],
-    queryFn: () => getCredentialList({ page: 1, limit: 500 }),
-    staleTime: 30000,
-  })
-  const syncCredentialOptions = useMemo(
-    () => (credentialOptions.data?.items || []).filter((credential) => !credential.disabled && credential.authMethod !== 'api_key'),
-    [credentialOptions.data?.items]
-  )
 
   const [savingConfig, setSavingConfig] = useState(false)
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
@@ -527,8 +518,18 @@ export function ExternalPoolsPage() {
         open={createOpen}
         draft={createForm}
         saving={savingPool}
-        credentialOptions={syncCredentialOptions}
         onDraftChange={setCreateForm}
+        onDiscoverSupportedModels={async () => {
+          if (!createForm.baseUrl.trim() || !createForm.apiKey.trim()) {
+            throw new Error('请先填写外部账号 Base URL 和 Key')
+          }
+          const response = await discoverExternalPoolSupportedModels({
+            baseUrl: createForm.baseUrl.trim(),
+            apiKey: createForm.apiKey.trim(),
+            authType: createForm.authType,
+          })
+          return response.supportedModels
+        }}
         onClose={() => { if (savingPool) return; setCreateOpen(false); setCreateForm(defaultPoolForm()) }}
         onSubmit={submitPool}
       />
@@ -538,12 +539,14 @@ export function ExternalPoolsPage() {
         open={Boolean(editingPool)}
         draft={editForm}
         saving={savingPool}
-        credentialOptions={syncCredentialOptions}
         onDraftChange={setEditForm}
-        onSyncSupportedModels={async (credentialId) => {
+        onDiscoverSupportedModels={async () => {
           if (!editingPool) return []
-          const response = await syncExternalPoolSupportedModels(editingPool.id, { credentialId })
-          invalidate()
+          const response = await discoverStoredExternalPoolSupportedModels(editingPool.id, {
+            baseUrl: editForm.baseUrl.trim() || null,
+            apiKey: editForm.apiKey.trim() || null,
+            authType: editForm.authType,
+          })
           return response.supportedModels
         }}
         onClose={() => { if (savingPool) return; setEditingPool(null); setEditForm(defaultPoolForm()) }}

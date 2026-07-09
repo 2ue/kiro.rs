@@ -20,6 +20,7 @@ import {
   setCredentialSupportedModels,
   setCredentialWarmup,
   setCredentialProxy,
+  discoverCredentialSupportedModels,
   syncCredentialSupportedModels,
   clearCredentialInFlight,
   resetCredentialFailure,
@@ -308,6 +309,12 @@ export function useSyncCredentialSupportedModels() {
     onSuccess: (_data, id) => {
       invalidateCredentialCaches(queryClient, id)
     },
+  })
+}
+
+export function useDiscoverCredentialSupportedModels() {
+  return useMutation({
+    mutationFn: (id: number) => discoverCredentialSupportedModels(id),
   })
 }
 

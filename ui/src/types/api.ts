@@ -147,6 +147,7 @@ export interface CredentialStatusItem {
   schedulerSelectionPressure?: number
   schedulerScore?: number
   estimatedCostUsd: number
+  originalCostUsd: number
   kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
@@ -250,7 +251,7 @@ export interface CredentialAccountInfoListResponse {
 
 export type CredentialUsageSummaryItem = Pick<
   CredentialStatusItem,
-  'id' | 'estimatedCostUsd' | 'kiroMeteringUsage' | 'pricedRequests' | 'unpricedRequests'
+  'id' | 'estimatedCostUsd' | 'originalCostUsd' | 'kiroMeteringUsage' | 'pricedRequests' | 'unpricedRequests'
 >
 
 export interface CredentialUsageSummaryResponse {
@@ -285,6 +286,11 @@ export interface CredentialAccountInfo {
   creditRemaining: number
   creditBase: number
   creditBonus: number
+  overageStatus?: string | null
+  overageCapability?: string | null
+  overageCap: number
+  overageRate: number
+  currentOverages: number
   nextResetAt: number | null
   checkedAt: string
 }
@@ -301,6 +307,11 @@ export interface BalanceResponse {
   creditRemaining: number
   creditBase: number
   creditBonus: number
+  overageStatus?: string | null
+  overageCapability?: string | null
+  overageCap: number
+  overageRate: number
+  currentOverages: number
   nextResetAt: number | null
 }
 
@@ -524,6 +535,7 @@ export interface AddCredentialRequest {
   rpm?: number | null
   rateLimitAutoDisableEnabled?: boolean | null
   disabled?: boolean | null
+  enableOverageAfterImport?: boolean | null
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -542,6 +554,7 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+  warning?: string
 }
 
 export interface TestCredentialRequest {
@@ -700,6 +713,7 @@ export interface UsageRecord {
   cacheCreation5mInputTokens: number
   cacheCreation1hInputTokens: number
   estimatedCostUsd: number
+  originalCostUsd: number
   kiroMeteringUsage: number
   pricingAvailable: boolean
   pricingModel?: string
@@ -813,6 +827,7 @@ export interface UsageAggregate {
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
   estimatedCostUsd: number
+  originalCostUsd: number
 }
 
 export interface UsageRealtimeStats {
@@ -835,6 +850,7 @@ export interface UsageSummary {
   totalCacheReadInputTokens: number
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
   pricedRequests: number
   unpricedRequests: number
   localPromptCacheRequests: number
@@ -931,6 +947,7 @@ export interface UsageDashboardSummary {
   totalCacheCreationInputTokens: number
   cacheReadRatio: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
   pricedRequests: number
   unpricedRequests: number
   averageDurationMs: number
@@ -969,6 +986,7 @@ export interface UsageSeriesPoint {
   billableInputTokens: number
   totalOutputTokens: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
 }
 
 export interface UsageDashboardTop {
@@ -990,6 +1008,7 @@ export interface UsageTopAggregate {
   totalCacheReadInputTokens: number
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
 }
 
 export interface UsageRecordsQuery {
@@ -1356,8 +1375,10 @@ export interface SetSupportedModelsRequest {
   supportedModels: string[]
 }
 
-export interface SyncSupportedModelsFromCredentialRequest {
-  credentialId: number
+export interface DiscoverExternalPoolSupportedModelsRequest {
+  baseUrl?: string | null
+  apiKey?: string | null
+  authType?: 'bearer' | 'x_api_key' | null
 }
 
 export interface SupportedModelsResponse {

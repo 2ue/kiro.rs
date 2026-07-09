@@ -175,6 +175,7 @@ export function mergeCredentialPlanes(
     schedulerSelectionPressure: runtime?.schedulerSelectionPressure ?? 0,
     schedulerScore: runtime?.schedulerScore ?? 0,
     estimatedCostUsd: usage?.estimatedCostUsd ?? 0,
+    originalCostUsd: usage?.originalCostUsd ?? 0,
     kiroMeteringUsage: usage?.kiroMeteringUsage ?? 0,
     pricedRequests: usage?.pricedRequests ?? 0,
     unpricedRequests: usage?.unpricedRequests ?? 0,

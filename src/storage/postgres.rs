@@ -1173,7 +1173,8 @@ impl PostgresStore {
             r#"
             SELECT credential_id, subscription_title, current_usage, usage_limit,
                    remaining, usage_percentage, credit_limit, credit_remaining,
-                   credit_base, credit_bonus, next_reset_at, checked_at
+                   credit_base, credit_bonus, overage_status, overage_capability,
+                   overage_cap, overage_rate, current_overages, next_reset_at, checked_at
             FROM credential_account_info
             "#,
         )
@@ -1196,6 +1197,11 @@ impl PostgresStore {
                     credit_remaining: row.try_get("credit_remaining")?,
                     credit_base: row.try_get("credit_base")?,
                     credit_bonus: row.try_get("credit_bonus")?,
+                    overage_status: row.try_get("overage_status")?,
+                    overage_capability: row.try_get("overage_capability")?,
+                    overage_cap: row.try_get("overage_cap")?,
+                    overage_rate: row.try_get("overage_rate")?,
+                    current_overages: row.try_get("current_overages")?,
                     next_reset_at: row.try_get("next_reset_at")?,
                     checked_at: checked_at.to_rfc3339(),
                 },
@@ -1216,7 +1222,8 @@ impl PostgresStore {
             r#"
             SELECT credential_id, subscription_title, current_usage, usage_limit,
                    remaining, usage_percentage, credit_limit, credit_remaining,
-                   credit_base, credit_bonus, next_reset_at, checked_at
+                   credit_base, credit_bonus, overage_status, overage_capability,
+                   overage_cap, overage_rate, current_overages, next_reset_at, checked_at
             FROM credential_account_info
             WHERE credential_id = ANY($1)
             "#,
@@ -1241,6 +1248,11 @@ impl PostgresStore {
                     credit_remaining: row.try_get("credit_remaining")?,
                     credit_base: row.try_get("credit_base")?,
                     credit_bonus: row.try_get("credit_bonus")?,
+                    overage_status: row.try_get("overage_status")?,
+                    overage_capability: row.try_get("overage_capability")?,
+                    overage_cap: row.try_get("overage_cap")?,
+                    overage_rate: row.try_get("overage_rate")?,
+                    current_overages: row.try_get("current_overages")?,
                     next_reset_at: row.try_get("next_reset_at")?,
                     checked_at: checked_at.to_rfc3339(),
                 },
@@ -1262,9 +1274,10 @@ impl PostgresStore {
             INSERT INTO credential_account_info (
                 credential_id, subscription_title, current_usage, usage_limit,
                 remaining, usage_percentage, credit_limit, credit_remaining,
-                credit_base, credit_bonus, next_reset_at, checked_at, updated_at
+                credit_base, credit_bonus, overage_status, overage_capability,
+                overage_cap, overage_rate, current_overages, next_reset_at, checked_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now())
             ON CONFLICT (credential_id) DO UPDATE
             SET subscription_title = EXCLUDED.subscription_title,
                 current_usage = EXCLUDED.current_usage,
@@ -1275,6 +1288,11 @@ impl PostgresStore {
                 credit_remaining = EXCLUDED.credit_remaining,
                 credit_base = EXCLUDED.credit_base,
                 credit_bonus = EXCLUDED.credit_bonus,
+                overage_status = EXCLUDED.overage_status,
+                overage_capability = EXCLUDED.overage_capability,
+                overage_cap = EXCLUDED.overage_cap,
+                overage_rate = EXCLUDED.overage_rate,
+                current_overages = EXCLUDED.current_overages,
                 next_reset_at = EXCLUDED.next_reset_at,
                 checked_at = EXCLUDED.checked_at,
                 updated_at = now()
@@ -1290,6 +1308,11 @@ impl PostgresStore {
         .bind(info.credit_remaining)
         .bind(info.credit_base)
         .bind(info.credit_bonus)
+        .bind(&info.overage_status)
+        .bind(&info.overage_capability)
+        .bind(info.overage_cap)
+        .bind(info.overage_rate)
+        .bind(info.current_overages)
         .bind(info.next_reset_at)
         .bind(checked_at)
         .execute(&self.pool)
@@ -2273,6 +2296,11 @@ pub struct CredentialAccountInfoRow {
     pub credit_remaining: f64,
     pub credit_base: f64,
     pub credit_bonus: f64,
+    pub overage_status: Option<String>,
+    pub overage_capability: Option<String>,
+    pub overage_cap: f64,
+    pub overage_rate: f64,
+    pub current_overages: f64,
     pub next_reset_at: Option<f64>,
     pub checked_at: String,
 }
@@ -2535,6 +2563,7 @@ impl PostgresUsageStore {
                 COALESCE(t.total_cache_read_input_tokens, 0)::bigint AS total_cache_read_input_tokens,
                 COALESCE(t.total_cache_creation_input_tokens, 0)::bigint AS total_cache_creation_input_tokens,
                 COALESCE(t.total_estimated_cost_usd, 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(t.total_original_cost_usd, 0)::double precision AS total_original_cost_usd,
                 COALESCE(t.priced_requests, 0)::bigint AS priced_requests,
                 COALESCE(t.unpriced_requests, 0)::bigint AS unpriced_requests,
                 COALESCE(t.local_prompt_cache_requests, 0)::bigint AS local_prompt_cache_requests,
@@ -2568,7 +2597,7 @@ impl PostgresUsageStore {
             GROUP BY t.requests, t.success_requests, t.error_requests,
                      t.total_input_tokens, t.total_output_tokens,
                      t.total_cache_read_input_tokens, t.total_cache_creation_input_tokens,
-                     t.total_estimated_cost_usd, t.priced_requests, t.unpriced_requests,
+                     t.total_estimated_cost_usd, t.total_original_cost_usd, t.priced_requests, t.unpriced_requests,
                      t.local_prompt_cache_requests, t.local_prompt_cache_input_tokens,
                      t.local_prompt_cache_read_input_tokens,
                      t.local_prompt_cache_creation_input_tokens,
@@ -2596,6 +2625,7 @@ impl PostgresUsageStore {
             total_cache_read_input_tokens: row.try_get("total_cache_read_input_tokens")?,
             total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+            total_original_cost_usd: row.try_get("total_original_cost_usd")?,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             local_prompt_cache_requests: row_i64_to_usize(&row, "local_prompt_cache_requests")?,
@@ -2847,6 +2877,7 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
                 COALESCE(SUM(b.total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
                 COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(SUM(b.total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
                 COALESCE(SUM(b.priced_requests), 0)::bigint AS priced_requests,
                 COALESCE(SUM(b.unpriced_requests), 0)::bigint AS unpriced_requests,
                 CASE
@@ -2911,6 +2942,7 @@ impl PostgresUsageStore {
                 r.total_cache_read_input_tokens,
                 r.total_cache_creation_input_tokens,
                 r.total_estimated_cost_usd,
+                r.total_original_cost_usd,
                 r.priced_requests,
                 r.unpriced_requests,
                 r.average_duration_ms,
@@ -3018,7 +3050,8 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
                 COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
                 COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
+                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(SUM(b.total_original_cost_usd), 0)::double precision AS total_original_cost_usd
             FROM windows w
             LEFT JOIN usage_rollup_time_buckets b
                 ON b.dimension = 'global'
@@ -3123,7 +3156,8 @@ impl PostgresUsageStore {
                 total_output_tokens::bigint AS total_output_tokens,
                 total_cache_read_input_tokens::bigint AS total_cache_read_input_tokens,
                 total_cache_creation_input_tokens::bigint AS total_cache_creation_input_tokens,
-                total_estimated_cost_usd::double precision AS total_estimated_cost_usd
+                total_estimated_cost_usd::double precision AS total_estimated_cost_usd,
+                total_original_cost_usd::double precision AS total_original_cost_usd
             FROM usage_rollup_totals
             WHERE dimension = "#,
         );
@@ -3148,6 +3182,7 @@ impl PostgresUsageStore {
             SELECT
                 credential_id,
                 estimated_cost_usd,
+                original_cost_usd,
                 kiro_metering_usage,
                 priced_requests,
                 unpriced_requests
@@ -3165,6 +3200,7 @@ impl PostgresUsageStore {
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
+                    original_cost_usd: row.try_get("original_cost_usd")?,
                     kiro_metering_usage: row.try_get("kiro_metering_usage")?,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
@@ -3187,6 +3223,7 @@ impl PostgresUsageStore {
             SELECT
                 credential_id,
                 estimated_cost_usd,
+                original_cost_usd,
                 kiro_metering_usage,
                 priced_requests,
                 unpriced_requests
@@ -3205,6 +3242,7 @@ impl PostgresUsageStore {
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
+                    original_cost_usd: row.try_get("original_cost_usd")?,
                     kiro_metering_usage: row.try_get("kiro_metering_usage")?,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
@@ -3223,7 +3261,8 @@ impl PostgresUsageStore {
                 requests,
                 total_cache_read_input_tokens AS cache_read_input_tokens,
                 total_cache_creation_input_tokens AS cache_creation_input_tokens,
-                total_estimated_cost_usd AS estimated_cost_usd
+                total_estimated_cost_usd AS estimated_cost_usd,
+                total_original_cost_usd AS original_cost_usd
             FROM usage_rollup_totals
             WHERE dimension = 'credential' AND requests > 0
             ORDER BY estimated_cost_usd DESC, requests DESC, cache_read_input_tokens DESC
@@ -3244,7 +3283,8 @@ impl PostgresUsageStore {
                 requests,
                 total_cache_read_input_tokens AS cache_read_input_tokens,
                 total_cache_creation_input_tokens AS cache_creation_input_tokens,
-                total_estimated_cost_usd AS estimated_cost_usd
+                total_estimated_cost_usd AS estimated_cost_usd,
+                total_original_cost_usd AS original_cost_usd
             FROM usage_rollup_totals
             WHERE dimension = 'conversation' AND requests > 0
             ORDER BY estimated_cost_usd DESC, requests DESC, cache_read_input_tokens DESC
@@ -3302,14 +3342,14 @@ async fn upsert_usage_record_in_tx(
             credential_label, status, usage_source, total_input_tokens, compat_input_tokens,
             billable_input_tokens, output_tokens, cache_read_input_tokens,
             cache_creation_input_tokens, cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens, estimated_cost_usd, kiro_metering_usage,
+            cache_creation_1h_input_tokens, estimated_cost_usd, original_cost_usd, kiro_metering_usage,
             pricing_available, pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
             error_type, error_message, error_detail, data
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
+            $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
         )
         ON CONFLICT (id) DO UPDATE
         SET created_at = EXCLUDED.created_at,
@@ -3330,6 +3370,7 @@ async fn upsert_usage_record_in_tx(
             cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
             estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+            original_cost_usd = EXCLUDED.original_cost_usd,
             kiro_metering_usage = EXCLUDED.kiro_metering_usage,
             pricing_available = EXCLUDED.pricing_available,
             pricing_model = EXCLUDED.pricing_model,
@@ -3364,6 +3405,7 @@ async fn upsert_usage_record_in_tx(
     .bind(record.cache_creation_5m_input_tokens)
     .bind(record.cache_creation_1h_input_tokens)
     .bind(record.estimated_cost_usd)
+    .bind(record.original_cost_usd)
     .bind(record.kiro_metering_usage)
     .bind(record.pricing_available)
     .bind(&record.pricing_model)
@@ -3412,6 +3454,7 @@ struct UsageRollupMetrics {
     local_prompt_cache_read_input_tokens: i64,
     local_prompt_cache_creation_input_tokens: i64,
     total_estimated_cost_usd: f64,
+    total_original_cost_usd: f64,
     external_pool_requests: i64,
     external_pool_priced_requests: i64,
     external_pool_unpriced_requests: i64,
@@ -3472,6 +3515,7 @@ impl UsageRollupMetrics {
                 0
             },
             total_estimated_cost_usd: record.estimated_cost_usd * sign as f64,
+            total_original_cost_usd: record.original_cost_usd * sign as f64,
             external_pool_requests: signed_bool(external_pool, sign),
             external_pool_priced_requests: signed_bool(external_priced, sign),
             external_pool_unpriced_requests: signed_bool(external_pool && !external_priced, sign),
@@ -3533,6 +3577,7 @@ impl UsageRollupMetrics {
         self.local_prompt_cache_creation_input_tokens +=
             other.local_prompt_cache_creation_input_tokens;
         self.total_estimated_cost_usd += other.total_estimated_cost_usd;
+        self.total_original_cost_usd += other.total_original_cost_usd;
         self.external_pool_requests += other.external_pool_requests;
         self.external_pool_priced_requests += other.external_pool_priced_requests;
         self.external_pool_unpriced_requests += other.external_pool_unpriced_requests;
@@ -3577,6 +3622,7 @@ impl UsageRollupAggregate {
 struct CredentialUsageSummaryDelta {
     requests: i64,
     estimated_cost_usd: f64,
+    original_cost_usd: f64,
     kiro_metering_usage: f64,
     priced_requests: i64,
     unpriced_requests: i64,
@@ -3626,6 +3672,7 @@ impl UsageRollupBatchDelta {
             let summary = self.credential_summaries.entry(credential_id).or_default();
             summary.requests += direction;
             summary.estimated_cost_usd += record.estimated_cost_usd * direction as f64;
+            summary.original_cost_usd += record.original_cost_usd * direction as f64;
             summary.kiro_metering_usage += record.kiro_metering_usage * direction as f64;
             summary.priced_requests += signed_bool(record.pricing_available, direction);
             summary.unpriced_requests += signed_bool(!record.pricing_available, direction);
@@ -3787,7 +3834,7 @@ async fn upsert_usage_rollup_total(
             total_cache_read_input_tokens, total_cache_creation_input_tokens,
             local_prompt_cache_input_tokens, local_prompt_cache_read_input_tokens,
             local_prompt_cache_creation_input_tokens, total_estimated_cost_usd,
-            external_pool_requests, external_pool_priced_requests,
+            total_original_cost_usd, external_pool_requests, external_pool_priced_requests,
             external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
             external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
             external_pool_uplifted_cost_usd, external_pool_profit_usd,
@@ -3800,7 +3847,7 @@ async fn upsert_usage_rollup_total(
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, now()
+            $35, $36, $37, $38, $39, now()
         )
         ON CONFLICT (dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_totals.dimension_label),
@@ -3825,6 +3872,7 @@ async fn upsert_usage_rollup_total(
             local_prompt_cache_read_input_tokens = usage_rollup_totals.local_prompt_cache_read_input_tokens + EXCLUDED.local_prompt_cache_read_input_tokens,
             local_prompt_cache_creation_input_tokens = usage_rollup_totals.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_totals.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
+            total_original_cost_usd = usage_rollup_totals.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
             external_pool_requests = usage_rollup_totals.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_totals.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_totals.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -3866,6 +3914,7 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.local_prompt_cache_read_input_tokens)
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
+    .bind(metrics.total_original_cost_usd)
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -3902,7 +3951,7 @@ async fn upsert_usage_rollup_time_bucket(
             total_output_tokens, total_cache_read_input_tokens,
             total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
             local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-            total_estimated_cost_usd, external_pool_requests,
+            total_estimated_cost_usd, total_original_cost_usd, external_pool_requests,
             external_pool_priced_requests, external_pool_unpriced_requests,
             external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
             external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -3916,7 +3965,7 @@ async fn upsert_usage_rollup_time_bucket(
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, $39, now()
+            $35, $36, $37, $38, $39, $40, now()
         )
         ON CONFLICT (bucket_start, dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_time_buckets.dimension_label),
@@ -3941,6 +3990,7 @@ async fn upsert_usage_rollup_time_bucket(
             local_prompt_cache_read_input_tokens = usage_rollup_time_buckets.local_prompt_cache_read_input_tokens + EXCLUDED.local_prompt_cache_read_input_tokens,
             local_prompt_cache_creation_input_tokens = usage_rollup_time_buckets.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_time_buckets.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
+            total_original_cost_usd = usage_rollup_time_buckets.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
             external_pool_requests = usage_rollup_time_buckets.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_time_buckets.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_time_buckets.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -3983,6 +4033,7 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.local_prompt_cache_read_input_tokens)
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
+    .bind(metrics.total_original_cost_usd)
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -4081,13 +4132,14 @@ async fn upsert_credential_usage_summary_delta(
     sqlx::query(
         r#"
         INSERT INTO usage_credential_cost_summary (
-            credential_id, requests, estimated_cost_usd, kiro_metering_usage,
+            credential_id, requests, estimated_cost_usd, original_cost_usd, kiro_metering_usage,
             priced_requests, unpriced_requests, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, now())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
         ON CONFLICT (credential_id) DO UPDATE
         SET requests = usage_credential_cost_summary.requests + EXCLUDED.requests,
             estimated_cost_usd = usage_credential_cost_summary.estimated_cost_usd + EXCLUDED.estimated_cost_usd,
+            original_cost_usd = usage_credential_cost_summary.original_cost_usd + EXCLUDED.original_cost_usd,
             kiro_metering_usage = usage_credential_cost_summary.kiro_metering_usage + EXCLUDED.kiro_metering_usage,
             priced_requests = usage_credential_cost_summary.priced_requests + EXCLUDED.priced_requests,
             unpriced_requests = usage_credential_cost_summary.unpriced_requests + EXCLUDED.unpriced_requests,
@@ -4097,6 +4149,7 @@ async fn upsert_credential_usage_summary_delta(
     .bind(credential_id as i64)
     .bind(delta.requests)
     .bind(delta.estimated_cost_usd)
+    .bind(delta.original_cost_usd)
     .bind(delta.kiro_metering_usage)
     .bind(delta.priced_requests)
     .bind(delta.unpriced_requests)
@@ -4374,6 +4427,7 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
             total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
             cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+            total_original_cost_usd: row.try_get("total_original_cost_usd")?,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             average_duration_ms: row.try_get("average_duration_ms")?,
@@ -4420,6 +4474,7 @@ fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
         billable_input_tokens: row.try_get("billable_input_tokens")?,
         total_output_tokens: row.try_get("total_output_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+        total_original_cost_usd: row.try_get("total_original_cost_usd")?,
     })
 }
 
@@ -4431,6 +4486,7 @@ fn usage_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageAggregate> {
         cache_read_input_tokens: row.try_get("cache_read_input_tokens")?,
         cache_creation_input_tokens: row.try_get("cache_creation_input_tokens")?,
         estimated_cost_usd: row.try_get("estimated_cost_usd")?,
+        original_cost_usd: row.try_get("original_cost_usd")?,
     })
 }
 
@@ -4446,6 +4502,7 @@ fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate>
         total_cache_read_input_tokens: row.try_get("total_cache_read_input_tokens")?,
         total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+        total_original_cost_usd: row.try_get("total_original_cost_usd")?,
     })
 }
 
@@ -4932,6 +4989,11 @@ CREATE TABLE IF NOT EXISTS credential_account_info (
     credit_remaining DOUBLE PRECISION NOT NULL DEFAULT 0,
     credit_base DOUBLE PRECISION NOT NULL DEFAULT 0,
     credit_bonus DOUBLE PRECISION NOT NULL DEFAULT 0,
+    overage_status TEXT,
+    overage_capability TEXT,
+    overage_cap DOUBLE PRECISION NOT NULL DEFAULT 0,
+    overage_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+    current_overages DOUBLE PRECISION NOT NULL DEFAULT 0,
     next_reset_at DOUBLE PRECISION,
     checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -4945,6 +5007,16 @@ ALTER TABLE credential_account_info
     ADD COLUMN IF NOT EXISTS credit_base DOUBLE PRECISION NOT NULL DEFAULT 0;
 ALTER TABLE credential_account_info
     ADD COLUMN IF NOT EXISTS credit_bonus DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS overage_status TEXT;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS overage_capability TEXT;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS overage_cap DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS overage_rate DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS current_overages DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS usage_records (
     id TEXT PRIMARY KEY,
@@ -4966,6 +5038,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     cache_creation_5m_input_tokens INTEGER NOT NULL,
     cache_creation_1h_input_tokens INTEGER NOT NULL,
     estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     pricing_available BOOLEAN NOT NULL DEFAULT false,
     pricing_model TEXT,
@@ -4983,7 +5056,22 @@ CREATE TABLE IF NOT EXISTS usage_records (
 
 ALTER TABLE usage_records
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+UPDATE usage_records
+SET original_cost_usd = COALESCE(
+    NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision,
+    NULLIF(data #>> '{originalCostUsd}', '')::double precision,
+    estimated_cost_usd,
+    0
+)
+WHERE original_cost_usd = 0
+  AND (
+      estimated_cost_usd <> 0
+      OR NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '') IS NOT NULL
+      OR NULLIF(data #>> '{originalCostUsd}', '') IS NOT NULL
+  );
 
 CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_credential_created ON usage_records (credential_id, created_at DESC) WHERE deleted_at IS NULL;
@@ -5020,6 +5108,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     local_prompt_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -5042,6 +5131,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_rollup_totals_dimension_cost
     ON usage_rollup_totals (dimension, total_estimated_cost_usd DESC, requests DESC);
 
 ALTER TABLE usage_rollup_totals
+    ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -5053,6 +5143,15 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+UPDATE usage_rollup_totals
+SET total_original_cost_usd = CASE
+    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
+    THEN external_pool_raw_cost_usd
+    ELSE total_estimated_cost_usd
+END
+WHERE total_original_cost_usd = 0
+  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
 
 CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     bucket_start TIMESTAMPTZ NOT NULL,
@@ -5080,6 +5179,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     local_prompt_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -5105,6 +5205,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_rollup_time_dimension_key_bucket
     ON usage_rollup_time_buckets (dimension, dimension_key, bucket_start);
 
 ALTER TABLE usage_rollup_time_buckets
+    ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -5116,6 +5217,15 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+UPDATE usage_rollup_time_buckets
+SET total_original_cost_usd = CASE
+    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
+    THEN external_pool_raw_cost_usd
+    ELSE total_estimated_cost_usd
+END
+WHERE total_original_cost_usd = 0
+  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
 
 UPDATE usage_rollup_totals
 SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
@@ -5169,6 +5279,7 @@ CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
     credential_id BIGINT NOT NULL PRIMARY KEY,
     requests BIGINT NOT NULL DEFAULT 0,
     estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     priced_requests BIGINT NOT NULL DEFAULT 0,
     unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -5179,7 +5290,13 @@ CREATE INDEX IF NOT EXISTS idx_usage_credential_cost_summary_cost
     ON usage_credential_cost_summary (estimated_cost_usd DESC, requests DESC);
 
 ALTER TABLE usage_credential_cost_summary
+    ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+UPDATE usage_credential_cost_summary
+SET original_cost_usd = estimated_cost_usd
+WHERE original_cost_usd = 0
+  AND estimated_cost_usd <> 0;
 
 INSERT INTO usage_rollup_totals (
     dimension, dimension_key, dimension_label, requests, success_requests, error_requests,
@@ -5189,7 +5306,7 @@ INSERT INTO usage_rollup_totals (
     billable_input_tokens, total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, external_pool_requests, external_pool_priced_requests,
+    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests,
     external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
     external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
     external_pool_uplifted_cost_usd, external_pool_profit_usd,
@@ -5222,6 +5339,7 @@ SELECT
     COALESCE(SUM(r.cache_read_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
     COALESCE(SUM(r.cache_creation_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
     COALESCE(SUM(r.estimated_cost_usd), 0)::double precision,
+    COALESCE(SUM(r.original_cost_usd), 0)::double precision,
     COUNT(*) FILTER (WHERE r.data->>'routeKind' = 'external_pool')::bigint,
     COUNT(*) FILTER (
         WHERE r.data->>'routeKind' = 'external_pool'
@@ -5291,7 +5409,7 @@ INSERT INTO usage_rollup_time_buckets (
     billable_input_tokens, total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, external_pool_requests, external_pool_priced_requests,
+    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests,
     external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
     external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
     external_pool_uplifted_cost_usd, external_pool_profit_usd,
@@ -5325,6 +5443,7 @@ SELECT
     COALESCE(SUM(r.cache_read_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
     COALESCE(SUM(r.cache_creation_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
     COALESCE(SUM(r.estimated_cost_usd), 0)::double precision,
+    COALESCE(SUM(r.original_cost_usd), 0)::double precision,
     COUNT(*) FILTER (WHERE r.data->>'routeKind' = 'external_pool')::bigint,
     COUNT(*) FILTER (
         WHERE r.data->>'routeKind' = 'external_pool'
@@ -5410,12 +5529,13 @@ GROUP BY date_trunc('hour', created_at), LEAST(GREATEST(duration_ms, 0), 2147483
 ON CONFLICT (bucket_start, duration_ms) DO NOTHING;
 
 INSERT INTO usage_credential_cost_summary (
-    credential_id, requests, estimated_cost_usd, kiro_metering_usage, priced_requests, unpriced_requests
+    credential_id, requests, estimated_cost_usd, original_cost_usd, kiro_metering_usage, priced_requests, unpriced_requests
 )
 SELECT
     credential_id,
     COUNT(*)::bigint,
     COALESCE(SUM(estimated_cost_usd), 0)::double precision,
+    COALESCE(SUM(original_cost_usd), 0)::double precision,
     COALESCE(SUM(kiro_metering_usage), 0)::double precision,
     COUNT(*) FILTER (WHERE pricing_available)::bigint,
     COUNT(*) FILTER (WHERE NOT pricing_available)::bigint
@@ -5532,6 +5652,7 @@ SELECT
     COALESCE(SUM(local_prompt_cache_read_input_tokens), 0)::bigint AS local_prompt_cache_read_input_tokens,
     COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
     COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+    COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
     COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
     COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
     COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
@@ -5561,7 +5682,7 @@ INSERT INTO usage_rollup_time_buckets (
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, external_pool_requests,
+    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests,
     external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -5578,7 +5699,7 @@ SELECT
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, external_pool_requests,
+    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests,
     external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -5695,6 +5816,7 @@ mod tests {
             cache_creation_5m_input_tokens: 5,
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
+            original_cost_usd: 0.001,
             kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
@@ -6014,6 +6136,7 @@ mod tests {
             cache_creation_5m_input_tokens: reported_usage.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens: reported_usage.cache_creation_1h_input_tokens,
             estimated_cost_usd: uplifted_cost_usd,
+            original_cost_usd: raw_cost_usd,
             kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
@@ -6127,6 +6250,11 @@ mod tests {
                     credit_remaining: 10_910.0,
                     credit_base: 1_000.0,
                     credit_bonus: 10_000.0,
+                    overage_status: Some("ENABLED".to_string()),
+                    overage_capability: Some("OVERAGE_CAPABLE".to_string()),
+                    overage_cap: 10.0,
+                    overage_rate: 0.04,
+                    current_overages: 0.0,
                     next_reset_at: Some(1_780_000_000.0),
                     checked_at: Utc::now().to_rfc3339(),
                 },
