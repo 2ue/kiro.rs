@@ -176,6 +176,7 @@ type ExternalPoolFormDraft = {
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
+  streamResponseMode: 'inherit' | NonNullable<CreateExternalPoolRequest['streamResponseMode']>
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
@@ -196,6 +197,7 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   enabled: false,
   priority: 100,
   maxConcurrentRequests: 10,
+  streamResponseMode: 'inherit',
   requestBodyMode: 'normalized',
   rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
@@ -216,6 +218,7 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   enabled: pool.enabled,
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
+  streamResponseMode: pool.streamResponseMode || 'inherit',
   requestBodyMode: pool.requestBodyMode || 'normalized',
   rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
@@ -329,6 +332,7 @@ export function ExternalPoolsPanel() {
         apiKey: createForm.apiKey.trim(),
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
+        streamResponseMode: createForm.streamResponseMode === 'inherit' ? null : createForm.streamResponseMode,
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
       })
@@ -364,6 +368,7 @@ export function ExternalPoolsPanel() {
         apiKey: editForm.apiKey?.trim() ? editForm.apiKey.trim() : undefined,
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
+        streamResponseMode: editForm.streamResponseMode === 'inherit' ? null : editForm.streamResponseMode,
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
       }
@@ -514,6 +519,9 @@ export function ExternalPoolsPanel() {
                   <NumberBox disabled={!waitModeActive} label="排队上限" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待秒数" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="最大重试次数" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
+                  <SelectBox disabled={!externalEnabled} label="流式 SSE 默认转发" value={configDraft.externalPoolStreamResponseMode} onChange={(externalPoolStreamResponseMode) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamResponseMode: externalPoolStreamResponseMode as ExternalPoolsConfig['externalPoolStreamResponseMode'] }))}>
+                    <option value="event_passthrough">事件级透传</option>
+                  </SelectBox>
                 </div>
               </FormSection>
 
@@ -620,7 +628,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -825,6 +833,16 @@ function ExternalPoolFormDialog({
                   <option value="current_path_policy">按当前路径整形：重写 usage 并应用全局补偿</option>
                 </SelectBox>
                 <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
+              </div>
+            </FormSection>
+
+            <FormSection title="流式 SSE 转发" description="只决定 stream=true 时 SSE 事件如何转发；usage 口径仍看上面的配置。">
+              <div className="space-y-3">
+                <SelectBox label="流式处理" value={draft.streamResponseMode} disabled={saving} onChange={(streamResponseMode) => onDraftChange((prev) => ({ ...prev, streamResponseMode: streamResponseMode as ExternalPoolFormDraft['streamResponseMode'] }))}>
+                  <option value="inherit">继承全局默认</option>
+                  <option value="event_passthrough">SSE 事件级透传</option>
+                </SelectBox>
+                <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
               </div>
             </FormSection>
           </div>
@@ -1366,6 +1384,13 @@ function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | 
   return '严格透传外部池返回的 usage，不应用缓存补偿和输出补偿。适合只把外部池当作直接上游。'
 }
 
+function streamResponseDescription(mode: ExternalPoolFormDraft['streamResponseMode']) {
+  if (mode === 'event_passthrough') {
+    return '仅控制 stream=true 的 SSE 事件转发方式。普通事件按上游事件级转发；usage 是否透传或按路径整理，由上面的 Usage 上报模式决定。'
+  }
+  return '当前外部池不单独覆盖流式 SSE 转发方式，使用外部池全局默认值；usage 口径仍由上面的 Usage 上报模式决定。'
+}
+
 function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
   if (pool.usageProjectionMode !== 'current_path_policy') {
     return 'Usage: 严格透传'
@@ -1378,6 +1403,12 @@ function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
     parts.push(`输出 >= ${config.externalPoolUsageProjectionOutputUpliftMinTokens} 后 +${config.externalPoolUsageProjectionOutputUpliftPercent}%`)
   }
   return parts.join(' · ')
+}
+
+function poolStreamSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
+  const mode = pool.streamResponseMode || config.externalPoolStreamResponseMode
+  const summary = mode === 'event_passthrough' ? '流式: 事件透传' : '流式: 默认'
+  return pool.streamResponseMode ? `${summary} · 单池覆盖` : summary
 }
 
 function authLabel(authType: ExternalPool['authType']) {

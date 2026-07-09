@@ -1037,6 +1037,7 @@ export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
+export type ExternalPoolStreamResponseMode = 'event_passthrough'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
 export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
@@ -1205,6 +1206,7 @@ export interface ExternalPoolsConfig {
   externalPoolGlobalMaxConcurrentRequests: number
   externalPoolMaxQueuedRequests: number
   externalPoolCapacityMode: 'fail_fast' | 'wait'
+  externalPoolStreamResponseMode: ExternalPoolStreamResponseMode
   externalPoolDispatchMaxWaitSecs: number
   externalPoolRetryMaxAttempts: number
   externalDirectPolicyEnabled: boolean
@@ -1258,6 +1260,7 @@ export interface ExternalPool {
   priority: number
   maxConcurrentRequests: number
   usageProjectionMode: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode
   requestBodyMode: ExternalPoolRequestBodyMode
   rawModelMode: ExternalPoolRawModelMode
   autoDisablePolicy: ExternalPoolAutoDisablePolicy
@@ -1303,6 +1306,7 @@ export interface CreateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
@@ -1324,6 +1328,7 @@ export interface UpdateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy

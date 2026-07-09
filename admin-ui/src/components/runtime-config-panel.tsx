@@ -220,6 +220,7 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolGlobalMaxConcurrentRequests: 0,
   externalPoolMaxQueuedRequests: 0,
   externalPoolCapacityMode: 'fail_fast' as const,
+  externalPoolStreamResponseMode: 'event_passthrough' as const,
   externalPoolDispatchMaxWaitSecs: 30,
   externalPoolRetryMaxAttempts: 0,
   externalDirectPolicyEnabled: false,
