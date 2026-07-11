@@ -49,6 +49,12 @@ pub(super) struct CredentialEntry {
     pub(super) failure_count: u32,
     /// Token 刷新连续失败次数
     pub(super) refresh_failure_count: u32,
+    /// Last authoritative PgSQL runtime-state revision applied by this process.
+    pub(super) runtime_revision: u64,
+    /// Reset generation used to fence runtime mutations created before an Admin reset/update.
+    pub(super) runtime_generation: u64,
+    /// A PgSQL mutation is waiting to be replayed. Quarantined credentials are not dispatched.
+    pub(super) runtime_persistence_degraded: bool,
     /// 是否已禁用
     pub(super) disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
@@ -95,6 +101,10 @@ pub(super) struct InFlightLease {
     pub(super) last_seen_at: Instant,
     pub(super) kind: InFlightKind,
     pub(super) weight_units: u32,
+    /// `true` when this process owns the guard that created the lease. Redis
+    /// snapshots also contain leases owned by other instances; those mirrors
+    /// must disappear locally as soon as Redis no longer reports them.
+    pub(super) locally_owned: bool,
 }
 
 /// 会话到凭据的粘性绑定。

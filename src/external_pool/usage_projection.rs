@@ -3,6 +3,7 @@ use super::*;
 #[derive(Debug, Default)]
 struct ExternalUsageProjectionState {
     committed_controlled_usage: Option<CacheUsage>,
+    observed_cache_read_evidence: bool,
 }
 
 #[derive(Clone)]
@@ -208,6 +209,12 @@ fn cache_amplification(
 }
 
 impl ExternalUsageProjectionContext {
+    pub(super) fn observe_cache_read_evidence(&self, observed: bool) -> bool {
+        let mut state = self.state.lock();
+        state.observed_cache_read_evidence |= observed;
+        state.observed_cache_read_evidence
+    }
+
     pub(super) fn mark_committed(&self, usage: CacheUsage) {
         let mut state = self.state.lock();
         state.committed_controlled_usage = Some(usage);

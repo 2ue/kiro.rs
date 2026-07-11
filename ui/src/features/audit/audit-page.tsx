@@ -228,10 +228,12 @@ export function AuditPage() {
       filtered = filtered.filter(
         (r) =>
           r.action.includes(lower) ||
-          actionLabel(r.action).includes(lower) ||
+          actionLabel(r.action).toLowerCase().includes(lower) ||
           r.actor.toLowerCase().includes(lower) ||
           r.objectType.includes(lower) ||
-          (r.objectId && String(r.objectId).includes(lower))
+          objectLabel(r.objectType).toLowerCase().includes(lower) ||
+          (r.objectId && String(r.objectId).includes(lower)) ||
+          (r.errorMessage && r.errorMessage.toLowerCase().includes(lower))
       )
     }
     if (successFilter !== '__all__') {
@@ -263,6 +265,10 @@ export function AuditPage() {
           <Toolbar>
             <ToolbarSearch value={q} onChange={(v) => { setQ(v); setPage(1) }} placeholder="搜索动作、执行者、对象..." />
             <ToolbarActions>
+              <Button variant="outline" size="sm" onClick={() => logs.refetch()} disabled={pending}>
+                <RefreshCw className={`h-3.5 w-3.5 ${pending ? 'animate-spin' : ''}`} />
+                刷新
+              </Button>
               <Button
                 variant="outline"
                 size="sm"

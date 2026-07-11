@@ -9,6 +9,7 @@ import {
   Clock3,
   Database,
   Download,
+  DollarSign,
   SlidersHorizontal,
   Info,
   RefreshCw,
@@ -26,6 +27,8 @@ import {
   useUsageRecordsPage,
   useUsageCleanupStatus,
   useRefreshUsageQueriesAfterCleanup,
+  useModelPricing,
+  useSyncModelPricing,
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
 import { getCredentialList, getExternalPools } from '@/api/credentials'
@@ -84,7 +87,7 @@ import { UsageCostInline, usageRecordCostModel } from './usage-billing'
 
 const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const PAGE_SIZE = 20
-const EXPORT_LIMIT = 1000
+const EXPORT_LIMIT = 10_000
 const ROUTE_OPTION_LIMIT = 50
 const REQUEST_ID_PATTERN = /req_[A-Za-z0-9_-]+/
 const SLOW_FIRST_TOKEN_MS = 10_000
@@ -1110,6 +1113,8 @@ export function UsagePage() {
   const autoRefresh = useAutoRefreshPreference(AUTO_REFRESH_KEY, 30)
   const summary = useUsageSummary(autoRefresh.refetchInterval)
   const cleanupStatus = useUsageCleanupStatus()
+  const modelPricing = useModelPricing(autoRefresh.refetchInterval)
+  const syncPricing = useSyncModelPricing()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
   const data = summary.data
@@ -1122,6 +1127,21 @@ export function UsagePage() {
     (data?.localPromptCacheReadInputTokens ?? 0) + (data?.localPromptCacheCreationInputTokens ?? 0),
     data?.localPromptCacheInputTokens ?? 0,
   )
+  const pricingStatus = modelPricing.data
+
+  const handleSyncPricing = () => {
+    syncPricing.mutate(undefined, {
+      onSuccess: (status) => {
+        if (status.lastError) {
+          toast.warning(`价格同步失败，继续使用${status.source === 'built-in' ? '内置价格' : '当前价格'}: ${status.lastError}`)
+          return
+        }
+        toast.success(`价格已同步：${formatNumber(status.modelCount)} 个模型`)
+        summary.refetch()
+      },
+      onError: (e) => toast.error(`同步失败: ${extractErrorMessage(e)}`),
+    })
+  }
 
   const headerActions = (
     <div className="flex flex-wrap items-center gap-2">
@@ -1145,6 +1165,17 @@ export function UsagePage() {
         />
         <span className="text-xs text-muted-foreground">秒</span>
       </div>
+      <div className="hidden items-center gap-1 rounded-lg border bg-card px-2 py-1 text-xs text-muted-foreground md:flex">
+        <DollarSign className="size-3.5" />
+        <span className="font-medium text-foreground">计价</span>
+        <span>{pricingStatus?.source || 'loading'}</span>
+        <span>· {formatNumber(pricingStatus?.modelCount ?? 0)} 模型</span>
+        {pricingStatus?.lastError && <span className="max-w-40 truncate text-destructive" title={pricingStatus.lastError}>· {pricingStatus.lastError}</span>}
+      </div>
+      <Button variant="outline" size="sm" onClick={handleSyncPricing} disabled={syncPricing.isPending}>
+        {syncPricing.isPending ? <Spinner size="sm" /> : <DollarSign className="h-3.5 w-3.5" />}
+        同步价格
+      </Button>
       {summary.isFetching && <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />}
       <Button variant="outline" size="sm" className="text-destructive hover:bg-destructive/10" onClick={() => setCleanupOpen(true)}>
         <Trash2 className="h-3.5 w-3.5" />清理记录

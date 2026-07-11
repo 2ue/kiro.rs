@@ -29,6 +29,7 @@ import type { ExternalPoolUsageSnapshot, UsageCleanupMode, UsageCleanupRequest, 
 const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
 const EXPORT_LIMIT = 10_000
+const SLOW_FIRST_TOKEN_MS = 10_000
 
 type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -205,6 +206,14 @@ function formatDate(value?: string): string {
     minute: '2-digit',
     second: '2-digit',
   })
+}
+
+function datetimeLocalToIso(value: string): string | undefined {
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const date = new Date(trimmed)
+  if (Number.isNaN(date.getTime())) return undefined
+  return date.toISOString()
 }
 
 function sourceLabel(source: UsageSource): string {
@@ -436,6 +445,9 @@ export function UsageRecordsPanel() {
   const [source, setSource] = useState<UsageSource | ''>('')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
+  const [minFirstTokenLatencyMs, setMinFirstTokenLatencyMs] = useState('')
+  const [since, setSince] = useState('')
+  const [until, setUntil] = useState('')
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [currentPage, setCurrentPage] = useState(1)
@@ -478,8 +490,16 @@ export function UsageRecordsPanel() {
     if (minCacheRead.trim() && Number.isFinite(parsedMinCacheRead)) {
       next.minCacheRead = parsedMinCacheRead
     }
+    const parsedMinFirstTokenLatency = Number(minFirstTokenLatencyMs)
+    if (minFirstTokenLatencyMs.trim() && Number.isFinite(parsedMinFirstTokenLatency)) {
+      next.minFirstTokenLatencyMs = Math.max(0, Math.floor(parsedMinFirstTokenLatency))
+    }
+    const sinceIso = datetimeLocalToIso(since)
+    if (sinceIso) next.since = sinceIso
+    const untilIso = datetimeLocalToIso(until)
+    if (untilIso) next.until = untilIso
     return next
-  }, [conversationId, currentPage, endpoint, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
+  }, [conversationId, currentPage, endpoint, minCacheRead, minFirstTokenLatencyMs, model, routeTarget, searchText, since, source, status, streamMode, until])
 
   const summary = useUsageSummary(autoRefresh.refetchInterval)
   const records = useUsageRecordsPage(query, autoRefresh.refetchInterval)
@@ -490,7 +510,7 @@ export function UsageRecordsPanel() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [conversationId, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
+  }, [conversationId, minCacheRead, minFirstTokenLatencyMs, model, routeTarget, searchText, since, source, status, streamMode, until])
 
   const credentialLabels = useMemo(() => {
     const labels = new Map<number, string>()
@@ -558,7 +578,10 @@ export function UsageRecordsPanel() {
     status ||
     source ||
     streamMode !== 'all' ||
-    minCacheRead.trim()
+    minCacheRead.trim() ||
+    minFirstTokenLatencyMs.trim() ||
+    since.trim() ||
+    until.trim()
   )
 
   const handleResetFilters = () => {
@@ -571,6 +594,9 @@ export function UsageRecordsPanel() {
     setSource('')
     setStreamMode('all')
     setMinCacheRead('')
+    setMinFirstTokenLatencyMs('')
+    setSince('')
+    setUntil('')
   }
 
   const summaryData = summary.data
@@ -780,6 +806,24 @@ export function UsageRecordsPanel() {
             placeholder="最小 cache read"
             inputMode="numeric"
           />
+          <Input
+            value={minFirstTokenLatencyMs}
+            onChange={(event) => setMinFirstTokenLatencyMs(event.target.value)}
+            placeholder="首字延迟 ≥ ms"
+            inputMode="numeric"
+          />
+          <Input
+            value={since}
+            onChange={(event) => setSince(event.target.value)}
+            type="datetime-local"
+            title="开始时间"
+          />
+          <Input
+            value={until}
+            onChange={(event) => setUntil(event.target.value)}
+            type="datetime-local"
+            title="结束时间"
+          />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
@@ -801,6 +845,13 @@ export function UsageRecordsPanel() {
             onChange={(event) => autoRefresh.setIntervalSeconds(Number(event.target.value))}
           />
           <span className="text-xs text-muted-foreground">秒</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setMinFirstTokenLatencyMs(String(SLOW_FIRST_TOKEN_MS))}
+          >
+            慢首字 &gt; 10s
+          </Button>
           <Button variant="outline" size="sm" onClick={handleResetFilters} disabled={!hasFilters}>
             <X className="h-4 w-4" />
             重置
@@ -1397,11 +1448,14 @@ function cleanupStatusLabel(status?: string): string {
 }
 
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES = 10000
+const USAGE_CLEANUP_MAX_OLDER_THAN_DAYS = 3650
+const USAGE_CLEANUP_MAX_BATCH_SIZE = 5000
+const USAGE_CLEANUP_MAX_PAUSE_MS = 10000
 
-function parseCleanupInteger(value: string, fallback: number, min: number): number {
+function parseCleanupInteger(value: string, fallback: number, min: number, max: number): number {
   const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.max(min, Math.floor(parsed))
+  const normalized = Number.isFinite(parsed) ? Math.floor(parsed) : fallback
+  return Math.max(min, Math.min(max, normalized))
 }
 
 function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
@@ -1416,9 +1470,9 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const clearRecords = useClearUsageRecords()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
-  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0)
-  const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1)
-  const parsedPauseMs = parseCleanupInteger(pauseMs, 100, 0)
+  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0, USAGE_CLEANUP_MAX_OLDER_THAN_DAYS)
+  const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1, USAGE_CLEANUP_MAX_BATCH_SIZE)
+  const parsedPauseMs = parseCleanupInteger(pauseMs, 100, 0, USAGE_CLEANUP_MAX_PAUSE_MS)
   const cleanupRangeText = (cutoffLabel: string) => (
     parsedOlderThanDays === 0
       ? `${cutoffLabel}早于任务启动时刻（清理当时之前全部匹配记录）`
@@ -1499,7 +1553,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
               onClick={clearAll}
               disabled={clearRecords.isPending || running}
             >
-              {clearRecords.isPending ? '清空中...' : '清空全部展示记录'}
+              {running ? '清理任务执行中' : clearRecords.isPending ? '清空中...' : '清空全部展示记录'}
             </Button>
           </div>
 
@@ -1517,16 +1571,18 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             </label>
             <div className="space-y-1">
               <span className="block text-xs text-muted-foreground">{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
-              <Input value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" />
-              <span className="block text-[0.68rem] text-muted-foreground">填 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录。</span>
+              <Input value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" min={0} max={USAGE_CLEANUP_MAX_OLDER_THAN_DAYS} type="number" />
+              <span className="block text-[0.68rem] text-muted-foreground">填 0 表示以任务启动时刻为 cutoff，最大 {formatNumber(USAGE_CLEANUP_MAX_OLDER_THAN_DAYS)} 天。</span>
             </div>
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">每批数量</span>
-              <Input value={batchSize} onChange={(event) => setBatchSize(event.target.value)} inputMode="numeric" />
+              <Input value={batchSize} onChange={(event) => setBatchSize(event.target.value)} inputMode="numeric" min={1} max={USAGE_CLEANUP_MAX_BATCH_SIZE} type="number" />
+              <span className="block text-[0.68rem] text-muted-foreground">后端安全上限 {formatNumber(USAGE_CLEANUP_MAX_BATCH_SIZE)}。</span>
             </label>
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">批次间隔毫秒</span>
-              <Input value={pauseMs} onChange={(event) => setPauseMs(event.target.value)} inputMode="numeric" />
+              <Input value={pauseMs} onChange={(event) => setPauseMs(event.target.value)} inputMode="numeric" min={0} max={USAGE_CLEANUP_MAX_PAUSE_MS} type="number" />
+              <span className="block text-[0.68rem] text-muted-foreground">后端安全上限 {formatNumber(USAGE_CLEANUP_MAX_PAUSE_MS)}ms。</span>
             </label>
           </div>
 

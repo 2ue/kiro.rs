@@ -285,7 +285,7 @@ export function ModelsPage() {
     <PageContainer>
       <PageHeader
         title="模型能力"
-        subtitle="查看同步来的模型列表、手动维护能力参数；模型价格与盈亏分析请见「成本」页"
+        subtitle="查看同步来的模型列表、手动维护能力参数；价格会用于用量页的成本估算和明细分析"
         actions={
           <div className="flex items-center gap-2">
             <Button
@@ -327,28 +327,36 @@ export function ModelsPage() {
       {/* 同步状态摘要 */}
       <div className="grid gap-3 sm:grid-cols-2">
         <SectionCard title="能力目录" description={`来源: ${capabilities.data?.source ?? '—'} · 最后同步: ${capLastSync}`}>
-          <div className="flex items-center gap-2">
-            <Badge tone={capabilities.data?.available ? 'success' : 'error'}>
-              {capabilities.data?.available ? '可用' : '不可用'}
-            </Badge>
-            <span className="text-sm text-muted-foreground">
-              共 {formatNumber(capabilities.data?.modelCount ?? 0)} 个模型
-            </span>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Badge tone={capabilities.data?.available ? 'success' : 'error'}>
+                {capabilities.data?.available ? '可用' : '不可用'}
+              </Badge>
+              <span className="text-sm text-muted-foreground">
+                共 {formatNumber(capabilities.data?.modelCount ?? 0)} 个模型
+              </span>
+            </div>
             {capabilities.data?.lastError && (
-              <span className="text-xs text-destructive truncate max-w-xs">{capabilities.data.lastError}</span>
+              <div className="whitespace-pre-wrap break-words rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+                {capabilities.data.lastError}
+              </div>
             )}
           </div>
         </SectionCard>
         <SectionCard title="价格目录" description={`来源: ${pricing.data?.source ?? '—'} · 最后同步: ${priceLastSync}`}>
-          <div className="flex items-center gap-2">
-            <Badge tone={pricing.data?.available ? 'success' : 'error'}>
-              {pricing.data?.available ? '可用' : '不可用'}
-            </Badge>
-            <span className="text-sm text-muted-foreground">
-              共 {formatNumber(pricing.data?.modelCount ?? 0)} 个模型
-            </span>
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Badge tone={pricing.data?.available ? 'success' : 'error'}>
+                {pricing.data?.available ? '可用' : '不可用'}
+              </Badge>
+              <span className="text-sm text-muted-foreground">
+                共 {formatNumber(pricing.data?.modelCount ?? 0)} 个模型
+              </span>
+            </div>
             {pricing.data?.lastError && (
-              <span className="text-xs text-destructive truncate max-w-xs">{pricing.data.lastError}</span>
+              <div className="whitespace-pre-wrap break-words rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+                {pricing.data.lastError}
+              </div>
             )}
           </div>
         </SectionCard>

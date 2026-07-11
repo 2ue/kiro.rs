@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc,
 };
-use parking_lot::Mutex;
+use futures::future::join_all;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
+use tokio::runtime::{Runtime, RuntimeFlavor};
+use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
 use crate::storage::postgres::PostgresUsageStore;
@@ -23,10 +26,12 @@ const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 const USAGE_WRITER_BATCH_MAX: usize = 64;
 const USAGE_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(25);
 const USAGE_WRITER_POSTGRES_TIMEOUT_SECS: u64 = 5;
+const USAGE_WRITER_ADMISSION_TIMEOUT: StdDuration = StdDuration::from_millis(100);
 const USAGE_REDIS_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_REDIS_WRITER_BATCH_MAX: usize = 64;
 const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(10);
 const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
+const USAGE_WRITER_ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_millis(100);
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
 const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
@@ -935,21 +940,192 @@ fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
     FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecorderStats {
+    pub accepting: bool,
     pub in_memory_limit: usize,
     pub in_memory_records: usize,
     pub redis_enabled: bool,
     pub redis_queue_enabled: bool,
     pub redis_queue_capacity: usize,
     pub redis_queue_available: usize,
+    pub redis_writer_accepted: u64,
+    pub redis_writer_finished: u64,
+    pub backpressured_redis_records: u64,
     pub dropped_redis_records: u64,
     pub postgres_enabled: bool,
     pub writer_queue_enabled: bool,
     pub writer_queue_capacity: usize,
     pub writer_queue_available: usize,
+    pub writer_accepted: u64,
+    pub writer_finished: u64,
+    pub backpressured_persist_records: u64,
     pub dropped_persist_records: u64,
+    pub rejected_after_shutdown: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageRecordOutcome {
+    Accepted,
+    RejectedShuttingDown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageWriterDrainStatus {
+    pub target: u64,
+    pub finished: u64,
+    pub drained: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageRecorderDrainReport {
+    pub postgres: UsageWriterDrainStatus,
+    pub redis: UsageWriterDrainStatus,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageRecorderShutdownReport {
+    pub already_started: bool,
+    pub drained: bool,
+    pub timed_out: bool,
+    pub postgres_abandoned: u64,
+    pub redis_abandoned: u64,
+    pub stats: UsageRecorderStats,
+}
+
+#[derive(Default)]
+struct UsageWriterProgress {
+    accepted: AtomicU64,
+    finished: AtomicU64,
+    changed: Notify,
+}
+
+impl UsageWriterProgress {
+    fn accepted(&self) -> u64 {
+        self.accepted.load(Ordering::Acquire)
+    }
+
+    fn finished(&self) -> u64 {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    fn mark_accepted(&self) {
+        self.accepted.fetch_add(1, Ordering::Release);
+    }
+
+    fn mark_finished(&self, count: usize) {
+        self.finished.fetch_add(count as u64, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_until(&self, target: u64) -> u64 {
+        loop {
+            let changed = self.changed.notified();
+            let finished = self.finished();
+            if finished >= target {
+                return finished;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct UsageWriterControl {
+    sender: Mutex<Option<mpsc::Sender<UsageRecord>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    progress: Arc<UsageWriterProgress>,
+}
+
+enum UsageWriterEnqueueError {
+    AdmissionTimedOut(UsageRecord),
+    Closed(UsageRecord),
+}
+
+enum UsageWriterAdmissionError {
+    TimedOut,
+    Closed,
+}
+
+impl UsageWriterControl {
+    fn new(
+        sender: mpsc::Sender<UsageRecord>,
+        task: JoinHandle<()>,
+        progress: Arc<UsageWriterProgress>,
+    ) -> Self {
+        Self {
+            sender: Mutex::new(Some(sender)),
+            task: Mutex::new(Some(task)),
+            progress,
+        }
+    }
+
+    fn enqueue(&self, record: UsageRecord) -> Result<bool, UsageWriterEnqueueError> {
+        let Some(sender) = self.sender.lock().as_ref().cloned() else {
+            return Err(UsageWriterEnqueueError::Closed(record));
+        };
+        match sender.try_send(record) {
+            Ok(()) => {
+                self.progress.mark_accepted();
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(record)) => {
+                Err(UsageWriterEnqueueError::Closed(record))
+            }
+            Err(mpsc::error::TrySendError::Full(record)) => {
+                let admission = block_on_usage_runtime(async move {
+                    match tokio::time::timeout(
+                        USAGE_WRITER_ADMISSION_TIMEOUT,
+                        sender.reserve_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => Ok(permit),
+                        Ok(Err(_)) => Err(UsageWriterAdmissionError::Closed),
+                        Err(_) => Err(UsageWriterAdmissionError::TimedOut),
+                    }
+                });
+                match admission {
+                    Ok(Ok(permit)) => {
+                        permit.send(record);
+                        self.progress.mark_accepted();
+                        Ok(true)
+                    }
+                    Ok(Err(UsageWriterAdmissionError::TimedOut)) => {
+                        Err(UsageWriterEnqueueError::AdmissionTimedOut(record))
+                    }
+                    Ok(Err(UsageWriterAdmissionError::Closed)) | Err(_) => {
+                        Err(UsageWriterEnqueueError::Closed(record))
+                    }
+                }
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.sender.lock().take();
+    }
+
+    fn take_task(&self) -> Option<JoinHandle<()>> {
+        self.task.lock().take()
+    }
+
+    fn queue_stats(&self) -> (bool, usize, usize) {
+        self.sender
+            .lock()
+            .as_ref()
+            .map(|sender| (true, sender.max_capacity(), sender.capacity()))
+            .unwrap_or((false, 0, 0))
+    }
+}
+
+#[derive(Default)]
+struct UsageShutdownState {
+    started: AtomicBool,
+    complete: AtomicBool,
+    timed_out: AtomicBool,
+    changed: Notify,
 }
 
 pub struct UsageRecorder {
@@ -957,8 +1133,14 @@ pub struct UsageRecorder {
     limit: usize,
     postgres_store: Option<Arc<PostgresUsageStore>>,
     redis_store: Option<Arc<RedisStore>>,
-    writer_tx: Option<mpsc::Sender<UsageRecord>>,
-    redis_writer_tx: Option<mpsc::Sender<UsageRecord>>,
+    writer: Option<Arc<UsageWriterControl>>,
+    redis_writer: Option<Arc<UsageWriterControl>>,
+    lifecycle: Arc<RwLock<()>>,
+    accepting: Arc<AtomicBool>,
+    shutdown: Arc<UsageShutdownState>,
+    rejected_after_shutdown: AtomicU64,
+    backpressured_persist_records: AtomicU64,
+    backpressured_redis_records: AtomicU64,
     dropped_persist_records: Arc<AtomicU64>,
     dropped_redis_records: Arc<AtomicU64>,
 }
@@ -1200,8 +1382,14 @@ impl UsageRecorder {
             limit,
             postgres_store: None,
             redis_store: None,
-            writer_tx: None,
-            redis_writer_tx: None,
+            writer: None,
+            redis_writer: None,
+            lifecycle: Arc::new(RwLock::new(())),
+            accepting: Arc::new(AtomicBool::new(true)),
+            shutdown: Arc::new(UsageShutdownState::default()),
+            rejected_after_shutdown: AtomicU64::new(0),
+            backpressured_persist_records: AtomicU64::new(0),
+            backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
             dropped_redis_records: Arc::new(AtomicU64::new(0)),
         }
@@ -1215,29 +1403,33 @@ impl UsageRecorder {
         let runtime_available = tokio::runtime::Handle::try_current().is_ok();
         let dropped_persist_records = Arc::new(AtomicU64::new(0));
         let dropped_redis_records = Arc::new(AtomicU64::new(0));
-        let writer_tx = if runtime_available {
+        let writer = if runtime_available {
             let (tx, rx) = mpsc::channel(USAGE_WRITER_QUEUE_CAPACITY);
-            tokio::spawn(usage_writer_loop(
+            let progress = Arc::new(UsageWriterProgress::default());
+            let task = tokio::spawn(usage_writer_loop(
                 postgres_store.clone(),
                 rx,
                 dropped_persist_records.clone(),
+                progress.clone(),
             ));
-            Some(tx)
+            Some(Arc::new(UsageWriterControl::new(tx, task, progress)))
         } else {
             tracing::warn!(
                 "创建 UsageRecorder 时没有运行中的 Tokio runtime，将同步写入 PgSQL usage"
             );
             None
         };
-        let redis_writer_tx = redis_store.as_ref().and_then(|redis| {
+        let redis_writer = redis_store.as_ref().and_then(|redis| {
             if runtime_available {
                 let (tx, rx) = mpsc::channel(USAGE_REDIS_WRITER_QUEUE_CAPACITY);
-                tokio::spawn(usage_redis_writer_loop(
+                let progress = Arc::new(UsageWriterProgress::default());
+                let task = tokio::spawn(usage_redis_writer_loop(
                     redis.clone(),
                     rx,
                     dropped_redis_records.clone(),
+                    progress.clone(),
                 ));
-                Some(tx)
+                Some(Arc::new(UsageWriterControl::new(tx, task, progress)))
             } else {
                 tracing::warn!(
                     "创建 UsageRecorder 时没有运行中的 Tokio runtime，将同步写入 Redis usage summary"
@@ -1250,15 +1442,32 @@ impl UsageRecorder {
             limit: limit.max(1),
             postgres_store: Some(postgres_store),
             redis_store,
-            writer_tx,
-            redis_writer_tx,
+            writer,
+            redis_writer,
+            lifecycle: Arc::new(RwLock::new(())),
+            accepting: Arc::new(AtomicBool::new(true)),
+            shutdown: Arc::new(UsageShutdownState::default()),
+            rejected_after_shutdown: AtomicU64::new(0),
+            backpressured_persist_records: AtomicU64::new(0),
+            backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records,
             dropped_redis_records,
         }
     }
 
-    pub fn record(&self, record: UsageRecord) {
+    pub fn record(&self, record: UsageRecord) -> UsageRecordOutcome {
+        let _lifecycle = self.lifecycle.read();
+        if !self.accepting.load(Ordering::Acquire) {
+            let rejected = self.rejected_after_shutdown.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_log_usage_counter(rejected) {
+                tracing::warn!(rejected, "UsageRecorder 已停止接收，拒绝新的 usage record");
+            }
+            return UsageRecordOutcome::RejectedShuttingDown;
+        }
         let record = normalize_error_diagnostics(record);
+
+        self.record_usage_postgres(record.clone());
+
         {
             let mut records = self.records.lock();
             if let Some(index) = records.iter().position(|existing| existing.id == record.id) {
@@ -1270,21 +1479,33 @@ impl UsageRecorder {
             }
         }
 
-        self.record_usage_redis(record.clone());
+        self.record_usage_redis(record);
+        UsageRecordOutcome::Accepted
+    }
 
-        if let Some(tx) = &self.writer_tx {
-            match tx.try_send(record.clone()) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::warn!(dropped, "PgSQL usage 写入队列已满，本条 usage 持久化被丢弃");
+    fn record_usage_postgres(&self, record: UsageRecord) {
+        if let Some(writer) = &self.writer {
+            match writer.enqueue(record) {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.backpressured_persist_records
+                        .fetch_add(1, Ordering::Relaxed);
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+                Err(UsageWriterEnqueueError::AdmissionTimedOut(record)) => {
+                    let count = self
+                        .backpressured_persist_records
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
                     tracing::warn!(
-                        dropped,
-                        "PgSQL usage 写入队列已关闭，本条 usage 持久化被丢弃"
+                        count,
+                        timeout_ms = USAGE_WRITER_ADMISSION_TIMEOUT.as_millis() as u64,
+                        "PgSQL usage 队列容量等待超时，降级为有界直接持久化"
                     );
+                    self.persist_usage_sync(record);
+                }
+                Err(UsageWriterEnqueueError::Closed(record)) => {
+                    tracing::warn!("PgSQL usage writer 意外关闭，降级为直接持久化");
+                    self.persist_usage_sync(record);
                 }
             }
         } else {
@@ -1296,71 +1517,216 @@ impl UsageRecorder {
         let Some(redis) = &self.redis_store else {
             return;
         };
-        if let Some(tx) = &self.redis_writer_tx {
-            match tx.try_send(record) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::warn!(
-                        dropped,
-                        "Redis usage 写入队列已满，本条 usage summary 被丢弃"
-                    );
+        if let Some(writer) = &self.redis_writer {
+            match writer.enqueue(record) {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.backpressured_redis_records
+                        .fetch_add(1, Ordering::Relaxed);
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+                Err(UsageWriterEnqueueError::AdmissionTimedOut(record)) => {
+                    let count = self
+                        .backpressured_redis_records
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
                     tracing::warn!(
-                        dropped,
-                        "Redis usage 写入队列已关闭，本条 usage summary 被丢弃"
+                        count,
+                        timeout_ms = USAGE_WRITER_ADMISSION_TIMEOUT.as_millis() as u64,
+                        "Redis usage 队列容量等待超时，降级为有界直接持久化"
                     );
+                    self.persist_usage_redis_sync(redis.clone(), record);
+                }
+                Err(UsageWriterEnqueueError::Closed(record)) => {
+                    tracing::warn!("Redis usage writer 意外关闭，降级为直接持久化");
+                    self.persist_usage_redis_sync(redis.clone(), record);
                 }
             }
             return;
         }
 
-        let redis = redis.clone();
-        if let Err(err) =
-            block_on_usage_store(async move { redis.record_usage_summary(&record).await })
-        {
-            tracing::warn!("写入 Redis usage summary 失败: {}", err);
-        }
+        self.persist_usage_redis_sync(redis.clone(), record);
     }
 
     pub fn writer_stats(&self) -> UsageRecorderStats {
         let in_memory_records = self.records.lock().len();
-        let (writer_queue_enabled, writer_queue_capacity, writer_queue_available) =
-            if let Some(tx) = &self.writer_tx {
-                (true, tx.max_capacity(), tx.capacity())
-            } else {
-                (false, 0, 0)
-            };
-        let (redis_queue_enabled, redis_queue_capacity, redis_queue_available) =
-            if let Some(tx) = &self.redis_writer_tx {
-                (true, tx.max_capacity(), tx.capacity())
-            } else {
-                (false, 0, 0)
-            };
+        let (writer_queue_enabled, writer_queue_capacity, writer_queue_available) = self
+            .writer
+            .as_ref()
+            .map(|writer| writer.queue_stats())
+            .unwrap_or((false, 0, 0));
+        let (redis_queue_enabled, redis_queue_capacity, redis_queue_available) = self
+            .redis_writer
+            .as_ref()
+            .map(|writer| writer.queue_stats())
+            .unwrap_or((false, 0, 0));
         UsageRecorderStats {
+            accepting: self.accepting.load(Ordering::Acquire),
             in_memory_limit: self.limit,
             in_memory_records,
             redis_enabled: self.redis_store.is_some(),
             redis_queue_enabled,
             redis_queue_capacity,
             redis_queue_available,
+            redis_writer_accepted: self
+                .redis_writer
+                .as_ref()
+                .map(|writer| writer.progress.accepted())
+                .unwrap_or(0),
+            redis_writer_finished: self
+                .redis_writer
+                .as_ref()
+                .map(|writer| writer.progress.finished())
+                .unwrap_or(0),
+            backpressured_redis_records: self.backpressured_redis_records.load(Ordering::Relaxed),
             dropped_redis_records: self.dropped_redis_records.load(Ordering::Relaxed),
             postgres_enabled: self.postgres_store.is_some(),
             writer_queue_enabled,
             writer_queue_capacity,
             writer_queue_available,
+            writer_accepted: self
+                .writer
+                .as_ref()
+                .map(|writer| writer.progress.accepted())
+                .unwrap_or(0),
+            writer_finished: self
+                .writer
+                .as_ref()
+                .map(|writer| writer.progress.finished())
+                .unwrap_or(0),
+            backpressured_persist_records: self
+                .backpressured_persist_records
+                .load(Ordering::Relaxed),
             dropped_persist_records: self.dropped_persist_records.load(Ordering::Relaxed),
+            rejected_after_shutdown: self.rejected_after_shutdown.load(Ordering::Relaxed),
         }
     }
 
     fn persist_usage_sync(&self, record: UsageRecord) {
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
-            if let Err(err) = block_on_usage_store(async move { store.record(record).await }) {
+            if let Err(err) = block_on_usage_store(async move {
+                tokio::time::timeout(
+                    StdDuration::from_secs(USAGE_WRITER_POSTGRES_TIMEOUT_SECS),
+                    store.record(record),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "PgSQL usage 直接持久化超时（{}s）",
+                        USAGE_WRITER_POSTGRES_TIMEOUT_SECS
+                    )
+                })?
+            }) {
+                self.dropped_persist_records.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("写入 PgSQL usage record 失败: {}", err);
             }
+        }
+    }
+
+    fn persist_usage_redis_sync(&self, redis: Arc<RedisStore>, record: UsageRecord) {
+        if let Err(err) = block_on_usage_store(async move {
+            tokio::time::timeout(
+                StdDuration::from_secs(USAGE_REDIS_WRITER_TIMEOUT_SECS),
+                redis.record_usage_summary(&record),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Redis usage 直接持久化超时（{}s）",
+                    USAGE_REDIS_WRITER_TIMEOUT_SECS
+                )
+            })?
+        }) {
+            self.dropped_redis_records.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("写入 Redis usage summary 失败: {}", err);
+        }
+    }
+
+    pub async fn drain(&self, timeout: StdDuration) -> UsageRecorderDrainReport {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (postgres, postgres_timed_out) =
+            drain_usage_writer(self.writer.as_deref(), deadline).await;
+        let (redis, redis_timed_out) =
+            drain_usage_writer(self.redis_writer.as_deref(), deadline).await;
+        UsageRecorderDrainReport {
+            postgres,
+            redis,
+            timed_out: postgres_timed_out || redis_timed_out,
+        }
+    }
+
+    pub async fn shutdown(&self, timeout: StdDuration) -> UsageRecorderShutdownReport {
+        let already_started = self
+            .shutdown
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err();
+        if !already_started {
+            {
+                let _lifecycle = self.lifecycle.write();
+                self.accepting.store(false, Ordering::Release);
+                if let Some(writer) = &self.writer {
+                    writer.close();
+                }
+                if let Some(writer) = &self.redis_writer {
+                    writer.close();
+                }
+            }
+
+            let writer = self.writer.clone();
+            let redis_writer = self.redis_writer.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + timeout;
+                let postgres_timed_out =
+                    wait_usage_writer_task("PgSQL", writer.as_deref(), deadline).await;
+                let redis_timed_out =
+                    wait_usage_writer_task("Redis", redis_writer.as_deref(), deadline).await;
+                shutdown
+                    .timed_out
+                    .store(postgres_timed_out || redis_timed_out, Ordering::Release);
+                shutdown.complete.store(true, Ordering::Release);
+                shutdown.changed.notify_waiters();
+            });
+        }
+
+        let wait_timed_out = tokio::time::timeout(timeout, self.wait_for_shutdown())
+            .await
+            .is_err();
+        self.shutdown_report(already_started, wait_timed_out)
+    }
+
+    async fn wait_for_shutdown(&self) {
+        loop {
+            let changed = self.shutdown.changed.notified();
+            if self.shutdown.complete.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn shutdown_report(
+        &self,
+        already_started: bool,
+        wait_timed_out: bool,
+    ) -> UsageRecorderShutdownReport {
+        let stats = self.writer_stats();
+        let postgres_abandoned = stats.writer_accepted.saturating_sub(stats.writer_finished);
+        let redis_abandoned = stats
+            .redis_writer_accepted
+            .saturating_sub(stats.redis_writer_finished);
+        let timed_out = wait_timed_out || self.shutdown.timed_out.load(Ordering::Acquire);
+        UsageRecorderShutdownReport {
+            already_started,
+            drained: self.shutdown.complete.load(Ordering::Acquire)
+                && !timed_out
+                && postgres_abandoned == 0
+                && redis_abandoned == 0,
+            timed_out,
+            postgres_abandoned,
+            redis_abandoned,
+            stats,
         }
     }
 
@@ -2017,10 +2383,102 @@ impl UsageRecorder {
     }
 }
 
+async fn drain_usage_writer(
+    writer: Option<&UsageWriterControl>,
+    deadline: tokio::time::Instant,
+) -> (UsageWriterDrainStatus, bool) {
+    let Some(writer) = writer else {
+        return (UsageWriterDrainStatus::default(), false);
+    };
+    let target = writer.progress.accepted();
+    let finished = writer.progress.finished();
+    if finished >= target {
+        return (
+            UsageWriterDrainStatus {
+                target,
+                finished,
+                drained: true,
+            },
+            false,
+        );
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return (
+            UsageWriterDrainStatus {
+                target,
+                finished,
+                drained: false,
+            },
+            true,
+        );
+    }
+    match tokio::time::timeout(remaining, writer.progress.wait_until(target)).await {
+        Ok(finished) => (
+            UsageWriterDrainStatus {
+                target,
+                finished,
+                drained: true,
+            },
+            false,
+        ),
+        Err(_) => (
+            UsageWriterDrainStatus {
+                target,
+                finished: writer.progress.finished(),
+                drained: false,
+            },
+            true,
+        ),
+    }
+}
+
+async fn wait_usage_writer_task(
+    writer_name: &'static str,
+    writer: Option<&UsageWriterControl>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let Some(writer) = writer else {
+        return false;
+    };
+    let Some(mut task) = writer.take_task() else {
+        return false;
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !remaining.is_zero() {
+        match tokio::time::timeout(remaining, &mut task).await {
+            Ok(Ok(())) => return false,
+            Ok(Err(err)) => {
+                tracing::warn!(writer_name, "usage writer 异常退出: {}", err);
+                return false;
+            }
+            Err(_) => {}
+        }
+    }
+    task.abort();
+    if tokio::time::timeout(USAGE_WRITER_ABORT_JOIN_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            writer_name,
+            timeout_ms = USAGE_WRITER_ABORT_JOIN_TIMEOUT.as_millis() as u64,
+            "等待已取消的 usage writer 退出再次超时"
+        );
+    }
+    tracing::warn!(writer_name, "等待 usage writer 排空超时，已停止 writer");
+    true
+}
+
+fn should_log_usage_counter(value: u64) -> bool {
+    value == 1 || value.is_power_of_two()
+}
+
 async fn usage_writer_loop(
     store: Arc<PostgresUsageStore>,
     mut rx: mpsc::Receiver<UsageRecord>,
     dropped_records: Arc<AtomicU64>,
+    progress: Arc<UsageWriterProgress>,
 ) {
     while let Some(first) = rx.recv().await {
         let mut records = Vec::with_capacity(USAGE_WRITER_BATCH_MAX);
@@ -2035,7 +2493,9 @@ async fn usage_writer_loop(
                 Ok(None) | Err(_) => {}
             }
         }
+        let record_count = records.len();
         persist_usage_batch_with_retry(&store, records, &dropped_records).await;
+        progress.mark_finished(record_count);
     }
 }
 
@@ -2127,6 +2587,7 @@ async fn usage_redis_writer_loop(
     redis: Arc<RedisStore>,
     mut rx: mpsc::Receiver<UsageRecord>,
     dropped_records: Arc<AtomicU64>,
+    progress: Arc<UsageWriterProgress>,
 ) {
     while let Some(first) = rx.recv().await {
         let mut records = Vec::with_capacity(USAGE_REDIS_WRITER_BATCH_MAX);
@@ -2141,7 +2602,9 @@ async fn usage_redis_writer_loop(
                 Ok(None) | Err(_) => {}
             }
         }
+        let record_count = records.len();
         persist_usage_redis_batch_with_timeout(&redis, records, &dropped_records).await;
+        progress.mark_finished(record_count);
     }
 }
 
@@ -2170,27 +2633,18 @@ async fn persist_usage_redis_batch_with_timeout(
         .unwrap_or_default()
         .to_string();
     let started_at = Instant::now();
+    let results = run_bounded_usage_batch(
+        records,
+        StdDuration::from_secs(USAGE_REDIS_WRITER_TIMEOUT_SECS),
+        |record| async move { redis.record_usage_summary(&record).await },
+    )
+    .await;
     let mut failed = 0u64;
     let mut last_error: Option<String> = None;
-    for record in records {
-        match tokio::time::timeout(
-            StdDuration::from_secs(USAGE_REDIS_WRITER_TIMEOUT_SECS),
-            redis.record_usage_summary(&record),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                failed += 1;
-                last_error = Some(err.to_string());
-            }
-            Err(_) => {
-                failed += 1;
-                last_error = Some(format!(
-                    "timeout after {}s",
-                    USAGE_REDIS_WRITER_TIMEOUT_SECS
-                ));
-            }
+    for result in results {
+        if let Err(err) = result {
+            failed += 1;
+            last_error = Some(err.to_string());
         }
     }
     if failed > 0 {
@@ -2218,18 +2672,36 @@ async fn persist_usage_redis_batch_with_timeout(
     }
 }
 
-fn block_on_usage_store<T>(
-    future: impl std::future::Future<Output = anyhow::Result<T>>,
+async fn run_bounded_usage_batch<T, F, Fut>(
+    items: Vec<T>,
+    operation_timeout: StdDuration,
+    write: F,
+) -> Vec<anyhow::Result<()>>
+where
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    join_all(items.into_iter().map(|item| {
+        let write = write(item);
+        async move {
+            tokio::time::timeout(operation_timeout, write)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "usage batch operation timed out after {}ms",
+                        operation_timeout.as_millis()
+                    )
+                })?
+        }
+    }))
+    .await
+}
+
+fn block_on_usage_store<T: Send>(
+    future: impl std::future::Future<Output = anyhow::Result<T>> + Send,
 ) -> anyhow::Result<T> {
     let started_at = Instant::now();
-    let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(future))
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(future)
-    };
+    let result = block_on_usage_runtime(future)?;
     let elapsed = started_at.elapsed();
     if elapsed >= StdDuration::from_millis(100) {
         tracing::warn!(
@@ -2238,6 +2710,41 @@ fn block_on_usage_store<T>(
         );
     }
     result
+}
+
+fn block_on_usage_runtime<T: Send>(
+    future: impl std::future::Future<Output = T> + Send,
+) -> anyhow::Result<T> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            RuntimeFlavor::MultiThread => {
+                Ok(tokio::task::block_in_place(|| handle.block_on(future)))
+            }
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(move || usage_fallback_runtime().block_on(future))
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("usage 存储线程异常退出"))
+            }),
+        }
+    } else {
+        Ok(tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(future))
+    }
+}
+
+fn usage_fallback_runtime() -> &'static Runtime {
+    static FALLBACK_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    FALLBACK_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("kiro-usage-store")
+            .enable_all()
+            .build()
+            .expect("创建 usage 存储 runtime 失败")
+    })
 }
 
 fn normalize_limit(limit: usize) -> usize {
@@ -2440,6 +2947,7 @@ fn top_aggregates(map: HashMap<String, UsageAggregate>) -> Vec<UsageAggregate> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::sync::{Notify, Semaphore};
 
     fn record_with_time(
         id: &str,
@@ -2514,6 +3022,232 @@ mod tests {
 
     fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
         record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
+    }
+
+    fn recorder_with_test_writer(
+        capacity: usize,
+        pause_first: bool,
+    ) -> (
+        Arc<UsageRecorder>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Notify>,
+        Arc<Semaphore>,
+    ) {
+        let progress = Arc::new(UsageWriterProgress::default());
+        let worker_progress = progress.clone();
+        let persisted = Arc::new(Mutex::new(Vec::new()));
+        let worker_persisted = persisted.clone();
+        let started = Arc::new(Notify::new());
+        let worker_started = started.clone();
+        let gate = Arc::new(Semaphore::new(0));
+        let worker_gate = gate.clone();
+        let (sender, mut receiver) = mpsc::channel::<UsageRecord>(capacity.max(1));
+        let task = tokio::spawn(async move {
+            let mut first = true;
+            while let Some(record) = receiver.recv().await {
+                if first && pause_first {
+                    worker_started.notify_one();
+                    let _permit = worker_gate.acquire().await.expect("test gate open");
+                }
+                first = false;
+                worker_persisted.lock().push(record.id);
+                worker_progress.mark_finished(1);
+            }
+        });
+        let recorder = Arc::new(UsageRecorder {
+            records: Mutex::new(VecDeque::with_capacity(16)),
+            limit: 16,
+            postgres_store: None,
+            redis_store: None,
+            writer: Some(Arc::new(UsageWriterControl::new(sender, task, progress))),
+            redis_writer: None,
+            lifecycle: Arc::new(RwLock::new(())),
+            accepting: Arc::new(AtomicBool::new(true)),
+            shutdown: Arc::new(UsageShutdownState::default()),
+            rejected_after_shutdown: AtomicU64::new(0),
+            backpressured_persist_records: AtomicU64::new(0),
+            backpressured_redis_records: AtomicU64::new(0),
+            dropped_persist_records: Arc::new(AtomicU64::new(0)),
+            dropped_redis_records: Arc::new(AtomicU64::new(0)),
+        });
+        (recorder, persisted, started, gate)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_store_bridge_works_inside_current_thread_runtime() {
+        let value = block_on_usage_store(async {
+            tokio::time::sleep(StdDuration::from_millis(1)).await;
+            Ok::<_, anyhow::Error>(42)
+        })
+        .unwrap();
+
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_applies_bounded_backpressure_and_shutdown_drains() {
+        let (recorder, persisted, started, gate) = recorder_with_test_writer(1, true);
+        assert_eq!(
+            recorder.record(record("queued-1", 0, UsageSource::None)),
+            UsageRecordOutcome::Accepted
+        );
+        started.notified().await;
+        assert_eq!(
+            recorder.record(record("queued-2", 0, UsageSource::None)),
+            UsageRecordOutcome::Accepted
+        );
+
+        let third_recorder = recorder.clone();
+        let third =
+            tokio::spawn(
+                async move { third_recorder.record(record("queued-3", 0, UsageSource::None)) },
+            );
+        tokio::time::sleep(StdDuration::from_millis(25)).await;
+        assert!(
+            !third.is_finished(),
+            "third record should wait for queue capacity"
+        );
+
+        gate.add_permits(1);
+        assert_eq!(third.await.unwrap(), UsageRecordOutcome::Accepted);
+        let report = recorder.shutdown(StdDuration::from_secs(1)).await;
+        assert!(report.drained);
+        assert!(!report.timed_out);
+        assert_eq!(report.stats.writer_accepted, 3);
+        assert_eq!(report.stats.writer_finished, 3);
+        assert_eq!(report.stats.backpressured_persist_records, 1);
+        assert_eq!(report.stats.dropped_persist_records, 0);
+        assert_eq!(
+            persisted.lock().as_slice(),
+            &["queued-1", "queued-2", "queued-3"]
+        );
+
+        assert_eq!(
+            recorder.record(record("late", 0, UsageSource::None)),
+            UsageRecordOutcome::RejectedShuttingDown
+        );
+        assert_eq!(recorder.writer_stats().rejected_after_shutdown, 1);
+        assert!(
+            recorder
+                .query(UsageRecordQuery::default())
+                .records
+                .iter()
+                .all(|record| record.id != "late")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_reports_timeout_without_closing_then_shutdown_finishes() {
+        let (recorder, persisted, started, gate) = recorder_with_test_writer(1, true);
+        recorder.record(record("slow", 0, UsageSource::None));
+        started.notified().await;
+
+        let drain = recorder.drain(StdDuration::from_millis(20)).await;
+        assert!(drain.timed_out);
+        assert!(!drain.postgres.drained);
+        assert_eq!(drain.postgres.target, 1);
+        assert!(recorder.writer_stats().accepting);
+
+        gate.add_permits(1);
+        let shutdown = recorder.shutdown(StdDuration::from_secs(1)).await;
+        assert!(shutdown.drained);
+        assert_eq!(persisted.lock().as_slice(), &["slow"]);
+
+        let repeated = recorder.shutdown(StdDuration::from_secs(1)).await;
+        assert!(repeated.already_started);
+        assert!(repeated.drained);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_writer_admission_and_fallback_are_bounded() {
+        let (recorder, persisted, started, gate) = recorder_with_test_writer(1, true);
+        recorder.record(record("busy", 0, UsageSource::None));
+        started.notified().await;
+        recorder.record(record("queued", 0, UsageSource::None));
+
+        let started_at = Instant::now();
+        assert_eq!(
+            recorder.record(record("fallback", 0, UsageSource::None)),
+            UsageRecordOutcome::Accepted
+        );
+        let elapsed = started_at.elapsed();
+        assert!(elapsed >= StdDuration::from_millis(80));
+        assert!(elapsed < StdDuration::from_millis(500));
+        assert_eq!(recorder.writer_stats().writer_accepted, 2);
+        assert_eq!(recorder.writer_stats().backpressured_persist_records, 1);
+
+        gate.add_permits(1);
+        assert!(recorder.shutdown(StdDuration::from_secs(1)).await.drained);
+        assert_eq!(persisted.lock().as_slice(), &["busy", "queued"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_shutdown_owner_does_not_strand_usage_recorder() {
+        let (recorder, persisted, started, gate) = recorder_with_test_writer(1, true);
+        recorder.record(record("slow", 0, UsageSource::None));
+        started.notified().await;
+
+        let shutdown_recorder = recorder.clone();
+        let owner =
+            tokio::spawn(
+                async move { shutdown_recorder.shutdown(StdDuration::from_secs(1)).await },
+            );
+        tokio::time::timeout(StdDuration::from_millis(200), async {
+            while recorder.writer_stats().accepting {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown should close admission promptly");
+        owner.abort();
+        let _ = owner.await;
+
+        gate.add_permits(1);
+        let report = recorder.shutdown(StdDuration::from_secs(1)).await;
+        assert!(report.already_started);
+        assert!(report.drained);
+        assert!(!report.timed_out);
+        assert_eq!(persisted.lock().as_slice(), &["slow"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_timeout_aborts_writer_and_publishes_final_report() {
+        let (recorder, persisted, started, _gate) = recorder_with_test_writer(1, true);
+        recorder.record(record("stuck", 0, UsageSource::None));
+        started.notified().await;
+
+        let first = recorder.shutdown(StdDuration::from_millis(20)).await;
+        assert!(first.timed_out);
+        let repeated = recorder.shutdown(StdDuration::from_secs(1)).await;
+        assert!(repeated.already_started);
+        assert!(repeated.timed_out);
+        assert!(!repeated.drained);
+        assert_eq!(repeated.postgres_abandoned, 1);
+        assert!(persisted.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_usage_batch_runs_operations_concurrently() {
+        let started_at = Instant::now();
+        let results = run_bounded_usage_batch(
+            (0..8).collect::<Vec<_>>(),
+            StdDuration::from_millis(500),
+            |_| async {
+                tokio::time::sleep(StdDuration::from_millis(40)).await;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        assert!(started_at.elapsed() < StdDuration::from_millis(200));
+
+        let started_at = Instant::now();
+        let results = run_bounded_usage_batch(vec![1, 2, 3], StdDuration::from_millis(20), |_| {
+            std::future::pending::<anyhow::Result<()>>()
+        })
+        .await;
+        assert!(results.iter().all(Result::is_err));
+        assert!(started_at.elapsed() < StdDuration::from_millis(200));
     }
 
     #[test]

@@ -27,6 +27,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  getCredentialCreditSummary,
   testCredential,
   addCredential,
   deleteCredential,
@@ -63,6 +64,7 @@ function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClien
   queryClient.invalidateQueries({ queryKey: ['credentials-runtime'] })
   queryClient.invalidateQueries({ queryKey: ['credentials-account-info'] })
   queryClient.invalidateQueries({ queryKey: ['credentials-usage-summary'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
   if (typeof id === 'number') {
     queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
   } else {
@@ -129,6 +131,14 @@ export function useCredentialsUsageSummary(ids: number[]) {
     enabled: ids.length > 0,
     refetchInterval: 30000,
     placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useCredentialCreditSummary() {
+  return useQuery({
+    queryKey: ['credential-credit-summary'],
+    queryFn: getCredentialCreditSummary,
+    refetchInterval: 60000,
   })
 }
 

@@ -68,6 +68,14 @@ export interface CredentialsPageQuery {
   page: number
   limit: number
   q?: string
+  credentialId?: number
+  account?: string
+  region?: string
+  model?: string
+  endpoint?: string
+  priority?: number
+  rpm?: number
+  concurrency?: number
   status?: string
   authMethod?: string
   subscription?: string
@@ -85,6 +93,7 @@ export type CredentialListItem = Pick<
   | 'disabled'
   | 'disabledReason'
   | 'authMethod'
+  | 'provider'
   | 'region'
   | 'authRegion'
   | 'apiRegion'
@@ -208,6 +217,7 @@ export interface CredentialStatusItem {
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
+  provider?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -390,6 +400,16 @@ export interface CredentialValidationItem {
   subscriptionKey: string
   subscriptionTitle: string
   error?: string | null
+  subscriptionChecked?: boolean
+  usageChecked?: boolean
+  livenessChecked?: boolean
+  subscriptionOk?: boolean | null
+  usageOk?: boolean | null
+  livenessOk?: boolean | null
+  usageError?: string | null
+  livenessError?: string | null
+  livenessModel?: string | null
+  livenessResponse?: string | null
   matchedExistingCredentialId?: number | null
   existingDisabled?: boolean | null
 }
@@ -1026,6 +1046,9 @@ export interface UsageRecordsQuery {
   source?: UsageSource
   stream?: boolean
   minCacheRead?: number
+  minFirstTokenLatencyMs?: number
+  since?: string
+  until?: string
 }
 
 export interface UsageRecordsPageQuery extends UsageRecordsQuery {

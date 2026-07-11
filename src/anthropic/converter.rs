@@ -2907,23 +2907,27 @@ mod tests {
     }
 
     #[test]
-    fn test_process_message_content_preserves_non_text_tool_result_items() {
+    fn test_process_message_content_extracts_images_from_tool_results() {
         let content = serde_json::json!([
             {
                 "type": "tool_result",
                 "tool_use_id": "toolu_ok",
                 "content": [
                     {"type": "text", "text": "plain"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
                 ]
             }
         ]);
 
-        let (_, _, tool_results) = process_message_content(&content).expect("process");
+        let (_, images, tool_results) = process_message_content(&content).expect("process");
         let text = kiro_tool_result_to_text(&tool_results[0]).expect("text");
 
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes.as_deref(), Some("iVBORw0KGgo="));
         assert!(text.contains("plain"));
-        assert!(text.contains("\"image\""));
+        assert!(text.contains("[image attached]"));
+        assert!(!text.contains("iVBOR"));
     }
 
     #[test]
@@ -3242,5 +3246,69 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    #[test]
+    fn test_convert_request_attaches_tool_result_image_to_current_message() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Inspect the image"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "toolu_image",
+                        "name": "Read",
+                        "input": {"file_path": "fixture.png"}
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_image",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "iVBORw0KGgo="
+                            }
+                        }]
+                    }]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("tool-result image should convert");
+        let current = result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(current.images.len(), 1);
+        assert_eq!(current.images[0].format, "png");
+        assert_eq!(
+            current.images[0].source.bytes.as_deref(),
+            Some("iVBORw0KGgo=")
+        );
+        assert_eq!(current.user_input_message_context.tool_results.len(), 1);
+        assert_eq!(
+            current.user_input_message_context.tool_results[0].content[0]
+                .get("text")
+                .and_then(serde_json::Value::as_str),
+            Some("[image attached]")
+        );
     }
 }

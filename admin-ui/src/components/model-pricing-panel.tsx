@@ -155,7 +155,7 @@ function buildManualPayload(form: ManualModelForm): UpsertManualModelRequest {
     throw new Error('输入上限和输出上限必须是大于 0 的整数，或留空')
   }
   const payload: UpsertManualModelRequest = {
-    model: form.model.trim(),
+    model: form.model.trim().toLowerCase(),
     displayName: form.displayName.trim() || undefined,
     description: form.description.trim() || undefined,
     maxInputTokens,

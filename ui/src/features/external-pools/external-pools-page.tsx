@@ -381,6 +381,21 @@ export function ExternalPoolsPage() {
                   <NumberBox disabled={!externalEnabled} label="流式空闲超时" suffix="秒" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamIdleTimeoutSecs: v }))} />
                 </div>
               </FormSection>
+              <FormSection title="流式 SSE 默认转发" description="作为外部账号默认值；单个外部账号仍可在编辑弹窗中覆盖。">
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <SelectBox
+                    disabled={!externalEnabled}
+                    label="SSE 默认转发"
+                    value={configDraft.externalPoolStreamResponseMode}
+                    onChange={(v) => setConfigDraft((p) => ({
+                      ...p,
+                      externalPoolStreamResponseMode: v as ExternalPoolsConfig['externalPoolStreamResponseMode'],
+                    }))}
+                  >
+                    <SelectItem value="event_passthrough">SSE 事件级透传</SelectItem>
+                  </SelectBox>
+                </div>
+              </FormSection>
               <FormSection title="外部账号失败后回本地" description="仅对本地优先 fallback 到外部账号的请求生效；显式直连开启时不会回本地。">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="启用回本地" checked={configDraft.externalPoolLocalRescueEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolLocalRescueEnabled: v }))} />

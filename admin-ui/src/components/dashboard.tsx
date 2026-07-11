@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2, LayoutDashboard, SlidersHorizontal } from 'lucide-react'
+import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2, LayoutDashboard, SlidersHorizontal, Wallet, X } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -30,6 +30,7 @@ import {
   useCredentialsSummary,
   useCredentialsUsageSummary,
   useBatchUpdateCredentials,
+  useCredentialCreditSummary,
   useDeleteCredential,
   useDeleteDisabledCredentials,
   useLoadBalancingMode,
@@ -45,11 +46,37 @@ import type { BalanceResponse, CredentialListItem, CredentialSortBy, CredentialS
 
 const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'default', label: '默认排序' },
+  { value: 'priority', label: '优先级' },
   { value: 'created_at', label: '创建时间' },
   { value: 'updated_at', label: '更新时间' },
-  { value: 'priority', label: '优先级' },
+  { value: 'last_used_at', label: '最后使用' },
+  { value: 'success_count', label: '成功次数' },
+  { value: 'failure_count', label: '失败次数' },
+  { value: 'refresh_failure_count', label: '刷新失败' },
+  { value: 'in_flight_requests', label: '并发占用' },
+  { value: 'scheduler_score', label: '调度评分' },
+  { value: 'estimated_cost', label: '本地成本' },
+  { value: 'usage_percentage', label: '额度使用率' },
+  { value: 'remaining_quota', label: '剩余额度' },
   { value: 'id', label: 'ID' },
 ]
+
+function numericQueryValue(value: string): number | undefined {
+  const trimmed = value.trim().replace(/^#/, '')
+  if (!trimmed) return undefined
+  const parsed = Number(trimmed)
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+function formatCredits(value?: number | null): string {
+  if (!Number.isFinite(value ?? Number.NaN)) return '-'
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value as number)
+}
+
+function formatDateTime(value?: string | null): string {
+  if (!value) return '未查询'
+  return new Date(value).toLocaleString('zh-CN', { hour12: false })
+}
 
 function credentialFromListItem(item: CredentialListItem): CredentialStatusItem {
   return {
@@ -120,6 +147,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [sortOrder, setSortOrder] = useState<CredentialSortOrder>('desc')
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [credentialIdQuery, setCredentialIdQuery] = useState('')
+  const [accountQuery, setAccountQuery] = useState('')
+  const [regionQuery, setRegionQuery] = useState('')
+  const [modelQuery, setModelQuery] = useState('')
+  const [endpointQuery, setEndpointQuery] = useState('')
+  const [priorityQuery, setPriorityQuery] = useState('')
+  const [rpmQuery, setRpmQuery] = useState('')
+  const [concurrencyQuery, setConcurrencyQuery] = useState('')
   const [activeTab, setActiveTab] = useState<'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
@@ -137,6 +172,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
       page: currentPage,
       limit: itemsPerPage,
       q: queryText.trim() || undefined,
+      credentialId: numericQueryValue(credentialIdQuery),
+      account: accountQuery.trim() || undefined,
+      region: regionQuery.trim() || undefined,
+      model: modelQuery.trim() || undefined,
+      endpoint: endpointQuery.trim() || undefined,
+      priority: numericQueryValue(priorityQuery),
+      rpm: numericQueryValue(rpmQuery),
+      concurrency: numericQueryValue(concurrencyQuery),
       status: statusFilter !== 'all' ? statusFilter : undefined,
       authMethod: authFilter !== 'all' ? authFilter : undefined,
       subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
@@ -144,7 +187,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       sortBy: sortBy !== 'default' ? sortBy : undefined,
       sortOrder: sortBy !== 'default' ? sortOrder : undefined,
     }),
-    [authFilter, currentPage, proxyFilter, queryText, sortBy, sortOrder, statusFilter, subscriptionFilter]
+    [accountQuery, authFilter, concurrencyQuery, credentialIdQuery, currentPage, endpointQuery, modelQuery, priorityQuery, proxyFilter, queryText, regionQuery, rpmQuery, sortBy, sortOrder, statusFilter, subscriptionFilter]
   )
   const {
     data: listData,
@@ -175,12 +218,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: proxyResourcesData } = useProxyResources()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const runtimeConfig = useRuntimeConfig()
+  const creditSummary = useCredentialCreditSummary()
   const refetch = () => {
     refetchList()
     refetchSummary()
     runtimeQuery.refetch()
     accountInfoQuery.refetch()
     usageSummaryQuery.refetch()
+    creditSummary.refetch()
   }
 
   // 计算分页
@@ -237,6 +282,40 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const selectedPriorityOverrideCount = selectedCredentials.filter((credential) => credential.priority !== 0).length
   const selectedConcurrencyOverrideCount = selectedCredentials.filter((credential) => typeof credential.maxConcurrentRequestsOverride === 'number').length
   const selectedRpmOverrideCount = selectedCredentials.filter((credential) => typeof credential.rpmOverride === 'number').length
+  const hasCredentialFilters = Boolean(
+    queryText.trim() ||
+    credentialIdQuery.trim() ||
+    accountQuery.trim() ||
+    regionQuery.trim() ||
+    modelQuery.trim() ||
+    endpointQuery.trim() ||
+    priorityQuery.trim() ||
+    rpmQuery.trim() ||
+    concurrencyQuery.trim() ||
+    statusFilter !== 'all' ||
+    authFilter !== 'all' ||
+    subscriptionFilter !== 'all' ||
+    proxyFilter !== 'all' ||
+    sortBy !== 'default'
+  )
+
+  const clearCredentialFilters = () => {
+    setQueryText('')
+    setCredentialIdQuery('')
+    setAccountQuery('')
+    setRegionQuery('')
+    setModelQuery('')
+    setEndpointQuery('')
+    setPriorityQuery('')
+    setRpmQuery('')
+    setConcurrencyQuery('')
+    setStatusFilter('all')
+    setAuthFilter('all')
+    setSubscriptionFilter('all')
+    setProxyFilter('all')
+    setSortBy('default')
+    setSortOrder('desc')
+  }
 
   // 后台分页总数变化时，避免停留在不存在的页码。
   useEffect(() => {
@@ -257,7 +336,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
     setSelectedIds(new Set())
-  }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
+  }, [accountQuery, authFilter, concurrencyQuery, credentialIdQuery, endpointQuery, modelQuery, priorityQuery, proxyFilter, queryText, regionQuery, rpmQuery, sortBy, sortOrder, statusFilter, subscriptionFilter])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -507,6 +586,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
       if (response.failed === 0) {
         toast.success(`查询完成：成功 ${response.success}/${response.total}`)
       } else {
@@ -682,6 +762,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+      queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
 
       if (response.failed === 0) {
         toast.success(`查询完成：成功 ${response.success}/${response.total}`)
@@ -960,7 +1041,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         ) : (
           <>
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5 mb-6">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -1014,6 +1095,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 {runtimeConfig.data?.credentialMaxConcurrentRequests || '不限'}
               </div>
               <div className="text-xs text-muted-foreground">每个凭据同时处理请求上限</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-1 text-sm font-medium text-muted-foreground">
+                <Wallet className="h-3.5 w-3.5" />
+                启用积分
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">{formatCredits(creditSummary.data?.enabledCreditRemaining)}</div>
+              <div className="text-xs text-muted-foreground">
+                总额 {formatCredits(creditSummary.data?.enabledCreditLimit)} · {formatDateTime(creditSummary.data?.lastCheckedAt)}
+              </div>
             </CardContent>
           </Card>
         </div>
@@ -1174,9 +1269,35 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 className="pl-9"
                 value={queryText}
                 onChange={event => setQueryText(event.target.value)}
-                placeholder="搜索邮箱、ID、订阅、代理、错误"
+                placeholder="模糊搜索：订阅、代理、错误、priority:0、rpm:60..."
               />
             </div>
+            <Input
+              value={credentialIdQuery}
+              onChange={event => setCredentialIdQuery(event.target.value)}
+              placeholder="ID，如 #473"
+              inputMode="numeric"
+            />
+            <Input
+              value={accountQuery}
+              onChange={event => setAccountQuery(event.target.value)}
+              placeholder="邮箱 / Key"
+            />
+            <Input
+              value={regionQuery}
+              onChange={event => setRegionQuery(event.target.value)}
+              placeholder="Region"
+            />
+            <Input
+              value={modelQuery}
+              onChange={event => setModelQuery(event.target.value)}
+              placeholder="可用模型"
+            />
+            <Input
+              value={endpointQuery}
+              onChange={event => setEndpointQuery(event.target.value)}
+              placeholder="Endpoint"
+            />
             <select
               className="h-10 rounded-md border bg-background px-3 text-sm"
               value={sortBy}
@@ -1197,6 +1318,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <option value="desc">降序</option>
               <option value="asc">升序</option>
             </select>
+            <Input
+              value={priorityQuery}
+              onChange={event => setPriorityQuery(event.target.value)}
+              placeholder="优先级 = 0"
+              inputMode="numeric"
+            />
+            <Input
+              value={rpmQuery}
+              onChange={event => setRpmQuery(event.target.value)}
+              placeholder="RPM = 60"
+              inputMode="numeric"
+            />
+            <Input
+              value={concurrencyQuery}
+              onChange={event => setConcurrencyQuery(event.target.value)}
+              placeholder="并发 = 3"
+              inputMode="numeric"
+            />
             <select
               className="h-10 rounded-md border bg-background px-3 text-sm"
               value={statusFilter}
@@ -1251,6 +1390,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </option>
               ))}
             </select>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!hasCredentialFilters}
+              onClick={clearCredentialFilters}
+            >
+              <X className="h-4 w-4 mr-2" />
+              清除筛选
+            </Button>
           </div>
           {currentCredentials.length === 0 ? (
             <Card>

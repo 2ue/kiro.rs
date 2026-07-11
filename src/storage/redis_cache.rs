@@ -169,6 +169,63 @@ const USAGE_RECORDS_TTL_SECS: usize = 35 * 24 * 60 * 60;
 const USAGE_RECORDS_MAX_CACHED: usize = 100_000;
 const USAGE_RECORDS_TRIM_BATCH: usize = 512;
 const USAGE_RECORDS_QUERY_SCAN_LIMIT: usize = 5_000;
+const DISPATCH_QUEUE_PRUNE_AND_COUNT_SCRIPT: &str = r#"
+    local now = redis.call('TIME')
+    local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+    return redis.call('ZCARD', KEYS[1])
+"#;
+const DISPATCH_QUEUE_ADMIT_SCRIPT: &str = r#"
+    local max_queued = tonumber(ARGV[1])
+    local ttl_ms = tonumber(ARGV[2]) * 1000
+    local lease_id = ARGV[3]
+    local now = redis.call('TIME')
+    local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+    if redis.call('ZSCORE', KEYS[1], lease_id) then
+        return 1
+    end
+
+    local count = redis.call('ZCARD', KEYS[1])
+    if max_queued > 0 and count >= max_queued then
+        return 0
+    end
+
+    local expires_at_ms = now_ms + ttl_ms
+    redis.call('ZADD', KEYS[1], expires_at_ms, lease_id)
+    local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+    if latest[2] then
+        redis.call('PEXPIREAT', KEYS[1], math.ceil(tonumber(latest[2])))
+    end
+    return 1
+"#;
+const DISPATCH_QUEUE_RELEASE_SCRIPT: &str = r#"
+    local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+    if redis.call('ZCARD', KEYS[1]) == 0 then
+        redis.call('DEL', KEYS[1])
+    end
+    return removed
+"#;
+const DISPATCH_QUEUE_RENEW_SCRIPT: &str = r#"
+    local ttl_ms = tonumber(ARGV[1]) * 1000
+    local lease_id = ARGV[2]
+    local now = redis.call('TIME')
+    local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+    if not redis.call('ZSCORE', KEYS[1], lease_id) then
+        return 0
+    end
+
+    local expires_at_ms = now_ms + ttl_ms
+    redis.call('ZADD', KEYS[1], 'XX', expires_at_ms, lease_id)
+    local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+    if latest[2] then
+        redis.call('PEXPIREAT', KEYS[1], math.ceil(tonumber(latest[2])))
+    end
+    return 1
+"#;
 const USAGE_DASHBOARD_DURATION_MAX_SCRIPT: &str = r#"
     local current = tonumber(redis.call('HGET', KEYS[1], 'duration_ms_max') or '0')
     local candidate = tonumber(ARGV[1]) or 0
@@ -1718,27 +1775,31 @@ impl RedisStore {
         session_id: &str,
         binding: &SchedulerSessionBinding,
         ttl_secs: usize,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SchedulerSessionBinding> {
         let encoded = serde_json::to_string(binding)?;
         let session_hash = session_hash(session_id);
         let script = r#"
             local old = redis.call('GET', KEYS[1])
+            local next = cjson.decode(ARGV[3])
             if old then
                 local ok, parsed = pcall(cjson.decode, old)
                 if ok and parsed['credential_id'] then
                     local old_id = tostring(parsed['credential_id'])
                     if old_id ~= ARGV[2] then
                         redis.call('SREM', ARGV[5] .. old_id, ARGV[1])
+                    else
+                        next['soft_failure_count'] = tonumber(parsed['soft_failure_count'] or '0')
                     end
                 end
             end
-            redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+            local next_encoded = cjson.encode(next)
+            redis.call('SET', KEYS[1], next_encoded, 'EX', ARGV[4])
             redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[1])
             redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
-            return 1
+            return next_encoded
         "#;
         let mut manager = self.scheduler_manager();
-        let _: i64 = redis::cmd("EVAL")
+        let actual: String = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
             .arg(self.key(session_binding_key(session_id)))
@@ -1749,7 +1810,7 @@ impl RedisStore {
             .arg(self.key("scheduler:sessions_by_credential:"))
             .query_async(&mut manager)
             .await?;
-        Ok(())
+        Ok(serde_json::from_str(&actual)?)
     }
 
     pub async fn delete_session_binding(&self, session_id: &str) -> anyhow::Result<()> {
@@ -1777,6 +1838,41 @@ impl RedisStore {
         Ok(())
     }
 
+    pub async fn delete_session_binding_if_bound_to(
+        &self,
+        session_id: &str,
+        credential_id: u64,
+    ) -> anyhow::Result<bool> {
+        let session_hash = session_hash(session_id);
+        let script = r#"
+            local old = redis.call('GET', KEYS[1])
+            if not old then
+                return 0
+            end
+            local ok, parsed = pcall(cjson.decode, old)
+            if not ok or not parsed['credential_id'] then
+                return 0
+            end
+            if tostring(parsed['credential_id']) ~= ARGV[2] then
+                return 0
+            end
+            redis.call('DEL', KEYS[1])
+            redis.call('SREM', ARGV[3] .. ARGV[2], ARGV[1])
+            return 1
+        "#;
+        let mut manager = self.scheduler_manager();
+        let deleted: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(1)
+            .arg(self.key(session_binding_key(session_id)))
+            .arg(&session_hash)
+            .arg(credential_id.to_string())
+            .arg(self.key("scheduler:sessions_by_credential:"))
+            .query_async(&mut manager)
+            .await?;
+        Ok(deleted == 1)
+    }
+
     pub async fn delete_sessions_for_credential(
         &self,
         credential_id: u64,
@@ -1785,18 +1881,83 @@ impl RedisStore {
         let mut manager = self.scheduler_manager();
         let session_hashes: Vec<String> = manager.smembers(&set_key).await?;
         let mut deleted = 0usize;
+        let script = r#"
+            local raw = redis.call('GET', KEYS[1])
+            if not raw then
+                redis.call('SREM', KEYS[2], ARGV[1])
+                return 0
+            end
+            local ok, parsed = pcall(cjson.decode, raw)
+            if not ok or tostring(parsed['credential_id']) ~= ARGV[2] then
+                redis.call('SREM', KEYS[2], ARGV[1])
+                return 0
+            end
+            redis.call('DEL', KEYS[1])
+            redis.call('SREM', KEYS[2], ARGV[1])
+            return 1
+        "#;
         for session_hash in &session_hashes {
-            let removed: i64 = manager
-                .del(self.key(format!("scheduler:session:{}", session_hash)))
+            let removed: i64 = redis::cmd("EVAL")
+                .arg(script)
+                .arg(2)
+                .arg(self.key(format!("scheduler:session:{}", session_hash)))
+                .arg(&set_key)
+                .arg(session_hash)
+                .arg(credential_id.to_string())
+                .query_async(&mut manager)
                 .await?;
             if removed > 0 {
                 deleted += 1;
             }
         }
-        let _: () = manager.del(set_key).await?;
         Ok(deleted)
     }
 
+    pub async fn record_session_soft_failure_with_state(
+        &self,
+        session_id: &str,
+        credential_id: u64,
+        ttl_secs: usize,
+    ) -> anyhow::Result<Option<SchedulerSessionBinding>> {
+        let session_hash = session_hash(session_id);
+        let script = r#"
+            local raw = redis.call('GET', KEYS[1])
+            if not raw then
+                return nil
+            end
+            local ok, parsed = pcall(cjson.decode, raw)
+            if not ok or not parsed['credential_id'] then
+                return nil
+            end
+            if tostring(parsed['credential_id']) ~= ARGV[2] then
+                return nil
+            end
+            parsed['soft_failure_count'] = tonumber(parsed['soft_failure_count'] or '0') + 1
+            parsed['last_used_at'] = ARGV[3]
+            local encoded = cjson.encode(parsed)
+            redis.call('SET', KEYS[1], encoded, 'EX', ARGV[4])
+            redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[1])
+            redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
+            return encoded
+        "#;
+        let mut manager = self.scheduler_manager();
+        let encoded: Option<String> = redis::cmd("EVAL")
+            .arg(script)
+            .arg(1)
+            .arg(self.key(session_binding_key(session_id)))
+            .arg(&session_hash)
+            .arg(credential_id.to_string())
+            .arg(Utc::now().to_rfc3339())
+            .arg(ttl_secs.max(1))
+            .arg(self.key("scheduler:sessions_by_credential:"))
+            .query_async(&mut manager)
+            .await?;
+        encoded
+            .map(|encoded| serde_json::from_str(&encoded).map_err(anyhow::Error::from))
+            .transpose()
+    }
+
+    #[cfg(test)]
     pub async fn record_session_soft_failure(
         &self,
         session_id: &str,
@@ -1804,83 +1965,64 @@ impl RedisStore {
         threshold: u32,
         ttl_secs: usize,
     ) -> anyhow::Result<bool> {
+        Ok(self
+            .record_session_soft_failure_with_state(session_id, credential_id, ttl_secs)
+            .await?
+            .is_some_and(|binding| binding.soft_failure_count >= threshold))
+    }
+
+    pub async fn clear_session_soft_failure_with_state(
+        &self,
+        session_id: &str,
+        credential_id: u64,
+        ttl_secs: usize,
+    ) -> anyhow::Result<Option<SchedulerSessionBinding>> {
         let session_hash = session_hash(session_id);
         let script = r#"
             local raw = redis.call('GET', KEYS[1])
             if not raw then
-                return 0
+                return nil
             end
             local ok, parsed = pcall(cjson.decode, raw)
             if not ok or not parsed['credential_id'] then
-                return 0
+                return nil
             end
             if tostring(parsed['credential_id']) ~= ARGV[2] then
-                return 0
+                return nil
             end
-            local count = tonumber(parsed['soft_failure_count'] or '0') + 1
-            parsed['soft_failure_count'] = count
-            parsed['last_used_at'] = ARGV[4]
-            redis.call('SET', KEYS[1], cjson.encode(parsed), 'EX', ARGV[5])
-            redis.call('SADD', ARGV[6] .. ARGV[2], ARGV[1])
-            redis.call('EXPIRE', ARGV[6] .. ARGV[2], ARGV[5])
-            if count >= tonumber(ARGV[3]) then
-                return 1
-            end
-            return 0
+            parsed['soft_failure_count'] = 0
+            parsed['last_used_at'] = ARGV[3]
+            local encoded = cjson.encode(parsed)
+            redis.call('SET', KEYS[1], encoded, 'EX', ARGV[4])
+            redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[1])
+            redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
+            return encoded
         "#;
         let mut manager = self.scheduler_manager();
-        let should_fallback: i64 = redis::cmd("EVAL")
+        let encoded: Option<String> = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
             .arg(self.key(session_binding_key(session_id)))
             .arg(&session_hash)
             .arg(credential_id.to_string())
-            .arg(threshold)
             .arg(Utc::now().to_rfc3339())
             .arg(ttl_secs.max(1))
             .arg(self.key("scheduler:sessions_by_credential:"))
             .query_async(&mut manager)
             .await?;
-        Ok(should_fallback == 1)
+        encoded
+            .map(|encoded| serde_json::from_str(&encoded).map_err(anyhow::Error::from))
+            .transpose()
     }
 
+    #[cfg(test)]
     pub async fn clear_session_soft_failure(
         &self,
         session_id: &str,
         credential_id: u64,
         ttl_secs: usize,
     ) -> anyhow::Result<()> {
-        let session_hash = session_hash(session_id);
-        let script = r#"
-            local raw = redis.call('GET', KEYS[1])
-            if not raw then
-                return 0
-            end
-            local ok, parsed = pcall(cjson.decode, raw)
-            if not ok or not parsed['credential_id'] then
-                return 0
-            end
-            if tostring(parsed['credential_id']) ~= ARGV[2] then
-                return 0
-            end
-            parsed['soft_failure_count'] = 0
-            parsed['last_used_at'] = ARGV[3]
-            redis.call('SET', KEYS[1], cjson.encode(parsed), 'EX', ARGV[4])
-            redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[1])
-            redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
-            return 1
-        "#;
-        let mut manager = self.scheduler_manager();
-        let _: i64 = redis::cmd("EVAL")
-            .arg(script)
-            .arg(1)
-            .arg(self.key(session_binding_key(session_id)))
-            .arg(&session_hash)
-            .arg(credential_id.to_string())
-            .arg(Utc::now().to_rfc3339())
-            .arg(ttl_secs.max(1))
-            .arg(self.key("scheduler:sessions_by_credential:"))
-            .query_async(&mut manager)
+        self.clear_session_soft_failure_with_state(session_id, credential_id, ttl_secs)
             .await?;
         Ok(())
     }
@@ -2596,21 +2738,34 @@ impl RedisStore {
         }
     }
 
+    #[cfg(test)]
     pub async fn release_in_flight_lease(
         &self,
         credential_id: u64,
         lease_id: u64,
     ) -> anyhow::Result<bool> {
-        self.release_in_flight_lease_inner(credential_id, lease_id, false)
+        self.release_in_flight_lease_inner(credential_id, lease_id, false, None)
             .await
     }
 
+    #[cfg(test)]
     pub async fn release_in_flight_lease_with_tombstone(
         &self,
         credential_id: u64,
         lease_id: u64,
     ) -> anyhow::Result<bool> {
-        self.release_in_flight_lease_inner(credential_id, lease_id, true)
+        self.release_in_flight_lease_inner(credential_id, lease_id, true, None)
+            .await
+    }
+
+    pub async fn release_in_flight_lease_and_publish_wakeup(
+        &self,
+        credential_id: u64,
+        lease_id: u64,
+        tombstone: bool,
+        wakeup_payload: &str,
+    ) -> anyhow::Result<bool> {
+        self.release_in_flight_lease_inner(credential_id, lease_id, tombstone, Some(wakeup_payload))
             .await
     }
 
@@ -2619,6 +2774,7 @@ impl RedisStore {
         credential_id: u64,
         lease_id: u64,
         tombstone: bool,
+        wakeup_payload: Option<&str>,
     ) -> anyhow::Result<bool> {
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
@@ -2660,12 +2816,15 @@ impl RedisStore {
                     redis.call('SET', KEYS[10], 0)
                 end
             end
+            if removed > 0 and ARGV[4] ~= '' then
+                redis.call('PUBLISH', KEYS[12], ARGV[4])
+            end
             return removed
         "#;
         let tombstone_ttl_secs = 120i64;
         let removed: i64 = redis::cmd("EVAL")
             .arg(script)
-            .arg(11)
+            .arg(12)
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&keys.kind))
@@ -2677,9 +2836,11 @@ impl RedisStore {
             .arg(self.key(&global_keys.weight))
             .arg(self.key(&global_keys.count))
             .arg(self.key(&keys.released))
+            .arg(self.dispatch_wakeup_channel())
             .arg(&lease_id)
             .arg(if tombstone { 1 } else { 0 })
             .arg(tombstone_ttl_secs)
+            .arg(wakeup_payload.unwrap_or_default())
             .query_async(&mut manager)
             .await?;
         Ok(removed > 0)
@@ -3429,113 +3590,130 @@ impl RedisStore {
     pub async fn global_capacity_state(&self) -> anyhow::Result<SchedulerGlobalCapacityState> {
         let keys = global_in_flight_keys();
         let mut manager = self.scheduler_capacity_manager();
-        let (weighted_in_flight, zcard_in_flight, queued): (Option<i64>, i64, Option<i64>) =
-            redis::pipe()
-                .cmd("GET")
-                .arg(self.key(&keys.count))
-                .cmd("ZCARD")
-                .arg(self.key(&keys.acquired))
-                .cmd("GET")
-                .arg(self.key(scheduler_global_queue_key()))
-                .query_async(&mut manager)
-                .await?;
+        let (weighted_in_flight, zcard_in_flight, queued): (Option<i64>, i64, i64) = redis::pipe()
+            .cmd("GET")
+            .arg(self.key(&keys.count))
+            .cmd("ZCARD")
+            .arg(self.key(&keys.acquired))
+            .cmd("EVAL")
+            .arg(DISPATCH_QUEUE_PRUNE_AND_COUNT_SCRIPT)
+            .arg(1)
+            .arg(self.key(scheduler_global_queue_key()))
+            .query_async(&mut manager)
+            .await?;
         let in_flight = weighted_in_flight.unwrap_or(zcard_in_flight);
         Ok(SchedulerGlobalCapacityState {
             in_flight_requests: in_flight.max(0) as u32,
-            queued_requests: queued.unwrap_or(0).max(0) as u32,
+            queued_requests: queued.max(0) as u32,
         })
     }
+
     pub async fn try_enter_dispatch_queue(
         &self,
+        lease_id: &str,
         max_queued: u32,
         ttl_secs: u64,
     ) -> anyhow::Result<bool> {
-        let script = r#"
-            local max_queued = tonumber(ARGV[1])
-            local count = tonumber(redis.call('GET', KEYS[1]) or '0')
-            if max_queued > 0 and count >= max_queued then
-                return 0
-            end
-            redis.call('INCR', KEYS[1])
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
-            return 1
-        "#;
         let mut manager = self.scheduler_capacity_manager();
         let admitted: i64 = redis::cmd("EVAL")
-            .arg(script)
+            .arg(DISPATCH_QUEUE_ADMIT_SCRIPT)
             .arg(1)
             .arg(self.key(scheduler_global_queue_key()))
             .arg(max_queued)
             .arg(ttl_secs.max(60))
+            .arg(lease_id)
             .query_async(&mut manager)
             .await?;
         Ok(admitted == 1)
     }
 
-    pub async fn leave_dispatch_queue(&self) -> anyhow::Result<()> {
-        let script = r#"
-            local count = tonumber(redis.call('GET', KEYS[1]) or '0')
-            if count <= 1 then
-                redis.call('DEL', KEYS[1])
-            else
-                redis.call('DECR', KEYS[1])
-            end
-            return 1
-        "#;
+    pub async fn leave_dispatch_queue(&self, lease_id: &str) -> anyhow::Result<bool> {
         let mut manager = self.scheduler_capacity_manager();
-        let _: i64 = redis::cmd("EVAL")
-            .arg(script)
+        let removed: i64 = redis::cmd("EVAL")
+            .arg(DISPATCH_QUEUE_RELEASE_SCRIPT)
             .arg(1)
             .arg(self.key(scheduler_global_queue_key()))
+            .arg(lease_id)
             .query_async(&mut manager)
             .await?;
-        Ok(())
+        Ok(removed > 0)
+    }
+
+    pub async fn renew_dispatch_queue(
+        &self,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> anyhow::Result<bool> {
+        let mut manager = self.scheduler_capacity_manager();
+        let renewed: i64 = redis::cmd("EVAL")
+            .arg(DISPATCH_QUEUE_RENEW_SCRIPT)
+            .arg(1)
+            .arg(self.key(scheduler_global_queue_key()))
+            .arg(ttl_secs.max(60))
+            .arg(lease_id)
+            .query_async(&mut manager)
+            .await?;
+        Ok(renewed == 1)
     }
 
     pub async fn try_enter_external_pool_dispatch_queue(
         &self,
+        lease_id: &str,
         max_queued: u32,
+        ttl_secs: u64,
     ) -> anyhow::Result<bool> {
-        let script = r#"
-            local max_queued = tonumber(ARGV[1])
-            local count = tonumber(redis.call('GET', KEYS[1]) or '0')
-            if max_queued > 0 and count >= max_queued then
-                return 0
-            end
-            redis.call('INCR', KEYS[1])
-            redis.call('EXPIRE', KEYS[1], ARGV[2])
-            return 1
-        "#;
         let mut manager = self.scheduler_capacity_manager();
         let admitted: i64 = redis::cmd("EVAL")
-            .arg(script)
+            .arg(DISPATCH_QUEUE_ADMIT_SCRIPT)
             .arg(1)
             .arg(self.key(external_pool_global_queue_key()))
             .arg(max_queued)
-            .arg(3600)
+            .arg(ttl_secs.max(60))
+            .arg(lease_id)
             .query_async(&mut manager)
             .await?;
         Ok(admitted == 1)
     }
 
-    pub async fn leave_external_pool_dispatch_queue(&self) -> anyhow::Result<()> {
-        let script = r#"
-            local count = tonumber(redis.call('GET', KEYS[1]) or '0')
-            if count <= 1 then
-                redis.call('DEL', KEYS[1])
-            else
-                redis.call('DECR', KEYS[1])
-            end
-            return 1
-        "#;
+    pub async fn renew_external_pool_dispatch_queue(
+        &self,
+        lease_id: &str,
+        ttl_secs: u64,
+    ) -> anyhow::Result<bool> {
         let mut manager = self.scheduler_capacity_manager();
-        let _: i64 = redis::cmd("EVAL")
-            .arg(script)
+        let renewed: i64 = redis::cmd("EVAL")
+            .arg(DISPATCH_QUEUE_RENEW_SCRIPT)
+            .arg(1)
+            .arg(self.key(external_pool_global_queue_key()))
+            .arg(ttl_secs.max(60))
+            .arg(lease_id)
+            .query_async(&mut manager)
+            .await?;
+        Ok(renewed == 1)
+    }
+
+    pub async fn leave_external_pool_dispatch_queue(&self, lease_id: &str) -> anyhow::Result<bool> {
+        let mut manager = self.scheduler_capacity_manager();
+        let removed: i64 = redis::cmd("EVAL")
+            .arg(DISPATCH_QUEUE_RELEASE_SCRIPT)
+            .arg(1)
+            .arg(self.key(external_pool_global_queue_key()))
+            .arg(lease_id)
+            .query_async(&mut manager)
+            .await?;
+        Ok(removed > 0)
+    }
+
+    #[cfg(test)]
+    pub async fn external_pool_dispatch_queue_size(&self) -> anyhow::Result<u32> {
+        let mut manager = self.scheduler_capacity_manager();
+        let count: i64 = redis::cmd("EVAL")
+            .arg(DISPATCH_QUEUE_PRUNE_AND_COUNT_SCRIPT)
             .arg(1)
             .arg(self.key(external_pool_global_queue_key()))
             .query_async(&mut manager)
             .await?;
-        Ok(())
+        Ok(count.max(0) as u32)
     }
 
     pub async fn acquire_refresh_lock(
@@ -4456,11 +4634,11 @@ fn scheduler_rate_limit_key(credential_id: u64) -> String {
 }
 
 fn scheduler_global_queue_key() -> &'static str {
-    "scheduler:global:queued"
+    "scheduler:global:queue_leases:v1"
 }
 
 fn external_pool_global_queue_key() -> &'static str {
-    "external_pool:global:queued"
+    "external_pool:global:queue_leases:v1"
 }
 
 fn local_pool_circuit_failures_key() -> &'static str {
@@ -4554,7 +4732,7 @@ mod tests {
     }
 
     fn test_config() -> Option<Config> {
-        let url = std::env::var("KIRO_RS_TEST_REDIS_URL").ok()?;
+        let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
         let mut config = Config::default();
         config.redis.url = Some(url);
         config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
@@ -5039,6 +5217,19 @@ mod tests {
                 .await
                 .unwrap()
         );
+        let same_credential = SchedulerSessionBinding {
+            credential_id: 8,
+            last_used_at: Utc::now(),
+            soft_failure_count: 0,
+        };
+        let preserved = store
+            .set_session_binding("session-a", &same_credential, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            preserved.soft_failure_count, 2,
+            "rebinding to the same credential must not overwrite the atomic failure count"
+        );
         store
             .clear_session_soft_failure("session-a", 8, 60)
             .await
@@ -5378,6 +5569,461 @@ mod tests {
         );
         let state = store.scheduler_state_for_credentials(&[9]).await.unwrap();
         assert_eq!(state.get(&9).unwrap().in_flight_leases.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn redis_dispatch_queue_leases_enforce_cross_manager_limit_and_idempotence() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store_a = RedisStore::connect(&config).await.unwrap();
+        let store_b = RedisStore::connect(&config).await.unwrap();
+        assert!(
+            store_a
+                .try_enter_dispatch_queue("manager-a:lease-1", 1, 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store_b
+                .try_enter_dispatch_queue("manager-a:lease-1", 1, 60)
+                .await
+                .unwrap(),
+            "retrying the same lease must remain admitted even at the queue limit"
+        );
+        assert!(
+            !store_b
+                .try_enter_dispatch_queue("manager-b:lease-1", 1, 60)
+                .await
+                .unwrap(),
+            "a different manager must observe the shared queue limit"
+        );
+        assert!(
+            !store_b.leave_dispatch_queue("missing-lease").await.unwrap(),
+            "releasing an unknown lease must not decrement another waiter"
+        );
+        assert_eq!(
+            store_a
+                .global_capacity_state()
+                .await
+                .unwrap()
+                .queued_requests,
+            1
+        );
+
+        assert!(
+            store_a
+                .leave_dispatch_queue("manager-a:lease-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store_a
+                .leave_dispatch_queue("manager-a:lease-1")
+                .await
+                .unwrap(),
+            "queue lease release must be idempotent"
+        );
+        assert!(
+            store_b
+                .try_enter_dispatch_queue("manager-b:lease-1", 1, 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store_b
+                .leave_dispatch_queue("manager-b:lease-1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store_a
+                .global_capacity_state()
+                .await
+                .unwrap()
+                .queued_requests,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_dispatch_queue_prunes_stale_leases_before_admission_and_counting() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let queue_key = store.key(scheduler_global_queue_key());
+        let mut manager = store.scheduler_capacity_manager();
+        let _: i64 = redis::cmd("ZADD")
+            .arg(&queue_key)
+            .arg(1)
+            .arg("expired-lease")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .try_enter_dispatch_queue("live-lease", 1, 60)
+                .await
+                .unwrap(),
+            "an expired lease must not consume the queue limit"
+        );
+        assert_eq!(
+            store.global_capacity_state().await.unwrap().queued_requests,
+            1
+        );
+        let expired_score: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("expired-lease")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert!(expired_score.is_none());
+        assert!(store.leave_dispatch_queue("live-lease").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn redis_dispatch_queue_commit_unknown_cleanup_only_removes_its_lease() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let _unknown_result = store
+            .try_enter_dispatch_queue("commit-unknown", 2, 60)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .try_enter_dispatch_queue("unrelated-waiter", 2, 60)
+                .await
+                .unwrap()
+        );
+
+        assert!(store.leave_dispatch_queue("commit-unknown").await.unwrap());
+        assert!(!store.leave_dispatch_queue("commit-unknown").await.unwrap());
+        assert_eq!(
+            store.global_capacity_state().await.unwrap().queued_requests,
+            1,
+            "commit-unknown cleanup must not pollute the global count"
+        );
+        assert!(
+            store
+                .leave_dispatch_queue("unrelated-waiter")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_dispatch_queue_admission_and_renewal_only_update_their_own_lease() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let queue_key = store.key(scheduler_global_queue_key());
+        assert!(
+            store
+                .try_enter_dispatch_queue("earlier-lease", 2, 60)
+                .await
+                .unwrap()
+        );
+        let mut manager = store.scheduler_capacity_manager();
+        let before: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("earlier-lease")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .try_enter_dispatch_queue("later-lease", 2, 120)
+                .await
+                .unwrap()
+        );
+        let after: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("earlier-lease")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        let later: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("later-lease")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+
+        assert_eq!(before, after);
+        assert!(later > after);
+        assert!(
+            store
+                .renew_dispatch_queue("earlier-lease", 180)
+                .await
+                .unwrap()
+        );
+        let renewed: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("earlier-lease")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        let later_after_renewal: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("later-lease")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert!(renewed > later);
+        assert_eq!(later, later_after_renewal);
+        assert!(
+            !store
+                .renew_dispatch_queue("missing-lease", 180)
+                .await
+                .unwrap(),
+            "renewal must not recreate an expired or released queue lease"
+        );
+        assert!(store.leave_dispatch_queue("earlier-lease").await.unwrap());
+        assert!(store.leave_dispatch_queue("later-lease").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn redis_external_pool_queue_leases_enforce_cross_manager_limit_and_idempotence() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store_a = RedisStore::connect(&config).await.unwrap();
+        let store_b = RedisStore::connect(&config).await.unwrap();
+        assert!(
+            store_a
+                .try_enter_external_pool_dispatch_queue("manager-a:waiter-1", 1, 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store_b
+                .try_enter_external_pool_dispatch_queue("manager-a:waiter-1", 1, 60)
+                .await
+                .unwrap(),
+            "retrying the same external waiter must remain admitted at the limit"
+        );
+        assert!(
+            !store_b
+                .try_enter_external_pool_dispatch_queue("manager-b:waiter-1", 1, 60)
+                .await
+                .unwrap(),
+            "another manager must observe the shared external queue limit"
+        );
+        assert!(
+            !store_b
+                .leave_external_pool_dispatch_queue("missing-waiter")
+                .await
+                .unwrap(),
+            "an unknown release must not remove another external waiter"
+        );
+        assert_eq!(
+            store_a.external_pool_dispatch_queue_size().await.unwrap(),
+            1
+        );
+        assert!(
+            store_a
+                .leave_external_pool_dispatch_queue("manager-a:waiter-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store_a
+                .leave_external_pool_dispatch_queue("manager-a:waiter-1")
+                .await
+                .unwrap(),
+            "external queue release must be idempotent"
+        );
+        assert_eq!(
+            store_a.external_pool_dispatch_queue_size().await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_external_pool_queue_prunes_stale_leases_before_admission() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let queue_key = store.key(external_pool_global_queue_key());
+        let mut manager = store.scheduler_capacity_manager();
+        let _: i64 = redis::cmd("ZADD")
+            .arg(&queue_key)
+            .arg(1)
+            .arg("expired-waiter")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .try_enter_external_pool_dispatch_queue("live-waiter", 1, 60)
+                .await
+                .unwrap(),
+            "an expired external waiter must not consume the queue limit"
+        );
+        assert_eq!(store.external_pool_dispatch_queue_size().await.unwrap(), 1);
+        let expired_score: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("expired-waiter")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert!(expired_score.is_none());
+        assert!(
+            store
+                .leave_external_pool_dispatch_queue("live-waiter")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_external_pool_queue_commit_unknown_cleanup_only_removes_its_waiter() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let _unknown_result = store
+            .try_enter_external_pool_dispatch_queue("commit-unknown", 2, 60)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .try_enter_external_pool_dispatch_queue("unrelated-waiter", 2, 60)
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .leave_external_pool_dispatch_queue("commit-unknown")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .leave_external_pool_dispatch_queue("commit-unknown")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.external_pool_dispatch_queue_size().await.unwrap(),
+            1,
+            "commit-unknown cleanup must preserve unrelated external waiters"
+        );
+        assert!(
+            store
+                .leave_external_pool_dispatch_queue("unrelated-waiter")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_external_pool_queue_admission_and_renewal_only_update_their_own_lease() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let queue_key = store.key(external_pool_global_queue_key());
+        assert!(
+            store
+                .try_enter_external_pool_dispatch_queue("earlier-waiter", 2, 60)
+                .await
+                .unwrap()
+        );
+        let mut manager = store.scheduler_capacity_manager();
+        let earlier_before: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("earlier-waiter")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .try_enter_external_pool_dispatch_queue("later-waiter", 2, 120)
+                .await
+                .unwrap()
+        );
+        let earlier_after_admission: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("earlier-waiter")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        let later_before_renewal: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("later-waiter")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert_eq!(earlier_before, earlier_after_admission);
+        assert!(later_before_renewal > earlier_after_admission);
+
+        assert!(
+            store
+                .renew_external_pool_dispatch_queue("earlier-waiter", 180)
+                .await
+                .unwrap(),
+            "an unbounded waiter must be able to renew its own lease"
+        );
+        let earlier_after_renewal: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("earlier-waiter")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        let later_after_renewal: f64 = redis::cmd("ZSCORE")
+            .arg(&queue_key)
+            .arg("later-waiter")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert!(earlier_after_renewal > earlier_after_admission);
+        assert_eq!(later_before_renewal, later_after_renewal);
+        assert!(
+            !store
+                .renew_external_pool_dispatch_queue("missing-waiter", 180)
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .leave_external_pool_dispatch_queue("earlier-waiter")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .leave_external_pool_dispatch_queue("later-waiter")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -12,8 +12,9 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { useTestCredential } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, buildTestModelOptions, defaultTestModelForOptions, testModelLabel } from '@/lib/test-models'
 import type { CredentialStatusItem, TestCredentialResponse } from '@/types/api'
 
 interface CredentialTestDialogProps {
@@ -43,6 +44,11 @@ export function CredentialTestDialog({
   const [result, setResult] = useState<TestCredentialResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const testCredential = useTestCredential()
+  const modelCapabilities = useModelCapabilities()
+  const modelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models, credential?.supportedModels),
+    [credential?.supportedModels, modelCapabilities.data?.models]
+  )
 
   const selectedModelLabel = useMemo(
     () => testModelLabel(model),
@@ -56,7 +62,8 @@ export function CredentialTestDialog({
     setResult(null)
     setError(null)
     setPrompt(DEFAULT_TEST_PROMPT)
-  }, [open, credential?.id])
+    setModel(defaultTestModelForOptions(modelOptions))
+  }, [modelOptions, open, credential?.id])
 
   const handleRun = () => {
     if (!credential) {
@@ -132,7 +139,7 @@ export function CredentialTestDialog({
                   disabled={isRunning}
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {TEST_MODELS.map((option) => (
+                  {modelOptions.map((option) => (
                     <option key={option.id} value={option.id}>
                       {option.label}
                     </option>

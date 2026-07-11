@@ -81,13 +81,23 @@ impl CacheUsage {
         policy: ReportedCacheUsagePolicy,
         raw: RawUsage,
     ) -> Self {
+        self.with_reported_cache_usage_policy_and_raw_evidence(policy, raw, false)
+    }
+
+    pub(crate) fn with_reported_cache_usage_policy_and_raw_evidence(
+        self,
+        policy: ReportedCacheUsagePolicy,
+        raw: RawUsage,
+        cache_read_evidence: bool,
+    ) -> Self {
         let raw = raw.normalized();
         if !policy.reports_local_prompt_cache() {
             return Self::from_raw_usage(raw);
         }
 
-        let had_cache_read =
-            self.cache_read_input_tokens.max(0) > 0 || raw.cache_read_input_tokens.max(0) > 0;
+        let had_cache_read = cache_read_evidence
+            || self.cache_read_input_tokens.max(0) > 0
+            || raw.cache_read_input_tokens.max(0) > 0;
         let mut usage = self;
 
         usage.input_tokens = policy.input_base_value(self.input_tokens, raw.input_tokens);
@@ -130,7 +140,8 @@ impl CacheUsage {
             usage.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
         }
         let current_input = usage.input_tokens.max(0);
-        if current_input > 0 {
+        let can_sample_input = !policy.input_moves_delta_to_cache_read() || had_cache_read;
+        if current_input > 0 && can_sample_input {
             if let Some(reported_input) = policy.sample_input(usage, current_input) {
                 let input_delta = current_input.saturating_sub(reported_input);
                 usage.input_tokens = reported_input;
@@ -366,7 +377,8 @@ impl ReportedCacheUsagePolicy {
         let input = self.policy.input.normalized();
         let rewrites_input = matches!(input.mode, ReportedUsageFieldMode::SampleMax)
             && input.max_tokens > 0
-            && usage.input_tokens > input.max_tokens;
+            && usage.input_tokens > input.max_tokens
+            && (!input.move_delta_to_cache_read || usage.cache_read_input_tokens > 0);
         rewrites_input || self.should_cap_final_cache_read(usage)
     }
 
@@ -519,6 +531,9 @@ impl ReportedCacheUsagePolicy {
             return usage;
         }
         if !self.should_cap_final_input(current_input) {
+            return usage;
+        }
+        if self.input_moves_delta_to_cache_read() && !had_cache_read {
             return usage;
         }
 
@@ -1177,32 +1192,16 @@ pub fn build_usage_with_simulation_policy(
     fill_zero_metadata_cache_from_simulation: bool,
 ) -> CacheUsage {
     if let Some(usage) = metadata_usage {
+        let resolved =
+            usage_from_metadata_or_estimate(Some(usage), total_input_tokens, output_tokens);
         if fill_zero_metadata_cache_from_simulation && metadata_cache_is_empty(usage) {
             if let Some(simulation) = simulation {
-                let output_tokens = if usage.output_tokens > 0 {
-                    usage.output_tokens
-                } else {
-                    output_tokens
-                };
-                let metadata_input_tokens = if usage.uncached_input_tokens > 0 {
-                    usage.uncached_input_tokens
-                } else {
-                    usage.total_input_tokens()
-                };
-                let total_input_tokens = metadata_input_tokens.max(total_input_tokens);
-                return simulation.to_usage(total_input_tokens, output_tokens);
+                let total_input_tokens = resolved.input_tokens.max(total_input_tokens.max(0));
+                return simulation.to_usage(total_input_tokens, resolved.output_tokens);
             }
         }
 
-        return CacheUsage {
-            total_input_tokens: usage.total_input_tokens(),
-            input_tokens: usage.input_tokens(),
-            output_tokens: usage.output_tokens,
-            cache_creation_input_tokens: usage.cache_write_input_tokens,
-            cache_read_input_tokens: usage.cache_read_input_tokens,
-            cache_creation_5m_input_tokens: usage.cache_write_input_tokens,
-            cache_creation_1h_input_tokens: 0,
-        };
+        return resolved;
     }
 
     simulation
@@ -1216,6 +1215,65 @@ pub fn build_usage_with_simulation_policy(
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         })
+}
+
+pub fn usage_from_metadata_or_estimate(
+    metadata_usage: Option<&MetadataTokenUsage>,
+    input_tokens: i32,
+    output_tokens: i32,
+) -> CacheUsage {
+    let estimated_total_input_tokens = input_tokens.max(0);
+    let output_tokens = output_tokens.max(0);
+    let Some(usage) = metadata_usage else {
+        return CacheUsage {
+            total_input_tokens: estimated_total_input_tokens,
+            input_tokens: estimated_total_input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+    };
+
+    let output_tokens = if usage.output_tokens > 0 {
+        usage.output_tokens
+    } else {
+        output_tokens
+    };
+    let cache_creation_input_tokens = usage.cache_write_input_tokens.max(0);
+    let cache_read_input_tokens = usage.cache_read_input_tokens.max(0);
+    let cached_input_tokens = cache_creation_input_tokens.saturating_add(cache_read_input_tokens);
+    let metadata_total_input_tokens = usage.total_tokens.max(0).saturating_sub(output_tokens);
+    let fallback_total_input_tokens = if usage.total_tokens > 0 {
+        metadata_total_input_tokens
+    } else {
+        estimated_total_input_tokens
+    };
+    let input_tokens = if usage.uncached_input_tokens > 0 {
+        usage.uncached_input_tokens
+    } else {
+        fallback_total_input_tokens.saturating_sub(cached_input_tokens)
+    };
+
+    CacheUsage {
+        total_input_tokens: input_tokens
+            .saturating_add(cache_creation_input_tokens)
+            .saturating_add(cache_read_input_tokens),
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        cache_creation_5m_input_tokens: cache_creation_input_tokens,
+        cache_creation_1h_input_tokens: 0,
+    }
+}
+
+pub fn metadata_usage_has_signal(usage: &MetadataTokenUsage) -> bool {
+    usage.uncached_input_tokens > 0
+        || usage.output_tokens > 0
+        || usage.cache_read_input_tokens > 0
+        || usage.cache_write_input_tokens > 0
 }
 
 pub fn metadata_cache_is_empty(usage: &MetadataTokenUsage) -> bool {
@@ -1306,6 +1364,59 @@ mod tests {
         assert_eq!(usage.output_tokens, 123);
         assert_eq!(usage.cache_read_input_tokens, 95_000);
         assert_eq!(usage.input_tokens, 100_000);
+    }
+
+    #[test]
+    fn all_zero_metadata_without_simulation_falls_back_to_local_estimates() {
+        let metadata = MetadataTokenUsage::default();
+
+        let usage = build_usage_with_simulation_policy(Some(&metadata), 4_096, 17, None, false);
+
+        assert_eq!(usage.total_input_tokens, 4_096);
+        assert_eq!(usage.input_tokens, 4_096);
+        assert_eq!(usage.output_tokens, 17);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert!(!metadata_usage_has_signal(&metadata));
+    }
+
+    #[test]
+    fn partial_metadata_preserves_cache_and_falls_back_missing_fields() {
+        let metadata = MetadataTokenUsage {
+            uncached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cache_read_input_tokens: 1_500,
+            cache_write_input_tokens: 250,
+        };
+
+        let usage = usage_from_metadata_or_estimate(Some(&metadata), 4_096, 17);
+
+        assert_eq!(usage.total_input_tokens, 4_096);
+        assert_eq!(usage.input_tokens, 2_346);
+        assert_eq!(usage.output_tokens, 17);
+        assert_eq!(usage.cache_read_input_tokens, 1_500);
+        assert_eq!(usage.cache_creation_input_tokens, 250);
+        assert!(metadata_usage_has_signal(&metadata));
+    }
+
+    #[test]
+    fn partial_metadata_uses_reported_total_to_derive_uncached_input() {
+        let metadata = MetadataTokenUsage {
+            uncached_input_tokens: 0,
+            output_tokens: 100,
+            total_tokens: 2_000,
+            cache_read_input_tokens: 1_200,
+            cache_write_input_tokens: 300,
+        };
+
+        let usage = usage_from_metadata_or_estimate(Some(&metadata), 4_096, 17);
+
+        assert_eq!(usage.total_input_tokens, 1_900);
+        assert_eq!(usage.input_tokens, 400);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.cache_read_input_tokens, 1_200);
+        assert_eq!(usage.cache_creation_input_tokens, 300);
     }
 
     #[test]
@@ -1822,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_does_not_create_cache_read_without_existing_read() {
+    fn reported_usage_policy_preserves_input_without_existing_read() {
         let usage = CacheUsage {
             total_input_tokens: 150_000,
             input_tokens: 100_000,
@@ -1844,7 +1955,7 @@ mod tests {
 
         let reported = usage.with_reported_cache_usage_policy_and_raw(policy, raw);
 
-        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.input_tokens, raw.input_tokens);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(reported.cache_creation_input_tokens, 50_000);
         assert_eq!(
@@ -1854,7 +1965,34 @@ mod tests {
     }
 
     #[test]
-    fn final_input_guard_does_not_create_cache_read_without_existing_read() {
+    fn reported_usage_policy_uses_read_evidence_without_importing_read_value() {
+        let usage = CacheUsage {
+            total_input_tokens: 100_000,
+            input_tokens: 100_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let raw = RawUsage::uncached(100_000, 9);
+        let policy = ReportedCacheUsagePolicy::input_only(96, 29).unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy_and_raw_evidence(policy, raw, true);
+
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            raw.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.reported_total_input_tokens()
+        );
+    }
+
+    #[test]
+    fn final_input_guard_preserves_input_without_existing_read() {
         let usage = CacheUsage {
             total_input_tokens: 1_234,
             input_tokens: 1_234,
@@ -1875,7 +2013,7 @@ mod tests {
 
         let reported = policy.apply_final_input_guard(usage);
 
-        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.input_tokens, usage.input_tokens);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(
@@ -2055,7 +2193,11 @@ mod tests {
                             RawUsage::uncached(request_input, output_tokens),
                         );
 
-                        assert!((1..=input_cap).contains(&reported.input_tokens));
+                        if turn == 0 {
+                            assert_eq!(reported.input_tokens, request_input);
+                        } else {
+                            assert!((1..=input_cap).contains(&reported.input_tokens));
+                        }
                         assert_eq!(
                             reported.total_input_tokens,
                             reported.reported_total_input_tokens()
@@ -2214,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_does_not_turn_creation_only_delta_into_read_cache() {
+    fn reported_usage_policy_preserves_creation_only_uncached_input() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 80_000,
@@ -2229,7 +2371,7 @@ mod tests {
         let reported = usage.with_reported_cache_usage_policy(policy);
 
         assert!((1..=3_300).contains(&reported.cache_creation_input_tokens));
-        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.input_tokens, usage.input_tokens);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(
             reported.total_input_tokens,
@@ -2255,7 +2397,7 @@ mod tests {
         assert_eq!(reported.cache_creation_input_tokens, 40_000);
         assert_eq!(reported.cache_creation_5m_input_tokens, 30_000);
         assert_eq!(reported.cache_creation_1h_input_tokens, 10_000);
-        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.input_tokens, usage.input_tokens);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(
             reported.total_input_tokens,
@@ -2264,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_shapes_uncached_usage_without_reported_cache_read() {
+    fn reported_usage_policy_preserves_uncached_usage_without_cache_read() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 120_000,
@@ -2278,7 +2420,7 @@ mod tests {
 
         let reported = usage.with_reported_cache_usage_policy(policy);
 
-        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.input_tokens, usage.input_tokens);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(reported.output_tokens, usage.output_tokens);
@@ -2291,11 +2433,11 @@ mod tests {
     #[test]
     fn reported_usage_policy_samples_uncached_input_naturally() {
         let usage = CacheUsage {
-            total_input_tokens: 120_000,
+            total_input_tokens: 130_000,
             input_tokens: 80_000,
             output_tokens: 9,
             cache_creation_input_tokens: 40_000,
-            cache_read_input_tokens: 0,
+            cache_read_input_tokens: 10_000,
             cache_creation_5m_input_tokens: 40_000,
             cache_creation_1h_input_tokens: 0,
         };

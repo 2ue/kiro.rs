@@ -93,6 +93,7 @@ export interface CredentialStatusItem {
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
+  provider?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -151,8 +152,8 @@ export interface CredentialStatusItem {
   kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
-  rpm?: number
-  rpmOverride?: number | null
+  rpm: number
+  rpmOverride?: number
   rateLimitAutoDisableEnabled: boolean
 }
 
@@ -164,6 +165,7 @@ export type CredentialListItem = Pick<
   | 'priority'
   | 'disabled'
   | 'authMethod'
+  | 'provider'
   | 'region'
   | 'authRegion'
   | 'apiRegion'
@@ -192,9 +194,7 @@ export type CredentialListItem = Pick<
   | 'rateLimitAutoDisableEnabled'
   | 'warmupRemaining'
   | 'supportedModels'
-> & {
-  provider?: string
-}
+>
 
 export type CredentialRuntimeItem = Pick<
   CredentialStatusItem,
@@ -215,6 +215,7 @@ export type CredentialRuntimeItem = Pick<
   | 'oldestInFlightAgeSecs'
   | 'newestInFlightIdleSecs'
   | 'maxConcurrentRequests'
+  | 'rpm'
   | 'inFlightLeaseMaxSecs'
   | 'transientFailureStreak'
   | 'recentErrorRate'

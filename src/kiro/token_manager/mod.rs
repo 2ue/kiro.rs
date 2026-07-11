@@ -10,7 +10,7 @@ mod refresh;
 mod route_state;
 mod rpm;
 mod sticky;
-mod storage_task;
+pub(crate) mod storage_task;
 mod strategy;
 mod types;
 
@@ -21,8 +21,15 @@ pub use admin_snapshot::{
     ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
 };
 pub use concurrency::InFlightLeaseGuard;
-pub use manager::MultiTokenManager;
+#[allow(unused_imports)]
+pub use manager::{MultiTokenManager, StatsFlushShutdownReport, StatsFlushWorkerHandle};
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
+#[allow(unused_imports)]
+pub use storage_task::{
+    StorageTaskDrainReport, StorageTaskShutdownReport, StorageTaskStats,
+    best_effort_storage_task_stats, drain_best_effort_storage_tasks,
+    shutdown_best_effort_storage_tasks,
+};
 pub use types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID,
     TransientFailureKind,

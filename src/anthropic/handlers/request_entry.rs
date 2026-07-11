@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_MESSAGES_JSON_NESTING_DEPTH: usize = 192;
+
 pub(super) async fn handle_messages_endpoint(
     state: AppState,
     headers: HeaderMap,
@@ -133,7 +135,23 @@ pub(super) fn parse_messages_payload(
     raw_body: &Bytes,
     _request_id: &str,
 ) -> Result<MessagesRequest, EntryRequestError> {
-    let payload = serde_json::from_slice::<MessagesRequest>(raw_body).map_err(|err| {
+    if json_nesting_exceeds_limit(raw_body, MAX_MESSAGES_JSON_NESTING_DEPTH) {
+        return Err(EntryRequestError::invalid(
+            format!(
+                "JSON body nesting exceeds the supported limit of {}",
+                MAX_MESSAGES_JSON_NESTING_DEPTH
+            ),
+            "json_nesting_too_deep",
+        ));
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(raw_body);
+    deserializer.disable_recursion_limit();
+    let payload =
+        <MessagesRequest as serde::Deserialize>::deserialize(&mut deserializer).map_err(|err| {
+            EntryRequestError::invalid(format!("Invalid JSON body: {}", err), "invalid_json_body")
+        })?;
+    deserializer.end().map_err(|err| {
         EntryRequestError::invalid(format!("Invalid JSON body: {}", err), "invalid_json_body")
     })?;
     if payload.model.trim().is_empty() {
@@ -143,6 +161,39 @@ pub(super) fn parse_messages_payload(
         ));
     }
     Ok(payload)
+}
+
+fn json_nesting_exceeds_limit(raw_body: &[u8], limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for byte in raw_body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match *byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > limit {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    false
 }
 
 fn record_entry_request_error(
@@ -267,6 +318,14 @@ mod tests {
         )
     }
 
+    fn nested_json_value(depth: usize) -> Value {
+        let mut value = json!({"leaf": true});
+        for level in (0..depth).rev() {
+            value = json!({"level": level, "children": [value]});
+        }
+        value
+    }
+
     #[test]
     fn missing_max_tokens_default_value_rewrites_body_for_typed_parse() {
         let mut raw = Bytes::from_static(
@@ -285,6 +344,52 @@ mod tests {
         assert_eq!(defaulted, Some(DEFAULT_MISSING_MAX_TOKENS_VALUE));
         assert_eq!(parsed.max_tokens, DEFAULT_MISSING_MAX_TOKENS_VALUE);
         assert_eq!(parsed.model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn typed_parse_accepts_deep_tool_input_within_explicit_limit() {
+        let raw = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_deep",
+                        "name": "echo",
+                        "input": nested_json_value(80)
+                    }]
+                }]
+            }))
+            .expect("serialize deep request"),
+        );
+
+        let parsed = parse_messages_payload(&raw, "req_deep_json").expect("deep request parses");
+
+        assert_eq!(parsed.model, "claude-sonnet-4-5");
+        assert_eq!(parsed.messages.len(), 1);
+    }
+
+    #[test]
+    fn typed_parse_rejects_json_beyond_explicit_nesting_limit() {
+        let raw = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": [{
+                    "role": "user",
+                    "content": nested_json_value(MAX_MESSAGES_JSON_NESTING_DEPTH)
+                }]
+            }))
+            .expect("serialize over-deep request"),
+        );
+
+        let error = parse_messages_payload(&raw, "req_too_deep_json")
+            .expect_err("over-deep request is rejected");
+
+        assert_eq!(error.reason, "json_nesting_too_deep");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

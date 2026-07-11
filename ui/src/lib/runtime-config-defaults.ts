@@ -4,6 +4,7 @@ import type {
   BodyConversionConfig,
   ImageProcessingConfig,
   MissingMaxTokensConfig,
+  ModelMappingConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
   ReportedUsageConfig,
@@ -269,6 +270,22 @@ export function defaultModelMappingConfig() {
   }
 }
 
+export function normalizeModelMapping(config?: Partial<ModelMappingConfig> | null): ModelMappingConfig {
+  return {
+    ...defaultModelMappingConfig(),
+    ...(config ?? {}),
+    rules: (config?.rules ?? [])
+      .map((rule) => ({
+        enabled: rule.enabled !== false,
+        source: rule.source.trim().toLowerCase(),
+        target: rule.target.trim().toLowerCase(),
+        kind: rule.kind || 'alias',
+        note: rule.note?.trim() || null,
+      }))
+      .filter((rule) => rule.source && rule.target),
+  }
+}
+
 export const emptyRuntimeConfig: RuntimeConfig = {
   proxyUrl: null,
   proxyUsername: null,
@@ -446,7 +463,16 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
   const trimmed = prefix.trim()
   if (!trimmed) return null
   const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
-  return withSlash.replace(/\/+$/, '') || '/'
+  return canonicalCachePolicyPath(withSlash.replace(/\/+$/, '') || '/')
+}
+
+function canonicalCachePolicyPath(prefix: string): string {
+  const normalized = prefix.replace(/\/+$/, '') || '/'
+  const lower = normalized.toLowerCase()
+  if (lower === '/cc/v1' || lower === '/cc/v1/messages') return '/cc'
+  if (lower === '/ha/v1' || lower === '/ha/v1/messages') return '/ha'
+  if (lower === '/na/v1' || lower === '/na/v1/messages') return '/na'
+  return normalized
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
@@ -492,20 +518,24 @@ export function normalizePromptCacheCreationControl(
   }
 }
 
-export function normalizePayloadShaping(config: PayloadShapingConfig): PayloadShapingConfig {
+export function normalizePayloadShaping(config?: Partial<PayloadShapingConfig> | null): PayloadShapingConfig {
+  const next = {
+    ...defaultPayloadShaping(),
+    ...(config ?? {}),
+  }
   return {
-    ...config,
-    historicalToolResultMaxChars: toWhole(config.historicalToolResultMaxChars),
-    historicalToolResultHeadLines: toWhole(config.historicalToolResultHeadLines),
-    historicalToolResultTailLines: toWhole(config.historicalToolResultTailLines),
-    toolDefinitionsBudgetBytes: toWhole(config.toolDefinitionsBudgetBytes),
-    toolDescriptionMaxChars: toWhole(config.toolDescriptionMaxChars),
-    toolSchemaAnnotationMaxChars: toWhole(config.toolSchemaAnnotationMaxChars),
-    webFetchBodyMaxChars: toWhole(config.webFetchBodyMaxChars),
-    currentToolResultMaxChars: toWhole(config.currentToolResultMaxChars),
-    currentUserContentMaxChars: toWhole(config.currentUserContentMaxChars),
-    currentDocumentMaxChars: toWhole(config.currentDocumentMaxChars),
-    currentImagesMaxBytes: toWhole(config.currentImagesMaxBytes),
-    oversizedImageHandling: config.oversizedImageHandling ?? 'drop-with-placeholder',
+    ...next,
+    historicalToolResultMaxChars: toWhole(next.historicalToolResultMaxChars),
+    historicalToolResultHeadLines: toWhole(next.historicalToolResultHeadLines),
+    historicalToolResultTailLines: toWhole(next.historicalToolResultTailLines),
+    toolDefinitionsBudgetBytes: toWhole(next.toolDefinitionsBudgetBytes),
+    toolDescriptionMaxChars: toWhole(next.toolDescriptionMaxChars),
+    toolSchemaAnnotationMaxChars: toWhole(next.toolSchemaAnnotationMaxChars),
+    webFetchBodyMaxChars: toWhole(next.webFetchBodyMaxChars),
+    currentToolResultMaxChars: toWhole(next.currentToolResultMaxChars),
+    currentUserContentMaxChars: toWhole(next.currentUserContentMaxChars),
+    currentDocumentMaxChars: toWhole(next.currentDocumentMaxChars),
+    currentImagesMaxBytes: toWhole(next.currentImagesMaxBytes),
+    oversizedImageHandling: next.oversizedImageHandling ?? 'drop-with-placeholder',
   }
 }

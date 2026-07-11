@@ -13,7 +13,7 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig,
     ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
     PromptCacheSimulationMode, ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
@@ -40,39 +40,19 @@ use super::{
 /// 请求体最大大小限制 (50MB)
 const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
-/// 创建 Anthropic API 路由
-///
-/// # 端点
-/// - `GET /v1/models` - 获取可用模型列表
-/// - `POST /v1/messages` - 创建消息（对话）
-/// - `POST /v1/messages/count_tokens` - 计算 token 数量
-/// - `GET /na/v1/models` - 获取可用模型列表（no-cache）
-/// - `POST /na/v1/messages` - 创建消息（no-cache）
-/// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
-/// - `GET /ha/v1/models` - 获取可用模型列表（high-cache，usage 上报由 `/ha` 覆盖项控制）
-/// - `POST /ha/v1/messages` - 创建消息（high-cache，usage 上报由 `/ha` 覆盖项控制）
-/// - `POST /ha/v1/messages/count_tokens` - 计算 token 数量
-///
-/// # 认证
-/// 所有 `/v1` 路径需要 API Key 认证，支持：
-/// - `x-api-key` header
-/// - `Authorization: Bearer <token>` header
-///
-/// # 参数
-/// - `api_key`: API 密钥，用于验证客户端请求
-/// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
+pub struct AnthropicRouterDependencies {
+    pub request_api_keys: Arc<RequestApiKeyStore>,
+    pub kiro_provider: Option<Arc<KiroProvider>>,
+    pub usage_recorder: Arc<UsageRecorder>,
+    pub prompt_cache: Arc<PromptCacheTracker>,
+    pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
+    pub pricing_catalog: Arc<PricingCatalog>,
+    pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
+    pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
+}
 
-/// 创建带有 KiroProvider 的 Anthropic API 路由
-#[allow(clippy::too_many_arguments)]
-pub fn create_router_with_provider(
-    request_api_keys: Arc<RequestApiKeyStore>,
-    kiro_provider: Option<Arc<KiroProvider>>,
+pub struct AnthropicRouterConfig {
     extract_thinking: bool,
-    usage_recorder: Arc<UsageRecorder>,
-    prompt_cache: Arc<PromptCacheTracker>,
-    prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
-    pricing_catalog: Arc<PricingCatalog>,
-    model_capabilities: Arc<ModelCapabilitiesCatalog>,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -105,8 +85,121 @@ pub fn create_router_with_provider(
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
     tool_format_debug: ToolFormatDebugConfig,
-    external_pool_manager: Option<Arc<ExternalPoolManager>>,
+}
+
+impl AnthropicRouterConfig {
+    pub fn from_runtime_config(config: &Config) -> Self {
+        Self {
+            extract_thinking: config.extract_thinking,
+            prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
+            prompt_cache_token_scale: config.prompt_cache_token_scale,
+            prompt_cache_max_simulated_input_tokens: config.prompt_cache_max_simulated_input_tokens,
+            prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens,
+            prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens,
+            prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
+            prompt_cache_creation_control: config.prompt_cache_creation_control.normalized(),
+            prompt_cache_bounds: PromptCacheBounds::from_config(
+                config.prompt_cache_max_entries_per_account,
+                config.prompt_cache_max_entries_global,
+                config.prompt_cache_entry_ttl_secs,
+                config.prompt_cache_estimated_bytes_limit,
+            ),
+            reported_usage: config.reported_usage.clone(),
+            cache_policy: config.cache_policy.clone(),
+            defined_cache_routes: config.defined_cache_routes.clone(),
+            compat_profile: config.compat_profile,
+            thinking_trigger_mode: config.thinking_trigger_mode,
+            model_resolution_mode: config.model_resolution_mode,
+            model_mapping: config.model_mapping.clone().normalized(),
+            expose_proxy_warnings: config.expose_proxy_warnings,
+            payload_guard_enabled: config.payload_guard_enabled,
+            payload_guard_mode: config.payload_guard_mode,
+            payload_guard_max_bytes: config.payload_guard_max_bytes,
+            payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
+            payload_guard_trim_history: config.payload_guard_trim_history,
+            payload_guard_external_enabled: config.payload_guard_external_enabled,
+            kiro_cache_point_enabled: config.kiro_cache_point_enabled,
+            kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
+            kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
+            kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            image_processing: config.image_processing.normalized(),
+            body_conversion: config.body_conversion,
+            missing_max_tokens: config.missing_max_tokens.normalized(),
+            payload_shaping: config.payload_shaping,
+            external_pools: config.external_pools.clone(),
+            tool_format_debug: config.tool_format_debug.clone(),
+        }
+    }
+}
+
+/// 创建 Anthropic API 路由
+///
+/// # 端点
+/// - `GET /v1/models` - 获取可用模型列表
+/// - `POST /v1/messages` - 创建消息（对话）
+/// - `POST /v1/messages/count_tokens` - 计算 token 数量
+/// - `GET /na/v1/models` - 获取可用模型列表（no-cache）
+/// - `POST /na/v1/messages` - 创建消息（no-cache）
+/// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
+/// - `GET /ha/v1/models` - 获取可用模型列表（high-cache，usage 上报由 `/ha` 覆盖项控制）
+/// - `POST /ha/v1/messages` - 创建消息（high-cache，usage 上报由 `/ha` 覆盖项控制）
+/// - `POST /ha/v1/messages/count_tokens` - 计算 token 数量
+///
+/// # 认证
+/// 所有 `/v1` 路径需要 API Key 认证，支持：
+/// - `x-api-key` header
+/// - `Authorization: Bearer <token>` header
+///
+/// 创建带有 KiroProvider 的 Anthropic API 路由
+pub fn create_router_with_provider(
+    dependencies: AnthropicRouterDependencies,
+    config: AnthropicRouterConfig,
 ) -> Router {
+    let AnthropicRouterDependencies {
+        request_api_keys,
+        kiro_provider,
+        usage_recorder,
+        prompt_cache,
+        prompt_cache_creation_controller,
+        pricing_catalog,
+        model_capabilities,
+        external_pool_manager,
+    } = dependencies;
+    let AnthropicRouterConfig {
+        extract_thinking,
+        prompt_cache_target_read_ratio,
+        prompt_cache_token_scale,
+        prompt_cache_max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens,
+        prompt_cache_creation_control,
+        prompt_cache_bounds,
+        reported_usage,
+        cache_policy,
+        defined_cache_routes,
+        compat_profile,
+        thinking_trigger_mode,
+        model_resolution_mode,
+        model_mapping,
+        expose_proxy_warnings,
+        payload_guard_enabled,
+        payload_guard_mode,
+        payload_guard_max_bytes,
+        payload_guard_safety_margin_bytes,
+        payload_guard_trim_history,
+        payload_guard_external_enabled,
+        kiro_cache_point_enabled,
+        kiro_cache_point_tools_only,
+        kiro_cache_point_record_plan,
+        kiro_upstream_stream_idle_timeout_secs,
+        image_processing,
+        body_conversion,
+        missing_max_tokens,
+        payload_shaping,
+        external_pools,
+        tool_format_debug,
+    } = config;
     let tool_format_debug_recorder = ToolFormatDebugRecorder::new(tool_format_debug);
     let mut base_state = AppState::new(
         request_api_keys,

@@ -18,3 +18,40 @@ export const DEFAULT_TEST_PROMPT = 'hi'
 export function testModelLabel(model: string) {
   return TEST_MODELS.find((option) => option.id === model)?.label || model
 }
+
+function isAutoModel(model: string) {
+  return model.trim().toLowerCase() === 'auto'
+}
+
+export interface TestModelCatalogItem {
+  model: string
+  displayName?: string
+}
+
+export function buildTestModelOptions(
+  catalogModels?: TestModelCatalogItem[],
+  supportedModels?: string[]
+): TestModelOption[] {
+  const seen = new Set<string>()
+  const options: TestModelOption[] = []
+  const push = (id: string, label?: string) => {
+    const model = id.trim()
+    if (!model) return
+    const key = model.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    options.push({ id: model, label: label?.trim() || testModelLabel(model) })
+  }
+
+  ;(supportedModels || []).forEach((model) => push(model))
+  ;[...(catalogModels || [])]
+    .sort((left, right) => left.model.localeCompare(right.model))
+    .forEach((item) => push(item.model, item.displayName || testModelLabel(item.model)))
+  TEST_MODELS.forEach((item) => push(item.id, item.label))
+
+  return options.sort((left, right) => Number(isAutoModel(left.id)) - Number(isAutoModel(right.id)))
+}
+
+export function defaultTestModelForOptions(options: TestModelOption[]) {
+  return options.find((option) => !isAutoModel(option.id))?.id || DEFAULT_TEST_MODEL
+}

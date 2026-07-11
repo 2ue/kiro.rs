@@ -17,7 +17,16 @@ env:
   IMAGE_NAME: kiro-rs
 
 jobs:
+  quality:
+    if: ${{ github.event.created == true && github.event.deleted == false && github.event.forced == false }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yaml
+    with:
+      release_tag: ${{ github.ref_name }}
+
   build:
+    needs: quality
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -41,10 +50,6 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           VERSION_WITHOUT_V="${VERSION#v}"
-          if [[ ! "$VERSION_WITHOUT_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Docker publish tags must use Git tag format vMAJOR.MINOR.PATCH, for example v0.0.2."
-            exit 1
-          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "version_without_v=${VERSION_WITHOUT_V}" >> "$GITHUB_OUTPUT"
 
@@ -135,6 +140,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Determine version
         id: version
         shell: bash
@@ -144,6 +154,12 @@ jobs:
           if [[ ! "$VERSION_WITHOUT_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Docker publish tags must use Git tag format vMAJOR.MINOR.PATCH, for example v0.0.2."
             exit 1
+          fi
+          LATEST_STABLE_TAG="$(git tag --list 'v*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { print; exit }')"
+          if [ "$VERSION" = "$LATEST_STABLE_TAG" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
           fi
           echo "version_without_v=${VERSION_WITHOUT_V}" >> "$GITHUB_OUTPUT"
 
@@ -203,6 +219,7 @@ jobs:
             shift
 
             local refs=()
+            local tags=(-t "${image}:${VERSION_WITHOUT_V}")
             for digest in "${DIGESTS[@]}"; do
               if [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
                 echo "::error::Invalid digest artifact name: $digest"
@@ -210,10 +227,12 @@ jobs:
               fi
               refs+=("${image}@sha256:${digest}")
             done
+            if [ "${{ steps.version.outputs.is_latest }}" = "true" ]; then
+              tags+=(-t "${image}:latest")
+            fi
 
             docker buildx imagetools create \
-              -t "${image}:${VERSION_WITHOUT_V}" \
-              -t "${image}:latest" \
+              "${tags[@]}" \
               "${refs[@]}"
           }
 

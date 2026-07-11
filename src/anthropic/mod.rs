@@ -55,4 +55,4 @@ pub mod types;
 pub(crate) mod usage;
 mod websearch;
 
-pub use router::create_router_with_provider;
+pub use router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider};

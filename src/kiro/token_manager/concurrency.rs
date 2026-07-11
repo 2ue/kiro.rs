@@ -12,14 +12,118 @@ use crate::storage::redis_cache::{RedisStore, SchedulerCredentialState};
 
 use super::account_state::CredentialEntry;
 use super::route_state::CachedLocalPoolRouteState;
-use super::storage_task::spawn_best_effort_storage_task;
+use super::storage_task::{
+    block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
+};
 use super::types::InFlightKind;
 
-const RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL: StdDuration = StdDuration::from_secs(30);
+const RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_TTL: StdDuration = StdDuration::from_secs(15 * 60);
 const RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_PRUNE_THRESHOLD: usize = 4096;
 const RELEASED_IN_FLIGHT_LEASE_TOMBSTONE_HARD_LIMIT: usize = 200_000;
+const REDIS_CRITICAL_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const REDIS_CRITICAL_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const DISPATCH_QUEUE_LEASE_RENEW_INTERVAL_MAX_SECS: u64 = 20;
 
 pub(super) type ReleasedInFlightLeaseTombstones = Arc<Mutex<HashMap<(u64, u64), Instant>>>;
+
+pub(super) async fn release_redis_in_flight_lease_and_wakeup(
+    redis: Arc<RedisStore>,
+    credential_id: u64,
+    lease_id: u64,
+    tombstone: bool,
+    attempts: usize,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "kind": "dispatch_wakeup",
+        "credentialId": credential_id,
+        "leaseId": lease_id,
+        "changedAt": Utc::now().to_rfc3339(),
+    })
+    .to_string();
+    let attempts = attempts.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match tokio::time::timeout(
+            REDIS_CRITICAL_OPERATION_TIMEOUT,
+            redis.release_in_flight_lease_and_publish_wakeup(
+                credential_id,
+                lease_id,
+                tombstone,
+                &payload,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(err)) => last_error = Some(err),
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!(
+                    "Redis lease release timed out after {}ms",
+                    REDIS_CRITICAL_OPERATION_TIMEOUT.as_millis()
+                ));
+            }
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(REDIS_CRITICAL_RETRY_DELAY).await;
+        }
+    }
+    Err(last_error.expect("at least one Redis release attempt must run"))
+}
+
+async fn release_redis_dispatch_queue_lease_with_retry(
+    redis: Arc<RedisStore>,
+    lease_id: String,
+    attempts: usize,
+) -> anyhow::Result<()> {
+    let attempts = attempts.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match tokio::time::timeout(
+            REDIS_CRITICAL_OPERATION_TIMEOUT,
+            redis.leave_dispatch_queue(&lease_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(err)) => last_error = Some(err),
+            Err(_) => {
+                last_error = Some(anyhow::anyhow!(
+                    "Redis dispatch queue release timed out after {}ms",
+                    REDIS_CRITICAL_OPERATION_TIMEOUT.as_millis()
+                ));
+            }
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(REDIS_CRITICAL_RETRY_DELAY).await;
+        }
+    }
+    Err(last_error.expect("at least one Redis queue release attempt must run"))
+}
+
+pub(super) fn release_redis_dispatch_queue_lease_reliably(
+    redis: Arc<RedisStore>,
+    lease_id: String,
+) {
+    let fallback_redis = redis.clone();
+    let fallback_lease_id = lease_id.clone();
+    let admitted = spawn_critical_storage_task("释放 Redis 调度排队 lease", async move {
+        release_redis_dispatch_queue_lease_with_retry(redis, lease_id, 2).await
+    });
+    if !admitted
+        && let Err(err) = block_on_storage(
+            "关键队列拒绝后同步释放 Redis 调度排队 lease",
+            async move {
+                release_redis_dispatch_queue_lease_with_retry(fallback_redis, fallback_lease_id, 2)
+                    .await
+            },
+        )
+    {
+        tracing::error!(
+            "Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+            err
+        );
+    }
+}
 
 fn prune_released_in_flight_lease_tombstones_locked(
     tombstones: &mut HashMap<(u64, u64), Instant>,
@@ -146,28 +250,58 @@ impl InFlightLeaseGuard {
             let credential_id = self.credential_id;
             let lease_id = self.lease_id;
             let tombstone_release = self.tombstone_redis_release;
-            spawn_best_effort_storage_task("释放 Redis 并发 lease", async move {
-                let released = if tombstone_release {
-                    redis
-                        .release_in_flight_lease_with_tombstone(credential_id, lease_id)
-                        .await?
-                } else {
-                    redis
-                        .release_in_flight_lease(credential_id, lease_id)
-                        .await?
-                };
-                if released {
-                    let payload = serde_json::json!({
-                        "kind": "dispatch_wakeup",
-                        "credentialId": credential_id,
-                        "leaseId": lease_id,
-                        "changedAt": Utc::now().to_rfc3339(),
-                    })
-                    .to_string();
-                    redis.publish_dispatch_wakeup(payload).await?;
+            let retry_redis = redis.clone();
+            let fallback_redis = redis.clone();
+            if let Err(err) = block_on_storage("释放 Redis 并发 lease 并唤醒调度", async move {
+                release_redis_in_flight_lease_and_wakeup(
+                    redis,
+                    credential_id,
+                    lease_id,
+                    tombstone_release,
+                    1,
+                )
+                .await
+            }) {
+                tracing::warn!(
+                    credential_id,
+                    lease_id,
+                    "同步释放 Redis 并发 lease 失败，将后台重试: {}",
+                    err
+                );
+                let admitted =
+                    spawn_critical_storage_task("重试释放 Redis 并发 lease", async move {
+                        release_redis_in_flight_lease_and_wakeup(
+                            retry_redis,
+                            credential_id,
+                            lease_id,
+                            tombstone_release,
+                            2,
+                        )
+                        .await
+                    });
+                if !admitted {
+                    if let Err(retry_err) = block_on_storage(
+                        "关键队列拒绝后同步重试释放 Redis 并发 lease",
+                        async move {
+                            release_redis_in_flight_lease_and_wakeup(
+                                fallback_redis,
+                                credential_id,
+                                lease_id,
+                                tombstone_release,
+                                2,
+                            )
+                            .await
+                        },
+                    ) {
+                        tracing::error!(
+                            credential_id,
+                            lease_id,
+                            "Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+                            retry_err
+                        );
+                    }
                 }
-                Ok(())
-            });
+            }
         }
     }
 
@@ -215,7 +349,9 @@ pub(super) struct DispatchQueueGuard {
     local_queued: Arc<AtomicU32>,
     in_flight_notify: Arc<Notify>,
     local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
-    redis_admitted: bool,
+    redis_lease_id: Option<String>,
+    redis_lease_ttl_secs: u64,
+    next_redis_renew_at: Option<Instant>,
     released: AtomicBool,
 }
 
@@ -225,16 +361,57 @@ impl DispatchQueueGuard {
         local_queued: Arc<AtomicU32>,
         in_flight_notify: Arc<Notify>,
         local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
-        redis_admitted: bool,
+        redis_lease_id: Option<String>,
+        redis_lease_ttl_secs: u64,
     ) -> Self {
+        let renew_interval_secs =
+            (redis_lease_ttl_secs / 3).clamp(1, DISPATCH_QUEUE_LEASE_RENEW_INTERVAL_MAX_SECS);
+        let next_redis_renew_at = redis_lease_id
+            .as_ref()
+            .map(|_| Instant::now() + StdDuration::from_secs(renew_interval_secs));
         Self {
             redis_store,
             local_queued,
             in_flight_notify,
             local_pool_route_state_cache,
-            redis_admitted,
+            redis_lease_id,
+            redis_lease_ttl_secs,
+            next_redis_renew_at,
             released: AtomicBool::new(false),
         }
+    }
+
+    pub(super) async fn renew_if_needed(&mut self) -> anyhow::Result<()> {
+        if self.released.load(Ordering::Acquire)
+            || self
+                .next_redis_renew_at
+                .is_none_or(|renew_at| Instant::now() < renew_at)
+        {
+            return Ok(());
+        }
+        let (Some(redis), Some(lease_id)) = (&self.redis_store, &self.redis_lease_id) else {
+            self.next_redis_renew_at = None;
+            return Ok(());
+        };
+        let renewed = tokio::time::timeout(
+            REDIS_CRITICAL_OPERATION_TIMEOUT,
+            redis.renew_dispatch_queue(lease_id, self.redis_lease_ttl_secs),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Redis dispatch queue renewal timed out after {}ms",
+                REDIS_CRITICAL_OPERATION_TIMEOUT.as_millis()
+            )
+        })??;
+        if !renewed {
+            anyhow::bail!("Redis dispatch queue lease expired before renewal");
+        }
+        let renew_interval_secs =
+            (self.redis_lease_ttl_secs / 3).clamp(1, DISPATCH_QUEUE_LEASE_RENEW_INTERVAL_MAX_SECS);
+        self.next_redis_renew_at =
+            Some(Instant::now() + StdDuration::from_secs(renew_interval_secs));
+        Ok(())
     }
 
     fn release(&self) {
@@ -243,13 +420,8 @@ impl DispatchQueueGuard {
         }
         self.local_queued.fetch_sub(1, Ordering::AcqRel);
         self.local_pool_route_state_cache.lock().clear();
-        if self.redis_admitted {
-            if let Some(redis) = &self.redis_store {
-                let redis = redis.clone();
-                spawn_best_effort_storage_task("释放 Redis 调度排队占位", async move {
-                    redis.leave_dispatch_queue().await
-                });
-            }
+        if let (Some(redis), Some(lease_id)) = (&self.redis_store, &self.redis_lease_id) {
+            release_redis_dispatch_queue_lease_reliably(redis.clone(), lease_id.clone());
         }
         self.in_flight_notify.notify_waiters();
     }
@@ -329,5 +501,29 @@ fn set_in_flight_lease_kind_from_entries(
             lease.kind = kind;
             lease.last_seen_at = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_queue_guard_releases_local_count_only_once() {
+        let queued = Arc::new(AtomicU32::new(1));
+        let guard = DispatchQueueGuard::new(
+            None,
+            queued.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+            60,
+        );
+
+        guard.release();
+        guard.release();
+        drop(guard);
+
+        assert_eq!(queued.load(Ordering::Acquire), 0);
     }
 }

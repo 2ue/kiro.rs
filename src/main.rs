@@ -11,7 +11,7 @@ pub mod token;
 
 use std::{
     collections::HashMap,
-    future::Future,
+    future::{Future, IntoFuture},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -19,7 +19,6 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use anthropic::prompt_cache::PromptCacheBounds;
 use anyhow::Context as _;
 use axum::{
     Json, Router,
@@ -44,6 +43,11 @@ use storage::postgres::{PostgresStore, PostgresUsageStore};
 use storage::redis_cache::RedisStore;
 
 const STARTUP_DEPENDENCY_MAX_WAIT: StdDuration = StdDuration::from_secs(60);
+const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 
 #[tokio::main]
 async fn main() {
@@ -186,16 +190,23 @@ async fn main() {
     config.set_config_path_for_runtime(None);
     apply_service_bind_env_overrides(&mut config);
 
-    let credentials_list = postgres_store.load_credentials().await.unwrap_or_else(|e| {
-        tracing::error!("从 PgSQL 加载凭据失败: {}", e);
-        std::process::exit(1);
-    });
+    let (credentials_list, initial_runtime_states) = postgres_store
+        .load_credentials_with_runtime_state()
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("从 PgSQL 一致性加载凭据和运行态失败: {}", e);
+            std::process::exit(1);
+        });
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
-    // 获取第一个凭据用于日志显示
-    let first_credentials = credentials_list.first().cloned().unwrap_or_default();
-    tracing::debug!("主凭证: {:?}", first_credentials);
+    if let Some(first_credentials) = credentials_list.first() {
+        tracing::debug!(
+            credential_id = ?first_credentials.id,
+            disabled = first_credentials.disabled,
+            "已选择主凭证"
+        );
+    }
 
     // 获取客户端请求 API Key。历史配置使用 apiKey；新配置可额外使用 apiKeys。
     let request_api_keys = config.request_api_keys();
@@ -215,7 +226,7 @@ async fn main() {
     });
 
     if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+        tracing::info!("已配置 HTTP 代理");
     }
 
     // 构建端点注册表
@@ -312,23 +323,22 @@ async fn main() {
     }
 
     // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new_with_stores(
+    let token_manager = MultiTokenManager::new_with_stores_and_runtime_state(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
-        None,
-        true,
         Some(postgres_store.clone()),
         Some(redis_store.clone()),
+        Some(initial_runtime_states),
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    token_manager.spawn_stats_flush_worker();
+    let stats_flush_worker = token_manager.spawn_stats_flush_worker();
     let runtime_event_health = Arc::new(RuntimeEventHealth::default());
-    spawn_redis_runtime_event_listener(
+    let runtime_event_listener = spawn_redis_runtime_event_listener(
         redis_store.clone(),
         token_manager.clone(),
         request_api_key_store.clone(),
@@ -345,7 +355,7 @@ async fn main() {
         postgres_store.clone(),
         redis_store.clone(),
     ));
-    {
+    let startup_catalog_sync_task = {
         let model_capabilities = model_capabilities.clone();
         let postgres_store = postgres_store.clone();
         let kiro_provider = kiro_provider.clone();
@@ -393,8 +403,8 @@ async fn main() {
                     "模型价格已按当前模型能力目录初始化"
                 );
             }
-        });
-    }
+        })
+    };
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -407,52 +417,17 @@ async fn main() {
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
-        request_api_key_store.clone(),
-        Some(kiro_provider.clone()),
-        config.extract_thinking,
-        usage_recorder.clone(),
-        prompt_cache.clone(),
-        prompt_cache_creation_controller.clone(),
-        pricing_catalog.clone(),
-        model_capabilities.clone(),
-        config.prompt_cache_target_read_ratio,
-        config.prompt_cache_token_scale,
-        config.prompt_cache_max_simulated_input_tokens,
-        config.prompt_cache_cap_jitter_min_tokens,
-        config.prompt_cache_cap_jitter_max_tokens,
-        config.prompt_cache_scale_min_input_tokens,
-        config.prompt_cache_creation_control.normalized(),
-        PromptCacheBounds::from_config(
-            config.prompt_cache_max_entries_per_account,
-            config.prompt_cache_max_entries_global,
-            config.prompt_cache_entry_ttl_secs,
-            config.prompt_cache_estimated_bytes_limit,
-        ),
-        config.reported_usage.clone(),
-        config.cache_policy.clone(),
-        config.defined_cache_routes.clone(),
-        config.compat_profile,
-        config.thinking_trigger_mode,
-        config.model_resolution_mode,
-        config.model_mapping.clone().normalized(),
-        config.expose_proxy_warnings,
-        config.payload_guard_enabled,
-        config.payload_guard_mode,
-        config.payload_guard_max_bytes,
-        config.payload_guard_safety_margin_bytes,
-        config.payload_guard_trim_history,
-        config.payload_guard_external_enabled,
-        config.kiro_cache_point_enabled,
-        config.kiro_cache_point_tools_only,
-        config.kiro_cache_point_record_plan,
-        config.kiro_upstream_stream_idle_timeout_secs,
-        config.image_processing.normalized(),
-        config.body_conversion,
-        config.missing_max_tokens.normalized(),
-        config.payload_shaping,
-        config.external_pools.clone(),
-        config.tool_format_debug.clone(),
-        Some(external_pool_manager.clone()),
+        anthropic::AnthropicRouterDependencies {
+            request_api_keys: request_api_key_store.clone(),
+            kiro_provider: Some(kiro_provider.clone()),
+            usage_recorder: usage_recorder.clone(),
+            prompt_cache: prompt_cache.clone(),
+            prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
+            pricing_catalog: pricing_catalog.clone(),
+            model_capabilities: model_capabilities.clone(),
+            external_pool_manager: Some(external_pool_manager.clone()),
+        },
+        anthropic::AnthropicRouterConfig::from_runtime_config(&config),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -468,20 +443,20 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(
-                token_manager.clone(),
-                endpoint_names.clone(),
-                usage_recorder.clone(),
-                prompt_cache.clone(),
-                prompt_cache_creation_controller.clone(),
-                pricing_catalog.clone(),
-                model_capabilities.clone(),
-                kiro_provider.clone(),
-                postgres_store.clone(),
-                redis_store.clone(),
-                request_api_key_store.clone(),
-                external_pool_manager.clone(),
-            );
+            let admin_service = admin::AdminService::new(admin::AdminServiceDependencies {
+                token_manager: token_manager.clone(),
+                known_endpoints: endpoint_names.clone(),
+                usage_recorder: usage_recorder.clone(),
+                prompt_cache: prompt_cache.clone(),
+                prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
+                pricing_catalog: pricing_catalog.clone(),
+                model_capabilities: model_capabilities.clone(),
+                kiro_provider: kiro_provider.clone(),
+                postgres_store: postgres_store.clone(),
+                redis_store: redis_store.clone(),
+                request_api_key_store: request_api_key_store.clone(),
+                external_pool_manager: external_pool_manager.clone(),
+            });
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -505,7 +480,7 @@ async fn main() {
     let health_state = Arc::new(AppHealthState {
         postgres_store: postgres_store.clone(),
         redis_store: redis_store.clone(),
-        runtime_events: runtime_event_health,
+        runtime_events: runtime_event_health.clone(),
     });
     let app = app.merge(create_health_router(health_state));
 
@@ -555,7 +530,220 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let server_result = serve_until_shutdown(listener, app).await;
+
+    let shutdown_started_at = Instant::now();
+    let shutdown_deadline = shutdown_started_at + BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT;
+    runtime_event_health.mark_disconnected();
+    tokio::join!(
+        abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
+        abort_task_with_timeout("startup catalog sync", startup_catalog_sync_task),
+    );
+
+    let stats_report = stats_flush_worker
+        .shutdown(remaining_shutdown_budget(
+            shutdown_deadline,
+            BACKGROUND_SHUTDOWN_TIMEOUT,
+        ))
+        .await;
+    tracing::info!(
+        signal_sent = stats_report.signal_sent,
+        flushed = stats_report.flushed,
+        timed_out = stats_report.timed_out,
+        task_failed = stats_report.task_failed,
+        pending_stats_batches = stats_report.pending_stats_batches,
+        pending_stats_deltas = stats_report.pending_stats_deltas,
+        pending_runtime_mutations = stats_report.pending_runtime_mutations,
+        overflow_runtime_mutations = stats_report.overflow_runtime_mutations,
+        "凭据统计后台任务已停止"
+    );
+    let stats_shutdown_failed = !stats_report.flushed
+        || stats_report.timed_out
+        || stats_report.task_failed
+        || stats_report.pending_stats_batches > 0
+        || stats_report.pending_stats_deltas > 0
+        || stats_report.pending_runtime_mutations > 0;
+
+    let storage_stats = kiro::token_manager::best_effort_storage_task_stats();
+    let usage_drain_timeout =
+        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
+    let storage_drain_timeout =
+        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
+    let (usage_drain, storage_drain) = tokio::join!(
+        usage_recorder.drain(usage_drain_timeout),
+        kiro::token_manager::drain_best_effort_storage_tasks(storage_drain_timeout),
+    );
+    tracing::info!(
+        timed_out = usage_drain.timed_out,
+        postgres_target = usage_drain.postgres.target,
+        postgres_finished = usage_drain.postgres.finished,
+        redis_target = usage_drain.redis.target,
+        redis_finished = usage_drain.redis.finished,
+        "Usage writer 排空阶段已结束"
+    );
+    tracing::info!(
+        accepting = storage_stats.accepting,
+        queued = storage_stats
+            .queue_capacity
+            .saturating_sub(storage_stats.queue_available),
+        target = storage_drain.target,
+        finished = storage_drain.finished,
+        timed_out = storage_drain.timed_out,
+        "后台存储任务排空阶段已结束"
+    );
+
+    let usage_shutdown_timeout =
+        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
+    let storage_shutdown_timeout =
+        remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
+    let (usage_report, storage_report) = tokio::join!(
+        usage_recorder.shutdown(usage_shutdown_timeout),
+        kiro::token_manager::shutdown_best_effort_storage_tasks(storage_shutdown_timeout),
+    );
+    tracing::info!(
+        already_started = usage_report.already_started,
+        drained = usage_report.drained,
+        timed_out = usage_report.timed_out,
+        postgres_abandoned = usage_report.postgres_abandoned,
+        redis_abandoned = usage_report.redis_abandoned,
+        postgres_accepted = usage_report.stats.writer_accepted,
+        postgres_finished = usage_report.stats.writer_finished,
+        redis_accepted = usage_report.stats.redis_writer_accepted,
+        redis_finished = usage_report.stats.redis_writer_finished,
+        "Usage writer 已停止"
+    );
+    tracing::info!(
+        already_started = storage_report.already_started,
+        drained = storage_report.drained,
+        timed_out = storage_report.timed_out,
+        abandoned = storage_report.abandoned,
+        accepted = storage_report.stats.accepted,
+        finished = storage_report.stats.finished,
+        rejected_full = storage_report.stats.rejected_full,
+        "后台存储任务执行器已停止"
+    );
+    tracing::info!(
+        elapsed_ms = shutdown_started_at.elapsed().as_millis() as u64,
+        total_budget_ms = BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT.as_millis() as u64,
+        deadline_exhausted = Instant::now() >= shutdown_deadline,
+        "后台生命周期关闭完成"
+    );
+
+    if stats_shutdown_failed {
+        panic!(
+            "凭据统计关闭未完整排空: timed_out={}, task_failed={}, pending_stats_batches={}, pending_stats_deltas={}, pending_runtime_mutations={}",
+            stats_report.timed_out,
+            stats_report.task_failed,
+            stats_report.pending_stats_batches,
+            stats_report.pending_stats_deltas,
+            stats_report.pending_runtime_mutations,
+        );
+    }
+    if let Err(err) = server_result {
+        panic!("HTTP 服务异常退出: {err}");
+    }
+}
+
+fn remaining_shutdown_budget(deadline: Instant, stage_limit: StdDuration) -> StdDuration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .min(stage_limit)
+}
+
+async fn abort_task_with_timeout<T>(task_name: &'static str, task: tokio::task::JoinHandle<T>) {
+    task.abort();
+    if tokio::time::timeout(ABORTED_TASK_JOIN_TIMEOUT, task)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            task = task_name,
+            timeout_ms = ABORTED_TASK_JOIN_TIMEOUT.as_millis() as u64,
+            "等待已中止后台任务退出超时，丢弃任务句柄"
+        );
+    }
+}
+
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+) -> std::io::Result<()> {
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_sender.send(true);
+    });
+
+    let mut graceful_receiver = shutdown_receiver.clone();
+    let graceful_shutdown = async move {
+        wait_for_shutdown_request(&mut graceful_receiver).await;
+        tracing::info!("收到停止信号，停止接收新请求");
+    };
+    let mut deadline_receiver = shutdown_receiver;
+    let shutdown_deadline = async move {
+        wait_for_shutdown_request(&mut deadline_receiver).await;
+        tokio::time::sleep(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT).await;
+    };
+
+    let mut server = Box::pin(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(graceful_shutdown)
+            .into_future(),
+    );
+    let result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown_deadline => {
+            tracing::warn!(
+                timeout_secs = SERVER_GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+                "等待 HTTP 连接排空超时，停止剩余连接"
+            );
+            Ok(())
+        }
+    };
+    drop(server);
+    abort_task_with_timeout("shutdown signal listener", signal_task).await;
+    result
+}
+
+async fn wait_for_shutdown_request(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *receiver.borrow() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!("监听 Ctrl-C 失败: {}", err);
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!("监听 SIGTERM 失败: {}", err);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 async fn retry_startup_dependency<T, F, Fut>(
@@ -712,7 +900,7 @@ fn spawn_redis_runtime_event_listener(
     token_manager: Arc<MultiTokenManager>,
     request_api_key_store: Arc<RequestApiKeyStore>,
     health: Arc<RuntimeEventHealth>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let config_channel = redis_store.runtime_config_changed_channel();
@@ -778,7 +966,7 @@ fn spawn_redis_runtime_event_listener(
             tracing::warn!("Redis 运行时事件订阅已断开，准备重新订阅");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-    });
+    })
 }
 
 fn handle_cli_command(
@@ -881,4 +1069,26 @@ fn handle_credentials_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn remaining_shutdown_budget_caps_each_stage_and_expires() {
+        let future_deadline = Instant::now() + StdDuration::from_secs(1);
+        assert_eq!(
+            remaining_shutdown_budget(future_deadline, StdDuration::from_millis(10)),
+            StdDuration::from_millis(10)
+        );
+
+        let expired_deadline = Instant::now()
+            .checked_sub(StdDuration::from_millis(1))
+            .expect("Instant supports a one millisecond subtraction");
+        assert_eq!(
+            remaining_shutdown_budget(expired_deadline, StdDuration::from_secs(1)),
+            StdDuration::ZERO
+        );
+    }
 }

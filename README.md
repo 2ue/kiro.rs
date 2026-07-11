@@ -9,7 +9,7 @@
 
 ## 注意！
 
-因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
+运行时默认使用 rustls；默认 feature 构建和官方 Docker 镜像同时包含 rustls 与 native-tls，可通过 `config.json` 的 `tlsBackend` 切换。只有显式使用 `--no-default-features` 构建时才不包含 native-tls。
 如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
 
 **Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，通常与输出过长被截断有关，可尝试调低输出相关 token 上限。
@@ -67,16 +67,39 @@
 
 > PS: 如果不想编辑可以直接前往 Release 下载二进制文件
 
-> **发布/嵌入式构建前置步骤**：如果要重新构建带 embedded 前端的 Rust 二进制，需要先生成前端 `dist`：
+CI、Docker 和发布构建固定使用 Node.js `22.23.0`、pnpm `11.11.0` 与 Rust `1.92.0`。
+
+> **发布/嵌入式构建前置步骤**：从干净 checkout 构建二进制时，必须先生成新旧两套前端的 `dist`：
 > ```bash
-> pnpm --dir ui install && pnpm --dir ui build
+> npm install --global pnpm@11.11.0
+> pnpm --dir admin-ui install --frozen-lockfile
+> pnpm --dir admin-ui build
+> pnpm --dir ui install --frozen-lockfile
+> pnpm --dir ui build
 > ```
 >
 > 日常前端开发不要靠重新构建 Rust 二进制看效果，直接使用 Vite 热更新入口，见 [前端开发预览](docs/frontend-dev-environment.md)。
 
 ```bash
-cargo build --release
+rustup toolchain install 1.92.0
+cargo +1.92.0 build --release --locked
 ```
+
+默认构建同时支持 `rustls` 和 `native-tls`，运行时仍默认选择 `rustls`。仅需要 rustls 的自定义构建可以使用 `cargo +1.92.0 build --release --locked --no-default-features`；该二进制不能把 `tlsBackend` 切换为 `native-tls`。
+
+### 构建门禁
+
+PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `admin-ui` 与 `ui`，检查 Rust 格式和 Clippy 告警基线，使用真实 PgSQL/Redis 分别执行默认 feature 与无默认 feature 测试，并用默认 feature 生成 release 二进制。发布 tag 必须严格等于 `v` 加 `Cargo.toml` 中的版本，例如 Cargo 版本 `0.0.101` 对应 `v0.0.101`。
+
+本地执行存储集成测试时必须显式提供测试实例；测试会在 PgSQL 中创建临时 schema，并在 Redis 中使用随机 key prefix：
+
+```bash
+export KIRO_RS_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/kiro_rs_test'
+export KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:6379/0'
+cargo +1.92.0 test --locked --all-targets --no-default-features
+```
+
+CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定现有 Clippy 债务，新增或增加任何 lint/file 告警桶都会失败。清理告警后使用固定 Rust 版本执行 `node scripts/ci/check-clippy-baseline.mjs --update`，把基线同步下调。
 
 ### 2. 最小配置
 

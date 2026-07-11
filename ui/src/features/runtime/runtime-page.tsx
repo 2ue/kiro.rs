@@ -2,6 +2,9 @@ import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 import {
   Gauge,
+  Eye,
+  EyeOff,
+  Router,
   Save,
   Shield,
   Sparkles,
@@ -32,7 +35,6 @@ import {
   defaultBodyConversion,
   defaultExternalPoolsConfig,
   defaultMissingMaxTokens,
-  defaultPayloadShaping,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
   defaultWeightedCapacity,
@@ -41,6 +43,8 @@ import {
   normalizeBodyConversion,
   normalizeImageProcessing,
   normalizeMissingMaxTokens,
+  normalizeModelMapping,
+  normalizePayloadShaping,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   normalizeWeightedCapacity,
@@ -58,6 +62,7 @@ import { useModelCapabilities } from '@/hooks/use-usage'
 import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
 import {
   CachePolicySettingsSection,
+  normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
   ModelMappingSection,
   PayloadFallbackSection,
@@ -73,6 +78,7 @@ type RuntimeSectionKey =
   | 'payload'
   | 'cachePolicy'
   | 'modelMapping'
+  | 'startupProxy'
   | 'compat'
 
 const runtimeSections: Array<{
@@ -89,6 +95,7 @@ const runtimeSections: Array<{
   { key: 'payload', title: '请求体处理', desc: '协议转换、大小保护、历史清理和当前请求兜底', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'cachePolicy', title: '缓存策略', desc: '策略模板默认参数和路径绑定', icon: <Zap className="h-4 w-4" /> },
   { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
+  { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
   { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
 ]
 
@@ -170,6 +177,70 @@ function TwoCol({ children }: { children: ReactNode }) {
   return <div className="grid gap-4 md:grid-cols-2">{children}</div>
 }
 
+function maskSecret(value?: string | null): string {
+  if (!value) return '-'
+  if (value.length <= 6) return '******'
+  return `${value.slice(0, 3)}...${value.slice(-3)}`
+}
+
+function ReadOnlySecretField({
+  label,
+  value,
+}: {
+  label: string
+  value?: string | null
+}) {
+  const [visible, setVisible] = useState(false)
+  return (
+    <div className="space-y-1.5">
+      <div className="text-sm font-semibold">{label}</div>
+      <div className="relative">
+        <Input readOnly className="pr-10 font-mono text-xs" value={visible ? value || '-' : maskSecret(value)} />
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className="absolute right-1 top-1/2 -translate-y-1/2"
+          onClick={() => setVisible((v) => !v)}
+          title={visible ? '隐藏' : '显示'}
+        >
+          {visible ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function StartupProxySection({ config }: { config: RuntimeConfig }) {
+  const hasGlobalProxy = Boolean(config.proxyUrl)
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border bg-card p-4">
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <div>
+            <div className="text-sm font-semibold">全局代理（启动期配置，只读）</div>
+            <div className="mt-1 text-xs leading-5 text-muted-foreground">
+              它作为未配置账号直连代理、也未绑定代理资源时的默认代理；修改需要调整启动配置并重启服务。
+            </div>
+          </div>
+          <span className={`ml-auto rounded-lg border px-2 py-1 text-xs font-medium ${hasGlobalProxy ? 'border-success/30 bg-success/10 text-success' : 'bg-muted text-muted-foreground'}`}>
+            {hasGlobalProxy ? '已配置' : '未配置'}
+          </span>
+          <span className="rounded-lg border bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">只读</span>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-1.5 md:col-span-2">
+            <div className="text-sm font-semibold">代理 URL</div>
+            <Input readOnly className="font-mono text-xs" value={config.proxyUrl || '-'} />
+          </div>
+          <ReadOnlySecretField label="代理用户名" value={config.proxyUsername} />
+          <ReadOnlySecretField label="代理密码" value={config.proxyPassword} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── normalizeConfig ──────────────────────────────────────────────────────────
 
 function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
@@ -211,6 +282,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
     schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
     selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
+    payloadShaping: normalizePayloadShaping(draft.payloadShaping),
     payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
     payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
     promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
@@ -231,9 +303,32 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
+    modelMapping: normalizeModelMapping(draft.modelMapping),
     externalPools: {
       ...defaultExternalPoolsConfig(),
       ...draft.externalPools,
+      externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
+      externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
+      externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs),
+      externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
+      externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
+      localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
+      localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
+      localPoolCircuitRequireDistinctCredentials: toWhole(draft.externalPools.localPoolCircuitRequireDistinctCredentials),
+      localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
+      externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
+      externalPoolAutoDisableWindowSecs: toWhole(draft.externalPools.externalPoolAutoDisableWindowSecs, 1),
+      externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
+      externalPoolRateLimitCooldownSecs: toWhole(draft.externalPools.externalPoolRateLimitCooldownSecs, 1),
+      externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
+      externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
+      externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
+      externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
+      externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
+      externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
+      externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
+      externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
+      externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
     },
   }
   return next
@@ -263,10 +358,12 @@ export function RuntimePage() {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
         },
-        payloadShaping: { ...defaultPayloadShaping(), ...config.data.payloadShaping },
+        payloadShaping: normalizePayloadShaping(config.data.payloadShaping),
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
         reportedUsage: config.data.reportedUsage ?? defaultReportedUsage(),
         cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
+        definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
+        modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
     }
   }, [config.data])
@@ -315,7 +412,14 @@ export function RuntimePage() {
     }))
 
   const save = () => {
+    const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
+    if (invalidDefinedCacheRoute)
+      return toast.error('缓存策略里的 /dfcache 路径必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
     const next = normalizeConfig(draft)
+    if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs)
+      return toast.error('临时冷却秒数不能大于最大冷却秒数')
+    if ([next.credentialRateLimitCooldownSecs, next.credentialServerErrorCooldownSecs, next.credentialNetworkErrorCooldownSecs, next.credentialStreamErrorCooldownSecs, next.credentialProtocolErrorCooldownSecs, next.credentialAuthErrorCooldownSecs].some((value) => value > next.credentialMaxCooldownSecs))
+      return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens)
       return toast.error('触顶扣减下限不能大于上限')
     if (next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536)
@@ -742,6 +846,10 @@ export function RuntimePage() {
                   onChange={(m: ModelMappingConfig) => set('modelMapping')(m)}
                 />
               </div>
+            )}
+
+            {activeSection === 'startupProxy' && (
+              <StartupProxySection config={draft} />
             )}
 
             {activeSection === 'compat' && (

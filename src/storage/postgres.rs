@@ -8,6 +8,7 @@ use sqlx::{
     Connection, PgPool, Postgres, QueryBuilder, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
 };
+use uuid::Uuid;
 
 use crate::anthropic::model_capabilities::{
     MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
@@ -34,6 +35,21 @@ use crate::external_pool::{
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::{Config, ExternalPoolStreamResponseMode, ModelMappingRule};
 use crate::model::model_support::normalize_supported_models;
+
+const ACTIVE_CREDENTIALS_SELECT_SQL: &str = r#"
+SELECT id, priority, disabled, data, created_at, updated_at, revision
+FROM credentials
+WHERE deleted_at IS NULL
+ORDER BY priority ASC, id ASC
+"#;
+
+const CREDENTIAL_RUNTIME_STATE_SELECT_SQL: &str = r#"
+SELECT credential_id, failure_count, refresh_failure_count,
+       disabled_reason, warmup_remaining, generation, revision
+FROM credential_runtime_state
+"#;
+
+const CREDENTIAL_ID_SEQUENCE_LOCK_ID: i64 = 4_950_531_234_002;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,17 +140,17 @@ fn credential_hash_columns(
 }
 
 fn duplicate_credential_message(err: sqlx::Error) -> anyhow::Error {
-    if let sqlx::Error::Database(db_err) = &err {
-        if db_err.is_unique_violation() {
-            let constraint = db_err.constraint().unwrap_or_default();
-            if constraint.contains("api_key") {
-                return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
-            }
-            if constraint.contains("refresh_token") {
-                return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
-            }
-            return anyhow::anyhow!("凭据已存在（唯一约束冲突）");
+    if let sqlx::Error::Database(db_err) = &err
+        && db_err.is_unique_violation()
+    {
+        let constraint = db_err.constraint().unwrap_or_default();
+        if constraint.contains("api_key") {
+            return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
         }
+        if constraint.contains("refresh_token") {
+            return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
+        }
+        return anyhow::anyhow!("凭据已存在（唯一约束冲突）");
     }
     anyhow::Error::new(err)
 }
@@ -145,16 +161,33 @@ fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
     let disabled: bool = row.try_get("disabled")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+    let revision: i64 = row.try_get("revision")?;
     let value: serde_json::Value = row.try_get("data")?;
     let mut credential: KiroCredentials = serde_json::from_value(value)?;
     credential.id = Some(id as u64);
     credential.created_at = Some(created_at.to_rfc3339());
     credential.updated_at = Some(updated_at.to_rfc3339());
+    credential.storage_revision = revision.max(0) as u64;
     credential.priority = priority.max(0) as u32;
     credential.disabled = disabled;
     credential.canonicalize_auth_method();
     credential.normalize_supported_models();
     Ok(credential)
+}
+
+fn credentials_from_rows(rows: Vec<PgRow>) -> anyhow::Result<Vec<KiroCredentials>> {
+    rows.into_iter().map(credential_from_row).collect()
+}
+
+fn credential_runtime_states_from_rows(
+    rows: Vec<PgRow>,
+) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateRow>> {
+    let mut states = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let credential_id: i64 = row.try_get("credential_id")?;
+        states.insert(credential_id.max(0) as u64, runtime_state_from_row(&row)?);
+    }
+    Ok(states)
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +299,37 @@ impl PostgresStore {
             .await?;
 
             execute_sql_statements(&mut conn, SCHEMA_SQL).await?;
+            repair_active_credential_hashes(&mut conn).await?;
+            run_versioned_migration(
+                &mut conn,
+                "credential-storage-revision-v1",
+                CREDENTIAL_STORAGE_REVISION_SQL,
+            )
+            .await?;
+            run_versioned_migration(
+                &mut conn,
+                "credential-runtime-revision-v1",
+                CREDENTIAL_RUNTIME_REVISION_SQL,
+            )
+            .await?;
+            run_versioned_migration(
+                &mut conn,
+                "credential-runtime-generation-v1",
+                CREDENTIAL_RUNTIME_GENERATION_SQL,
+            )
+            .await?;
+            run_versioned_migration(
+                &mut conn,
+                "credential-runtime-mutation-cleanup-v1",
+                CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL,
+            )
+            .await?;
+            run_versioned_migration(
+                &mut conn,
+                "credential-stats-delta-batches-v1",
+                CREDENTIAL_STATS_DELTA_BATCH_SQL,
+            )
+            .await?;
             if compress_usage_rollups {
                 run_versioned_migration(
                     &mut conn,
@@ -728,18 +792,34 @@ impl PostgresStore {
     }
 
     pub async fn load_credentials(&self) -> anyhow::Result<Vec<KiroCredentials>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, priority, disabled, data, created_at, updated_at
-            FROM credentials
-            WHERE deleted_at IS NULL
-            ORDER BY priority ASC, id ASC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
+            .fetch_all(&self.pool)
+            .await?;
 
-        rows.into_iter().map(credential_from_row).collect()
+        credentials_from_rows(rows)
+    }
+
+    pub async fn load_credentials_with_runtime_state(
+        &self,
+    ) -> anyhow::Result<(
+        Vec<KiroCredentials>,
+        HashMap<u64, CredentialRuntimeStateRow>,
+    )> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let credential_rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
+            .fetch_all(&mut *tx)
+            .await?;
+        let runtime_state_rows = sqlx::query(CREDENTIAL_RUNTIME_STATE_SELECT_SQL)
+            .fetch_all(&mut *tx)
+            .await?;
+        let credentials = credentials_from_rows(credential_rows)?;
+        let runtime_states = credential_runtime_states_from_rows(runtime_state_rows)?;
+        tx.commit().await?;
+
+        Ok((credentials, runtime_states))
     }
 
     /// 查询未软删除的 API Key 凭据。
@@ -756,7 +836,7 @@ impl PostgresStore {
         }
         let row = sqlx::query(
             r#"
-            SELECT id, priority, disabled, data, created_at, updated_at
+            SELECT id, priority, disabled, data, created_at, updated_at, revision
             FROM credentials
             WHERE deleted_at IS NULL
               AND api_key_hash = $1
@@ -815,105 +895,585 @@ impl PostgresStore {
             return Ok(());
         }
         self.save_credentials(credentials).await?;
-        self.sync_credential_id_sequence().await?;
         Ok(())
     }
 
-    async fn sync_credential_id_sequence(&self) -> anyhow::Result<()> {
+    async fn lock_credential_id_sequence_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(CREDENTIAL_ID_SEQUENCE_LOCK_ID)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    async fn advance_credential_id_sequence_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        credential_id: i64,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
             SELECT setval(
                 'credentials_id_seq',
-                GREATEST(COALESCE((SELECT MAX(id) FROM credentials), 0) + 1, 1),
-                false
+                GREATEST(last_value, $1),
+                is_called OR $1 >= last_value
             )
+            FROM credentials_id_seq
             "#,
         )
-        .execute(&self.pool)
+        .bind(credential_id)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
 
-    async fn next_credential_id(&self) -> anyhow::Result<u64> {
-        let id: i64 = sqlx::query_scalar("SELECT nextval('credentials_id_seq')")
-            .fetch_one(&self.pool)
+    async fn next_credential_id_in_tx(tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<i64> {
+        let max_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM credentials")
+            .fetch_one(&mut **tx)
             .await?;
-        Ok(id as u64)
+        Self::advance_credential_id_sequence_in_tx(tx, max_id).await?;
+        let id: i64 = sqlx::query_scalar("SELECT nextval('credentials_id_seq')")
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok(id)
     }
 
     /// 非破坏性保存凭据列表。
     ///
     /// 该方法用于首次 bootstrap 或补全旧凭据字段，只 upsert 传入行，不删除
     /// PgSQL 中其他未软删除凭据，避免旧进程内存快照覆盖其他实例新增的凭据。
-    pub async fn save_credentials(&self, credentials: &[KiroCredentials]) -> anyhow::Result<()> {
+    pub async fn save_credentials(
+        &self,
+        credentials: &[KiroCredentials],
+    ) -> anyhow::Result<Vec<KiroCredentials>> {
+        let mut saved = Vec::with_capacity(credentials.len());
         for credential in credentials {
-            if credential.id.is_some() {
-                self.upsert_credential(credential).await?;
+            let authoritative = if credential.id.is_some() {
+                match self.upsert_credential(credential).await? {
+                    CredentialUpsertCasOutcome::Applied(saved) => saved,
+                    CredentialUpsertCasOutcome::Conflict { current } => current,
+                }
             } else {
-                self.insert_credential(credential).await?;
-            }
+                self.insert_credential(credential).await?
+            };
+            saved.push(authoritative);
         }
-        Ok(())
+        Ok(saved)
     }
 
     pub async fn insert_credential(
         &self,
         credential: &KiroCredentials,
     ) -> anyhow::Result<KiroCredentials> {
-        let id = match credential.id {
-            Some(id) => id,
-            None => self.next_credential_id().await?,
-        };
         let mut canonical = credential.clone();
-        canonical.id = Some(id);
-        canonical.canonicalize_auth_method();
-        canonical.normalize_supported_models();
-        self.upsert_credential(&canonical).await
+        canonical.storage_revision = 0;
+        match self
+            .upsert_credential_with_optional_id(&canonical, true)
+            .await?
+        {
+            CredentialUpsertCasOutcome::Applied(credential) => Ok(credential),
+            CredentialUpsertCasOutcome::Conflict { current } => {
+                let id = current.id.unwrap_or_default();
+                anyhow::bail!(
+                    "凭据 #{} 已存在（当前 revision {}）",
+                    id,
+                    current.storage_revision
+                )
+            }
+        }
     }
 
     pub async fn upsert_credential(
         &self,
         credential: &KiroCredentials,
-    ) -> anyhow::Result<KiroCredentials> {
-        let id = credential
-            .id
-            .ok_or_else(|| anyhow::anyhow!("保存到 PgSQL 的凭据必须先分配 id"))?;
+    ) -> anyhow::Result<CredentialUpsertCasOutcome> {
+        if credential.id.is_none() {
+            anyhow::bail!("保存到 PgSQL 的凭据必须先分配 id");
+        }
+        self.upsert_credential_with_optional_id(credential, false)
+            .await
+    }
+
+    async fn upsert_credential_with_optional_id(
+        &self,
+        credential: &KiroCredentials,
+        allocate_missing_id: bool,
+    ) -> anyhow::Result<CredentialUpsertCasOutcome> {
+        if credential.id.is_none() && !allocate_missing_id {
+            anyhow::bail!("保存到 PgSQL 的凭据必须先分配 id");
+        }
+        let expected_revision = i64::try_from(credential.storage_revision)
+            .map_err(|_| anyhow::anyhow!("凭据 storage revision 超出 PgSQL BIGINT 范围"))?;
+        let next_revision = credential
+            .storage_revision
+            .checked_add(1)
+            .filter(|revision| i64::try_from(*revision).is_ok())
+            .ok_or_else(|| anyhow::anyhow!("凭据 storage revision 已达到 PgSQL BIGINT 上限"))?;
+        let mut tx = self.pool.begin().await?;
+        if credential.storage_revision == 0 {
+            Self::lock_credential_id_sequence_in_tx(&mut tx).await?;
+        }
+        let id_i64 = match credential.id {
+            Some(id) => {
+                i64::try_from(id).map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?
+            }
+            None if credential.storage_revision == 0 => {
+                Self::next_credential_id_in_tx(&mut tx).await?
+            }
+            None => anyhow::bail!("保存到 PgSQL 的凭据必须先分配 id"),
+        };
+        let id = id_i64 as u64;
         let mut canonical = credential.clone();
         canonical.id = Some(id);
         canonical.canonicalize_auth_method();
         canonical.normalize_supported_models();
+        let priority = i32::try_from(canonical.priority)
+            .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
+        let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
+        let value = serde_json::to_value(&canonical)?;
+        let applied = if canonical.storage_revision == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO credentials (
+                    id, priority, disabled, auth_kind, api_key_hash, refresh_token_hash,
+                    data, updated_at, deleted_at, revision
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, now(), NULL, 1)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id, priority, disabled, data, created_at, updated_at, revision
+                "#,
+            )
+            .bind(id_i64)
+            .bind(priority)
+            .bind(canonical.disabled)
+            .bind(&auth_kind)
+            .bind(&api_key_hash)
+            .bind(&refresh_token_hash)
+            .bind(&value)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(duplicate_credential_message)?
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE credentials
+                SET priority = $2,
+                    disabled = $3,
+                    auth_kind = $4,
+                    api_key_hash = $5,
+                    refresh_token_hash = $6,
+                    data = $7,
+                    updated_at = now(),
+                    revision = credentials.revision + 1
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                  AND revision = $8
+                RETURNING id, priority, disabled, data, created_at, updated_at, revision
+                "#,
+            )
+            .bind(id_i64)
+            .bind(priority)
+            .bind(canonical.disabled)
+            .bind(&auth_kind)
+            .bind(&api_key_hash)
+            .bind(&refresh_token_hash)
+            .bind(&value)
+            .bind(expected_revision)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(duplicate_credential_message)?
+        };
+        if let Some(row) = applied {
+            let credential = credential_from_row(row)?;
+            if credential.storage_revision != next_revision {
+                anyhow::bail!(
+                    "凭据 #{} storage revision 不一致：期望 {}，实际 {}",
+                    id,
+                    next_revision,
+                    credential.storage_revision
+                );
+            }
+            if canonical.storage_revision == 0 {
+                Self::advance_credential_id_sequence_in_tx(&mut tx, id_i64).await?;
+            }
+            tx.commit().await?;
+            return Ok(CredentialUpsertCasOutcome::Applied(credential));
+        }
+
+        let current = sqlx::query(
+            r#"
+            SELECT id, priority, disabled, data, created_at, updated_at, revision
+            FROM credentials
+            WHERE id = $1 AND deleted_at IS NULL
+            FOR SHARE
+            "#,
+        )
+        .bind(id_i64)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(credential_from_row)
+        .transpose()?;
+        if let Some(current) = current {
+            tx.commit().await?;
+            return Ok(CredentialUpsertCasOutcome::Conflict { current });
+        }
+
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credentials WHERE id = $1)")
+                .bind(id_i64)
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.rollback().await?;
+        if exists {
+            anyhow::bail!("凭据 #{} 已被删除，禁止通过 upsert 恢复", id);
+        }
+        anyhow::bail!("凭据 #{} 不存在，无法按 revision 更新", id)
+    }
+
+    pub async fn insert_credential_with_runtime_patch(
+        &self,
+        credential: &KiroCredentials,
+        operation_id: Uuid,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<(KiroCredentials, CredentialRuntimeStateMutationResult)> {
+        validate_credential_runtime_state_patch(patch)?;
+        let mut tx = self.pool.begin().await?;
+        Self::lock_credential_id_sequence_in_tx(&mut tx).await?;
+        let id = match credential.id {
+            Some(id) => id,
+            None => {
+                let id = Self::next_credential_id_in_tx(&mut tx).await?;
+                id.max(0) as u64
+            }
+        };
+        let id_i64 =
+            i64::try_from(id).map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
+        let mut canonical = credential.clone();
+        canonical.id = Some(id);
+        canonical.storage_revision = 0;
+        if let Some(disabled) = patch.credential_disabled {
+            canonical.disabled = disabled;
+        }
+        canonical.canonicalize_auth_method();
+        canonical.normalize_supported_models();
+        let priority = i32::try_from(canonical.priority)
+            .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
         let value = serde_json::to_value(&canonical)?;
         let row = sqlx::query(
             r#"
             INSERT INTO credentials (
                 id, priority, disabled, auth_kind, api_key_hash, refresh_token_hash,
-                data, updated_at, deleted_at
+                data, updated_at, deleted_at, revision
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), NULL)
-            ON CONFLICT (id) DO UPDATE
-            SET priority = EXCLUDED.priority,
-                disabled = EXCLUDED.disabled,
-                auth_kind = EXCLUDED.auth_kind,
-                api_key_hash = EXCLUDED.api_key_hash,
-                refresh_token_hash = EXCLUDED.refresh_token_hash,
-                data = EXCLUDED.data,
-                updated_at = now(),
-                deleted_at = NULL
-            RETURNING id, priority, disabled, data, created_at, updated_at
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), NULL, 1)
+            RETURNING id, priority, disabled, data, created_at, updated_at, revision
             "#,
         )
-        .bind(id as i64)
-        .bind(canonical.priority as i32)
+        .bind(id_i64)
+        .bind(priority)
         .bind(canonical.disabled)
         .bind(auth_kind)
         .bind(api_key_hash)
         .bind(refresh_token_hash)
         .bind(value)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(duplicate_credential_message)?;
-        credential_from_row(row)
+        let inserted = credential_from_row(row)?;
+        if inserted.storage_revision != 1 {
+            anyhow::bail!("新凭据 #{} 的 storage revision 必须为 1", id);
+        }
+        Self::advance_credential_id_sequence_in_tx(&mut tx, id_i64).await?;
+
+        let mut runtime_patch = patch.clone();
+        runtime_patch.credential_disabled = None;
+        let runtime = Self::patch_credential_runtime_state_in_tx(
+            &mut tx,
+            id,
+            operation_id,
+            "initial_patch",
+            &runtime_patch,
+        )
+        .await?;
+        if !runtime.applied {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "新凭据 #{} 的初始运行态 generation 已过期：当前 {}",
+                id,
+                runtime.state.generation
+            );
+        }
+        tx.commit().await?;
+        Ok((inserted, runtime))
+    }
+
+    pub async fn update_credential_with_runtime_patch_cas(
+        &self,
+        credential: &KiroCredentials,
+        operation_id: Uuid,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<CredentialWithRuntimePatchCasOutcome> {
+        validate_credential_runtime_state_patch(patch)?;
+        let id = credential
+            .id
+            .ok_or_else(|| anyhow::anyhow!("更新 PgSQL 凭据必须提供 id"))?;
+        if credential.storage_revision == 0 {
+            anyhow::bail!(
+                "凭据 #{} runtime patch 更新必须提供非零 storage revision",
+                id
+            );
+        }
+        let id_i64 =
+            i64::try_from(id).map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
+        let expected_revision = i64::try_from(credential.storage_revision)
+            .map_err(|_| anyhow::anyhow!("凭据 storage revision 超出 PgSQL BIGINT 范围"))?;
+        let next_revision = credential
+            .storage_revision
+            .checked_add(1)
+            .filter(|revision| i64::try_from(*revision).is_ok())
+            .ok_or_else(|| anyhow::anyhow!("凭据 storage revision 已达到 PgSQL BIGINT 上限"))?;
+        let mut canonical = credential.clone();
+        if let Some(disabled) = patch.credential_disabled {
+            canonical.disabled = disabled;
+        }
+        canonical.canonicalize_auth_method();
+        canonical.normalize_supported_models();
+        let priority = i32::try_from(canonical.priority)
+            .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
+        let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
+        let value = serde_json::to_value(&canonical)?;
+
+        let mut tx = self.pool.begin().await?;
+        let applied = sqlx::query(
+            r#"
+            UPDATE credentials
+            SET priority = $2,
+                disabled = $3,
+                auth_kind = $4,
+                api_key_hash = $5,
+                refresh_token_hash = $6,
+                data = $7,
+                updated_at = now(),
+                revision = credentials.revision + 1
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND revision = $8
+            RETURNING id, priority, disabled, data, created_at, updated_at, revision
+            "#,
+        )
+        .bind(id_i64)
+        .bind(priority)
+        .bind(canonical.disabled)
+        .bind(auth_kind)
+        .bind(api_key_hash)
+        .bind(refresh_token_hash)
+        .bind(value)
+        .bind(expected_revision)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(duplicate_credential_message)?;
+        let Some(row) = applied else {
+            let current = sqlx::query(
+                r#"
+                SELECT id, priority, disabled, data, created_at, updated_at, revision
+                FROM credentials
+                WHERE id = $1 AND deleted_at IS NULL
+                FOR SHARE
+                "#,
+            )
+            .bind(id_i64)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(credential_from_row)
+            .transpose()?;
+            if let Some(current) = current {
+                tx.commit().await?;
+                return Ok(CredentialWithRuntimePatchCasOutcome::Conflict { current });
+            }
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM credentials WHERE id = $1)")
+                    .bind(id_i64)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            tx.rollback().await?;
+            if exists {
+                anyhow::bail!("凭据 #{} 已被删除，禁止更新", id);
+            }
+            anyhow::bail!("凭据 #{} 不存在，无法更新", id);
+        };
+        let updated = credential_from_row(row)?;
+        if updated.storage_revision != next_revision {
+            anyhow::bail!(
+                "凭据 #{} storage revision 不一致：期望 {}，实际 {}",
+                id,
+                next_revision,
+                updated.storage_revision
+            );
+        }
+
+        let mut runtime_patch = patch.clone();
+        runtime_patch.credential_disabled = None;
+        let runtime = Self::patch_credential_runtime_state_in_tx(
+            &mut tx,
+            id,
+            operation_id,
+            "credential_update_patch",
+            &runtime_patch,
+        )
+        .await?;
+        if !runtime.applied {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "凭据 #{} 的原子运行态 generation 已过期：当前 {}",
+                id,
+                runtime.state.generation
+            );
+        }
+        tx.commit().await?;
+        Ok(CredentialWithRuntimePatchCasOutcome::Applied {
+            credential: updated,
+            runtime,
+        })
+    }
+
+    pub async fn update_credential_refresh_fields_cas(
+        &self,
+        credential_id: u64,
+        expected: &CredentialRefreshExpectedContext,
+        patch: &CredentialRefreshFieldsPatch,
+    ) -> anyhow::Result<CredentialRefreshFieldsCasOutcome> {
+        if patch
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            anyhow::bail!("刷新后的 refreshToken 不能为空");
+        }
+        if patch.access_token.is_none()
+            && patch.refresh_token.is_none()
+            && patch.profile_arn.is_none()
+            && patch.expires_at.is_none()
+            && patch.scopes.is_none()
+        {
+            anyhow::bail!("凭据 refresh 字段更新不能为空");
+        }
+
+        let new_refresh_token_hash = patch.refresh_token.as_deref().map(sha256_hex);
+        let mut tx = self.pool.begin().await?;
+        let applied = sqlx::query(
+            r#"
+            UPDATE credentials
+            SET refresh_token_hash = CASE
+                    WHEN $10::text IS NULL THEN credentials.refresh_token_hash
+                    ELSE $11::text
+                END,
+                data = credentials.data
+                    || CASE WHEN $9::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('accessToken', $9::text)
+                    END
+                    || CASE WHEN $10::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('refreshToken', $10::text)
+                    END
+                    || CASE WHEN $12::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('profileArn', $12::text)
+                    END
+                    || CASE WHEN $13::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('expiresAt', $13::text)
+                    END
+                    || CASE WHEN $14::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('scopes', $14::text)
+                    END,
+                updated_at = now(),
+                revision = credentials.revision + 1
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND refresh_token_hash = $2
+              AND (
+                  CASE regexp_replace(
+                      lower(COALESCE(data->>'authMethod', data->>'auth_method')),
+                      '[^a-z0-9]',
+                      '',
+                      'g'
+                  )
+                      WHEN 'builderid' THEN 'idc'
+                      WHEN 'iam' THEN 'idc'
+                      WHEN 'idc' THEN 'idc'
+                      WHEN 'apikey' THEN 'api_key'
+                      WHEN 'externalidp' THEN 'external_idp'
+                      WHEN 'enterprise' THEN 'external_idp'
+                      WHEN 'iamsso' THEN 'external_idp'
+                      WHEN 'awsidc' THEN 'external_idp'
+                      WHEN 'internal' THEN 'external_idp'
+                      WHEN 'social' THEN 'social'
+                      ELSE COALESCE(data->>'authMethod', data->>'auth_method')
+                  END
+                  IS NOT DISTINCT FROM $3::text
+              )
+              AND (data->>'provider' IS NOT DISTINCT FROM $4::text)
+              AND (
+                  COALESCE(data->>'clientId', data->>'client_id')
+                  IS NOT DISTINCT FROM $5::text
+              )
+              AND (
+                  COALESCE(data->>'clientSecret', data->>'client_secret')
+                  IS NOT DISTINCT FROM $6::text
+              )
+              AND (
+                  COALESCE(data->>'tokenEndpoint', data->>'token_endpoint')
+                  IS NOT DISTINCT FROM $7::text
+              )
+              AND (
+                  COALESCE(data->>'scopes', data->>'scope')
+                  IS NOT DISTINCT FROM $8::text
+              )
+            RETURNING id, priority, disabled, data, created_at, updated_at, revision
+            "#,
+        )
+        .bind(credential_id as i64)
+        .bind(&expected.refresh_token_hash)
+        .bind(&expected.auth_method)
+        .bind(&expected.provider)
+        .bind(&expected.client_id)
+        .bind(&expected.client_secret)
+        .bind(&expected.token_endpoint)
+        .bind(&expected.scopes)
+        .bind(&patch.access_token)
+        .bind(&patch.refresh_token)
+        .bind(&new_refresh_token_hash)
+        .bind(&patch.profile_arn)
+        .bind(&patch.expires_at)
+        .bind(&patch.scopes)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(duplicate_credential_message)?;
+        if let Some(row) = applied {
+            let credential = credential_from_row(row)?;
+            tx.commit().await?;
+            return Ok(CredentialRefreshFieldsCasOutcome::Applied(credential));
+        }
+
+        let current = sqlx::query(
+            r#"
+            SELECT id, priority, disabled, data, created_at, updated_at, revision
+            FROM credentials
+            WHERE id = $1 AND deleted_at IS NULL
+            FOR SHARE
+            "#,
+        )
+        .bind(credential_id as i64)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(credential_from_row)
+        .transpose()?;
+        tx.commit().await?;
+        Ok(CredentialRefreshFieldsCasOutcome::Conflict { current })
     }
 
     pub async fn soft_delete_credential(&self, credential_id: u64) -> anyhow::Result<()> {
@@ -921,7 +1481,8 @@ impl PostgresStore {
             r#"
             UPDATE credentials
             SET deleted_at = now(),
-                updated_at = now()
+                updated_at = now(),
+                revision = credentials.revision + 1
             WHERE id = $1 AND deleted_at IS NULL
             "#,
         )
@@ -1138,32 +1699,79 @@ impl PostgresStore {
     pub async fn load_credential_runtime_state(
         &self,
     ) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateRow>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(CREDENTIAL_RUNTIME_STATE_SELECT_SQL)
+            .fetch_all(&self.pool)
+            .await?;
+        credential_runtime_states_from_rows(rows)
+    }
+
+    pub async fn cleanup_credential_runtime_mutations(
+        &self,
+        retention: std::time::Duration,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        const MAX_CLEANUP_BATCH: usize = 10_000;
+        let limit = limit.min(MAX_CLEANUP_BATCH);
+        if limit == 0 {
+            return Ok(0);
+        }
+        let retention_micros = i64::try_from(retention.as_micros())
+            .map_err(|_| anyhow::anyhow!("credential mutation retention 超出 PgSQL 范围"))?;
+        let removed: i64 = sqlx::query_scalar(
             r#"
-            SELECT credential_id, failure_count, refresh_failure_count, disabled_reason, warmup_remaining
-            FROM credential_runtime_state
+            WITH runtime_candidates AS (
+                SELECT operation_id, created_at
+                FROM credential_runtime_mutations
+                WHERE created_at < now() - ($1::bigint * interval '1 microsecond')
+                ORDER BY created_at ASC, operation_id ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            ),
+            stats_candidates AS (
+                SELECT operation_id, created_at
+                FROM credential_stats_delta_batches
+                WHERE created_at < now() - ($1::bigint * interval '1 microsecond')
+                ORDER BY created_at ASC, operation_id ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            ),
+            expired AS (
+                SELECT ledger_kind, operation_id
+                FROM (
+                    SELECT 'runtime'::text AS ledger_kind,
+                           operation_id, created_at
+                    FROM runtime_candidates
+                    UNION ALL
+                    SELECT 'stats'::text AS ledger_kind,
+                           operation_id, created_at
+                    FROM stats_candidates
+                ) AS candidates
+                ORDER BY created_at ASC, ledger_kind ASC, operation_id ASC
+                LIMIT $2
+            ),
+            deleted_runtime AS (
+                DELETE FROM credential_runtime_mutations AS mutation
+                USING expired
+                WHERE expired.ledger_kind = 'runtime'
+                  AND mutation.operation_id = expired.operation_id
+                RETURNING 1
+            ),
+            deleted_stats AS (
+                DELETE FROM credential_stats_delta_batches AS batch
+                USING expired
+                WHERE expired.ledger_kind = 'stats'
+                  AND batch.operation_id = expired.operation_id
+                RETURNING 1
+            )
+            SELECT (SELECT COUNT(*) FROM deleted_runtime)
+                 + (SELECT COUNT(*) FROM deleted_stats)
             "#,
         )
-        .fetch_all(&self.pool)
+        .bind(retention_micros)
+        .bind(limit as i64)
+        .fetch_one(&self.pool)
         .await?;
-        let mut states = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let credential_id: i64 = row.try_get("credential_id")?;
-            let failure_count: i32 = row.try_get("failure_count")?;
-            let refresh_failure_count: i32 = row.try_get("refresh_failure_count")?;
-            let disabled_reason: Option<String> = row.try_get("disabled_reason")?;
-            let warmup_remaining: i32 = row.try_get("warmup_remaining")?;
-            states.insert(
-                credential_id as u64,
-                CredentialRuntimeStateRow {
-                    failure_count: failure_count.max(0) as u32,
-                    refresh_failure_count: refresh_failure_count.max(0) as u32,
-                    disabled_reason,
-                    warmup_remaining: warmup_remaining.max(0) as u32,
-                },
-            );
-        }
-        Ok(states)
+        Ok(removed.max(0) as u64)
     }
 
     pub async fn load_credential_account_info(
@@ -1324,22 +1932,32 @@ impl PostgresStore {
     pub async fn save_credential_runtime_state(
         &self,
         states: &HashMap<u64, CredentialRuntimeStateRow>,
-    ) -> anyhow::Result<()> {
-        for (credential_id, state) in states {
-            self.save_credential_runtime_state_for(*credential_id, state)
-                .await?;
-        }
-        Ok(())
+    ) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateCasOutcome>> {
+        let snapshots = states
+            .iter()
+            .map(|(credential_id, state)| {
+                (
+                    *credential_id,
+                    CredentialRuntimeStateSnapshot {
+                        state: state.clone(),
+                        expected_revision: state.revision,
+                    },
+                )
+            })
+            .collect();
+        self.apply_credential_runtime_state_snapshots(&snapshots)
+            .await
     }
 
+    #[allow(dead_code)]
     pub async fn save_credential_runtime_state_for(
         &self,
         credential_id: u64,
         state: &CredentialRuntimeStateRow,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<CredentialRuntimeStateCasOutcome> {
         let snapshot = CredentialRuntimeStateSnapshot {
             state: state.clone(),
-            updated_at: Utc::now(),
+            expected_revision: state.revision,
         };
         self.save_credential_runtime_state_snapshot(credential_id, &snapshot)
             .await
@@ -1349,32 +1967,98 @@ impl PostgresStore {
         &self,
         credential_id: u64,
         snapshot: &CredentialRuntimeStateSnapshot,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO credential_runtime_state (
-                credential_id, failure_count, refresh_failure_count,
-                disabled_reason, warmup_remaining, updated_at
+    ) -> anyhow::Result<CredentialRuntimeStateCasOutcome> {
+        if snapshot.state.revision != snapshot.expected_revision {
+            anyhow::bail!(
+                "凭据 #{} snapshot revision {} 与 expected revision {} 不一致",
+                credential_id,
+                snapshot.state.revision,
+                snapshot.expected_revision
+            );
+        }
+        let expected_revision = i64::try_from(snapshot.expected_revision)
+            .map_err(|_| anyhow::anyhow!("凭据运行态 expected revision 超出 PgSQL BIGINT 范围"))?;
+        let expected_generation = i64::try_from(snapshot.state.generation)
+            .map_err(|_| anyhow::anyhow!("凭据运行态 generation 超出 PgSQL BIGINT 范围"))?;
+        let next_revision = snapshot
+            .expected_revision
+            .checked_add(1)
+            .filter(|revision| i64::try_from(*revision).is_ok())
+            .ok_or_else(|| anyhow::anyhow!("凭据运行态 revision 已达到 PgSQL BIGINT 上限"))?;
+        let mut tx = self.pool.begin().await?;
+        lock_active_credential_in_tx(&mut tx, credential_id).await?;
+        let applied = if snapshot.expected_revision == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO credential_runtime_state (
+                    credential_id, failure_count, refresh_failure_count,
+                    disabled_reason, warmup_remaining, generation, revision, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, 1, now())
+                ON CONFLICT (credential_id) DO NOTHING
+                RETURNING failure_count, refresh_failure_count, disabled_reason,
+                          warmup_remaining, generation, revision
+                "#,
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (credential_id) DO UPDATE
-            SET failure_count = EXCLUDED.failure_count,
-                refresh_failure_count = EXCLUDED.refresh_failure_count,
-                disabled_reason = EXCLUDED.disabled_reason,
-                warmup_remaining = EXCLUDED.warmup_remaining,
-                updated_at = EXCLUDED.updated_at
-            WHERE credential_runtime_state.updated_at <= EXCLUDED.updated_at
+            .bind(credential_id as i64)
+            .bind(snapshot.state.failure_count as i32)
+            .bind(snapshot.state.refresh_failure_count as i32)
+            .bind(&snapshot.state.disabled_reason)
+            .bind(snapshot.state.warmup_remaining as i32)
+            .bind(expected_generation)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE credential_runtime_state
+                SET failure_count = $2,
+                    refresh_failure_count = $3,
+                    disabled_reason = $4,
+                    warmup_remaining = $5,
+                    revision = credential_runtime_state.revision + 1,
+                    updated_at = now()
+                WHERE credential_id = $1
+                  AND credential_runtime_state.generation = $6
+                  AND credential_runtime_state.revision = $7
+                RETURNING failure_count, refresh_failure_count, disabled_reason,
+                          warmup_remaining, generation, revision
+                "#,
+            )
+            .bind(credential_id as i64)
+            .bind(snapshot.state.failure_count as i32)
+            .bind(snapshot.state.refresh_failure_count as i32)
+            .bind(&snapshot.state.disabled_reason)
+            .bind(snapshot.state.warmup_remaining as i32)
+            .bind(expected_generation)
+            .bind(expected_revision)
+            .fetch_optional(&mut *tx)
+            .await?
+        };
+        if let Some(row) = applied {
+            let state = runtime_state_from_row(&row)?;
+            verify_runtime_mutation_revision(&state, next_revision)?;
+            verify_runtime_mutation_generation(&state, snapshot.state.generation)?;
+            tx.commit().await?;
+            return Ok(CredentialRuntimeStateCasOutcome::Applied(state));
+        }
+
+        let current = sqlx::query(
+            r#"
+            SELECT failure_count, refresh_failure_count, disabled_reason,
+                   warmup_remaining, generation, revision
+            FROM credential_runtime_state
+            WHERE credential_id = $1
+            FOR SHARE
             "#,
         )
         .bind(credential_id as i64)
-        .bind(snapshot.state.failure_count as i32)
-        .bind(snapshot.state.refresh_failure_count as i32)
-        .bind(&snapshot.state.disabled_reason)
-        .bind(snapshot.state.warmup_remaining as i32)
-        .bind(snapshot.updated_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| runtime_state_from_row(&row))
+        .transpose()?;
+        tx.commit().await?;
+        Ok(CredentialRuntimeStateCasOutcome::Conflict { current })
     }
 
     #[cfg(test)]
@@ -1394,6 +2078,9 @@ impl PostgresStore {
         credential_id: u64,
         stat: &CredentialStatsRow,
     ) -> anyhow::Result<()> {
+        if let Some(last_used_at) = stat.last_used_at.as_deref() {
+            validate_rfc3339_timestamp("last_used_at", last_used_at)?;
+        }
         sqlx::query(
             r#"
             INSERT INTO credential_stats (
@@ -1403,7 +2090,14 @@ impl PostgresStore {
             ON CONFLICT (credential_id) DO UPDATE
             SET success_count = GREATEST(credential_stats.success_count, EXCLUDED.success_count),
                 selection_count = GREATEST(credential_stats.selection_count, EXCLUDED.selection_count),
-                last_used_at = EXCLUDED.last_used_at,
+                last_used_at = CASE
+                    WHEN EXCLUDED.last_used_at IS NULL THEN credential_stats.last_used_at
+                    WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
+                    WHEN EXCLUDED.last_used_at::timestamptz
+                         >= credential_stats.last_used_at::timestamptz
+                        THEN EXCLUDED.last_used_at
+                    ELSE credential_stats.last_used_at
+                END,
                 updated_at = now()
             "#,
         )
@@ -1418,25 +2112,101 @@ impl PostgresStore {
 
     pub async fn apply_credential_stats_deltas(
         &self,
+        operation_id: Uuid,
         deltas: &HashMap<u64, CredentialStatsDeltaRow>,
     ) -> anyhow::Result<()> {
-        let rows: Vec<(i64, i64, i64, Option<String>)> = deltas
-            .iter()
-            .filter(|(_, delta)| {
-                delta.success_delta != 0
-                    || delta.selection_delta != 0
-                    || delta.last_used_at.is_some()
-            })
-            .map(|(credential_id, delta)| {
-                (
-                    *credential_id as i64,
-                    delta.success_delta as i64,
-                    delta.selection_delta as i64,
-                    delta.last_used_at.clone(),
-                )
-            })
-            .collect();
-        if rows.is_empty() {
+        let mut rows = Vec::with_capacity(deltas.len());
+        for (credential_id, delta) in deltas {
+            if delta.success_delta == 0
+                && delta.selection_delta == 0
+                && delta.last_used_at.is_none()
+            {
+                continue;
+            }
+            if let Some(last_used_at) = delta.last_used_at.as_deref() {
+                validate_rfc3339_timestamp("last_used_at", last_used_at)?;
+            }
+            rows.push((
+                i64::try_from(*credential_id).map_err(|_| {
+                    anyhow::anyhow!("凭据统计增量 credential_id 超出 PgSQL BIGINT 范围")
+                })?,
+                i64::try_from(delta.success_delta).map_err(|_| {
+                    anyhow::anyhow!("凭据统计 success_delta 超出 PgSQL BIGINT 范围")
+                })?,
+                i64::try_from(delta.selection_delta).map_err(|_| {
+                    anyhow::anyhow!("凭据统计 selection_delta 超出 PgSQL BIGINT 范围")
+                })?,
+                delta.last_used_at.clone(),
+            ));
+        }
+        rows.sort_unstable_by_key(|row| row.0);
+        let payload_hash = sha256_hex(&serde_json::to_string(&rows)?);
+        let input_credential_count = i32::try_from(rows.len())
+            .map_err(|_| anyhow::anyhow!("凭据统计增量批次行数超出 PgSQL INTEGER 范围"))?;
+
+        let mut tx = self.pool.begin().await?;
+        let credential_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let active_credential_ids: Vec<i64> = if credential_ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_scalar(
+                r#"
+                SELECT id
+                FROM credentials
+                WHERE deleted_at IS NULL
+                  AND id = ANY($1)
+                ORDER BY id ASC
+                FOR SHARE
+                "#,
+            )
+            .bind(&credential_ids)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        rows.retain(|row| active_credential_ids.binary_search(&row.0).is_ok());
+        let applied_credential_count = i32::try_from(rows.len())
+            .map_err(|_| anyhow::anyhow!("凭据统计有效增量行数超出 PgSQL INTEGER 范围"))?;
+
+        let operation_id = operation_id.to_string();
+        let inserted: Option<String> = sqlx::query_scalar(
+            r#"
+            INSERT INTO credential_stats_delta_batches (
+                operation_id, payload_hash, input_credential_count,
+                applied_credential_count, created_at
+            )
+            VALUES ($1, $2, $3, $4, now())
+            ON CONFLICT (operation_id) DO NOTHING
+            RETURNING operation_id
+            "#,
+        )
+        .bind(&operation_id)
+        .bind(&payload_hash)
+        .bind(input_credential_count)
+        .bind(applied_credential_count)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if inserted.is_none() {
+            let existing_payload_hash: String = sqlx::query_scalar(
+                r#"
+                SELECT payload_hash
+                FROM credential_stats_delta_batches
+                WHERE operation_id = $1
+                FOR UPDATE
+                "#,
+            )
+            .bind(&operation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if existing_payload_hash != payload_hash {
+                anyhow::bail!("凭据统计 operation_id {} 已用于不同 payload", operation_id);
+            }
+            sqlx::query(
+                "UPDATE credential_stats_delta_batches SET created_at = now() WHERE operation_id = $1",
+            )
+            .bind(&operation_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
             return Ok(());
         }
 
@@ -1467,60 +2237,32 @@ impl PostgresStore {
                     last_used_at = CASE
                         WHEN EXCLUDED.last_used_at IS NULL THEN credential_stats.last_used_at
                         WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
-                        WHEN EXCLUDED.last_used_at >= credential_stats.last_used_at THEN EXCLUDED.last_used_at
+                        WHEN EXCLUDED.last_used_at::timestamptz
+                             >= credential_stats.last_used_at::timestamptz
+                            THEN EXCLUDED.last_used_at
                         ELSE credential_stats.last_used_at
                     END,
                     updated_at = now()
                 "#,
             );
-            builder.build().execute(&self.pool).await?;
+            builder.build().execute(&mut *tx).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn apply_credential_runtime_state_snapshots(
         &self,
         snapshots: &HashMap<u64, CredentialRuntimeStateSnapshot>,
-    ) -> anyhow::Result<()> {
-        let rows: Vec<(i64, CredentialRuntimeStateSnapshot)> = snapshots
-            .iter()
-            .map(|(credential_id, snapshot)| (*credential_id as i64, snapshot.clone()))
-            .collect();
-        if rows.is_empty() {
-            return Ok(());
+    ) -> anyhow::Result<HashMap<u64, CredentialRuntimeStateCasOutcome>> {
+        let mut outcomes = HashMap::with_capacity(snapshots.len());
+        for (credential_id, snapshot) in snapshots {
+            let outcome = self
+                .save_credential_runtime_state_snapshot(*credential_id, snapshot)
+                .await?;
+            outcomes.insert(*credential_id, outcome);
         }
-
-        for chunk in rows.chunks(1_000) {
-            let mut builder = QueryBuilder::<Postgres>::new(
-                r#"
-                INSERT INTO credential_runtime_state (
-                    credential_id, failure_count, refresh_failure_count,
-                    disabled_reason, warmup_remaining, updated_at
-                )
-                "#,
-            );
-            builder.push_values(chunk.iter(), |mut row, &(credential_id, ref snapshot)| {
-                row.push_bind(credential_id)
-                    .push_bind(snapshot.state.failure_count as i32)
-                    .push_bind(snapshot.state.refresh_failure_count as i32)
-                    .push_bind(snapshot.state.disabled_reason.clone())
-                    .push_bind(snapshot.state.warmup_remaining as i32)
-                    .push_bind(snapshot.updated_at.clone());
-            });
-            builder.push(
-                r#"
-                ON CONFLICT (credential_id) DO UPDATE
-                SET failure_count = EXCLUDED.failure_count,
-                    refresh_failure_count = EXCLUDED.refresh_failure_count,
-                    disabled_reason = EXCLUDED.disabled_reason,
-                    warmup_remaining = EXCLUDED.warmup_remaining,
-                    updated_at = EXCLUDED.updated_at
-                WHERE credential_runtime_state.updated_at <= EXCLUDED.updated_at
-                "#,
-            );
-            builder.build().execute(&self.pool).await?;
-        }
-        Ok(())
+        Ok(outcomes)
     }
 
     #[cfg(test)]
@@ -1541,108 +2283,596 @@ impl PostgresStore {
     }
 
     #[allow(dead_code)]
-    pub async fn record_credential_api_failure(
+    pub async fn record_credential_success(
         &self,
         credential_id: u64,
-        last_used_at: &str,
-        max_failures: u32,
+        operation_id: Uuid,
     ) -> anyhow::Result<CredentialRuntimeStateRow> {
+        Ok(self
+            .record_credential_success_with_expected_generation(credential_id, operation_id, None)
+            .await?
+            .state)
+    }
+
+    pub async fn record_credential_success_at_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: u64,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.record_credential_success_with_expected_generation(
+            credential_id,
+            operation_id,
+            Some(expected_generation),
+        )
+        .await
+    }
+
+    async fn record_credential_success_with_expected_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: Option<u64>,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
         let mut tx = self.pool.begin().await?;
-        upsert_last_used_at(&mut tx, credential_id, last_used_at).await?;
+        let (next_revision, credential_disabled) = match prepare_credential_runtime_mutation(
+            &mut tx,
+            credential_id,
+            operation_id,
+            "success",
+            expected_generation,
+        )
+        .await?
+        {
+            CredentialRuntimeMutationPreparation::Apply {
+                next_revision,
+                credential_disabled,
+                ..
+            } => (next_revision, credential_disabled),
+            CredentialRuntimeMutationPreparation::Duplicate {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: true,
+                });
+            }
+            CredentialRuntimeMutationPreparation::Stale {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: false,
+                });
+            }
+        };
         let row = sqlx::query(
             r#"
-            INSERT INTO credential_runtime_state (
-                credential_id, failure_count, refresh_failure_count,
-                disabled_reason, warmup_remaining, updated_at
-            )
-            VALUES ($1, 1, 0, NULL, 0, now())
-            ON CONFLICT (credential_id) DO UPDATE
-            SET failure_count = credential_runtime_state.failure_count + 1,
+            UPDATE credential_runtime_state
+            SET failure_count = 0,
+                refresh_failure_count = 0,
+                warmup_remaining = GREATEST(credential_runtime_state.warmup_remaining - 1, 0),
+                revision = credential_runtime_state.revision + 1,
                 updated_at = now()
-            RETURNING failure_count, refresh_failure_count, disabled_reason, warmup_remaining
+            WHERE credential_id = $1
+            RETURNING failure_count, refresh_failure_count, disabled_reason,
+                      warmup_remaining, generation, revision
             "#,
         )
         .bind(credential_id as i64)
         .fetch_one(&mut *tx)
         .await?;
-        let mut state = runtime_state_from_row(&row)?;
-        if state.failure_count >= max_failures {
-            state.disabled_reason = Some("TooManyFailures".to_string());
-            persist_credential_disabled_in_tx(
-                &mut tx,
+        let state = runtime_state_from_row(&row)?;
+        verify_runtime_mutation_revision(&state, next_revision)?;
+        tx.commit().await?;
+        Ok(CredentialRuntimeStateMutationResult {
+            state,
+            credential_disabled,
+            applied: true,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub async fn record_credential_api_failure(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        last_used_at: &str,
+        max_failures: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateRow> {
+        Ok(self
+            .record_credential_api_failure_with_expected_generation(
                 credential_id,
-                "TooManyFailures",
-                Some(state.failure_count),
+                operation_id,
                 None,
+                last_used_at,
+                max_failures,
             )
-            .await?;
+            .await?
+            .state)
+    }
+
+    pub async fn record_credential_api_failure_at_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: u64,
+        last_used_at: &str,
+        max_failures: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.record_credential_api_failure_with_expected_generation(
+            credential_id,
+            operation_id,
+            Some(expected_generation),
+            last_used_at,
+            max_failures,
+        )
+        .await
+    }
+
+    async fn record_credential_api_failure_with_expected_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: Option<u64>,
+        last_used_at: &str,
+        max_failures: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        let mut tx = self.pool.begin().await?;
+        let (next_revision, mut credential_disabled) = match prepare_credential_runtime_mutation(
+            &mut tx,
+            credential_id,
+            operation_id,
+            "api_failure",
+            expected_generation,
+        )
+        .await?
+        {
+            CredentialRuntimeMutationPreparation::Apply {
+                next_revision,
+                credential_disabled,
+                ..
+            } => (next_revision, credential_disabled),
+            CredentialRuntimeMutationPreparation::Duplicate {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: true,
+                });
+            }
+            CredentialRuntimeMutationPreparation::Stale {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: false,
+                });
+            }
+        };
+        upsert_last_used_at(&mut tx, credential_id, last_used_at).await?;
+        let row = sqlx::query(
+            r#"
+            UPDATE credential_runtime_state
+            SET failure_count = credential_runtime_state.failure_count + 1,
+                disabled_reason = CASE
+                    WHEN credential_runtime_state.failure_count + 1 >= $2
+                        THEN 'TooManyFailures'
+                    ELSE credential_runtime_state.disabled_reason
+                END,
+                revision = credential_runtime_state.revision + 1,
+                updated_at = now()
+            WHERE credential_id = $1
+            RETURNING failure_count, refresh_failure_count, disabled_reason,
+                      warmup_remaining, generation, revision
+            "#,
+        )
+        .bind(credential_id as i64)
+        .bind(max_failures as i32)
+        .fetch_one(&mut *tx)
+        .await?;
+        let state = runtime_state_from_row(&row)?;
+        verify_runtime_mutation_revision(&state, next_revision)?;
+        if state.disabled_reason.as_deref() == Some("TooManyFailures") {
+            persist_credential_disabled_flag_in_tx(&mut tx, credential_id, true).await?;
+            credential_disabled = true;
         }
         tx.commit().await?;
-        Ok(state)
+        Ok(CredentialRuntimeStateMutationResult {
+            state,
+            credential_disabled,
+            applied: true,
+        })
     }
 
     #[allow(dead_code)]
     pub async fn record_credential_refresh_failure(
         &self,
         credential_id: u64,
+        operation_id: Uuid,
         last_used_at: &str,
         max_failures: u32,
     ) -> anyhow::Result<CredentialRuntimeStateRow> {
+        Ok(self
+            .record_credential_refresh_failure_with_expected_generation(
+                credential_id,
+                operation_id,
+                None,
+                last_used_at,
+                max_failures,
+            )
+            .await?
+            .state)
+    }
+
+    pub async fn record_credential_refresh_failure_at_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: u64,
+        last_used_at: &str,
+        max_failures: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.record_credential_refresh_failure_with_expected_generation(
+            credential_id,
+            operation_id,
+            Some(expected_generation),
+            last_used_at,
+            max_failures,
+        )
+        .await
+    }
+
+    async fn record_credential_refresh_failure_with_expected_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: Option<u64>,
+        last_used_at: &str,
+        max_failures: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
         let mut tx = self.pool.begin().await?;
+        let (next_revision, mut credential_disabled) = match prepare_credential_runtime_mutation(
+            &mut tx,
+            credential_id,
+            operation_id,
+            "refresh_failure",
+            expected_generation,
+        )
+        .await?
+        {
+            CredentialRuntimeMutationPreparation::Apply {
+                next_revision,
+                credential_disabled,
+                ..
+            } => (next_revision, credential_disabled),
+            CredentialRuntimeMutationPreparation::Duplicate {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: true,
+                });
+            }
+            CredentialRuntimeMutationPreparation::Stale {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: false,
+                });
+            }
+        };
         upsert_last_used_at(&mut tx, credential_id, last_used_at).await?;
         let row = sqlx::query(
             r#"
-            INSERT INTO credential_runtime_state (
-                credential_id, failure_count, refresh_failure_count,
-                disabled_reason, warmup_remaining, updated_at
-            )
-            VALUES ($1, 0, 1, NULL, 0, now())
-            ON CONFLICT (credential_id) DO UPDATE
+            UPDATE credential_runtime_state
             SET refresh_failure_count = credential_runtime_state.refresh_failure_count + 1,
+                disabled_reason = CASE
+                    WHEN credential_runtime_state.refresh_failure_count + 1 >= $2
+                        THEN 'TooManyRefreshFailures'
+                    ELSE credential_runtime_state.disabled_reason
+                END,
+                revision = credential_runtime_state.revision + 1,
                 updated_at = now()
-            RETURNING failure_count, refresh_failure_count, disabled_reason, warmup_remaining
+            WHERE credential_id = $1
+            RETURNING failure_count, refresh_failure_count, disabled_reason,
+                      warmup_remaining, generation, revision
             "#,
         )
         .bind(credential_id as i64)
+        .bind(max_failures as i32)
         .fetch_one(&mut *tx)
         .await?;
-        let mut state = runtime_state_from_row(&row)?;
-        if state.refresh_failure_count >= max_failures {
-            state.disabled_reason = Some("TooManyRefreshFailures".to_string());
-            persist_credential_disabled_in_tx(
-                &mut tx,
-                credential_id,
-                "TooManyRefreshFailures",
-                None,
-                Some(state.refresh_failure_count),
-            )
-            .await?;
+        let state = runtime_state_from_row(&row)?;
+        verify_runtime_mutation_revision(&state, next_revision)?;
+        if state.disabled_reason.as_deref() == Some("TooManyRefreshFailures") {
+            persist_credential_disabled_flag_in_tx(&mut tx, credential_id, true).await?;
+            credential_disabled = true;
         }
         tx.commit().await?;
-        Ok(state)
+        Ok(CredentialRuntimeStateMutationResult {
+            state,
+            credential_disabled,
+            applied: true,
+        })
+    }
+
+    pub async fn heal_credential_api_failures(
+        &self,
+        credential_id: u64,
+    ) -> anyhow::Result<Option<CredentialRuntimeStateRow>> {
+        let mut tx = self.pool.begin().await?;
+        lock_active_credential_in_tx(&mut tx, credential_id).await?;
+        let current_reason: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT disabled_reason
+            FROM credential_runtime_state
+            WHERE credential_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(credential_id as i64)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        if current_reason.as_deref() != Some("TooManyFailures") {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let row = sqlx::query(
+            r#"
+            UPDATE credential_runtime_state
+            SET failure_count = 0,
+                disabled_reason = NULL,
+                generation = credential_runtime_state.generation + 1,
+                revision = credential_runtime_state.revision + 1,
+                updated_at = now()
+            WHERE credential_id = $1 AND disabled_reason = 'TooManyFailures'
+            RETURNING failure_count, refresh_failure_count, disabled_reason,
+                      warmup_remaining, generation, revision
+            "#,
+        )
+        .bind(credential_id as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        persist_credential_disabled_flag_in_tx(&mut tx, credential_id, false).await?;
+        let state = runtime_state_from_row(&row)?;
+        tx.commit().await?;
+        Ok(Some(state))
+    }
+
+    pub async fn patch_credential_runtime_state(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.patch_credential_runtime_state_with_kind(credential_id, operation_id, "patch", patch)
+            .await
+    }
+
+    async fn patch_credential_runtime_state_with_kind(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        mutation_kind: &str,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        validate_credential_runtime_state_patch(patch)?;
+        let mut tx = self.pool.begin().await?;
+        let result = Self::patch_credential_runtime_state_in_tx(
+            &mut tx,
+            credential_id,
+            operation_id,
+            mutation_kind,
+            patch,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    async fn patch_credential_runtime_state_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        credential_id: u64,
+        operation_id: Uuid,
+        mutation_kind: &str,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        let failure_count = runtime_state_count_to_i32("failure_count", patch.failure_count)?;
+        let refresh_failure_count =
+            runtime_state_count_to_i32("refresh_failure_count", patch.refresh_failure_count)?;
+        let warmup_remaining =
+            runtime_state_count_to_i32("warmup_remaining", patch.warmup_remaining)?;
+        let (update_disabled_reason, disabled_reason) = match &patch.disabled_reason {
+            CredentialRuntimeDisabledReasonPatch::Preserve => (false, None),
+            CredentialRuntimeDisabledReasonPatch::Set(reason) => (true, Some(reason.as_str())),
+            CredentialRuntimeDisabledReasonPatch::Clear => (true, None),
+        };
+
+        let (next_revision, current_generation, current_credential_disabled) =
+            match prepare_credential_runtime_mutation(
+                tx,
+                credential_id,
+                operation_id,
+                mutation_kind,
+                patch.expected_generation,
+            )
+            .await?
+            {
+                CredentialRuntimeMutationPreparation::Apply {
+                    next_revision,
+                    current_generation,
+                    credential_disabled,
+                } => (next_revision, current_generation, credential_disabled),
+                CredentialRuntimeMutationPreparation::Duplicate {
+                    state,
+                    credential_disabled,
+                } => {
+                    return Ok(CredentialRuntimeStateMutationResult {
+                        state,
+                        credential_disabled,
+                        applied: true,
+                    });
+                }
+                CredentialRuntimeMutationPreparation::Stale {
+                    state,
+                    credential_disabled,
+                } => {
+                    return Ok(CredentialRuntimeStateMutationResult {
+                        state,
+                        credential_disabled,
+                        applied: false,
+                    });
+                }
+            };
+        let next_generation = if patch.advance_generation {
+            current_generation
+                .checked_add(1)
+                .filter(|generation| i64::try_from(*generation).is_ok())
+                .ok_or_else(|| anyhow::anyhow!("凭据运行态 generation 已达到 PgSQL BIGINT 上限"))?
+        } else {
+            current_generation
+        };
+        if let Some(last_used_at) = patch.last_used_at.as_deref() {
+            upsert_last_used_at(tx, credential_id, last_used_at).await?;
+        }
+        let row = sqlx::query(
+            r#"
+            UPDATE credential_runtime_state
+            SET failure_count = COALESCE($2, credential_runtime_state.failure_count),
+                refresh_failure_count = COALESCE($3, credential_runtime_state.refresh_failure_count),
+                disabled_reason = CASE
+                    WHEN $4 THEN $5
+                    ELSE credential_runtime_state.disabled_reason
+                END,
+                warmup_remaining = COALESCE($6, credential_runtime_state.warmup_remaining),
+                generation = credential_runtime_state.generation
+                    + CASE WHEN $7 THEN 1 ELSE 0 END,
+                revision = credential_runtime_state.revision + 1,
+                updated_at = now()
+            WHERE credential_id = $1
+            RETURNING failure_count, refresh_failure_count, disabled_reason,
+                      warmup_remaining, generation, revision
+            "#,
+        )
+        .bind(credential_id as i64)
+        .bind(failure_count)
+        .bind(refresh_failure_count)
+        .bind(update_disabled_reason)
+        .bind(disabled_reason)
+        .bind(warmup_remaining)
+        .bind(patch.advance_generation)
+        .fetch_one(&mut **tx)
+        .await?;
+        let state = runtime_state_from_row(&row)?;
+        verify_runtime_mutation_revision(&state, next_revision)?;
+        verify_runtime_mutation_generation(&state, next_generation)?;
+        let credential_disabled = if let Some(disabled) = patch.credential_disabled {
+            persist_credential_disabled_flag_in_tx(tx, credential_id, disabled).await?;
+            disabled
+        } else {
+            current_credential_disabled
+        };
+        Ok(CredentialRuntimeStateMutationResult {
+            state,
+            credential_disabled,
+            applied: true,
+        })
     }
 
     #[allow(dead_code)]
     pub async fn mark_credential_disabled(
         &self,
         credential_id: u64,
+        operation_id: Uuid,
         reason: &str,
         failure_count: Option<u32>,
         refresh_failure_count: Option<u32>,
         last_used_at: &str,
-    ) -> anyhow::Result<CredentialRuntimeStateRow> {
-        let mut tx = self.pool.begin().await?;
-        upsert_last_used_at(&mut tx, credential_id, last_used_at).await?;
-        let state = persist_credential_disabled_in_tx(
-            &mut tx,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.mark_credential_disabled_with_expected_generation(
             credential_id,
+            operation_id,
+            None,
             reason,
-            failure_count,
-            refresh_failure_count,
+            CredentialRuntimeFailureCounts {
+                failure_count,
+                refresh_failure_count,
+            },
+            last_used_at,
         )
-        .await?;
-        tx.commit().await?;
-        Ok(state)
+        .await
+    }
+
+    pub async fn mark_credential_disabled_at_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: u64,
+        reason: &str,
+        failure_counts: CredentialRuntimeFailureCounts,
+        last_used_at: &str,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.mark_credential_disabled_with_expected_generation(
+            credential_id,
+            operation_id,
+            Some(expected_generation),
+            reason,
+            failure_counts,
+            last_used_at,
+        )
+        .await
+    }
+
+    async fn mark_credential_disabled_with_expected_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: Option<u64>,
+        reason: &str,
+        failure_counts: CredentialRuntimeFailureCounts,
+        last_used_at: &str,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.patch_credential_runtime_state_with_kind(
+            credential_id,
+            operation_id,
+            "disable",
+            &CredentialRuntimeStatePatch {
+                failure_count: failure_counts.failure_count,
+                refresh_failure_count: failure_counts.refresh_failure_count,
+                disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(reason.to_string()),
+                credential_disabled: Some(true),
+                last_used_at: Some(last_used_at.to_string()),
+                expected_generation,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -1651,12 +2881,19 @@ impl PostgresStore {
         credential_id: u64,
         last_used_at: &str,
     ) -> anyhow::Result<()> {
+        validate_rfc3339_timestamp("last_used_at", last_used_at)?;
         sqlx::query(
             r#"
             INSERT INTO credential_stats (credential_id, success_count, last_used_at, updated_at)
             VALUES ($1, 0, $2, now())
             ON CONFLICT (credential_id) DO UPDATE
-            SET last_used_at = EXCLUDED.last_used_at,
+            SET last_used_at = CASE
+                    WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
+                    WHEN EXCLUDED.last_used_at::timestamptz
+                         >= credential_stats.last_used_at::timestamptz
+                        THEN EXCLUDED.last_used_at
+                    ELSE credential_stats.last_used_at
+                END,
                 updated_at = now()
             "#,
         )
@@ -2257,6 +3494,115 @@ async fn execute_sql_statements_in_tx(
     Ok(())
 }
 
+async fn repair_active_credential_hashes(
+    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+) -> anyhow::Result<()> {
+    let mut tx = conn.begin().await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, api_key_hash, refresh_token_hash, data
+        FROM credentials
+        WHERE deleted_at IS NULL
+          AND (
+              (
+                  api_key_hash IS NULL
+                  AND COALESCE(data->>'kiroApiKey', data->>'kiro_api_key') IS NOT NULL
+              )
+              OR (
+                  refresh_token_hash IS NULL
+                  AND COALESCE(data->>'refreshToken', data->>'refresh_token') IS NOT NULL
+              )
+          )
+        ORDER BY id ASC
+        FOR UPDATE
+        "#,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    for row in rows {
+        let credential_id: i64 = row.try_get("id")?;
+        let existing_api_key_hash: Option<String> = row.try_get("api_key_hash")?;
+        let existing_refresh_token_hash: Option<String> = row.try_get("refresh_token_hash")?;
+        let data: serde_json::Value = row.try_get("data")?;
+        let mut credential: KiroCredentials = serde_json::from_value(data)?;
+        credential.id = Some(credential_id.max(0) as u64);
+        credential.canonicalize_auth_method();
+        let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&credential);
+
+        if existing_api_key_hash.is_none()
+            && let Some(api_key_hash) = api_key_hash.as_deref()
+        {
+            let conflicting_id: Option<i64> = sqlx::query_scalar(
+                r#"
+                    SELECT id
+                    FROM credentials
+                    WHERE deleted_at IS NULL
+                      AND id <> $1
+                      AND api_key_hash = $2
+                    LIMIT 1
+                    "#,
+            )
+            .bind(credential_id)
+            .bind(api_key_hash)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(conflicting_id) = conflicting_id {
+                anyhow::bail!(
+                    "凭据 #{} 与 #{} 的 kiroApiKey 重复，无法回填 hash",
+                    credential_id,
+                    conflicting_id
+                );
+            }
+        }
+        if existing_refresh_token_hash.is_none()
+            && let Some(refresh_token_hash) = refresh_token_hash.as_deref()
+        {
+            let conflicting_id: Option<i64> = sqlx::query_scalar(
+                r#"
+                    SELECT id
+                    FROM credentials
+                    WHERE deleted_at IS NULL
+                      AND id <> $1
+                      AND refresh_token_hash = $2
+                    LIMIT 1
+                    "#,
+            )
+            .bind(credential_id)
+            .bind(refresh_token_hash)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(conflicting_id) = conflicting_id {
+                anyhow::bail!(
+                    "凭据 #{} 与 #{} 的 refreshToken 重复，无法回填 hash",
+                    credential_id,
+                    conflicting_id
+                );
+            }
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE credentials
+            SET auth_kind = $2,
+                api_key_hash = COALESCE(credentials.api_key_hash, $3),
+                refresh_token_hash = COALESCE(credentials.refresh_token_hash, $4)
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(credential_id)
+        .bind(auth_kind)
+        .bind(api_key_hash)
+        .bind(refresh_token_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(duplicate_credential_message)?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CredentialStatsRow {
     pub success_count: u64,
@@ -2271,18 +3617,129 @@ pub struct CredentialStatsDeltaRow {
     pub last_used_at: Option<String>,
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct CredentialRefreshFieldsPatch {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub profile_arn: Option<String>,
+    pub expires_at: Option<String>,
+    pub scopes: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[must_use = "credential upsert CAS conflicts must be handled explicitly"]
+pub enum CredentialUpsertCasOutcome {
+    Applied(KiroCredentials),
+    Conflict { current: KiroCredentials },
+}
+
+#[derive(Debug, Clone)]
+#[must_use = "credential/runtime CAS conflicts must be handled explicitly"]
+pub enum CredentialWithRuntimePatchCasOutcome {
+    Applied {
+        credential: KiroCredentials,
+        runtime: CredentialRuntimeStateMutationResult,
+    },
+    Conflict {
+        current: KiroCredentials,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialRefreshExpectedContext {
+    refresh_token_hash: String,
+    auth_method: Option<String>,
+    provider: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    token_endpoint: Option<String>,
+    scopes: Option<String>,
+}
+
+impl CredentialRefreshExpectedContext {
+    pub fn from_credentials(credentials: &KiroCredentials) -> anyhow::Result<Self> {
+        let mut credentials = credentials.clone();
+        credentials.canonicalize_auth_method();
+        let refresh_token = credentials
+            .refresh_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("凭据 refreshToken CAS 缺少原 refreshToken"))?;
+        Ok(Self {
+            refresh_token_hash: sha256_hex(refresh_token),
+            auth_method: credentials.auth_method,
+            provider: credentials.provider,
+            client_id: credentials.client_id,
+            client_secret: credentials.client_secret,
+            token_endpoint: credentials.token_endpoint,
+            scopes: credentials.scopes,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+#[must_use = "credential refresh field CAS conflicts must be handled explicitly"]
+pub enum CredentialRefreshFieldsCasOutcome {
+    Applied(KiroCredentials),
+    Conflict { current: Option<KiroCredentials> },
+}
+
 #[derive(Debug, Clone)]
 pub struct CredentialRuntimeStateSnapshot {
     pub state: CredentialRuntimeStateRow,
-    pub updated_at: DateTime<Utc>,
+    pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CredentialRuntimeStateRow {
     pub failure_count: u32,
     pub refresh_failure_count: u32,
     pub disabled_reason: Option<String>,
     pub warmup_remaining: u32,
+    pub generation: u64,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CredentialRuntimeDisabledReasonPatch {
+    #[default]
+    Preserve,
+    Set(String),
+    Clear,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CredentialRuntimeStatePatch {
+    pub failure_count: Option<u32>,
+    pub refresh_failure_count: Option<u32>,
+    pub disabled_reason: CredentialRuntimeDisabledReasonPatch,
+    pub warmup_remaining: Option<u32>,
+    pub credential_disabled: Option<bool>,
+    pub last_used_at: Option<String>,
+    pub expected_generation: Option<u64>,
+    pub advance_generation: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CredentialRuntimeFailureCounts {
+    pub failure_count: Option<u32>,
+    pub refresh_failure_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRuntimeStateMutationResult {
+    pub state: CredentialRuntimeStateRow,
+    pub credential_disabled: bool,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "credential runtime CAS conflicts must be handled explicitly"]
+pub enum CredentialRuntimeStateCasOutcome {
+    Applied(CredentialRuntimeStateRow),
+    Conflict {
+        current: Option<CredentialRuntimeStateRow>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4552,11 +6009,15 @@ fn runtime_state_from_row(row: &PgRow) -> anyhow::Result<CredentialRuntimeStateR
     let refresh_failure_count: i32 = row.try_get("refresh_failure_count")?;
     let disabled_reason: Option<String> = row.try_get("disabled_reason")?;
     let warmup_remaining: i32 = row.try_get("warmup_remaining")?;
+    let generation: i64 = row.try_get("generation")?;
+    let revision: i64 = row.try_get("revision")?;
     Ok(CredentialRuntimeStateRow {
         failure_count: failure_count.max(0) as u32,
         refresh_failure_count: refresh_failure_count.max(0) as u32,
         disabled_reason,
         warmup_remaining: warmup_remaining.max(0) as u32,
+        generation: generation.max(0) as u64,
+        revision: revision.max(0) as u64,
     })
 }
 
@@ -4646,12 +6107,19 @@ async fn upsert_last_used_at(
     credential_id: u64,
     last_used_at: &str,
 ) -> anyhow::Result<()> {
+    validate_rfc3339_timestamp("last_used_at", last_used_at)?;
     sqlx::query(
         r#"
         INSERT INTO credential_stats (credential_id, success_count, last_used_at, updated_at)
         VALUES ($1, 0, $2, now())
         ON CONFLICT (credential_id) DO UPDATE
-        SET last_used_at = EXCLUDED.last_used_at,
+        SET last_used_at = CASE
+                WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
+                WHEN EXCLUDED.last_used_at::timestamptz
+                     >= credential_stats.last_used_at::timestamptz
+                    THEN EXCLUDED.last_used_at
+                ELSE credential_stats.last_used_at
+            END,
             updated_at = now()
         "#,
     )
@@ -4662,48 +6130,285 @@ async fn upsert_last_used_at(
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn persist_credential_disabled_in_tx(
+enum CredentialRuntimeMutationPreparation {
+    Apply {
+        next_revision: u64,
+        current_generation: u64,
+        credential_disabled: bool,
+    },
+    Duplicate {
+        state: CredentialRuntimeStateRow,
+        credential_disabled: bool,
+    },
+    Stale {
+        state: CredentialRuntimeStateRow,
+        credential_disabled: bool,
+    },
+}
+
+async fn prepare_credential_runtime_mutation(
     tx: &mut Transaction<'_, Postgres>,
     credential_id: u64,
-    reason: &str,
-    failure_count: Option<u32>,
-    refresh_failure_count: Option<u32>,
-) -> anyhow::Result<CredentialRuntimeStateRow> {
-    let row = sqlx::query(
+    operation_id: Uuid,
+    mutation_kind: &str,
+    expected_generation: Option<u64>,
+) -> anyhow::Result<CredentialRuntimeMutationPreparation> {
+    let operation_id = operation_id.to_string();
+    let credential_disabled = lock_active_credential_in_tx(tx, credential_id).await?;
+    sqlx::query(
         r#"
         INSERT INTO credential_runtime_state (
             credential_id, failure_count, refresh_failure_count,
-            disabled_reason, warmup_remaining, updated_at
+            disabled_reason, warmup_remaining, generation, revision, updated_at
         )
-        VALUES ($1, COALESCE($2, 0), COALESCE($3, 0), $4, 0, now())
-        ON CONFLICT (credential_id) DO UPDATE
-        SET failure_count = COALESCE($2, credential_runtime_state.failure_count),
-            refresh_failure_count = COALESCE($3, credential_runtime_state.refresh_failure_count),
-            disabled_reason = $4,
-            updated_at = now()
-        RETURNING failure_count, refresh_failure_count, disabled_reason, warmup_remaining
-        "#,
-    )
-    .bind(credential_id as i64)
-    .bind(failure_count.map(|value| value as i32))
-    .bind(refresh_failure_count.map(|value| value as i32))
-    .bind(reason)
-    .fetch_one(&mut **tx)
-    .await?;
-    sqlx::query(
-        r#"
-        UPDATE credentials
-        SET disabled = TRUE,
-            data = jsonb_set(data, '{disabled}', 'true'::jsonb, true),
-            updated_at = now()
-        WHERE id = $1 AND deleted_at IS NULL
+        VALUES ($1, 0, 0, NULL, 0, 0, 0, now())
+        ON CONFLICT (credential_id) DO NOTHING
         "#,
     )
     .bind(credential_id as i64)
     .execute(&mut **tx)
     .await?;
-    runtime_state_from_row(&row)
+
+    let row = sqlx::query(
+        r#"
+        SELECT failure_count, refresh_failure_count, disabled_reason,
+               warmup_remaining, generation, revision
+        FROM credential_runtime_state
+        WHERE credential_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(credential_id as i64)
+    .fetch_one(&mut **tx)
+    .await?;
+    let state = runtime_state_from_row(&row)?;
+
+    let existing = sqlx::query(
+        r#"
+        SELECT credential_id, mutation_kind
+        FROM credential_runtime_mutations
+        WHERE operation_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(&operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(existing) = existing {
+        let existing_credential_id: i64 = existing.try_get("credential_id")?;
+        let existing_mutation_kind: String = existing.try_get("mutation_kind")?;
+        if existing_credential_id != credential_id as i64 || existing_mutation_kind != mutation_kind
+        {
+            anyhow::bail!(
+                "运行态 operation_id {} 已用于凭据 #{} 的 {} 操作",
+                operation_id,
+                existing_credential_id,
+                existing_mutation_kind
+            );
+        }
+        sqlx::query(
+            "UPDATE credential_runtime_mutations SET created_at = now() WHERE operation_id = $1",
+        )
+        .bind(&operation_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(CredentialRuntimeMutationPreparation::Duplicate {
+            state,
+            credential_disabled,
+        });
+    }
+
+    if let Some(expected_generation) = expected_generation {
+        if expected_generation < state.generation {
+            return Ok(CredentialRuntimeMutationPreparation::Stale {
+                state,
+                credential_disabled,
+            });
+        }
+        if expected_generation > state.generation {
+            anyhow::bail!(
+                "凭据 #{} 运行态 generation 超前：期望 {}，当前 {}",
+                credential_id,
+                expected_generation,
+                state.generation
+            );
+        }
+    }
+
+    let next_revision = state
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("凭据运行态 revision 已溢出"))?;
+    let next_revision_i64 = i64::try_from(next_revision)
+        .map_err(|_| anyhow::anyhow!("凭据运行态 revision 超出 PgSQL BIGINT 范围"))?;
+
+    let inserted_revision: Option<i64> = sqlx::query_scalar(
+        r#"
+        INSERT INTO credential_runtime_mutations (
+            operation_id, credential_id, mutation_kind, applied_revision, created_at
+        )
+        VALUES ($1, $2, $3, $4, now())
+        ON CONFLICT (operation_id) DO NOTHING
+        RETURNING applied_revision
+        "#,
+    )
+    .bind(&operation_id)
+    .bind(credential_id as i64)
+    .bind(mutation_kind)
+    .bind(next_revision_i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(inserted_revision) = inserted_revision {
+        if inserted_revision != next_revision_i64 {
+            anyhow::bail!("凭据运行态 mutation revision 写入不一致");
+        }
+        return Ok(CredentialRuntimeMutationPreparation::Apply {
+            next_revision,
+            current_generation: state.generation,
+            credential_disabled,
+        });
+    }
+
+    let existing = sqlx::query(
+        r#"
+        SELECT credential_id, mutation_kind
+        FROM credential_runtime_mutations
+        WHERE operation_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(&operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let existing_credential_id: i64 = existing.try_get("credential_id")?;
+    let existing_mutation_kind: String = existing.try_get("mutation_kind")?;
+    if existing_credential_id != credential_id as i64 || existing_mutation_kind != mutation_kind {
+        anyhow::bail!(
+            "运行态 operation_id {} 已用于凭据 #{} 的 {} 操作",
+            operation_id,
+            existing_credential_id,
+            existing_mutation_kind
+        );
+    }
+    sqlx::query(
+        "UPDATE credential_runtime_mutations SET created_at = now() WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(CredentialRuntimeMutationPreparation::Duplicate {
+        state,
+        credential_disabled,
+    })
+}
+
+fn verify_runtime_mutation_revision(
+    state: &CredentialRuntimeStateRow,
+    expected_revision: u64,
+) -> anyhow::Result<()> {
+    if state.revision != expected_revision {
+        anyhow::bail!(
+            "凭据运行态 revision 不一致：期望 {}，实际 {}",
+            expected_revision,
+            state.revision
+        );
+    }
+    Ok(())
+}
+
+fn verify_runtime_mutation_generation(
+    state: &CredentialRuntimeStateRow,
+    expected_generation: u64,
+) -> anyhow::Result<()> {
+    if state.generation != expected_generation {
+        anyhow::bail!(
+            "凭据运行态 generation 不一致：期望 {}，实际 {}",
+            expected_generation,
+            state.generation
+        );
+    }
+    Ok(())
+}
+
+fn validate_rfc3339_timestamp(field: &str, value: &str) -> anyhow::Result<()> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("{} 必须是有效 RFC3339 时间: {}", field, err))
+}
+
+fn validate_credential_runtime_state_patch(
+    patch: &CredentialRuntimeStatePatch,
+) -> anyhow::Result<()> {
+    runtime_state_count_to_i32("failure_count", patch.failure_count)?;
+    runtime_state_count_to_i32("refresh_failure_count", patch.refresh_failure_count)?;
+    runtime_state_count_to_i32("warmup_remaining", patch.warmup_remaining)?;
+    if patch
+        .expected_generation
+        .is_some_and(|generation| i64::try_from(generation).is_err())
+    {
+        anyhow::bail!("凭据运行态 expected generation 超出 PgSQL BIGINT 范围");
+    }
+    if let Some(last_used_at) = patch.last_used_at.as_deref() {
+        validate_rfc3339_timestamp("last_used_at", last_used_at)?;
+    }
+    Ok(())
+}
+
+fn runtime_state_count_to_i32(field: &str, value: Option<u32>) -> anyhow::Result<Option<i32>> {
+    value
+        .map(|value| {
+            i32::try_from(value).map_err(|_| {
+                anyhow::anyhow!(
+                    "凭据运行态字段 {} 的值 {} 超出 PgSQL INTEGER 范围",
+                    field,
+                    value
+                )
+            })
+        })
+        .transpose()
+}
+
+async fn lock_active_credential_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    credential_id: u64,
+) -> anyhow::Result<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT disabled
+        FROM credentials
+        WHERE id = $1 AND deleted_at IS NULL
+        FOR UPDATE
+        "#,
+    )
+    .bind(credential_id as i64)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在或已删除，无法更新运行态", credential_id))
+}
+
+async fn persist_credential_disabled_flag_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    credential_id: u64,
+    disabled: bool,
+) -> anyhow::Result<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE credentials
+        SET disabled = $2,
+            data = jsonb_set(data, '{disabled}', to_jsonb($2::boolean), true),
+            updated_at = now(),
+            revision = credentials.revision + 1
+        WHERE id = $1 AND deleted_at IS NULL
+        "#,
+    )
+    .bind(credential_id as i64)
+    .bind(disabled)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("凭据 #{} 不存在或已删除，无法更新禁用状态", credential_id);
+    }
+    Ok(())
 }
 
 fn usize_to_i64(value: usize) -> i64 {
@@ -4760,13 +6465,8 @@ CREATE TABLE IF NOT EXISTS credentials (
     data JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revision BIGINT NOT NULL DEFAULT 1,
     deleted_at TIMESTAMPTZ
-);
-
-SELECT setval(
-    'credentials_id_seq',
-    GREATEST(COALESCE((SELECT MAX(id) FROM credentials), 0) + 1, 1),
-    false
 );
 
 ALTER TABLE credentials
@@ -4786,6 +6486,9 @@ ALTER TABLE credentials
 
 ALTER TABLE credentials
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE credentials
+    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 
 ALTER TABLE credentials
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
@@ -4966,6 +6669,17 @@ CREATE TABLE IF NOT EXISTS credential_stats (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS credential_stats_delta_batches (
+    operation_id TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    input_credential_count INTEGER NOT NULL,
+    applied_credential_count INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_stats_delta_batches_created_at
+    ON credential_stats_delta_batches (created_at ASC);
+
 ALTER TABLE credential_stats
     ADD COLUMN IF NOT EXISTS selection_count BIGINT NOT NULL DEFAULT 0;
 
@@ -4975,8 +6689,30 @@ CREATE TABLE IF NOT EXISTS credential_runtime_state (
     refresh_failure_count INTEGER NOT NULL DEFAULT 0,
     disabled_reason TEXT,
     warmup_remaining INTEGER NOT NULL DEFAULT 0,
+    generation BIGINT NOT NULL DEFAULT 0,
+    revision BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE credential_runtime_state
+    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE credential_runtime_state
+    ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS credential_runtime_mutations (
+    operation_id TEXT PRIMARY KEY,
+    credential_id BIGINT NOT NULL REFERENCES credential_runtime_state(credential_id) ON DELETE CASCADE,
+    mutation_kind TEXT NOT NULL,
+    applied_revision BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_credential_created
+    ON credential_runtime_mutations (credential_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_created_at
+    ON credential_runtime_mutations (created_at ASC);
 
 CREATE TABLE IF NOT EXISTS credential_account_info (
     credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
@@ -5624,6 +7360,58 @@ CREATE INDEX IF NOT EXISTS idx_credential_events_type_created
     ON credential_events (event_type, created_at DESC);
 "#;
 
+const CREDENTIAL_RUNTIME_REVISION_SQL: &str = r#"
+ALTER TABLE credential_runtime_state
+    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+
+UPDATE credential_runtime_state
+SET revision = 1
+WHERE revision = 0;
+
+CREATE TABLE IF NOT EXISTS credential_runtime_mutations (
+    operation_id TEXT PRIMARY KEY,
+    credential_id BIGINT NOT NULL REFERENCES credential_runtime_state(credential_id) ON DELETE CASCADE,
+    mutation_kind TEXT NOT NULL,
+    applied_revision BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_credential_created
+    ON credential_runtime_mutations (credential_id, created_at DESC);
+"#;
+
+const CREDENTIAL_RUNTIME_GENERATION_SQL: &str = r#"
+ALTER TABLE credential_runtime_state
+    ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+"#;
+
+const CREDENTIAL_STORAGE_REVISION_SQL: &str = r#"
+ALTER TABLE credentials
+    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+
+UPDATE credentials
+SET revision = 1
+WHERE revision < 1;
+"#;
+
+const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_credential_runtime_mutations_created_at
+    ON credential_runtime_mutations (created_at ASC);
+"#;
+
+const CREDENTIAL_STATS_DELTA_BATCH_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS credential_stats_delta_batches (
+    operation_id TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    input_credential_count INTEGER NOT NULL,
+    applied_credential_count INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_stats_delta_batches_created_at
+    ON credential_stats_delta_batches (created_at ASC);
+"#;
+
 const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL: &str = r#"
 CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
 SELECT
@@ -5757,7 +7545,7 @@ mod tests {
     use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
 
     fn test_config() -> Option<Config> {
-        let url = std::env::var("KIRO_RS_TEST_POSTGRES_URL").ok()?;
+        let url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")?;
         let mut config = Config::default();
         config.postgres.url = Some(url);
         config.postgres.max_connections = 2;
@@ -5777,6 +7565,8 @@ mod tests {
             "TRUNCATE TABLE usage_records",
             "TRUNCATE TABLE model_pricing_sync_status",
             "TRUNCATE TABLE model_pricing",
+            "TRUNCATE TABLE credential_stats_delta_batches",
+            "TRUNCATE TABLE credential_runtime_mutations",
             "TRUNCATE TABLE credential_runtime_state CASCADE",
             "TRUNCATE TABLE credential_stats CASCADE",
             "TRUNCATE TABLE credentials CASCADE",
@@ -6348,6 +8138,8 @@ mod tests {
                 refresh_failure_count: 1,
                 disabled_reason: Some("TooManyFailures".to_string()),
                 warmup_remaining: 4,
+                revision: 0,
+                ..Default::default()
             },
         )]);
         store
@@ -6363,6 +8155,7 @@ mod tests {
             Some("TooManyFailures")
         );
         assert_eq!(loaded_runtime_state.warmup_remaining, 4);
+        assert_eq!(loaded_runtime_state.revision, 1);
 
         let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
         let mut usage_1 = usage_record("usage-1", 10);
@@ -6644,6 +8437,2530 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_credential_upsert_rejects_soft_deleted_rows() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let inserted = store
+            .insert_credential(&KiroCredentials {
+                email: Some("before-delete@example.com".to_string()),
+                refresh_token: Some("refresh-before-delete".to_string()),
+                auth_method: Some("social".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let credential_id = inserted.id.unwrap();
+        store.soft_delete_credential(credential_id).await.unwrap();
+
+        let mut stale = inserted;
+        stale.email = Some("stale-writer@example.com".to_string());
+        stale.priority = 99;
+        let error = store.upsert_credential(&stale).await.unwrap_err();
+        assert!(error.to_string().contains("已被删除"));
+
+        let row = sqlx::query(
+            r#"
+            SELECT deleted_at IS NOT NULL AS is_deleted,
+                   priority,
+                   data->>'email' AS email
+            FROM credentials
+            WHERE id = $1
+            "#,
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(row.try_get::<bool, _>("is_deleted").unwrap());
+        assert_eq!(row.try_get::<i32, _>("priority").unwrap(), 0);
+        assert_eq!(
+            row.try_get::<Option<String>, _>("email")
+                .unwrap()
+                .as_deref(),
+            Some("before-delete@example.com")
+        );
+        assert!(store.load_credentials().await.unwrap().is_empty());
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_credential_revision_cas_preserves_concurrent_field_updates() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let original = store
+            .insert_credential(&KiroCredentials {
+                access_token: Some("revision-access-old".to_string()),
+                refresh_token: Some("revision-refresh-old".to_string()),
+                auth_method: Some("social".to_string()),
+                email: Some("revision-original@example.com".to_string()),
+                priority: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let credential_id = original.id.unwrap();
+        assert_eq!(original.storage_revision, 1);
+
+        let mut priority_update = original.clone();
+        priority_update.priority = 17;
+        let mut email_update = original.clone();
+        email_update.email = Some("revision-concurrent@example.com".to_string());
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (priority_outcome, email_outcome) = tokio::join!(
+            first_store.upsert_credential(&priority_update),
+            second_store.upsert_credential(&email_update),
+        );
+        let priority_outcome = priority_outcome.unwrap();
+        let email_outcome = email_outcome.unwrap();
+        let mut retry = match (priority_outcome, email_outcome) {
+            (
+                CredentialUpsertCasOutcome::Applied(applied),
+                CredentialUpsertCasOutcome::Conflict { current },
+            ) => {
+                assert_eq!(applied.priority, 17);
+                assert_eq!(applied.storage_revision, 2);
+                assert_eq!(current.storage_revision, 2);
+                let mut retry = current;
+                retry.email = Some("revision-concurrent@example.com".to_string());
+                retry
+            }
+            (
+                CredentialUpsertCasOutcome::Conflict { current },
+                CredentialUpsertCasOutcome::Applied(applied),
+            ) => {
+                assert_eq!(
+                    applied.email.as_deref(),
+                    Some("revision-concurrent@example.com")
+                );
+                assert_eq!(applied.storage_revision, 2);
+                assert_eq!(current.storage_revision, 2);
+                let mut retry = current;
+                retry.priority = 17;
+                retry
+            }
+            _ => panic!("exactly one writer must apply for the same base revision"),
+        };
+        let retried = store.upsert_credential(&retry).await.unwrap();
+        let CredentialUpsertCasOutcome::Applied(retried) = retried else {
+            panic!("field-level retry against the authoritative revision must apply");
+        };
+        assert_eq!(retried.priority, 17);
+        assert_eq!(
+            retried.email.as_deref(),
+            Some("revision-concurrent@example.com")
+        );
+        assert_eq!(retried.storage_revision, 3);
+
+        retry = original.clone();
+        retry.email = Some("revision-stale-overwrite@example.com".to_string());
+        let stale = store.upsert_credential(&retry).await.unwrap();
+        let CredentialUpsertCasOutcome::Conflict { current } = stale else {
+            panic!("stale full-row credential update must conflict");
+        };
+        assert_eq!(current.priority, 17);
+        assert_eq!(
+            current.email.as_deref(),
+            Some("revision-concurrent@example.com")
+        );
+        assert_eq!(current.storage_revision, 3);
+
+        let refresh_context = CredentialRefreshExpectedContext::from_credentials(&current).unwrap();
+        let refreshed = store
+            .update_credential_refresh_fields_cas(
+                credential_id,
+                &refresh_context,
+                &CredentialRefreshFieldsPatch {
+                    access_token: Some("revision-access-new".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let CredentialRefreshFieldsCasOutcome::Applied(refreshed) = refreshed else {
+            panic!("refresh fields must apply against the current auth context");
+        };
+        assert_eq!(refreshed.storage_revision, 4);
+
+        let runtime = store
+            .patch_credential_runtime_state(
+                credential_id,
+                Uuid::new_v4(),
+                &CredentialRuntimeStatePatch {
+                    credential_disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(runtime.credential_disabled);
+        let authoritative = store
+            .load_credentials()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|credential| credential.id == Some(credential_id))
+            .unwrap();
+        assert!(authoritative.disabled);
+        assert_eq!(authoritative.storage_revision, 5);
+        assert_eq!(authoritative.priority, 17);
+        assert_eq!(
+            authoritative.email.as_deref(),
+            Some("revision-concurrent@example.com")
+        );
+        assert_eq!(
+            authoritative.access_token.as_deref(),
+            Some("revision-access-new")
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_credential_revision_migration_upgrades_legacy_rows() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_credential_revision_migration".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        sqlx::query("ALTER TABLE credentials DROP COLUMN revision")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM schema_migrations WHERE version = 'credential-storage-revision-v1'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        store.migrate_with_options(false).await.unwrap();
+        let revision: i64 = sqlx::query_scalar("SELECT revision FROM credentials WHERE id = $1")
+            .bind(credential_id as i64)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(revision, 1);
+        let loaded = store
+            .load_credentials()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|credential| credential.id == Some(credential_id))
+            .unwrap();
+        assert_eq!(loaded.storage_revision, 1);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_atomic_credential_insert_rolls_back_when_runtime_patch_fails() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        sqlx::query(
+            r#"
+            ALTER TABLE credential_runtime_state
+            ADD CONSTRAINT test_atomic_insert_runtime_failure
+            CHECK (warmup_remaining <> 99)
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let credential = KiroCredentials {
+            refresh_token: Some("atomic-insert-refresh".to_string()),
+            auth_method: Some("social".to_string()),
+            email: Some("atomic-insert@example.com".to_string()),
+            ..Default::default()
+        };
+        let operation_id = Uuid::new_v4();
+        let patch = CredentialRuntimeStatePatch {
+            failure_count: Some(2),
+            refresh_failure_count: Some(3),
+            disabled_reason: CredentialRuntimeDisabledReasonPatch::Set("Manual".to_string()),
+            warmup_remaining: Some(99),
+            credential_disabled: Some(true),
+            last_used_at: Some("2026-07-10T08:00:00Z".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .insert_credential_with_runtime_patch(&credential, operation_id, &patch)
+                .await
+                .is_err()
+        );
+        let credential_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credentials WHERE data->>'refreshToken' = 'atomic-insert-refresh'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(credential_count, 0);
+        let runtime_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM credential_runtime_state")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(runtime_count, 0);
+        let mutation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(mutation_count, 0);
+        let stats_count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM credential_stats")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(stats_count, 0);
+
+        sqlx::query(
+            "ALTER TABLE credential_runtime_state DROP CONSTRAINT test_atomic_insert_runtime_failure",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let mut valid_patch = patch;
+        valid_patch.warmup_remaining = Some(4);
+        let (inserted, runtime) = store
+            .insert_credential_with_runtime_patch(&credential, operation_id, &valid_patch)
+            .await
+            .unwrap();
+        assert_eq!(inserted.storage_revision, 1);
+        assert!(inserted.disabled);
+        assert_eq!(runtime.state.failure_count, 2);
+        assert_eq!(runtime.state.refresh_failure_count, 3);
+        assert_eq!(runtime.state.disabled_reason.as_deref(), Some("Manual"));
+        assert_eq!(runtime.state.warmup_remaining, 4);
+        assert_eq!(runtime.state.revision, 1);
+        assert!(runtime.credential_disabled);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_atomic_credential_update_rolls_back_with_runtime_patch() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let (original, original_runtime) = store
+            .insert_credential_with_runtime_patch(
+                &KiroCredentials {
+                    refresh_token: Some("atomic-update-refresh-old".to_string()),
+                    access_token: Some("atomic-update-access-old".to_string()),
+                    auth_method: Some("social".to_string()),
+                    email: Some("atomic-update-old@example.com".to_string()),
+                    ..Default::default()
+                },
+                Uuid::new_v4(),
+                &CredentialRuntimeStatePatch {
+                    failure_count: Some(8),
+                    refresh_failure_count: Some(9),
+                    disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(
+                        "Manual".to_string(),
+                    ),
+                    warmup_remaining: Some(5),
+                    credential_disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(original.storage_revision, 1);
+        assert_eq!(original_runtime.state.revision, 1);
+        let credential_id = original.id.unwrap();
+
+        sqlx::query(
+            r#"
+            ALTER TABLE credential_runtime_state
+            ADD CONSTRAINT test_atomic_update_runtime_failure
+            CHECK (warmup_remaining <> 77)
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let mut updated = original.clone();
+        updated.refresh_token = Some("atomic-update-refresh-new".to_string());
+        updated.access_token = Some("atomic-update-access-new".to_string());
+        updated.email = Some("atomic-update-new@example.com".to_string());
+        let operation_id = Uuid::new_v4();
+        let failing_patch = CredentialRuntimeStatePatch {
+            failure_count: Some(0),
+            refresh_failure_count: Some(0),
+            disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+            warmup_remaining: Some(77),
+            credential_disabled: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .update_credential_with_runtime_patch_cas(&updated, operation_id, &failing_patch,)
+                .await
+                .is_err()
+        );
+        let after_failure = store
+            .load_credentials()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|credential| credential.id == Some(credential_id))
+            .unwrap();
+        assert_eq!(after_failure.storage_revision, 1);
+        assert_eq!(
+            after_failure.refresh_token.as_deref(),
+            Some("atomic-update-refresh-old")
+        );
+        assert!(after_failure.disabled);
+        let after_failure_runtime = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(after_failure_runtime.failure_count, 8);
+        assert_eq!(after_failure_runtime.warmup_remaining, 5);
+        assert_eq!(after_failure_runtime.revision, 1);
+
+        sqlx::query(
+            "ALTER TABLE credential_runtime_state DROP CONSTRAINT test_atomic_update_runtime_failure",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let mut valid_patch = failing_patch;
+        valid_patch.warmup_remaining = Some(0);
+        let outcome = store
+            .update_credential_with_runtime_patch_cas(&updated, operation_id, &valid_patch)
+            .await
+            .unwrap();
+        let CredentialWithRuntimePatchCasOutcome::Applied {
+            credential,
+            runtime,
+        } = outcome
+        else {
+            panic!("fresh credential/runtime revision must apply atomically");
+        };
+        assert_eq!(credential.storage_revision, 2);
+        assert_eq!(
+            credential.refresh_token.as_deref(),
+            Some("atomic-update-refresh-new")
+        );
+        assert!(!credential.disabled);
+        assert_eq!(runtime.state.failure_count, 0);
+        assert_eq!(runtime.state.refresh_failure_count, 0);
+        assert_eq!(runtime.state.disabled_reason, None);
+        assert_eq!(runtime.state.warmup_remaining, 0);
+        assert_eq!(runtime.state.revision, 2);
+        assert!(!runtime.credential_disabled);
+
+        let duplicate = store
+            .update_credential_with_runtime_patch_cas(&updated, operation_id, &valid_patch)
+            .await
+            .unwrap();
+        let CredentialWithRuntimePatchCasOutcome::Conflict { current } = duplicate else {
+            panic!("a retry with the stale credential revision must reconcile as a conflict");
+        };
+        assert_eq!(current.storage_revision, 2);
+        let runtime_after_duplicate = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(runtime_after_duplicate.revision, 2);
+        let applied_mutation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(applied_mutation_count, 1);
+
+        let stale_operation_id = Uuid::new_v4();
+        let stale = store
+            .update_credential_with_runtime_patch_cas(
+                &original,
+                stale_operation_id,
+                &CredentialRuntimeStatePatch::default(),
+            )
+            .await
+            .unwrap();
+        let CredentialWithRuntimePatchCasOutcome::Conflict { current } = stale else {
+            panic!("stale credential revision must not apply the runtime patch");
+        };
+        assert_eq!(current.storage_revision, 2);
+        let stale_mutation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
+        )
+        .bind(stale_operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(stale_mutation_count, 0);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_refresh_field_cas_preserves_admin_changes_and_rejects_stale_hashes() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let inserted = store
+            .insert_credential(&KiroCredentials {
+                access_token: Some("access-old".to_string()),
+                refresh_token: Some("refresh-old".to_string()),
+                profile_arn: Some("profile-old".to_string()),
+                expires_at: Some("2026-07-10T00:00:00Z".to_string()),
+                scopes: Some("scope-old".to_string()),
+                auth_method: Some("social".to_string()),
+                email: Some("owner@example.com".to_string()),
+                priority: 2,
+                proxy_url: Some("http://proxy-before.example:8080".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let credential_id = inserted.id.unwrap();
+        let expected_old = CredentialRefreshExpectedContext::from_credentials(&inserted).unwrap();
+
+        let mut admin_update = inserted.clone();
+        admin_update.email = Some("admin-update@example.com".to_string());
+        admin_update.priority = 17;
+        admin_update.disabled = true;
+        admin_update.max_concurrent_requests = Some(23);
+        admin_update.proxy_url = Some("http://proxy-after.example:8080".to_string());
+        let admin_update = store.upsert_credential(&admin_update).await.unwrap();
+        let CredentialUpsertCasOutcome::Applied(admin_update) = admin_update else {
+            panic!("fresh admin revision must apply");
+        };
+        assert_eq!(admin_update.storage_revision, 2);
+
+        let applied = store
+            .update_credential_refresh_fields_cas(
+                credential_id,
+                &expected_old,
+                &CredentialRefreshFieldsPatch {
+                    access_token: Some("access-new".to_string()),
+                    refresh_token: Some("refresh-new".to_string()),
+                    profile_arn: Some("profile-new".to_string()),
+                    expires_at: Some("2026-07-11T00:00:00Z".to_string()),
+                    scopes: Some("scope-new".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let CredentialRefreshFieldsCasOutcome::Applied(applied) = applied else {
+            panic!("fresh refresh hash must apply");
+        };
+        assert_eq!(applied.access_token.as_deref(), Some("access-new"));
+        assert_eq!(applied.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(applied.profile_arn.as_deref(), Some("profile-new"));
+        assert_eq!(applied.expires_at.as_deref(), Some("2026-07-11T00:00:00Z"));
+        assert_eq!(applied.scopes.as_deref(), Some("scope-new"));
+        assert_eq!(applied.email.as_deref(), Some("admin-update@example.com"));
+        assert_eq!(applied.priority, 17);
+        assert!(applied.disabled);
+        assert_eq!(applied.max_concurrent_requests, Some(23));
+        assert_eq!(
+            applied.proxy_url.as_deref(),
+            Some("http://proxy-after.example:8080")
+        );
+
+        let stored_refresh_hash: Option<String> =
+            sqlx::query_scalar("SELECT refresh_token_hash FROM credentials WHERE id = $1")
+                .bind(credential_id as i64)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_refresh_hash.as_deref(),
+            Some(sha256_hex("refresh-new").as_str())
+        );
+
+        let stale = store
+            .update_credential_refresh_fields_cas(
+                credential_id,
+                &expected_old,
+                &CredentialRefreshFieldsPatch {
+                    access_token: Some("access-stale".to_string()),
+                    refresh_token: Some("refresh-stale".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let CredentialRefreshFieldsCasOutcome::Conflict {
+            current: Some(current),
+        } = stale
+        else {
+            panic!("stale refresh hash must return the authoritative credential");
+        };
+        assert_eq!(current.access_token.as_deref(), Some("access-new"));
+        assert_eq!(current.refresh_token.as_deref(), Some("refresh-new"));
+        assert_eq!(current.priority, 17);
+        assert!(current.disabled);
+
+        let expected_new = CredentialRefreshExpectedContext::from_credentials(&applied).unwrap();
+        let mut auth_context_update = applied.clone();
+        auth_context_update.auth_method = Some("external_idp".to_string());
+        auth_context_update.provider = Some("EntraId".to_string());
+        auth_context_update.client_id = Some("client-after".to_string());
+        auth_context_update.client_secret = Some("secret-after".to_string());
+        auth_context_update.token_endpoint =
+            Some("https://login.example.test/oauth2/v2.0/token".to_string());
+        auth_context_update.scopes = Some("scope-admin-change".to_string());
+        let auth_context_update = store.upsert_credential(&auth_context_update).await.unwrap();
+        let CredentialUpsertCasOutcome::Applied(auth_context_update) = auth_context_update else {
+            panic!("fresh auth context revision must apply");
+        };
+        let auth_context_conflict = store
+            .update_credential_refresh_fields_cas(
+                credential_id,
+                &expected_new,
+                &CredentialRefreshFieldsPatch {
+                    access_token: Some("access-from-old-auth-context".to_string()),
+                    scopes: Some("scope-from-old-auth-context".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let CredentialRefreshFieldsCasOutcome::Conflict {
+            current: Some(current),
+        } = auth_context_conflict
+        else {
+            panic!("changed auth context must reject an in-flight refresh result");
+        };
+        assert_eq!(current.access_token.as_deref(), Some("access-new"));
+        assert_eq!(current.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(current.provider.as_deref(), Some("EntraId"));
+        assert_eq!(current.client_id.as_deref(), Some("client-after"));
+        assert_eq!(current.client_secret.as_deref(), Some("secret-after"));
+        assert_eq!(current.scopes.as_deref(), Some("scope-admin-change"));
+
+        let expected_after_auth_update =
+            CredentialRefreshExpectedContext::from_credentials(&auth_context_update).unwrap();
+        store.soft_delete_credential(credential_id).await.unwrap();
+        let deleted = store
+            .update_credential_refresh_fields_cas(
+                credential_id,
+                &expected_after_auth_update,
+                &CredentialRefreshFieldsPatch {
+                    access_token: Some("access-after-delete".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            deleted,
+            CredentialRefreshFieldsCasOutcome::Conflict { current: None }
+        ));
+        let stored_access_token: Option<String> =
+            sqlx::query_scalar("SELECT data->>'accessToken' FROM credentials WHERE id = $1")
+                .bind(credential_id as i64)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored_access_token.as_deref(), Some("access-new"));
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_credential_hash_repair_backfills_legacy_rows_and_detects_collisions() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let legacy_id = 501_i64;
+        sqlx::query(
+            r#"
+            INSERT INTO credentials (
+                id, priority, disabled, auth_kind,
+                api_key_hash, refresh_token_hash, data
+            )
+            VALUES ($1, 4, false, 'oauth', NULL, NULL, $2)
+            "#,
+        )
+        .bind(legacy_id)
+        .bind(serde_json::json!({
+            "refreshToken": "legacy-refresh-token",
+            "authMethod": "builderId",
+            "clientId": "legacy-client",
+            "clientSecret": "legacy-secret",
+            "scopes": "legacy-scope"
+        }))
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        store.migrate_with_options(false).await.unwrap();
+        let repaired =
+            sqlx::query("SELECT auth_kind, refresh_token_hash FROM credentials WHERE id = $1")
+                .bind(legacy_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(repaired.try_get::<String, _>("auth_kind").unwrap(), "idc");
+        assert_eq!(
+            repaired
+                .try_get::<Option<String>, _>("refresh_token_hash")
+                .unwrap()
+                .as_deref(),
+            Some(sha256_hex("legacy-refresh-token").as_str())
+        );
+
+        let legacy = store
+            .load_credentials()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|credential| credential.id == Some(legacy_id as u64))
+            .unwrap();
+        assert_eq!(legacy.auth_method.as_deref(), Some("idc"));
+        let expected = CredentialRefreshExpectedContext::from_credentials(&legacy).unwrap();
+        let applied = store
+            .update_credential_refresh_fields_cas(
+                legacy_id as u64,
+                &expected,
+                &CredentialRefreshFieldsPatch {
+                    access_token: Some("legacy-access-new".to_string()),
+                    refresh_token: Some("legacy-refresh-new".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let CredentialRefreshFieldsCasOutcome::Applied(applied) = applied else {
+            panic!("canonical expected context must match a legacy authMethod alias");
+        };
+        assert_eq!(applied.access_token.as_deref(), Some("legacy-access-new"));
+        assert_eq!(applied.refresh_token.as_deref(), Some("legacy-refresh-new"));
+
+        for credential_id in [502_i64, 503_i64] {
+            sqlx::query(
+                r#"
+                INSERT INTO credentials (
+                    id, priority, disabled, auth_kind,
+                    api_key_hash, refresh_token_hash, data
+                )
+                VALUES ($1, 0, false, 'oauth', NULL, NULL, $2)
+                "#,
+            )
+            .bind(credential_id)
+            .bind(serde_json::json!({
+                "refreshToken": "duplicate-legacy-refresh-token",
+                "authMethod": "social"
+            }))
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        let collision = store.migrate_with_options(false).await.unwrap_err();
+        assert!(collision.to_string().contains("refreshToken 重复"));
+        let hashes: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT refresh_token_hash FROM credentials WHERE id IN (502, 503) ORDER BY id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(hashes, vec![None, None]);
+
+        sqlx::query("UPDATE credentials SET deleted_at = now() WHERE id = 503")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.migrate_with_options(false).await.unwrap();
+        let repaired_hash: Option<String> =
+            sqlx::query_scalar("SELECT refresh_token_hash FROM credentials WHERE id = 502")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            repaired_hash.as_deref(),
+            Some(sha256_hex("duplicate-legacy-refresh-token").as_str())
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_stats_delta_batches_are_exactly_once_and_payload_bound() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let first_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_stats_exactly_once_first".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let second_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_stats_exactly_once_second".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let deltas = HashMap::from([
+            (
+                first_id,
+                CredentialStatsDeltaRow {
+                    success_delta: 2,
+                    selection_delta: 3,
+                    last_used_at: Some("2026-07-10T03:00:00Z".to_string()),
+                },
+            ),
+            (
+                second_id,
+                CredentialStatsDeltaRow {
+                    success_delta: 5,
+                    selection_delta: 7,
+                    last_used_at: Some("2026-07-10T04:00:00Z".to_string()),
+                },
+            ),
+        ]);
+        let operation_id = Uuid::new_v4();
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (first, duplicate) = tokio::join!(
+            first_store.apply_credential_stats_deltas(operation_id, &deltas),
+            second_store.apply_credential_stats_deltas(operation_id, &deltas),
+        );
+        first.unwrap();
+        duplicate.unwrap();
+        store
+            .apply_credential_stats_deltas(operation_id, &deltas)
+            .await
+            .unwrap();
+
+        let stats = store.load_credential_stats().await.unwrap();
+        assert_eq!(stats.get(&first_id).unwrap().success_count, 2);
+        assert_eq!(stats.get(&first_id).unwrap().selection_count, 3);
+        assert_eq!(
+            stats.get(&first_id).unwrap().last_used_at.as_deref(),
+            Some("2026-07-10T03:00:00Z")
+        );
+        assert_eq!(stats.get(&second_id).unwrap().success_count, 5);
+        assert_eq!(stats.get(&second_id).unwrap().selection_count, 7);
+
+        let different_payload = HashMap::from([(
+            first_id,
+            CredentialStatsDeltaRow {
+                success_delta: 100,
+                ..Default::default()
+            },
+        )]);
+        let payload_error = store
+            .apply_credential_stats_deltas(operation_id, &different_payload)
+            .await
+            .unwrap_err();
+        assert!(payload_error.to_string().contains("不同 payload"));
+        assert_eq!(
+            store
+                .load_credential_stats()
+                .await
+                .unwrap()
+                .get(&first_id)
+                .unwrap()
+                .success_count,
+            2
+        );
+        let ledger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(ledger_count, 1);
+
+        sqlx::query(
+            "UPDATE credential_stats_delta_batches SET created_at = now() - interval '2 days' WHERE operation_id = $1",
+        )
+        .bind(operation_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .cleanup_credential_runtime_mutations(std::time::Duration::from_secs(86_400), 1)
+                .await
+                .unwrap(),
+            1
+        );
+        let ledger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(ledger_count, 0);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_stats_delta_batch_rolls_back_all_chunks() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        sqlx::query(
+            r#"
+            INSERT INTO credentials (
+                id, priority, disabled, auth_kind,
+                api_key_hash, refresh_token_hash, data
+            )
+            SELECT id,
+                   0,
+                   false,
+                   'api_key',
+                   NULL,
+                   NULL,
+                   jsonb_build_object(
+                       'kiroApiKey', 'ksk_stats_chunk_' || id::text,
+                       'authMethod', 'api_key'
+                   )
+            FROM generate_series(1, 1001) AS id
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            ALTER TABLE credential_stats
+            ADD CONSTRAINT test_stats_second_chunk_failure
+            CHECK (credential_id <> 1001)
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let deltas = (1_u64..=1001)
+            .map(|credential_id| {
+                (
+                    credential_id,
+                    CredentialStatsDeltaRow {
+                        success_delta: 1,
+                        selection_delta: 1,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let operation_id = Uuid::new_v4();
+        assert!(
+            store
+                .apply_credential_stats_deltas(operation_id, &deltas)
+                .await
+                .is_err()
+        );
+        let stats_count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM credential_stats")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(stats_count, 0, "earlier chunks must roll back");
+        let ledger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger_count, 0,
+            "failed batches must not reserve operation_id"
+        );
+
+        sqlx::query("ALTER TABLE credential_stats DROP CONSTRAINT test_stats_second_chunk_failure")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .apply_credential_stats_deltas(operation_id, &deltas)
+            .await
+            .unwrap();
+        let totals = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS credential_count,
+                   SUM(success_count)::bigint AS success_count,
+                   SUM(selection_count)::bigint AS selection_count
+            FROM credential_stats
+            "#,
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(totals.try_get::<i64, _>("credential_count").unwrap(), 1001);
+        assert_eq!(totals.try_get::<i64, _>("success_count").unwrap(), 1001);
+        assert_eq!(totals.try_get::<i64, _>("selection_count").unwrap(), 1001);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_stats_delta_batch_filters_soft_delete_races() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_stats_soft_delete_race".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let mut delete_tx = store.pool().begin().await.unwrap();
+        sqlx::query("UPDATE credentials SET deleted_at = now(), updated_at = now() WHERE id = $1")
+            .bind(credential_id as i64)
+            .execute(&mut *delete_tx)
+            .await
+            .unwrap();
+
+        let operation_id = Uuid::new_v4();
+        let deltas = HashMap::from([(
+            credential_id,
+            CredentialStatsDeltaRow {
+                success_delta: 9,
+                selection_delta: 11,
+                last_used_at: Some("2026-07-10T05:00:00Z".to_string()),
+            },
+        )]);
+        let task_store = store.clone();
+        let task_deltas = deltas.clone();
+        let mut stats_task = tokio::spawn(async move {
+            task_store
+                .apply_credential_stats_deltas(operation_id, &task_deltas)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut stats_task)
+                .await
+                .is_err(),
+            "stats batch should wait for the credential row lock"
+        );
+        delete_tx.commit().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), stats_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        store
+            .apply_credential_stats_deltas(operation_id, &deltas)
+            .await
+            .unwrap();
+
+        let stats_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_stats WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(stats_count, 0);
+        let ledger = sqlx::query(
+            r#"
+            SELECT input_credential_count, applied_credential_count
+            FROM credential_stats_delta_batches
+            WHERE operation_id = $1
+            "#,
+        )
+        .bind(operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger.try_get::<i32, _>("input_credential_count").unwrap(),
+            1
+        );
+        assert_eq!(
+            ledger
+                .try_get::<i32, _>("applied_credential_count")
+                .unwrap(),
+            0
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_last_used_at_compares_rfc3339_instants() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_last_used_rfc3339_order".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+
+        for last_used_at in [
+            "2026-07-10T04:00:00Z",
+            "2026-07-10T05:30:00+02:00",
+            "2026-07-10T04:30:00+00:00",
+            "2026-07-10T00:45:00-04:00",
+        ] {
+            store
+                .apply_credential_stats_deltas(
+                    Uuid::new_v4(),
+                    &HashMap::from([(
+                        credential_id,
+                        CredentialStatsDeltaRow {
+                            last_used_at: Some(last_used_at.to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                )
+                .await
+                .unwrap();
+        }
+        let last_used_at: Option<String> = sqlx::query_scalar(
+            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            last_used_at.as_deref(),
+            Some("2026-07-10T00:45:00-04:00"),
+            "offset timestamps must be ordered by instant rather than text"
+        );
+
+        store
+            .record_credential_api_failure(
+                credential_id,
+                Uuid::new_v4(),
+                "2026-07-10T06:00:00+00:00",
+                10,
+            )
+            .await
+            .unwrap();
+        store
+            .record_credential_refresh_failure(
+                credential_id,
+                Uuid::new_v4(),
+                "2026-07-10T07:30:00+02:00",
+                10,
+            )
+            .await
+            .unwrap();
+        let last_used_at: Option<String> = sqlx::query_scalar(
+            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(last_used_at.as_deref(), Some("2026-07-10T06:00:00+00:00"));
+
+        let invalid_operation_id = Uuid::new_v4();
+        let error = store
+            .apply_credential_stats_deltas(
+                invalid_operation_id,
+                &HashMap::from([(
+                    credential_id,
+                    CredentialStatsDeltaRow {
+                        last_used_at: Some("not-a-timestamp".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("有效 RFC3339"));
+        let invalid_ledger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_stats_delta_batches WHERE operation_id = $1",
+        )
+        .bind(invalid_operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(invalid_ledger_count, 0);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_mutations_are_idempotent_and_revisioned() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_mutation_revision".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+
+        let failure_operation_id = Uuid::new_v4();
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (failure, duplicate) = tokio::join!(
+            first_store.record_credential_api_failure(
+                credential_id,
+                failure_operation_id,
+                "2026-07-10T00:00:00Z",
+                3,
+            ),
+            second_store.record_credential_api_failure(
+                credential_id,
+                failure_operation_id,
+                "2026-07-10T00:00:00Z",
+                3,
+            ),
+        );
+        let failure = failure.unwrap();
+        let duplicate = duplicate.unwrap();
+        assert_eq!(failure.failure_count, 1);
+        assert_eq!(failure.revision, 1);
+        assert_eq!(duplicate.failure_count, 1);
+        assert_eq!(duplicate.revision, 1);
+
+        let refresh_failure = store
+            .record_credential_refresh_failure(
+                credential_id,
+                Uuid::new_v4(),
+                "2026-07-10T00:00:01Z",
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh_failure.failure_count, 1);
+        assert_eq!(refresh_failure.refresh_failure_count, 1);
+        assert_eq!(refresh_failure.revision, 2);
+
+        let success = store
+            .record_credential_success(credential_id, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(success.failure_count, 0);
+        assert_eq!(success.refresh_failure_count, 0);
+        assert_eq!(success.revision, 3);
+
+        let late_duplicate = store
+            .record_credential_api_failure(
+                credential_id,
+                failure_operation_id,
+                "2026-07-10T00:00:00Z",
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_duplicate.failure_count, 0);
+        assert_eq!(late_duplicate.revision, 3);
+
+        let mutation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(mutation_count, 3);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_generation_fences_pre_reset_mutations() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_generation_fence".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+
+        let reset_operation_id = Uuid::new_v4();
+        let reset_patch = CredentialRuntimeStatePatch {
+            failure_count: Some(0),
+            refresh_failure_count: Some(0),
+            disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+            warmup_remaining: Some(0),
+            credential_disabled: Some(false),
+            expected_generation: Some(0),
+            advance_generation: true,
+            ..Default::default()
+        };
+        let reset = store
+            .patch_credential_runtime_state(credential_id, reset_operation_id, &reset_patch)
+            .await
+            .unwrap();
+        assert!(reset.applied);
+        assert_eq!(reset.state.generation, 1);
+        assert_eq!(reset.state.revision, 1);
+        assert!(!reset.credential_disabled);
+
+        let duplicate_reset = store
+            .patch_credential_runtime_state(credential_id, reset_operation_id, &reset_patch)
+            .await
+            .unwrap();
+        assert!(duplicate_reset.applied);
+        assert_eq!(duplicate_reset, reset);
+
+        let stale_failure_operation_id = Uuid::new_v4();
+        let stale_failure = store
+            .record_credential_api_failure_at_generation(
+                credential_id,
+                stale_failure_operation_id,
+                0,
+                "2026-07-10T00:00:01Z",
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(!stale_failure.applied);
+        assert_eq!(stale_failure.state, reset.state);
+
+        let stale_refresh_operation_id = Uuid::new_v4();
+        let stale_refresh = store
+            .record_credential_refresh_failure_at_generation(
+                credential_id,
+                stale_refresh_operation_id,
+                0,
+                "2026-07-10T00:00:02Z",
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(!stale_refresh.applied);
+        assert_eq!(stale_refresh.state, reset.state);
+
+        let stale_disable_operation_id = Uuid::new_v4();
+        let stale_disable = store
+            .mark_credential_disabled_at_generation(
+                credential_id,
+                stale_disable_operation_id,
+                0,
+                "InvalidRefreshToken",
+                CredentialRuntimeFailureCounts {
+                    failure_count: Some(1),
+                    refresh_failure_count: None,
+                },
+                "2026-07-10T00:00:03Z",
+            )
+            .await
+            .unwrap();
+        assert!(!stale_disable.applied);
+        assert_eq!(stale_disable.state, reset.state);
+        assert!(!stale_disable.credential_disabled);
+
+        let stale_ledger_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM credential_runtime_mutations
+            WHERE operation_id = ANY($1)
+            "#,
+        )
+        .bind(vec![
+            stale_failure_operation_id.to_string(),
+            stale_refresh_operation_id.to_string(),
+            stale_disable_operation_id.to_string(),
+        ])
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(stale_ledger_count, 0);
+        let stale_stats_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_stats WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(stale_stats_count, 0);
+        let credential_disabled: bool =
+            sqlx::query_scalar("SELECT disabled FROM credentials WHERE id = $1")
+                .bind(credential_id as i64)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(!credential_disabled);
+
+        let current_failure = store
+            .record_credential_api_failure_at_generation(
+                credential_id,
+                Uuid::new_v4(),
+                1,
+                "2026-07-10T00:00:04Z",
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(current_failure.applied);
+        assert_eq!(current_failure.state.generation, 1);
+        assert_eq!(current_failure.state.failure_count, 1);
+        assert_eq!(current_failure.state.revision, 2);
+        assert!(current_failure.credential_disabled);
+
+        let healed = store
+            .heal_credential_api_failures(credential_id)
+            .await
+            .unwrap()
+            .expect("threshold failure should be healed");
+        assert_eq!(healed.generation, 2);
+        assert_eq!(healed.failure_count, 0);
+        assert_eq!(healed.disabled_reason, None);
+        assert_eq!(healed.revision, 3);
+
+        let pre_heal_operation_id = Uuid::new_v4();
+        let pre_heal_failure = store
+            .record_credential_api_failure_at_generation(
+                credential_id,
+                pre_heal_operation_id,
+                1,
+                "2026-07-10T00:00:05Z",
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(!pre_heal_failure.applied);
+        assert_eq!(pre_heal_failure.state, healed);
+        let pre_heal_ledger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
+        )
+        .bind(pre_heal_operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(pre_heal_ledger_count, 0);
+
+        let current_refresh = store
+            .record_credential_refresh_failure_at_generation(
+                credential_id,
+                Uuid::new_v4(),
+                2,
+                "2026-07-10T00:00:06Z",
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(current_refresh.applied);
+        assert_eq!(current_refresh.state.generation, 2);
+        assert_eq!(current_refresh.state.refresh_failure_count, 1);
+        assert_eq!(current_refresh.state.revision, 4);
+
+        let current_success = store
+            .record_credential_success_at_generation(credential_id, Uuid::new_v4(), 2)
+            .await
+            .unwrap();
+        assert!(current_success.applied);
+        assert_eq!(current_success.state.generation, 2);
+        assert_eq!(current_success.state.failure_count, 0);
+        assert_eq!(current_success.state.refresh_failure_count, 0);
+        assert_eq!(current_success.state.revision, 5);
+
+        let future_operation_id = Uuid::new_v4();
+        let future_error = store
+            .record_credential_success_at_generation(credential_id, future_operation_id, 3)
+            .await
+            .unwrap_err();
+        assert!(future_error.to_string().contains("generation 超前"));
+        let future_ledger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE operation_id = $1",
+        )
+        .bind(future_operation_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(future_ledger_count, 0);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_disable_mutations_are_idempotent_and_preserve_unspecified_counts() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_disable_mutation_idempotency".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let initial = store
+            .save_credential_runtime_state_for(
+                credential_id,
+                &CredentialRuntimeStateRow {
+                    failure_count: 2,
+                    refresh_failure_count: 3,
+                    disabled_reason: None,
+                    warmup_remaining: 0,
+                    revision: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let CredentialRuntimeStateCasOutcome::Applied(initial) = initial else {
+            panic!("initial state must be applied");
+        };
+        assert_eq!(initial.revision, 1);
+
+        let duplicate_operation_id = Uuid::new_v4();
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (first, duplicate) = tokio::join!(
+            first_store.mark_credential_disabled(
+                credential_id,
+                duplicate_operation_id,
+                "QuotaExceeded",
+                Some(7),
+                None,
+                "2026-07-10T00:00:00Z",
+            ),
+            second_store.mark_credential_disabled(
+                credential_id,
+                duplicate_operation_id,
+                "QuotaExceeded",
+                Some(7),
+                None,
+                "2026-07-10T00:00:00Z",
+            ),
+        );
+        let first = first.unwrap();
+        let duplicate = duplicate.unwrap();
+        assert_eq!(first, duplicate);
+        assert!(first.credential_disabled);
+        let first = first.state;
+        assert_eq!(first.failure_count, 7);
+        assert_eq!(first.refresh_failure_count, 3);
+        assert_eq!(first.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(first.revision, 2);
+
+        let refresh_operation_id = Uuid::new_v4();
+        let failure_operation_id = Uuid::new_v4();
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (refresh_update, failure_update) = tokio::join!(
+            first_store.mark_credential_disabled(
+                credential_id,
+                refresh_operation_id,
+                "AccountSuspended",
+                None,
+                Some(11),
+                "2026-07-10T00:00:01Z",
+            ),
+            second_store.mark_credential_disabled(
+                credential_id,
+                failure_operation_id,
+                "InvalidRefreshToken",
+                Some(13),
+                None,
+                "2026-07-10T00:00:02Z",
+            ),
+        );
+        refresh_update.unwrap();
+        failure_update.unwrap();
+
+        let stored = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(stored.failure_count, 13);
+        assert_eq!(stored.refresh_failure_count, 11);
+        assert!(matches!(
+            stored.disabled_reason.as_deref(),
+            Some("AccountSuspended" | "InvalidRefreshToken")
+        ));
+        assert_eq!(stored.revision, 4);
+
+        let late_duplicate = store
+            .mark_credential_disabled(
+                credential_id,
+                duplicate_operation_id,
+                "QuotaExceeded",
+                Some(7),
+                None,
+                "1900-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_duplicate.state, stored);
+        assert!(late_duplicate.credential_disabled);
+        let last_used_at: Option<String> = sqlx::query_scalar(
+            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_ne!(last_used_at.as_deref(), Some("1900-01-01T00:00:00Z"));
+
+        let credential_row = sqlx::query(
+            "SELECT disabled, data->>'disabled' AS data_disabled FROM credentials WHERE id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(credential_row.try_get::<bool, _>("disabled").unwrap());
+        assert_eq!(
+            credential_row
+                .try_get::<Option<String>, _>("data_disabled")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        let mutation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(mutation_count, 3);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_patches_are_field_level_and_idempotent() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_patch_idempotency".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let initial = store
+            .save_credential_runtime_state_for(
+                credential_id,
+                &CredentialRuntimeStateRow {
+                    failure_count: 2,
+                    refresh_failure_count: 3,
+                    disabled_reason: Some("Initial".to_string()),
+                    warmup_remaining: 4,
+                    revision: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let CredentialRuntimeStateCasOutcome::Applied(initial) = initial else {
+            panic!("initial state must be applied");
+        };
+        assert_eq!(initial.revision, 1);
+
+        let failure_patch = CredentialRuntimeStatePatch {
+            failure_count: Some(7),
+            disabled_reason: CredentialRuntimeDisabledReasonPatch::Set("QuotaExceeded".to_string()),
+            credential_disabled: Some(true),
+            last_used_at: Some("2026-07-10T01:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let refresh_patch = CredentialRuntimeStatePatch {
+            refresh_failure_count: Some(11),
+            warmup_remaining: Some(9),
+            ..Default::default()
+        };
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (failure_result, refresh_result) = tokio::join!(
+            first_store.patch_credential_runtime_state(
+                credential_id,
+                Uuid::new_v4(),
+                &failure_patch,
+            ),
+            second_store.patch_credential_runtime_state(
+                credential_id,
+                Uuid::new_v4(),
+                &refresh_patch,
+            ),
+        );
+        let failure_result = failure_result.unwrap();
+        let refresh_result = refresh_result.unwrap();
+        let mut applied_revisions = [failure_result.state.revision, refresh_result.state.revision];
+        applied_revisions.sort_unstable();
+        assert_eq!(applied_revisions, [2, 3]);
+
+        let stored = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(stored.failure_count, 7);
+        assert_eq!(stored.refresh_failure_count, 11);
+        assert_eq!(stored.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(stored.warmup_remaining, 9);
+        assert_eq!(stored.revision, 3);
+
+        let duplicate_operation_id = Uuid::new_v4();
+        let clear_patch = CredentialRuntimeStatePatch {
+            failure_count: Some(13),
+            disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+            credential_disabled: Some(false),
+            last_used_at: Some("2026-07-10T02:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (first, duplicate) = tokio::join!(
+            first_store.patch_credential_runtime_state(
+                credential_id,
+                duplicate_operation_id,
+                &clear_patch,
+            ),
+            second_store.patch_credential_runtime_state(
+                credential_id,
+                duplicate_operation_id,
+                &clear_patch,
+            ),
+        );
+        let first = first.unwrap();
+        let duplicate = duplicate.unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(first.state.failure_count, 13);
+        assert_eq!(first.state.refresh_failure_count, 11);
+        assert_eq!(first.state.disabled_reason, None);
+        assert_eq!(first.state.warmup_remaining, 9);
+        assert_eq!(first.state.revision, 4);
+        assert!(!first.credential_disabled);
+
+        let later = store
+            .patch_credential_runtime_state(
+                credential_id,
+                Uuid::new_v4(),
+                &CredentialRuntimeStatePatch {
+                    disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(
+                        "LaterDisable".to_string(),
+                    ),
+                    warmup_remaining: Some(21),
+                    credential_disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(later.state.revision, 5);
+        assert!(later.credential_disabled);
+
+        let late_duplicate = store
+            .patch_credential_runtime_state(credential_id, duplicate_operation_id, &clear_patch)
+            .await
+            .unwrap();
+        assert_eq!(late_duplicate, later);
+        assert_eq!(late_duplicate.state.failure_count, 13);
+        assert_eq!(late_duplicate.state.refresh_failure_count, 11);
+        assert_eq!(late_duplicate.state.warmup_remaining, 21);
+        assert_eq!(
+            late_duplicate.state.disabled_reason.as_deref(),
+            Some("LaterDisable")
+        );
+        assert!(late_duplicate.credential_disabled);
+
+        let credential_row = sqlx::query(
+            "SELECT disabled, data->>'disabled' AS data_disabled FROM credentials WHERE id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(credential_row.try_get::<bool, _>("disabled").unwrap());
+        assert_eq!(
+            credential_row
+                .try_get::<Option<String>, _>("data_disabled")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        let last_used_at: Option<String> = sqlx::query_scalar(
+            "SELECT last_used_at FROM credential_stats WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(last_used_at.as_deref(), Some("2026-07-10T02:00:00Z"));
+        let mutation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1",
+        )
+        .bind(credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(mutation_count, 4);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_mutations_and_snapshots_reject_soft_delete_races() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let mutation_credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_patch_soft_delete".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+
+        let mut delete_tx = store.pool().begin().await.unwrap();
+        sqlx::query("UPDATE credentials SET deleted_at = now(), updated_at = now() WHERE id = $1")
+            .bind(mutation_credential_id as i64)
+            .execute(&mut *delete_tx)
+            .await
+            .unwrap();
+        let patch_store = store.clone();
+        let mut patch_task = tokio::spawn(async move {
+            patch_store
+                .patch_credential_runtime_state(
+                    mutation_credential_id,
+                    Uuid::new_v4(),
+                    &CredentialRuntimeStatePatch {
+                        failure_count: Some(5),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut patch_task)
+                .await
+                .is_err(),
+            "runtime patch should wait for the credential row lock"
+        );
+        delete_tx.commit().await.unwrap();
+        let patch_error = tokio::time::timeout(std::time::Duration::from_secs(5), patch_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(patch_error.to_string().contains("不存在或已删除"));
+
+        let snapshot_credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_snapshot_soft_delete".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let mut delete_tx = store.pool().begin().await.unwrap();
+        sqlx::query("UPDATE credentials SET deleted_at = now(), updated_at = now() WHERE id = $1")
+            .bind(snapshot_credential_id as i64)
+            .execute(&mut *delete_tx)
+            .await
+            .unwrap();
+        let snapshot_store = store.clone();
+        let mut snapshot_task = tokio::spawn(async move {
+            snapshot_store
+                .save_credential_runtime_state_snapshot(
+                    snapshot_credential_id,
+                    &CredentialRuntimeStateSnapshot {
+                        state: CredentialRuntimeStateRow {
+                            failure_count: 8,
+                            ..Default::default()
+                        },
+                        expected_revision: 0,
+                    },
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut snapshot_task,)
+                .await
+                .is_err(),
+            "runtime snapshot should wait for the credential row lock"
+        );
+        delete_tx.commit().await.unwrap();
+        let snapshot_error = tokio::time::timeout(std::time::Duration::from_secs(5), snapshot_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(snapshot_error.to_string().contains("不存在或已删除"));
+
+        let runtime_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_state WHERE credential_id IN ($1, $2)",
+        )
+        .bind(mutation_credential_id as i64)
+        .bind(snapshot_credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(runtime_count, 0);
+        let mutation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id IN ($1, $2)",
+        )
+        .bind(mutation_credential_id as i64)
+        .bind(snapshot_credential_id as i64)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(mutation_count, 0);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_snapshot_cas_rejects_stale_revision_without_writing() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_snapshot_stale".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let initial = CredentialRuntimeStateSnapshot {
+            state: CredentialRuntimeStateRow {
+                failure_count: 1,
+                refresh_failure_count: 0,
+                disabled_reason: None,
+                warmup_remaining: 4,
+                revision: 0,
+                ..Default::default()
+            },
+            expected_revision: 0,
+        };
+        let first = store
+            .save_credential_runtime_state_snapshot(credential_id, &initial)
+            .await
+            .unwrap();
+        let CredentialRuntimeStateCasOutcome::Applied(first) = first else {
+            panic!("initial snapshot must be applied");
+        };
+        assert_eq!(first.revision, 1);
+
+        let fresh = CredentialRuntimeStateSnapshot {
+            state: CredentialRuntimeStateRow {
+                failure_count: 2,
+                refresh_failure_count: 1,
+                disabled_reason: Some("TooManyFailures".to_string()),
+                warmup_remaining: 3,
+                revision: first.revision,
+                ..Default::default()
+            },
+            expected_revision: first.revision,
+        };
+        let fresh = store
+            .save_credential_runtime_state_snapshot(credential_id, &fresh)
+            .await
+            .unwrap();
+        let CredentialRuntimeStateCasOutcome::Applied(fresh) = fresh else {
+            panic!("fresh snapshot must be applied");
+        };
+        assert_eq!(fresh.revision, 2);
+
+        let stale = CredentialRuntimeStateSnapshot {
+            state: CredentialRuntimeStateRow {
+                failure_count: 99,
+                refresh_failure_count: 99,
+                disabled_reason: None,
+                warmup_remaining: 99,
+                revision: 1,
+                ..Default::default()
+            },
+            expected_revision: 1,
+        };
+        let conflict = store
+            .save_credential_runtime_state_snapshot(credential_id, &stale)
+            .await
+            .unwrap();
+        assert_eq!(
+            conflict,
+            CredentialRuntimeStateCasOutcome::Conflict {
+                current: Some(fresh.clone())
+            }
+        );
+        let stored = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(stored, fresh);
+
+        let missing_state_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_snapshot_missing".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let missing_state_snapshot = CredentialRuntimeStateSnapshot {
+            state: CredentialRuntimeStateRow {
+                revision: 7,
+                ..CredentialRuntimeStateRow::default()
+            },
+            expected_revision: 7,
+        };
+        assert_eq!(
+            store
+                .save_credential_runtime_state_snapshot(missing_state_id, &missing_state_snapshot,)
+                .await
+                .unwrap(),
+            CredentialRuntimeStateCasOutcome::Conflict { current: None }
+        );
+        assert!(
+            !store
+                .load_credential_runtime_state()
+                .await
+                .unwrap()
+                .contains_key(&missing_state_id)
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_snapshot_cas_allows_one_concurrent_writer() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_snapshot_concurrent".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let initial = CredentialRuntimeStateRow {
+            failure_count: 0,
+            refresh_failure_count: 0,
+            disabled_reason: None,
+            warmup_remaining: 0,
+            revision: 0,
+            ..Default::default()
+        };
+        let initial = store
+            .save_credential_runtime_state_for(credential_id, &initial)
+            .await
+            .unwrap();
+        let CredentialRuntimeStateCasOutcome::Applied(initial) = initial else {
+            panic!("initial state must be applied");
+        };
+        assert_eq!(initial.revision, 1);
+
+        let first_snapshot = CredentialRuntimeStateSnapshot {
+            state: CredentialRuntimeStateRow {
+                failure_count: 10,
+                revision: initial.revision,
+                ..initial.clone()
+            },
+            expected_revision: initial.revision,
+        };
+        let second_snapshot = CredentialRuntimeStateSnapshot {
+            state: CredentialRuntimeStateRow {
+                failure_count: 20,
+                revision: initial.revision,
+                ..initial
+            },
+            expected_revision: 1,
+        };
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (first, second) = tokio::join!(
+            first_store.save_credential_runtime_state_snapshot(credential_id, &first_snapshot,),
+            second_store.save_credential_runtime_state_snapshot(credential_id, &second_snapshot,),
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CredentialRuntimeStateCasOutcome::Applied(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    CredentialRuntimeStateCasOutcome::Conflict { current: Some(_) }
+                ))
+                .count(),
+            1
+        );
+        let stored = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(stored.revision, 2);
+        assert!(matches!(stored.failure_count, 10 | 20));
+        for outcome in outcomes {
+            match outcome {
+                CredentialRuntimeStateCasOutcome::Applied(state)
+                | CredentialRuntimeStateCasOutcome::Conflict {
+                    current: Some(state),
+                } => assert_eq!(state, stored),
+                CredentialRuntimeStateCasOutcome::Conflict { current: None } => {
+                    panic!("existing state conflict must return the authoritative row")
+                }
+            }
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_mutation_cleanup_is_expiry_aware_and_bounded() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_mutation_cleanup".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        let operation_ids = (0..4).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        for operation_id in &operation_ids {
+            store
+                .record_credential_success(credential_id, *operation_id)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            r#"
+            UPDATE credential_runtime_mutations
+            SET created_at = now() - interval '2 days'
+            WHERE operation_id IN ($1, $2, $3)
+            "#,
+        )
+        .bind(operation_ids[0].to_string())
+        .bind(operation_ids[1].to_string())
+        .bind(operation_ids[2].to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let retention = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            store
+                .cleanup_credential_runtime_mutations(retention, 2)
+                .await
+                .unwrap(),
+            2
+        );
+        let remaining_expired: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM credential_runtime_mutations
+            WHERE created_at < now() - interval '1 day'
+            "#,
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining_expired, 1);
+
+        assert_eq!(
+            store
+                .cleanup_credential_runtime_mutations(retention, 1)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .cleanup_credential_runtime_mutations(retention, 1)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .cleanup_credential_runtime_mutations(retention, 0)
+                .await
+                .unwrap(),
+            0
+        );
+        let remaining_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT operation_id FROM credential_runtime_mutations ORDER BY operation_id",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(remaining_ids, vec![operation_ids[3].to_string()]);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_consistent_credential_runtime_load_matches_individual_loads() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let first_id = store
+            .insert_credential(&KiroCredentials {
+                email: Some("consistent-first@example.com".to_string()),
+                kiro_api_key: Some("ksk_consistent_first".to_string()),
+                auth_method: Some("api_key".to_string()),
+                priority: 2,
+                disabled: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        store
+            .insert_credential(&KiroCredentials {
+                email: Some("consistent-second@example.com".to_string()),
+                kiro_api_key: Some("ksk_consistent_second".to_string()),
+                auth_method: Some("api_key".to_string()),
+                priority: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let runtime_state_write = store
+            .save_credential_runtime_state_for(
+                first_id,
+                &CredentialRuntimeStateRow {
+                    failure_count: 2,
+                    refresh_failure_count: 1,
+                    disabled_reason: Some("TooManyFailures".to_string()),
+                    warmup_remaining: 3,
+                    revision: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            runtime_state_write,
+            CredentialRuntimeStateCasOutcome::Applied(_)
+        ));
+
+        let individual_credentials = store.load_credentials().await.unwrap();
+        let individual_states = store.load_credential_runtime_state().await.unwrap();
+        let (consistent_credentials, consistent_states) =
+            store.load_credentials_with_runtime_state().await.unwrap();
+
+        assert_eq!(consistent_credentials.len(), individual_credentials.len());
+        for (consistent, individual) in consistent_credentials
+            .iter()
+            .zip(individual_credentials.iter())
+        {
+            assert_eq!(consistent.id, individual.id);
+            assert_eq!(consistent.created_at, individual.created_at);
+            assert_eq!(consistent.updated_at, individual.updated_at);
+            assert_eq!(
+                serde_json::to_value(consistent).unwrap(),
+                serde_json::to_value(individual).unwrap()
+            );
+        }
+        assert_eq!(consistent_states.len(), individual_states.len());
+        for (credential_id, individual) in individual_states {
+            let consistent = consistent_states.get(&credential_id).unwrap();
+            assert_eq!(consistent.failure_count, individual.failure_count);
+            assert_eq!(
+                consistent.refresh_failure_count,
+                individual.refresh_failure_count
+            );
+            assert_eq!(consistent.disabled_reason, individual.disabled_reason);
+            assert_eq!(consistent.warmup_remaining, individual.warmup_remaining);
+            assert_eq!(consistent.generation, individual.generation);
+            assert_eq!(consistent.revision, individual.revision);
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_revision_migration_upgrades_existing_rows() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_revision_migration".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM schema_migrations WHERE version = 'credential-runtime-revision-v1'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("DROP TABLE credential_runtime_mutations")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE credential_runtime_state DROP COLUMN revision")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO credential_runtime_state (
+                credential_id, failure_count, refresh_failure_count,
+                disabled_reason, warmup_remaining, updated_at
+            )
+            VALUES ($1, 2, 1, NULL, 0, now())
+            "#,
+        )
+        .bind(credential_id as i64)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        store.migrate_with_options(false).await.unwrap();
+
+        let state = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(state.failure_count, 2);
+        assert_eq!(state.refresh_failure_count, 1);
+        assert_eq!(state.revision, 1);
+        let mutation_table_exists: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('credential_runtime_mutations')::text")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            mutation_table_exists.as_deref(),
+            Some("credential_runtime_mutations")
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_runtime_generation_migration_upgrades_existing_rows() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let credential_id = store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_runtime_generation_migration".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .id
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO credential_runtime_state (
+                credential_id, failure_count, refresh_failure_count,
+                disabled_reason, warmup_remaining, generation, revision, updated_at
+            )
+            VALUES ($1, 2, 1, NULL, 0, 0, 1, now())
+            "#,
+        )
+        .bind(credential_id as i64)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM schema_migrations WHERE version = 'credential-runtime-generation-v1'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE credential_runtime_state DROP COLUMN generation")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        store.migrate_with_options(false).await.unwrap();
+
+        let state = store
+            .load_credential_runtime_state()
+            .await
+            .unwrap()
+            .remove(&credential_id)
+            .unwrap();
+        assert_eq!(state.failure_count, 2);
+        assert_eq!(state.refresh_failure_count, 1);
+        assert_eq!(state.generation, 0);
+        assert_eq!(state.revision, 1);
+        let migration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM schema_migrations WHERE version = 'credential-runtime-generation-v1'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(migration_count, 1);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_generates_unique_ids_for_concurrent_credential_inserts() {
         let Some(config) = test_config() else {
             eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -6700,6 +11017,146 @@ mod tests {
             .await
             .unwrap_err();
         assert!(duplicate.to_string().contains("kiroApiKey 重复"));
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_explicit_credential_ids_advance_sequence_without_regression() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+
+        store
+            .save_credentials(&[KiroCredentials {
+                id: Some(7),
+                email: Some("explicit-seven@example.com".to_string()),
+                kiro_api_key: Some("ksk_explicit_seven".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        let after_explicit = store
+            .insert_credential(&KiroCredentials {
+                email: Some("after-explicit@example.com".to_string()),
+                kiro_api_key: Some("ksk_after_explicit".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(after_explicit.id.unwrap() > 7);
+
+        sqlx::query("SELECT setval('credentials_id_seq', $1, true)")
+            .bind(100_i64)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .save_credentials(&[KiroCredentials {
+                id: Some(50),
+                email: Some("explicit-fifty@example.com".to_string()),
+                kiro_api_key: Some("ksk_explicit_fifty".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        let after_higher_sequence = store
+            .insert_credential(&KiroCredentials {
+                email: Some("after-higher-sequence@example.com".to_string()),
+                kiro_api_key: Some("ksk_after_higher_sequence".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_higher_sequence.id, Some(101));
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postgres_serializes_explicit_and_automatic_credential_id_allocation() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        const EXPLICIT_INSERTS: usize = 8;
+        const AUTOMATIC_INSERTS: usize = 16;
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(
+            EXPLICIT_INSERTS + AUTOMATIC_INSERTS,
+        ));
+        let mut handles = Vec::new();
+
+        for index in 0..EXPLICIT_INSERTS {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let id = ((index + 1) * 10_000) as u64;
+                barrier.wait().await;
+                let saved = store
+                    .save_credentials(&[KiroCredentials {
+                        id: Some(id),
+                        email: Some(format!("explicit-concurrent-{index}@example.com")),
+                        kiro_api_key: Some(format!("ksk_explicit_concurrent_{index}")),
+                        auth_method: Some("api_key".to_string()),
+                        ..Default::default()
+                    }])
+                    .await
+                    .unwrap();
+                saved[0].id.unwrap()
+            }));
+        }
+        for index in 0..AUTOMATIC_INSERTS {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .insert_credential(&KiroCredentials {
+                        email: Some(format!("automatic-concurrent-{index}@example.com")),
+                        kiro_api_key: Some(format!("ksk_automatic_concurrent_{index}")),
+                        auth_method: Some("api_key".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .id
+                    .unwrap()
+            }));
+        }
+
+        let mut ids = Vec::with_capacity(handles.len());
+        for handle in handles {
+            ids.push(handle.await.unwrap());
+        }
+        let inserted_count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), inserted_count);
+        assert_eq!(
+            store.load_credentials().await.unwrap().len(),
+            inserted_count
+        );
+        let after_concurrent_inserts = store
+            .insert_credential(&KiroCredentials {
+                email: Some("after-concurrent-allocation@example.com".to_string()),
+                kiro_api_key: Some("ksk_after_concurrent_allocation".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(after_concurrent_inserts.id.unwrap() > (EXPLICIT_INSERTS * 10_000) as u64);
 
         store.drop_test_schema().await.unwrap();
     }

@@ -51,10 +51,26 @@ impl MetadataTokenUsage {
         self.uncached_input_tokens
     }
 
-    pub fn total_input_tokens(&self) -> i32 {
-        self.uncached_input_tokens
-            .saturating_add(self.cache_read_input_tokens)
-            .saturating_add(self.cache_write_input_tokens)
+    /// Metadata can arrive in both `metadataEvent` and
+    /// `messageMetadataEvent`. Some upstream versions only populate a subset
+    /// of fields in the later event, so zero values must not erase an earlier
+    /// positive measurement.
+    pub fn merge_positive_from(&mut self, newer: &Self) {
+        if newer.uncached_input_tokens > 0 {
+            self.uncached_input_tokens = newer.uncached_input_tokens;
+        }
+        if newer.output_tokens > 0 {
+            self.output_tokens = newer.output_tokens;
+        }
+        if newer.total_tokens > 0 {
+            self.total_tokens = newer.total_tokens;
+        }
+        if newer.cache_read_input_tokens > 0 {
+            self.cache_read_input_tokens = newer.cache_read_input_tokens;
+        }
+        if newer.cache_write_input_tokens > 0 {
+            self.cache_write_input_tokens = newer.cache_write_input_tokens;
+        }
     }
 }
 
@@ -165,7 +181,12 @@ mod tests {
 
         let usage = event.token_usage.unwrap();
         assert_eq!(usage.input_tokens(), 120);
-        assert_eq!(usage.total_input_tokens(), 157);
+        assert_eq!(
+            usage.uncached_input_tokens
+                + usage.cache_read_input_tokens
+                + usage.cache_write_input_tokens,
+            157
+        );
         assert_eq!(usage.output_tokens, 11);
         assert_eq!(usage.cache_write_input_tokens, 7);
     }
@@ -187,10 +208,41 @@ mod tests {
 
         let usage = event.token_usage.unwrap();
         assert_eq!(usage.input_tokens(), 1200);
-        assert_eq!(usage.total_input_tokens(), 205200);
+        assert_eq!(
+            usage.uncached_input_tokens
+                + usage.cache_read_input_tokens
+                + usage.cache_write_input_tokens,
+            205200
+        );
         assert_eq!(usage.cache_read_input_tokens, 180000);
         assert_eq!(usage.cache_write_input_tokens, 24000);
         assert_eq!(usage.output_tokens, 900);
+    }
+
+    #[test]
+    fn metadata_usage_merge_keeps_earlier_positive_fields() {
+        let mut usage = MetadataTokenUsage {
+            uncached_input_tokens: 120,
+            output_tokens: 0,
+            total_tokens: 157,
+            cache_read_input_tokens: 30,
+            cache_write_input_tokens: 7,
+        };
+
+        usage.merge_positive_from(&MetadataTokenUsage {
+            uncached_input_tokens: 0,
+            output_tokens: 11,
+            total_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+        });
+        usage.merge_positive_from(&MetadataTokenUsage::default());
+
+        assert_eq!(usage.uncached_input_tokens, 120);
+        assert_eq!(usage.output_tokens, 11);
+        assert_eq!(usage.total_tokens, 157);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.cache_write_input_tokens, 7);
     }
 
     #[test]

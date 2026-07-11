@@ -1,6 +1,7 @@
-FROM node:22-alpine AS frontend-builder
+FROM node:22.23.0-alpine3.23 AS frontend-builder
 
-RUN npm install -g pnpm
+ARG PNPM_VERSION=11.11.0
+RUN npm install -g "pnpm@${PNPM_VERSION}" && pnpm --version
 
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/.npmrc admin-ui/pnpm-workspace.yaml ./
@@ -14,7 +15,7 @@ RUN pnpm install --frozen-lockfile
 COPY ui ./
 RUN pnpm build
 
-FROM rust:1.92-alpine AS builder
+FROM rust:1.92.0-alpine3.23 AS builder
 
 RUN apk add --no-cache musl-dev perl make
 
@@ -34,9 +35,9 @@ COPY src ./src
 COPY data ./data
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 COPY --from=frontend-builder /app/ui/dist /app/ui/dist
-RUN cargo build --release --locked --no-default-features
+RUN cargo build --release --locked
 
-FROM alpine:3.21
+FROM alpine:3.23
 
 RUN apk add --no-cache busybox-extras ca-certificates
 

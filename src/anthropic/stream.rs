@@ -1641,13 +1641,16 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::Metadata(metadata) => {
                 if let Some(token_usage) = &metadata.token_usage {
-                    self.output_tokens = token_usage.output_tokens;
-                    self.metadata_usage = Some(token_usage.clone());
+                    let merged_usage = self.metadata_usage.get_or_insert_with(Default::default);
+                    merged_usage.merge_positive_from(token_usage);
+                    if merged_usage.output_tokens > 0 {
+                        self.output_tokens = merged_usage.output_tokens;
+                    }
                     tracing::debug!(
-                        input_tokens = token_usage.input_tokens(),
-                        output_tokens = token_usage.output_tokens,
-                        cache_read_input_tokens = token_usage.cache_read_input_tokens,
-                        cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                        input_tokens = merged_usage.input_tokens(),
+                        output_tokens = merged_usage.output_tokens,
+                        cache_read_input_tokens = merged_usage.cache_read_input_tokens,
+                        cache_write_input_tokens = merged_usage.cache_write_input_tokens,
                         "收到 metadataEvent token usage"
                     );
                 }
@@ -1656,11 +1659,17 @@ impl StreamContext {
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = self.context_window_tokens;
-                let actual_input_tokens =
-                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
-                self.context_input_tokens = Some(actual_input_tokens);
+                let percentage = context_usage.context_usage_percentage;
+                let actual_input_tokens = if percentage.is_finite() && percentage > 0.0 {
+                    (percentage * (window_size as f64) / 100.0) as i32
+                } else {
+                    0
+                };
+                if actual_input_tokens > 0 {
+                    self.context_input_tokens = Some(actual_input_tokens);
+                }
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if context_usage.context_usage_percentage >= 100.0 {
+                if percentage.is_finite() && percentage >= 100.0 {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
@@ -1673,15 +1682,18 @@ impl StreamContext {
             }
             Event::MessageMetadata(metadata) => {
                 if let Some(token_usage) = &metadata.token_usage {
-                    self.output_tokens = token_usage.output_tokens;
-                    self.metadata_usage = Some(token_usage.clone());
+                    let merged_usage = self.metadata_usage.get_or_insert_with(Default::default);
+                    merged_usage.merge_positive_from(token_usage);
+                    if merged_usage.output_tokens > 0 {
+                        self.output_tokens = merged_usage.output_tokens;
+                    }
                     tracing::debug!(
                         conversation_id = ?metadata.conversation_id,
                         utterance_id = ?metadata.utterance_id,
-                        input_tokens = token_usage.input_tokens(),
-                        output_tokens = token_usage.output_tokens,
-                        cache_read_input_tokens = token_usage.cache_read_input_tokens,
-                        cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                        input_tokens = merged_usage.input_tokens(),
+                        output_tokens = merged_usage.output_tokens,
+                        cache_read_input_tokens = merged_usage.cache_read_input_tokens,
+                        cache_write_input_tokens = merged_usage.cache_write_input_tokens,
                         "收到 messageMetadataEvent token usage"
                     );
                 }
@@ -1764,7 +1776,7 @@ impl StreamContext {
     }
 
     pub fn context_input_tokens_seen(&self) -> bool {
-        self.context_input_tokens.is_some()
+        self.context_input_tokens.is_some_and(|tokens| tokens > 0)
     }
 
     pub fn stream_error_detail(&self) -> Option<(String, String)> {
@@ -2582,7 +2594,7 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
-        self.generate_final_events_with_reported_usage_mapper(|_, reported_usage, _, _| {
+        self.generate_final_events_with_reported_usage_mapper(|_, reported_usage, _, _, _| {
             reported_usage
         })
     }
@@ -2597,6 +2609,7 @@ impl StreamContext {
             super::cache::CacheUsage,
             Option<&MetadataTokenUsage>,
             bool,
+            i32,
         ) -> super::cache::CacheUsage,
     {
         let mut events = Vec::new();
@@ -2703,23 +2716,23 @@ impl StreamContext {
         }
         events.extend(self.emit_queued_leaked_tool_uses());
 
-        // 优先使用 metadataEvent 的准确 token usage；缺失时回退到 contextUsageEvent 估算值。
-        let final_input_tokens = self
-            .metadata_usage
-            .as_ref()
-            .map(|usage| usage.total_input_tokens())
-            .or(self.context_input_tokens)
+        // Metadata fields are resolved independently in the usage builder. Keep
+        // the local/context estimate as the fallback for missing input fields.
+        let estimated_input_tokens = self
+            .context_input_tokens
+            .filter(|tokens| *tokens > 0)
             .unwrap_or(self.input_tokens);
         let usage_input_tokens = if self.local_prompt_cache_projection_enabled {
-            final_input_tokens.max(self.input_tokens)
+            estimated_input_tokens.max(self.input_tokens)
         } else {
-            final_input_tokens
+            estimated_input_tokens
         };
         let estimated_output_tokens = self.output_tokens.max(self.thinking_output_tokens);
         let final_output_tokens = self
             .metadata_usage
             .as_ref()
             .map(|usage| usage.output_tokens)
+            .filter(|tokens| *tokens > 0)
             .unwrap_or(estimated_output_tokens);
         self.state_manager
             .maybe_set_max_tokens_stop_reason(self.requested_max_tokens, final_output_tokens);
@@ -2732,13 +2745,17 @@ impl StreamContext {
         );
         self.final_usage = Some(final_usage);
         let reported_usage = self.reported_usage_for_downstream(final_usage);
-        let context_estimated =
-            self.metadata_usage.is_none() && self.context_input_tokens.is_some();
+        let context_estimated = self
+            .metadata_usage
+            .as_ref()
+            .is_none_or(|usage| !super::cache::metadata_usage_has_signal(usage))
+            && self.context_input_tokens_seen();
         let reported_usage = usage_mapper(
             final_usage,
             reported_usage,
             self.metadata_usage.as_ref(),
             context_estimated,
+            estimated_input_tokens,
         );
         self.final_reported_usage = Some(reported_usage);
 
@@ -2974,6 +2991,118 @@ mod tests {
     }
 
     #[test]
+    fn test_all_zero_metadata_and_context_fall_back_to_local_usage() {
+        use crate::kiro::model::events::{ContextUsageEvent, MetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 4_096, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("fake response"));
+        all_events.extend(
+            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 0.0,
+            })),
+        );
+        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(MetadataTokenUsage::default()),
+        })));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        let usage = &message_delta.data["usage"];
+        assert_eq!(usage["input_tokens"], 4_096);
+        assert!(
+            usage["output_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| tokens > 0)
+        );
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(ctx.final_usage().expect("final usage").input_tokens, 4_096);
+        assert_eq!(ctx.context_input_tokens, None);
+        assert!(!ctx.context_input_tokens_seen());
+    }
+
+    #[test]
+    fn test_later_zero_message_metadata_does_not_erase_usage() {
+        use crate::kiro::model::events::{MessageMetadataEvent, MetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+        let mut events = ctx.process_assistant_response("hello");
+        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(MetadataTokenUsage {
+                uncached_input_tokens: 21,
+                output_tokens: 13,
+                total_tokens: 377,
+                cache_read_input_tokens: 300,
+                cache_write_input_tokens: 43,
+            }),
+        })));
+        events.extend(
+            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+                conversation_id: Some("conv-1".to_string()),
+                utterance_id: Some("utt-1".to_string()),
+                token_usage: Some(MetadataTokenUsage::default()),
+            })),
+        );
+        events.extend(ctx.generate_final_events());
+
+        let usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist")
+            .data["usage"];
+        assert_eq!(usage["input_tokens"], 21);
+        assert_eq!(usage["output_tokens"], 13);
+        assert_eq!(usage["cache_read_input_tokens"], 300);
+        assert_eq!(usage["cache_creation_input_tokens"], 43);
+    }
+
+    #[test]
+    fn test_metadata_events_merge_complementary_positive_fields() {
+        use crate::kiro::model::events::{MessageMetadataEvent, MetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+        let mut events = ctx.process_assistant_response("hello");
+        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(MetadataTokenUsage {
+                output_tokens: 13,
+                ..MetadataTokenUsage::default()
+            }),
+        })));
+        events.extend(
+            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+                conversation_id: Some("conv-1".to_string()),
+                utterance_id: Some("utt-1".to_string()),
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 21,
+                    output_tokens: 0,
+                    total_tokens: 377,
+                    cache_read_input_tokens: 300,
+                    cache_write_input_tokens: 43,
+                }),
+            })),
+        );
+        events.extend(ctx.generate_final_events());
+
+        let usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist")
+            .data["usage"];
+        assert_eq!(usage["input_tokens"], 21);
+        assert_eq!(usage["output_tokens"], 13);
+        assert_eq!(usage["cache_read_input_tokens"], 300);
+        assert_eq!(usage["cache_creation_input_tokens"], 43);
+    }
+
+    #[test]
     fn test_metering_event_is_recorded_but_not_emitted_downstream() {
         use crate::kiro::model::events::MeteringEvent;
 
@@ -3179,11 +3308,7 @@ mod tests {
             .find(|event| event.event == "message_start")
             .expect("message_start should exist");
         let start_usage = &message_start.data["message"]["usage"];
-        assert!(
-            start_usage["input_tokens"]
-                .as_i64()
-                .is_some_and(|tokens| (1..=96).contains(&tokens))
-        );
+        assert_eq!(start_usage["input_tokens"], 100_000);
         assert_eq!(start_usage["cache_creation_input_tokens"], 0);
         assert_eq!(start_usage["cache_read_input_tokens"], 0);
 
@@ -3196,11 +3321,7 @@ mod tests {
             .find(|event| event.event == "message_delta")
             .expect("message_delta should exist");
         let final_usage = &message_delta.data["usage"];
-        assert!(
-            final_usage["input_tokens"]
-                .as_i64()
-                .is_some_and(|tokens| (1..=96).contains(&tokens))
-        );
+        assert_eq!(final_usage["input_tokens"], 100_000);
         assert_eq!(final_usage["cache_creation_input_tokens"], 0);
         assert_eq!(final_usage["cache_read_input_tokens"], 0);
     }

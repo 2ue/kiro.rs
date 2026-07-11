@@ -4,8 +4,8 @@
 //! 支持单凭据和多凭据配置格式
 
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::Path;
+use std::{fmt, fs};
 
 use base64::{
     Engine as _,
@@ -17,7 +17,7 @@ use crate::model::config::Config;
 use crate::model::model_support::{model_is_supported_by_list, normalize_supported_models};
 
 /// Kiro OAuth 凭证
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroCredentials {
     /// 凭据唯一标识符（自增 ID）
@@ -31,6 +31,10 @@ pub struct KiroCredentials {
     /// 凭据更新时间（由 PgSQL credentials.updated_at 提供，仅用于运行时展示）
     #[serde(skip)]
     pub updated_at: Option<String>,
+
+    /// PgSQL credentials.revision，仅用于持久化层乐观并发控制。
+    #[serde(skip)]
+    pub storage_revision: u64,
 
     /// 访问令牌
     #[serde(skip_serializing_if = "Option::is_none", alias = "access_token")]
@@ -176,6 +180,53 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+}
+
+impl fmt::Debug for KiroCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KiroCredentials")
+            .field("id", &self.id)
+            .field("created_at_present", &self.created_at.is_some())
+            .field("updated_at_present", &self.updated_at.is_some())
+            .field("storage_revision", &self.storage_revision)
+            .field("access_token_present", &self.access_token.is_some())
+            .field("refresh_token_present", &self.refresh_token.is_some())
+            .field("profile_arn_present", &self.profile_arn.is_some())
+            .field("expires_at_present", &self.expires_at.is_some())
+            .field("auth_method_present", &self.auth_method.is_some())
+            .field("provider_present", &self.provider.is_some())
+            .field("client_id_present", &self.client_id.is_some())
+            .field("client_secret_present", &self.client_secret.is_some())
+            .field("token_endpoint_present", &self.token_endpoint.is_some())
+            .field("issuer_url_present", &self.issuer_url.is_some())
+            .field("scopes_present", &self.scopes.is_some())
+            .field("priority", &self.priority)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("rpm", &self.rpm)
+            .field(
+                "rate_limit_auto_disable_enabled",
+                &self.rate_limit_auto_disable_enabled,
+            )
+            .field("region_present", &self.region.is_some())
+            .field("auth_region_present", &self.auth_region.is_some())
+            .field("api_region_present", &self.api_region.is_some())
+            .field("machine_id_present", &self.machine_id.is_some())
+            .field("email_present", &self.email.is_some())
+            .field(
+                "subscription_title_present",
+                &self.subscription_title.is_some(),
+            )
+            .field("supported_model_count", &self.supported_models.len())
+            .field("proxy_url_present", &self.proxy_url.is_some())
+            .field("proxy_username_present", &self.proxy_username.is_some())
+            .field("proxy_password_present", &self.proxy_password.is_some())
+            .field("proxy_resource_id", &self.proxy_resource_id)
+            .field("disabled", &self.disabled)
+            .field("kiro_api_key_present", &self.kiro_api_key.is_some())
+            .field("endpoint_present", &self.endpoint.is_some())
+            .finish()
+    }
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -560,6 +611,82 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    #[test]
+    fn debug_output_redacts_all_credential_strings() {
+        let credentials = KiroCredentials {
+            id: Some(42),
+            created_at: Some("created-at-sensitive-value".to_string()),
+            updated_at: Some("updated-at-sensitive-value".to_string()),
+            storage_revision: 7,
+            access_token: Some("access-token-sensitive-value".to_string()),
+            refresh_token: Some("refresh-token-sensitive-value".to_string()),
+            profile_arn: Some("profile-arn-sensitive-value".to_string()),
+            expires_at: Some("expires-at-sensitive-value".to_string()),
+            auth_method: Some("auth-method-sensitive-value".to_string()),
+            provider: Some("provider-sensitive-value".to_string()),
+            client_id: Some("client-id-sensitive-value".to_string()),
+            client_secret: Some("client-secret-sensitive-value".to_string()),
+            token_endpoint: Some("token-endpoint-sensitive-value".to_string()),
+            issuer_url: Some("issuer-url-sensitive-value".to_string()),
+            scopes: Some("scopes-sensitive-value".to_string()),
+            priority: 3,
+            max_concurrent_requests: Some(4),
+            rpm: Some(5),
+            rate_limit_auto_disable_enabled: Some(false),
+            region: Some("region-sensitive-value".to_string()),
+            auth_region: Some("auth-region-sensitive-value".to_string()),
+            api_region: Some("api-region-sensitive-value".to_string()),
+            machine_id: Some("machine-id-sensitive-value".to_string()),
+            email: Some("email-sensitive-value@example.invalid".to_string()),
+            subscription_title: Some("subscription-sensitive-value".to_string()),
+            supported_models: vec!["model-sensitive-value".to_string()],
+            proxy_url: Some("http://proxy-user:proxy-pass@example.invalid".to_string()),
+            proxy_username: Some("proxy-username-sensitive-value".to_string()),
+            proxy_password: Some("proxy-password-sensitive-value".to_string()),
+            proxy_resource_id: Some(6),
+            disabled: true,
+            kiro_api_key: Some("kiro-api-key-sensitive-value".to_string()),
+            endpoint: Some("endpoint-sensitive-value".to_string()),
+        };
+
+        let debug_output = format!("{credentials:?}");
+        for sensitive_value in [
+            credentials.created_at.as_deref().unwrap(),
+            credentials.updated_at.as_deref().unwrap(),
+            credentials.access_token.as_deref().unwrap(),
+            credentials.refresh_token.as_deref().unwrap(),
+            credentials.profile_arn.as_deref().unwrap(),
+            credentials.expires_at.as_deref().unwrap(),
+            credentials.auth_method.as_deref().unwrap(),
+            credentials.provider.as_deref().unwrap(),
+            credentials.client_id.as_deref().unwrap(),
+            credentials.client_secret.as_deref().unwrap(),
+            credentials.token_endpoint.as_deref().unwrap(),
+            credentials.issuer_url.as_deref().unwrap(),
+            credentials.scopes.as_deref().unwrap(),
+            credentials.region.as_deref().unwrap(),
+            credentials.auth_region.as_deref().unwrap(),
+            credentials.api_region.as_deref().unwrap(),
+            credentials.machine_id.as_deref().unwrap(),
+            credentials.email.as_deref().unwrap(),
+            credentials.subscription_title.as_deref().unwrap(),
+            credentials.supported_models[0].as_str(),
+            credentials.proxy_url.as_deref().unwrap(),
+            credentials.proxy_username.as_deref().unwrap(),
+            credentials.proxy_password.as_deref().unwrap(),
+            credentials.kiro_api_key.as_deref().unwrap(),
+            credentials.endpoint.as_deref().unwrap(),
+        ] {
+            assert!(
+                !debug_output.contains(sensitive_value),
+                "Debug output leaked {sensitive_value:?}: {debug_output}"
+            );
+        }
+        assert!(debug_output.contains("id: Some(42)"));
+        assert!(debug_output.contains("access_token_present: true"));
+        assert!(debug_output.contains("email_present: true"));
+    }
 
     #[test]
     fn test_from_json() {

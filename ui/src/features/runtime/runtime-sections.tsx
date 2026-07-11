@@ -1556,6 +1556,34 @@ export function ModelMappingSection({
 
   const defaultRules = useMemo(() => generateDefaultModelMappingRules(capabilities), [capabilities])
 
+  useEffect(() => {
+    setText(JSON.stringify(mapping.rules, null, 2))
+  }, [mapping.rules])
+
+  const commitRules = (rules: ModelMappingRule[]) => {
+    setText(JSON.stringify(rules, null, 2))
+    setError(null)
+    onChange({ ...mapping, rules })
+  }
+
+  const updateRule = (index: number, patch: Partial<ModelMappingRule>) => {
+    const rules = mapping.rules.map((rule, ruleIndex) =>
+      ruleIndex === index ? { ...rule, ...patch } : rule
+    )
+    commitRules(rules)
+  }
+
+  const removeRule = (index: number) => {
+    commitRules(mapping.rules.filter((_, ruleIndex) => ruleIndex !== index))
+  }
+
+  const appendRule = () => {
+    commitRules([
+      ...mapping.rules,
+      { enabled: true, source: '', target: '', kind: 'alias', note: '' },
+    ])
+  }
+
   const commitText = (value: string) => {
     setText(value)
     try {
@@ -1593,15 +1621,58 @@ export function ModelMappingSection({
       </TwoCol>
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-2">
-          <span className="text-sm font-semibold">映射规则（JSON）</span>
+          <span className="text-sm font-semibold">映射规则</span>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <span>当前 {mapping.rules.length} 条 · 可生成 {defaultRules.length} 条</span>
+            <Button size="sm" variant="outline" onClick={appendRule}>添加规则</Button>
             <Button size="sm" variant="outline" onClick={fillDefault}>填充默认规则</Button>
           </div>
         </div>
         <div className="text-xs leading-5 text-muted-foreground">
           source 是客户端传来的模型名，target 是实际发送给上游的模型名。
         </div>
+        <div className="overflow-hidden rounded-lg border bg-card">
+          <div className="hidden grid-cols-[72px_1fr_1fr_150px_1fr_48px] gap-2 border-b bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground lg:grid">
+            <div>启用</div>
+            <div>Source</div>
+            <div>Target</div>
+            <div>类型</div>
+            <div>备注</div>
+            <div />
+          </div>
+          <div className="divide-y">
+            {mapping.rules.length === 0 ? (
+              <div className="px-3 py-6 text-center text-sm text-muted-foreground">暂无显式规则，可添加或填充默认规则。</div>
+            ) : mapping.rules.map((rule, index) => (
+              <div key={index} className="grid gap-2 px-3 py-3 lg:grid-cols-[72px_1fr_1fr_150px_1fr_48px] lg:items-center">
+                <label className="flex items-center justify-between gap-2 text-xs text-muted-foreground lg:block">
+                  <span className="lg:hidden">启用</span>
+                  <Switch checked={rule.enabled !== false} onCheckedChange={(enabled) => updateRule(index, { enabled })} />
+                </label>
+                <Input className="font-mono text-xs" value={rule.source} placeholder="sonnet"
+                  onChange={(e) => updateRule(index, { source: e.target.value })} />
+                <Input className="font-mono text-xs" value={rule.target} placeholder="claude-sonnet-4.5"
+                  onChange={(e) => updateRule(index, { target: e.target.value })} />
+                <Select value={rule.kind || 'alias'} onValueChange={(kind) => updateRule(index, { kind: kind as ModelMappingRule['kind'] })}>
+                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="alias">别名</SelectItem>
+                    <SelectItem value="version_equivalent">版本等价</SelectItem>
+                    <SelectItem value="fallback">兜底</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Input value={rule.note ?? ''} placeholder="备注" onChange={(e) => updateRule(index, { note: e.target.value })} />
+                <Button variant="ghost" size="icon-sm" className="text-destructive hover:text-destructive"
+                  onClick={() => removeRule(index)} title="删除规则">
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="space-y-2">
+        <span className="text-sm font-semibold">批量编辑 JSON</span>
         <Textarea value={text} rows={12} className="font-mono text-xs"
           onChange={(e) => commitText(e.target.value)} />
         {error && <div className="text-xs text-destructive">规则解析错误: {error}</div>}

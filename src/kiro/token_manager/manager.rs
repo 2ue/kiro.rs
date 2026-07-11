@@ -3,13 +3,15 @@
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
 //! 支持多凭据 (MultiTokenManager) 管理
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
+use tokio::task::JoinHandle;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -24,11 +26,15 @@ use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use crate::storage::postgres::{
-    CredentialRuntimeStateRow, CredentialRuntimeStateSnapshot, CredentialStatsDeltaRow,
-    PostgresStore,
+    CredentialRefreshExpectedContext, CredentialRefreshFieldsCasOutcome,
+    CredentialRefreshFieldsPatch, CredentialRuntimeDisabledReasonPatch,
+    CredentialRuntimeFailureCounts, CredentialRuntimeStateMutationResult,
+    CredentialRuntimeStatePatch, CredentialRuntimeStateRow, CredentialStatsDeltaRow,
+    CredentialUpsertCasOutcome, CredentialWithRuntimePatchCasOutcome, PostgresStore,
 };
 use crate::storage::redis_cache::{
     RedisStore, SchedulerCredentialState, SchedulerGlobalCapacityState, SchedulerHealthState,
+    SchedulerSessionBinding,
 };
 
 use super::account_state::{
@@ -47,11 +53,11 @@ use super::capacity::{
     global_has_concurrency_capacity, is_opus_model, normalize_capacity_weight_units,
     proxy_unavailable_error,
 };
-#[cfg(test)]
-use super::concurrency::record_released_in_flight_lease_tombstone;
 use super::concurrency::{
     DispatchQueueGuard, InFlightLeaseGuard, ReleasedInFlightLeaseTombstones,
     filter_released_in_flight_leases_from_scheduler_states,
+    record_released_in_flight_lease_tombstone, release_redis_dispatch_queue_lease_reliably,
+    release_redis_in_flight_lease_and_wakeup,
 };
 use super::cooldown::{entry_any_cooldown_remaining, entry_cooldown_remaining, model_state_key};
 use super::queue::{
@@ -80,15 +86,19 @@ use super::rpm::{
     rate_limit_interval_for_rpm,
 };
 use super::sticky::{
+    MAX_SESSION_SOFT_FAILURES, SESSION_BINDING_TTL_SECS,
     bind_session_to_credential as bind_sticky_session_to_credential,
     bound_credential_id as sticky_bound_credential_id,
-    clear_session_soft_failure as clear_sticky_session_soft_failure, prune_session_bindings_locked,
+    cache_redis_binding as cache_sticky_redis_binding,
+    clear_session_soft_failure as clear_sticky_session_soft_failure,
     record_session_soft_failure as record_sticky_session_soft_failure,
     unbind_session as unbind_sticky_session,
     unbind_session_if_bound_to as unbind_sticky_session_if_bound_to,
     unbind_sessions_for_credential as unbind_sticky_sessions_for_credential,
 };
-use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
+use super::storage_task::{
+    block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
+};
 use super::strategy::{
     balanced_selection_key, entry_effective_health_mut, priority_selection_key,
     record_local_selection, refresh_local_selection_windows_locked, select_health_weighted,
@@ -187,11 +197,11 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
         clear_access_token = true;
     }
 
-    if let Some(auth_method) = update.auth_method {
-        if let Some(auth_method) = trimmed_optional(auth_method) {
-            credential.auth_method = Some(auth_method);
-            clear_access_token = true;
-        }
+    if let Some(auth_method) = update.auth_method
+        && let Some(auth_method) = trimmed_optional(auth_method)
+    {
+        credential.auth_method = Some(auth_method);
+        clear_access_token = true;
     }
     if update.provider.is_some() {
         apply_optional_string(&mut credential.provider, update.provider);
@@ -255,12 +265,99 @@ fn truncate_for_audit(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn rfc3339_is_after(candidate: &str, existing: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(candidate),
+        chrono::DateTime::parse_from_rfc3339(existing),
+    ) {
+        (Ok(candidate), Ok(existing)) => candidate > existing,
+        _ => candidate > existing,
+    }
+}
+
 fn merge_json_object(base: &mut serde_json::Value, extra: serde_json::Value) {
     let (Some(base), serde_json::Value::Object(extra)) = (base.as_object_mut(), extra) else {
         return;
     };
     for (key, value) in extra {
         base.insert(key, value);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatsFlushShutdownReport {
+    pub signal_sent: bool,
+    pub flushed: bool,
+    pub timed_out: bool,
+    pub task_failed: bool,
+    pub pending_stats_batches: usize,
+    pub pending_stats_deltas: usize,
+    pub pending_runtime_mutations: usize,
+    pub overflow_runtime_mutations: u64,
+}
+
+pub struct StatsFlushWorkerHandle {
+    shutdown: Option<oneshot::Sender<Instant>>,
+    task: JoinHandle<bool>,
+    manager: Arc<MultiTokenManager>,
+}
+
+impl StatsFlushWorkerHandle {
+    pub async fn shutdown(mut self, timeout: StdDuration) -> StatsFlushShutdownReport {
+        const COMPLETION_RESERVE: StdDuration = StdDuration::from_millis(100);
+        const ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+
+        let wait_deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let flush_deadline = wait_deadline
+            .checked_sub(timeout.min(COMPLETION_RESERVE))
+            .unwrap_or_else(Instant::now);
+        let signal_sent = self
+            .shutdown
+            .take()
+            .is_some_and(|shutdown| shutdown.send(flush_deadline).is_ok());
+        let mut task = self.task;
+        let mut report = match tokio::time::timeout_at(wait_deadline.into(), &mut task).await {
+            Ok(Ok(flushed)) => StatsFlushShutdownReport {
+                signal_sent,
+                flushed,
+                ..StatsFlushShutdownReport::default()
+            },
+            Ok(Err(err)) => {
+                tracing::warn!("凭据统计刷盘任务异常退出: {}", err);
+                StatsFlushShutdownReport {
+                    signal_sent,
+                    task_failed: true,
+                    ..StatsFlushShutdownReport::default()
+                }
+            }
+            Err(_) => {
+                task.abort();
+                if tokio::time::timeout(ABORT_JOIN_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("凭据统计任务 abort 后仍未退出，停止等待该任务");
+                }
+                tracing::warn!("等待凭据统计最终刷盘超时，已停止后台任务");
+                StatsFlushShutdownReport {
+                    signal_sent,
+                    timed_out: true,
+                    ..StatsFlushShutdownReport::default()
+                }
+            }
+        };
+        let pending = self.manager.pending_persistence_backlog();
+        report.pending_stats_batches = pending.stats_batches;
+        report.pending_stats_deltas = pending.stats_deltas;
+        report.pending_runtime_mutations = pending.runtime_mutations;
+        let (_, overflow) = self.manager.runtime_mutation_backlog();
+        report.overflow_runtime_mutations = overflow;
+        if !report.timed_out && !report.task_failed {
+            report.flushed = self.manager.refresh_stats_dirty_from_pending();
+        }
+        report
     }
 }
 
@@ -287,24 +384,28 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
+    /// 最近一次清理 PgSQL 运行态 mutation 幂等记录的时间。
+    last_runtime_mutation_cleanup_at: Mutex<Option<Instant>>,
     /// 最近一次从 Redis 全量同步调度状态的时间，用于避免每个请求重复拉取所有凭据状态。
     last_scheduler_redis_sync_at: Mutex<Option<Instant>>,
     /// 最近一次执行 Redis 超时 lease 清理的时间。清理是全局操作，不能放在请求热路径每轮执行。
     last_scheduler_redis_cleanup_at: Mutex<Option<Instant>>,
-    /// Redis 调度热路径最近一次超时/失败后的退避截止时间。退避期间请求只用本机内存态调度。
+    /// Redis 调度热路径最近一次超时/失败后的退避截止时间。退避期间暂停分布式调度准入。
     scheduler_redis_degraded_until: Mutex<Option<Instant>>,
     /// Redis 调度热路径连续失败次数。Redis 持续慢时拉长退避，避免每个退避周期重复制造阻塞。
     scheduler_redis_degraded_streak: AtomicU32,
-    /// Redis 热路径并发探测数量。突发流量下限制同进程同时阻塞在 Redis 上的请求数。
-    scheduler_redis_hot_ops_in_flight: AtomicU32,
     /// Redis 全量调度状态同步后台任务是否正在运行，避免高并发下重复扫全部账号状态。
     scheduler_redis_sync_in_flight: Arc<AtomicBool>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// 未落盘的统计增量。请求热路径只合并内存 delta，后台任务定期写入 PgSQL。
     pending_stats_deltas: Mutex<HashMap<u64, CredentialStatsDeltaRow>>,
-    /// 未落盘的运行态快照。成功路径只合并最新快照，后台任务定期写入 PgSQL。
-    pending_runtime_state_snapshots: Mutex<HashMap<u64, CredentialRuntimeStateSnapshot>>,
+    /// 已冻结的统计批次；重试必须保留相同 operation ID 和完全相同的 payload。
+    pending_stats_batches: Mutex<VecDeque<PendingCredentialStatsBatch>>,
+    /// PgSQL 临时不可用时保留的权威运行态 mutation，按凭据 FIFO 重放。
+    pending_runtime_mutations: Mutex<HashMap<u64, VecDeque<PendingCredentialRuntimeMutation>>>,
+    overflow_runtime_mutations: AtomicU64,
+    runtime_mutation_flush_cursor: AtomicU64,
     /// 会话粘性绑定：conversationId -> credential id
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
     /// 凭据并发槽释放通知，用于所有凭据占满时排队等待。
@@ -327,15 +428,27 @@ const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs
 const SCHEDULER_REDIS_HOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(75);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE: StdDuration = StdDuration::from_secs(2);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX: StdDuration = StdDuration::from_secs(30);
-const SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS: u32 = 2;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(60);
+const CREDENTIAL_RUNTIME_MUTATION_RETENTION: StdDuration =
+    StdDuration::from_secs(30 * 24 * 60 * 60);
+const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_LIMIT: usize = 10_000;
+const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_MAX_BATCHES: usize = 64;
+const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_BUDGET: StdDuration = StdDuration::from_secs(5);
+const SOFT_PENDING_RUNTIME_MUTATIONS_PER_CREDENTIAL: usize = 4_096;
+const SOFT_PENDING_RUNTIME_MUTATIONS_TOTAL: usize = 65_536;
+const RUNTIME_MUTATION_FLUSH_LIMIT: usize = 256;
+const RUNTIME_MUTATION_FLUSH_BUDGET: StdDuration = StdDuration::from_secs(10);
+const CREDENTIAL_PGSQL_SYNC_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+const REFRESH_REDIS_LOCK_OP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const TOKEN_REFRESH_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(90);
+const TOKEN_REFRESH_COORDINATION_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+const TOKEN_REFRESH_RECONCILIATION_RESERVE: StdDuration = StdDuration::from_secs(15);
+const TOKEN_REFRESH_REDIS_LOCK_TTL_SECS: usize = 120;
 const LOCAL_REDIS_LEASE_COUNTER_SPACE: u64 = 1_000_000_000;
 const LOCAL_REDIS_LEASE_NAMESPACE_COUNT: u64 = 9_000_000_000;
 static LOCAL_REDIS_LEASE_NAMESPACE_SEQ: AtomicU64 = AtomicU64::new(1);
-
-struct SchedulerRedisHotOpGuard<'a> {
-    in_flight: &'a AtomicU32,
-}
 
 enum SchedulerRedisHotOutcome<T> {
     Completed(T),
@@ -343,10 +456,350 @@ enum SchedulerRedisHotOutcome<T> {
     Failed,
 }
 
-impl Drop for SchedulerRedisHotOpGuard<'_> {
-    fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+#[derive(Clone, Debug)]
+enum PendingCredentialRuntimeMutation {
+    Success {
+        operation_id: uuid::Uuid,
+        expected_generation: u64,
+    },
+    ApiFailure {
+        operation_id: uuid::Uuid,
+        expected_generation: u64,
+        last_used_at: String,
+    },
+    RefreshFailure {
+        operation_id: uuid::Uuid,
+        expected_generation: u64,
+        last_used_at: String,
+    },
+    Disable {
+        operation_id: uuid::Uuid,
+        expected_generation: u64,
+        reason: String,
+        failure_count: Option<u32>,
+        refresh_failure_count: Option<u32>,
+        last_used_at: String,
+    },
+    Patch {
+        operation_id: uuid::Uuid,
+        patch: CredentialRuntimeStatePatch,
+    },
+}
+
+struct PersistedCredentialRuntimeMutation {
+    state: CredentialRuntimeStateRow,
+    credential_disabled: Option<bool>,
+    applied: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TokenRefreshBudgets {
+    workflow: StdDuration,
+    coordination: StdDuration,
+    reconciliation: StdDuration,
+}
+
+impl Default for TokenRefreshBudgets {
+    fn default() -> Self {
+        Self {
+            workflow: TOKEN_REFRESH_WORKFLOW_TIMEOUT,
+            coordination: TOKEN_REFRESH_COORDINATION_WAIT_TIMEOUT,
+            reconciliation: TOKEN_REFRESH_RECONCILIATION_RESERVE,
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+struct TokenRefreshDeadlines {
+    work: tokio::time::Instant,
+    total: tokio::time::Instant,
+    coordination: tokio::time::Instant,
+}
+
+impl TokenRefreshBudgets {
+    fn deadlines(self) -> anyhow::Result<TokenRefreshDeadlines> {
+        if self.reconciliation > self.workflow {
+            anyhow::bail!("Token 刷新 reconciliation 预算不能超过总预算");
+        }
+        let now = tokio::time::Instant::now();
+        let work_budget = self.workflow.saturating_sub(self.reconciliation);
+        Ok(TokenRefreshDeadlines {
+            work: now + work_budget,
+            total: now + self.workflow,
+            coordination: now + self.coordination.min(work_budget),
+        })
+    }
+}
+
+struct AbortOnDropJoinHandle<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn run_refresh_step_until<T: Send + 'static>(
+    operation: &'static str,
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+) -> anyhow::Result<T> {
+    // The per-credential refresh mutex bounds these tasks. Spawning gives the
+    // deadline an independent poller even if the future's first poll performs
+    // synchronous TLS/client initialization.
+    let mut task = AbortOnDropJoinHandle(tokio::spawn(future));
+    match tokio::time::timeout_at(deadline, &mut task.0).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => Err(anyhow::anyhow!("{}任务异常结束: {}", operation, err)),
+        Err(_) => Err(anyhow::anyhow!("{}超过工作期限", operation)),
+    }
+}
+
+async fn refresh_token_until(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+    deadline: tokio::time::Instant,
+    operation: &'static str,
+) -> anyhow::Result<KiroCredentials> {
+    let credentials = credentials.clone();
+    let config = config.clone();
+    let proxy = proxy.cloned();
+    run_refresh_step_until(operation, deadline, async move {
+        refresh_token(&credentials, &config, proxy.as_ref()).await
+    })
+    .await
+}
+
+struct RedisRefreshLockGuard {
+    redis: Arc<RedisStore>,
+    credential_id: u64,
+    lock_token: Option<String>,
+}
+
+impl RedisRefreshLockGuard {
+    fn new(redis: Arc<RedisStore>, credential_id: u64, lock_token: String) -> Self {
+        Self {
+            redis,
+            credential_id,
+            lock_token: Some(lock_token),
+        }
+    }
+
+    async fn release(mut self) {
+        let Some(lock_token) = self.lock_token.as_deref() else {
+            return;
+        };
+        match tokio::time::timeout(
+            REFRESH_REDIS_LOCK_OP_TIMEOUT,
+            self.redis
+                .release_refresh_lock(self.credential_id, lock_token),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                self.lock_token.take();
+            }
+            Ok(Ok(false)) => {
+                tracing::warn!(
+                    credential_id = self.credential_id,
+                    "Redis Token 刷新锁已过期或不再属于本实例"
+                );
+                self.lock_token.take();
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    credential_id = self.credential_id,
+                    "释放 Redis Token 刷新锁失败，将提交 critical cleanup: {}",
+                    err
+                );
+            }
+            Err(_) => tracing::warn!(
+                credential_id = self.credential_id,
+                "释放 Redis Token 刷新锁超过 {}ms，将提交 critical cleanup",
+                REFRESH_REDIS_LOCK_OP_TIMEOUT.as_millis()
+            ),
+        }
+    }
+}
+
+impl Drop for RedisRefreshLockGuard {
+    fn drop(&mut self) {
+        let Some(lock_token) = self.lock_token.take() else {
+            return;
+        };
+        let redis = self.redis.clone();
+        let credential_id = self.credential_id;
+        let accepted = spawn_critical_storage_task("释放取消中的 Redis Token 刷新锁", async move {
+            let released = tokio::time::timeout(
+                REFRESH_REDIS_LOCK_OP_TIMEOUT,
+                redis.release_refresh_lock(credential_id, &lock_token),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("取消清理 Redis Token 刷新锁超时"))??;
+            if !released {
+                tracing::debug!(credential_id, "取消清理时 Redis Token 刷新锁已过期或已转移");
+            }
+            Ok(())
+        });
+        if !accepted {
+            tracing::error!(
+                credential_id,
+                "critical storage lane 拒绝 Redis Token 刷新锁 cleanup；等待 TTL 兜底"
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PendingCredentialStatsBatch {
+    operation_id: uuid::Uuid,
+    deltas: HashMap<u64, CredentialStatsDeltaRow>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PendingPersistenceBacklog {
+    stats_batches: usize,
+    stats_deltas: usize,
+    runtime_mutations: usize,
+}
+
+impl PendingPersistenceBacklog {
+    fn is_empty(self) -> bool {
+        self.stats_batches == 0 && self.stats_deltas == 0 && self.runtime_mutations == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsBatchFlushOutcome {
+    NoWork,
+    Persisted,
+    Failed,
+}
+
+impl PendingCredentialRuntimeMutation {
+    fn operation_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Success { operation_id, .. }
+            | Self::ApiFailure { operation_id, .. }
+            | Self::RefreshFailure { operation_id, .. }
+            | Self::Disable { operation_id, .. }
+            | Self::Patch { operation_id, .. } => *operation_id,
+        }
+    }
+}
+
+async fn credential_pgsql_sync_with_timeout<T: Send>(
+    operation: &'static str,
+    timeout: StdDuration,
+    future: impl Future<Output = anyhow::Result<T>> + Send,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| anyhow::anyhow!("{}超过 {}ms", operation, timeout.as_millis()))?
+}
+
+async fn credential_pgsql_sync_until<T: Send>(
+    operation: &'static str,
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = anyhow::Result<T>> + Send,
+) -> anyhow::Result<T> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("{}超过工作流总期限", operation);
+    }
+    credential_pgsql_sync_with_timeout(
+        operation,
+        remaining.min(CREDENTIAL_PGSQL_SYNC_TIMEOUT),
+        future,
+    )
+    .await
+}
+
+async fn acquire_refresh_lock_until<'a>(
+    lock: &'a TokioMutex<()>,
+    deadline: tokio::time::Instant,
+    credential_id: u64,
+) -> anyhow::Result<tokio::sync::MutexGuard<'a, ()>> {
+    tokio::time::timeout_at(deadline, lock.lock())
+        .await
+        .map_err(|_| anyhow::anyhow!("等待凭据 #{} 的本地 Token 刷新锁超时", credential_id))
+}
+
+fn refresh_step_timeout(deadline: tokio::time::Instant, cap: StdDuration) -> Option<StdDuration> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    (!remaining.is_zero()).then_some(remaining.min(cap))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RuntimeMutationCleanupReport {
+    removed: u64,
+    batches: usize,
+    saturated: bool,
+}
+
+async fn cleanup_runtime_mutation_history_batches(
+    store: Arc<PostgresStore>,
+    retention: StdDuration,
+    batch_limit: usize,
+    max_batches: usize,
+    budget: StdDuration,
+) -> anyhow::Result<RuntimeMutationCleanupReport> {
+    cleanup_runtime_mutation_history_batches_with(batch_limit, max_batches, budget, move || {
+        let store = store.clone();
+        async move {
+            store
+                .cleanup_credential_runtime_mutations(retention, batch_limit)
+                .await
+        }
+    })
+    .await
+}
+
+async fn cleanup_runtime_mutation_history_batches_with<F, Fut>(
+    batch_limit: usize,
+    max_batches: usize,
+    budget: StdDuration,
+    mut cleanup_batch: F,
+) -> anyhow::Result<RuntimeMutationCleanupReport>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<u64>> + Send,
+{
+    if batch_limit == 0 || max_batches == 0 || budget.is_zero() {
+        return Ok(RuntimeMutationCleanupReport::default());
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut report = RuntimeMutationCleanupReport::default();
+    while report.batches < max_batches {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            report.saturated = true;
+            break;
+        }
+        let removed = credential_pgsql_sync_with_timeout(
+            "清理 PgSQL 凭据 mutation 幂等记录",
+            remaining.min(CREDENTIAL_PGSQL_SYNC_TIMEOUT),
+            cleanup_batch(),
+        )
+        .await?;
+        report.batches += 1;
+        report.removed = report.removed.saturating_add(removed);
+        if removed < batch_limit as u64 {
+            return Ok(report);
+        }
+    }
+    report.saturated = true;
+    Ok(report)
+}
+
+fn block_on_credential_pgsql<T: Send>(
+    operation: &'static str,
+    future: impl Future<Output = anyhow::Result<T>> + Send,
+) -> anyhow::Result<T> {
+    block_on_storage(operation, async move {
+        credential_pgsql_sync_with_timeout(operation, CREDENTIAL_PGSQL_SYNC_TIMEOUT, future).await
+    })
 }
 
 fn initial_in_flight_lease_id(redis_enabled: bool) -> u64 {
@@ -405,9 +858,10 @@ impl MultiTokenManager {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_stores(
         config: Config,
-        mut credentials: Vec<KiroCredentials>,
+        credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
@@ -415,10 +869,30 @@ impl MultiTokenManager {
         redis_store: Option<Arc<RedisStore>>,
     ) -> anyhow::Result<Self> {
         let _ = (credentials_path, is_multiple_format);
-        if credentials.iter().any(|credential| credential.id.is_none()) {
-            if let Some(store) = &postgres_store {
-                let store = store.clone();
-                credentials = block_on_storage("通过 PgSQL 为无 ID 凭据分配 ID", async move {
+        Self::new_with_stores_and_runtime_state(
+            config,
+            credentials,
+            proxy,
+            postgres_store,
+            redis_store,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_stores_and_runtime_state(
+        config: Config,
+        mut credentials: Vec<KiroCredentials>,
+        proxy: Option<ProxyConfig>,
+        postgres_store: Option<Arc<PostgresStore>>,
+        redis_store: Option<Arc<RedisStore>>,
+        initial_runtime_states: Option<HashMap<u64, CredentialRuntimeStateRow>>,
+    ) -> anyhow::Result<Self> {
+        if credentials.iter().any(|credential| credential.id.is_none())
+            && let Some(store) = &postgres_store
+        {
+            let store = store.clone();
+            credentials =
+                block_on_credential_pgsql("通过 PgSQL 为无 ID 凭据分配 ID", async move {
                     let mut resolved = Vec::with_capacity(credentials.len());
                     for credential in credentials {
                         if credential.id.is_some() {
@@ -429,7 +903,6 @@ impl MultiTokenManager {
                     }
                     Ok(resolved)
                 })?;
-            }
         }
 
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
@@ -461,6 +934,9 @@ impl MultiTokenManager {
                     credentials: cred.clone(),
                     failure_count: 0,
                     refresh_failure_count: 0,
+                    runtime_revision: 0,
+                    runtime_generation: 0,
+                    runtime_persistence_degraded: false,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
                         Some(DisabledReason::Manual)
@@ -529,7 +1005,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let proxy_resources = if let Some(store) = &postgres_store {
             let store = store.clone();
-            match block_on_storage("从 PgSQL 加载代理资源", async move {
+            match block_on_credential_pgsql("从 PgSQL 加载代理资源", async move {
                 store.load_proxy_resources().await
             }) {
                 Ok(resources) => resources
@@ -557,15 +1033,18 @@ impl MultiTokenManager {
             proxy_resources: Arc::new(Mutex::new(proxy_resources)),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
+            last_runtime_mutation_cleanup_at: Mutex::new(None),
             last_scheduler_redis_sync_at: Mutex::new(None),
             last_scheduler_redis_cleanup_at: Mutex::new(None),
             scheduler_redis_degraded_until: Mutex::new(None),
             scheduler_redis_degraded_streak: AtomicU32::new(0),
-            scheduler_redis_hot_ops_in_flight: AtomicU32::new(0),
             scheduler_redis_sync_in_flight: Arc::new(AtomicBool::new(false)),
             stats_dirty: AtomicBool::new(false),
             pending_stats_deltas: Mutex::new(HashMap::new()),
-            pending_runtime_state_snapshots: Mutex::new(HashMap::new()),
+            pending_stats_batches: Mutex::new(VecDeque::new()),
+            pending_runtime_mutations: Mutex::new(HashMap::new()),
+            overflow_runtime_mutations: AtomicU64::new(0),
+            runtime_mutation_flush_cursor: AtomicU64::new(0),
             session_bindings: Mutex::new(HashMap::new()),
             in_flight_notify: Arc::new(Notify::new()),
             released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
@@ -585,7 +1064,12 @@ impl MultiTokenManager {
 
         // 加载持久化的统计数据（success_count, last_used_at）
         manager.load_stats();
-        manager.load_runtime_state();
+        if let Some(states) = initial_runtime_states {
+            manager.apply_loaded_runtime_states(&states);
+        } else {
+            manager.load_runtime_state();
+        }
+        manager.select_highest_priority();
         manager.refresh_scheduler_state_from_redis_force_best_effort();
         for id in invalid_config_credential_ids {
             manager.record_scheduler_credential_audit(
@@ -768,9 +1252,10 @@ impl MultiTokenManager {
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let to_save = updated.clone();
-            saved_version = Some(block_on_storage("持久化运行时配置到 PgSQL", async move {
-                store.save_runtime_config_returning_version(&to_save).await
-            })?);
+            saved_version = Some(block_on_credential_pgsql(
+                "持久化运行时配置到 PgSQL",
+                async move { store.save_runtime_config_returning_version(&to_save).await },
+            )?);
         }
 
         {
@@ -791,9 +1276,10 @@ impl MultiTokenManager {
             return Ok(false);
         };
         let store = store.clone();
-        let Some(mut config) = block_on_storage("从 PgSQL 重新加载运行时配置", async move {
-            store.load_runtime_config().await
-        })?
+        let Some(mut config) =
+            block_on_credential_pgsql("从 PgSQL 重新加载运行时配置", async move {
+                store.load_runtime_config().await
+            })?
         else {
             return Ok(false);
         };
@@ -890,6 +1376,12 @@ impl MultiTokenManager {
         state: &LocalPoolRouteState,
         error_message: &str,
     ) -> (SelectionFailureStage, AccountRejectReason) {
+        if error_message.contains("Redis 调度协调状态不可用") {
+            return (
+                SelectionFailureStage::DispatchQueue,
+                AccountRejectReason::Unknown,
+            );
+        }
         if error_message.contains("等待队列已满") {
             return (
                 SelectionFailureStage::DispatchQueue,
@@ -1181,10 +1673,12 @@ impl MultiTokenManager {
     }
 
     fn auto_heal_too_many_failures_if_applicable(&self) -> bool {
-        let healed_ids = {
-            let mut entries = self.entries.lock();
+        let candidate_ids = {
+            let entries = self.entries.lock();
             if !entries.iter().any(|entry| {
-                entry.disabled && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                entry.disabled
+                    && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                    && !entry.runtime_persistence_degraded
             }) {
                 return false;
             }
@@ -1193,25 +1687,64 @@ impl MultiTokenManager {
                 "所有可调度凭据均不可用且存在连续失败自动禁用凭据，执行自愈：重置失败计数并重新启用"
             );
 
-            let mut healed_ids = Vec::new();
-            for entry in entries.iter_mut() {
-                if entry.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                    entry.disabled = false;
-                    entry.disabled_reason = None;
-                    entry.failure_count = 0;
-                    healed_ids.push(entry.id);
-                }
-            }
-            healed_ids
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.disabled
+                        && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                        && !entry.runtime_persistence_degraded
+                })
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
         };
+
+        let mut healed_ids = Vec::new();
+        for id in candidate_ids {
+            let persisted_state = if let Some(store) = &self.postgres_store {
+                let store = store.clone();
+                match block_on_credential_pgsql("原子恢复 PgSQL 连续失败禁用凭据", async move {
+                    store.heal_credential_api_failures(id).await
+                }) {
+                    Ok(Some(state)) => Some(state),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(credential_id = id, "{}", err);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+                continue;
+            };
+            if entry.disabled_reason != Some(DisabledReason::TooManyFailures) {
+                continue;
+            }
+            if let Some(state) = persisted_state.as_ref() {
+                if state.revision <= entry.runtime_revision {
+                    continue;
+                }
+                entry.credentials.disabled = false;
+                Self::apply_runtime_state_if_newer(entry, state);
+            } else {
+                entry.failure_count = 0;
+                entry.credentials.disabled = false;
+                entry.disabled = false;
+                entry.disabled_reason = None;
+            }
+            if entry.disabled {
+                continue;
+            }
+            healed_ids.push(id);
+        }
 
         if healed_ids.is_empty() {
             return false;
         }
 
         for healed_id in healed_ids {
-            self.queue_runtime_state_flush(healed_id, None, Utc::now());
-            self.save_runtime_state_for(healed_id);
             self.record_scheduler_credential_audit(
                 "auto_enable_credential",
                 healed_id,
@@ -1270,15 +1803,14 @@ impl MultiTokenManager {
         }
     }
 
-    fn try_enter_scheduler_redis_hot_op(&self) -> Option<SchedulerRedisHotOpGuard<'_>> {
-        self.scheduler_redis_hot_ops_in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS).then_some(current + 1)
-            })
-            .ok()?;
-        Some(SchedulerRedisHotOpGuard {
-            in_flight: &self.scheduler_redis_hot_ops_in_flight,
-        })
+    fn scheduler_redis_retry_after_secs(&self) -> u64 {
+        let now = Instant::now();
+        let degraded_until = *self.scheduler_redis_degraded_until.lock();
+        degraded_until
+            .and_then(|until| until.checked_duration_since(now))
+            .map(|remaining| remaining.as_secs().saturating_add(1))
+            .unwrap_or(1)
+            .max(1)
     }
 
     fn mark_scheduler_redis_degraded(&self, operation: &'static str, err: &anyhow::Error) {
@@ -1307,7 +1839,7 @@ impl MultiTokenManager {
                 operation,
                 timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
                 backoff_ms = backoff.as_millis() as u64,
-                "Redis 调度热路径仍在退避窗口内，沿用本地调度: {}",
+                "Redis 调度热路径仍在退避窗口内，暂停分布式调度准入: {}",
                 err
             );
         } else {
@@ -1315,23 +1847,30 @@ impl MultiTokenManager {
                 operation,
                 timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
                 backoff_ms = backoff.as_millis() as u64,
-                "Redis 调度热路径不可用，本进程暂时降级为本地调度: {}",
+                "Redis 调度热路径不可用，本进程暂时暂停分布式调度准入: {}",
                 err
             );
         }
     }
 
-    fn block_on_scheduler_redis_hot<T>(
+    fn block_on_scheduler_redis_hot<T: Send>(
         &self,
         operation: &'static str,
-        future: impl Future<Output = anyhow::Result<T>>,
+        future: impl Future<Output = anyhow::Result<T>> + Send,
     ) -> Option<T> {
-        if !self.scheduler_redis_hot_path_allowed() {
-            return None;
+        match self.block_on_scheduler_redis_hot_outcome(operation, future) {
+            SchedulerRedisHotOutcome::Completed(value) => Some(value),
+            SchedulerRedisHotOutcome::Skipped | SchedulerRedisHotOutcome::Failed => None,
         }
-        let _redis_hot_op_guard = self.try_enter_scheduler_redis_hot_op()?;
+    }
+
+    fn block_on_scheduler_redis_hot_outcome<T: Send>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = anyhow::Result<T>> + Send,
+    ) -> SchedulerRedisHotOutcome<T> {
         if !self.scheduler_redis_hot_path_allowed() {
-            return None;
+            return SchedulerRedisHotOutcome::Skipped;
         }
         let result = block_on_storage(operation, async move {
             match tokio::time::timeout(SCHEDULER_REDIS_HOT_OP_TIMEOUT, future).await {
@@ -1347,11 +1886,11 @@ impl MultiTokenManager {
             Ok(value) => {
                 self.scheduler_redis_degraded_streak
                     .store(0, Ordering::Release);
-                Some(value)
+                SchedulerRedisHotOutcome::Completed(value)
             }
             Err(err) => {
                 self.mark_scheduler_redis_degraded(operation, &err);
-                None
+                SchedulerRedisHotOutcome::Failed
             }
         }
     }
@@ -1361,12 +1900,6 @@ impl MultiTokenManager {
         operation: &'static str,
         future: impl Future<Output = anyhow::Result<T>>,
     ) -> SchedulerRedisHotOutcome<T> {
-        if !self.scheduler_redis_hot_path_allowed() {
-            return SchedulerRedisHotOutcome::Skipped;
-        }
-        let Some(_redis_hot_op_guard) = self.try_enter_scheduler_redis_hot_op() else {
-            return SchedulerRedisHotOutcome::Skipped;
-        };
         if !self.scheduler_redis_hot_path_allowed() {
             return SchedulerRedisHotOutcome::Skipped;
         }
@@ -1391,10 +1924,10 @@ impl MultiTokenManager {
         }
     }
 
-    fn block_on_scheduler_redis_state_sync<T>(
+    fn block_on_scheduler_redis_state_sync<T: Send>(
         &self,
         operation: &'static str,
-        future: impl Future<Output = anyhow::Result<T>>,
+        future: impl Future<Output = anyhow::Result<T>> + Send,
     ) -> Option<T> {
         if self.redis_store.is_some() && !self.scheduler_redis_hot_path_allowed() {
             return None;
@@ -1484,6 +2017,7 @@ impl MultiTokenManager {
                 last_seen_at: now,
                 kind: InFlightKind::Api,
                 weight_units: lease_weight_units,
+                locally_owned: true,
             });
             return true;
         }
@@ -1647,7 +2181,6 @@ impl MultiTokenManager {
         let global_max_concurrent_requests = self.global_max_concurrent_requests();
         let now = Instant::now();
         let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
-        let mut late_redis_acquire_possible = false;
 
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -1694,21 +2227,76 @@ impl MultiTokenManager {
                     }
                     if let Some(redis) = &self.redis_store {
                         let redis = redis.clone();
-                        spawn_best_effort_storage_task(
+                        let fallback_redis = redis.clone();
+                        let admitted = spawn_critical_storage_task(
                             "释放本地竞争失败的 Redis 并发 lease",
                             async move {
-                                redis.release_in_flight_lease(id, lease_id).await?;
-                                Ok(())
+                                release_redis_in_flight_lease_and_wakeup(
+                                    redis, id, lease_id, false, 2,
+                                )
+                                .await
                             },
                         );
+                        if !admitted {
+                            release_redis_in_flight_lease_and_wakeup(
+                                fallback_redis,
+                                id,
+                                lease_id,
+                                false,
+                                2,
+                            )
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!("释放本地竞争失败的 Redis 并发 lease 失败: {}", err)
+                            })?;
+                        }
                     }
                     return Ok(None);
                 }
                 SchedulerRedisHotOutcome::Completed(None) => return Ok(None),
                 SchedulerRedisHotOutcome::Failed => {
-                    late_redis_acquire_possible = true;
+                    record_released_in_flight_lease_tombstone(
+                        &self.released_in_flight_lease_tombstones,
+                        id,
+                        lease_id,
+                    );
+                    let redis = self
+                        .redis_store
+                        .as_ref()
+                        .expect("Redis store exists")
+                        .clone();
+                    let fallback_redis = redis.clone();
+                    let admitted = spawn_critical_storage_task(
+                        "清理结果不确定的 Redis 并发 lease",
+                        async move {
+                            release_redis_in_flight_lease_and_wakeup(redis, id, lease_id, true, 2)
+                                .await
+                        },
+                    );
+                    if !admitted {
+                        release_redis_in_flight_lease_and_wakeup(
+                            fallback_redis,
+                            id,
+                            lease_id,
+                            true,
+                            2,
+                        )
+                        .await
+                        .map_err(|err| {
+                            anyhow::anyhow!("清理结果不确定的 Redis 并发 lease 失败: {}", err)
+                        })?;
+                    }
+                    anyhow::bail!(
+                        "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
+                        self.scheduler_redis_retry_after_secs()
+                    );
                 }
-                SchedulerRedisHotOutcome::Skipped => {}
+                SchedulerRedisHotOutcome::Skipped => {
+                    anyhow::bail!(
+                        "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
+                        self.scheduler_redis_retry_after_secs()
+                    );
+                }
             }
         }
 
@@ -1723,18 +2311,14 @@ impl MultiTokenManager {
             self.invalidate_local_pool_route_state_cache();
             return Ok(Some(InFlightLeaseGuard::new(
                 self.entries.clone(),
-                late_redis_acquire_possible
-                    .then(|| self.redis_store.clone())
-                    .flatten(),
-                self.redis_store
-                    .is_some()
-                    .then(|| self.released_in_flight_lease_tombstones.clone()),
+                None,
+                None,
                 self.in_flight_notify.clone(),
                 self.local_pool_route_state_cache.clone(),
                 id,
                 lease_id,
                 request_weight_units,
-                late_redis_acquire_possible,
+                false,
             )));
         }
         Ok(None)
@@ -1778,16 +2362,15 @@ impl MultiTokenManager {
         age: StdDuration,
     ) {
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == credential_id) {
-            if let Some(lease) = entry
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == credential_id)
+            && let Some(lease) = entry
                 .in_flight_leases
                 .iter_mut()
                 .find(|lease| lease.id == lease_id)
-            {
-                let now = Instant::now();
-                lease.acquired_at = now - age;
-                lease.last_seen_at = now - age;
-            }
+        {
+            let now = Instant::now();
+            lease.acquired_at = now - age;
+            lease.last_seen_at = now - age;
         }
     }
 
@@ -2002,6 +2585,28 @@ impl MultiTokenManager {
             return;
         }
         let _ = tokio::time::timeout(wakeup, self.in_flight_notify.notified()).await;
+        if self.redis_store.is_some()
+            && let Err(err) = self.refresh_scheduler_state_from_redis_force()
+        {
+            tracing::debug!("调度等待唤醒后同步 Redis 并发状态失败: {}", err);
+        }
+    }
+
+    async fn renew_dispatch_queue_lease_if_needed(
+        &self,
+        queue_guard: &mut Option<DispatchQueueGuard>,
+    ) -> anyhow::Result<()> {
+        let Some(guard) = queue_guard.as_mut() else {
+            return Ok(());
+        };
+        if let Err(err) = guard.renew_if_needed().await {
+            self.mark_scheduler_redis_degraded("续期 Redis 调度排队 lease", &err);
+            anyhow::bail!(
+                "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
+                self.scheduler_redis_retry_after_secs()
+            );
+        }
+        Ok(())
     }
 
     fn try_enter_dispatch_queue(&self) -> anyhow::Result<Option<DispatchQueueGuard>> {
@@ -2010,25 +2615,45 @@ impl MultiTokenManager {
             return Ok(None);
         }
         self.invalidate_local_pool_route_state_cache();
-        let mut redis_admitted = false;
+        let mut redis_lease_id = None;
+        let redis_lease_ttl_secs = self
+            .config
+            .lock()
+            .credential_dispatch_max_wait_secs
+            .saturating_add(60)
+            .max(60);
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
-            let ttl_secs = self
-                .config
-                .lock()
-                .credential_dispatch_max_wait_secs
-                .saturating_add(60)
-                .max(60);
-            if let Some(admitted) = self
-                .block_on_scheduler_redis_hot("占用 Redis 调度排队名额", async move {
-                    redis.try_enter_dispatch_queue(max_queued, ttl_secs).await
-                })
-            {
-                if !admitted {
+            let cleanup_redis = redis.clone();
+            let lease_id = uuid::Uuid::new_v4().to_string();
+            let acquire_lease_id = lease_id.clone();
+            match self.block_on_scheduler_redis_hot_outcome("占用 Redis 调度排队名额", async move {
+                redis
+                    .try_enter_dispatch_queue(&acquire_lease_id, max_queued, redis_lease_ttl_secs)
+                    .await
+            }) {
+                SchedulerRedisHotOutcome::Completed(true) => {
+                    redis_lease_id = Some(lease_id);
+                }
+                SchedulerRedisHotOutcome::Completed(false) => {
                     self.queued_requests.fetch_sub(1, Ordering::AcqRel);
                     return Ok(None);
                 }
-                redis_admitted = true;
+                SchedulerRedisHotOutcome::Failed => {
+                    self.queued_requests.fetch_sub(1, Ordering::AcqRel);
+                    release_redis_dispatch_queue_lease_reliably(cleanup_redis, lease_id);
+                    anyhow::bail!(
+                        "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
+                        self.scheduler_redis_retry_after_secs()
+                    );
+                }
+                SchedulerRedisHotOutcome::Skipped => {
+                    self.queued_requests.fetch_sub(1, Ordering::AcqRel);
+                    anyhow::bail!(
+                        "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
+                        self.scheduler_redis_retry_after_secs()
+                    );
+                }
             }
         }
         Ok(Some(DispatchQueueGuard::new(
@@ -2036,7 +2661,8 @@ impl MultiTokenManager {
             self.queued_requests.clone(),
             self.in_flight_notify.clone(),
             self.local_pool_route_state_cache.clone(),
-            redis_admitted,
+            redis_lease_id,
+            redis_lease_ttl_secs,
         )))
     }
 
@@ -2251,13 +2877,7 @@ impl MultiTokenManager {
         if let Err(err) = self.refresh_scheduler_state_from_redis() {
             tracing::warn!("读取会话绑定前同步 Redis 调度状态失败: {}", err);
         }
-        let bound_id = {
-            let mut bindings = self.session_bindings.lock();
-            prune_session_bindings_locked(&mut bindings);
-            bindings
-                .get(session_id)
-                .map(|binding| binding.credential_id)
-        }?;
+        let bound_id = self.bound_credential_id(session_id)?;
 
         if excluded_ids.contains(&bound_id) {
             return None;
@@ -2287,6 +2907,17 @@ impl MultiTokenManager {
     }
 
     fn bound_credential_id(&self, session_id: &str) -> Option<u64> {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            if let Some(binding) = self
+                .block_on_scheduler_redis_hot("读取 Redis 会话绑定", async move {
+                    redis.get_session_binding(&session_id_owned).await
+                })
+            {
+                cache_sticky_redis_binding(&self.session_bindings, session_id, binding);
+            }
+        }
         sticky_bound_credential_id(&self.session_bindings, session_id)
     }
 
@@ -2308,60 +2939,130 @@ impl MultiTokenManager {
     }
 
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
-        bind_sticky_session_to_credential(
-            &self.session_bindings,
-            self.redis_store.as_ref(),
-            session_id,
-            credential_id,
-        );
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            let binding = SchedulerSessionBinding {
+                credential_id,
+                last_used_at: Utc::now(),
+                soft_failure_count: 0,
+            };
+            if let Some(actual) =
+                self.block_on_scheduler_redis_hot("原子写入 Redis 会话绑定", async move {
+                    redis
+                        .set_session_binding(
+                            &session_id_owned,
+                            &binding,
+                            SESSION_BINDING_TTL_SECS as usize,
+                        )
+                        .await
+                })
+            {
+                cache_sticky_redis_binding(&self.session_bindings, session_id, Some(actual));
+                return;
+            }
+        }
+        bind_sticky_session_to_credential(&self.session_bindings, session_id, credential_id);
     }
 
     /// 清理指定会话的粘性绑定。
     pub fn unbind_session(&self, session_id: &str) {
-        unbind_sticky_session(
-            &self.session_bindings,
-            self.redis_store.as_ref(),
-            session_id,
-        );
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            let _ = self.block_on_scheduler_redis_hot("删除 Redis 会话绑定", async move {
+                redis.delete_session_binding(&session_id_owned).await
+            });
+        }
+        unbind_sticky_session(&self.session_bindings, session_id);
     }
 
     /// 仅当指定会话当前绑定到该凭据时清理绑定。
     pub fn unbind_session_if_bound_to(&self, session_id: &str, credential_id: u64) {
-        unbind_sticky_session_if_bound_to(
-            &self.session_bindings,
-            self.redis_store.as_ref(),
-            session_id,
-            credential_id,
-        );
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            if let Some(deleted) =
+                self.block_on_scheduler_redis_hot("按凭据删除 Redis 会话绑定", async move {
+                    redis
+                        .delete_session_binding_if_bound_to(&session_id_owned, credential_id)
+                        .await
+                })
+            {
+                if deleted {
+                    unbind_sticky_session_if_bound_to(
+                        &self.session_bindings,
+                        session_id,
+                        credential_id,
+                    );
+                } else {
+                    let _ = self.bound_credential_id(session_id);
+                }
+                return;
+            }
+        }
+        unbind_sticky_session_if_bound_to(&self.session_bindings, session_id, credential_id);
     }
 
     /// 清理某个凭据关联的所有会话绑定。
     pub fn unbind_sessions_for_credential(&self, credential_id: u64) {
-        unbind_sticky_sessions_for_credential(
-            &self.session_bindings,
-            self.redis_store.as_ref(),
-            credential_id,
-        );
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let _ = self.block_on_scheduler_redis_hot("删除 Redis 凭据会话绑定", async move {
+                redis.delete_sessions_for_credential(credential_id).await?;
+                Ok(())
+            });
+        }
+        unbind_sticky_sessions_for_credential(&self.session_bindings, credential_id);
     }
 
     /// 记录绑定账号的一次软失败。返回 true 表示本次请求可以临时 fallback。
     pub fn record_session_soft_failure(&self, session_id: &str, credential_id: u64) -> bool {
-        record_sticky_session_soft_failure(
-            &self.session_bindings,
-            self.redis_store.as_ref(),
-            session_id,
-            credential_id,
-        )
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            if let Some(binding) =
+                self.block_on_scheduler_redis_hot("原子记录 Redis 会话软失败", async move {
+                    redis
+                        .record_session_soft_failure_with_state(
+                            &session_id_owned,
+                            credential_id,
+                            SESSION_BINDING_TTL_SECS as usize,
+                        )
+                        .await
+                })
+            {
+                let should_fallback = binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.soft_failure_count >= MAX_SESSION_SOFT_FAILURES);
+                cache_sticky_redis_binding(&self.session_bindings, session_id, binding);
+                return should_fallback;
+            }
+        }
+        record_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id)
     }
 
     /// 清理绑定账号的软失败计数。
     pub fn clear_session_soft_failure(&self, session_id: &str, credential_id: u64) {
-        clear_sticky_session_soft_failure(
-            &self.session_bindings,
-            self.redis_store.as_ref(),
-            session_id,
-            credential_id,
-        );
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            if let Some(binding) =
+                self.block_on_scheduler_redis_hot("原子清理 Redis 会话软失败", async move {
+                    redis
+                        .clear_session_soft_failure_with_state(
+                            &session_id_owned,
+                            credential_id,
+                            SESSION_BINDING_TTL_SECS as usize,
+                        )
+                        .await
+                })
+            {
+                cache_sticky_redis_binding(&self.session_bindings, session_id, binding);
+                return;
+            }
+        }
+        clear_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id);
     }
 
     /// 获取 API 调用上下文
@@ -2478,14 +3179,12 @@ impl MultiTokenManager {
                         );
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                        if best.is_none() {
-                            if self.auto_heal_too_many_failures_if_applicable() {
-                                best = self.select_next_credential_excluding(
-                                    model,
-                                    &local_excluded_ids,
-                                    request_weight_units,
-                                );
-                            }
+                        if best.is_none() && self.auto_heal_too_many_failures_if_applicable() {
+                            best = self.select_next_credential_excluding(
+                                model,
+                                &local_excluded_ids,
+                                request_weight_units,
+                            );
                         }
 
                         if let Some((new_id, new_creds)) = best {
@@ -2773,6 +3472,8 @@ impl MultiTokenManager {
                         retry_after_secs,
                         "所有可用凭据暂不可调度，进入排队等待"
                     );
+                    self.renew_dispatch_queue_lease_if_needed(&mut queue_guard)
+                        .await?;
                     self.wait_for_dispatch_capacity(
                         wait_for,
                         self.dispatch_wait_remaining(acquire_mode, dispatch_wait_started_at, now),
@@ -2839,6 +3540,8 @@ impl MultiTokenManager {
                     credential_id = id,
                     "选中凭据后并发槽已被其他请求占用，进入排队等待"
                 );
+                self.renew_dispatch_queue_lease_if_needed(&mut queue_guard)
+                    .await?;
                 self.wait_for_dispatch_capacity(
                     None,
                     self.dispatch_wait_remaining(acquire_mode, dispatch_wait_started_at, now),
@@ -2912,16 +3615,15 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| !e.disabled)
             .min_by_key(|e| e.credentials.priority)
+            && best.id != *current_id
         {
-            if best.id != *current_id {
-                tracing::info!(
-                    "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
-                    *current_id,
-                    best.id,
-                    best.credentials.priority
-                );
-                *current_id = best.id;
-            }
+            tracing::info!(
+                "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
+                *current_id,
+                best.id,
+                best.credentials.priority
+            );
+            *current_id = best.id;
         }
     }
 
@@ -2932,11 +3634,61 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID，用于更新正确的条目
     /// * `credentials` - 凭据信息
+    async fn reload_credential_for_refresh_until(
+        &self,
+        id: u64,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<KiroCredentials> {
+        let store = self
+            .postgres_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("跨实例 Token 刷新等待需要 PgSQL"))?;
+        let (credentials, runtime_states) = credential_pgsql_sync_until(
+            "等待跨实例刷新时读取 PgSQL 权威凭据",
+            deadline,
+            store.load_credentials_with_runtime_state(),
+        )
+        .await?;
+        let latest = credentials
+            .into_iter()
+            .find(|credential| credential.id == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+        if latest.storage_revision >= entry.credentials.storage_revision {
+            entry.credentials = latest;
+            Self::recompute_entry_disabled(entry);
+        }
+        if let Some(state) = runtime_states.get(&id) {
+            Self::apply_runtime_state_if_newer(entry, state);
+        }
+        Ok(entry.credentials.clone())
+    }
+
     async fn try_ensure_token(
         &self,
         id: u64,
         credentials: &KiroCredentials,
         update_refresh_health: bool,
+    ) -> anyhow::Result<CallContext> {
+        self.try_ensure_token_with_budgets(
+            id,
+            credentials,
+            update_refresh_health,
+            TokenRefreshBudgets::default(),
+        )
+        .await
+    }
+
+    async fn try_ensure_token_with_budgets(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        update_refresh_health: bool,
+        budgets: TokenRefreshBudgets,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -2957,11 +3709,13 @@ impl MultiTokenManager {
 
         // 第一次检查（无锁）：快速判断是否需要刷新
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        let deadlines = budgets.deadlines()?;
 
         let creds = if needs_refresh {
             // 同一凭据只允许一个刷新任务；不同凭据互不阻塞。
             let refresh_lock = self.refresh_lock_for_credential(id);
-            let _guard = refresh_lock.lock().await;
+            let _guard =
+                acquire_refresh_lock_until(&refresh_lock, deadlines.coordination, id).await?;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -2974,98 +3728,152 @@ impl MultiTokenManager {
             };
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                let mut redis_refresh_lock: Option<(Arc<RedisStore>, String)> = None;
+                let mut redis_refresh_lock: Option<RedisRefreshLockGuard> = None;
+                let mut refreshed_by_peer = None;
                 if let Some(redis) = &self.redis_store {
                     let redis_for_lock = redis.clone();
-                    match redis_for_lock.acquire_refresh_lock(id, 120).await {
-                        Ok(Some(lock_token)) => {
-                            redis_refresh_lock = Some((redis_for_lock, lock_token));
+                    let lock_timeout =
+                        refresh_step_timeout(deadlines.coordination, REFRESH_REDIS_LOCK_OP_TIMEOUT)
+                            .ok_or_else(|| anyhow::anyhow!("等待 Token 刷新协调超时"))?;
+                    match tokio::time::timeout(
+                        lock_timeout,
+                        redis_for_lock.acquire_refresh_lock(id, TOKEN_REFRESH_REDIS_LOCK_TTL_SECS),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(lock_token))) => {
+                            redis_refresh_lock =
+                                Some(RedisRefreshLockGuard::new(redis_for_lock, id, lock_token));
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             tracing::debug!(
                                 credential_id = id,
                                 "其他实例正在刷新 Token，等待 PgSQL 凭据同步"
                             );
-                            for _ in 0..30 {
-                                tokio::time::sleep(StdDuration::from_millis(500)).await;
-                                if let Err(err) = self.reload_credentials_from_postgres() {
-                                    tracing::warn!(
-                                        credential_id = id,
-                                        "等待跨实例刷新时重新加载凭据失败: {}",
-                                        err
-                                    );
+                            loop {
+                                let now = tokio::time::Instant::now();
+                                if now >= deadlines.coordination {
+                                    anyhow::bail!("等待其他实例刷新 Token 超时");
                                 }
-                                let latest = {
-                                    let entries = self.entries.lock();
-                                    entries
-                                        .iter()
-                                        .find(|e| e.id == id)
-                                        .map(|e| e.credentials.clone())
-                                        .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+                                tokio::time::sleep_until(
+                                    (now + StdDuration::from_millis(500))
+                                        .min(deadlines.coordination),
+                                )
+                                .await;
+                                let latest = match self
+                                    .reload_credential_for_refresh_until(id, deadlines.coordination)
+                                    .await
+                                {
+                                    Ok(latest) => latest,
+                                    Err(err)
+                                        if tokio::time::Instant::now() < deadlines.coordination =>
+                                    {
+                                        tracing::warn!(
+                                            credential_id = id,
+                                            "等待跨实例刷新时读取 PgSQL 失败，将在总期限内重试: {}",
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                    Err(err) => return Err(err),
                                 };
                                 if !is_token_expired(&latest) && !is_token_expiring_soon(&latest) {
                                     tracing::debug!(
                                         credential_id = id,
                                         "Token 已由其他实例刷新，跳过本实例刷新"
                                     );
-                                    return self.token_context_from_credentials(
-                                        id,
-                                        latest,
-                                        update_refresh_health,
-                                    );
+                                    refreshed_by_peer = Some(latest);
+                                    break;
                                 }
                             }
-                            anyhow::bail!("等待其他实例刷新 Token 超时");
                         }
-                        Err(err) => tracing::warn!(
-                            credential_id = id,
-                            "获取 Redis Token 刷新锁失败，使用本进程刷新锁继续: {}",
-                            err
+                        Ok(Err(err)) => {
+                            anyhow::bail!("获取 Redis Token 刷新锁失败: {}", err);
+                        }
+                        Err(_) => anyhow::bail!(
+                            "获取 Redis Token 刷新锁超过 {}ms",
+                            REFRESH_REDIS_LOCK_OP_TIMEOUT.as_millis()
                         ),
                     }
                 }
 
-                // 确实需要刷新
-                let refresh_result = match self.resolve_proxy_for_credential(current_creds.clone())
-                {
-                    Ok(current_creds_for_proxy) => {
+                if let Some(latest) = refreshed_by_peer {
+                    latest
+                } else {
+                    let refreshed_and_persisted = async {
+                        let current_creds_for_proxy =
+                            self.resolve_proxy_for_credential(current_creds.clone())?;
                         let effective_proxy =
                             current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
                         let config = self.runtime_config();
-                        refresh_token(&current_creds_for_proxy, &config, effective_proxy.as_ref())
+                        let mut new_creds = refresh_token_until(
+                            &current_creds_for_proxy,
+                            &config,
+                            effective_proxy.as_ref(),
+                            deadlines.work,
+                            "Token 刷新上游阶段",
+                        )
+                        .await?;
+                        new_creds.proxy_url = current_creds.proxy_url.clone();
+                        new_creds.proxy_username = current_creds.proxy_username.clone();
+                        new_creds.proxy_password = current_creds.proxy_password.clone();
+                        new_creds.proxy_resource_id = current_creds.proxy_resource_id;
+
+                        if is_token_expired(&new_creds) {
+                            anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+                        }
+
+                        new_creds = self
+                            .persist_refreshed_credential_fields(
+                                id,
+                                &current_creds,
+                                new_creds,
+                                true,
+                                deadlines.work,
+                                deadlines.total,
+                            )
+                            .await?;
+
+                        {
+                            let mut entries = self.entries.lock();
+                            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                                Self::merge_refresh_fields(&mut entry.credentials, &new_creds);
+                            }
+                        }
+
+                        if let Some(redis) = &self.redis_store {
+                            let payload = serde_json::json!({
+                                "kind": "credentials_changed",
+                                "reason": "token_refreshed",
+                                "changedAt": Utc::now().to_rfc3339(),
+                            })
+                            .to_string();
+                            match tokio::time::timeout_at(
+                                deadlines.total,
+                                redis.publish_credentials_changed(payload),
+                            )
                             .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => tracing::warn!(
+                                    credential_id = id,
+                                    "发布 Token 刷新通知失败，其他实例将通过定时同步恢复: {}",
+                                    err
+                                ),
+                                Err(_) => tracing::warn!(
+                                    credential_id = id,
+                                    "发布 Token 刷新通知超过总期限，其他实例将通过定时同步恢复"
+                                ),
+                            }
+                        }
+                        Ok::<KiroCredentials, anyhow::Error>(new_creds)
                     }
-                    Err(err) => Err(err),
-                };
-                if let Some((redis, lock_token)) = redis_refresh_lock {
-                    if let Err(err) = redis.release_refresh_lock(id, &lock_token).await {
-                        tracing::warn!(credential_id = id, "释放 Redis Token 刷新锁失败: {}", err);
+                    .await;
+                    if let Some(redis_refresh_lock) = redis_refresh_lock {
+                        redis_refresh_lock.release().await;
                     }
+                    refreshed_and_persisted?
                 }
-                let mut new_creds = refresh_result?;
-                new_creds.proxy_url = current_creds.proxy_url.clone();
-                new_creds.proxy_username = current_creds.proxy_username.clone();
-                new_creds.proxy_password = current_creds.proxy_password.clone();
-                new_creds.proxy_resource_id = current_creds.proxy_resource_id;
-
-                if is_token_expired(&new_creds) {
-                    anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-                }
-
-                // 更新凭据
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
-
-                // 只回写当前凭据行，避免旧内存快照覆盖其他实例新增凭据；回写不阻塞本次请求。
-                if self.persist_credential_entry_best_effort(id, "Token 刷新后持久化失败") {
-                    self.publish_credentials_changed("token_refreshed");
-                }
-
-                new_creds
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
@@ -3075,14 +3883,16 @@ impl MultiTokenManager {
             credentials.clone()
         };
 
-        self.token_context_from_credentials(id, creds, update_refresh_health)
+        self.token_context_from_credentials_until(id, creds, update_refresh_health, deadlines.total)
+            .await
     }
 
-    fn token_context_from_credentials(
+    async fn token_context_from_credentials_until(
         &self,
         id: u64,
         creds: KiroCredentials,
         update_refresh_health: bool,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<CallContext> {
         let creds = self.resolve_proxy_for_credential(creds)?;
         let token = creds
@@ -3091,18 +3901,28 @@ impl MultiTokenManager {
             .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
 
         if update_refresh_health {
-            let mut changed = false;
-            {
+            let reset_generation = {
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    if entry.refresh_failure_count != 0 {
-                        changed = true;
-                    }
+                    let reset_generation =
+                        (entry.refresh_failure_count != 0).then_some(entry.runtime_generation);
                     entry.refresh_failure_count = 0;
+                    reset_generation
+                } else {
+                    None
                 }
-            }
-            if changed {
-                self.queue_runtime_state_flush(id, None, Utc::now());
+            };
+            if let Some(expected_generation) = reset_generation {
+                self.persist_runtime_patch_best_effort_until(
+                    id,
+                    CredentialRuntimeStatePatch {
+                        refresh_failure_count: Some(0),
+                        expected_generation: Some(expected_generation),
+                        ..Default::default()
+                    },
+                    deadline,
+                )
+                .await;
             }
         }
 
@@ -3156,21 +3976,299 @@ impl MultiTokenManager {
     fn credential_from_entry(entry: &CredentialEntry) -> KiroCredentials {
         let mut cred = entry.credentials.clone();
         cred.id = Some(entry.id);
-        cred.disabled = entry.disabled;
+        cred.disabled = if entry.runtime_persistence_degraded {
+            entry.credentials.disabled
+        } else {
+            entry.disabled
+        };
         cred.canonicalize_auth_method();
         cred.normalize_supported_models();
         cred
     }
 
-    fn runtime_state_from_entry(entry: &CredentialEntry) -> CredentialRuntimeStateRow {
-        CredentialRuntimeStateRow {
-            failure_count: entry.failure_count,
-            refresh_failure_count: entry.refresh_failure_count,
-            disabled_reason: entry
-                .disabled_reason
-                .map(|reason| reason.as_str().to_string()),
-            warmup_remaining: entry.warmup_remaining,
+    fn merge_refresh_fields(target: &mut KiroCredentials, source: &KiroCredentials) {
+        target.access_token = source.access_token.clone();
+        target.refresh_token = source.refresh_token.clone();
+        target.profile_arn = source.profile_arn.clone();
+        target.expires_at = source.expires_at.clone();
+        target.scopes = source.scopes.clone();
+        target.created_at = source.created_at.clone();
+        target.updated_at = source.updated_at.clone();
+        target.storage_revision = source.storage_revision;
+    }
+
+    fn merge_credential_update(
+        base: &KiroCredentials,
+        requested: &KiroCredentials,
+        current: &KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        if base.id != requested.id || base.id != current.id {
+            anyhow::bail!("凭据 CAS 三方合并的 id 不一致");
         }
+        let base_value = serde_json::to_value(base)?;
+        let requested_value = serde_json::to_value(requested)?;
+        let mut merged_value = serde_json::to_value(current)?;
+        let base_fields = base_value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("凭据基线不是 JSON 对象"))?;
+        let requested_fields = requested_value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("凭据更新不是 JSON 对象"))?;
+        let merged_fields = merged_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("当前凭据不是 JSON 对象"))?;
+        let changed_fields: HashSet<&String> = base_fields
+            .keys()
+            .chain(requested_fields.keys())
+            .filter(|key| base_fields.get(*key) != requested_fields.get(*key))
+            .collect();
+        for key in changed_fields {
+            let base_value = base_fields.get(key);
+            let requested_value = requested_fields.get(key);
+            let current_value = merged_fields.get(key);
+            if current_value != base_value && current_value != requested_value {
+                anyhow::bail!("凭据字段 {} 已被其他实例并发修改", key);
+            }
+            if let Some(value) = requested_fields.get(key) {
+                merged_fields.insert(key.clone(), value.clone());
+            } else {
+                merged_fields.remove(key);
+            }
+        }
+
+        let mut merged: KiroCredentials = serde_json::from_value(merged_value)?;
+        merged.id = current.id;
+        merged.created_at = current.created_at.clone();
+        merged.updated_at = current.updated_at.clone();
+        merged.storage_revision = current.storage_revision;
+        merged.canonicalize_auth_method();
+        merged.normalize_supported_models();
+        Ok(merged)
+    }
+
+    fn credential_update_is_applied(
+        base: &KiroCredentials,
+        requested: &KiroCredentials,
+        current: &KiroCredentials,
+    ) -> anyhow::Result<bool> {
+        let base_value = serde_json::to_value(base)?;
+        let requested_value = serde_json::to_value(requested)?;
+        let current_value = serde_json::to_value(current)?;
+        let base_fields = base_value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("凭据基线不是 JSON 对象"))?;
+        let requested_fields = requested_value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("凭据更新不是 JSON 对象"))?;
+        let current_fields = current_value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("当前凭据不是 JSON 对象"))?;
+        Ok(base_fields
+            .keys()
+            .chain(requested_fields.keys())
+            .filter(|key| base_fields.get(*key) != requested_fields.get(*key))
+            .all(|key| current_fields.get(key) == requested_fields.get(key)))
+    }
+
+    fn credential_runtime_patch_is_applied(
+        base: &KiroCredentials,
+        requested: &KiroCredentials,
+        current: &KiroCredentials,
+        runtime: Option<&CredentialRuntimeStateRow>,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<bool> {
+        if !Self::credential_update_is_applied(base, requested, current)?
+            || patch
+                .credential_disabled
+                .is_some_and(|disabled| current.disabled != disabled)
+            || patch.last_used_at.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(runtime) = runtime else {
+            return Ok(false);
+        };
+        if let Some(expected_generation) = patch.expected_generation {
+            let applied_generation = expected_generation
+                .checked_add(u64::from(patch.advance_generation))
+                .ok_or_else(|| anyhow::anyhow!("凭据运行态 generation 已溢出"))?;
+            if runtime.generation != applied_generation {
+                return Ok(false);
+            }
+        }
+        if patch
+            .failure_count
+            .is_some_and(|value| runtime.failure_count != value)
+            || patch
+                .refresh_failure_count
+                .is_some_and(|value| runtime.refresh_failure_count != value)
+            || patch
+                .warmup_remaining
+                .is_some_and(|value| runtime.warmup_remaining != value)
+        {
+            return Ok(false);
+        }
+        Ok(match &patch.disabled_reason {
+            CredentialRuntimeDisabledReasonPatch::Preserve => true,
+            CredentialRuntimeDisabledReasonPatch::Set(reason) => {
+                runtime.disabled_reason.as_ref() == Some(reason)
+            }
+            CredentialRuntimeDisabledReasonPatch::Clear => runtime.disabled_reason.is_none(),
+        })
+    }
+
+    fn refresh_fields_match(
+        current: &KiroCredentials,
+        requested: &CredentialRefreshFieldsPatch,
+    ) -> bool {
+        requested
+            .access_token
+            .as_ref()
+            .is_none_or(|value| current.access_token.as_ref() == Some(value))
+            && requested
+                .refresh_token
+                .as_ref()
+                .is_none_or(|value| current.refresh_token.as_ref() == Some(value))
+            && requested
+                .profile_arn
+                .as_ref()
+                .is_none_or(|value| current.profile_arn.as_ref() == Some(value))
+            && requested
+                .expires_at
+                .as_ref()
+                .is_none_or(|value| current.expires_at.as_ref() == Some(value))
+            && requested
+                .scopes
+                .as_ref()
+                .is_none_or(|value| current.scopes.as_ref() == Some(value))
+    }
+
+    async fn persist_refreshed_credential_fields(
+        &self,
+        id: u64,
+        expected_credentials: &KiroCredentials,
+        refreshed_credentials: KiroCredentials,
+        accept_fresh_conflict: bool,
+        work_deadline: tokio::time::Instant,
+        reconciliation_deadline: tokio::time::Instant,
+    ) -> anyhow::Result<KiroCredentials> {
+        let Some(store) = &self.postgres_store else {
+            return Ok(refreshed_credentials);
+        };
+        let expected = CredentialRefreshExpectedContext::from_credentials(expected_credentials)?;
+        let patch = CredentialRefreshFieldsPatch {
+            access_token: refreshed_credentials.access_token.clone(),
+            refresh_token: refreshed_credentials.refresh_token.clone(),
+            profile_arn: refreshed_credentials.profile_arn.clone(),
+            expires_at: refreshed_credentials.expires_at.clone(),
+            scopes: refreshed_credentials.scopes.clone(),
+        };
+        let first_attempt = credential_pgsql_sync_until(
+            "Token 刷新后字段级 CAS 写入 PgSQL",
+            work_deadline,
+            store.update_credential_refresh_fields_cas(id, &expected, &patch),
+        )
+        .await;
+        let outcome = match first_attempt {
+            Ok(outcome) => outcome,
+            Err(first_err) => {
+                tracing::warn!(
+                    credential_id = id,
+                    "Token 字段级 CAS 首次结果不确定，使用相同前置条件安全重试: {}",
+                    first_err
+                );
+                match credential_pgsql_sync_until(
+                    "Token 刷新后字段级 CAS 安全重试",
+                    reconciliation_deadline,
+                    store.update_credential_refresh_fields_cas(id, &expected, &patch),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(retry_err) => {
+                        let current = credential_pgsql_sync_until(
+                            "Token 刷新 CAS 未知提交后读取 PgSQL 权威凭据",
+                            reconciliation_deadline,
+                            store.load_credentials(),
+                        )
+                        .await?
+                        .into_iter()
+                        .find(|credential| credential.id == Some(id));
+                        if let Some(current) = current
+                            && Self::refresh_fields_match(&current, &patch)
+                        {
+                            return Ok(current);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Token 刷新 CAS 结果不确定；首次错误: {}；重试错误: {}",
+                            first_err,
+                            retry_err
+                        ));
+                    }
+                }
+            }
+        };
+        match outcome {
+            CredentialRefreshFieldsCasOutcome::Applied(saved) => Ok(saved),
+            CredentialRefreshFieldsCasOutcome::Conflict {
+                current: Some(current),
+            } if Self::refresh_fields_match(&current, &patch)
+                || (accept_fresh_conflict
+                    && !is_token_expired(&current)
+                    && !is_token_expiring_soon(&current)) =>
+            {
+                tracing::debug!(
+                    credential_id = id,
+                    "Token 已由其他写入刷新，采用 PgSQL 权威凭据"
+                );
+                Ok(current)
+            }
+            CredentialRefreshFieldsCasOutcome::Conflict { current: Some(_) } => {
+                anyhow::bail!("凭据 #{} 刷新上下文已变更，拒绝写入旧刷新结果", id)
+            }
+            CredentialRefreshFieldsCasOutcome::Conflict { current: None } => {
+                anyhow::bail!("凭据 #{} 已删除，拒绝写入刷新结果", id)
+            }
+        }
+    }
+
+    fn apply_runtime_state_if_newer(
+        entry: &mut CredentialEntry,
+        state: &CredentialRuntimeStateRow,
+    ) -> bool {
+        if state.revision <= entry.runtime_revision {
+            return false;
+        }
+        let persisted_reason = state
+            .disabled_reason
+            .as_deref()
+            .and_then(DisabledReason::from_str);
+        let next_reason = persisted_reason
+            .or_else(|| entry.credentials.disabled.then_some(DisabledReason::Manual));
+        let next_disabled = entry.runtime_persistence_degraded || next_reason.is_some();
+        let changed = entry.failure_count != state.failure_count
+            || entry.refresh_failure_count != state.refresh_failure_count
+            || entry.warmup_remaining != state.warmup_remaining
+            || entry.runtime_generation != state.generation
+            || entry.disabled != next_disabled
+            || entry.disabled_reason != next_reason;
+        entry.failure_count = state.failure_count;
+        entry.refresh_failure_count = state.refresh_failure_count;
+        entry.warmup_remaining = state.warmup_remaining;
+        entry.disabled = next_disabled;
+        entry.disabled_reason = next_reason;
+        entry.runtime_generation = state.generation;
+        entry.runtime_revision = state.revision;
+        changed
+    }
+
+    fn recompute_entry_disabled(entry: &mut CredentialEntry) {
+        if entry.credentials.disabled && entry.disabled_reason.is_none() {
+            entry.disabled_reason = Some(DisabledReason::Manual);
+        }
+        entry.disabled = entry.runtime_persistence_degraded
+            || entry.credentials.disabled
+            || entry.disabled_reason.is_some();
     }
 
     /// 非破坏性地将当前凭据快照 upsert 到 PgSQL。
@@ -3187,15 +4285,298 @@ impl MultiTokenManager {
             return Ok(false);
         };
         let store = store.clone();
-        block_on_storage("保存凭据到 PgSQL", async move {
+        let saved = block_on_credential_pgsql("保存凭据到 PgSQL", async move {
             store.save_credentials(&credentials).await
         })?;
+        let saved_by_id: HashMap<u64, KiroCredentials> = saved
+            .into_iter()
+            .filter_map(|credential| credential.id.map(|id| (id, credential)))
+            .collect();
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            let Some(saved) = saved_by_id.get(&entry.id) else {
+                continue;
+            };
+            if saved.storage_revision >= entry.credentials.storage_revision {
+                entry.credentials = saved.clone();
+                Self::recompute_entry_disabled(entry);
+            }
+        }
         tracing::debug!("已保存凭据到 PgSQL");
         Ok(true)
     }
 
-    fn persist_credential_entry(&self, id: u64) -> anyhow::Result<bool> {
-        let credential = {
+    fn persist_credential_update(
+        &self,
+        base: &KiroCredentials,
+        requested: &KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        let id = base
+            .id
+            .filter(|id| requested.id == Some(*id))
+            .ok_or_else(|| anyhow::anyhow!("凭据 CAS 更新缺少一致的 id"))?;
+        let saved = if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let base = base.clone();
+            let requested = requested.clone();
+            block_on_storage("保存凭据到 PgSQL", async move {
+                let deadline = tokio::time::Instant::now() + CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT;
+                let mut candidate = requested.clone();
+                let mut last_error = None;
+                for attempt in 1..=4 {
+                    match credential_pgsql_sync_until(
+                        "保存凭据到 PgSQL",
+                        deadline,
+                        store.upsert_credential(&candidate),
+                    )
+                    .await
+                    {
+                        Ok(CredentialUpsertCasOutcome::Applied(saved)) => return Ok(saved),
+                        Ok(CredentialUpsertCasOutcome::Conflict { current }) => {
+                            if Self::credential_update_is_applied(&base, &requested, &current)? {
+                                return Ok(current);
+                            }
+                            candidate = Self::merge_credential_update(&base, &requested, &current)?;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                credential_id = id,
+                                attempt,
+                                "凭据 CAS 写入结果不确定，读取 PgSQL 权威值后重试: {}",
+                                err
+                            );
+                            last_error = Some(err);
+                            let current = credential_pgsql_sync_until(
+                                "凭据 CAS 未知提交后读取 PgSQL 权威值",
+                                deadline,
+                                store.load_credentials(),
+                            )
+                            .await?
+                            .into_iter()
+                            .find(|credential| credential.id == Some(id))
+                            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
+                            if Self::credential_update_is_applied(&base, &requested, &current)? {
+                                return Ok(current);
+                            }
+                            candidate = Self::merge_credential_update(&base, &requested, &current)?;
+                        }
+                    }
+                }
+                if let Some(err) = last_error {
+                    anyhow::bail!("凭据 #{} CAS 在总期限内未确认: {}", id, err);
+                }
+                anyhow::bail!("凭据 #{} CAS 冲突重试耗尽或超过总期限", id)
+            })?
+        } else {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let current = Self::credential_from_entry(entry);
+            let saved = Self::merge_credential_update(base, requested, &current)?;
+            entry.credentials = saved.clone();
+            Self::recompute_entry_disabled(entry);
+            return Ok(saved);
+        };
+
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id)
+            && saved.storage_revision >= entry.credentials.storage_revision
+        {
+            entry.credentials = saved.clone();
+            Self::recompute_entry_disabled(entry);
+        }
+        Ok(saved)
+    }
+
+    fn persist_credential_update_with_runtime_patch(
+        &self,
+        base: &KiroCredentials,
+        requested: &KiroCredentials,
+        mut patch: CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<KiroCredentials> {
+        let id = base
+            .id
+            .filter(|id| requested.id == Some(*id))
+            .ok_or_else(|| anyhow::anyhow!("凭据 CAS 更新缺少一致的 id"))?;
+        let current_generation = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.runtime_generation)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        patch.expected_generation.get_or_insert(current_generation);
+        let Some(store) = &self.postgres_store else {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let current = Self::credential_from_entry(entry);
+            let mut saved = Self::merge_credential_update(base, requested, &current)?;
+            if let Some(value) = patch.failure_count {
+                entry.failure_count = value;
+            }
+            if let Some(value) = patch.refresh_failure_count {
+                entry.refresh_failure_count = value;
+            }
+            if let Some(value) = patch.warmup_remaining {
+                entry.warmup_remaining = value;
+            }
+            match &patch.disabled_reason {
+                CredentialRuntimeDisabledReasonPatch::Preserve => {}
+                CredentialRuntimeDisabledReasonPatch::Set(reason) => {
+                    entry.disabled_reason = DisabledReason::from_str(reason);
+                }
+                CredentialRuntimeDisabledReasonPatch::Clear => entry.disabled_reason = None,
+            }
+            if let Some(disabled) = patch.credential_disabled {
+                saved.disabled = disabled;
+            }
+            if let Some(last_used_at) = patch.last_used_at {
+                let replace = entry
+                    .last_used_at
+                    .as_ref()
+                    .is_none_or(|existing| rfc3339_is_after(&last_used_at, existing));
+                if replace {
+                    entry.last_used_at = Some(last_used_at);
+                }
+            }
+            if patch.advance_generation {
+                entry.runtime_generation = entry
+                    .runtime_generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("凭据运行态 generation 已溢出"))?;
+            }
+            entry.credentials = saved.clone();
+            Self::recompute_entry_disabled(entry);
+            return Ok(saved);
+        };
+        if self.has_pending_runtime_mutations(id)
+            || self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.runtime_persistence_degraded)
+        {
+            anyhow::bail!("凭据 #{} 运行态持久化正在恢复，请稍后重试", id);
+        }
+
+        let store = store.clone();
+        let base = base.clone();
+        let requested = requested.clone();
+        let operation_id = uuid::Uuid::new_v4();
+        let patch_for_store = patch.clone();
+        let (saved, runtime) = block_on_storage("原子更新凭据及运行态", async move {
+            let deadline = tokio::time::Instant::now() + CREDENTIAL_PGSQL_SYNC_TIMEOUT;
+            let mut candidate = requested.clone();
+            let mut last_error = None;
+            for attempt in 1..=2 {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let attempt_timeout = remaining / 2;
+                let outcome = credential_pgsql_sync_with_timeout(
+                    "原子更新凭据及运行态",
+                    attempt_timeout,
+                    store.update_credential_with_runtime_patch_cas(
+                        &candidate,
+                        operation_id,
+                        &patch_for_store,
+                    ),
+                )
+                .await;
+                match outcome {
+                    Ok(CredentialWithRuntimePatchCasOutcome::Applied {
+                        credential,
+                        runtime,
+                    }) => return Ok((credential, runtime)),
+                    Ok(CredentialWithRuntimePatchCasOutcome::Conflict { current }) => {
+                        tracing::debug!(
+                            credential_id = id,
+                            current_revision = current.storage_revision,
+                            "原子凭据 CAS 冲突，一致读取凭据及运行态后协调"
+                        );
+                    }
+                    Err(err) => {
+                        last_error = Some(err);
+                    }
+                }
+
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let read_timeout = if attempt == 1 {
+                    remaining / 2
+                } else {
+                    remaining
+                };
+                let (credentials, runtime_states) = credential_pgsql_sync_with_timeout(
+                    "原子凭据 CAS 后一致读取权威值",
+                    read_timeout,
+                    store.load_credentials_with_runtime_state(),
+                )
+                .await?;
+                let current = credentials
+                    .into_iter()
+                    .find(|credential| credential.id == Some(id))
+                    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
+                let runtime = runtime_states.get(&id);
+                if Self::credential_runtime_patch_is_applied(
+                    &base,
+                    &requested,
+                    &current,
+                    runtime,
+                    &patch_for_store,
+                )? {
+                    return Ok((
+                        current.clone(),
+                        CredentialRuntimeStateMutationResult {
+                            state: runtime
+                                .cloned()
+                                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 缺少运行态", id))?,
+                            credential_disabled: current.disabled,
+                            applied: true,
+                        },
+                    ));
+                }
+                if attempt == 2 {
+                    break;
+                }
+                candidate = Self::merge_credential_update(&base, &requested, &current)?;
+            }
+            if let Some(err) = last_error {
+                anyhow::bail!("凭据 #{} 原子 CAS 在总期限内未确认: {}", id, err);
+            }
+            anyhow::bail!("凭据 #{} 原子 CAS 超过总期限", id)
+        })?;
+
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id)
+            && saved.storage_revision >= entry.credentials.storage_revision
+        {
+            entry.credentials = saved.clone();
+            entry.credentials.disabled = runtime.credential_disabled;
+            if runtime.state.revision > entry.runtime_revision {
+                Self::apply_runtime_state_if_newer(entry, &runtime.state);
+            } else {
+                Self::recompute_entry_disabled(entry);
+            }
+        }
+        Ok(saved)
+    }
+
+    fn persist_credential_mutation(
+        &self,
+        id: u64,
+        mutate: impl FnOnce(&mut KiroCredentials) -> anyhow::Result<()>,
+    ) -> anyhow::Result<KiroCredentials> {
+        let base = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3203,53 +4584,11 @@ impl MultiTokenManager {
                 .map(Self::credential_from_entry)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
-        self.persist_credential_value(&credential)
-    }
-
-    fn persist_credential_entry_best_effort(&self, id: u64, operation: &'static str) -> bool {
-        let Some(store) = &self.postgres_store else {
-            return false;
-        };
-        let credential = {
-            let entries = self.entries.lock();
-            let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
-                return false;
-            };
-            Self::credential_from_entry(entry)
-        };
-        let store = store.clone();
-        let entries = self.entries.clone();
-        spawn_best_effort_storage_task(operation, async move {
-            let saved = store.upsert_credential(&credential).await?;
-            if let Some(saved_id) = saved.id {
-                let mut entries = entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == saved_id) {
-                    entry.credentials.created_at = saved.created_at;
-                    entry.credentials.updated_at = saved.updated_at;
-                }
-            }
-            Ok(())
-        });
-        true
-    }
-
-    fn persist_credential_value(&self, credential: &KiroCredentials) -> anyhow::Result<bool> {
-        let Some(store) = &self.postgres_store else {
-            return Ok(false);
-        };
-        let store = store.clone();
-        let credential = credential.clone();
-        let saved = block_on_storage("保存凭据到 PgSQL", async move {
-            store.upsert_credential(&credential).await
-        })?;
-        if let Some(id) = saved.id {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                entry.credentials.created_at = saved.created_at;
-                entry.credentials.updated_at = saved.updated_at;
-            }
-        }
-        Ok(true)
+        let mut requested = base.clone();
+        mutate(&mut requested)?;
+        requested.canonicalize_auth_method();
+        requested.normalize_supported_models();
+        self.persist_credential_update(&base, &requested)
     }
 
     pub fn reload_credentials_from_postgres(&self) -> anyhow::Result<bool> {
@@ -3258,9 +4597,15 @@ impl MultiTokenManager {
         };
         let proxy_changed = self.reload_proxy_resources_from_postgres()?;
         let store = store.clone();
-        let credentials = block_on_storage("从 PgSQL 重新加载凭据", async move {
-            store.load_credentials().await
-        })?;
+        let (credentials, runtime_states) =
+            block_on_storage("从 PgSQL 一致性重新加载凭据和运行态", async move {
+                credential_pgsql_sync_with_timeout(
+                    "从 PgSQL 一致性重新加载凭据和运行态",
+                    CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                    store.load_credentials_with_runtime_state(),
+                )
+                .await
+            })?;
         let by_id: HashMap<u64, KiroCredentials> = credentials
             .into_iter()
             .filter_map(|credential| credential.id.map(|id| (id, credential)))
@@ -3268,6 +4613,11 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let mut changed = false;
         let non_deleted_ids: HashSet<u64> = by_id.keys().copied().collect();
+        let removed_ids: Vec<u64> = entries
+            .iter()
+            .filter(|entry| !non_deleted_ids.contains(&entry.id))
+            .map(|entry| entry.id)
+            .collect();
         let before_len = entries.len();
         entries.retain(|entry| non_deleted_ids.contains(&entry.id));
         if entries.len() != before_len {
@@ -3285,12 +4635,33 @@ impl MultiTokenManager {
                 {
                     changed = true;
                 }
-                entry.disabled = credential.disabled;
-                entry.disabled_reason = if credential.disabled {
-                    Some(DisabledReason::Manual)
+                if entry.runtime_persistence_degraded {
+                    credential.disabled = entry.credentials.disabled;
                 } else {
-                    entry.disabled_reason
-                };
+                    let previous_disabled = entry.disabled;
+                    let previous_reason = entry.disabled_reason;
+                    entry.credentials = credential.clone();
+                    if let Some(state) = runtime_states.get(&entry.id) {
+                        if state.revision > entry.runtime_revision {
+                            changed |= Self::apply_runtime_state_if_newer(entry, state);
+                        } else if state.revision == entry.runtime_revision {
+                            if entry.disabled_reason == Some(DisabledReason::Manual)
+                                && !credential.disabled
+                            {
+                                entry.disabled_reason = None;
+                            } else if entry.disabled_reason.is_none() && credential.disabled {
+                                entry.disabled_reason = Some(DisabledReason::Manual);
+                            }
+                            Self::recompute_entry_disabled(entry);
+                        }
+                    } else if entry.runtime_revision == 0 {
+                        entry.disabled_reason =
+                            credential.disabled.then_some(DisabledReason::Manual);
+                        Self::recompute_entry_disabled(entry);
+                    }
+                    changed |= entry.disabled != previous_disabled
+                        || entry.disabled_reason != previous_reason;
+                }
                 entry.credentials = credential;
             }
         }
@@ -3300,7 +4671,7 @@ impl MultiTokenManager {
             }
             credential.canonicalize_auth_method();
             credential.normalize_supported_models();
-            entries.push(CredentialEntry {
+            let mut entry = CredentialEntry {
                 id,
                 disabled: credential.disabled,
                 disabled_reason: if credential.disabled {
@@ -3311,6 +4682,9 @@ impl MultiTokenManager {
                 credentials: credential,
                 failure_count: 0,
                 refresh_failure_count: 0,
+                runtime_revision: 0,
+                runtime_generation: 0,
+                runtime_persistence_degraded: false,
                 success_count: 0,
                 total_selection_count: 0,
                 last_used_at: None,
@@ -3324,22 +4698,28 @@ impl MultiTokenManager {
                 health: SchedulerHealthState::default(),
                 model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
-            });
+            };
+            if let Some(state) = runtime_states.get(&id) {
+                Self::apply_runtime_state_if_newer(&mut entry, state);
+            }
+            entries.push(entry);
             changed = true;
         }
         if changed {
             entries.sort_by_key(|entry| (entry.credentials.priority, entry.id));
         }
         drop(entries);
-        let runtime_changed = self.load_runtime_state();
+        for id in removed_ids {
+            self.clear_pending_persistence_for_credential(id);
+        }
         if changed {
             self.load_stats();
         }
-        if changed || runtime_changed {
+        if changed {
             self.select_highest_priority();
             self.invalidate_local_pool_route_state_cache();
         }
-        Ok(changed || runtime_changed || proxy_changed)
+        Ok(changed || proxy_changed)
     }
 
     pub fn reload_proxy_resources_from_postgres(&self) -> anyhow::Result<bool> {
@@ -3347,7 +4727,7 @@ impl MultiTokenManager {
             return Ok(false);
         };
         let store = store.clone();
-        let resources = block_on_storage("从 PgSQL 重新加载代理资源", async move {
+        let resources = block_on_credential_pgsql("从 PgSQL 重新加载代理资源", async move {
             store.load_proxy_resources().await
         })?;
         let next: HashMap<u64, ProxyResourceRuntime> = resources
@@ -3411,7 +4791,12 @@ impl MultiTokenManager {
         };
         let store = store.clone();
         let stats = match block_on_storage("从 PgSQL 加载凭据统计", async move {
-            store.load_credential_stats().await
+            credential_pgsql_sync_with_timeout(
+                "从 PgSQL 加载凭据统计",
+                CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                store.load_credential_stats(),
+            )
+            .await
         }) {
             Ok(stats) => stats,
             Err(e) => {
@@ -3425,11 +4810,18 @@ impl MultiTokenManager {
             if let Some(s) = stats.get(&entry.id) {
                 entry.success_count = entry.success_count.max(s.success_count);
                 entry.total_selection_count = entry.total_selection_count.max(s.selection_count);
-                entry.last_used_at = s.last_used_at.clone();
+                if let Some(last_used_at) = s.last_used_at.as_ref() {
+                    let replace = entry
+                        .last_used_at
+                        .as_ref()
+                        .is_none_or(|existing| rfc3339_is_after(last_used_at, existing));
+                    if replace {
+                        entry.last_used_at = Some(last_used_at.clone());
+                    }
+                }
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
-        self.stats_dirty.store(false, Ordering::Relaxed);
         if log_info {
             tracing::info!("已从 PgSQL 加载 {} 条凭据统计", stats.len());
         } else {
@@ -3439,116 +4831,552 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到 PgSQL
     fn save_stats(&self) {
-        let Some(store) = &self.postgres_store else {
-            return;
-        };
-        let deltas: HashMap<u64, CredentialStatsDeltaRow> = {
-            let mut pending = self.pending_stats_deltas.lock();
-            std::mem::take(&mut *pending)
-        };
-        let runtime_snapshots: HashMap<u64, CredentialRuntimeStateSnapshot> = {
-            let mut pending = self.pending_runtime_state_snapshots.lock();
-            std::mem::take(&mut *pending)
-        };
-        if deltas.is_empty() && runtime_snapshots.is_empty() {
-            self.stats_dirty.store(false, Ordering::Release);
+        if self.postgres_store.is_none() {
             return;
         }
-
-        if !deltas.is_empty() {
-            let store = store.clone();
-            let deltas_to_write = deltas.clone();
-            if let Err(e) = block_on_storage("保存凭据统计增量到 PgSQL", async move {
-                store.apply_credential_stats_deltas(&deltas_to_write).await
-            }) {
-                tracing::warn!("{}", e);
-                self.requeue_stats_deltas(deltas);
-                self.requeue_runtime_state_snapshots(runtime_snapshots);
-                self.stats_dirty.store(true, Ordering::Release);
-                return;
-            }
-        }
-
-        if !runtime_snapshots.is_empty() {
-            let store = store.clone();
-            let runtime_snapshots_to_write = runtime_snapshots.clone();
-            if let Err(e) = block_on_storage("保存凭据运行态快照到 PgSQL", async move {
-                store
-                    .apply_credential_runtime_state_snapshots(&runtime_snapshots_to_write)
-                    .await
-            }) {
-                tracing::warn!("{}", e);
-                self.requeue_runtime_state_snapshots(runtime_snapshots);
-                self.stats_dirty.store(true, Ordering::Release);
-                return;
-            }
-        }
-
-        if self.pending_stats_deltas.lock().is_empty()
-            && self.pending_runtime_state_snapshots.lock().is_empty()
-        {
+        self.flush_pending_runtime_mutations();
+        let deadline = Instant::now()
+            .checked_add(CREDENTIAL_PGSQL_SYNC_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        let _ = self.flush_one_pending_stats_batch_until(deadline);
+        if self.refresh_stats_dirty_from_pending() {
             *self.last_stats_save_at.lock() = Some(Instant::now());
-            self.stats_dirty.store(false, Ordering::Release);
-        } else {
-            self.stats_dirty.store(true, Ordering::Release);
         }
     }
 
-    fn requeue_stats_deltas(&self, deltas: HashMap<u64, CredentialStatsDeltaRow>) {
-        if deltas.is_empty() {
-            return;
-        }
-        let mut pending = self.pending_stats_deltas.lock();
-        for (id, delta) in deltas {
-            let entry = pending.entry(id).or_default();
-            entry.success_delta = entry.success_delta.saturating_add(delta.success_delta);
-            entry.selection_delta = entry.selection_delta.saturating_add(delta.selection_delta);
-            if let Some(last_used_at) = delta.last_used_at {
-                let replace = entry
-                    .last_used_at
-                    .as_ref()
-                    .is_none_or(|existing| &last_used_at > existing);
-                if replace {
-                    entry.last_used_at = Some(last_used_at);
-                }
+    fn flush_one_pending_stats_batch_until(&self, deadline: Instant) -> StatsBatchFlushOutcome {
+        let Some(store) = &self.postgres_store else {
+            return StatsBatchFlushOutcome::NoWork;
+        };
+        let stats_batch = {
+            let mut deltas = self.pending_stats_deltas.lock();
+            let mut batches = self.pending_stats_batches.lock();
+            if batches.is_empty() && !deltas.is_empty() {
+                batches.push_back(PendingCredentialStatsBatch {
+                    operation_id: uuid::Uuid::new_v4(),
+                    deltas: std::mem::take(&mut *deltas),
+                });
             }
+            batches.front().cloned()
+        };
+        let Some(batch) = stats_batch else {
+            return StatsBatchFlushOutcome::NoWork;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.mark_stats_dirty();
+            return StatsBatchFlushOutcome::Failed;
         }
+
+        let store = store.clone();
+        let batch_to_write = batch.clone();
+        if let Err(e) = block_on_storage("保存凭据统计增量到 PgSQL", async move {
+            credential_pgsql_sync_with_timeout(
+                "保存凭据统计增量到 PgSQL",
+                remaining.min(CREDENTIAL_PGSQL_SYNC_TIMEOUT),
+                store.apply_credential_stats_deltas(
+                    batch_to_write.operation_id,
+                    &batch_to_write.deltas,
+                ),
+            )
+            .await
+        }) {
+            tracing::warn!("{}", e);
+            self.mark_stats_dirty();
+            return StatsBatchFlushOutcome::Failed;
+        }
+        let mut batches = self.pending_stats_batches.lock();
+        if batches
+            .front()
+            .is_some_and(|pending| pending.operation_id == batch.operation_id)
+        {
+            batches.pop_front();
+        }
+        StatsBatchFlushOutcome::Persisted
     }
 
-    fn requeue_runtime_state_snapshots(
+    fn drain_stats_until_with_runtime_limit(
         &self,
-        snapshots: HashMap<u64, CredentialRuntimeStateSnapshot>,
-    ) {
-        if snapshots.is_empty() {
-            return;
-        }
-        let mut pending = self.pending_runtime_state_snapshots.lock();
-        for (id, snapshot) in snapshots {
-            match pending.get_mut(&id) {
-                Some(existing) if existing.updated_at > snapshot.updated_at => {}
-                Some(existing) => *existing = snapshot,
-                None => {
-                    pending.insert(id, snapshot);
-                }
+        deadline: Instant,
+        runtime_attempt_limit: usize,
+    ) -> bool {
+        let mut failed_runtime_ids = HashSet::new();
+        let mut stats_batch_failed = false;
+        loop {
+            let before = self.pending_persistence_backlog();
+            if before.is_empty() {
+                self.stats_dirty.store(false, Ordering::Release);
+                return true;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            let stats_outcome = if stats_batch_failed {
+                StatsBatchFlushOutcome::NoWork
+            } else {
+                let outcome = self.flush_one_pending_stats_batch_until(deadline);
+                stats_batch_failed = outcome == StatsBatchFlushOutcome::Failed;
+                outcome
+            };
+            let runtime_progress = self.flush_pending_runtime_mutations_until(
+                deadline,
+                runtime_attempt_limit,
+                &mut failed_runtime_ids,
+            );
+            let after = self.pending_persistence_backlog();
+            if after.is_empty() {
+                self.stats_dirty.store(false, Ordering::Release);
+                *self.last_stats_save_at.lock() = Some(Instant::now());
+                return true;
+            }
+
+            let made_progress = runtime_progress
+                || stats_outcome == StatsBatchFlushOutcome::Persisted
+                || after != before;
+            if !made_progress {
+                break;
             }
         }
+
+        self.refresh_stats_dirty_from_pending()
     }
 
     fn mark_stats_dirty(&self) {
         self.stats_dirty.store(true, Ordering::Release);
     }
 
-    pub fn spawn_stats_flush_worker(self: &Arc<Self>) {
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(CREDENTIAL_STATS_FLUSH_MIN_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                let _ = manager.cleanup_expired_in_flight_leases_throttled();
-                manager.save_stats();
+    fn refresh_stats_dirty_from_pending(&self) -> bool {
+        let stats = self.pending_stats_deltas.lock();
+        let batches = self.pending_stats_batches.lock();
+        let mutations = self.pending_runtime_mutations.lock();
+        let empty = stats.is_empty() && batches.is_empty() && mutations.is_empty();
+        self.stats_dirty.store(!empty, Ordering::Release);
+        empty
+    }
+
+    fn clear_pending_persistence_for_credential(&self, id: u64) {
+        let mut stats = self.pending_stats_deltas.lock();
+        let batches = self.pending_stats_batches.lock();
+        let mut mutations = self.pending_runtime_mutations.lock();
+        stats.remove(&id);
+        mutations.remove(&id);
+
+        if stats.is_empty() && batches.is_empty() && mutations.is_empty() {
+            self.stats_dirty.store(false, Ordering::Release);
+        }
+    }
+
+    fn pending_persistence_backlog(&self) -> PendingPersistenceBacklog {
+        let stats = self.pending_stats_deltas.lock();
+        let batches = self.pending_stats_batches.lock();
+        let mutations = self.pending_runtime_mutations.lock();
+        PendingPersistenceBacklog {
+            stats_batches: batches.len(),
+            stats_deltas: stats.len(),
+            runtime_mutations: mutations.values().map(VecDeque::len).sum(),
+        }
+    }
+
+    fn runtime_mutation_backlog(&self) -> (usize, u64) {
+        let pending = self
+            .pending_runtime_mutations
+            .lock()
+            .values()
+            .map(VecDeque::len)
+            .sum();
+        (
+            pending,
+            self.overflow_runtime_mutations.load(Ordering::Acquire),
+        )
+    }
+
+    fn has_pending_runtime_mutations(&self, id: u64) -> bool {
+        self.pending_runtime_mutations
+            .lock()
+            .get(&id)
+            .is_some_and(|queue| !queue.is_empty())
+    }
+
+    fn enqueue_pending_runtime_mutation(
+        &self,
+        id: u64,
+        mutation: PendingCredentialRuntimeMutation,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry_index) = entries.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let operation_id = mutation.operation_id();
+        let over_soft_budget = {
+            let mut pending = self.pending_runtime_mutations.lock();
+            if pending.values().any(|queue| {
+                queue
+                    .iter()
+                    .any(|queued| queued.operation_id() == operation_id)
+            }) {
+                false
+            } else {
+                let total = pending.values().map(VecDeque::len).sum::<usize>();
+                let queue = pending.entry(id).or_default();
+                let over_soft_budget = total >= SOFT_PENDING_RUNTIME_MUTATIONS_TOTAL
+                    || queue.len() >= SOFT_PENDING_RUNTIME_MUTATIONS_PER_CREDENTIAL;
+                queue.push_back(mutation);
+                over_soft_budget
             }
+        };
+        if over_soft_budget {
+            let overflow = self
+                .overflow_runtime_mutations
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            tracing::warn!(
+                credential_id = id,
+                %operation_id,
+                overflow,
+                "PgSQL 凭据运行态 FIFO 超过软预算；为避免丢失已在途结果仍保留 mutation，新请求继续隔离"
+            );
+        }
+        entries[entry_index].runtime_persistence_degraded = true;
+        entries[entry_index].disabled = true;
+        drop(entries);
+        self.mark_stats_dirty();
+        self.invalidate_local_pool_route_state_cache();
+        true
+    }
+
+    async fn persist_pending_runtime_mutation(
+        store: Arc<PostgresStore>,
+        id: u64,
+        mutation: PendingCredentialRuntimeMutation,
+    ) -> anyhow::Result<PersistedCredentialRuntimeMutation> {
+        match mutation {
+            PendingCredentialRuntimeMutation::Success {
+                operation_id,
+                expected_generation,
+            } => store
+                .record_credential_success_at_generation(id, operation_id, expected_generation)
+                .await
+                .map(|result| PersistedCredentialRuntimeMutation {
+                    state: result.state,
+                    credential_disabled: Some(result.credential_disabled),
+                    applied: result.applied,
+                }),
+            PendingCredentialRuntimeMutation::ApiFailure {
+                operation_id,
+                expected_generation,
+                last_used_at,
+            } => store
+                .record_credential_api_failure_at_generation(
+                    id,
+                    operation_id,
+                    expected_generation,
+                    &last_used_at,
+                    MAX_FAILURES_PER_CREDENTIAL,
+                )
+                .await
+                .map(|result| PersistedCredentialRuntimeMutation {
+                    state: result.state,
+                    credential_disabled: Some(result.credential_disabled),
+                    applied: result.applied,
+                }),
+            PendingCredentialRuntimeMutation::RefreshFailure {
+                operation_id,
+                expected_generation,
+                last_used_at,
+            } => store
+                .record_credential_refresh_failure_at_generation(
+                    id,
+                    operation_id,
+                    expected_generation,
+                    &last_used_at,
+                    MAX_FAILURES_PER_CREDENTIAL,
+                )
+                .await
+                .map(|result| PersistedCredentialRuntimeMutation {
+                    state: result.state,
+                    credential_disabled: Some(result.credential_disabled),
+                    applied: result.applied,
+                }),
+            PendingCredentialRuntimeMutation::Disable {
+                operation_id,
+                expected_generation,
+                reason,
+                failure_count,
+                refresh_failure_count,
+                last_used_at,
+            } => store
+                .mark_credential_disabled_at_generation(
+                    id,
+                    operation_id,
+                    expected_generation,
+                    &reason,
+                    CredentialRuntimeFailureCounts {
+                        failure_count,
+                        refresh_failure_count,
+                    },
+                    &last_used_at,
+                )
+                .await
+                .map(|result| PersistedCredentialRuntimeMutation {
+                    state: result.state,
+                    credential_disabled: Some(result.credential_disabled),
+                    applied: result.applied,
+                }),
+            PendingCredentialRuntimeMutation::Patch {
+                operation_id,
+                patch,
+            } => store
+                .patch_credential_runtime_state(id, operation_id, &patch)
+                .await
+                .map(|result| PersistedCredentialRuntimeMutation {
+                    state: result.state,
+                    credential_disabled: Some(result.credential_disabled),
+                    applied: result.applied,
+                }),
+        }
+    }
+
+    fn flush_pending_runtime_mutations(&self) {
+        self.flush_pending_runtime_mutations_with_budget(RUNTIME_MUTATION_FLUSH_BUDGET);
+    }
+
+    fn flush_pending_runtime_mutations_with_budget(&self, budget: StdDuration) {
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(Instant::now);
+        let mut failed_ids = HashSet::new();
+        self.flush_pending_runtime_mutations_until(
+            deadline,
+            RUNTIME_MUTATION_FLUSH_LIMIT,
+            &mut failed_ids,
+        );
+    }
+
+    fn flush_pending_runtime_mutations_until(
+        &self,
+        deadline: Instant,
+        attempt_limit: usize,
+        failed_ids: &mut HashSet<u64>,
+    ) -> bool {
+        let Some(store) = &self.postgres_store else {
+            return false;
+        };
+        let mut attempted = 0;
+        let mut recovered_any = false;
+        let mut persisted_any = false;
+        while attempted < attempt_limit {
+            let mut ids: Vec<u64> = self
+                .pending_runtime_mutations
+                .lock()
+                .keys()
+                .filter(|&&id| !failed_ids.contains(&id))
+                .copied()
+                .collect();
+            if ids.is_empty() {
+                break;
+            }
+            ids.sort_unstable();
+            let cursor = self.runtime_mutation_flush_cursor.load(Ordering::Acquire);
+            if let Some(split) = ids.iter().position(|id| *id > cursor) {
+                ids.rotate_left(split);
+            }
+
+            let mut round_succeeded = false;
+            for id in ids {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if attempted >= attempt_limit || remaining.is_zero() {
+                    break;
+                }
+                self.runtime_mutation_flush_cursor
+                    .store(id, Ordering::Release);
+                let mutation = {
+                    let pending = self.pending_runtime_mutations.lock();
+                    pending.get(&id).and_then(|queue| queue.front()).cloned()
+                };
+                let Some(mutation) = mutation else {
+                    continue;
+                };
+                attempted += 1;
+                let operation_id = mutation.operation_id();
+                let store = store.clone();
+                let result = block_on_storage("重放 PgSQL 凭据运行态 mutation", async move {
+                    credential_pgsql_sync_with_timeout(
+                        "重放 PgSQL 凭据运行态 mutation",
+                        remaining.min(CREDENTIAL_PGSQL_SYNC_TIMEOUT),
+                        Self::persist_pending_runtime_mutation(store, id, mutation),
+                    )
+                    .await
+                });
+                let persisted = match result {
+                    Ok(persisted) => persisted,
+                    Err(err) => {
+                        tracing::warn!(
+                            credential_id = id,
+                            %operation_id,
+                            "PgSQL 凭据运行态 mutation 重放失败，保留 FIFO 等待下次重试: {}",
+                            err
+                        );
+                        failed_ids.insert(id);
+                        self.mark_stats_dirty();
+                        continue;
+                    }
+                };
+                if !persisted.applied {
+                    tracing::info!(
+                        credential_id = id,
+                        %operation_id,
+                        authoritative_generation = persisted.state.generation,
+                        "已丢弃 reset 前创建的过期 PgSQL 凭据运行态 mutation"
+                    );
+                }
+                round_succeeded = true;
+                persisted_any = true;
+                let queue_empty = {
+                    let mut pending = self.pending_runtime_mutations.lock();
+                    let mut queue_empty = false;
+                    if let Some(queue) = pending.get_mut(&id) {
+                        if queue
+                            .front()
+                            .is_some_and(|queued| queued.operation_id() == operation_id)
+                        {
+                            queue.pop_front();
+                        }
+                        queue_empty = queue.is_empty();
+                    }
+                    if queue_empty {
+                        pending.remove(&id);
+                    }
+                    queue_empty
+                };
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                        entry.runtime_persistence_degraded = !queue_empty;
+                        Self::apply_persisted_runtime_mutation_to_entry(entry, &persisted);
+                        if entry.runtime_persistence_degraded {
+                            entry.disabled = true;
+                        } else {
+                            Self::recompute_entry_disabled(entry);
+                        }
+                    }
+                }
+                recovered_any |= queue_empty;
+            }
+            if !round_succeeded {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        if recovered_any {
+            self.select_highest_priority();
+            self.invalidate_local_pool_route_state_cache();
+            self.notify_dispatch_state_changed();
+            self.publish_credentials_changed("credential_runtime_persistence_recovered");
+        }
+        if !self.pending_runtime_mutations.lock().is_empty() {
+            self.mark_stats_dirty();
+        }
+        persisted_any
+    }
+
+    fn cleanup_runtime_mutation_history_throttled(&self) {
+        let Some(store) = &self.postgres_store else {
+            return;
+        };
+        let now = Instant::now();
+        {
+            let mut last_cleanup_at = self.last_runtime_mutation_cleanup_at.lock();
+            if last_cleanup_at.is_some_and(|last| {
+                now.saturating_duration_since(last) < CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL
+            }) {
+                return;
+            }
+            *last_cleanup_at = Some(now);
+        }
+
+        let store = store.clone();
+        match block_on_storage("清理 PgSQL 凭据运行态 mutation 幂等记录", async move {
+            cleanup_runtime_mutation_history_batches(
+                store,
+                CREDENTIAL_RUNTIME_MUTATION_RETENTION,
+                CREDENTIAL_RUNTIME_MUTATION_CLEANUP_LIMIT,
+                CREDENTIAL_RUNTIME_MUTATION_CLEANUP_MAX_BATCHES,
+                CREDENTIAL_RUNTIME_MUTATION_CLEANUP_BUDGET,
+            )
+            .await
+        }) {
+            Ok(report) => {
+                if report.removed > 0 {
+                    tracing::info!(
+                        removed = report.removed,
+                        batches = report.batches,
+                        "已清理过期的 PgSQL 凭据运行态 mutation 幂等记录"
+                    );
+                }
+                if report.saturated {
+                    tracing::warn!(
+                        removed = report.removed,
+                        batches = report.batches,
+                        "PgSQL 凭据运行态 mutation 清理达到单次预算或批次上限"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!("清理 PgSQL 凭据运行态 mutation 幂等记录失败: {}", err);
+            }
+        }
+    }
+
+    pub fn spawn_stats_flush_worker(self: &Arc<Self>) -> StatsFlushWorkerHandle {
+        self.spawn_stats_flush_worker_inner(
+            tokio::time::Instant::now(),
+            RUNTIME_MUTATION_FLUSH_LIMIT,
+        )
+    }
+
+    fn spawn_stats_flush_worker_inner(
+        self: &Arc<Self>,
+        first_tick: tokio::time::Instant,
+        final_runtime_attempt_limit: usize,
+    ) -> StatsFlushWorkerHandle {
+        let (shutdown, mut shutdown_requested) = oneshot::channel();
+        let manager = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval_at(first_tick, CREDENTIAL_STATS_FLUSH_MIN_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let shutdown_deadline = loop {
+                tokio::select! {
+                    request = &mut shutdown_requested => {
+                        break request.unwrap_or_else(|_| {
+                            Instant::now()
+                                .checked_add(
+                                    RUNTIME_MUTATION_FLUSH_BUDGET
+                                        .saturating_add(CREDENTIAL_PGSQL_SYNC_TIMEOUT),
+                                )
+                                .unwrap_or_else(Instant::now)
+                        });
+                    }
+                    _ = interval.tick() => {
+                        let _ = manager.cleanup_expired_in_flight_leases_throttled();
+                        manager.save_stats();
+                        manager.cleanup_runtime_mutation_history_throttled();
+                    }
+                }
+            };
+            manager.drain_stats_until_with_runtime_limit(
+                shutdown_deadline,
+                final_runtime_attempt_limit,
+            )
         });
+        StatsFlushWorkerHandle {
+            shutdown: Some(shutdown),
+            task,
+            manager: Arc::clone(self),
+        }
     }
 
     /// 从 PgSQL 加载凭据运行态（失败计数、禁用原因、预热次数）。
@@ -3558,7 +5386,12 @@ impl MultiTokenManager {
         };
         let store = store.clone();
         let states = match block_on_storage("从 PgSQL 加载凭据运行态", async move {
-            store.load_credential_runtime_state().await
+            credential_pgsql_sync_with_timeout(
+                "从 PgSQL 加载凭据运行态",
+                CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                store.load_credential_runtime_state(),
+            )
+            .await
         }) {
             Ok(states) => states,
             Err(e) => {
@@ -3567,86 +5400,90 @@ impl MultiTokenManager {
             }
         };
 
-        let mut entries = self.entries.lock();
-        let mut changed = false;
-        for entry in entries.iter_mut() {
-            if let Some(state) = states.get(&entry.id) {
-                let next_reason = state
-                    .disabled_reason
-                    .as_deref()
-                    .and_then(DisabledReason::from_str);
-                let next_disabled = entry.credentials.disabled || next_reason.is_some();
-                let next_disabled_reason = if !next_disabled {
-                    None
-                } else if let Some(reason) = next_reason {
-                    Some(reason)
-                } else {
-                    Some(DisabledReason::Manual)
-                };
-
-                changed |= entry.failure_count != state.failure_count
-                    || entry.refresh_failure_count != state.refresh_failure_count
-                    || entry.warmup_remaining != state.warmup_remaining
-                    || entry.disabled != next_disabled
-                    || entry.disabled_reason != next_disabled_reason;
-                entry.failure_count = state.failure_count;
-                entry.refresh_failure_count = state.refresh_failure_count;
-                entry.warmup_remaining = state.warmup_remaining;
-                entry.disabled = next_disabled;
-                entry.disabled_reason = next_disabled_reason;
-            }
-        }
+        let changed = self.apply_loaded_runtime_states(&states);
         tracing::info!("已从 PgSQL 加载 {} 条凭据运行态", states.len());
         changed
     }
 
-    fn save_runtime_state_for(&self, id: u64) {
-        let state = {
-            let entries = self.entries.lock();
-            let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
-                return;
-            };
-            Self::runtime_state_from_entry(entry)
-        };
-        if let Err(e) = self.persist_runtime_state_value(id, &state) {
-            tracing::warn!("{}", e);
+    fn apply_loaded_runtime_states(
+        &self,
+        states: &HashMap<u64, CredentialRuntimeStateRow>,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let mut changed = false;
+        for entry in entries.iter_mut() {
+            if entry.runtime_persistence_degraded {
+                continue;
+            }
+            if let Some(state) = states.get(&entry.id) {
+                changed |= Self::apply_runtime_state_if_newer(entry, state);
+            }
         }
+        changed
     }
 
-    fn persist_runtime_state_value(
-        &self,
-        id: u64,
-        state: &CredentialRuntimeStateRow,
-    ) -> anyhow::Result<bool> {
-        let Some(store) = &self.postgres_store else {
-            return Ok(false);
-        };
-        let store = store.clone();
-        let snapshot = CredentialRuntimeStateSnapshot {
-            state: state.clone(),
-            updated_at: Utc::now(),
-        };
-        block_on_storage("保存凭据运行态到 PgSQL", async move {
-            store
-                .save_credential_runtime_state_snapshot(id, &snapshot)
-                .await
-        })?;
-        Ok(true)
-    }
-
-    fn persist_success_state(
-        &self,
-        id: u64,
-        last_used_at: &str,
-        updated_at: chrono::DateTime<Utc>,
-    ) {
-        let runtime_state = {
-            let entries = self.entries.lock();
-            let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
-                return;
-            };
-            Self::runtime_state_from_entry(entry)
-        };
+    fn persist_success_state(&self, id: u64, expected_generation: u64, last_used_at: &str) -> bool {
+        let operation_id = uuid::Uuid::new_v4();
+        let queue_without_attempt = self.postgres_store.is_some()
+            && (self.has_pending_runtime_mutations(id)
+                || self
+                    .entries
+                    .lock()
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .is_some_and(|entry| entry.runtime_persistence_degraded));
+        if queue_without_attempt {
+            self.enqueue_pending_runtime_mutation(
+                id,
+                PendingCredentialRuntimeMutation::Success {
+                    operation_id,
+                    expected_generation,
+                },
+            );
+        }
+        if let Some(store) = &self.postgres_store
+            && !queue_without_attempt
+        {
+            let store = store.clone();
+            match block_on_credential_pgsql("原子记录 PgSQL 凭据调用成功", async move {
+                store
+                    .record_credential_success_at_generation(id, operation_id, expected_generation)
+                    .await
+            }) {
+                Ok(result) => {
+                    let disabled = {
+                        let mut entries = self.entries.lock();
+                        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+                            return false;
+                        };
+                        Self::apply_runtime_mutation_result_to_entry(entry, &result);
+                        entry.disabled
+                    };
+                    let mut pending = self.pending_stats_deltas.lock();
+                    let entry = pending.entry(id).or_default();
+                    entry.success_delta = entry.success_delta.saturating_add(1);
+                    entry.last_used_at = Some(last_used_at.to_string());
+                    drop(pending);
+                    self.mark_stats_dirty();
+                    return disabled;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        credential_id = id,
+                        %operation_id,
+                        "{}；保留相同 operation ID 等待 PgSQL 恢复后重放",
+                        err
+                    );
+                    self.enqueue_pending_runtime_mutation(
+                        id,
+                        PendingCredentialRuntimeMutation::Success {
+                            operation_id,
+                            expected_generation,
+                        },
+                    );
+                }
+            }
+        }
 
         {
             let mut pending = self.pending_stats_deltas.lock();
@@ -3654,63 +5491,272 @@ impl MultiTokenManager {
             entry.success_delta = entry.success_delta.saturating_add(1);
             entry.last_used_at = Some(last_used_at.to_string());
         }
-        {
-            let mut pending = self.pending_runtime_state_snapshots.lock();
-            let snapshot = CredentialRuntimeStateSnapshot {
-                state: runtime_state,
-                updated_at,
-            };
-            match pending.get_mut(&id) {
-                Some(existing) if existing.updated_at > snapshot.updated_at => {}
-                Some(existing) => *existing = snapshot,
-                None => {
-                    pending.insert(id, snapshot);
-                }
-            }
-        }
         self.mark_stats_dirty();
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| entry.disabled)
     }
 
-    fn queue_runtime_state_flush(
+    fn persist_disabled_state(
         &self,
         id: u64,
-        last_used_at: Option<String>,
-        updated_at: chrono::DateTime<Utc>,
+        expected_generation: u64,
+        reason: DisabledReason,
+        failure_count: Option<u32>,
+        refresh_failure_count: Option<u32>,
+        last_used_at: &str,
     ) {
-        let runtime_state = {
-            let entries = self.entries.lock();
-            let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
-                return;
-            };
-            Self::runtime_state_from_entry(entry)
+        let operation_id = uuid::Uuid::new_v4();
+        let mutation = PendingCredentialRuntimeMutation::Disable {
+            operation_id,
+            expected_generation,
+            reason: reason.as_str().to_string(),
+            failure_count,
+            refresh_failure_count,
+            last_used_at: last_used_at.to_string(),
         };
+        let Some(store) = &self.postgres_store else {
+            return;
+        };
+        if self.has_pending_runtime_mutations(id)
+            || self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.runtime_persistence_degraded)
+        {
+            self.enqueue_pending_runtime_mutation(id, mutation);
+            return;
+        }
 
-        if let Some(last_used_at) = last_used_at {
-            let mut pending = self.pending_stats_deltas.lock();
-            let entry = pending.entry(id).or_default();
-            let replace = entry
-                .last_used_at
-                .as_ref()
-                .is_none_or(|existing| &last_used_at > existing);
-            if replace {
-                entry.last_used_at = Some(last_used_at);
+        let store = store.clone();
+        let mutation_to_write = mutation.clone();
+        let result = block_on_storage("原子禁用 PgSQL 凭据运行态", async move {
+            credential_pgsql_sync_with_timeout(
+                "原子禁用 PgSQL 凭据运行态",
+                CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                Self::persist_pending_runtime_mutation(store, id, mutation_to_write),
+            )
+            .await
+        });
+        match result {
+            Ok(persisted) => {
+                let mut entries = self.entries.lock();
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                    Self::apply_persisted_runtime_mutation_to_entry(entry, &persisted);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    credential_id = id,
+                    %operation_id,
+                    "{}；保留相同 operation ID 等待 PgSQL 恢复后重放",
+                    err
+                );
+                self.enqueue_pending_runtime_mutation(id, mutation);
             }
         }
+    }
+
+    fn apply_runtime_mutation_result(
+        &self,
+        id: u64,
+        result: &CredentialRuntimeStateMutationResult,
+    ) {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        Self::apply_runtime_mutation_result_to_entry(entry, result);
+    }
+
+    fn apply_runtime_mutation_result_to_entry(
+        entry: &mut CredentialEntry,
+        result: &CredentialRuntimeStateMutationResult,
+    ) {
+        Self::apply_authoritative_runtime_state_to_entry(
+            entry,
+            &result.state,
+            Some(result.credential_disabled),
+        );
+    }
+
+    fn apply_persisted_runtime_mutation_to_entry(
+        entry: &mut CredentialEntry,
+        persisted: &PersistedCredentialRuntimeMutation,
+    ) {
+        Self::apply_authoritative_runtime_state_to_entry(
+            entry,
+            &persisted.state,
+            persisted.credential_disabled,
+        );
+    }
+
+    fn apply_authoritative_runtime_state_to_entry(
+        entry: &mut CredentialEntry,
+        state: &CredentialRuntimeStateRow,
+        credential_disabled: Option<bool>,
+    ) {
+        if state.revision < entry.runtime_revision {
+            return;
+        }
+        if let Some(disabled) = credential_disabled {
+            entry.credentials.disabled = disabled;
+        }
+        if state.revision > entry.runtime_revision {
+            Self::apply_runtime_state_if_newer(entry, state);
+        } else {
+            Self::recompute_entry_disabled(entry);
+        }
+    }
+
+    fn persist_runtime_patch_value(
+        &self,
+        id: u64,
+        mut patch: CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<bool> {
+        for (field, value) in [
+            ("failure_count", patch.failure_count),
+            ("refresh_failure_count", patch.refresh_failure_count),
+            ("warmup_remaining", patch.warmup_remaining),
+        ] {
+            if value.is_some_and(|value| i32::try_from(value).is_err()) {
+                anyhow::bail!("凭据运行态字段 {} 超出 PgSQL INTEGER 范围", field);
+            }
+        }
+        let Some(store) = &self.postgres_store else {
+            return Ok(false);
+        };
+        if self.has_pending_runtime_mutations(id)
+            || self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.runtime_persistence_degraded)
         {
-            let mut pending = self.pending_runtime_state_snapshots.lock();
-            let snapshot = CredentialRuntimeStateSnapshot {
-                state: runtime_state,
-                updated_at,
-            };
-            match pending.get_mut(&id) {
-                Some(existing) if existing.updated_at > snapshot.updated_at => {}
-                Some(existing) => *existing = snapshot,
-                None => {
-                    pending.insert(id, snapshot);
+            anyhow::bail!("凭据 #{} 运行态持久化正在恢复，请稍后重试", id);
+        }
+        let expected_generation = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.runtime_generation)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        patch.expected_generation.get_or_insert(expected_generation);
+
+        let operation_id = uuid::Uuid::new_v4();
+        let store = store.clone();
+        let result = block_on_storage("原子更新 PgSQL 凭据运行态字段", async move {
+            credential_pgsql_sync_with_timeout(
+                "原子更新 PgSQL 凭据运行态字段",
+                CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                store.patch_credential_runtime_state(id, operation_id, &patch),
+            )
+            .await
+        });
+        match result {
+            Ok(result) => {
+                self.apply_runtime_mutation_result(id, &result);
+                if result.applied {
+                    Ok(true)
+                } else {
+                    anyhow::bail!(
+                        "凭据 #{} 运行态 generation 已由其他实例推进，请重试 Admin 更新",
+                        id
+                    )
+                }
+            }
+            Err(err) => {
+                if let Err(reload_err) = self.reload_credentials_from_postgres() {
+                    tracing::warn!(
+                        credential_id = id,
+                        %operation_id,
+                        "Admin 运行态 patch 失败后重新加载 PgSQL 权威状态也失败: {}",
+                        reload_err
+                    );
+                }
+                Err(anyhow::anyhow!(
+                    "{}；operation {} 未进入后台重放队列",
+                    err,
+                    operation_id
+                ))
+            }
+        }
+    }
+
+    async fn persist_runtime_patch_best_effort_until(
+        &self,
+        id: u64,
+        mut patch: CredentialRuntimeStatePatch,
+        deadline: tokio::time::Instant,
+    ) {
+        let Some(store) = &self.postgres_store else {
+            return;
+        };
+        if [
+            patch.failure_count,
+            patch.refresh_failure_count,
+            patch.warmup_remaining,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| i32::try_from(value).is_err())
+        {
+            tracing::error!(credential_id = id, "拒绝不可持久化的凭据运行态 patch");
+            return;
+        }
+        let Some(expected_generation) = self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.runtime_generation)
+        else {
+            return;
+        };
+        patch.expected_generation.get_or_insert(expected_generation);
+        let operation_id = uuid::Uuid::new_v4();
+        let mutation = PendingCredentialRuntimeMutation::Patch {
+            operation_id,
+            patch: patch.clone(),
+        };
+        if self.has_pending_runtime_mutations(id)
+            || self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.runtime_persistence_degraded)
+        {
+            self.enqueue_pending_runtime_mutation(id, mutation);
+            return;
+        }
+        let store = store.clone();
+        let result = credential_pgsql_sync_until(
+            "原子更新 PgSQL 凭据运行态字段",
+            deadline,
+            store.patch_credential_runtime_state(id, operation_id, &patch),
+        )
+        .await;
+        match result {
+            Ok(result) => self.apply_runtime_mutation_result(id, &result),
+            Err(err) => {
+                tracing::warn!(
+                    credential_id = id,
+                    %operation_id,
+                    "{}；保留字段级 mutation 等待 PgSQL 恢复后重放",
+                    err
+                );
+                if self.entries.lock().iter().any(|entry| entry.id == id) {
+                    self.enqueue_pending_runtime_mutation(id, mutation);
                 }
             }
         }
-        self.mark_stats_dirty();
     }
 
     fn delete_persisted_credential_state(&self, id: u64) -> anyhow::Result<bool> {
@@ -3718,7 +5764,7 @@ impl MultiTokenManager {
             return Ok(false);
         };
         let store = store.clone();
-        block_on_storage("删除凭据持久化状态", async move {
+        block_on_credential_pgsql("删除凭据持久化状态", async move {
             store.soft_delete_credential(id).await?;
             store.delete_credential_stats_and_runtime(id).await
         })?;
@@ -3963,8 +6009,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         latency: Option<StdDuration>,
     ) {
-        let mut last_used_at: Option<String> = None;
-        let mut success_at: Option<DateTime<Utc>> = None;
+        let mut persisted_success: Option<(u64, String)> = None;
         let alpha = self
             .config
             .lock()
@@ -3975,12 +6020,12 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                let expected_generation = entry.runtime_generation;
                 if entry.warmup_remaining > 0 {
                     entry.warmup_remaining -= 1;
                 }
                 entry.success_count += 1;
-                let now_at = Utc::now();
-                let now = now_at.to_rfc3339();
+                let now = Utc::now().to_rfc3339();
                 entry.last_used_at = Some(now.clone());
                 {
                     let health = entry_effective_health_mut(entry, model);
@@ -3997,8 +6042,7 @@ impl MultiTokenManager {
                         );
                     }
                 }
-                last_used_at = Some(now);
-                success_at = Some(now_at);
+                persisted_success = Some((expected_generation, now));
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -4006,8 +6050,15 @@ impl MultiTokenManager {
                 );
             }
         }
-        if let (Some(last_used_at), Some(success_at)) = (last_used_at, success_at) {
-            self.persist_success_state(id, &last_used_at, success_at);
+        let disabled = if let Some((expected_generation, last_used_at)) = persisted_success {
+            self.persist_success_state(id, expected_generation, &last_used_at)
+        } else {
+            false
+        };
+        if disabled {
+            self.select_highest_priority();
+            self.unbind_sessions_for_credential(id);
+            self.clear_scheduler_state_for_credential(id, false);
         }
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -4148,31 +6199,29 @@ impl MultiTokenManager {
             (until.saturating_duration_since(now), coalesced)
         };
 
-        if !coalesced {
-            if let Some(redis) = &self.redis_store {
-                let redis = redis.clone();
-                let reason_for_redis = reason.clone();
-                let model_for_redis = model.map(str::to_string);
-                spawn_best_effort_storage_task("写入 Redis 凭据临时冷却与健康状态", async move {
-                    redis
-                        .record_scheduler_transient_failure(
-                            id,
-                            model_for_redis.as_deref(),
-                            kind.as_str(),
-                            &reason_for_redis,
-                            retry_after,
-                            base,
-                            max,
-                            multiplier,
-                            jitter,
-                            probation,
-                            alpha,
-                            coalesce_window,
-                        )
-                        .await?;
-                    Ok(())
-                });
-            }
+        if !coalesced && let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let reason_for_redis = reason.clone();
+            let model_for_redis = model.map(str::to_string);
+            spawn_best_effort_storage_task("写入 Redis 凭据临时冷却与健康状态", async move {
+                redis
+                    .record_scheduler_transient_failure(
+                        id,
+                        model_for_redis.as_deref(),
+                        kind.as_str(),
+                        &reason_for_redis,
+                        retry_after,
+                        base,
+                        max,
+                        multiplier,
+                        jitter,
+                        probation,
+                        alpha,
+                        coalesce_window,
+                    )
+                    .await?;
+                Ok(())
+            });
         }
 
         if coalesced {
@@ -4244,25 +6293,83 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let last_used_at: String;
-        let _available_after_local_update = {
-            let mut entries = self.entries.lock();
-            let mut current_id = self.current_id.lock();
+        let expected_generation = {
+            let entries = self.entries.lock();
+            let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
+                return entries.iter().any(|entry| !entry.disabled);
+            };
+            if entry.disabled && !entry.runtime_persistence_degraded {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+            entry.runtime_generation
+        };
 
+        let last_used_at = Utc::now().to_rfc3339();
+        let operation_id = uuid::Uuid::new_v4();
+        let queue_without_attempt = self.postgres_store.is_some()
+            && (self.has_pending_runtime_mutations(id)
+                || self
+                    .entries
+                    .lock()
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .is_some_and(|entry| entry.runtime_persistence_degraded));
+        let mut persistence_failed = queue_without_attempt;
+        let persisted_state = (!queue_without_attempt)
+            .then_some(self.postgres_store.as_ref())
+            .flatten()
+            .and_then(|store| {
+                let store = store.clone();
+                let last_used_at = last_used_at.clone();
+                match block_on_credential_pgsql("原子记录 PgSQL 凭据 API 失败", async move {
+                    store
+                        .record_credential_api_failure_at_generation(
+                            id,
+                            operation_id,
+                            expected_generation,
+                            &last_used_at,
+                            MAX_FAILURES_PER_CREDENTIAL,
+                        )
+                        .await
+                }) {
+                    Ok(state) => Some(state),
+                    Err(err) => {
+                        persistence_failed = true;
+                        tracing::warn!(
+                            credential_id = id,
+                            %operation_id,
+                            "{}；本次先更新本地并隔离凭据，等待 PgSQL 恢复后重放",
+                            err
+                        );
+                        None
+                    }
+                }
+            });
+
+        let (failure_count, mut disabled, auto_disabled) = {
+            let mut entries = self.entries.lock();
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
                 None => return entries.iter().any(|e| !e.disabled),
             };
 
-            if entry.disabled {
+            if entry.disabled && !entry.runtime_persistence_degraded {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.failure_count += 1;
-            let now = Utc::now().to_rfc3339();
-            entry.last_used_at = Some(now.clone());
-            last_used_at = now;
+            if let Some(result) = persisted_state.as_ref() {
+                Self::apply_runtime_mutation_result_to_entry(entry, result);
+            } else {
+                entry.failure_count = entry.failure_count.saturating_add(1);
+                if entry.failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                    entry.disabled = true;
+                    entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                }
+            }
+            entry.last_used_at = Some(last_used_at.clone());
             let failure_count = entry.failure_count;
+            let disabled = entry.disabled;
+            let auto_disabled = entry.disabled_reason == Some(DisabledReason::TooManyFailures);
 
             tracing::warn!(
                 "凭据 #{} API 调用失败（{}/{}）",
@@ -4271,56 +6378,44 @@ impl MultiTokenManager {
                 MAX_FAILURES_PER_CREDENTIAL
             );
 
-            if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
-                entry.disabled = true;
-                entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+            if disabled {
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
-
-                // 切换到优先级最高的可用凭据
-                if let Some(next) = entries
-                    .iter()
-                    .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
-                {
-                    *current_id = next.id;
-                    tracing::info!(
-                        "已切换到凭据 #{}（优先级 {}）",
-                        next.id,
-                        next.credentials.priority
-                    );
-                } else {
-                    tracing::error!("所有凭据均已禁用！");
-                }
             }
+            (failure_count, disabled, auto_disabled)
+        };
 
-            entries.iter().any(|e| !e.disabled)
-        };
-        let disabled = {
-            let entries = self.entries.lock();
-            entries.iter().any(|e| e.id == id && e.disabled)
-        };
+        if persistence_failed {
+            self.enqueue_pending_runtime_mutation(
+                id,
+                PendingCredentialRuntimeMutation::ApiFailure {
+                    operation_id,
+                    expected_generation,
+                    last_used_at: last_used_at.clone(),
+                },
+            );
+            disabled = true;
+        }
+
         if disabled {
             self.select_highest_priority();
             self.unbind_sessions_for_credential(id);
             self.clear_scheduler_state_for_credential(id, false);
         }
-        self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
-        if disabled {
-            self.save_runtime_state_for(id);
+        if auto_disabled {
             self.record_scheduler_credential_audit(
                 "auto_disable_credential",
                 id,
                 DisabledReason::TooManyFailures,
                 "api_failure_threshold",
                 "连续 API 调用失败达到阈值，已自动禁用凭据",
-                serde_json::json!({}),
+                serde_json::json!({ "failureCount": failure_count }),
             );
         }
         let result = {
             let entries = self.entries.lock();
             entries.iter().any(|e| !e.disabled)
         };
-        if disabled {
+        if auto_disabled {
             self.publish_credentials_changed("credential_failure_reported");
         }
         self.notify_dispatch_state_changed();
@@ -4335,6 +6430,7 @@ impl MultiTokenManager {
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
         let last_used_at: String;
+        let expected_generation: u64;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -4347,6 +6443,7 @@ impl MultiTokenManager {
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
             }
+            expected_generation = entry.runtime_generation;
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
@@ -4378,8 +6475,14 @@ impl MultiTokenManager {
         };
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
-        self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
-        self.save_runtime_state_for(id);
+        self.persist_disabled_state(
+            id,
+            expected_generation,
+            DisabledReason::QuotaExceeded,
+            Some(MAX_FAILURES_PER_CREDENTIAL),
+            None,
+            &last_used_at,
+        );
         self.record_scheduler_credential_audit(
             "auto_disable_credential",
             id,
@@ -4409,6 +6512,7 @@ impl MultiTokenManager {
         let detail_summary = truncate_for_audit(&detail, 500);
         let disabled_reason = reason.disabled_reason();
         let last_used_at: String;
+        let expected_generation: u64;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -4421,6 +6525,7 @@ impl MultiTokenManager {
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
             }
+            expected_generation = entry.runtime_generation;
 
             entry.disabled = true;
             entry.disabled_reason = Some(disabled_reason);
@@ -4457,8 +6562,14 @@ impl MultiTokenManager {
         };
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
-        self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
-        self.save_runtime_state_for(id);
+        self.persist_disabled_state(
+            id,
+            expected_generation,
+            disabled_reason,
+            Some(MAX_FAILURES_PER_CREDENTIAL),
+            None,
+            &last_used_at,
+        );
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let event_reason = reason.event_reason().to_string();
@@ -4499,89 +6610,131 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
-        let last_used_at: String;
-        let _available_after_local_update = {
-            let mut entries = self.entries.lock();
-            let mut current_id = self.current_id.lock();
-
-            let entry = match entries.iter_mut().find(|e| e.id == id) {
-                Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+        let expected_generation = {
+            let entries = self.entries.lock();
+            let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
+                return entries.iter().any(|entry| !entry.disabled);
             };
+            if entry.disabled && !entry.runtime_persistence_degraded {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+            entry.runtime_generation
+        };
 
-            if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+        let last_used_at = Utc::now().to_rfc3339();
+        let operation_id = uuid::Uuid::new_v4();
+        let queue_without_attempt = self.postgres_store.is_some()
+            && (self.has_pending_runtime_mutations(id)
+                || self
+                    .entries
+                    .lock()
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .is_some_and(|entry| entry.runtime_persistence_degraded));
+        let mut persistence_failed = queue_without_attempt;
+        let persisted_state = (!queue_without_attempt)
+            .then_some(self.postgres_store.as_ref())
+            .flatten()
+            .and_then(|store| {
+                let store = store.clone();
+                let last_used_at = last_used_at.clone();
+                match block_on_credential_pgsql("原子记录 PgSQL 凭据 Token 刷新失败", async move {
+                    store
+                        .record_credential_refresh_failure_at_generation(
+                            id,
+                            operation_id,
+                            expected_generation,
+                            &last_used_at,
+                            MAX_FAILURES_PER_CREDENTIAL,
+                        )
+                        .await
+                }) {
+                    Ok(state) => Some(state),
+                    Err(err) => {
+                        persistence_failed = true;
+                        tracing::warn!(
+                            credential_id = id,
+                            %operation_id,
+                            "{}；本次先更新本地并隔离凭据，等待 PgSQL 恢复后重放",
+                            err
+                        );
+                        None
+                    }
+                }
+            });
+
+        let (refresh_failure_count, mut disabled, auto_disabled) = {
+            let mut entries = self.entries.lock();
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => return entries.iter().any(|entry| !entry.disabled),
+            };
+            if entry.disabled && !entry.runtime_persistence_degraded {
+                return entries.iter().any(|entry| !entry.disabled);
             }
 
-            let now = Utc::now().to_rfc3339();
-            entry.last_used_at = Some(now.clone());
-            last_used_at = now;
-            entry.refresh_failure_count += 1;
-            let refresh_failure_count = entry.refresh_failure_count;
+            if let Some(result) = persisted_state.as_ref() {
+                Self::apply_runtime_mutation_result_to_entry(entry, result);
+            } else {
+                entry.refresh_failure_count = entry.refresh_failure_count.saturating_add(1);
+                if entry.refresh_failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                    entry.disabled = true;
+                    entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+                }
+            }
+            entry.last_used_at = Some(last_used_at.clone());
 
+            let refresh_failure_count = entry.refresh_failure_count;
+            let auto_disabled =
+                entry.disabled_reason == Some(DisabledReason::TooManyRefreshFailures);
             tracing::warn!(
                 "凭据 #{} Token 刷新失败（{}/{}）",
                 id,
                 refresh_failure_count,
                 MAX_FAILURES_PER_CREDENTIAL
             );
-
-            if refresh_failure_count < MAX_FAILURES_PER_CREDENTIAL {
-                return entries.iter().any(|e| !e.disabled);
-            }
-
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
-
-            tracing::error!(
-                "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
-                id,
-                refresh_failure_count
-            );
-
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
+            if auto_disabled {
+                tracing::error!(
+                    "凭据 #{} Token 已连续刷新失败 {} 次，已被禁用",
+                    id,
+                    refresh_failure_count
                 );
-                true
-            } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
             }
+            (refresh_failure_count, entry.disabled, auto_disabled)
         };
-        let disabled = {
-            let entries = self.entries.lock();
-            entries.iter().any(|e| e.id == id && e.disabled)
-        };
+
+        if persistence_failed {
+            self.enqueue_pending_runtime_mutation(
+                id,
+                PendingCredentialRuntimeMutation::RefreshFailure {
+                    operation_id,
+                    expected_generation,
+                    last_used_at: last_used_at.clone(),
+                },
+            );
+            disabled = true;
+        }
+
         if disabled {
             self.select_highest_priority();
             self.unbind_sessions_for_credential(id);
             self.clear_scheduler_state_for_credential(id, false);
         }
-        self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
-        if disabled {
-            self.save_runtime_state_for(id);
+        if auto_disabled {
             self.record_scheduler_credential_audit(
                 "auto_disable_credential",
                 id,
                 DisabledReason::TooManyRefreshFailures,
                 "token_refresh_failure_threshold",
                 "连续 Token 刷新失败达到阈值，已自动禁用凭据",
-                serde_json::json!({}),
+                serde_json::json!({ "refreshFailureCount": refresh_failure_count }),
             );
         }
         let result = {
             let entries = self.entries.lock();
             entries.iter().any(|e| !e.disabled)
         };
-        if disabled {
+        if auto_disabled {
             self.publish_credentials_changed("credential_refresh_failure_reported");
         }
         self.notify_dispatch_state_changed();
@@ -4594,6 +6747,7 @@ impl MultiTokenManager {
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
         let last_used_at: String;
+        let expected_generation: u64;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -4606,6 +6760,7 @@ impl MultiTokenManager {
             if entry.disabled {
                 return entries.iter().any(|e| !e.disabled);
             }
+            expected_generation = entry.runtime_generation;
 
             let now = Utc::now().to_rfc3339();
             entry.last_used_at = Some(now.clone());
@@ -4637,8 +6792,14 @@ impl MultiTokenManager {
         };
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
-        self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
-        self.save_runtime_state_for(id);
+        self.persist_disabled_state(
+            id,
+            expected_generation,
+            DisabledReason::InvalidRefreshToken,
+            None,
+            None,
+            &last_used_at,
+        );
         self.record_scheduler_credential_audit(
             "auto_disable_credential",
             id,
@@ -4940,26 +7101,30 @@ impl MultiTokenManager {
 
     /// 设置凭据禁用状态（Admin API）
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
-        let (credential, runtime_state) = {
+        {
             let entries = self.entries.lock();
-            let entry = entries
+            entries
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
-            let mut runtime_state = Self::runtime_state_from_entry(entry);
-            credential.disabled = disabled;
-            if disabled {
-                runtime_state.disabled_reason = Some(DisabledReason::Manual.as_str().to_string());
-            } else {
-                runtime_state.failure_count = 0;
-                runtime_state.refresh_failure_count = 0;
-                runtime_state.disabled_reason = None;
-            }
-            (credential, runtime_state)
-        };
-        self.persist_credential_value(&credential)?;
-        self.persist_runtime_state_value(id, &runtime_state)?;
+        }
+        let persisted = self.persist_runtime_patch_value(
+            id,
+            CredentialRuntimeStatePatch {
+                failure_count: (!disabled).then_some(0),
+                refresh_failure_count: (!disabled).then_some(0),
+                disabled_reason: if disabled {
+                    CredentialRuntimeDisabledReasonPatch::Set(
+                        DisabledReason::Manual.as_str().to_string(),
+                    )
+                } else {
+                    CredentialRuntimeDisabledReasonPatch::Clear
+                },
+                credential_disabled: Some(disabled),
+                advance_generation: true,
+                ..Default::default()
+            },
+        )?;
 
         {
             let mut entries = self.entries.lock();
@@ -4967,23 +7132,19 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.disabled = disabled;
-            if !disabled {
-                // 启用时重置失败计数
-                entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
-                entry.disabled_reason = None;
-                entry.cooldown_until = None;
-                entry.cooldown_reason = None;
-                entry.model_cooldowns.clear();
-                entry.rate_limit_available_at = None;
-            } else {
-                entry.disabled_reason = Some(DisabledReason::Manual);
-                entry.cooldown_until = None;
-                entry.cooldown_reason = None;
-                entry.model_cooldowns.clear();
-                entry.rate_limit_available_at = None;
+            if !persisted {
+                entry.credentials.disabled = disabled;
+                entry.disabled = disabled;
+                entry.disabled_reason = disabled.then_some(DisabledReason::Manual);
+                if !disabled {
+                    entry.failure_count = 0;
+                    entry.refresh_failure_count = 0;
+                }
             }
+            entry.cooldown_until = None;
+            entry.cooldown_reason = None;
+            entry.model_cooldowns.clear();
+            entry.rate_limit_available_at = None;
         }
         if disabled {
             self.unbind_sessions_for_credential(id);
@@ -5001,27 +7162,10 @@ impl MultiTokenManager {
     ///
     /// 修改优先级后会立即按新优先级重新选择当前凭据。
     pub fn set_priority(&self, id: u64, priority: u32) -> anyhow::Result<()> {
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        self.persist_credential_mutation(id, |credential| {
             credential.priority = priority;
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.priority = priority;
-        }
-        // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
+            Ok(())
+        })?;
         self.select_highest_priority();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_priority_updated");
@@ -5038,26 +7182,10 @@ impl MultiTokenManager {
         id: u64,
         max_concurrent_requests: Option<u32>,
     ) -> anyhow::Result<()> {
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        self.persist_credential_mutation(id, |credential| {
             credential.max_concurrent_requests = max_concurrent_requests;
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.max_concurrent_requests = credential.max_concurrent_requests;
-        }
+            Ok(())
+        })?;
 
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_concurrency_updated");
@@ -5070,26 +7198,10 @@ impl MultiTokenManager {
     /// `Some(0)` 表示该凭据不做本地 RPM 限制；
     /// `Some(n)` 表示该凭据每分钟最多调度 n 次。
     pub fn set_credential_rpm(&self, id: u64, rpm: Option<u32>) -> anyhow::Result<()> {
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        self.persist_credential_mutation(id, |credential| {
             credential.rpm = rpm;
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.rpm = credential.rpm;
-        }
+            Ok(())
+        })?;
 
         self.clear_rate_limit_for_credential(id);
         self.notify_dispatch_state_changed();
@@ -5103,27 +7215,10 @@ impl MultiTokenManager {
         id: u64,
         enabled: bool,
     ) -> anyhow::Result<()> {
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        self.persist_credential_mutation(id, |credential| {
             credential.rate_limit_auto_disable_enabled = Some(enabled);
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.rate_limit_auto_disable_enabled =
-                credential.rate_limit_auto_disable_enabled;
-        }
+            Ok(())
+        })?;
 
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_rate_limit_auto_disable_updated");
@@ -5138,31 +7233,15 @@ impl MultiTokenManager {
         id: u64,
         supported_models: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        let saved = self.persist_credential_mutation(id, |credential| {
             credential.supported_models = supported_models;
             credential.normalize_supported_models();
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.supported_models = credential.supported_models.clone();
-        }
+            Ok(())
+        })?;
 
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_supported_models_updated");
-        Ok(credential.supported_models)
+        Ok(saved.supported_models)
     }
 
     /// 设置凭据 Region 覆盖值（Admin API）。
@@ -5176,13 +7255,7 @@ impl MultiTokenManager {
         auth_region: Option<Option<String>>,
         api_region: Option<Option<String>>,
     ) -> anyhow::Result<()> {
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        self.persist_credential_mutation(id, |credential| {
             let region_changed = region.is_some() || auth_region.is_some() || api_region.is_some();
             if let Some(value) = region {
                 credential.region = value;
@@ -5197,30 +7270,12 @@ impl MultiTokenManager {
                 credential.access_token = None;
                 credential.expires_at = None;
                 credential.subscription_title = None;
-                if api_region_conflicts_with_profile_arn(&credential) {
+                if api_region_conflicts_with_profile_arn(credential) {
                     credential.profile_arn = None;
                 }
             }
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.region = credential.region;
-            entry.credentials.auth_region = credential.auth_region;
-            entry.credentials.api_region = credential.api_region;
-            if !entry.credentials.is_api_key_credential() {
-                entry.credentials.access_token = None;
-                entry.credentials.expires_at = None;
-                entry.credentials.subscription_title = None;
-            }
-            entry.credentials.profile_arn = credential.profile_arn;
-        }
+            Ok(())
+        })?;
 
         self.publish_credentials_changed("credential_regions_updated");
         self.notify_dispatch_state_changed();
@@ -5233,13 +7288,14 @@ impl MultiTokenManager {
         update: CredentialAuthUpdate,
         reset_runtime_state: bool,
     ) -> anyhow::Result<()> {
-        let mut credential = {
+        let (base, mut credential) = {
             let entries = self.entries.lock();
             let entry = entries
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            Self::credential_from_entry(entry)
+            let base = Self::credential_from_entry(entry);
+            (base.clone(), base)
         };
 
         apply_credential_auth_update(&mut credential, update);
@@ -5295,31 +7351,35 @@ impl MultiTokenManager {
             }
         }
 
-        self.persist_credential_value(&credential)?;
-
-        let runtime_state = {
+        if reset_runtime_state {
+            self.persist_credential_update_with_runtime_patch(
+                &base,
+                &credential,
+                CredentialRuntimeStatePatch {
+                    failure_count: Some(0),
+                    refresh_failure_count: Some(0),
+                    disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+                    credential_disabled: Some(false),
+                    advance_generation: true,
+                    ..Default::default()
+                },
+            )?;
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials = credential;
-            if reset_runtime_state {
-                entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
-                entry.cooldown_until = None;
-                entry.cooldown_reason = None;
-                entry.model_cooldowns.clear();
-                entry.rate_limit_available_at = None;
-                entry.health = SchedulerHealthState::default();
-                entry.model_health.clear();
-                entry.selection_events.clear();
-            }
-            reset_runtime_state.then(|| Self::runtime_state_from_entry(entry))
-        };
-        if let Some(runtime_state) = runtime_state {
-            self.persist_runtime_state_value(id, &runtime_state)?;
+            entry.cooldown_until = None;
+            entry.cooldown_reason = None;
+            entry.model_cooldowns.clear();
+            entry.rate_limit_available_at = None;
+            entry.health = SchedulerHealthState::default();
+            entry.model_health.clear();
+            entry.selection_events.clear();
+            drop(entries);
             self.clear_scheduler_state_for_credential(id, false);
+        } else {
+            self.persist_credential_update(&base, &credential)?;
         }
 
         self.publish_credentials_changed("credential_auth_updated");
@@ -5335,32 +7395,17 @@ impl MultiTokenManager {
         let profile_arn = profile_arn
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        self.persist_credential_mutation(id, |credential| {
             credential.profile_arn = profile_arn;
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.profile_arn = credential.profile_arn.clone();
-        }
+            Ok(())
+        })?;
         self.publish_credentials_changed("credential_profile_arn_updated");
         Ok(())
     }
 
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
-        let (credential, runtime_state) = {
+        {
             let entries = self.entries.lock();
             let entry = entries
                 .iter()
@@ -5369,16 +7414,18 @@ impl MultiTokenManager {
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
-            let mut credential = Self::credential_from_entry(entry);
-            credential.disabled = false;
-            let mut runtime_state = Self::runtime_state_from_entry(entry);
-            runtime_state.failure_count = 0;
-            runtime_state.refresh_failure_count = 0;
-            runtime_state.disabled_reason = None;
-            (credential, runtime_state)
-        };
-        self.persist_credential_value(&credential)?;
-        self.persist_runtime_state_value(id, &runtime_state)?;
+        }
+        let persisted = self.persist_runtime_patch_value(
+            id,
+            CredentialRuntimeStatePatch {
+                failure_count: Some(0),
+                refresh_failure_count: Some(0),
+                disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+                credential_disabled: Some(false),
+                advance_generation: true,
+                ..Default::default()
+            },
+        )?;
 
         {
             let mut entries = self.entries.lock();
@@ -5389,10 +7436,13 @@ impl MultiTokenManager {
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
-            entry.failure_count = 0;
-            entry.refresh_failure_count = 0;
-            entry.disabled = false;
-            entry.disabled_reason = None;
+            if !persisted {
+                entry.failure_count = 0;
+                entry.refresh_failure_count = 0;
+                entry.credentials.disabled = false;
+                entry.disabled = false;
+                entry.disabled_reason = None;
+            }
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
             entry.model_cooldowns.clear();
@@ -5418,31 +7468,29 @@ impl MultiTokenManager {
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
-            let changed = {
-                let mut entries = self.entries.lock();
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let old_title = entry.credentials.subscription_title.clone();
-                    if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title = Some(subscription_title.to_string());
-                        tracing::info!(
-                            "凭据 #{} 订阅等级已更新: {:?} -> {}",
-                            id,
-                            old_title,
-                            subscription_title
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-
-            if changed {
-                if let Err(e) = self.persist_credential_entry(id) {
+            let old_title = self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.subscription_title.clone());
+            if old_title
+                .as_ref()
+                .is_some_and(|title| title.as_deref() != Some(subscription_title))
+            {
+                let requested_title = subscription_title.to_string();
+                if let Err(e) = self.persist_credential_mutation(id, |credential| {
+                    credential.subscription_title = Some(requested_title);
+                    Ok(())
+                }) {
                     tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
                 } else {
+                    tracing::info!(
+                        "凭据 #{} 订阅等级已更新: {:?} -> {}",
+                        id,
+                        old_title.flatten(),
+                        subscription_title
+                    );
                     self.publish_credentials_changed("subscription_title_updated");
                 }
             }
@@ -5509,7 +7557,13 @@ impl MultiTokenManager {
         let config = self.runtime_config();
         let refreshed = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
         let refreshed = Self::preserve_proxy_fields(refreshed, &source_credentials);
-        self.token_context_from_credentials(EXTERNAL_CREDENTIAL_CONTEXT_ID, refreshed, false)
+        self.token_context_from_credentials_until(
+            EXTERNAL_CREDENTIAL_CONTEXT_ID,
+            refreshed,
+            false,
+            tokio::time::Instant::now() + CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT,
+        )
+        .await
     }
 
     /// 使用一份外部凭据临时查询账号信息，不加入凭据池、不改变调度状态。
@@ -5664,32 +7718,69 @@ impl MultiTokenManager {
 
         let initial_disabled = new_cred.disabled;
         let warmup_remaining = self.runtime_config().credential_warmup_requests;
-        let new_id = if let Some(store) = &self.postgres_store {
+        let initial_runtime_patch = CredentialRuntimeStatePatch {
+            failure_count: Some(0),
+            refresh_failure_count: Some(0),
+            disabled_reason: if initial_disabled {
+                CredentialRuntimeDisabledReasonPatch::Set(
+                    DisabledReason::Manual.as_str().to_string(),
+                )
+            } else {
+                CredentialRuntimeDisabledReasonPatch::Clear
+            },
+            warmup_remaining: Some(warmup_remaining),
+            credential_disabled: Some(initial_disabled),
+            ..Default::default()
+        };
+        let (new_id, persisted_runtime) = if let Some(store) = &self.postgres_store {
             validated_cred.disabled = initial_disabled;
-            let inserted = store.insert_credential(&validated_cred).await?;
+            let operation_id = uuid::Uuid::new_v4();
+            let (inserted, runtime) = credential_pgsql_sync_with_timeout(
+                "原子新增凭据及初始运行态",
+                CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                store.insert_credential_with_runtime_patch(
+                    &validated_cred,
+                    operation_id,
+                    &initial_runtime_patch,
+                ),
+            )
+            .await?;
             let id = inserted
                 .id
                 .ok_or_else(|| anyhow::anyhow!("PgSQL 新增凭据未返回 id"))?;
             validated_cred = inserted;
-            id
+            (id, Some(runtime))
         } else {
             let id = {
                 let entries = self.entries.lock();
                 entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
             };
             validated_cred.id = Some(id);
-            id
+            (id, None)
         };
+
+        let persisted_state = persisted_runtime.as_ref().map(|runtime| &runtime.state);
+        let persisted_disabled = persisted_runtime
+            .as_ref()
+            .map_or(initial_disabled, |runtime| runtime.credential_disabled);
+        let persisted_reason = persisted_state
+            .and_then(|state| state.disabled_reason.as_deref())
+            .and_then(DisabledReason::from_str)
+            .or_else(|| persisted_disabled.then_some(DisabledReason::Manual));
 
         {
             let mut entries = self.entries.lock();
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
-                failure_count: 0,
-                refresh_failure_count: 0,
-                disabled: initial_disabled,
-                disabled_reason: initial_disabled.then_some(DisabledReason::Manual),
+                failure_count: persisted_state.map_or(0, |state| state.failure_count),
+                refresh_failure_count: persisted_state
+                    .map_or(0, |state| state.refresh_failure_count),
+                runtime_revision: persisted_state.map_or(0, |state| state.revision),
+                runtime_generation: persisted_state.map_or(0, |state| state.generation),
+                runtime_persistence_degraded: false,
+                disabled: persisted_disabled,
+                disabled_reason: persisted_reason,
                 success_count: 0,
                 total_selection_count: 0,
                 last_used_at: None,
@@ -5699,7 +7790,8 @@ impl MultiTokenManager {
                 rate_limit_available_at: None,
                 in_flight_requests: 0,
                 in_flight_leases: Vec::new(),
-                warmup_remaining,
+                warmup_remaining: persisted_state
+                    .map_or(warmup_remaining, |state| state.warmup_remaining),
                 health: SchedulerHealthState::default(),
                 model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
@@ -5710,7 +7802,6 @@ impl MultiTokenManager {
         if self.postgres_store.is_none() {
             self.persist_credentials()?;
         }
-        self.save_runtime_state_for(new_id);
         self.publish_credentials_changed("credential_added");
         self.notify_dispatch_state_changed();
 
@@ -5720,19 +7811,23 @@ impl MultiTokenManager {
 
     /// 设置凭据预热剩余请求数。0 表示关闭预热。
     pub fn set_warmup_remaining(&self, id: u64, warmup_remaining: u32) -> anyhow::Result<()> {
-        let runtime_state = {
+        {
             let entries = self.entries.lock();
-            let entry = entries
+            entries
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut runtime_state = Self::runtime_state_from_entry(entry);
-            runtime_state.warmup_remaining = warmup_remaining;
-            runtime_state
-        };
-        self.persist_runtime_state_value(id, &runtime_state)?;
+        }
+        let persisted = self.persist_runtime_patch_value(
+            id,
+            CredentialRuntimeStatePatch {
+                warmup_remaining: Some(warmup_remaining),
+                advance_generation: true,
+                ..Default::default()
+            },
+        )?;
 
-        {
+        if !persisted {
             let mut entries = self.entries.lock();
             let entry = entries
                 .iter_mut()
@@ -5760,32 +7855,13 @@ impl MultiTokenManager {
             }
         }
 
-        let credential = {
-            let entries = self.entries.lock();
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            let mut credential = Self::credential_from_entry(entry);
+        self.persist_credential_mutation(id, |credential| {
             credential.proxy_resource_id = proxy_resource_id;
             credential.proxy_url = proxy_url;
             credential.proxy_username = proxy_username;
             credential.proxy_password = proxy_password;
-            credential
-        };
-        self.persist_credential_value(&credential)?;
-
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.proxy_resource_id = credential.proxy_resource_id;
-            entry.credentials.proxy_url = credential.proxy_url;
-            entry.credentials.proxy_username = credential.proxy_username;
-            entry.credentials.proxy_password = credential.proxy_password;
-        }
+            Ok(())
+        })?;
         self.publish_credentials_changed("credential_proxy_updated");
         self.notify_dispatch_state_changed();
         Ok(())
@@ -5821,6 +7897,10 @@ impl MultiTokenManager {
         }
 
         // 行级软删除，并清理该凭据的统计/运行态残留。成功后再更新本进程快照。
+        let refresh_lock = self.refresh_lock_for_credential(id);
+        let _refresh_guard = refresh_lock
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("凭据 #{} 正在刷新 Token，请稍后再删除", id))?;
         self.delete_persisted_credential_state(id)?;
 
         let was_current = {
@@ -5830,6 +7910,7 @@ impl MultiTokenManager {
             entries.retain(|e| e.id != id);
             was_current
         };
+        self.clear_pending_persistence_for_credential(id);
 
         // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
@@ -5861,81 +7942,174 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
+        self.force_refresh_token_for_with_budgets(id, TokenRefreshBudgets::default())
+            .await
+    }
 
+    async fn force_refresh_token_for_with_budgets(
+        &self,
+        id: u64,
+        budgets: TokenRefreshBudgets,
+    ) -> anyhow::Result<()> {
+        if !self.entries.lock().iter().any(|entry| entry.id == id) {
+            anyhow::bail!("凭据不存在: {}", id);
+        }
+        let deadlines = budgets.deadlines()?;
         // 获取该凭据的刷新锁，防止同一账号并发刷新。
         let refresh_lock = self.refresh_lock_for_credential(id);
-        let _guard = refresh_lock.lock().await;
-        let mut redis_refresh_lock: Option<(Arc<RedisStore>, String)> = None;
-        let mut redis_lock_failed_open = false;
+        let _guard = acquire_refresh_lock_until(&refresh_lock, deadlines.coordination, id).await?;
+        let mut redis_refresh_lock: Option<RedisRefreshLockGuard> = None;
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
-            for _ in 0..10 {
-                match redis.acquire_refresh_lock(id, 120).await {
-                    Ok(Some(lock_token)) => {
-                        redis_refresh_lock = Some((redis.clone(), lock_token));
+            while tokio::time::Instant::now() < deadlines.coordination {
+                let remaining = deadlines
+                    .coordination
+                    .saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(
+                    remaining.min(REFRESH_REDIS_LOCK_OP_TIMEOUT),
+                    redis.acquire_refresh_lock(id, TOKEN_REFRESH_REDIS_LOCK_TTL_SECS),
+                )
+                .await
+                {
+                    Ok(Ok(Some(lock_token))) => {
+                        redis_refresh_lock =
+                            Some(RedisRefreshLockGuard::new(redis.clone(), id, lock_token));
                         break;
                     }
-                    Ok(None) => tokio::time::sleep(StdDuration::from_millis(500)).await,
-                    Err(err) => {
-                        tracing::warn!(
-                            credential_id = id,
-                            "强制刷新时获取 Redis Token 刷新锁失败，使用本进程刷新锁继续: {}",
-                            err
-                        );
-                        redis_lock_failed_open = true;
-                        break;
+                    Ok(Ok(None)) => {
+                        let now = tokio::time::Instant::now();
+                        tokio::time::sleep_until(
+                            (now + StdDuration::from_millis(500)).min(deadlines.coordination),
+                        )
+                        .await;
                     }
+                    Ok(Err(err)) => {
+                        anyhow::bail!("强制刷新时获取 Redis Token 刷新锁失败: {}", err);
+                    }
+                    Err(_) => anyhow::bail!(
+                        "强制刷新时获取 Redis Token 刷新锁超过 {}ms",
+                        REFRESH_REDIS_LOCK_OP_TIMEOUT.as_millis()
+                    ),
                 }
             }
-            if !redis_lock_failed_open && redis_refresh_lock.is_none() {
+            if redis_refresh_lock.is_none() {
                 anyhow::bail!("其他实例正在刷新凭据 #{}，请稍后再试", id);
             }
         }
 
-        // 无条件调用 refresh_token
-        let refresh_result = match self.resolve_proxy_for_credential(credentials.clone()) {
-            Ok(credentials_for_proxy) => {
-                let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
-                let config = self.runtime_config();
-                refresh_token(&credentials_for_proxy, &config, effective_proxy.as_ref()).await
-            }
-            Err(err) => Err(err),
-        };
-        if let Some((redis, lock_token)) = redis_refresh_lock {
-            if let Err(err) = redis.release_refresh_lock(id, &lock_token).await {
-                tracing::warn!(credential_id = id, "释放 Redis Token 刷新锁失败: {}", err);
-            }
-        }
-        let mut new_creds = refresh_result?;
-        new_creds.proxy_url = credentials.proxy_url;
-        new_creds.proxy_username = credentials.proxy_username;
-        new_creds.proxy_password = credentials.proxy_password;
-        new_creds.proxy_resource_id = credentials.proxy_resource_id;
+        let refresh_and_publish_result = async {
+            let credentials = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| entry.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+            // 无条件调用 refresh_token。
+            let mut new_creds = match self.resolve_proxy_for_credential(credentials.clone()) {
+                Ok(credentials_for_proxy) => {
+                    let effective_proxy =
+                        credentials_for_proxy.effective_proxy(self.proxy.as_ref());
+                    let config = self.runtime_config();
+                    refresh_token_until(
+                        &credentials_for_proxy,
+                        &config,
+                        effective_proxy.as_ref(),
+                        deadlines.work,
+                        "强制刷新 Token 上游阶段",
+                    )
+                    .await?
+                }
+                Err(err) => return Err(err),
+            };
+            new_creds.proxy_url = credentials.proxy_url.clone();
+            new_creds.proxy_username = credentials.proxy_username.clone();
+            new_creds.proxy_password = credentials.proxy_password.clone();
+            new_creds.proxy_resource_id = credentials.proxy_resource_id;
 
-        // 更新 entries 中对应凭据
-        {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
+            // PgSQL 是多实例的权威凭据存储。字段级 CAS 成功后才能更新本机并通知其他实例。
+            new_creds = self
+                .persist_refreshed_credential_fields(
+                    id,
+                    &credentials,
+                    new_creds,
+                    false,
+                    deadlines.work,
+                    deadlines.total,
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("强制刷新 Token 后写入 PgSQL 失败: {}", err))?;
+
+            let expected_generation = {
+                let mut entries = self.entries.lock();
+                let entry = entries
+                    .iter_mut()
+                    .find(|entry| entry.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+                Self::merge_refresh_fields(&mut entry.credentials, &new_creds);
                 entry.refresh_failure_count = 0;
-            }
-        }
+                entry.runtime_generation
+            };
+            self.persist_runtime_patch_best_effort_until(
+                id,
+                CredentialRuntimeStatePatch {
+                    refresh_failure_count: Some(0),
+                    expected_generation: Some(expected_generation),
+                    ..Default::default()
+                },
+                deadlines.total,
+            )
+            .await;
+            self.invalidate_local_pool_route_state_cache();
 
-        // 持久化当前凭据行
-        if let Err(e) = self.persist_credential_entry(id) {
-            tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
-        } else {
-            self.publish_credentials_changed("credential_force_refreshed");
+            if let Some(store) = &self.postgres_store {
+                let store = store.clone();
+                spawn_best_effort_storage_task("记录强制刷新凭据事件到 PgSQL", async move {
+                    store
+                        .record_credential_event(
+                            Some(id),
+                            "credentials_changed",
+                            Some("credential_force_refreshed"),
+                            serde_json::json!({ "reason": "credential_force_refreshed" }),
+                        )
+                        .await
+                });
+            }
+            if let Some(redis) = &self.redis_store {
+                let payload = serde_json::json!({
+                    "kind": "credentials_changed",
+                    "reason": "credential_force_refreshed",
+                    "changedAt": Utc::now().to_rfc3339(),
+                })
+                .to_string();
+                match tokio::time::timeout_at(
+                    deadlines.total,
+                    redis.publish_credentials_changed(payload),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::warn!(
+                        credential_id = id,
+                        "发布强制刷新凭据通知失败，其他实例将通过定时同步恢复: {}",
+                        err
+                    ),
+                    Err(_) => tracing::warn!(
+                        credential_id = id,
+                        "发布强制刷新凭据通知超过总期限，其他实例将通过定时同步恢复"
+                    ),
+                }
+            }
+            Ok::<(), anyhow::Error>(())
         }
-        self.save_runtime_state_for(id);
+        .await;
+
+        // 所有成功步骤和任一失败路径都在释放分布式锁后再返回。
+        if let Some(redis_refresh_lock) = redis_refresh_lock {
+            redis_refresh_lock.release().await;
+        }
+        refresh_and_publish_result?;
 
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
@@ -5953,7 +8127,7 @@ impl MultiTokenManager {
         let mut saved_version: Option<i64> = None;
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
-            saved_version = Some(block_on_storage(
+            saved_version = Some(block_on_credential_pgsql(
                 "持久化负载均衡模式到 PgSQL",
                 async move { store.save_runtime_config_returning_version(&config).await },
             )?);
@@ -5993,4805 +8167,12 @@ impl MultiTokenManager {
 
 impl Drop for MultiTokenManager {
     fn drop(&mut self) {
-        if self.stats_dirty.load(Ordering::Relaxed) {
-            self.save_stats();
+        if !self.refresh_stats_dirty_from_pending() {
+            tracing::warn!("MultiTokenManager 释放时仍有未刷盘统计；应先关闭 stats flush worker");
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    const SONNET_MODEL: &str = "claude-sonnet-4.5";
-
-    async fn test_redis_store() -> Option<Arc<RedisStore>> {
-        let url = std::env::var("KIRO_RS_TEST_REDIS_URL").ok()?;
-        let mut config = Config::default();
-        config.redis.url = Some(url);
-        config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
-        Some(Arc::new(RedisStore::connect(&config).await.unwrap()))
-    }
-
-    async fn test_postgres_store() -> Option<Arc<PostgresStore>> {
-        let url = std::env::var("KIRO_RS_TEST_POSTGRES_URL").ok()?;
-        let mut config = Config::default();
-        config.postgres.url = Some(url);
-        config.postgres.max_connections = 2;
-        Some(Arc::new(
-            PostgresStore::connect_test(&config).await.unwrap(),
-        ))
-    }
-
-    fn api_key_credential(token: &str) -> KiroCredentials {
-        KiroCredentials {
-            kiro_api_key: Some(token.to_string()),
-            auth_method: Some("api_key".to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_partial_scheduler_state_apply_preserves_unrequested_entries() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![
-                test_access_token_credential("token-1", "Pro"),
-                test_access_token_credential("token-2", "Pro"),
-            ],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        {
-            let mut entries = manager.entries.lock();
-            entries[0].in_flight_requests = 7;
-            entries[0].health.last_error_kind = Some("old-first".to_string());
-            entries[1].in_flight_requests = 3;
-            entries[1].health.last_error_kind = Some("keep-second".to_string());
-            entries[1].health.selection_count = 11;
-        }
-
-        let mut health = SchedulerHealthState {
-            last_error_kind: Some("updated-first".to_string()),
-            selection_count: 5,
-            ..Default::default()
-        };
-        health.recent_selection_count_60s = 2;
-        let mut states = HashMap::new();
-        states.insert(
-            1,
-            SchedulerCredentialState {
-                health,
-                ..Default::default()
-            },
-        );
-
-        manager.apply_scheduler_states_for_ids(states);
-
-        let entries = manager.entries.lock();
-        assert_eq!(
-            entries[0].health.last_error_kind.as_deref(),
-            Some("updated-first")
-        );
-        assert_eq!(entries[0].health.selection_count, 5);
-        assert_eq!(entries[0].in_flight_requests, 0);
-        assert_eq!(
-            entries[1].health.last_error_kind.as_deref(),
-            Some("keep-second")
-        );
-        assert_eq!(entries[1].health.selection_count, 11);
-        assert_eq!(entries[1].in_flight_requests, 3);
-    }
-
-    #[test]
-    fn test_scheduler_state_apply_preserves_local_in_flight_leases() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![test_access_token_credential("token-1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let now = Instant::now();
-        {
-            let mut entries = manager.entries.lock();
-            entries[0].in_flight_requests = 1;
-            entries[0].in_flight_leases.push(InFlightLease {
-                id: 99,
-                acquired_at: now,
-                last_seen_at: now,
-                kind: InFlightKind::Stream,
-                weight_units: 1,
-            });
-        }
-
-        let mut states = HashMap::new();
-        states.insert(1, SchedulerCredentialState::default());
-
-        manager.apply_scheduler_states_for_ids(states);
-
-        let entries = manager.entries.lock();
-        assert_eq!(entries[0].in_flight_requests, 1);
-        assert_eq!(entries[0].in_flight_leases.len(), 1);
-        assert_eq!(entries[0].in_flight_leases[0].id, 99);
-        assert_eq!(entries[0].in_flight_leases[0].kind, InFlightKind::Stream);
-    }
-
-    #[test]
-    fn test_scheduler_state_apply_filters_expired_redis_in_flight_leases() {
-        let mut config = Config::default();
-        config.credential_in_flight_lease_max_secs = 1;
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("token-1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let now_ms = Utc::now().timestamp_millis();
-        let stale_redis_lease = crate::storage::redis_cache::SchedulerInFlightLease {
-            id: 44,
-            acquired_at_ms: now_ms - 5_000,
-            last_seen_at_ms: now_ms - 5_000,
-            kind: InFlightKind::Api.as_str().to_string(),
-            weight_units: 1,
-        };
-
-        let mut states = HashMap::new();
-        states.insert(
-            1,
-            SchedulerCredentialState {
-                in_flight_leases: vec![stale_redis_lease.clone()],
-                ..Default::default()
-            },
-        );
-        manager.apply_scheduler_states_for_ids(states);
-        {
-            let entries = manager.entries.lock();
-            assert_eq!(entries[0].in_flight_requests, 0);
-            assert!(entries[0].in_flight_leases.is_empty());
-        }
-
-        let now = Instant::now();
-        {
-            let mut entries = manager.entries.lock();
-            entries[0].in_flight_requests = 1;
-            entries[0].in_flight_leases.push(InFlightLease {
-                id: 99,
-                acquired_at: now,
-                last_seen_at: now,
-                kind: InFlightKind::Stream,
-                weight_units: 1,
-            });
-        }
-
-        let mut states = HashMap::new();
-        states.insert(
-            1,
-            SchedulerCredentialState {
-                in_flight_leases: vec![stale_redis_lease],
-                ..Default::default()
-            },
-        );
-        manager.apply_scheduler_states_for_ids(states);
-
-        let entries = manager.entries.lock();
-        assert_eq!(entries[0].in_flight_requests, 1);
-        assert_eq!(entries[0].in_flight_leases.len(), 1);
-        assert_eq!(entries[0].in_flight_leases[0].id, 99);
-        assert_eq!(entries[0].in_flight_leases[0].kind, InFlightKind::Stream);
-    }
-
-    #[test]
-    fn test_scheduler_state_apply_ignores_recently_released_redis_in_flight_lease() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![test_access_token_credential("token-1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let now_ms = Utc::now().timestamp_millis();
-
-        record_released_in_flight_lease_tombstone(
-            &manager.released_in_flight_lease_tombstones,
-            1,
-            44,
-        );
-
-        let mut states = HashMap::new();
-        states.insert(
-            1,
-            SchedulerCredentialState {
-                in_flight_leases: vec![crate::storage::redis_cache::SchedulerInFlightLease {
-                    id: 44,
-                    acquired_at_ms: now_ms,
-                    last_seen_at_ms: now_ms,
-                    kind: InFlightKind::Api.as_str().to_string(),
-                    weight_units: 1,
-                }],
-                ..Default::default()
-            },
-        );
-        manager.apply_scheduler_states_for_ids(states);
-        {
-            let entries = manager.entries.lock();
-            assert_eq!(entries[0].in_flight_requests, 0);
-            assert!(entries[0].in_flight_leases.is_empty());
-        }
-
-        let mut states = HashMap::new();
-        states.insert(
-            1,
-            SchedulerCredentialState {
-                in_flight_leases: vec![crate::storage::redis_cache::SchedulerInFlightLease {
-                    id: 45,
-                    acquired_at_ms: now_ms,
-                    last_seen_at_ms: now_ms,
-                    kind: InFlightKind::Api.as_str().to_string(),
-                    weight_units: 1,
-                }],
-                ..Default::default()
-            },
-        );
-        manager.apply_scheduler_states_for_ids(states);
-
-        let entries = manager.entries.lock();
-        assert_eq!(entries[0].in_flight_requests, 1);
-        assert_eq!(entries[0].in_flight_leases.len(), 1);
-        assert_eq!(entries[0].in_flight_leases[0].id, 45);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![test_access_token_credential("token-1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let result = manager
-            .block_on_scheduler_redis_state_sync("测试 Redis 调度状态同步", async move {
-                std::future::pending::<anyhow::Result<()>>().await
-            });
-
-        assert!(result.is_none());
-        assert!(manager.scheduler_redis_degraded_until.lock().is_none());
-    }
-
-    #[test]
-    fn test_scheduler_redis_hot_op_guard_caps_parallel_ops() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![test_access_token_credential("token-1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut guards = Vec::new();
-        for _ in 0..SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS {
-            guards.push(
-                manager
-                    .try_enter_scheduler_redis_hot_op()
-                    .expect("hot Redis op guard should be admitted below cap"),
-            );
-        }
-        assert!(manager.try_enter_scheduler_redis_hot_op().is_none());
-
-        drop(guards.pop());
-        assert!(manager.try_enter_scheduler_redis_hot_op().is_some());
-    }
-
-    #[test]
-    fn test_scheduler_redis_degraded_backoff_grows_on_repeated_failures() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![test_access_token_credential("token-1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let err = anyhow::anyhow!("redis timeout");
-
-        manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
-        let first_deadline = *manager.scheduler_redis_degraded_until.lock();
-        let first_remaining = first_deadline
-            .expect("degraded deadline")
-            .saturating_duration_since(Instant::now());
-
-        *manager.scheduler_redis_degraded_until.lock() = None;
-        manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
-        let second_deadline = *manager.scheduler_redis_degraded_until.lock();
-        let second_remaining = second_deadline
-            .expect("degraded deadline")
-            .saturating_duration_since(Instant::now());
-
-        assert!(first_remaining <= SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE);
-        assert!(second_remaining > first_remaining);
-        assert!(second_remaining <= SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX);
-    }
-
-    fn test_access_token_credential(token: &str, subscription_title: &str) -> KiroCredentials {
-        let mut credential = KiroCredentials::default();
-        credential.subscription_title = Some(subscription_title.to_string());
-        credential.access_token = Some(token.to_string());
-        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        credential
-    }
-
-    #[test]
-    fn test_is_token_expired_with_expired_token() {
-        let mut credentials = KiroCredentials::default();
-        credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
-        assert!(is_token_expired(&credentials));
-    }
-
-    #[test]
-    fn test_is_token_expired_with_valid_token() {
-        let mut credentials = KiroCredentials::default();
-        let future = Utc::now() + Duration::hours(1);
-        credentials.expires_at = Some(future.to_rfc3339());
-        assert!(!is_token_expired(&credentials));
-    }
-
-    #[test]
-    fn test_is_token_expired_within_5_minutes() {
-        let mut credentials = KiroCredentials::default();
-        let expires = Utc::now() + Duration::minutes(3);
-        credentials.expires_at = Some(expires.to_rfc3339());
-        assert!(is_token_expired(&credentials));
-    }
-
-    #[test]
-    fn test_is_token_expired_no_expires_at() {
-        let credentials = KiroCredentials::default();
-        assert!(is_token_expired(&credentials));
-    }
-
-    #[test]
-    fn test_is_token_expiring_soon_within_10_minutes() {
-        let mut credentials = KiroCredentials::default();
-        let expires = Utc::now() + Duration::minutes(8);
-        credentials.expires_at = Some(expires.to_rfc3339());
-        assert!(is_token_expiring_soon(&credentials));
-    }
-
-    #[test]
-    fn test_is_token_expiring_soon_beyond_10_minutes() {
-        let mut credentials = KiroCredentials::default();
-        let expires = Utc::now() + Duration::minutes(15);
-        credentials.expires_at = Some(expires.to_rfc3339());
-        assert!(!is_token_expiring_soon(&credentials));
-    }
-
-    #[test]
-    fn test_validate_refresh_token_missing() {
-        let credentials = KiroCredentials::default();
-        let result = validate_refresh_token(&credentials);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_refresh_token_valid() {
-        let mut credentials = KiroCredentials::default();
-        credentials.refresh_token = Some("a".repeat(150));
-        let result = validate_refresh_token(&credentials);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_invalid_grant_resource_not_found_is_permanent_refresh_failure() {
-        assert!(is_invalid_grant_response(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":"invalid_grant","error_description":"Resource not found"}"#
-        ));
-        assert!(!is_invalid_grant_response(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"error":"invalid_grant","error_description":"Resource not found"}"#
-        ));
-        assert!(!is_invalid_grant_response(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":"slow_down"}"#
-        ));
-    }
-
-    #[test]
-    fn test_sha256_hex() {
-        let result = sha256_hex("test");
-        assert_eq!(
-            result,
-            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-        );
-    }
-
-    #[test]
-    fn usage_limits_user_agents_match_kiro_rest_shape() {
-        assert_eq!(
-            usage_limits_amz_user_agent("0.12.155", "machine"),
-            "aws-sdk-js/1.0.0 KiroIDE-0.12.155-machine"
-        );
-        assert_eq!(
-            usage_limits_user_agent("macos#23.4.0", "22.22.0", "0.12.155", "machine"),
-            "aws-sdk-js/1.0.0 ua/2.1 os/macos#23.4.0 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-0.12.155-machine"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_refresh_token_rejects_api_key_credential() {
-        let config = Config::default();
-        let mut credentials = KiroCredentials::default();
-        credentials.kiro_api_key = Some("ksk_test_key_123".to_string());
-        credentials.auth_method = Some("api_key".to_string());
-
-        let result = refresh_token(&credentials, &config, None).await;
-
-        assert!(result.is_err(), "API Key 凭据应被 refresh_token 拒绝");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("API Key 凭据不支持刷新"),
-            "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
-            err_msg
-        );
-    }
-
-    #[tokio::test]
-    async fn test_add_credential_reject_duplicate_refresh_token() {
-        let config = Config::default();
-
-        let mut existing = KiroCredentials::default();
-        existing.refresh_token = Some("a".repeat(150));
-
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
-
-        let mut duplicate = KiroCredentials::default();
-        duplicate.refresh_token = Some("a".repeat(150));
-
-        let result = manager.add_credential(duplicate).await;
-        assert!(result.is_err());
-        assert!(result.err().unwrap().to_string().contains("凭据已存在"));
-    }
-
-    #[tokio::test]
-    async fn test_add_credential_api_key_success() {
-        let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
-
-        let mut api_key_cred = KiroCredentials::default();
-        api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
-        api_key_cred.auth_method = Some("api_key".to_string());
-
-        let result = manager.add_credential(api_key_cred).await;
-        assert!(result.is_ok());
-        let id = result.unwrap();
-        assert!(id > 0);
-        assert_eq!(manager.total_count(), 1);
-        assert_eq!(manager.available_count(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn postgres_row_level_update_does_not_delete_credentials_added_by_other_instance() {
-        let Some(store) = test_postgres_store().await else {
-            eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let mut first = api_key_credential("ksk_first_row_level");
-        first.id = Some(1);
-        first.priority = 1;
-        store.save_credentials(&[first.clone()]).await.unwrap();
-
-        let manager = MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![first],
-            None,
-            None,
-            false,
-            Some(store.clone()),
-            None,
-        )
-        .unwrap();
-
-        let second = store
-            .insert_credential(&KiroCredentials {
-                kiro_api_key: Some("ksk_second_other_instance".to_string()),
-                auth_method: Some("api_key".to_string()),
-                priority: 2,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        manager.set_priority(1, 5).unwrap();
-        let loaded = store.load_credentials().await.unwrap();
-        assert!(
-            loaded
-                .iter()
-                .any(|credential| credential.id == Some(1) && credential.priority == 5),
-            "当前实例更新的凭据应被行级保存"
-        );
-        assert!(
-            loaded.iter().any(|credential| credential.id == second.id),
-            "其他实例新增的凭据不应被旧内存快照软删除"
-        );
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn postgres_failure_counts_are_atomic_across_managers() {
-        let Some(store) = test_postgres_store().await else {
-            eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
-            return;
-        };
-
-        let mut credential = api_key_credential("ksk_atomic_failure_count");
-        credential.id = Some(1);
-        store.save_credentials(&[credential.clone()]).await.unwrap();
-
-        let manager_a = MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![credential.clone()],
-            None,
-            None,
-            false,
-            Some(store.clone()),
-            None,
-        )
-        .unwrap();
-        let manager_b = MultiTokenManager::new_with_stores(
-            Config::default(),
-            vec![credential],
-            None,
-            None,
-            false,
-            Some(store.clone()),
-            None,
-        )
-        .unwrap();
-
-        assert!(manager_a.report_failure(1));
-        assert!(manager_b.report_failure(1));
-        assert!(!manager_a.report_failure(1));
-
-        let runtime_state = store.load_credential_runtime_state().await.unwrap();
-        let state = runtime_state.get(&1).unwrap();
-        assert_eq!(state.failure_count, MAX_FAILURES_PER_CREDENTIAL);
-        assert_eq!(
-            state.disabled_reason.as_deref(),
-            Some(DisabledReason::TooManyFailures.as_str())
-        );
-        let credentials = store.load_credentials().await.unwrap();
-        assert!(
-            credentials
-                .iter()
-                .any(|credential| { credential.id == Some(1) && credential.disabled })
-        );
-        let snapshot = manager_a.snapshot();
-        assert!(snapshot.entries.iter().any(|entry| {
-            entry.id == 1 && entry.disabled && entry.failure_count == MAX_FAILURES_PER_CREDENTIAL
-        }));
-
-        store.drop_test_schema().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_add_credential_reject_duplicate_api_key() {
-        let config = Config::default();
-
-        let mut existing = KiroCredentials::default();
-        existing.kiro_api_key = Some("ksk_existing_key".to_string());
-        existing.auth_method = Some("api_key".to_string());
-
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
-
-        let mut duplicate = KiroCredentials::default();
-        duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
-        duplicate.auth_method = Some("api_key".to_string());
-
-        let result = manager.add_credential(duplicate).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("kiroApiKey 重复")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_add_credential_api_key_empty_rejected() {
-        let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
-
-        let mut cred = KiroCredentials::default();
-        cred.kiro_api_key = Some(String::new());
-        cred.auth_method = Some("api_key".to_string());
-
-        let result = manager.add_credential(cred).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("kiroApiKey 为空")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_add_credential_api_key_missing_key_rejected() {
-        let config = Config::default();
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
-
-        let mut cred = KiroCredentials::default();
-        cred.auth_method = Some("api_key".to_string());
-        // kiro_api_key is None
-
-        let result = manager.add_credential(cred).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("缺少 kiroApiKey")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_add_credential_api_key_and_oauth_coexist() {
-        let config = Config::default();
-
-        let mut oauth_cred = KiroCredentials::default();
-        oauth_cred.refresh_token = Some("a".repeat(150));
-
-        let manager = MultiTokenManager::new(config, vec![oauth_cred], None, None, false).unwrap();
-
-        let mut api_key_cred = KiroCredentials::default();
-        api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
-        api_key_cred.auth_method = Some("api_key".to_string());
-
-        let result = manager.add_credential(api_key_cred).await;
-        assert!(result.is_ok());
-        assert_eq!(manager.total_count(), 2);
-        assert_eq!(manager.available_count(), 2);
-    }
-
-    // MultiTokenManager 测试
-
-    #[test]
-    fn test_multi_token_manager_new() {
-        let config = Config::default();
-        let mut cred1 = KiroCredentials::default();
-        cred1.priority = 0;
-        let mut cred2 = KiroCredentials::default();
-        cred2.priority = 1;
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
-        assert_eq!(manager.available_count(), 2);
-    }
-
-    #[test]
-    fn test_multi_token_manager_empty_credentials() {
-        let config = Config::default();
-        let result = MultiTokenManager::new(config, vec![], None, None, false);
-        // 支持 0 个凭据启动（可通过管理面板添加）
-        assert!(result.is_ok());
-        let manager = result.unwrap();
-        assert_eq!(manager.total_count(), 0);
-        assert_eq!(manager.available_count(), 0);
-    }
-
-    #[test]
-    fn test_multi_token_manager_duplicate_ids() {
-        let config = Config::default();
-        let mut cred1 = KiroCredentials::default();
-        cred1.id = Some(1);
-        let mut cred2 = KiroCredentials::default();
-        cred2.id = Some(1); // 重复 ID
-
-        let result = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false);
-        assert!(result.is_err());
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("重复的凭据 ID"),
-            "错误消息应包含 '重复的凭据 ID'，实际: {}",
-            err_msg
-        );
-    }
-
-    #[test]
-    fn test_multi_token_manager_api_key_missing_kiro_api_key_auto_disabled() {
-        let config = Config::default();
-
-        // auth_method=api_key 但缺少 kiro_api_key → 应被自动禁用
-        let mut bad_cred = KiroCredentials::default();
-        bad_cred.auth_method = Some("api_key".to_string());
-        // kiro_api_key 保持 None
-
-        let mut good_cred = KiroCredentials::default();
-        good_cred.refresh_token = Some("valid_token".to_string());
-
-        let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 2);
-        assert_eq!(manager.available_count(), 1); // bad_cred 被禁用，只剩 1 个可用
-    }
-
-    #[test]
-    fn test_multi_token_manager_api_key_with_kiro_api_key_not_disabled() {
-        let config = Config::default();
-
-        // auth_method=api_key 且有 kiro_api_key → 不应被禁用
-        let mut cred = KiroCredentials::default();
-        cred.auth_method = Some("api_key".to_string());
-        cred.kiro_api_key = Some("ksk_test123".to_string());
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        assert_eq!(manager.total_count(), 1);
-        assert_eq!(manager.available_count(), 1);
-    }
-
-    #[test]
-    fn test_multi_token_manager_report_failure() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        // 凭据会自动分配 ID（从 1 开始）
-        // 前两次失败不会禁用（使用 ID 1）
-        assert!(manager.report_failure(1));
-        assert!(manager.report_failure(1));
-        assert_eq!(manager.available_count(), 2);
-
-        // 第三次失败会禁用第一个凭据
-        assert!(manager.report_failure(1));
-        assert_eq!(manager.available_count(), 1);
-
-        // 继续失败第二个凭据（使用 ID 2）
-        assert!(manager.report_failure(2));
-        assert!(manager.report_failure(2));
-        assert!(!manager.report_failure(2)); // 所有凭据都禁用了
-        assert_eq!(manager.available_count(), 0);
-    }
-
-    #[test]
-    fn test_multi_token_manager_report_success() {
-        let config = Config::default();
-        let cred = KiroCredentials::default();
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-
-        // 失败两次（使用 ID 1）
-        manager.report_failure(1);
-        manager.report_failure(1);
-
-        // 成功后重置计数（使用 ID 1）
-        manager.report_success(1);
-
-        // 再失败两次不会禁用
-        manager.report_failure(1);
-        manager.report_failure(1);
-        assert_eq!(manager.available_count(), 1);
-    }
-
-    #[test]
-    fn test_multi_token_manager_switch_to_next() {
-        let config = Config::default();
-        let mut cred1 = KiroCredentials::default();
-        cred1.refresh_token = Some("token1".to_string());
-        let mut cred2 = KiroCredentials::default();
-        cred2.refresh_token = Some("token2".to_string());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        let initial_id = manager.snapshot().current_id;
-
-        // 切换到下一个
-        assert!(manager.switch_to_next());
-        assert_ne!(manager.snapshot().current_id, initial_id);
-    }
-
-    #[test]
-    fn test_set_load_balancing_mode_updates_runtime_memory_without_store() {
-        let config = Config::default();
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
-
-        manager
-            .set_load_balancing_mode("balanced".to_string())
-            .unwrap();
-
-        assert_eq!(manager.get_load_balancing_mode(), "balanced");
-        assert_eq!(manager.runtime_config().load_balancing_mode, "balanced");
-    }
-
-    #[test]
-    fn test_update_runtime_config_updates_runtime_memory_without_store() {
-        use crate::model::config::{
-            ReportedUsageConfig, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
-        };
-
-        let config = Config::default();
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
-
-        manager
-            .update_runtime_config(|config| {
-                config.credential_dispatch_max_wait_secs = 77;
-                config.reported_usage = ReportedUsageConfig {
-                    default: ReportedUsagePathPolicy::default(),
-                    path_overrides: [(
-                        "/custom".to_string(),
-                        ReportedUsagePathPolicy {
-                            input: ReportedUsageFieldPolicy::sample_input_max(42),
-                            ..ReportedUsagePathPolicy::default()
-                        },
-                    )]
-                    .into_iter()
-                    .collect(),
-                };
-            })
-            .unwrap();
-
-        assert_eq!(
-            manager
-                .runtime_config()
-                .reported_usage
-                .policy_for_path("/custom/v1/messages")
-                .input
-                .max_tokens,
-            42
-        );
-    }
-
-    #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
-        let config = Config::default();
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        // 凭据会自动分配 ID（从 1 开始）
-        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
-            manager.report_failure(1);
-        }
-        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
-            manager.report_failure(2);
-        }
-
-        assert_eq!(manager.available_count(), 0);
-
-        // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert!(ctx.token == "t1" || ctx.token == "t2");
-        assert_eq!(manager.available_count(), 2);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
-     {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut bad_cred = KiroCredentials::default();
-        bad_cred.priority = 0;
-        bad_cred.refresh_token = Some("bad".to_string());
-
-        let mut good_cred = KiroCredentials::default();
-        good_cred.priority = 1;
-        good_cred.access_token = Some("good-token".to_string());
-        good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 2);
-        assert_eq!(ctx.token, "good-token");
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_all_bad_refresh_tokens_are_bounded_by_auth_cooldown() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut first = KiroCredentials::default();
-        first.refresh_token = Some("bad".to_string());
-        let mut second = KiroCredentials::default();
-        second.refresh_token = Some("also-bad".to_string());
-
-        let manager =
-            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
-        let started = Instant::now();
-        let err = manager
-            .acquire_context(None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            started.elapsed() < StdDuration::from_millis(500),
-            "全部 refreshToken 无效时应按凭据数量和失败阈值有界结束，不应持续打"
-        );
-        assert!(
-            err.contains("所有可用账号均处于上游临时冷却"),
-            "错误应明确结束调度并要求退避，实际: {}",
-            err
-        );
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.available, 2);
-        assert!(snapshot.entries.iter().all(|entry| !entry.disabled));
-        assert!(
-            snapshot
-                .entries
-                .iter()
-                .all(|entry| entry.refresh_failure_count == 1)
-        );
-        assert!(snapshot.entries.iter().all(|entry| entry.cooled_down));
-    }
-
-    #[tokio::test]
-    async fn test_acquire_context_sticks_same_session_to_same_credential_in_balanced_mode() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        let excluded = HashSet::new();
-
-        let first = manager
-            .acquire_context_for_session(None, Some("session-a"), &excluded)
-            .await
-            .unwrap();
-        manager.report_success_for_session(first.id, Some("session-a"));
-
-        let second = manager
-            .acquire_context_for_session(None, Some("session-a"), &excluded)
-            .await
-            .unwrap();
-
-        assert_eq!(first.id, second.id);
-    }
-
-    #[tokio::test]
-    async fn test_model_specific_cooldown_only_blocks_same_model() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        manager
-            .report_transient_failure_kind(
-                1,
-                Some("claude-opus-4.8"),
-                TransientFailureKind::RateLimit,
-                Some(StdDuration::from_secs(60)),
-                "429",
-            )
-            .unwrap();
-
-        let mut sonnet = manager
-            .acquire_context_for_session(Some("claude-sonnet-4.6"), None, &HashSet::new())
-            .await
-            .unwrap();
-        assert_eq!(sonnet.id, 1);
-        sonnet.release_in_flight();
-
-        let mut opus = manager
-            .acquire_context_for_session(Some("claude-opus-4.8"), None, &HashSet::new())
-            .await
-            .unwrap();
-        assert_eq!(opus.id, 2);
-        opus.release_in_flight();
-
-        let snapshot = manager.snapshot();
-        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert!(entry.cooled_down);
-        assert_eq!(entry.cooldowns.len(), 1);
-        assert_eq!(entry.cooldowns[0].model.as_deref(), Some("claude-opus-4.8"));
-    }
-
-    #[tokio::test]
-    async fn test_supported_model_exact_match_allows_local_scheduler_selection() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        cred.supported_models = vec!["claude-sonnet-4".to_string()];
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let mut ctx = manager
-            .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
-            .await
-            .unwrap();
-
-        assert_eq!(ctx.id, 1);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_supported_model_filter_does_not_alias_local_scheduler_selection() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        cred.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let err = manager
-            .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(err.contains("没有支持当前模型的可用账号"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn test_empty_supported_models_allows_future_model_when_restricted_credential_does_not() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "priority".to_string();
-
-        let mut restricted = test_access_token_credential("restricted", "Pro");
-        restricted.priority = 0;
-        restricted.supported_models = vec!["claude-sonnet-4.6".to_string()];
-
-        let mut unrestricted = test_access_token_credential("unrestricted", "Pro");
-        unrestricted.priority = 1;
-        unrestricted.supported_models = Vec::new();
-
-        let manager =
-            MultiTokenManager::new(config, vec![restricted, unrestricted], None, None, false)
-                .unwrap();
-        let mut ctx = manager
-            .acquire_context_for_session(Some("claude-sonnet-5"), None, &HashSet::new())
-            .await
-            .unwrap();
-
-        assert_eq!(ctx.id, 2);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_supported_model_alias_does_not_cross_family_in_local_scheduler() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        cred.supported_models = vec!["claude-opus-4.8".to_string()];
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let err = manager
-            .acquire_context_for_session(Some("claude-sonnet-4.6"), None, &HashSet::new())
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(err.contains("没有支持当前模型的可用账号"), "{err}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn test_model_scoped_429_high_concurrency_disabled_and_model_filters() {
-        const OPUS_MODEL: &str = "claude-opus-4.8";
-        const CREDENTIAL_COUNT: usize = 12;
-        const REQUESTS_PER_MODEL: usize = 120;
-        const PER_CREDENTIAL_LIMIT: u32 = 2;
-        const GLOBAL_LIMIT: u32 = 12;
-
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = PER_CREDENTIAL_LIMIT;
-        config.dispatch_global_max_concurrent_requests = GLOBAL_LIMIT;
-        config.dispatch_max_queued_requests = (REQUESTS_PER_MODEL * 2) as u32;
-        config.credential_dispatch_max_wait_secs = 5;
-        config.credential_rate_limit_cooldown_secs = 30;
-        config.credential_max_cooldown_secs = 30;
-        config.credential_cooldown_jitter_percent = 0;
-
-        let mut credentials = (1..=CREDENTIAL_COUNT)
-            .map(|idx| {
-                let subscription = if idx % 2 == 0 { "Pro" } else { "Free" };
-                test_access_token_credential(&format!("token-{idx}"), subscription)
-            })
-            .collect::<Vec<_>>();
-        credentials[10].disabled = true;
-        credentials[11].disabled = true;
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
-
-        for id in [2_u64, 4, 6] {
-            manager
-                .report_transient_failure_kind(
-                    id,
-                    Some(OPUS_MODEL),
-                    TransientFailureKind::RateLimit,
-                    Some(StdDuration::from_secs(30)),
-                    "429 opus high concurrency",
-                )
-                .unwrap();
-        }
-
-        let start = Arc::new(tokio::sync::Barrier::new(REQUESTS_PER_MODEL * 2 + 1));
-        let selected_sonnet = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-        let selected_opus = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-        let mut handles = Vec::with_capacity(REQUESTS_PER_MODEL * 2);
-
-        for idx in 0..REQUESTS_PER_MODEL {
-            let manager = manager.clone();
-            let start = start.clone();
-            let selected_sonnet = selected_sonnet.clone();
-            handles.push(tokio::spawn(async move {
-                start.wait().await;
-                let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
-                let snapshot = manager.snapshot();
-                assert!(
-                    snapshot.global_in_flight_requests <= GLOBAL_LIMIT,
-                    "全局并发超限: {} > {}",
-                    snapshot.global_in_flight_requests,
-                    GLOBAL_LIMIT
-                );
-                for entry in &snapshot.entries {
-                    assert!(
-                        entry.in_flight_requests <= entry.max_concurrent_requests,
-                        "凭据 #{} 并发超限: {} > {}",
-                        entry.id,
-                        entry.in_flight_requests,
-                        entry.max_concurrent_requests
-                    );
-                }
-                tokio::time::sleep(StdDuration::from_millis(2 + (idx % 5) as u64)).await;
-                let id = ctx.id;
-                manager.report_success_with_latency(id, Some(SONNET_MODEL), None);
-                ctx.release_in_flight();
-                selected_sonnet.lock().unwrap().push(id);
-            }));
-        }
-
-        for idx in 0..REQUESTS_PER_MODEL {
-            let manager = manager.clone();
-            let start = start.clone();
-            let selected_opus = selected_opus.clone();
-            handles.push(tokio::spawn(async move {
-                start.wait().await;
-                let mut ctx = manager.acquire_context(Some(OPUS_MODEL)).await.unwrap();
-                assert!(
-                    matches!(ctx.id, 8 | 10),
-                    "opus 只能调度未冷却且支持 opus 的 Pro 凭据，实际 #{}",
-                    ctx.id
-                );
-                tokio::time::sleep(StdDuration::from_millis(2 + (idx % 5) as u64)).await;
-                let id = ctx.id;
-                manager.report_success_with_latency(id, Some(OPUS_MODEL), None);
-                ctx.release_in_flight();
-                selected_opus.lock().unwrap().push(id);
-            }));
-        }
-
-        start.wait().await;
-        for handle in handles {
-            tokio::time::timeout(StdDuration::from_secs(10), handle)
-                .await
-                .expect("混合模型高并发调度不应超时")
-                .expect("混合模型高并发调度不应 panic");
-        }
-
-        let sonnet_ids = selected_sonnet.lock().unwrap().clone();
-        let opus_ids = selected_opus.lock().unwrap().clone();
-        assert_eq!(sonnet_ids.len(), REQUESTS_PER_MODEL);
-        assert_eq!(opus_ids.len(), REQUESTS_PER_MODEL);
-        assert!(
-            [2_u64, 4, 6].iter().any(|id| sonnet_ids.contains(id)),
-            "sonnet 应允许使用仅 opus 模型冷却的凭据，实际分布: {:?}",
-            sonnet_ids
-        );
-        assert!(
-            opus_ids.iter().all(|id| matches!(*id, 8 | 10)),
-            "opus 不应使用 Free、禁用或 opus 冷却凭据，实际分布: {:?}",
-            opus_ids
-        );
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.global_in_flight_requests, 0);
-        assert_eq!(snapshot.queued_requests, 0);
-        for id in [2_u64, 4, 6] {
-            let entry = snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.id == id)
-                .unwrap();
-            assert!(entry.cooldowns.iter().any(|cooldown| {
-                !cooldown.global && cooldown.model.as_deref() == Some(OPUS_MODEL)
-            }));
-        }
-        for id in [11_u64, 12] {
-            assert!(
-                snapshot
-                    .entries
-                    .iter()
-                    .find(|entry| entry.id == id)
-                    .unwrap()
-                    .disabled
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_acquire_context_excluded_bound_session_can_fallback() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        let empty = HashSet::new();
-
-        let first = manager
-            .acquire_context_for_session(None, Some("session-b"), &empty)
-            .await
-            .unwrap();
-
-        let mut excluded = HashSet::new();
-        excluded.insert(first.id);
-        let fallback = manager
-            .acquire_context_for_session(None, Some("session-b"), &excluded)
-            .await
-            .unwrap();
-
-        assert_ne!(first.id, fallback.id);
-
-        let rebound = manager
-            .acquire_context_for_session(None, Some("session-b"), &empty)
-            .await
-            .unwrap();
-        assert_eq!(first.id, rebound.id);
-    }
-
-    #[tokio::test]
-    async fn test_bound_session_falls_back_when_bound_credential_is_full() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        let empty = HashSet::new();
-
-        let mut bound = manager
-            .acquire_context_for_session(None, Some("sticky-full"), &empty)
-            .await
-            .unwrap();
-        manager.report_success_for_session(bound.id, Some("sticky-full"));
-
-        let mut fallback = manager
-            .acquire_context_for_session(None, Some("sticky-full"), &empty)
-            .await
-            .unwrap();
-
-        assert_ne!(
-            bound.id, fallback.id,
-            "同一 sticky 会话绑定账号并发已满时，应临时调度到其他可用账号，而不是等待绑定账号"
-        );
-        assert!(fallback.fallback_from_sticky);
-        assert!(!fallback.sticky_bound);
-
-        fallback.release_in_flight();
-        bound.release_in_flight();
-
-        let rebound = manager
-            .acquire_context_for_session(None, Some("sticky-full"), &empty)
-            .await
-            .unwrap();
-        assert_eq!(
-            rebound.id, bound.id,
-            "并发释放后 sticky 会话应回到原绑定账号，保持粘性"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_transient_failure_cools_down_without_disabling_credential() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_transient_cooldown_secs = 60;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        assert!(
-            manager
-                .report_transient_failure(1, None, Some(StdDuration::from_secs(20)), "429")
-                .unwrap()
-        );
-
-        let snapshot = manager.snapshot();
-        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert!(!first.disabled);
-        assert_eq!(first.failure_count, 0);
-        assert!(first.cooled_down);
-        assert!(first.cooldown_remaining_secs > 0);
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 2);
-        assert_eq!(manager.available_count(), 2);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_transient_failure_does_not_shorten_existing_cooldown() {
-        let mut config = Config::default();
-        config.credential_transient_cooldown_secs = 60;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        manager
-            .report_transient_failure(1, None, Some(StdDuration::from_secs(30)), "long")
-            .unwrap();
-        manager
-            .report_transient_failure(1, None, Some(StdDuration::from_secs(1)), "short")
-            .unwrap();
-
-        let snapshot = manager.snapshot();
-        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert_eq!(first.cooldown_reason.as_deref(), Some("long"));
-        assert!(first.cooldown_remaining_secs >= 20);
-    }
-
-    #[test]
-    fn test_success_does_not_clear_active_transient_cooldown() {
-        let mut config = Config::default();
-        config.credential_transient_cooldown_secs = 60;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        manager
-            .report_transient_failure(1, None, Some(StdDuration::from_secs(30)), "429")
-            .unwrap();
-        manager.report_success(1);
-
-        let snapshot = manager.snapshot();
-        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert!(first.cooled_down);
-        assert_eq!(first.success_count, 1);
-    }
-
-    #[test]
-    fn test_structured_transient_failure_updates_health_and_backoff() {
-        let mut config = Config::default();
-        config.credential_rate_limit_cooldown_secs = 1;
-        config.credential_max_cooldown_secs = 10;
-        config.credential_cooldown_backoff_multiplier = 2.0;
-        config.credential_cooldown_jitter_percent = 0;
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
-
-        manager
-            .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
-            .unwrap();
-        {
-            let mut entries = manager.entries.lock();
-            let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
-            let coalesce_window_ms =
-                MultiTokenManager::transient_failure_coalesce_window(StdDuration::from_secs(1))
-                    .as_millis() as i64;
-            entry.health.last_error_at_ms =
-                Some(Utc::now().timestamp_millis() - coalesce_window_ms - 1);
-        }
-        manager
-            .report_transient_failure_kind(
-                1,
-                None,
-                TransientFailureKind::RateLimit,
-                None,
-                "429 again",
-            )
-            .unwrap();
-
-        let entry = &manager.snapshot().entries[0];
-        assert_eq!(entry.transient_failure_streak, 2);
-        assert!(entry.recent_error_rate > 0.0);
-        assert_eq!(entry.last_error_kind.as_deref(), Some("rate_limit"));
-        assert!(entry.cooldown_remaining_secs >= 2);
-        assert!(entry.in_probation);
-    }
-
-    #[test]
-    fn test_transient_failure_coalesces_same_burst_without_backoff_amplification() {
-        let mut config = Config::default();
-        config.credential_server_error_cooldown_secs = 5;
-        config.credential_max_cooldown_secs = 300;
-        config.credential_cooldown_backoff_multiplier = 2.0;
-        config.credential_cooldown_jitter_percent = 0;
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("token", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        for index in 0..12 {
-            manager
-                .report_transient_failure_kind(
-                    1,
-                    None,
-                    TransientFailureKind::Server,
-                    None,
-                    format!("server burst {index}"),
-                )
-                .unwrap();
-        }
-
-        let entry = &manager.snapshot().entries[0];
-        assert_eq!(entry.transient_failure_streak, 1);
-        assert!(
-            entry.cooldown_remaining_secs <= 6,
-            "同一波并发 server 错误不应把 5s 基础冷却放大，实际 remaining={}",
-            entry.cooldown_remaining_secs
-        );
-        assert_eq!(entry.last_error_kind.as_deref(), Some("server"));
-    }
-
-    #[test]
-    fn test_error_specific_cooldown_parameters_are_effective() {
-        let cases: [(TransientFailureKind, fn(&mut Config), u64); 6] = [
-            (
-                TransientFailureKind::RateLimit,
-                |config: &mut Config| config.credential_rate_limit_cooldown_secs = 2,
-                2,
-            ),
-            (
-                TransientFailureKind::Server,
-                |config: &mut Config| config.credential_server_error_cooldown_secs = 3,
-                3,
-            ),
-            (
-                TransientFailureKind::Network,
-                |config: &mut Config| config.credential_network_error_cooldown_secs = 4,
-                4,
-            ),
-            (
-                TransientFailureKind::Stream,
-                |config: &mut Config| config.credential_stream_error_cooldown_secs = 5,
-                5,
-            ),
-            (
-                TransientFailureKind::Protocol,
-                |config: &mut Config| config.credential_protocol_error_cooldown_secs = 6,
-                6,
-            ),
-            (
-                TransientFailureKind::Auth,
-                |config: &mut Config| config.credential_auth_error_cooldown_secs = 7,
-                7,
-            ),
-        ];
-
-        for (kind, configure, expected_min_secs) in cases {
-            let mut config = Config::default();
-            config.credential_max_cooldown_secs = 30;
-            config.credential_cooldown_backoff_multiplier = 1.0;
-            config.credential_cooldown_jitter_percent = 0;
-            configure(&mut config);
-
-            let manager = MultiTokenManager::new(
-                config,
-                vec![test_access_token_credential("token", "Pro")],
-                None,
-                None,
-                false,
-            )
-            .unwrap();
-
-            manager
-                .report_transient_failure_kind(1, None, kind, None, "synthetic")
-                .unwrap();
-            let entry = &manager.snapshot().entries[0];
-            assert_eq!(entry.last_error_kind.as_deref(), Some(kind.as_str()));
-            assert!(
-                entry.cooldown_remaining_secs >= expected_min_secs,
-                "{kind:?} 应使用对应配置冷却，实际 remaining={} expected_min={expected_min_secs}",
-                entry.cooldown_remaining_secs
-            );
-        }
-    }
-
-    #[test]
-    fn test_scheduler_error_ewma_alpha_changes_error_rate_update() {
-        let manager_with_alpha = |alpha: f64| {
-            let mut config = Config::default();
-            config.scheduler_error_ewma_alpha = alpha;
-            config.credential_rate_limit_cooldown_secs = 1;
-            config.credential_max_cooldown_secs = 10;
-            config.credential_cooldown_jitter_percent = 0;
-            MultiTokenManager::new(
-                config,
-                vec![test_access_token_credential("token", "Pro")],
-                None,
-                None,
-                false,
-            )
-            .unwrap()
-        };
-
-        let low_alpha = manager_with_alpha(0.1);
-        let high_alpha = manager_with_alpha(0.9);
-        low_alpha
-            .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
-            .unwrap();
-        high_alpha
-            .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
-            .unwrap();
-
-        let low_rate = low_alpha.snapshot().entries[0].recent_error_rate;
-        let high_rate = high_alpha.snapshot().entries[0].recent_error_rate;
-        assert!(
-            high_rate > low_rate,
-            "scheduler_error_ewma_alpha 应改变错误率 EWMA 更新幅度，low={low_rate}, high={high_rate}"
-        );
-        assert!((low_rate - 0.1).abs() < f64::EPSILON);
-        assert!((high_rate - 0.9).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_health_balanced_score_parameters_are_effective() {
-        let mut worse = CredentialEntry {
-            id: 1,
-            credentials: KiroCredentials {
-                priority: 10,
-                max_concurrent_requests: Some(2),
-                ..Default::default()
-            },
-            failure_count: 0,
-            refresh_failure_count: 0,
-            disabled: false,
-            disabled_reason: None,
-            success_count: 0,
-            total_selection_count: 100,
-            last_used_at: None,
-            cooldown_until: None,
-            cooldown_reason: None,
-            model_cooldowns: HashMap::new(),
-            rate_limit_available_at: None,
-            in_flight_requests: 1,
-            in_flight_leases: Vec::new(),
-            warmup_remaining: 0,
-            health: SchedulerHealthState::default(),
-            model_health: HashMap::new(),
-            selection_events: VecDeque::new(),
-        };
-        worse.health.recent_error_rate = 0.5;
-        worse.health.latency_ewma_ms = Some(1_000.0);
-        let now_ms = Utc::now().timestamp_millis();
-        worse.health.probation_until_ms = Some(now_ms + 60_000);
-
-        let better = CredentialEntry {
-            id: 2,
-            credentials: KiroCredentials::default(),
-            failure_count: 0,
-            refresh_failure_count: 0,
-            disabled: false,
-            disabled_reason: None,
-            success_count: 0,
-            total_selection_count: 0,
-            last_used_at: None,
-            cooldown_until: None,
-            cooldown_reason: None,
-            model_cooldowns: HashMap::new(),
-            rate_limit_available_at: None,
-            in_flight_requests: 0,
-            in_flight_leases: Vec::new(),
-            warmup_remaining: 0,
-            health: SchedulerHealthState::default(),
-            model_health: HashMap::new(),
-            selection_events: VecDeque::new(),
-        };
-
-        let mut config = Config::default();
-        config.scheduler_priority_weight = 0.0;
-        config.scheduler_load_weight = 0.0;
-        config.scheduler_error_weight = 0.0;
-        config.scheduler_latency_weight = 0.0;
-        config.scheduler_probation_weight = 0.0;
-        config.scheduler_selection_pressure_weight = 0.0;
-        config.scheduler_total_selection_weight = 0.0;
-
-        assert_eq!(
-            scheduler_score_with_config(&worse, None, now_ms, 0.0, &config),
-            scheduler_score_with_config(&better, None, now_ms, 0.0, &config)
-        );
-
-        let weight_setters: [fn(&mut Config); 7] = [
-            |config: &mut Config| config.scheduler_priority_weight = 1.0,
-            |config: &mut Config| config.scheduler_load_weight = 100.0,
-            |config: &mut Config| config.scheduler_error_weight = 100.0,
-            |config: &mut Config| config.scheduler_latency_weight = 0.01,
-            |config: &mut Config| config.scheduler_probation_weight = 50.0,
-            |config: &mut Config| config.scheduler_selection_pressure_weight = 25.0,
-            |config: &mut Config| config.scheduler_total_selection_weight = 1.0,
-        ];
-
-        for enable_weight in weight_setters {
-            let mut weighted = config.clone();
-            enable_weight(&mut weighted);
-            assert!(
-                scheduler_score_with_config(&worse, None, now_ms, 1.0, &weighted)
-                    > scheduler_score_with_config(&better, None, now_ms, 0.0, &weighted),
-                "启用单个健康调度权重后，较差候选得分应更高"
-            );
-        }
-    }
-
-    #[test]
-    fn test_success_updates_health_latency_without_clearing_cooldown() {
-        let mut config = Config::default();
-        config.credential_stream_error_cooldown_secs = 10;
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
-        manager
-            .report_transient_failure_kind(
-                1,
-                None,
-                TransientFailureKind::Stream,
-                None,
-                "stream idle timeout",
-            )
-            .unwrap();
-        manager.report_success_with_latency(1, None, Some(StdDuration::from_millis(120)));
-
-        let entry = &manager.snapshot().entries[0];
-        assert!(entry.cooled_down);
-        assert_eq!(entry.transient_failure_streak, 0);
-        assert_eq!(entry.latency_ewma_ms, Some(120.0));
-    }
-
-    #[tokio::test]
-    async fn test_health_balanced_mode_prefers_best_scored_candidate() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "health_balanced".to_string();
-        config.scheduler_top_k = 1;
-        let mut first = KiroCredentials::default();
-        first.access_token = Some("first".to_string());
-        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut second = KiroCredentials::default();
-        second.access_token = Some("second".to_string());
-        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager =
-            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
-        {
-            let mut entries = manager.entries.lock();
-            entries[0].health.recent_error_rate = 1.0;
-            entries[0].health.latency_ewma_ms = Some(10_000.0);
-        }
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 2);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_weighted_least_inflight_mode_prefers_lower_load_candidate() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "weighted_least_inflight".to_string();
-        config.credential_max_concurrent_requests = 10;
-        config.scheduler_top_k = 1;
-        config.scheduler_priority_weight = 10.0;
-        config.scheduler_load_weight = 100.0;
-        config.scheduler_error_weight = 0.0;
-        config.scheduler_latency_weight = 0.0;
-        config.scheduler_probation_weight = 0.0;
-        config.scheduler_selection_pressure_weight = 0.0;
-        config.scheduler_total_selection_weight = 0.0;
-        let manager = MultiTokenManager::new(
-            config,
-            vec![
-                test_access_token_credential("busy-token", "Pro"),
-                test_access_token_credential("idle-token", "Pro"),
-            ],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        {
-            let mut entries = manager.entries.lock();
-            entries[0].in_flight_requests = 8;
-            entries[1].in_flight_requests = 0;
-        }
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-
-        assert_eq!(ctx.id, 2);
-        assert_eq!(ctx.token, "idle-token");
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_health_balanced_mode_penalizes_recent_selection_pressure() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "health_balanced".to_string();
-        config.scheduler_top_k = 1;
-        config.scheduler_selection_pressure_weight = 100.0;
-        let mut first = KiroCredentials::default();
-        first.access_token = Some("first".to_string());
-        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut second = KiroCredentials::default();
-        second.access_token = Some("second".to_string());
-        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager =
-            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
-        {
-            let mut entries = manager.entries.lock();
-            entries[0].health.recent_selection_count_60s = 100;
-        }
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 2);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_balanced_mode_rotates_all_warming_credentials_by_recent_selection() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        let mut first = KiroCredentials::default();
-        first.access_token = Some("first".to_string());
-        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut second = KiroCredentials::default();
-        second.access_token = Some("second".to_string());
-        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut third = KiroCredentials::default();
-        third.access_token = Some("third".to_string());
-        third.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager =
-            MultiTokenManager::new(config, vec![first, second, third], None, None, false).unwrap();
-        manager.set_warmup_remaining(1, 3).unwrap();
-        manager.set_warmup_remaining(2, 3).unwrap();
-        manager.set_warmup_remaining(3, 3).unwrap();
-
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            let mut ctx = manager.acquire_context(None).await.unwrap();
-            seen.push(ctx.id);
-            ctx.release_in_flight();
-        }
-
-        assert_eq!(seen, vec![1, 2, 3]);
-        let snapshot = manager.snapshot();
-        assert_eq!(
-            snapshot
-                .entries
-                .iter()
-                .map(|entry| entry.recent_scheduler_selection_count_60s)
-                .collect::<Vec<_>>(),
-            vec![1, 1, 1]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_balanced_mode_gives_warming_group_scaled_target_share() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_warmup_selection_percent = 5;
-        config.credential_warmup_max_selection_percent = 50;
-        let mut ready = KiroCredentials::default();
-        ready.access_token = Some("ready".to_string());
-        ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut warming_a = KiroCredentials::default();
-        warming_a.access_token = Some("warming-a".to_string());
-        warming_a.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut warming_b = KiroCredentials::default();
-        warming_b.access_token = Some("warming-b".to_string());
-        warming_b.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager =
-            MultiTokenManager::new(config, vec![ready, warming_a, warming_b], None, None, false)
-                .unwrap();
-        manager.set_warmup_remaining(2, 3).unwrap();
-        manager.set_warmup_remaining(3, 3).unwrap();
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_ne!(ctx.id, 1);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_simulation_balanced_mode_spreads_new_warming_batch() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        let credentials = (1_u64..=10)
-            .map(|id| api_key_credential(&format!("ksk_warmup_{id}")))
-            .collect::<Vec<_>>();
-        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
-        for id in 1_u64..=10 {
-            manager.set_warmup_remaining(id, 3).unwrap();
-        }
-
-        let mut first_round = Vec::new();
-        for _ in 0..10 {
-            let mut ctx = manager.acquire_context(None).await.unwrap();
-            first_round.push(ctx.id);
-            ctx.release_in_flight();
-        }
-
-        assert_eq!(first_round, (1_u64..=10).collect::<Vec<_>>());
-
-        for _ in 0..40 {
-            let mut ctx = manager.acquire_context(None).await.unwrap();
-            ctx.release_in_flight();
-        }
-
-        let counts = manager
-            .snapshot()
-            .entries
-            .iter()
-            .map(|entry| entry.recent_scheduler_selection_count_60s)
-            .collect::<Vec<_>>();
-        let min = counts.iter().min().copied().unwrap();
-        let max = counts.iter().max().copied().unwrap();
-        assert!(
-            max - min <= 1,
-            "新导入预热账号应均衡参与调度，实际近期选中次数: {counts:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_scheduler_handles_500_daily_credentials_1000_rpm_simulation() {
-        const CREDENTIAL_COUNT: usize = 500;
-        const REQUEST_COUNT: usize = 1000;
-        const MAX_ELAPSED: StdDuration = StdDuration::from_secs(5);
-
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = 0;
-        config.dispatch_global_max_concurrent_requests = 0;
-        config.dispatch_max_queued_requests = 0;
-
-        let credentials = (1..=CREDENTIAL_COUNT)
-            .map(|id| api_key_credential(&format!("ksk_daily_{id}")))
-            .collect::<Vec<_>>();
-        let manager =
-            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
-
-        let started_at = Instant::now();
-        let mut selection_counts: HashMap<u64, usize> = HashMap::new();
-        for _ in 0..REQUEST_COUNT {
-            let mut ctx =
-                tokio::time::timeout(StdDuration::from_secs(1), manager.acquire_context(None))
-                    .await
-                    .expect("500 日抛凭据调度不应单次超时")
-                    .expect("500 日抛凭据调度不应失败");
-            *selection_counts.entry(ctx.id).or_insert(0) += 1;
-            ctx.release_in_flight();
-        }
-        let elapsed = started_at.elapsed();
-
-        assert!(
-            elapsed <= MAX_ELAPSED,
-            "500 日抛凭据、1000 RPM 等价调度耗时过高: {:?} > {:?}",
-            elapsed,
-            MAX_ELAPSED
-        );
-        assert_eq!(
-            selection_counts.len(),
-            CREDENTIAL_COUNT,
-            "1000 次调度应覆盖全部 500 个凭据，实际覆盖 {} 个",
-            selection_counts.len()
-        );
-        let min = selection_counts.values().min().copied().unwrap_or_default();
-        let max = selection_counts.values().max().copied().unwrap_or_default();
-        assert!(
-            max - min <= 1,
-            "balanced 模式在 500 凭据/1000 次调度下分布应接近均匀，实际 min={min}, max={max}"
-        );
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.global_in_flight_requests, 0);
-        assert_eq!(snapshot.queued_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_simulation_mixed_large_requests_failures_and_disabled_accounts() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_rate_limit_cooldown_secs = 60;
-        config.credential_server_error_cooldown_secs = 60;
-        config.credential_max_cooldown_secs = 60;
-        config.credential_cooldown_jitter_percent = 0;
-        config.credential_dispatch_max_wait_secs = 2;
-
-        let mut credentials = (1_u64..=8)
-            .map(|id| api_key_credential(&format!("ksk_mixed_{id}")))
-            .collect::<Vec<_>>();
-        credentials[1].disabled = true;
-        let manager =
-            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
-
-        assert!(manager.report_quota_exhausted(3));
-        assert!(manager.report_risk_controlled(
-            4,
-            CredentialRiskControlReason::TemporarilySuspended,
-            "TEMPORARILY_SUSPENDED"
-        ));
-        assert!(
-            manager
-                .report_transient_failure_kind(
-                    5,
-                    None,
-                    TransientFailureKind::RateLimit,
-                    Some(StdDuration::from_secs(30)),
-                    "429 Too Many Requests",
-                )
-                .unwrap()
-        );
-        assert!(
-            manager
-                .report_transient_failure_kind(
-                    6,
-                    None,
-                    TransientFailureKind::Server,
-                    Some(StdDuration::from_secs(30)),
-                    "502 Bad Gateway",
-                )
-                .unwrap()
-        );
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.available, 5);
-        for id in [2, 3, 4] {
-            let entry = snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.id == id)
-                .unwrap();
-            assert!(entry.disabled, "凭据 #{id} 应被禁用");
-        }
-        for id in [5, 6] {
-            let entry = snapshot
-                .entries
-                .iter()
-                .find(|entry| entry.id == id)
-                .unwrap();
-            assert!(entry.cooled_down, "凭据 #{id} 应处于瞬态冷却");
-        }
-
-        let mut long_a = manager.acquire_context(None).await.unwrap();
-        let mut long_b = manager.acquire_context(None).await.unwrap();
-        let mut long_c = manager.acquire_context(None).await.unwrap();
-        assert_eq!(vec![long_a.id, long_b.id, long_c.id], vec![1, 7, 8]);
-
-        let waiting_manager = manager.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert!(
-            !waiting.is_finished(),
-            "健康账号都被大请求占满时，后续请求应排队等待"
-        );
-
-        long_b.release_in_flight();
-        let mut recovered = tokio::time::timeout(StdDuration::from_secs(1), waiting)
-            .await
-            .expect("释放一个健康账号后等待请求应恢复")
-            .expect("等待任务不应 panic")
-            .expect("等待请求应成功获取凭据");
-        assert_eq!(recovered.id, 7);
-
-        recovered.release_in_flight();
-        long_a.release_in_flight();
-        long_c.release_in_flight();
-        assert_eq!(manager.snapshot().global_in_flight_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_transient_failure_cools_down_only_usable_credential() {
-        let mut config = Config::default();
-        config.credential_transient_cooldown_secs = 1;
-        config.credential_max_cooldown_secs = 1;
-
-        let mut disabled = KiroCredentials::default();
-        disabled.disabled = true;
-        let mut active = KiroCredentials::default();
-        active.access_token = Some("active-token".to_string());
-        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap(),
-        );
-
-        assert!(
-            !manager
-                .report_transient_failure(2, None, Some(StdDuration::from_millis(20)), "429")
-                .unwrap()
-        );
-
-        let snapshot = manager.snapshot();
-        let active = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
-        assert!(!active.disabled);
-        assert_eq!(active.failure_count, 0);
-        assert!(active.cooled_down);
-
-        let started = Instant::now();
-        let err = match manager.acquire_context(None).await {
-            Ok(mut ctx) => {
-                ctx.release_in_flight();
-                panic!("唯一可用凭据处于上游冷却时应快速失败")
-            }
-            Err(err) => err.to_string(),
-        };
-        assert!(
-            started.elapsed() < StdDuration::from_millis(200),
-            "全部候选都处于上游冷却时不应排队等待"
-        );
-        assert!(
-            err.contains("所有可用账号均处于上游临时冷却"),
-            "错误应明确提示全部处于上游临时冷却，实际: {}",
-            err
-        );
-        assert!(
-            err.contains("retry_after_secs="),
-            "错误应携带 retry_after_secs 供下游快速重试退避，实际: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_prefers_other_dispatchable_credential() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_rpm = Some(1);
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        let mut first = manager.acquire_context(None).await.unwrap();
-        let mut second = manager.acquire_context(None).await.unwrap();
-
-        assert_ne!(first.id, second.id);
-        assert!(
-            manager
-                .snapshot()
-                .entries
-                .iter()
-                .filter(|entry| entry.rate_limited)
-                .count()
-                >= 2
-        );
-        first.release_in_flight();
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_blocks_after_window_capacity_is_full() {
-        let mut config = Config::default();
-        config.credential_rpm = Some(1);
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
-        let mut first = manager.acquire_context(None).await.unwrap();
-        first.release_in_flight();
-
-        let state = manager.local_pool_route_state(None);
-        assert_eq!(state.kind, LocalPoolRouteStateKind::AllCoolingDown);
-        assert_eq!(state.rate_limit_blocked, 1);
-        assert!(state.retry_after_secs.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_rate_limiter_allows_idle_burst_up_to_rpm_capacity() {
-        let mut config = Config::default();
-        config.credential_rpm = Some(50);
-        config.credential_max_concurrent_requests = 50;
-        config.dispatch_global_max_concurrent_requests = 80;
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("t1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut leases = Vec::new();
-        for _ in 0..50 {
-            leases.push(manager.acquire_context(None).await.unwrap());
-        }
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.global_in_flight_requests, 50);
-        assert!(snapshot.entries[0].rate_limited);
-
-        for lease in &mut leases {
-            lease.release_in_flight();
-        }
-    }
-
-    #[tokio::test]
-    async fn test_runtime_config_disabling_credential_rpm_clears_rate_limit_state() {
-        let mut config = Config::default();
-        config.credential_rpm = Some(1);
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("t1", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut first = manager.acquire_context(None).await.unwrap();
-        first.release_in_flight();
-        assert!(manager.snapshot().entries[0].rate_limited);
-
-        manager
-            .update_runtime_config(|config| {
-                config.credential_rpm = None;
-            })
-            .unwrap();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].rate_limited, false);
-        assert_eq!(manager.runtime_config().credential_rpm, None);
-
-        let mut second = manager.acquire_context(None).await.unwrap();
-        assert_eq!(second.id, first.id);
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_credential_rpm_override_limits_when_global_unlimited() {
-        let mut config = Config::default();
-        config.credential_rpm = None;
-
-        let mut cred = test_access_token_credential("t1", "Pro");
-        cred.rpm = Some(1);
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let mut first = manager.acquire_context(None).await.unwrap();
-        first.release_in_flight();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].rpm, 1);
-        assert_eq!(snapshot.entries[0].rpm_override, Some(1));
-        assert!(snapshot.entries[0].rate_limited);
-    }
-
-    #[tokio::test]
-    async fn test_credential_rpm_override_zero_bypasses_global_limit() {
-        let mut config = Config::default();
-        config.credential_rpm = Some(60);
-
-        let mut cred = test_access_token_credential("t1", "Pro");
-        cred.rpm = Some(0);
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let mut first = manager.acquire_context(None).await.unwrap();
-        first.release_in_flight();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].rpm, 0);
-        assert_eq!(snapshot.entries[0].rpm_override, Some(0));
-        assert!(!snapshot.entries[0].rate_limited);
-    }
-
-    #[tokio::test]
-    async fn test_all_transient_cooldown_fails_fast() {
-        let mut config = Config::default();
-        config.credential_transient_cooldown_secs = 1;
-        config.credential_max_cooldown_secs = 1;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap(),
-        );
-        assert!(
-            manager
-                .report_transient_failure(1, None, Some(StdDuration::from_millis(20)), "429")
-                .unwrap()
-        );
-        assert!(
-            !manager
-                .report_transient_failure(2, None, Some(StdDuration::from_millis(20)), "429")
-                .unwrap()
-        );
-
-        let started = Instant::now();
-        let err = match manager.acquire_context(None).await {
-            Ok(mut ctx) => {
-                ctx.release_in_flight();
-                panic!("所有可用凭据都处于上游冷却时应快速失败")
-            }
-            Err(err) => err.to_string(),
-        };
-
-        assert!(
-            started.elapsed() < StdDuration::from_millis(200),
-            "全账号上游冷却时不应让请求排队等冷却恢复"
-        );
-        assert!(
-            err.contains("所有可用账号均处于上游临时冷却"),
-            "错误应明确提示全部处于上游临时冷却，实际: {}",
-            err
-        );
-        assert!(
-            err.contains("retry_after_secs="),
-            "错误应携带 retry_after_secs，实际: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_concurrency_limiter_prefers_other_dispatchable_credential() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        let mut first = manager.acquire_context(None).await.unwrap();
-        let mut second = manager.acquire_context(None).await.unwrap();
-
-        assert_ne!(first.id, second.id);
-        let snapshot = manager.snapshot();
-        assert_eq!(
-            snapshot
-                .entries
-                .iter()
-                .map(|entry| entry.in_flight_requests)
-                .sum::<u32>(),
-            2
-        );
-
-        first.release_in_flight();
-        let snapshot = manager.snapshot();
-        let released = snapshot
-            .entries
-            .iter()
-            .find(|entry| entry.id == first.id)
-            .unwrap();
-        assert_eq!(released.in_flight_requests, 0);
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_priority_mode_prefers_lower_in_flight_with_same_priority() {
-        let config = Config::default();
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        let mut first = manager.acquire_context(None).await.unwrap();
-        let mut second = manager.acquire_context(None).await.unwrap();
-
-        assert_ne!(first.id, second.id);
-
-        first.release_in_flight();
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_global_capacity_limits_dispatch_and_bounds_wait_queue() {
-        let mut config = Config::default();
-        config.dispatch_global_max_concurrent_requests = 1;
-        config.dispatch_max_queued_requests = 1;
-        let mut first_cred = KiroCredentials::default();
-        first_cred.access_token = Some("first".to_string());
-        first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut second_cred = KiroCredentials::default();
-        second_cred.access_token = Some("second".to_string());
-        second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
-                .unwrap(),
-        );
-
-        let mut first = manager.acquire_context(None).await.unwrap();
-        assert_eq!(manager.snapshot().global_in_flight_requests, 1);
-
-        let waiting_manager = manager.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-        tokio::time::sleep(StdDuration::from_millis(30)).await;
-        assert_eq!(manager.snapshot().queued_requests, 1);
-
-        let rejected = match manager.acquire_context(None).await {
-            Ok(mut ctx) => {
-                ctx.release_in_flight();
-                panic!("超过等待队列上限的请求不应获得调度上下文")
-            }
-            Err(err) => err,
-        };
-        assert!(rejected.to_string().contains("等待队列已满"));
-
-        first.release_in_flight();
-        let mut next = tokio::time::timeout(StdDuration::from_secs(1), waiting)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(manager.snapshot().queued_requests, 0);
-        next.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_fail_fast_global_capacity_full_returns_without_queueing() {
-        let mut config = Config::default();
-        config.dispatch_global_max_concurrent_requests = 1;
-        config.dispatch_max_queued_requests = 10;
-
-        let first_cred = test_access_token_credential("first", "Pro");
-        let second_cred = test_access_token_credential("second", "Pro");
-        let manager =
-            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
-                .unwrap();
-
-        let mut first = manager.acquire_context(None).await.unwrap();
-        let err = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                1,
-            )
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            err.contains("本地账号调度容量暂不可用"),
-            "fail-fast 模式全局容量满应直接返回容量错误，实际: {}",
-            err
-        );
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.global_in_flight_requests, 1);
-        assert_eq!(snapshot.queued_requests, 0);
-        first.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_weighted_local_capacity_consumes_single_credential_slots() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 4;
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("weighted", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut first = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                4,
-            )
-            .await
-            .unwrap();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].in_flight_requests, 4);
-        assert_eq!(snapshot.global_in_flight_requests, 4);
-
-        let err = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                1,
-            )
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            err.contains("本地账号调度容量暂不可用"),
-            "单账号 weighted 容量满应直接返回容量错误，实际: {err}"
-        );
-
-        first.release_in_flight();
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].in_flight_requests, 0);
-        assert_eq!(snapshot.global_in_flight_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_weighted_local_capacity_consumes_global_slots() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 8;
-        config.dispatch_global_max_concurrent_requests = 4;
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![
-                test_access_token_credential("weighted-a", "Pro"),
-                test_access_token_credential("weighted-b", "Pro"),
-            ],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut first = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                4,
-            )
-            .await
-            .unwrap();
-        assert_eq!(manager.snapshot().global_in_flight_requests, 4);
-
-        let err = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                1,
-            )
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            err.contains("本地账号调度容量暂不可用"),
-            "全局 weighted 容量满应直接返回容量错误，实际: {err}"
-        );
-
-        first.release_in_flight();
-        assert_eq!(manager.snapshot().global_in_flight_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_weighted_selection_pressure_counts_capacity_units_not_total_requests() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 8;
-        config.scheduler_selection_pressure_weight = 25.0;
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("weighted-selection", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut ctx = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                4,
-            )
-            .await
-            .unwrap();
-        ctx.release_in_flight();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].scheduler_selection_count, 1);
-        assert_eq!(snapshot.entries[0].recent_scheduler_selection_count_10s, 4);
-        assert_eq!(snapshot.entries[0].recent_scheduler_selection_count_60s, 4);
-        assert_eq!(snapshot.entries[0].recent_scheduler_selection_count_5m, 4);
-    }
-
-    #[tokio::test]
-    async fn test_weighted_rpm_consumes_capacity_units() {
-        let mut config = Config::default();
-        config.credential_rpm = Some(4);
-        config.credential_max_concurrent_requests = 8;
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("weighted-rpm", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut ctx = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                4,
-            )
-            .await
-            .unwrap();
-        ctx.release_in_flight();
-
-        let state = manager.local_pool_route_state(None);
-        assert_eq!(state.kind, LocalPoolRouteStateKind::AllCoolingDown);
-        assert_eq!(state.rate_limit_blocked, 1);
-        assert!(manager.snapshot().entries[0].rate_limited);
-    }
-
-    #[test]
-    fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
-        let empty = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
-        let empty_state = empty.local_pool_route_state(None);
-        assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
-        assert_eq!(empty_state.total, 0);
-        assert_eq!(empty_state.available, 0);
-
-        let mut disabled = test_access_token_credential("disabled", "Pro");
-        disabled.disabled = true;
-        let disabled_manager =
-            MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
-        let disabled_state = disabled_manager.local_pool_route_state(None);
-        assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
-        assert_eq!(disabled_state.total, 1);
-        assert_eq!(disabled_state.available, 0);
-    }
-
-    #[tokio::test]
-    async fn test_local_pool_route_state_reports_capacity_full_without_queueing() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.dispatch_max_queued_requests = 10;
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("first", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let ready = manager.local_pool_route_state(None);
-        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
-        assert_eq!(ready.dispatchable, 1);
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        let full = manager.local_pool_route_state(None);
-        assert_eq!(full.kind, LocalPoolRouteStateKind::CapacityFull);
-        assert_eq!(full.dispatchable, 0);
-        assert_eq!(full.concurrency_blocked, 1);
-        assert_eq!(full.queued_requests, 0);
-
-        ctx.release_in_flight();
-        let ready_again = manager.local_pool_route_state(None);
-        assert_eq!(ready_again.kind, LocalPoolRouteStateKind::Ready);
-        assert_eq!(ready_again.dispatchable, 1);
-    }
-
-    #[tokio::test]
-    async fn selection_failure_summary_records_concurrency_full_accounts() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("first", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        let summary = manager.selection_failure_summary(
-            "req_concurrency",
-            "/cc/v1/messages",
-            None,
-            "账号调度排队等待超时",
-        );
-
-        assert_eq!(summary.stage, SelectionFailureStage::DispatchWait);
-        assert_eq!(
-            summary.primary_reason,
-            AccountRejectReason::AccountConcurrencyFull
-        );
-        assert_eq!(
-            summary
-                .reason_counts
-                .get(&AccountRejectReason::AccountConcurrencyFull),
-            Some(&1)
-        );
-        assert_eq!(summary.sampled_accounts.len(), 1);
-        assert_eq!(
-            summary.sampled_accounts[0].reason,
-            AccountRejectReason::AccountConcurrencyFull
-        );
-
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn selection_failure_summary_records_rpm_limited_accounts() {
-        let mut config = Config::default();
-        config.credential_rpm = Some(60);
-        let manager = MultiTokenManager::new(
-            config,
-            vec![test_access_token_credential("first", "Pro")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        for _ in 0..60 {
-            let mut ctx = manager.acquire_context(None).await.unwrap();
-            ctx.release_in_flight();
-        }
-        let summary = manager.selection_failure_summary(
-            "req_rpm",
-            "/cc/v1/messages",
-            None,
-            "本地限流 retry_after_secs=1",
-        );
-
-        assert_eq!(summary.stage, SelectionFailureStage::RpmLimit);
-        assert_eq!(summary.primary_reason, AccountRejectReason::RpmLimited);
-        assert_eq!(
-            summary.reason_counts.get(&AccountRejectReason::RpmLimited),
-            Some(&1)
-        );
-        assert_eq!(summary.waitable_account_count, 1);
-        assert!(summary.retry_after_ms.is_some());
-    }
-
-    #[tokio::test]
-    async fn selection_failure_summary_records_model_not_supported() {
-        let mut free = api_key_credential("ksk_selection_free");
-        free.subscription_title = Some("Free".to_string());
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
-
-        let summary = manager.selection_failure_summary(
-            "req_model",
-            "/cc/v1/messages",
-            Some("claude-opus-4-8"),
-            "没有支持当前模型的可用账号",
-        );
-
-        assert_eq!(summary.stage, SelectionFailureStage::ModelEligibility);
-        assert_eq!(
-            summary.primary_reason,
-            AccountRejectReason::ModelNotSupported
-        );
-        assert_eq!(
-            summary
-                .reason_counts
-                .get(&AccountRejectReason::ModelNotSupported),
-            Some(&1)
-        );
-    }
-
-    #[test]
-    fn selection_failure_summary_enforces_sample_limit_and_omits_secrets() {
-        let credentials = (0..100)
-            .map(|idx| {
-                let mut credential = api_key_credential(&format!("ksk_secret_selection_{idx:03}"));
-                credential.disabled = true;
-                credential
-            })
-            .collect::<Vec<_>>();
-        let manager =
-            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
-
-        let summary = manager.selection_failure_summary(
-            "req_disabled",
-            "/cc/v1/messages",
-            None,
-            "所有账号均已禁用",
-        );
-
-        assert_eq!(summary.rejected_account_count, 100);
-        assert_eq!(
-            summary.sampled_accounts.len(),
-            Config::default().selection_failure_sample_limit
-        );
-        let serialized = serde_json::to_string(&summary).unwrap();
-        assert!(!serialized.contains("ksk_secret_selection"));
-        assert!(!serialized.contains("access_token"));
-        assert!(!serialized.contains("refresh_token"));
-    }
-
-    #[test]
-    fn selection_failure_summary_can_disable_account_samples() {
-        let mut config = Config::default();
-        config.selection_failure_record_enabled = false;
-        config.selection_failure_sample_limit = 20;
-        let credentials = (0..10)
-            .map(|idx| {
-                let mut credential = api_key_credential(&format!("ksk_secret_selection_{idx:03}"));
-                credential.disabled = true;
-                credential
-            })
-            .collect::<Vec<_>>();
-        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
-
-        let summary = manager.selection_failure_summary(
-            "req_disabled_no_samples",
-            "/cc/v1/messages",
-            None,
-            "所有账号均已禁用",
-        );
-
-        assert_eq!(summary.rejected_account_count, 10);
-        assert!(summary.sampled_accounts.is_empty());
-        assert_eq!(
-            summary.reason_counts.get(&AccountRejectReason::Disabled),
-            Some(&10)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_local_pool_route_state_sees_added_credential_after_empty_pool() {
-        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
-        let empty_state = manager.local_pool_route_state(None);
-        assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
-
-        manager
-            .add_credential(api_key_credential("ksk_dynamic_added"))
-            .await
-            .unwrap();
-
-        let ready = manager.local_pool_route_state(None);
-        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
-        assert_eq!(ready.total, 1);
-        assert_eq!(ready.dispatchable, 1);
-    }
-
-    #[test]
-    fn test_local_pool_route_state_sees_manual_enable_after_all_disabled() {
-        let mut disabled = api_key_credential("ksk_dynamic_disabled");
-        disabled.disabled = true;
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
-
-        let disabled_state = manager.local_pool_route_state(None);
-        assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
-
-        manager.set_disabled(1, false).unwrap();
-
-        let ready = manager.local_pool_route_state(None);
-        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
-        assert_eq!(ready.available, 1);
-        assert_eq!(ready.dispatchable, 1);
-    }
-
-    #[tokio::test]
-    async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
-        let mut free = api_key_credential("ksk_model_free");
-        free.subscription_title = Some("Free".to_string());
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
-
-        let unsupported = manager.local_pool_route_state(Some("claude-opus-4-8"));
-        assert_eq!(unsupported.kind, LocalPoolRouteStateKind::NoModelCompatible);
-
-        let mut pro = api_key_credential("ksk_model_pro");
-        pro.subscription_title = Some("Pro".to_string());
-        manager.add_credential(pro).await.unwrap();
-
-        let ready = manager.local_pool_route_state(Some("claude-opus-4-8"));
-        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
-        assert_eq!(ready.model_usable, 1);
-        assert_eq!(ready.dispatchable, 1);
-    }
-
-    #[test]
-    fn test_local_pool_route_state_auto_heals_too_many_failures() {
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![api_key_credential("ksk_auto_heal_preflight")],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-
-        assert!(manager.report_failure(1));
-        assert!(manager.report_failure(1));
-        assert!(!manager.report_failure(1));
-        let disabled = manager.snapshot().entries.into_iter().next().unwrap();
-        assert!(disabled.disabled);
-        assert_eq!(
-            disabled.disabled_reason.as_deref(),
-            Some(DisabledReason::TooManyFailures.as_str())
-        );
-
-        let ready = manager.local_pool_route_state(None);
-        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
-        assert_eq!(ready.available, 1);
-        assert_eq!(ready.dispatchable, 1);
-
-        let healed = manager.snapshot().entries.into_iter().next().unwrap();
-        assert!(!healed.disabled);
-        assert_eq!(healed.failure_count, 0);
-        assert!(healed.disabled_reason.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_local_pool_route_state_proxy_blocked_recovers_after_resource_enabled() {
-        let mut credential = api_key_credential("ksk_proxy_dynamic");
-        credential.proxy_resource_id = Some(7);
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
-        manager.proxy_resources.lock().insert(
-            7,
-            ProxyResourceRuntime {
-                id: 7,
-                name: "residential".to_string(),
-                proxy_url: "http://127.0.0.1:8080".to_string(),
-                proxy_username: None,
-                proxy_password: None,
-                enabled: false,
-            },
-        );
-        manager.invalidate_local_pool_route_state_cache();
-
-        let blocked = manager.local_pool_route_state(None);
-        assert_eq!(blocked.kind, LocalPoolRouteStateKind::ProxyBlocked);
-        assert_eq!(blocked.proxy_blocked, 1);
-
-        manager.proxy_resources.lock().get_mut(&7).unwrap().enabled = true;
-        manager.invalidate_local_pool_route_state_cache();
-
-        let ready = manager.local_pool_route_state(None);
-        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
-        assert_eq!(ready.dispatchable, 1);
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 1);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_concurrency_limiter_skips_disabled_credentials_and_queues_on_only_active() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut disabled1 = KiroCredentials::default();
-        disabled1.disabled = true;
-        let mut disabled2 = KiroCredentials::default();
-        disabled2.disabled = true;
-        let mut active = KiroCredentials::default();
-        active.access_token = Some("active-token".to_string());
-        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                vec![disabled1, disabled2, active],
-                None,
-                None,
-                false,
-            )
-            .unwrap(),
-        );
-        assert_eq!(manager.available_count(), 1);
-
-        let mut first = manager.acquire_context(None).await.unwrap();
-        assert_eq!(first.id, 3);
-
-        let waiting_manager = manager.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert!(
-            !waiting.is_finished(),
-            "只剩一个启用凭据且并发占满时，后续请求应排队等待"
-        );
-
-        first.release_in_flight();
-        let mut second = tokio::time::timeout(StdDuration::from_secs(1), waiting)
-            .await
-            .expect("释放唯一启用凭据后等待请求应被唤醒")
-            .expect("等待任务不应 panic")
-            .expect("等待请求应成功获取唯一启用凭据");
-
-        assert_eq!(second.id, 3);
-        second.release_in_flight();
-
-        let snapshot = manager.snapshot();
-        assert_eq!(
-            snapshot
-                .entries
-                .iter()
-                .map(|entry| entry.in_flight_requests)
-                .sum::<u32>(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn test_concurrency_limiter_multiple_waiters_are_served_serially_on_one_credential() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
-        let mut first = manager.acquire_context(None).await.unwrap();
-
-        let (acquired_tx, mut acquired_rx) = tokio::sync::mpsc::channel::<(&'static str, u64)>(2);
-        let (release_a_tx, release_a_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_b_tx, release_b_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut release_a_tx = Some(release_a_tx);
-        let mut release_b_tx = Some(release_b_tx);
-
-        let waiting_a_manager = manager.clone();
-        let waiting_a_tx = acquired_tx.clone();
-        let waiting_a = tokio::spawn(async move {
-            let mut ctx = waiting_a_manager.acquire_context(None).await.unwrap();
-            waiting_a_tx.send(("a", ctx.id)).await.unwrap();
-            let _ = release_a_rx.await;
-            ctx.release_in_flight();
-        });
-        let waiting_b_manager = manager.clone();
-        let waiting_b_tx = acquired_tx;
-        let waiting_b = tokio::spawn(async move {
-            let mut ctx = waiting_b_manager.acquire_context(None).await.unwrap();
-            waiting_b_tx.send(("b", ctx.id)).await.unwrap();
-            let _ = release_b_rx.await;
-            ctx.release_in_flight();
-        });
-
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert!(
-            matches!(
-                acquired_rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "首个占用未释放前，两个等待者都不应获得并发槽"
-        );
-
-        first.release_in_flight();
-
-        let (second_label, second_id) =
-            tokio::time::timeout(StdDuration::from_secs(1), acquired_rx.recv())
-                .await
-                .expect("第一个等待者应在释放后获得并发槽")
-                .expect("等待者应发送获取结果");
-        assert_eq!(second_id, 1);
-        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 1);
-
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert!(
-            matches!(
-                acquired_rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "第二个等待者应继续排队，不能和第一个等待者同时占用同一凭据"
-        );
-
-        if second_label == "a" {
-            release_a_tx.take().unwrap().send(()).unwrap();
-        } else {
-            release_b_tx.take().unwrap().send(()).unwrap();
-        }
-
-        let (third_label, third_id) =
-            tokio::time::timeout(StdDuration::from_secs(1), acquired_rx.recv())
-                .await
-                .expect("第二个等待者应在前一个请求释放后获得并发槽")
-                .expect("等待者应发送获取结果");
-        assert_eq!(third_id, 1);
-
-        if third_label == "a" {
-            release_a_tx.take().unwrap().send(()).unwrap();
-        } else {
-            release_b_tx.take().unwrap().send(()).unwrap();
-        }
-
-        tokio::time::timeout(StdDuration::from_secs(1), waiting_a)
-            .await
-            .expect("等待任务 a 应正常结束")
-            .expect("等待任务 a 不应 panic");
-        tokio::time::timeout(StdDuration::from_secs(1), waiting_b)
-            .await
-            .expect("等待任务 b 应正常结束")
-            .expect("等待任务 b 不应 panic");
-
-        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_acquire_context_all_manually_disabled_fails_without_queueing() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_dispatch_max_wait_secs = 1;
-
-        let mut disabled1 = KiroCredentials::default();
-        disabled1.disabled = true;
-        let mut disabled2 = KiroCredentials::default();
-        disabled2.disabled = true;
-
-        let manager =
-            MultiTokenManager::new(config, vec![disabled1, disabled2], None, None, false).unwrap();
-        assert_eq!(manager.available_count(), 0);
-
-        let started = Instant::now();
-        let err = manager
-            .acquire_context(None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            started.elapsed() < StdDuration::from_millis(200),
-            "全部手动禁用不是临时调度阻塞，不应进入并发排队等待"
-        );
-        assert!(
-            err.contains("所有账号均已禁用"),
-            "错误应明确提示全部禁用，实际: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_all_model_incompatible_credentials_fail_fast_without_queueing() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_dispatch_max_wait_secs = 1;
-
-        let free_a = test_access_token_credential("free-a", "Free");
-        let free_b = test_access_token_credential("free-b", "Free");
-        let manager =
-            MultiTokenManager::new(config, vec![free_a, free_b], None, None, false).unwrap();
-
-        let started = Instant::now();
-        let err = manager
-            .acquire_context(Some("claude-opus-4"))
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            started.elapsed() < StdDuration::from_millis(200),
-            "模型不兼容不是临时容量阻塞，不应进入等待队列"
-        );
-        assert!(
-            err.contains("没有支持当前模型的可用账号"),
-            "错误应明确提示模型不兼容，实际: {}",
-            err
-        );
-        assert_eq!(manager.snapshot().queued_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_concurrency_limiter_waits_until_slot_released() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
-        let mut first = manager.acquire_context(None).await.unwrap();
-
-        let waiting_manager = manager.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert!(
-            !waiting.is_finished(),
-            "并发占满时请求应排队等待，而不是立即返回"
-        );
-
-        first.release_in_flight();
-        let mut second = tokio::time::timeout(StdDuration::from_secs(1), waiting)
-            .await
-            .expect("释放并发槽后等待请求应被唤醒")
-            .expect("等待任务不应 panic")
-            .expect("等待请求应成功获取凭据");
-
-        assert_eq!(second.id, first.id);
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_fail_fast_slot_race_reselects_other_available_credential() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut first_cred = KiroCredentials::default();
-        first_cred.access_token = Some("t1".to_string());
-        first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        first_cred.priority = 0;
-
-        let mut second_cred = KiroCredentials::default();
-        second_cred.access_token = Some("t2".to_string());
-        second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        second_cred.priority = 0;
-
-        let manager =
-            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
-                .unwrap();
-        let mut first = manager.acquire_context(None).await.unwrap();
-        assert_eq!(first.id, 1);
-
-        let mut second = manager
-            .acquire_context_for_session_with_mode(
-                None,
-                None,
-                &HashSet::new(),
-                AcquireMode::FailFastOnCapacity,
-                1,
-            )
-            .await
-            .expect("fail-fast should reselect another credential when the selected slot is full");
-
-        assert_eq!(second.id, 2);
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].in_flight_requests, 1);
-        assert_eq!(snapshot.entries[1].in_flight_requests, 1);
-
-        first.release_in_flight();
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_credential_concurrency_override_limits_when_global_unlimited() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 0;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        cred.max_concurrent_requests = Some(1);
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
-        let mut first = manager.acquire_context(None).await.unwrap();
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].max_concurrent_requests, 1);
-        assert_eq!(
-            snapshot.entries[0].max_concurrent_requests_override,
-            Some(1)
-        );
-
-        let waiting_manager = manager.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert!(
-            !waiting.is_finished(),
-            "账号级并发覆盖为 1 时，即使全局不限，也应排队等待"
-        );
-
-        first.release_in_flight();
-        let mut second = tokio::time::timeout(StdDuration::from_secs(1), waiting)
-            .await
-            .expect("释放账号级并发槽后等待请求应恢复")
-            .expect("等待任务不应 panic")
-            .expect("等待请求应成功获取凭据");
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_credential_concurrency_override_zero_bypasses_global_limit() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        cred.max_concurrent_requests = Some(0);
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let mut first = manager.acquire_context(None).await.unwrap();
-        let mut second = manager.acquire_context(None).await.unwrap();
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].in_flight_requests, 2);
-        assert_eq!(snapshot.entries[0].max_concurrent_requests, 0);
-        assert_eq!(
-            snapshot.entries[0].max_concurrent_requests_override,
-            Some(0)
-        );
-        first.release_in_flight();
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_credential_concurrency_override_exceeds_global_default() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 5;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        cred.max_concurrent_requests = Some(200);
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let mut leases = Vec::new();
-        for _ in 0..6 {
-            leases.push(manager.acquire_context(None).await.unwrap());
-        }
-
-        let runtime_snapshot = manager.snapshot();
-        assert_eq!(runtime_snapshot.entries[0].in_flight_requests, 6);
-        assert_eq!(runtime_snapshot.entries[0].max_concurrent_requests, 200);
-        assert_eq!(
-            runtime_snapshot.entries[0].max_concurrent_requests_override,
-            Some(200)
-        );
-
-        let base_snapshot = manager.base_snapshot();
-        assert_eq!(base_snapshot.entries[0].max_concurrent_requests, 200);
-        assert_eq!(
-            base_snapshot.entries[0].max_concurrent_requests_override,
-            Some(200)
-        );
-
-        for mut lease in leases {
-            lease.release_in_flight();
-        }
-    }
-
-    #[tokio::test]
-    async fn test_concurrency_limiter_times_out_after_dispatch_wait_limit() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_dispatch_max_wait_secs = 1;
-        config.credential_in_flight_lease_max_secs = 0;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
-        let mut first = manager.acquire_context(None).await.unwrap();
-
-        let started = Instant::now();
-        let err = manager
-            .acquire_context(None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            started.elapsed() >= StdDuration::from_millis(900),
-            "排队等待上限生效前不应提前失败"
-        );
-        assert!(
-            err.contains("账号调度排队等待超时"),
-            "错误应提示调度排队超时，实际: {}",
-            err
-        );
-        assert!(
-            err.contains("max_wait_secs=1"),
-            "错误应包含配置的等待上限，实际: {}",
-            err
-        );
-
-        first.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_in_flight_lease_guard_drop_releases_slot() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        {
-            let ctx = manager.acquire_context(None).await.unwrap();
-            assert_eq!(ctx.in_flight_lease_id(), Some(1));
-            let snapshot = manager.snapshot();
-            assert_eq!(snapshot.entries[0].in_flight_requests, 1);
-        }
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].in_flight_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_expired_leaked_in_flight_lease_wakes_waiting_request() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_in_flight_lease_max_secs = 1;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
-        let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
-        manager.age_in_flight_lease_for_test(1, lease.id(), StdDuration::from_secs(2));
-        std::mem::forget(lease);
-
-        let waiting_manager = manager.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-
-        let mut ctx = tokio::time::timeout(StdDuration::from_secs(1), waiting)
-            .await
-            .expect("等待请求应触发超时 lease 清理并恢复调度")
-            .expect("等待任务不应 panic")
-            .expect("等待请求应成功获取凭据");
-
-        assert_eq!(ctx.id, 1);
-        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 1);
-        ctx.release_in_flight();
-        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_manual_clear_in_flight_leases_wakes_waiting_request() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_in_flight_lease_max_secs = 0;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
-        let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
-        let leaked_lease_id = lease.id();
-        std::mem::forget(lease);
-
-        let waiting_manager = manager.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert!(
-            !waiting.is_finished(),
-            "关闭自动回收且 lease 泄漏时，等待请求应保持排队"
-        );
-
-        manager.age_in_flight_lease_for_test(1, leaked_lease_id, StdDuration::from_secs(5));
-        assert_eq!(
-            manager.clear_in_flight_leases(1, Some(StdDuration::from_secs(3))),
-            1
-        );
-
-        let mut ctx = tokio::time::timeout(StdDuration::from_secs(1), waiting)
-            .await
-            .expect("手动清理异常占用后等待请求应被唤醒")
-            .expect("等待任务不应 panic")
-            .expect("等待请求应成功获取凭据");
-        assert_eq!(ctx.id, 1);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_expired_in_flight_lease_is_cleaned_and_dispatch_recovers() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_in_flight_lease_max_secs = 1;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
-        manager.age_in_flight_lease_for_test(1, lease.id(), StdDuration::from_secs(2));
-        std::mem::forget(lease);
-
-        assert_eq!(manager.cleanup_expired_in_flight_leases(), 1);
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 1);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_summary_snapshot_cleans_expired_in_flight_lease() {
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_in_flight_lease_max_secs = 1;
-
-        let mut cred = KiroCredentials::default();
-        cred.access_token = Some("t1".to_string());
-        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-        let lease = manager.acquire_in_flight_lease_for_test(1).unwrap();
-        manager.age_in_flight_lease_for_test(1, lease.id(), StdDuration::from_secs(2));
-        std::mem::forget(lease);
-
-        let summary = manager.summary_snapshot();
-        assert_eq!(summary.global_in_flight_requests, 0);
-        assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_added_credential_warmup_does_not_fake_success_count() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_warmup_requests = 2;
-        config.credential_warmup_selection_percent = 0;
-
-        let mut existing = KiroCredentials::default();
-        existing.access_token = Some("existing".to_string());
-        existing.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
-
-        let mut new_cred = KiroCredentials::default();
-        new_cred.kiro_api_key = Some("ksk_new_key".to_string());
-        new_cred.auth_method = Some("api_key".to_string());
-        let new_id = manager.add_credential(new_cred).await.unwrap();
-
-        let snapshot = manager.snapshot();
-        let added = snapshot
-            .entries
-            .iter()
-            .find(|entry| entry.id == new_id)
-            .unwrap();
-        assert_eq!(added.success_count, 0);
-        assert_eq!(added.warmup_remaining, 2);
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_ne!(ctx.id, new_id);
-        manager.report_success(ctx.id);
-        ctx.release_in_flight();
-
-        manager.set_warmup_remaining(new_id, 0).unwrap();
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, new_id);
-        manager.report_success(ctx.id);
-        ctx.release_in_flight();
-
-        let snapshot = manager.snapshot();
-        let added = snapshot
-            .entries
-            .iter()
-            .find(|entry| entry.id == new_id)
-            .unwrap();
-        assert_eq!(added.success_count, 1);
-        assert_eq!(added.warmup_remaining, 0);
-    }
-
-    #[tokio::test]
-    async fn test_warmup_selection_percent_allows_real_request_sampling() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_warmup_requests = 2;
-        config.credential_warmup_selection_percent = 100;
-
-        let mut ready = KiroCredentials::default();
-        ready.access_token = Some("ready".to_string());
-        ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut warming = KiroCredentials::default();
-        warming.access_token = Some("warming".to_string());
-        warming.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
-        manager.set_warmup_remaining(2, 2).unwrap();
-
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 2);
-        manager.report_success(ctx.id);
-        ctx.release_in_flight();
-
-        let snapshot = manager.snapshot();
-        let warming = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
-        assert_eq!(warming.success_count, 1);
-        assert_eq!(warming.warmup_remaining, 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn redis_backed_in_flight_limit_is_shared_between_managers() {
-        let Some(redis_store) = test_redis_store().await else {
-            eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
-            return;
-        };
-
-        let mut config = Config::default();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_dispatch_max_wait_secs = 2;
-
-        let manager_a = Arc::new(
-            MultiTokenManager::new_with_stores(
-                config.clone(),
-                vec![api_key_credential("a")],
-                None,
-                None,
-                false,
-                None,
-                Some(redis_store.clone()),
-            )
-            .unwrap(),
-        );
-        let manager_b = Arc::new(
-            MultiTokenManager::new_with_stores(
-                config,
-                vec![api_key_credential("a")],
-                None,
-                None,
-                false,
-                None,
-                Some(redis_store),
-            )
-            .unwrap(),
-        );
-
-        let mut first = manager_a.acquire_context(None).await.unwrap();
-        let waiting_manager = manager_b.clone();
-        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
-        assert!(
-            !waiting.is_finished(),
-            "另一个 manager 应看到 Redis 中的并发占用并排队"
-        );
-
-        first.release_in_flight();
-        let mut second = tokio::time::timeout(StdDuration::from_secs(2), waiting)
-            .await
-            .expect("释放 Redis 并发槽后等待请求应恢复")
-            .expect("等待任务不应 panic")
-            .expect("等待请求应成功");
-        second.release_in_flight();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers() {
-        let Some(redis_store) = test_redis_store().await else {
-            eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
-            return;
-        };
-
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_transient_cooldown_secs = 60;
-
-        let manager_a = MultiTokenManager::new_with_stores(
-            config.clone(),
-            vec![api_key_credential("a"), api_key_credential("b")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store.clone()),
-        )
-        .unwrap();
-        let manager_b = MultiTokenManager::new_with_stores(
-            config,
-            vec![api_key_credential("a"), api_key_credential("b")],
-            None,
-            None,
-            false,
-            None,
-            Some(redis_store),
-        )
-        .unwrap();
-        let empty = HashSet::new();
-
-        let mut first = manager_a
-            .acquire_context_for_session(None, Some("shared-session"), &empty)
-            .await
-            .unwrap();
-        let first_id = first.id;
-        first.release_in_flight();
-
-        let mut rebound = manager_b
-            .acquire_context_for_session(None, Some("shared-session"), &empty)
-            .await
-            .unwrap();
-        assert_eq!(rebound.id, first_id);
-        rebound.release_in_flight();
-
-        assert!(!manager_a.record_session_soft_failure("shared-session", first_id));
-        let mut rebound_after_soft_failure = manager_b
-            .acquire_context_for_session(None, Some("shared-session"), &empty)
-            .await
-            .unwrap();
-        assert_eq!(rebound_after_soft_failure.id, first_id);
-        rebound_after_soft_failure.release_in_flight();
-        assert!(
-            manager_b.record_session_soft_failure("shared-session", first_id),
-            "同凭据重新绑定不应清空 Redis 中已有软失败计数"
-        );
-        manager_b.clear_session_soft_failure("shared-session", first_id);
-
-        assert!(
-            manager_a
-                .report_transient_failure(first_id, None, Some(StdDuration::from_secs(30)), "429")
-                .unwrap()
-        );
-
-        let mut after_cooldown = manager_b.acquire_context(None).await.unwrap();
-        assert_ne!(after_cooldown.id, first_id);
-        after_cooldown.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_only_available_credential_is_not_an_alternate_after_soft_failure() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut disabled1 = KiroCredentials::default();
-        disabled1.disabled = true;
-        let mut disabled2 = KiroCredentials::default();
-        disabled2.disabled = true;
-        let mut active = KiroCredentials::default();
-        active.access_token = Some("active-token".to_string());
-        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![disabled1, disabled2, active],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let empty = HashSet::new();
-        let ctx = manager
-            .acquire_context_for_session(None, Some("session-only"), &empty)
-            .await
-            .unwrap();
-
-        assert_eq!(ctx.id, 3);
-        assert!(!manager.has_alternate_usable_credential(None, &empty, ctx.id));
-        assert!(!manager.record_session_soft_failure("session-only", ctx.id));
-        assert!(manager.record_session_soft_failure("session-only", ctx.id));
-        assert!(!manager.has_alternate_usable_credential(None, &empty, ctx.id));
-    }
-
-    #[test]
-    fn test_cached_alternate_usable_credential_uses_current_memory_state() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_transient_cooldown_secs = 60;
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![
-                test_access_token_credential("t1", "Pro"),
-                test_access_token_credential("t2", "Pro"),
-            ],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let mut excluded = HashSet::new();
-
-        assert!(manager.has_alternate_usable_credential_cached(None, &excluded, 1));
-
-        manager
-            .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
-            .unwrap();
-
-        assert!(
-            manager.has_alternate_usable_credential_cached(None, &excluded, 1),
-            "当前账号冷却后，本次 retry 应能用本机内存态发现另一个可调度账号"
-        );
-
-        excluded.insert(2);
-        assert!(
-            !manager.has_alternate_usable_credential_cached(None, &excluded, 1),
-            "唯一备选账号已被本次请求排除时，不应误报可 fallback"
-        );
-    }
-
-    #[test]
-    fn test_cached_alternate_usable_credential_is_false_for_single_active_credential() {
-        let mut disabled = KiroCredentials::default();
-        disabled.disabled = true;
-        let manager = MultiTokenManager::new(
-            Config::default(),
-            vec![
-                disabled,
-                test_access_token_credential("active-token", "Pro"),
-            ],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        let empty = HashSet::new();
-
-        assert!(!manager.has_alternate_usable_credential_cached(None, &empty, 2));
-    }
-
-    #[tokio::test]
-    async fn test_excluding_only_available_credential_reports_temporary_exclusion() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut disabled = KiroCredentials::default();
-        disabled.disabled = true;
-        let mut active = KiroCredentials::default();
-        active.access_token = Some("active-token".to_string());
-        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap();
-        let mut excluded = HashSet::new();
-        excluded.insert(2);
-
-        let err = manager
-            .acquire_context_for_session(None, Some("session-excluded"), &excluded)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            err.contains("本次请求临时排除了所有可用账号"),
-            "错误应提示临时排除，实际: {}",
-            err
-        );
-        assert!(
-            !err.contains("所有账号均已禁用"),
-            "错误不应误报所有账号禁用，实际: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_bound_disabled_proxy_resource_is_not_dispatchable() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut blocked = KiroCredentials::default();
-        blocked.access_token = Some("blocked-token".to_string());
-        blocked.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        blocked.proxy_resource_id = Some(7);
-
-        let mut active = KiroCredentials::default();
-        active.access_token = Some("active-token".to_string());
-        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![blocked, active], None, None, false).unwrap();
-        manager.proxy_resources.lock().insert(
-            7,
-            ProxyResourceRuntime {
-                id: 7,
-                name: "disabled-proxy".to_string(),
-                proxy_url: "socks5h://127.0.0.1:1080".to_string(),
-                proxy_username: None,
-                proxy_password: None,
-                enabled: false,
-            },
-        );
-
-        let ctx = manager.acquire_context(None).await.unwrap();
-        assert_eq!(ctx.id, 2);
-
-        let snapshot = manager.snapshot();
-        let blocked = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert_eq!(blocked.effective_proxy_source, "resource_disabled");
-        assert_eq!(blocked.effective_proxy_url, None);
-    }
-
-    #[tokio::test]
-    async fn test_all_proxy_blocked_credentials_fail_fast_with_proxy_error() {
-        let mut config = Config::default();
-        config.proxy_url = Some("http://global-proxy:8080".to_string());
-        config.credential_dispatch_max_wait_secs = 1;
-
-        let mut missing_proxy = test_access_token_credential("missing-proxy", "Pro");
-        missing_proxy.proxy_resource_id = Some(404);
-        let mut disabled_proxy = test_access_token_credential("disabled-proxy", "Pro");
-        disabled_proxy.proxy_resource_id = Some(7);
-
-        let manager = MultiTokenManager::new(
-            config,
-            vec![missing_proxy, disabled_proxy],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
-        manager.proxy_resources.lock().insert(
-            7,
-            ProxyResourceRuntime {
-                id: 7,
-                name: "disabled-proxy".to_string(),
-                proxy_url: "socks5h://127.0.0.1:1080".to_string(),
-                proxy_username: None,
-                proxy_password: None,
-                enabled: false,
-            },
-        );
-
-        let started = Instant::now();
-        let err = manager
-            .acquire_context(None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            started.elapsed() < StdDuration::from_millis(200),
-            "全部凭据代理资源不可用时应快速失败，不应进入容量等待"
-        );
-        assert!(
-            err.contains("代理资源不可用"),
-            "错误应明确提示代理资源不可用，实际: {}",
-            err
-        );
-        assert!(
-            !err.contains("所有账号均已禁用") && !err.contains("没有支持当前模型"),
-            "代理不可用不应误报禁用或模型不兼容，实际: {}",
-            err
-        );
-        assert_eq!(manager.snapshot().queued_requests, 0);
-    }
-
-    #[tokio::test]
-    async fn test_bound_missing_proxy_resource_does_not_fallback_to_global_proxy() {
-        let mut config = Config::default();
-        config.proxy_url = Some("http://global-proxy:8080".to_string());
-
-        let mut credential = KiroCredentials::default();
-        credential.access_token = Some("token".to_string());
-        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        credential.proxy_resource_id = Some(404);
-
-        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
-        let err = manager
-            .acquire_context_for_credential(1)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(
-            err.contains("代理资源 #404 不存在"),
-            "应返回代理资源缺失错误，实际: {}",
-            err
-        );
-        assert!(
-            err.contains("阻止回退"),
-            "不应静默回退到全局代理，实际: {}",
-            err
-        );
-
-        let snapshot = manager.snapshot();
-        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert_eq!(entry.effective_proxy_source, "resource_missing");
-        assert_eq!(entry.effective_proxy_url, None);
-    }
-
-    #[test]
-    fn test_external_import_refresh_preserves_bound_proxy_resource() {
-        let mut config = Config::default();
-        config.proxy_url = Some("http://global-proxy:8080".to_string());
-
-        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
-        manager.proxy_resources.lock().insert(
-            7,
-            ProxyResourceRuntime {
-                id: 7,
-                name: "import-proxy".to_string(),
-                proxy_url: "socks5h://127.0.0.1:1080".to_string(),
-                proxy_username: Some("user".to_string()),
-                proxy_password: Some("pass".to_string()),
-                enabled: true,
-            },
-        );
-
-        let mut source = KiroCredentials::default();
-        source.proxy_resource_id = Some(7);
-        let mut refreshed = KiroCredentials::default();
-        refreshed.access_token = Some("refreshed-token".to_string());
-        refreshed.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let preserved = MultiTokenManager::preserve_proxy_fields(refreshed, &source);
-        assert_eq!(preserved.proxy_resource_id, Some(7));
-
-        let resolved = manager.resolve_proxy_for_credential(preserved).unwrap();
-        assert_eq!(
-            resolved.proxy_url.as_deref(),
-            Some("socks5h://127.0.0.1:1080")
-        );
-        assert_eq!(resolved.proxy_username.as_deref(), Some("user"));
-        assert_eq!(resolved.proxy_password.as_deref(), Some("pass"));
-        assert_eq!(
-            resolved
-                .effective_proxy(manager.proxy.as_ref())
-                .unwrap()
-                .url,
-            "socks5h://127.0.0.1:1080"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_unbind_session_if_bound_to_does_not_clear_original_binding() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        let empty = HashSet::new();
-
-        let bound = manager
-            .acquire_context_for_session(None, Some("session-c"), &empty)
-            .await
-            .unwrap();
-
-        let mut excluded = HashSet::new();
-        excluded.insert(bound.id);
-        let fallback = manager
-            .acquire_context_for_session(None, Some("session-c"), &excluded)
-            .await
-            .unwrap();
-        assert_ne!(bound.id, fallback.id);
-
-        manager.unbind_session_if_bound_to("session-c", fallback.id);
-
-        let rebound = manager
-            .acquire_context_for_session(None, Some("session-c"), &empty)
-            .await
-            .unwrap();
-        assert_eq!(bound.id, rebound.id);
-    }
-
-    #[tokio::test]
-    async fn test_current_id_respects_opus_model_filter() {
-        let mut free = KiroCredentials::default();
-        free.priority = 0;
-        free.subscription_title = Some("Free".to_string());
-        free.access_token = Some("free-token".to_string());
-        free.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let mut pro = KiroCredentials::default();
-        pro.priority = 1;
-        pro.subscription_title = Some("Pro".to_string());
-        pro.access_token = Some("pro-token".to_string());
-        pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
-
-        let ctx = manager
-            .acquire_context(Some("claude-opus-4"))
-            .await
-            .unwrap();
-        assert_eq!(ctx.id, 2);
-        assert_eq!(ctx.token, "pro-token");
-    }
-
-    #[tokio::test]
-    async fn test_sonnet_model_can_use_free_credentials() {
-        let mut free = KiroCredentials::default();
-        free.priority = 0;
-        free.subscription_title = Some("Free".to_string());
-        free.access_token = Some("free-token".to_string());
-        free.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let mut pro = KiroCredentials::default();
-        pro.priority = 1;
-        pro.subscription_title = Some("Pro".to_string());
-        pro.access_token = Some("pro-token".to_string());
-        pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
-
-        let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
-        assert_eq!(ctx.id, 1);
-        assert_eq!(ctx.token, "free-token");
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_sonnet_bound_session_falls_back_when_bound_credential_is_full() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = 1;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.subscription_title = Some("Free".to_string());
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.subscription_title = Some("Free".to_string());
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-        let empty = HashSet::new();
-
-        let mut bound = manager
-            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-sticky-full"), &empty)
-            .await
-            .unwrap();
-        manager.report_success_for_session(bound.id, Some("sonnet-sticky-full"));
-
-        let mut fallback = manager
-            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-sticky-full"), &empty)
-            .await
-            .unwrap();
-
-        assert_ne!(bound.id, fallback.id);
-        assert!(fallback.fallback_from_sticky);
-        assert!(!fallback.sticky_bound);
-
-        fallback.release_in_flight();
-        bound.release_in_flight();
-
-        let mut rebound = manager
-            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-sticky-full"), &empty)
-            .await
-            .unwrap();
-        assert_eq!(rebound.id, bound.id);
-        rebound.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_sonnet_rate_limiter_prefers_other_dispatchable_credential() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_rpm = Some(1);
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.subscription_title = Some("Free".to_string());
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.subscription_title = Some("Free".to_string());
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        let mut first = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
-        let mut second = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
-
-        assert_ne!(first.id, second.id);
-        first.release_in_flight();
-        second.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_sonnet_rate_limit_cooldown_skips_limited_credential() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_rate_limit_cooldown_secs = 60;
-        config.credential_max_cooldown_secs = 60;
-        config.credential_cooldown_jitter_percent = 0;
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.subscription_title = Some("Free".to_string());
-        cred1.access_token = Some("t1".to_string());
-        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-        let mut cred2 = KiroCredentials::default();
-        cred2.subscription_title = Some("Free".to_string());
-        cred2.access_token = Some("t2".to_string());
-        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        assert!(
-            manager
-                .report_transient_failure_kind(
-                    1,
-                    Some(SONNET_MODEL),
-                    TransientFailureKind::RateLimit,
-                    None,
-                    "429 Too Many Requests"
-                )
-                .unwrap()
-        );
-
-        let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
-        assert_eq!(ctx.id, 2);
-        ctx.release_in_flight();
-    }
-
-    #[tokio::test]
-    async fn test_sonnet_pool_uses_available_credentials_when_one_is_cooldown_and_sticky_is_full() {
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = 1;
-        config.credential_auth_error_cooldown_secs = 60;
-        config.credential_max_cooldown_secs = 60;
-        config.credential_cooldown_jitter_percent = 0;
-
-        let credentials = (1..=4)
-            .map(|idx| {
-                let mut cred = KiroCredentials::default();
-                cred.subscription_title = Some("Free".to_string());
-                cred.access_token = Some(format!("t{idx}"));
-                cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-                cred
-            })
-            .collect();
-
-        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
-        let empty = HashSet::new();
-
-        assert!(
-            manager
-                .report_transient_failure_kind(
-                    1,
-                    Some(SONNET_MODEL),
-                    TransientFailureKind::Auth,
-                    None,
-                    "403 Forbidden user is not authorized"
-                )
-                .unwrap()
-        );
-
-        let mut bound = manager
-            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-pool-session"), &empty)
-            .await
-            .unwrap();
-        assert_ne!(bound.id, 1);
-        manager.report_success_for_session(bound.id, Some("sonnet-pool-session"));
-
-        let mut fallback = manager
-            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-pool-session"), &empty)
-            .await
-            .unwrap();
-        assert_ne!(fallback.id, 1);
-        assert_ne!(fallback.id, bound.id);
-        assert!(fallback.fallback_from_sticky);
-        assert!(!fallback.sticky_bound);
-
-        let mut unbound = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
-        assert_ne!(unbound.id, 1);
-        assert_ne!(unbound.id, bound.id);
-        assert_ne!(unbound.id, fallback.id);
-
-        unbound.release_in_flight();
-        fallback.release_in_flight();
-        bound.release_in_flight();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load() {
-        const CREDENTIAL_COUNT: usize = 24;
-        const COOLED_DOWN_CREDENTIALS: u64 = 4;
-        const AVAILABLE_CREDENTIALS: usize = CREDENTIAL_COUNT - COOLED_DOWN_CREDENTIALS as usize;
-        const REQUEST_COUNT: usize = 600;
-        const PER_CREDENTIAL_LIMIT: u32 = 3;
-        const GLOBAL_LIMIT: u32 = 48;
-
-        let mut config = Config::default();
-        config.load_balancing_mode = "balanced".to_string();
-        config.credential_max_concurrent_requests = PER_CREDENTIAL_LIMIT;
-        config.dispatch_global_max_concurrent_requests = GLOBAL_LIMIT;
-        config.dispatch_max_queued_requests = REQUEST_COUNT as u32;
-        config.credential_dispatch_max_wait_secs = 5;
-        config.credential_rate_limit_cooldown_secs = 30;
-        config.credential_auth_error_cooldown_secs = 30;
-        config.credential_max_cooldown_secs = 30;
-        config.credential_cooldown_jitter_percent = 0;
-
-        let credentials = (1..=CREDENTIAL_COUNT)
-            .map(|idx| {
-                let mut cred = KiroCredentials::default();
-                cred.subscription_title = Some("Free".to_string());
-                cred.email = Some(format!("sonnet-free-{idx}@example.test"));
-                cred.access_token = Some(format!("t{idx}"));
-                cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-                cred
-            })
-            .collect();
-        let manager =
-            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
-
-        for id in 1..=COOLED_DOWN_CREDENTIALS {
-            let kind = if id % 2 == 0 {
-                TransientFailureKind::RateLimit
-            } else {
-                TransientFailureKind::Auth
-            };
-            assert!(
-                manager
-                    .report_transient_failure_kind(
-                        id,
-                        Some(SONNET_MODEL),
-                        kind,
-                        None,
-                        "preload high-concurrency cooldown"
-                    )
-                    .unwrap()
-            );
-        }
-
-        let start = Arc::new(tokio::sync::Barrier::new(REQUEST_COUNT + 1));
-        let mut handles = Vec::with_capacity(REQUEST_COUNT);
-
-        for idx in 0..REQUEST_COUNT {
-            let manager = manager.clone();
-            let start = start.clone();
-            handles.push(tokio::spawn(async move {
-                start.wait().await;
-                let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
-                assert!(
-                    ctx.id > COOLED_DOWN_CREDENTIALS,
-                    "冷却凭据不应被调度，实际选中 #{}",
-                    ctx.id
-                );
-
-                let snapshot = manager.snapshot();
-                assert!(
-                    snapshot.global_in_flight_requests <= GLOBAL_LIMIT,
-                    "全局并发超限: {} > {}",
-                    snapshot.global_in_flight_requests,
-                    GLOBAL_LIMIT
-                );
-                assert!(
-                    snapshot.queued_requests <= REQUEST_COUNT as u32,
-                    "等待队列超出测试配置: {}",
-                    snapshot.queued_requests
-                );
-                for entry in &snapshot.entries {
-                    if entry.id <= COOLED_DOWN_CREDENTIALS {
-                        assert_eq!(
-                            entry.in_flight_requests, 0,
-                            "冷却凭据 #{} 不应持有 in-flight",
-                            entry.id
-                        );
-                    }
-                    if entry.max_concurrent_requests > 0 {
-                        assert!(
-                            entry.in_flight_requests <= entry.max_concurrent_requests,
-                            "凭据 #{} 并发超限: {} > {}",
-                            entry.id,
-                            entry.in_flight_requests,
-                            entry.max_concurrent_requests
-                        );
-                    }
-                }
-
-                tokio::time::sleep(StdDuration::from_millis(3 + (idx % 7) as u64)).await;
-                manager.report_success(ctx.id);
-                let id = ctx.id;
-                ctx.release_in_flight();
-                id
-            }));
-        }
-
-        let started_at = Instant::now();
-        start.wait().await;
-
-        let mut selection_counts: HashMap<u64, usize> = HashMap::new();
-        for handle in handles {
-            let selected_id = tokio::time::timeout(StdDuration::from_secs(10), handle)
-                .await
-                .expect("高并发调度任务不应超时")
-                .expect("高并发调度任务不应 panic");
-            *selection_counts.entry(selected_id).or_insert(0) += 1;
-        }
-
-        let elapsed = started_at.elapsed();
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.global_in_flight_requests, 0);
-        assert_eq!(snapshot.queued_requests, 0);
-        assert_eq!(
-            selection_counts.len(),
-            AVAILABLE_CREDENTIALS,
-            "所有非冷却凭据都应在高并发下被使用，实际分布: {:?}",
-            selection_counts
-        );
-        assert!(
-            selection_counts
-                .keys()
-                .all(|id| *id > COOLED_DOWN_CREDENTIALS),
-            "冷却凭据不应出现在最终调度分布中: {:?}",
-            selection_counts
-        );
-
-        let min_selected = selection_counts.values().copied().min().unwrap_or(0);
-        let max_selected = selection_counts.values().copied().max().unwrap_or(0);
-        let mut distribution: Vec<_> = selection_counts
-            .iter()
-            .map(|(id, count)| (*id, *count))
-            .collect();
-        distribution.sort_by_key(|(id, _)| *id);
-        println!(
-            "sonnet high concurrency dispatch: requests={}, total_credentials={}, cooled_down={}, used_credentials={}, global_limit={}, per_credential_limit={}, elapsed_ms={}, min_selected={}, max_selected={}, distribution={:?}",
-            REQUEST_COUNT,
-            CREDENTIAL_COUNT,
-            COOLED_DOWN_CREDENTIALS,
-            selection_counts.len(),
-            GLOBAL_LIMIT,
-            PER_CREDENTIAL_LIMIT,
-            elapsed.as_millis(),
-            min_selected,
-            max_selected,
-            distribution
-        );
-        assert!(
-            max_selected <= min_selected * 2 + 10,
-            "balanced 高并发分布过度倾斜: min={}, max={}, elapsed={:?}, counts={:?}",
-            min_selected,
-            max_selected,
-            elapsed,
-            selection_counts
-        );
-    }
-
-    #[test]
-    fn test_multi_token_manager_report_refresh_failure() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        assert_eq!(manager.available_count(), 2);
-        for _ in 0..(MAX_FAILURES_PER_CREDENTIAL - 1) {
-            assert!(manager.report_refresh_failure(1));
-        }
-        assert_eq!(manager.available_count(), 2);
-
-        assert!(manager.report_refresh_failure(1));
-        assert_eq!(manager.available_count(), 1);
-
-        let snapshot = manager.snapshot();
-        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
-        assert!(first.disabled);
-        assert_eq!(first.refresh_failure_count, MAX_FAILURES_PER_CREDENTIAL);
-        assert_eq!(snapshot.current_id, 2);
-    }
-
-    #[tokio::test]
-    async fn test_multi_token_manager_refresh_failure_disabled_is_not_auto_recovered() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
-            manager.report_refresh_failure(1);
-            manager.report_refresh_failure(2);
-        }
-        assert_eq!(manager.available_count(), 0);
-
-        let err = manager
-            .acquire_context(None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            err.contains("所有账号均已禁用"),
-            "错误应提示所有账号禁用，实际: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_multi_token_manager_report_quota_exhausted() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        // 凭据会自动分配 ID（从 1 开始）
-        assert_eq!(manager.available_count(), 2);
-        assert!(manager.report_quota_exhausted(1));
-        assert_eq!(manager.available_count(), 1);
-
-        // 再禁用第二个后，无可用凭据
-        assert!(!manager.report_quota_exhausted(2));
-        assert_eq!(manager.available_count(), 0);
-    }
-
-    #[test]
-    fn test_report_risk_controlled_disables_with_specific_reason() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        assert!(manager.report_risk_controlled(
-            1,
-            CredentialRiskControlReason::TemporarilySuspended,
-            "TEMPORARILY_SUSPENDED"
-        ));
-
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.available, 1);
-        assert_eq!(snapshot.current_id, 2);
-        let disabled = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert!(disabled.disabled);
-        assert_eq!(
-            disabled.disabled_reason.as_deref(),
-            Some("TemporarilySuspended")
-        );
-        assert_eq!(disabled.failure_count, MAX_FAILURES_PER_CREDENTIAL);
-    }
-
-    #[tokio::test]
-    async fn test_multi_token_manager_quota_disabled_is_not_auto_recovered() {
-        let config = Config::default();
-        let cred1 = KiroCredentials::default();
-        let cred2 = KiroCredentials::default();
-
-        let manager =
-            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
-
-        manager.report_quota_exhausted(1);
-        manager.report_quota_exhausted(2);
-        assert_eq!(manager.available_count(), 0);
-
-        let err = manager
-            .acquire_context(None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            err.contains("所有账号均已禁用"),
-            "错误应提示所有账号禁用，实际: {}",
-            err
-        );
-        assert_eq!(manager.available_count(), 0);
-    }
-
-    // ============ 凭据级 Region 优先级测试 ============
-
-    #[test]
-    fn test_credential_region_priority_uses_credential_auth_region() {
-        // 凭据配置了 auth_region 时，应使用凭据的 auth_region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.auth_region = Some("eu-west-1".to_string());
-
-        let region = credentials.effective_auth_region(&config);
-        assert_eq!(region, "eu-west-1");
-    }
-
-    #[test]
-    fn test_credential_region_priority_fallback_to_credential_region() {
-        // 凭据未配置 auth_region 但配置了 region 时，应回退到凭据.region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.region = Some("eu-central-1".to_string());
-
-        let region = credentials.effective_auth_region(&config);
-        assert_eq!(region, "eu-central-1");
-    }
-
-    #[test]
-    fn test_credential_region_priority_fallback_to_config() {
-        // 凭据未配置 auth_region 和 region 时，应回退到 config
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let credentials = KiroCredentials::default();
-        assert!(credentials.auth_region.is_none());
-        assert!(credentials.region.is_none());
-
-        let region = credentials.effective_auth_region(&config);
-        assert_eq!(region, "us-west-2");
-    }
-
-    #[test]
-    fn test_multiple_credentials_use_respective_regions() {
-        // 多凭据场景下，不同凭据使用各自的 auth_region
-        let mut config = Config::default();
-        config.region = "ap-northeast-1".to_string();
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.auth_region = Some("us-east-1".to_string());
-
-        let mut cred2 = KiroCredentials::default();
-        cred2.region = Some("eu-west-1".to_string());
-
-        let cred3 = KiroCredentials::default(); // 无 region，使用 config
-
-        assert_eq!(cred1.effective_auth_region(&config), "us-east-1");
-        assert_eq!(cred2.effective_auth_region(&config), "eu-west-1");
-        assert_eq!(cred3.effective_auth_region(&config), "ap-northeast-1");
-    }
-
-    #[test]
-    fn test_idc_oidc_endpoint_uses_credential_auth_region() {
-        // 验证 IdC OIDC endpoint URL 使用凭据 auth_region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.auth_region = Some("eu-central-1".to_string());
-
-        let region = credentials.effective_auth_region(&config);
-        let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
-
-        assert_eq!(refresh_url, "https://oidc.eu-central-1.amazonaws.com/token");
-    }
-
-    #[test]
-    fn test_social_refresh_endpoint_uses_credential_auth_region() {
-        // 验证 Social refresh endpoint URL 使用凭据 auth_region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.auth_region = Some("ap-southeast-1".to_string());
-
-        let region = credentials.effective_auth_region(&config);
-        let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
-
-        assert_eq!(
-            refresh_url,
-            "https://prod.ap-southeast-1.auth.desktop.kiro.dev/refreshToken"
-        );
-    }
-
-    #[test]
-    fn test_api_call_uses_effective_api_region() {
-        // 验证 API 调用使用 effective_api_region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.region = Some("eu-west-1".to_string());
-
-        // 凭据.region 不参与 api_region 回退链
-        let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
-
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
-    }
-
-    #[test]
-    fn test_api_call_uses_credential_api_region() {
-        // 凭据配置了 api_region 时，API 调用应使用凭据的 api_region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.api_region = Some("eu-central-1".to_string());
-
-        let api_region = credentials.effective_api_region(&config);
-        let api_host = format!("q.{}.amazonaws.com", api_region);
-
-        assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
-    }
-
-    #[test]
-    fn test_region_update_preserves_matching_profile_arn() {
-        let mut credential = KiroCredentials {
-            auth_method: Some("idc".to_string()),
-            access_token: Some("access".to_string()),
-            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
-            profile_arn: Some(
-                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL".to_string(),
-            ),
-            ..Default::default()
-        };
-        credential.id = Some(1);
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
-
-        manager
-            .set_credential_regions(1, None, None, Some(Some("eu-central-1".to_string())))
-            .unwrap();
-
-        let entry = manager
-            .snapshot()
-            .entries
-            .into_iter()
-            .find(|entry| entry.id == 1)
-            .unwrap();
-        assert_eq!(entry.api_region.as_deref(), Some("eu-central-1"));
-        assert_eq!(entry.effective_api_region, "eu-central-1");
-        assert!(entry.has_profile_arn);
-        assert!(entry.expires_at.is_none());
-    }
-
-    #[test]
-    fn test_region_update_clears_conflicting_profile_arn() {
-        let mut credential = KiroCredentials {
-            auth_method: Some("idc".to_string()),
-            profile_arn: Some(
-                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL".to_string(),
-            ),
-            ..Default::default()
-        };
-        credential.id = Some(1);
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
-
-        manager
-            .set_credential_regions(1, None, None, Some(Some("us-east-1".to_string())))
-            .unwrap();
-
-        let entry = manager
-            .snapshot()
-            .entries
-            .into_iter()
-            .find(|entry| entry.id == 1)
-            .unwrap();
-        assert_eq!(entry.api_region.as_deref(), Some("us-east-1"));
-        assert_eq!(entry.effective_api_region, "us-east-1");
-        assert!(!entry.has_profile_arn);
-    }
-
-    #[test]
-    fn test_credential_region_empty_string_treated_as_set() {
-        // 空字符串 auth_region 被视为已设置（虽然不推荐，但行为应一致）
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.auth_region = Some("".to_string());
-
-        let region = credentials.effective_auth_region(&config);
-        // 空字符串被视为已设置，不会回退到 config
-        assert_eq!(region, "");
-    }
-
-    #[test]
-    fn test_auth_and_api_region_independent() {
-        // auth_region 和 api_region 互不影响
-        let mut config = Config::default();
-        config.region = "default".to_string();
-
-        let mut credentials = KiroCredentials::default();
-        credentials.auth_region = Some("auth-only".to_string());
-        credentials.api_region = Some("api-only".to_string());
-
-        assert_eq!(credentials.effective_auth_region(&config), "auth-only");
-        assert_eq!(credentials.effective_api_region(&config), "api-only");
-    }
-}
+#[path = "manager_tests.rs"]
+mod tests;

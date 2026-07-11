@@ -11,6 +11,8 @@ use crate::kiro::model::requests::tool::ToolResult;
 
 use super::{ConversionError, EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER};
 
+const TOOL_RESULT_IMAGE_PLACEHOLDER: &str = "[image attached]";
+
 /// 处理消息内容，提取文本、图片和工具结果
 pub(super) fn process_message_content(
     content: &serde_json::Value,
@@ -55,6 +57,7 @@ pub(super) fn process_message_content(
                             if let Some(tool_use_id) =
                                 block.tool_use_id.as_deref().and_then(sanitize_tool_use_id)
                             {
+                                images.extend(extract_tool_result_images(&block.content)?);
                                 let result_content = normalize_tool_result_content(
                                     extract_tool_result_content(&block.content),
                                 );
@@ -499,7 +502,9 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                if item.get("type").and_then(|value| value.as_str()) == Some("image") {
+                    parts.push(TOOL_RESULT_IMAGE_PLACEHOLDER.to_string());
+                } else if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
                 } else if !item.is_null() {
                     parts.push(item.to_string());
@@ -510,6 +515,33 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
+}
+
+fn extract_tool_result_images(
+    content: &Option<serde_json::Value>,
+) -> Result<Vec<KiroImage>, ConversionError> {
+    let Some(serde_json::Value::Array(items)) = content else {
+        return Ok(Vec::new());
+    };
+
+    let mut images = Vec::new();
+    for item in items {
+        if item.get("type").and_then(|value| value.as_str()) != Some("image") {
+            continue;
+        }
+        let block = serde_json::from_value::<ContentBlock>(item.clone()).map_err(|error| {
+            ConversionError::UnsupportedContent(format!(
+                "invalid image block in tool_result: {error}"
+            ))
+        })?;
+        let source = block.source.ok_or_else(|| {
+            ConversionError::UnsupportedContent(
+                "image block in tool_result missing source".to_string(),
+            )
+        })?;
+        images.push(convert_image_source(source)?);
+    }
+    Ok(images)
 }
 
 fn normalize_tool_result_content(content: String) -> String {

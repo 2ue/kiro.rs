@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use crate::model::config::TlsBackend;
 
 /// 代理配置
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
     /// 代理地址，支持 http/https/socks5/socks5h
     pub url: String,
@@ -19,6 +19,18 @@ pub struct ProxyConfig {
     pub username: Option<String>,
     /// 代理认证密码
     pub password: Option<String>,
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProxyConfig")
+            .field("url_configured", &!self.url.trim().is_empty())
+            .field("scheme", &self.scheme_for_log())
+            .field("username_present", &self.username.is_some())
+            .field("password_present", &self.password.is_some())
+            .finish()
+    }
 }
 
 pub fn maybe_compress_json_whitespace(body: String, enabled: bool) -> String {
@@ -136,6 +148,19 @@ impl ProxyConfig {
         self.password = Some(password.into());
         self
     }
+
+    fn scheme_for_log(&self) -> &str {
+        url::Url::parse(&self.url)
+            .ok()
+            .map(|url| match url.scheme() {
+                "http" => "http",
+                "https" => "https",
+                "socks5" => "socks5",
+                "socks5h" => "socks5h",
+                _ => "other",
+            })
+            .unwrap_or("invalid")
+    }
 }
 
 /// 构建 HTTP Client
@@ -181,7 +206,10 @@ pub fn build_client(
         }
 
         builder = builder.proxy(proxy);
-        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+        tracing::debug!(
+            scheme = proxy_config.scheme_for_log(),
+            "HTTP Client 使用代理"
+        );
     }
 
     Ok(builder.build()?)
@@ -213,6 +241,26 @@ mod tests {
         assert_eq!(config.url, "socks5://127.0.0.1:1080");
         assert_eq!(config.username, Some("user".to_string()));
         assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn proxy_config_debug_redacts_url_and_authentication() {
+        let config = ProxyConfig::new("http://url-user:url-pass@proxy.example.invalid:8080/path")
+            .with_auth("configured-user", "configured-pass");
+
+        let output = format!("{config:?}");
+        for secret in [
+            config.url.as_str(),
+            config.username.as_deref().unwrap(),
+            config.password.as_deref().unwrap(),
+            "url-user",
+            "url-pass",
+            "proxy.example.invalid",
+        ] {
+            assert!(!output.contains(secret), "Debug output leaked {secret:?}");
+        }
+        assert!(output.contains("scheme: \"http\""));
+        assert!(output.contains("username_present: true"));
     }
 
     #[test]

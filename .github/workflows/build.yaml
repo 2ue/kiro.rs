@@ -1,4 +1,4 @@
-name: CI Tests
+name: Quality Gate
 
 on:
   push:
@@ -8,47 +8,142 @@ on:
     branches:
       - main
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Optional release tag that must match the Cargo package version
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-tests-${{ github.ref }}
+  group: quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  NODE_VERSION: '22.23.0'
+  PNPM_VERSION: '11.11.0'
+  RUST_TOOLCHAIN: '1.92.0'
+  KIRO_RS_TEST_POSTGRES_URL: postgres://kiro_rs:kiro_rs_test@127.0.0.1:5432/kiro_rs_test
+  KIRO_RS_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+  KIRO_RS_REQUIRE_STORAGE_TESTS: '1'
+  CARGO_PROFILE_RELEASE_LTO: 'false'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  CARGO_TERM_COLOR: always
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  quality:
+    name: Frontend and Rust quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16.9-alpine3.21
+        env:
+          POSTGRES_USER: kiro_rs
+          POSTGRES_PASSWORD: kiro_rs_test
+          POSTGRES_DB: kiro_rs_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kiro_rs -d kiro_rs_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7.4.5-alpine3.21
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          fetch-depth: 0
+
+      - name: Check changed lines for whitespace errors
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/ci/check-diff.sh "$BASE_SHA" "$GITHUB_SHA"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 11
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
 
-      - name: Install ui dependencies
-        working-directory: ui
-        run: pnpm install --frozen-lockfile
-
-      - name: Build ui
-        working-directory: ui
-        run: pnpm build
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: |
+            admin-ui/pnpm-lock.yaml
+            ui/pnpm-lock.yaml
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
-      - name: Run Rust tests
-        run: cargo test --locked --no-default-features
+      - name: Validate release tag
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: node scripts/ci/check-release-version.mjs "$RELEASE_TAG"
+
+      - name: Verify integration-test services
+        run: |
+          : "${KIRO_RS_TEST_POSTGRES_URL:?KIRO_RS_TEST_POSTGRES_URL must be set}"
+          : "${KIRO_RS_TEST_REDIS_URL:?KIRO_RS_TEST_REDIS_URL must be set}"
+          docker exec "${{ job.services.postgres.id }}" pg_isready -U kiro_rs -d kiro_rs_test
+          test "$(docker exec "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
+
+      - name: Install admin-ui dependencies
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install ui dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Check shared frontend contracts
+        run: node scripts/check-frontend-contracts.mjs
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm build
+
+      - name: Build ui
+        working-directory: ui
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Clippy warning baseline
+        run: node scripts/ci/check-clippy-baseline.mjs
+
+      - name: Test without default features
+        run: cargo test --locked --all-targets --no-default-features
+
+      - name: Test with default features
+        run: cargo test --locked --all-targets
+
+      - name: Build release with default features
+        run: cargo build --release --locked

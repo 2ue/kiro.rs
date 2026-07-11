@@ -1,5 +1,5 @@
 import { AlertTriangle, FileSearch, FileUp, RefreshCw, Upload } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -7,8 +7,9 @@ import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { validateExistingCredentials, validateExternalCredentials } from '@/api/credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, buildTestModelOptions, defaultTestModelForOptions, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import type { AddCredentialRequest, CredentialValidationGroup, CredentialValidationItem, CredentialValidationResponse } from '@/types/api'
 
@@ -43,6 +44,21 @@ function quotaText(item: CredentialValidationItem) {
   return `${formatQuota(item.current.currentUsage)}/${formatQuota(item.current.usageLimit)}`
 }
 
+function actionBadgeVariant(checked?: boolean, ok?: boolean | null): 'default' | 'secondary' | 'destructive' | 'outline' {
+  if (!checked) return 'outline'
+  if (ok === true) return 'default'
+  if (ok === false) return 'destructive'
+  return 'secondary'
+}
+
+function ActionBadge({ label, checked, ok }: { label: string; checked?: boolean; ok?: boolean | null }) {
+  return (
+    <Badge variant={actionBadgeVariant(checked, ok)}>
+      {label}{checked ? ok === true ? ' OK' : ok === false ? ' 失败' : ' 未知' : ' 未检查'}
+    </Badge>
+  )
+}
+
 function ResultGroup({ group }: { group: CredentialValidationGroup }) {
   return (
     <Card>
@@ -54,13 +70,21 @@ function ResultGroup({ group }: { group: CredentialValidationGroup }) {
       </CardHeader>
       <CardContent className="divide-y p-0">
         {group.items.map((item) => (
-          <div key={`${item.id || 'external'}-${item.index || item.email || item.subscriptionTitle}`} className="grid gap-3 px-4 py-3 text-sm lg:grid-cols-[1.4fr_1fr_1fr_1.2fr]">
+          <div key={`${item.id || 'external'}-${item.index || item.email || item.subscriptionTitle}`} className="grid gap-3 px-4 py-3 text-sm lg:grid-cols-[1.4fr_1.2fr_1fr_1.3fr_1.2fr]">
             <div className="min-w-0">
               <div className="truncate font-semibold" title={itemTitle(item)}>{itemTitle(item)}</div>
               <div className="mt-1 flex flex-wrap gap-1">
                 {item.disabled !== null && item.disabled !== undefined && <Badge variant={item.disabled ? 'destructive' : 'secondary'}>{item.disabled ? '已禁用' : '启用'}</Badge>}
                 {item.matchedExistingCredentialId && <Badge variant="outline">匹配系统 #{item.matchedExistingCredentialId}</Badge>}
                 {item.existingDisabled && <Badge variant="destructive">系统内已禁用</Badge>}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">校验项目</div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                <ActionBadge label="订阅" checked={item.subscriptionChecked} ok={item.subscriptionOk} />
+                <ActionBadge label="用量" checked={item.usageChecked} ok={item.usageOk} />
+                <ActionBadge label="验活" checked={item.livenessChecked} ok={item.livenessOk} />
               </div>
             </div>
             <div>
@@ -73,7 +97,19 @@ function ResultGroup({ group }: { group: CredentialValidationGroup }) {
             </div>
             <div>
               <div className="text-xs text-muted-foreground">状态</div>
-              <div className="break-words">{item.error ? <span className="text-destructive">{item.error}</span> : item.current ? formatDate(item.current.checkedAt) : '-'}</div>
+              <div className="break-words">
+                {item.error || item.usageError || item.livenessError
+                  ? <span className="text-destructive">{item.error || item.usageError || item.livenessError}</span>
+                  : item.current ? formatDate(item.current.checkedAt) : '-'}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">验活响应</div>
+              <div className="line-clamp-2 break-words text-xs">
+                {item.livenessChecked
+                  ? `${item.livenessModel ? testModelLabel(item.livenessModel) : '默认模型'}${item.livenessResponse ? `: ${item.livenessResponse}` : ''}`
+                  : '-'}
+              </div>
             </div>
           </div>
         ))}
@@ -120,6 +156,7 @@ function initialExternalOptions(): ExternalValidationOptions {
 }
 
 export function AccountValidationPanel() {
+  const modelCapabilities = useModelCapabilities()
   const [raw, setRaw] = useState('')
   const [result, setResult] = useState<CredentialValidationResponse | null>(null)
   const [loading, setLoading] = useState(false)
@@ -132,7 +169,17 @@ export function AccountValidationPanel() {
       return 0
     }
   }, [raw])
+  const modelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const defaultLivenessModel = defaultTestModelForOptions(modelOptions)
   const hasExternalAction = externalOptions.querySubscription || externalOptions.queryUsage || externalOptions.checkLiveness
+
+  useEffect(() => {
+    if (modelOptions.some((option) => option.id === externalOptions.livenessModel)) return
+    setExternalOptions((prev) => ({ ...prev, livenessModel: defaultLivenessModel }))
+  }, [defaultLivenessModel, externalOptions.livenessModel, modelOptions])
 
   const validateExisting = async (scope: 'all' | 'enabled' | 'disabled') => {
     setLoading(true)
@@ -288,7 +335,7 @@ export function AccountValidationPanel() {
                   disabled={loading || !externalOptions.checkLiveness}
                   onChange={(event) => updateExternalOption('livenessModel', event.target.value)}
                 >
-                  {TEST_MODELS.map((model) => (
+                  {modelOptions.map((model) => (
                     <option key={model.id} value={model.id}>{model.label}</option>
                   ))}
                 </select>

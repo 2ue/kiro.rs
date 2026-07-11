@@ -7,6 +7,20 @@ import type { UsageCleanupRequest } from '@/types/api'
 import { ModalShell, Callout, useConfirm } from '@/components/patterns'
 import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui'
 
+const CLEANUP_MAX_OLDER_THAN_DAYS = 3650
+const CLEANUP_MAX_BATCH_SIZE = 5000
+const CLEANUP_MAX_PAUSE_MS = 10000
+
+function boundedInteger(value: string, fallback: number, min: number, max: number): number {
+  const parsed = Number(value)
+  const normalized = Number.isFinite(parsed) ? Math.floor(parsed) : fallback
+  return Math.max(min, Math.min(max, normalized))
+}
+
+function cleanupRangeLabel(days: number): string {
+  return days === 0 ? '执行时刻之前' : `${days} 天前`
+}
+
 export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [olderThanDays, setOlderThanDays] = useState('30')
   const [mode, setMode] = useState<'soft_delete' | 'hard_delete'>('soft_delete')
@@ -27,9 +41,9 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
 
   const buildRequest = (): UsageCleanupRequest => ({
     mode,
-    olderThanDays: Math.max(1, Math.min(3650, Math.floor(Number(olderThanDays)) || 30)),
-    batchSize: Math.max(1, Math.min(100000, Math.floor(Number(batchSize)) || 1000)),
-    pauseMsBetweenBatches: Math.max(0, Math.min(60000, Math.floor(Number(pauseMs)) || 100)),
+    olderThanDays: boundedInteger(olderThanDays, 30, 0, CLEANUP_MAX_OLDER_THAN_DAYS),
+    batchSize: boundedInteger(batchSize, 1000, 1, CLEANUP_MAX_BATCH_SIZE),
+    pauseMsBetweenBatches: boundedInteger(pauseMs, 100, 0, CLEANUP_MAX_PAUSE_MS),
   })
 
   const handlePreview = async () => {
@@ -46,9 +60,10 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
 
   const handleStart = async () => {
     if (!previewResult) return
+    const request = buildRequest()
     const ok = await confirm({
       title: '确认清理',
-      message: `将删除 ${previewResult.matchedRows} 条 ${olderThanDays} 天前的记录（${mode === 'hard_delete' ? '物理删除，不可恢复' : '软删除'}）。确认执行？`,
+      message: `将清理 ${previewResult.matchedRows} 条 ${cleanupRangeLabel(request.olderThanDays ?? 30)}的记录（${mode === 'hard_delete' ? '物理删除，不可恢复' : '软删除'}）。确认执行？`,
       confirmText: '执行清理',
       tone: 'danger',
     })
@@ -72,6 +87,10 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
   }
 
   const handleClearAll = async () => {
+    if (isRunning) {
+      toast.warning('清理任务执行中，不能同时清空全部展示记录')
+      return
+    }
     const ok = await confirm({
       title: '清空所有记录',
       message: '将清空所有用量展示记录（仅影响展示，不影响实际计费），此操作无法撤销，确认继续？',
@@ -102,9 +121,9 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
             size="sm"
             className="text-destructive border-destructive/40 hover:bg-destructive/10 w-full"
             onClick={handleClearAll}
-            disabled={clearRecords.isPending}
+            disabled={clearRecords.isPending || isRunning}
           >
-            清空全部展示记录
+            {isRunning ? '清理任务执行中' : '清空全部展示记录'}
           </Button>
         </div>
 
@@ -162,20 +181,22 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
             <label className="text-xs text-muted-foreground w-20 shrink-0">保留天数</label>
             <Input
               type="number"
-              min={1}
-              max={3650}
+              min={0}
+              max={CLEANUP_MAX_OLDER_THAN_DAYS}
               className="flex-1 h-8 text-xs"
               value={olderThanDays}
               onChange={(e) => setOlderThanDays(e.target.value)}
             />
             <span className="text-xs text-muted-foreground">天前的记录</span>
           </div>
+          <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">允许填 0，表示以任务开始时间作为截止点。</p>
           <div className="space-y-1">
             <div className="flex items-center gap-3">
               <label className="text-xs text-muted-foreground w-20 shrink-0">每批数量</label>
               <Input
                 type="number"
                 min={1}
+                max={CLEANUP_MAX_BATCH_SIZE}
                 className="flex-1 h-8 text-xs"
                 value={batchSize}
                 onChange={(e) => setBatchSize(e.target.value)}
@@ -183,7 +204,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               />
               <span className="text-xs text-muted-foreground/60">条</span>
             </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每次删除的记录数，越大越快但数据库压力越高，默认 1000 通常合适</p>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每次删除的记录数，后端安全上限 {CLEANUP_MAX_BATCH_SIZE}，默认 1000 通常合适</p>
           </div>
           <div className="space-y-1">
             <div className="flex items-center gap-3">
@@ -191,6 +212,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               <Input
                 type="number"
                 min={0}
+                max={CLEANUP_MAX_PAUSE_MS}
                 className="flex-1 h-8 text-xs"
                 value={pauseMs}
                 onChange={(e) => setPauseMs(e.target.value)}
@@ -198,7 +220,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               />
               <span className="text-xs text-muted-foreground/60">ms</span>
             </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批之间的等待毫秒，控制数据库负载，默认 100ms</p>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批之间的等待毫秒，后端安全上限 {CLEANUP_MAX_PAUSE_MS}ms，默认 100ms</p>
           </div>
           <div className="text-xs text-muted-foreground/60">系统后端保留安全上限（maxBatches），超出后自动停止。</div>
         </div>

@@ -160,11 +160,14 @@ fn apply_scheduler_state_to_entry(
                 last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
                 kind: InFlightKind::from_str(&lease.kind),
                 weight_units: lease.weight_units.max(1),
+                locally_owned: previous_local_leases
+                    .iter()
+                    .any(|local| local.id == lease.id && local.locally_owned),
             }
         })
         .collect();
     for lease in previous_local_leases {
-        if seen_lease_ids.insert(lease.id) {
+        if lease.locally_owned && seen_lease_ids.insert(lease.id) {
             merged_in_flight_leases.push(lease);
         }
     }

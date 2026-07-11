@@ -421,11 +421,13 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
   }
 
   const deleteResource = async () => {
+    if (resource.credentialCount > 0) {
+      toast.warning(`代理「${resource.name}」当前仍绑定 ${resource.credentialCount} 个账号，请先在“账号绑定”里取消勾选并保存后再删除。`)
+      return
+    }
     const confirmed = await confirm({
       title: '删除代理资源',
-      message: resource.credentialCount > 0
-        ? `代理「${resource.name}」当前绑定 ${resource.credentialCount} 个账号，删除后这些账号会回退到全局代理或直连。确认删除？`
-        : `确认删除代理资源「${resource.name}」？`,
+      message: `确认删除代理资源「${resource.name}」？`,
       confirmText: '删除',
       tone: 'danger',
     })
