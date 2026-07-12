@@ -119,6 +119,7 @@ schema key 清洗/映射的成本：
 - [x] `cargo test external_public_error_reports_prompt_too_long -- --nocapture`
 - [x] `cargo fmt --check`
 - [x] `git diff --check`
+- [x] `rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs`
 - [x] `cargo check --all-targets`
 - [x] `cargo test --all-targets`
 - [x] `cargo build --release`
@@ -134,10 +135,11 @@ schema key 清洗/映射的成本：
 
 - `cargo fmt --check` 通过。
 - `git diff --check` 通过。
+- `rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs` 通过；本轮修复后 Clippy warning 为 683，低于 baseline 711。
 - `cargo check --all-targets` 通过，无 warning。
-- `cargo test --all-targets` 通过：主程序 1130/1130，`kiro_loadtest` 26/26。
+- `rustup run 1.92.0 cargo test --locked --all-targets` 通过：主程序 1130/1130，`kiro_loadtest` 26/26。
 - `pnpm build` 通过：`ui/` 与 `admin-ui/` 两套生产构建均通过。
-- `cargo build --release` 通过，release binary 成功构建并可启动。
+- `rustup run 1.92.0 cargo build --release --locked` 通过，release binary 成功构建并可启动。
 
 真实本地服务（临时端口 `127.0.0.1:19022`，未触碰 live `9022`）：
 

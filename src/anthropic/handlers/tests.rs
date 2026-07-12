@@ -1770,8 +1770,10 @@ fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
     stream_context.set_requested_max_tokens(payload.max_tokens);
     let _initial_events = stream_context.generate_initial_events();
     let mut events = Vec::new();
-    let mut assistant_response = crate::kiro::model::events::AssistantResponseEvent::default();
-    assistant_response.content = "near token limit".to_string();
+    let assistant_response = crate::kiro::model::events::AssistantResponseEvent {
+        content: "near token limit".to_string(),
+        ..Default::default()
+    };
     events.extend(stream_context.process_kiro_event(&Event::AssistantResponse(assistant_response)));
     events.extend(stream_context.process_kiro_event(&Event::MessageMetadata(
         crate::kiro::model::events::MessageMetadataEvent {
@@ -1842,8 +1844,10 @@ fn stream_zero_context_and_metadata_record_request_estimate_consistently() {
         PromptCacheSimulationMode::Disabled,
     );
     let _initial_events = stream_context.generate_initial_events();
-    let mut assistant_response = AssistantResponseEvent::default();
-    assistant_response.content = "fake response".to_string();
+    let assistant_response = AssistantResponseEvent {
+        content: "fake response".to_string(),
+        ..Default::default()
+    };
     let mut events =
         stream_context.process_kiro_event(&Event::AssistantResponse(assistant_response));
     events.extend(
@@ -3799,9 +3803,11 @@ fn external_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard
 
 #[test]
 fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
-    let mut config = ExternalPoolsConfig::default();
+    let mut config = ExternalPoolsConfig {
+        fallback_on_local_capacity_exhausted: false,
+        ..Default::default()
+    };
 
-    config.fallback_on_local_capacity_exhausted = false;
     assert_eq!(
         classify_local_error_for_external_fallback(
             "本地凭据调度容量暂不可用，并发槽位已满",
@@ -3922,8 +3928,10 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
 
 #[test]
 fn external_fallback_classifier_gates_unsupported_model() {
-    let mut config = ExternalPoolsConfig::default();
-    config.fallback_on_unsupported_model = false;
+    let mut config = ExternalPoolsConfig {
+        fallback_on_unsupported_model: false,
+        ..Default::default()
+    };
     assert_eq!(
         classify_local_error_for_external_fallback("模型不支持: claude-future", &[], &config,),
         None

@@ -985,8 +985,8 @@ fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u
         )
         .await
     });
-    if !admitted {
-        if let Err(err) = block_on_storage(
+    if !admitted
+        && let Err(err) = block_on_storage(
             "关键队列拒绝后同步释放外部池 Redis 并发 lease",
             async move {
                 release_external_pool_lease_with_retry(
@@ -997,14 +997,14 @@ fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u
                 )
                 .await
             },
-        ) {
-            tracing::error!(
-                pool_id,
-                lease_id,
-                "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-                err
-            );
-        }
+        )
+    {
+        tracing::error!(
+            pool_id,
+            lease_id,
+            "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+            err
+        );
     }
 }
 
@@ -1047,19 +1047,19 @@ fn release_external_pool_queue_lease_reliably(manager: ExternalPoolManager, leas
     let admitted = spawn_critical_storage_task("释放外部池 Redis 调度排队 lease", async move {
         release_external_pool_queue_lease_with_retry(manager, lease_id, 2).await
     });
-    if !admitted {
-        if let Err(err) = block_on_storage(
+    if !admitted
+        && let Err(err) = block_on_storage(
             "关键队列拒绝后同步释放外部池 Redis 调度排队 lease",
             async move {
                 release_external_pool_queue_lease_with_retry(fallback_manager, fallback_lease_id, 2)
                     .await
             },
-        ) {
-            tracing::error!(
-                "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-                err
-            );
-        }
+        )
+    {
+        tracing::error!(
+            "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+            err
+        );
     }
 }
 
@@ -2444,29 +2444,29 @@ impl ExternalPoolManager {
                 }
             }
         }
-        if let Some(guard) = queue_guard.as_mut() {
-            if let Err(err) = guard.renew_if_needed().await {
-                tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
-                let message = "Request dispatch queue unavailable: Redis coordination unavailable";
-                self.record_external_failure(
+        if let Some(guard) = queue_guard.as_mut()
+            && let Err(err) = guard.renew_if_needed().await
+        {
+            tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
+            let message = "Request dispatch queue unavailable: Redis coordination unavailable";
+            self.record_external_failure(
+                route,
+                None,
+                attempts,
+                "external_pool_queue_error",
+                message,
+                synthetic_external_error_diagnostics(
                     route,
-                    None,
-                    attempts,
-                    "external_pool_queue_error",
-                    message,
-                    synthetic_external_error_diagnostics(
-                        route,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "external_dispatch",
-                    ),
-                );
-                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "external_pool_queue_error",
-                    message,
-                    &route.error_id,
-                ));
-            }
+                    "external_dispatch",
+                ),
+            );
+            return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "external_pool_queue_error",
+                message,
+                &route.error_id,
+            ));
         }
 
         let mut wakeup = wait_for
