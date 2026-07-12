@@ -286,8 +286,11 @@ async fn external_pool_manager_selects_multiple_pools_by_priority_and_capacity()
     let mut after_release = None;
     for _ in 0..20 {
         if let Some(pool) = manager.select_pool(&HashSet::new(), &config).await {
+            if pool.id == primary.id {
+                after_release = Some(pool);
+                break;
+            }
             after_release = Some(pool);
-            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
