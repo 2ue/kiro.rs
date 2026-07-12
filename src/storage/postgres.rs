@@ -197,6 +197,15 @@ pub struct PostgresStore {
     test_schema: Option<String>,
 }
 
+#[cfg(test)]
+fn postgres_drop_schema_error_is_retryable(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|database_error| {
+        database_error
+            .code()
+            .is_some_and(|code| matches!(code.as_ref(), "40P01" | "55P03"))
+    })
+}
+
 impl PostgresStore {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
         let url = config
@@ -271,9 +280,18 @@ impl PostgresStore {
         let Some(schema) = &self.test_schema else {
             return Ok(());
         };
-        sqlx::query(&format!(r#"DROP SCHEMA IF EXISTS "{}" CASCADE"#, schema))
-            .execute(&self.pool)
-            .await?;
+        let query = format!(r#"DROP SCHEMA IF EXISTS "{}" CASCADE"#, schema);
+        let mut delay = std::time::Duration::from_millis(25);
+        for attempt in 0..5 {
+            match sqlx::query(&query).execute(&self.pool).await {
+                Ok(_) => return Ok(()),
+                Err(error) if postgres_drop_schema_error_is_retryable(&error) && attempt < 4 => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
     }
 
