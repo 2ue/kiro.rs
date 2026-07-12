@@ -224,7 +224,7 @@ mod tests {
             tool.input_schema.get("type"),
             Some(&serde_json::json!("object"))
         );
-        assert!(tool.input_schema.get("properties").is_some());
+        assert!(tool.input_schema.contains_key("properties"));
     }
 }
 
