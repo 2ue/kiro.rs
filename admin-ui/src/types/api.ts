@@ -1218,6 +1218,8 @@ export interface ImageProcessingConfig {
 export interface BodyConversionConfig {
   toolSchemaNormalization: boolean
   toolNameMapping: boolean
+  toolSchemaKeyMapping: 'sanitize' | 'reject' | 'disabled'
+  toolSchemaKeyValidationRegex: string
   toolChoiceSteering: boolean
   chunkedToolPolicy: boolean
   thinkingPromptControls: boolean

@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::anthropic::body_capabilities::KiroConverterPlan;
 use crate::anthropic::model_capabilities::ModelResolution;
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
+use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 #[cfg(test)]
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserMessage,
@@ -79,6 +80,8 @@ pub struct ConversionResult {
     pub cache_point_plan_recording_enabled: bool,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 工具 input_schema property key 映射（上游工具名 → 清洗 key 到原始 key），仅在本次请求内使用。
+    pub tool_schema_key_map: ToolSchemaKeyMap,
     /// 本次请求声明并实际发给上游的工具名集合，包含原始名和因长度限制生成的短名。
     ///
     /// 仅用于下游响应容错：当上游把工具调用泄漏为字面 `<invoke>` 文本时，只有工具名命中
@@ -90,7 +93,7 @@ pub struct ConversionResult {
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConverterOptions {
     pub compat_profile: CompatProfile,
     pub conversion: KiroConverterPlan,
@@ -116,20 +119,20 @@ impl Default for ConverterOptions {
 }
 
 impl ConverterOptions {
-    fn is_strict(self) -> bool {
+    fn is_strict(&self) -> bool {
         self.compat_profile.is_strict()
     }
 
-    fn inject_chunked_policy(self) -> bool {
+    fn inject_chunked_policy(&self) -> bool {
         !self.is_strict() && self.conversion.chunked_tool_policy.is_enabled()
     }
 
-    fn inject_thinking_prefix(self) -> bool {
+    fn inject_thinking_prefix(&self) -> bool {
         self.conversion.thinking_prompt_controls.is_enabled()
             && (self.force_visible_thinking || !self.is_strict())
     }
 
-    fn inject_tool_choice_prefix(self) -> bool {
+    fn inject_tool_choice_prefix(&self) -> bool {
         !self.is_strict() && self.conversion.tool_choice_steering.is_enabled()
     }
 }
@@ -267,7 +270,10 @@ pub(crate) fn extract_stable_conversation_id(req: &MessagesRequest) -> Option<St
     extract_metadata_conversation_id(req).or_else(|| derive_fallback_conversation_id(req))
 }
 
-fn conversation_id_for_options(req: &MessagesRequest, options: ConverterOptions) -> Option<String> {
+fn conversation_id_for_options(
+    req: &MessagesRequest,
+    options: &ConverterOptions,
+) -> Option<String> {
     match options.prompt_cache_simulation_mode {
         PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(req),
         PromptCacheSimulationMode::Disabled => extract_metadata_conversation_id(req),
@@ -373,7 +379,7 @@ fn convert_request_with_model_id(
     // High-cache 模式下缺失 metadata 时从稳定请求锚点派生确定性 UUID；
     // 其他模式保持旧语义，只信任显式 metadata session。
     let conversation_id =
-        conversation_id_for_options(req, options).unwrap_or_else(|| Uuid::new_v4().to_string());
+        conversation_id_for_options(req, &options).unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
@@ -385,7 +391,12 @@ fn convert_request_with_model_id(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
-    let converted_tools = convert_tools(&req.tools, &req.tool_choice, &mut tool_name_map, options);
+    let converted_tools = convert_tools(
+        &req.tools,
+        &req.tool_choice,
+        &mut tool_name_map,
+        options.clone(),
+    )?;
     let mut tools = converted_tools.tools;
     let mut known_tool_names: std::collections::HashSet<String> = tools
         .iter()
@@ -396,7 +407,13 @@ fn convert_request_with_model_id(
     }
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map, options)?;
+    let mut history = build_history(
+        req,
+        messages,
+        &model_id,
+        &mut tool_name_map,
+        options.clone(),
+    )?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -449,7 +466,7 @@ fn convert_request_with_model_id(
                     )));
                 }
                 known_tool_names.insert(tool_name.clone());
-                tools.push(create_placeholder_tool(&tool_name, options));
+                tools.push(create_placeholder_tool(&tool_name, options.clone()));
                 existing_tool_names.insert(tool_name_lower);
             }
         }
@@ -500,6 +517,13 @@ fn convert_request_with_model_id(
     if !tool_name_map.is_empty() {
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
+    let mapped_schema_key_count = converted_tools.tool_schema_key_map.len();
+    if mapped_schema_key_count > 0 {
+        tracing::info!(
+            mapped_schema_key_count,
+            "工具 schema property key 映射已启用"
+        );
+    }
 
     let additional_model_request_fields = build_additional_model_request_fields(
         req,
@@ -522,6 +546,7 @@ fn convert_request_with_model_id(
         tool_cache_point_insert_after: converted_tools.tool_cache_point_insert_after,
         cache_point_plan_recording_enabled: options.kiro_cache_point_record_plan,
         tool_name_map,
+        tool_schema_key_map: converted_tools.tool_schema_key_map,
         known_tool_names,
         warnings,
         additional_model_request_fields,
@@ -1268,6 +1293,283 @@ mod tests {
             .user_input_message_context
             .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    fn schema_key_mapping_request(
+        properties: serde_json::Value,
+        required: serde_json::Value,
+    ) -> MessagesRequest {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), properties);
+        schema.insert("required".to_string(), required);
+
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("call probe"),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(vec![AnthropicTool {
+                name: "probe".to_string(),
+                description: "A probe tool".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_schema_key_mapping_sanitizes_only_invalid_keys_and_reverses_input() {
+        let req = schema_key_mapping_request(
+            serde_json::json!({
+                "valid_key": {"type": "string"},
+                "bad key": {
+                    "type": "object",
+                    "properties": {
+                        "nested/key": {"type": "string"}
+                    },
+                    "required": ["nested/key"]
+                }
+            }),
+            serde_json::json!(["valid_key", "bad key"]),
+        );
+
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+        let tool = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools[0];
+        let schema = &tool.tool_specification.input_schema.json;
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("valid_key"));
+        assert!(!properties.contains_key("bad key"));
+
+        let sanitized_bad_key = properties
+            .keys()
+            .find(|key| key.as_str() != "valid_key")
+            .expect("sanitized bad key")
+            .clone();
+        assert!(
+            sanitized_bad_key.starts_with("key")
+                && sanitized_bad_key.len() == "key".len() + 16
+                && sanitized_bad_key["key".len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "invalid schema key should be mapped to a hash-only id, got {sanitized_bad_key}"
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String(sanitized_bad_key.clone()))
+        );
+
+        let nested_properties = properties[&sanitized_bad_key]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(!nested_properties.contains_key("nested/key"));
+        let sanitized_nested_key = nested_properties.keys().next().unwrap().clone();
+
+        let restored = result.tool_schema_key_map.reverse_tool_input(
+            "probe",
+            serde_json::json!({
+                "valid_key": "kept",
+                sanitized_bad_key: {
+                    sanitized_nested_key: "restored"
+                }
+            }),
+        );
+        assert_eq!(restored["valid_key"], "kept");
+        assert_eq!(restored["bad key"]["nested/key"], "restored");
+    }
+
+    #[test]
+    fn test_schema_key_mapping_reject_mode_errors_without_sanitizing() {
+        use crate::model::config::ToolSchemaKeyMappingMode;
+
+        let req = schema_key_mapping_request(
+            serde_json::json!({
+                "bad key": {"type": "string"}
+            }),
+            serde_json::json!(["bad key"]),
+        );
+        let mut options = ConverterOptions::default();
+        options.conversion.tool_schema_key_mapping = ToolSchemaKeyMappingMode::Reject;
+
+        let err = convert_request_with_options(&req, options).unwrap_err();
+        assert!(err.to_string().contains("bad key"));
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn test_schema_key_mapping_disabled_preserves_invalid_keys() {
+        use crate::model::config::ToolSchemaKeyMappingMode;
+
+        let req = schema_key_mapping_request(
+            serde_json::json!({
+                "bad key": {"type": "string"}
+            }),
+            serde_json::json!(["bad key"]),
+        );
+        let mut options = ConverterOptions::default();
+        options.conversion.tool_schema_key_mapping = ToolSchemaKeyMappingMode::Disabled;
+
+        let result = convert_request_with_options(&req, options).unwrap();
+        let schema = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools[0]
+            .tool_specification
+            .input_schema
+            .json;
+        assert!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("bad key")
+        );
+        assert!(!result.tool_schema_key_map.has_tool("probe"));
+    }
+
+    #[test]
+    fn test_schema_key_mapping_uses_configured_regex() {
+        let req = schema_key_mapping_request(
+            serde_json::json!({
+                "camelCase": {"type": "string"}
+            }),
+            serde_json::json!(["camelCase"]),
+        );
+        let mut options = ConverterOptions::default();
+        options.conversion.tool_schema_key_validation_regex = "^[a-z_][a-z0-9_]{0,63}$".to_string();
+
+        let result = convert_request_with_options(&req, options).unwrap();
+        let schema = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools[0]
+            .tool_specification
+            .input_schema
+            .json;
+        assert!(
+            !schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("camelCase")
+        );
+        assert!(result.tool_schema_key_map.has_tool("probe"));
+    }
+
+    #[test]
+    fn test_empty_tool_description_gets_non_empty_placeholder() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "computer".to_string(),
+                    description: "".to_string(),
+                    input_schema: HashMap::new(),
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "blank".to_string(),
+                    description: "   ".to_string(),
+                    input_schema: HashMap::new(),
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| !tool.tool_specification.description.trim().is_empty())
+        );
+        assert!(tools[0].tool_specification.description.contains("computer"));
+    }
+
+    #[test]
+    fn test_non_empty_tool_description_is_preserved() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                name: "probe".to_string(),
+                description: "Probe tool.".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(tools[0].tool_specification.description, "Probe tool.");
     }
 
     #[test]

@@ -3875,7 +3875,7 @@ impl AdminService {
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
             image_processing: config.image_processing.normalized(),
-            body_conversion: config.body_conversion,
+            body_conversion: config.body_conversion.clone(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
@@ -4034,7 +4034,8 @@ impl AdminService {
             .unwrap_or_else(|| current_config.image_processing.normalized());
         let body_conversion = req
             .body_conversion
-            .unwrap_or(current_config.body_conversion);
+            .clone()
+            .unwrap_or_else(|| current_config.body_conversion.clone());
         let missing_max_tokens = req
             .missing_max_tokens
             .unwrap_or(current_config.missing_max_tokens)

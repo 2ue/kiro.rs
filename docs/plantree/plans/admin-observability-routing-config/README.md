@@ -23,6 +23,12 @@ This plan covers four related but separable surfaces:
 - Observability changes must not block the request hot path.
 - Full regression must include normal calls, error calls, scheduler selection, external pool raw/normalized behavior, usage records, and UI builds.
 
+## Relationship And Authority
+
+This plan remains authoritative for the exact request-id usage query, supported-model dispatch eligibility, bounded prompt/protocol retry, configuration grouping, and local verification landed in its scope. The [system architecture modernization plan](../system-architecture-modernization/README.md) owns later control-plane boundaries, generated frontend contracts, cross-replica invalidation, storage ports, and system-wide migration sequencing.
+
+Modernization work must preserve the compatibility and dispatch semantics above unless an accepted decision explicitly supersedes them and provides migration and regression coverage.
+
 ## Reading Path
 
 1. [Usage query performance](topics/usage-query-performance.md)
@@ -31,4 +37,4 @@ This plan covers four related but separable surfaces:
 4. [Config and capability information architecture](topics/config-capability-information-architecture.md)
 5. [Regression plan](topics/regression-plan.md)
 6. [Roadmap](roadmap.md)
-7. [Implementation status](implementation-status.md)
+7. [Historical implementation snapshot](history/implementation-snapshot-2026-07-07.md)

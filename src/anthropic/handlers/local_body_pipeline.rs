@@ -1,5 +1,6 @@
 use super::*;
 use crate::anthropic::body_capabilities::{BodyStageState, LocalKiroBodyPlan};
+use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 
 pub(super) struct PreparedLocalKiroBody {
     pub(super) request_body: String,
@@ -11,6 +12,7 @@ pub(super) struct PreparedLocalKiroBody {
     pub(super) payload_guard_elapsed: Option<Duration>,
     pub(super) thinking_enabled: bool,
     pub(super) tool_name_map: HashMap<String, String>,
+    pub(super) tool_schema_key_map: ToolSchemaKeyMap,
     pub(super) known_tool_names: HashSet<String>,
     pub(super) warnings_header: Option<String>,
     pub(super) extract_xml_thinking: bool,
@@ -27,7 +29,7 @@ pub(super) fn prepare(
 ) -> Result<PreparedLocalKiroBody, Response> {
     let plan = LocalKiroBodyPlan::compatible_with_config(
         runtime_config.initial_payload_guard_config(),
-        runtime_config.body_conversion,
+        runtime_config.body_conversion.clone(),
     );
     prepare_with_plan(
         endpoint,
@@ -219,6 +221,7 @@ pub(super) fn prepare_with_plan(
         payload_guard_elapsed: prepared_payload.guard_elapsed,
         thinking_enabled,
         tool_name_map: conversion_result.tool_name_map,
+        tool_schema_key_map: conversion_result.tool_schema_key_map,
         known_tool_names: conversion_result.known_tool_names,
         warnings_header,
         extract_xml_thinking,

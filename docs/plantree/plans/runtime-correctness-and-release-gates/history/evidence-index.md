@@ -1,16 +1,40 @@
 # Evidence Index
 
-Date: 2026-07-11
+Date: 2026-07-12
 
 Role: Durable verification summary for the runtime-correctness and release-gates plan.
 
-Status: Current through the isolated Docker attempt on 2026-07-10/11. Every listed gate passed except the explicitly incomplete end-to-end Docker image build.
+Status: Current through the dirty-tree schema-key compatibility and local release-build evidence on 2026-07-12. Every listed gate passed except the explicitly incomplete end-to-end Docker image build.
+
+Source revision note: This historical index did not record the exact Git commit/tree of the validated worktree. Results and binary hashes below must not be attributed to the later `v0.0.102` version-only release commit without separate evidence.
 
 ## Scope Boundary
 
 - The implemented scope covers the verified audit findings except `6. P1` production container/TLS/Admin isolation/database-secret hardening.
 - No commit, tag, push, or release publication is part of this evidence.
 - Raw runtime reports remain under `target/loadtest/runtime-correctness-20260710204231-19707/`; this index records only non-secret outcomes and artifact identifiers.
+
+The later `v0.0.102` release action is a separate event and does not change the evidence boundary above. See [the version-specific release exception](release-exception-v0.0.102.md). The 2026-07-12 schema-key evidence below was produced from a dirty working tree and proves the current local implementation only; it is not an attestation for the already published `v0.0.102` artifact.
+
+## 2026-07-12 Tool Schema Key Compatibility
+
+- Implemented `bodyConversion.toolSchemaKeyMapping` with `sanitize` (default), `reject`, and `disabled`; implemented configurable `bodyConversion.toolSchemaKeyValidationRegex` defaulting to `^[a-zA-Z0-9_.-]{1,64}$`.
+- Default `sanitize` leaves valid schema property keys unchanged and creates request-local mappings only for invalid keys. Invalid keys are mapped to deterministic legal `key<16hex>` ids and reverse-mapped before client-visible `tool_use.input`.
+- The map is request-local and grouped by mapped/upstream tool name; no Redis/global state is used.
+- Stream and non-stream response paths, plus leaked `<invoke>` extraction, reverse-map tool input keys before Anthropic/Claude Code output.
+- Real local-service validation used temporary release service `127.0.0.1:19022` and a real upstream call. The temp process was stopped after validation and no listener remained on `19022`.
+- Non-stream `/v1/messages` result: HTTP 200, one `probe` tool block, client-visible input `{"bad key": "alpha", "valid_key": "beta"}`, and no `key<hash>` response key.
+- Stream `/cc/v1/messages` result: HTTP 200, one `probe` tool call, combined streamed input `{"bad key":"alpha","valid_key":"beta"}`, and no `key<hash>` response key.
+- `reject` and `disabled` behavior is covered by unit tests. A real `reject` service attempt was not counted because runtime PgSQL configuration overrode the temporary file config and left the service in default `sanitize` mode.
+
+## 2026-07-12 Local Release Build With Embedded UIs
+
+- Both maintained frontend bundles were built before the release binary:
+  - `(cd admin-ui && pnpm build)`
+  - `(cd ui && pnpm build)`
+- The shared frontend contract check passed: `node scripts/check-frontend-contracts.mjs`.
+- `cargo +1.92.0 build --release --locked` passed after both `admin-ui/dist` and `ui/dist` existed.
+- This preserves the release rule that both UI builds are embedded inputs. Missing frontend bundles remain a build failure, not an optional release mode.
 
 ## Static, Storage, And Frontend Gates
 
@@ -27,6 +51,7 @@ Status: Current through the isolated Docker attempt on 2026-07-10/11. Every list
 - `kiro-rs` SHA-256: `ff7b379d980e6a00239d1848c482ed2707aa55df7fc0904470756225ce917c5b`.
 - `kiro_loadtest` SHA-256: `eaf85d3d4a41c293685e69973878fd3a0f5f324ce6faa50726e2f8d4596c8871`.
 - The isolated release target directory was deleted after validation; the hashes are also recorded in the runtime report's `binary-sha256.txt`.
+- Because the source commit/version was not captured in this index, these hashes prove the historical isolated build only. They are not `v0.0.102` release-binary hashes.
 
 ## Protocol, Load, And Lifecycle
 
@@ -43,6 +68,12 @@ Status: Current through the isolated Docker attempt on 2026-07-10/11. Every list
 - The builder later remained in `RUN ... cargo fetch --locked ...` until the 1800-second outer timeout because crates.io downloads were too slow.
 - The run never reached Rust compilation or final image export. Therefore the end-to-end Docker gate is not recorded as passed.
 - The unique builder/container, newly pulled BuildKit image, temporary config, and `target/docker-validation-final` directory were precisely removed; the output image tag was absent because export was never reached, and no global Docker pruning was used.
+
+## Subsequent Release Exception
+
+- `v0.0.102` was later committed and tagged at `e9479df71ee0044cfa0da8acbf69d98c2259a66f` under a one-time explicit instruction to skip local compilation verification for that release action.
+- The exception did not convert the incomplete Docker result into a pass and does not apply to any later version.
+- The durable scope, consequence, and future-gate rule are recorded in [release-exception-v0.0.102.md](release-exception-v0.0.102.md).
 
 ## Cleanup And Preservation
 

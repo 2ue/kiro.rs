@@ -4,18 +4,21 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
+use crate::anthropic::tool_schema_keys::{SchemaKeyMapper, ToolSchemaKeyMap};
 use crate::anthropic::types::{MessagesRequest, Tool as AnthropicTool};
 use crate::kiro::model::requests::conversation::Message;
 use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolSpecification};
 
-use super::ConverterOptions;
 use super::schema::normalize_json_schema;
+use super::{ConversionError, ConverterOptions};
 
 /// 追加到 Write 工具 description 末尾的内容
 const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
 
 /// 追加到 Edit 工具 description 末尾的内容
 const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+
+const EMPTY_TOOL_DESCRIPTION_PLACEHOLDER: &str = "Tool available to the assistant.";
 
 /// 追加到系统提示词的分块写入策略
 pub(super) const SYSTEM_CHUNKED_POLICY: &str = "\
@@ -56,18 +59,21 @@ pub(super) fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 pub(super) fn create_placeholder_tool(name: &str, options: ConverterOptions) -> Tool {
+    let schema = serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {}
+    });
+    let schema = if options.conversion.tool_schema_normalization.is_enabled() {
+        normalize_json_schema(schema)
+    } else {
+        schema
+    };
     Tool {
         tool_specification: ToolSpecification {
             name: name.to_string(),
             description: "Tool used in conversation history".to_string(),
-            input_schema: input_schema_from_json(
-                serde_json::json!({
-                    "$schema": "http://json-schema.org/draft-07/schema#",
-                    "type": "object",
-                    "properties": {}
-                }),
-                options,
-            ),
+            input_schema: InputSchema::from_json(schema),
         },
     }
 }
@@ -220,13 +226,34 @@ fn selected_tool_indices(tools: &[AnthropicTool], directive: &ToolChoiceDirectiv
     }
 }
 
-fn input_schema_from_json(schema: serde_json::Value, options: ConverterOptions) -> InputSchema {
-    let schema = if options.conversion.tool_schema_normalization.is_enabled() {
+fn input_schema_from_json(
+    schema: serde_json::Value,
+    mapped_tool_name: &str,
+    mapper: &SchemaKeyMapper,
+    options: ConverterOptions,
+) -> Result<(InputSchema, HashMap<String, String>), ConversionError> {
+    let mut schema = if options.conversion.tool_schema_normalization.is_enabled() {
         normalize_json_schema(schema)
     } else {
         schema
     };
-    InputSchema::from_json(schema)
+    let schema_key_mapping = mapper
+        .apply_to_schema(mapped_tool_name, &mut schema)
+        .map_err(|err| ConversionError::UnsupportedContent(err.to_string()))?;
+    Ok((InputSchema::from_json(schema), schema_key_mapping))
+}
+
+fn normalize_tool_description(tool_name: &str, description: &str) -> String {
+    if !description.trim().is_empty() {
+        return description.to_string();
+    }
+
+    let tool_name = tool_name.trim();
+    if tool_name.is_empty() {
+        EMPTY_TOOL_DESCRIPTION_PLACEHOLDER.to_string()
+    } else {
+        format!("Tool `{}` available to the assistant.", tool_name)
+    }
 }
 
 pub(super) fn generate_tool_choice_prefix(
@@ -261,6 +288,7 @@ pub(super) fn generate_tool_choice_prefix(
 pub(super) struct ConvertedTools {
     pub(super) tools: Vec<Tool>,
     pub(super) tool_cache_point_insert_after: Vec<usize>,
+    pub(super) tool_schema_key_map: ToolSchemaKeyMap,
 }
 
 pub(super) fn convert_tools(
@@ -268,9 +296,9 @@ pub(super) fn convert_tools(
     tool_choice: &Option<serde_json::Value>,
     tool_name_map: &mut HashMap<String, String>,
     options: ConverterOptions,
-) -> ConvertedTools {
+) -> Result<ConvertedTools, ConversionError> {
     let Some(tools) = tools else {
-        return ConvertedTools::default();
+        return Ok(ConvertedTools::default());
     };
     let directive = if options.conversion.tool_choice_steering.is_enabled() {
         parse_tool_choice(tool_choice)
@@ -283,6 +311,14 @@ pub(super) fn convert_tools(
     let mut seen_tool_names = std::collections::HashSet::new();
     let mut converted = Vec::new();
     let mut cache_point_insert_after = Vec::new();
+    let mut tool_schema_key_map = ToolSchemaKeyMap::default();
+    let schema_key_mapper = match SchemaKeyMapper::new(
+        options.conversion.tool_schema_key_mapping,
+        options.conversion.tool_schema_key_validation_regex.clone(),
+    ) {
+        Ok(mapper) => mapper,
+        Err(err) => return Err(ConversionError::UnsupportedContent(err.to_string())),
+    };
 
     if options.kiro_cache_point_enabled && !options.kiro_cache_point_tools_only {
         tracing::debug!(
@@ -295,7 +331,7 @@ pub(super) fn convert_tools(
         .enumerate()
         .filter(|(idx, _)| selected.contains(idx))
     {
-        let mut description = t.description.clone();
+        let mut description = normalize_tool_description(&t.name, &t.description);
 
         // 对 Write/Edit 工具追加自定义描述后缀
         let suffix = if options.conversion.chunked_tool_policy.is_enabled() {
@@ -318,7 +354,7 @@ pub(super) fn convert_tools(
             None => description,
         };
 
-        let mapped_name = map_tool_name(&t.name, tool_name_map, options);
+        let mapped_name = map_tool_name(&t.name, tool_name_map, options.clone());
         if !seen_tool_names.insert(mapped_name.to_ascii_lowercase()) {
             tracing::warn!(
                 original_tool_name = %t.name,
@@ -330,11 +366,21 @@ pub(super) fn convert_tools(
 
         let converted_idx = converted.len();
         let has_cache_control = t.cache_control.is_some();
+        let (input_schema, schema_key_mapping) = input_schema_from_json(
+            serde_json::json!(t.input_schema),
+            &mapped_name,
+            &schema_key_mapper,
+            options.clone(),
+        )?;
+        if !schema_key_mapping.is_empty() {
+            tool_schema_key_map.insert_tool_mapping(mapped_name.clone(), schema_key_mapping);
+        }
+
         converted.push(Tool {
             tool_specification: ToolSpecification {
                 name: mapped_name,
                 description,
-                input_schema: input_schema_from_json(serde_json::json!(t.input_schema), options),
+                input_schema,
             },
         });
         if options.kiro_cache_point_enabled && has_cache_control {
@@ -342,8 +388,9 @@ pub(super) fn convert_tools(
         }
     }
 
-    ConvertedTools {
+    Ok(ConvertedTools {
         tools: converted,
         tool_cache_point_insert_after: cache_point_insert_after,
-    }
+        tool_schema_key_map,
+    })
 }

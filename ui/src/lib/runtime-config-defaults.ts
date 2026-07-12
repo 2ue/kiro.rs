@@ -114,6 +114,8 @@ export function defaultBodyConversion(): BodyConversionConfig {
   return {
     toolSchemaNormalization: true,
     toolNameMapping: true,
+    toolSchemaKeyMapping: 'sanitize',
+    toolSchemaKeyValidationRegex: '^[a-zA-Z0-9_.-]{1,64}$',
     toolChoiceSteering: true,
     chunkedToolPolicy: true,
     thinkingPromptControls: true,

@@ -108,12 +108,30 @@ impl ImageProcessingConfig {
     }
 }
 
+pub const DEFAULT_TOOL_SCHEMA_KEY_VALIDATION_REGEX: &str = "^[a-zA-Z0-9_.-]{1,64}$";
+
+fn default_tool_schema_key_validation_regex() -> String {
+    DEFAULT_TOOL_SCHEMA_KEY_VALIDATION_REGEX.to_string()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaKeyMappingMode {
+    /// 清洗不符合目标正则的 schema property key，并在响应 tool_use.input 中映射回原始 key。
+    #[default]
+    Sanitize,
+    /// 检测到不符合目标正则的 schema property key 时直接本地拒绝，不发给上游。
+    Reject,
+    /// 完全保持旧行为，不校验、不清洗、不反向映射。
+    Disabled,
+}
+
 /// 本地 Anthropic -> Kiro body 转换能力开关。
 ///
 /// 这些开关只影响本地凭据路径的 Kiro 协议转换器。外部池 raw body 透传不会进入
 /// 这些转换阶段；外部池 normalized body 仍按外部池自己的 body/model/usage 配置处理。
 /// 默认全部开启以保持旧行为。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BodyConversionConfig {
     /// 规范化工具 input_schema，移除 Kiro/上游容易拒绝的 OpenAPI/Zod/MCP 扩展字段。
@@ -123,6 +141,19 @@ pub struct BodyConversionConfig {
     /// 将不符合 Kiro 工具名约束的名称清洗/缩短，并维护响应反向映射。
     #[serde(default = "default_true")]
     pub tool_name_mapping: bool,
+
+    /// 工具 input_schema property key 映射策略。
+    ///
+    /// `sanitize` 仅清洗不匹配 `tool_schema_key_validation_regex` 的 key，合法 key 原样保留且不建映射；
+    /// `reject` 在发现非法 key 时本地 400；`disabled` 保持旧行为。
+    #[serde(default)]
+    pub tool_schema_key_mapping: ToolSchemaKeyMappingMode,
+
+    /// 工具 input_schema property key 合法性正则。默认来自问题分析文档。
+    ///
+    /// 只在 `tool_schema_key_mapping` 为 `sanitize` 或 `reject` 时使用。
+    #[serde(default = "default_tool_schema_key_validation_regex")]
+    pub tool_schema_key_validation_regex: String,
 
     /// 处理 Anthropic tool_choice：过滤当前工具列表并注入兼容提示。
     #[serde(default = "default_true")]
@@ -154,6 +185,8 @@ impl Default for BodyConversionConfig {
         Self {
             tool_schema_normalization: true,
             tool_name_mapping: true,
+            tool_schema_key_mapping: ToolSchemaKeyMappingMode::Sanitize,
+            tool_schema_key_validation_regex: default_tool_schema_key_validation_regex(),
             tool_choice_steering: true,
             chunked_tool_policy: true,
             thinking_prompt_controls: true,

@@ -102,6 +102,8 @@ struct Args {
     fake_stream_chunks: usize,
     #[arg(long, default_value_t = 250)]
     fake_stream_chunk_delay_ms: u64,
+    #[arg(long, default_value_t = 0)]
+    fake_tool_input_chars: usize,
     #[arg(long)]
     fake_capture_dir: Option<PathBuf>,
 }
@@ -146,6 +148,7 @@ enum PayloadCase {
     DeepToolInput,
     ManyTools,
     MixedPathological,
+    SchemaKeyMapping,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +173,7 @@ struct RunConfig {
     tool_result_count: usize,
     tool_input_depth: usize,
     tool_count: usize,
+    fake_tool_input_chars: usize,
     timeout_secs: u64,
     auth_key: Option<String>,
     target_pid: u32,
@@ -213,6 +217,7 @@ struct RequestProfile {
     tool_result_count: usize,
     tool_input_depth: usize,
     tool_count: usize,
+    fake_tool_input_chars: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -264,6 +269,7 @@ struct FakeServerState {
     recover_after: u64,
     stream_chunks: usize,
     stream_chunk_delay: Duration,
+    fake_tool_input_chars: usize,
     kiro_eventstream: bool,
     kiro_usage: FakeKiroUsageMode,
     capture_dir: Option<PathBuf>,
@@ -288,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
             recover_after: args.fake_recover_after,
             stream_chunks: args.fake_stream_chunks.max(1),
             stream_chunk_delay: Duration::from_millis(args.fake_stream_chunk_delay_ms),
+            fake_tool_input_chars: args.fake_tool_input_chars,
             kiro_eventstream: args.fake_kiro_eventstream,
             kiro_usage: args.fake_kiro_usage,
             capture_dir: args.fake_capture_dir,
@@ -330,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
         tool_result_count: args.tool_result_count,
         tool_input_depth: args.tool_input_depth,
         tool_count: args.tool_count,
+        fake_tool_input_chars: args.fake_tool_input_chars,
         timeout_secs: args.timeout_secs,
         auth_key: args.auth_key,
         target_pid: args.target_pid.unwrap_or_else(std::process::id),
@@ -572,6 +580,7 @@ fn payload_case_messages(config: &RunConfig, index: usize) -> Value {
             Value::Array(vec![user_text_message(current_user_text(config, index))])
         }
         PayloadCase::MixedPathological => Value::Array(mixed_pathological_messages(config, index)),
+        PayloadCase::SchemaKeyMapping => Value::Array(schema_key_mapping_messages(config, index)),
     }
 }
 
@@ -611,10 +620,38 @@ fn payload_case_requires_tools(config: &RunConfig) -> bool {
                 | PayloadCase::DeepToolInput
                 | PayloadCase::ManyTools
                 | PayloadCase::MixedPathological
+                | PayloadCase::SchemaKeyMapping
         )
 }
 
 fn loadtest_tools(config: &RunConfig) -> Vec<Value> {
+    if config.payload_case == PayloadCase::SchemaKeyMapping {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "bad key": {"type": "string"},
+                "valid_key": {"type": "string"}
+            },
+            "required": ["bad key", "valid_key"]
+        });
+        for level in (0..effective_tool_input_depth(config)).rev() {
+            let invalid_key = format!("nested key {level}");
+            schema = json!({
+                "type": "object",
+                "properties": {
+                    invalid_key.clone(): schema,
+                    "valid_key": {"type": "string"}
+                },
+                "required": [invalid_key, "valid_key"]
+            });
+        }
+        return vec![json!({
+            "name": "schema_probe",
+            "description": "Return mapped schema-key validation input.",
+            "input_schema": schema
+        })];
+    }
+
     let tool_count = effective_tool_count(config);
     (0..tool_count)
         .map(|index| {
@@ -674,9 +711,17 @@ fn effective_tool_input_depth(config: &RunConfig) -> usize {
     match config.payload_case {
         PayloadCase::DeepToolInput => 48,
         PayloadCase::MixedPathological => 32,
+        PayloadCase::SchemaKeyMapping => 1,
         PayloadCase::ManyTools => 8,
         _ => 1,
     }
+}
+
+fn schema_key_mapping_messages(config: &RunConfig, index: usize) -> Vec<Value> {
+    vec![user_text_message(format!(
+        "loadtest request {index}: call schema_probe with a mapped invalid schema key and a valid key; target input chars={}",
+        config.fake_tool_input_chars
+    ))]
 }
 
 fn tool_result_messages(config: &RunConfig, index: usize) -> Vec<Value> {
@@ -1211,7 +1256,10 @@ fn request_profile(config: &RunConfig) -> RequestProfile {
     );
     let uses_deep_input = matches!(
         config.payload_case,
-        PayloadCase::DeepToolInput | PayloadCase::ManyTools | PayloadCase::MixedPathological
+        PayloadCase::DeepToolInput
+            | PayloadCase::ManyTools
+            | PayloadCase::MixedPathological
+            | PayloadCase::SchemaKeyMapping
     );
     RequestProfile {
         payload_case: config.payload_case,
@@ -1243,6 +1291,7 @@ fn request_profile(config: &RunConfig) -> RequestProfile {
         } else {
             config.tool_count
         },
+        fake_tool_input_chars: config.fake_tool_input_chars,
     }
 }
 
@@ -1544,7 +1593,12 @@ async fn fake_handler(
                     } else {
                         kiro_eventstream_response(
                             request_id,
-                            tool_use_kiro_events(select_fake_tool_name(&request), state.kiro_usage),
+                            tool_use_kiro_events(
+                                select_fake_tool_name(&request),
+                                &request,
+                                state.kiro_usage,
+                                state.fake_tool_input_chars,
+                            ),
                         )
                     }
                 } else if body_contains_tool_result(&request) || !body_contains_tools(&request) {
@@ -1552,7 +1606,11 @@ async fn fake_handler(
                 } else {
                     sse_response(
                         request_id,
-                        tool_use_sse_events(select_fake_tool_name(&request)),
+                        tool_use_sse_events(
+                            select_fake_tool_name(&request),
+                            &request,
+                            state.fake_tool_input_chars,
+                        ),
                     )
                 }
             } else {
@@ -2273,8 +2331,98 @@ fn tool_use_input_for(name: &str) -> Value {
     }
 }
 
-fn tool_use_kiro_events(name: String, usage_mode: FakeKiroUsageMode) -> Vec<(Duration, Vec<u8>)> {
-    let input = tool_use_input_for(&name).to_string();
+fn schema_key_mapping_input_for(request: &Value, target_chars: usize) -> Option<Value> {
+    let sanitized_key = find_sanitized_schema_probe_key(request)?;
+    let value = if target_chars == 0 {
+        "mapped-alpha".to_string()
+    } else {
+        deterministic_long_text(0, 99_001, target_chars)
+    };
+    Some(json!({
+        sanitized_key: value,
+        "valid_key": "mapped-beta"
+    }))
+}
+
+fn is_schema_probe_tool_name(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    normalized == "schemaprobe" || normalized.starts_with("schemaprobehash")
+}
+
+fn schema_properties_from_schema(schema: &Value) -> Option<&serde_json::Map<String, Value>> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .or_else(|| schema.get("json").and_then(schema_properties_from_schema))
+}
+
+fn sanitized_schema_probe_key_from_spec(spec: &Value) -> Option<String> {
+    let map = spec.as_object()?;
+    if !map
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(is_schema_probe_tool_name)
+    {
+        return None;
+    }
+    let properties = map
+        .get("inputSchema")
+        .or_else(|| map.get("input_schema"))
+        .and_then(schema_properties_from_schema)?;
+    properties
+        .keys()
+        .find(|key| key.starts_with("key") && key.len() == 19)
+        .cloned()
+}
+
+fn find_sanitized_schema_probe_key(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map
+                .get("toolSpecification")
+                .and_then(sanitized_schema_probe_key_from_spec)
+                .or_else(|| sanitized_schema_probe_key_from_spec(value))
+            {
+                return Some(found);
+            }
+            for child in map.values() {
+                if let Some(found) = find_sanitized_schema_probe_key(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for child in items {
+                if let Some(found) = find_sanitized_schema_probe_key(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn fake_tool_use_input_for(name: &str, request: &Value, target_chars: usize) -> Value {
+    if name == "schema_probe" || is_schema_probe_tool_name(name) {
+        return schema_key_mapping_input_for(request, target_chars)
+            .unwrap_or_else(|| json!({"valid_key": "mapped-beta"}));
+    }
+    tool_use_input_for(name)
+}
+
+fn tool_use_kiro_events(
+    name: String,
+    request: &Value,
+    usage_mode: FakeKiroUsageMode,
+    target_chars: usize,
+) -> Vec<(Duration, Vec<u8>)> {
+    let input = fake_tool_use_input_for(&name, request, target_chars).to_string();
     vec![
         (
             Duration::ZERO,
@@ -2300,8 +2448,12 @@ fn tool_use_kiro_events(name: String, usage_mode: FakeKiroUsageMode) -> Vec<(Dur
     ]
 }
 
-fn tool_use_sse_events(name: String) -> Vec<(Duration, String)> {
-    let input = tool_use_input_for(&name).to_string();
+fn tool_use_sse_events(
+    name: String,
+    request: &Value,
+    target_chars: usize,
+) -> Vec<(Duration, String)> {
+    let input = fake_tool_use_input_for(&name, request, target_chars).to_string();
     vec![
         (
             Duration::ZERO,
@@ -2665,6 +2817,7 @@ mod tests {
             tool_result_count: 2,
             tool_input_depth: 4,
             tool_count: 3,
+            fake_tool_input_chars: 0,
             timeout_secs: 60,
             auth_key: None,
             target_pid: std::process::id(),

@@ -12,14 +12,15 @@
 - Validated raw and normalized external pool paths against fake upstream normal, slow, long-context, high-concurrency, error, recovery, and mixed-chaos scenarios.
 - Verified raw body passthrough with optional model rewrite and with explicit direct disabled.
 - Verified usage projection and external-pool billing remain independent from raw/normalized body mode.
+- Completed cleanup of the temporary validation proxy, database, Redis namespace, and owned ports.
 
 ## In Progress
 
-- Final cleanup of the temporary validation proxy, database, and Redis namespace.
+None. The implemented scope is in compatibility maintenance.
 
 ## Next
 
-- Consider a route planner extraction that can choose non-raw external targets before parsed-body preprocessing when enough raw facts are available.
+- Consider a route planner extraction through the [system architecture modernization plan](../system-architecture-modernization/README.md) if profiling shows that non-raw external targets still pay material unnecessary preprocessing cost.
 - Keep profiling the normalized long-context path if CPU/RSS pressure reappears under real upstream slow streams.
 
 ## Deferred

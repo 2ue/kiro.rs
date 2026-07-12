@@ -11,6 +11,7 @@ use crate::kiro::model::events::{Event, MetadataTokenUsage};
 use crate::model::config::PromptCacheSimulationMode;
 
 use super::envelope;
+use super::tool_schema_keys::ToolSchemaKeyMap;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -802,6 +803,7 @@ pub(crate) fn extract_invoke_content_blocks(
     text: &str,
     known_tool_names: &HashSet<String>,
     tool_name_map: &HashMap<String, String>,
+    tool_schema_key_map: &ToolSchemaKeyMap,
 ) -> Vec<serde_json::Value> {
     let collapsed = collapse_stray_token_floods(text);
     let text: &str = &collapsed;
@@ -843,9 +845,11 @@ pub(crate) fn extract_invoke_content_blocks(
             }
             push_text(&mut blocks, &mut pending_text);
             let (name, input_json) = parsed.expect("parsed is Some when name_known");
+            let upstream_name = name.clone();
             let name = tool_name_map.get(&name).cloned().unwrap_or(name);
             let input: serde_json::Value =
                 serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
+            let input = tool_schema_key_map.reverse_tool_input(&upstream_name, input);
             let input = repair_tool_use_input_for_cli(&name, input);
             let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
             blocks.push(json!({
@@ -1282,6 +1286,8 @@ pub struct StreamContext {
     pending_leaked_tools: Vec<(String, String, String)>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
+    /// 工具 schema property key 反向映射（上游工具名 → 清洗 key 到原始 key）。
+    pub tool_schema_key_map: ToolSchemaKeyMap,
     /// 本次请求声明的工具名集合。字面 `<invoke>` 只有命中该集合才会恢复成 tool_use。
     pub known_tool_names: HashSet<String>,
     /// 已发出的工具调用签名，用于结构化 toolUseEvent 与文本泄漏恢复之间去重。
@@ -1355,20 +1361,40 @@ impl StreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        Self::new_with_thinking_with_known_tools(
+        Self::new_with_thinking_with_known_tools_and_schema_keys(
             model,
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            ToolSchemaKeyMap::default(),
             HashSet::new(),
         )
     }
 
+    #[allow(dead_code)]
     pub fn new_with_thinking_with_known_tools(
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        known_tool_names: HashSet<String>,
+    ) -> Self {
+        Self::new_with_thinking_with_known_tools_and_schema_keys(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            ToolSchemaKeyMap::default(),
+            known_tool_names,
+        )
+    }
+
+    pub fn new_with_thinking_with_known_tools_and_schema_keys(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        tool_schema_key_map: ToolSchemaKeyMap,
         known_tool_names: HashSet<String>,
     ) -> Self {
         Self::new_with_simulation_with_known_tools(
@@ -1378,6 +1404,7 @@ impl StreamContext {
             thinking_enabled,
             true,
             tool_name_map,
+            tool_schema_key_map,
             known_tool_names,
             None,
             PromptCacheSimulationMode::Disabled,
@@ -1402,6 +1429,7 @@ impl StreamContext {
             thinking_enabled,
             extract_xml_thinking,
             tool_name_map,
+            ToolSchemaKeyMap::default(),
             HashSet::new(),
             simulated_usage,
             simulation_mode,
@@ -1415,6 +1443,7 @@ impl StreamContext {
         thinking_enabled: bool,
         extract_xml_thinking: bool,
         tool_name_map: HashMap<String, String>,
+        tool_schema_key_map: ToolSchemaKeyMap,
         known_tool_names: HashSet<String>,
         simulated_usage: Option<super::cache::CacheSimulation>,
         simulation_mode: PromptCacheSimulationMode,
@@ -1434,6 +1463,7 @@ impl StreamContext {
             tool_input_buffers: HashMap::new(),
             pending_leaked_tools: Vec::new(),
             tool_name_map,
+            tool_schema_key_map,
             known_tool_names,
             seen_tool_sigs: HashSet::new(),
             code_fence_open: false,
@@ -2158,7 +2188,10 @@ impl StreamContext {
             .tool_name_map
             .get(&parsed_name)
             .cloned()
-            .unwrap_or(parsed_name);
+            .unwrap_or_else(|| parsed_name.clone());
+        let input_json = self
+            .tool_schema_key_map
+            .reverse_tool_input_json(&parsed_name, &input_json);
         let input_json = repair_tool_use_input_json_for_cli(&output_name, &input_json);
         let sig = tool_use_signature_from_json_str(&output_name, &input_json);
         if self.seen_tool_sigs.contains(&sig) {
@@ -2533,7 +2566,8 @@ impl StreamContext {
         );
         events.extend(start_events);
 
-        let defer_input_until_stop = original_name == "AskUserQuestion";
+        let has_schema_key_map = self.tool_schema_key_map.has_tool(&tool_use.name);
+        let defer_input_until_stop = original_name == "AskUserQuestion" || has_schema_key_map;
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)。AskUserQuestion 需要先
         // 累计完整 JSON，避免已经发给 CLI 的增量参数无法修正。
@@ -2561,10 +2595,16 @@ impl StreamContext {
                 .tool_input_buffers
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_else(|| tool_use.input.clone());
-            let output_input = if defer_input_until_stop {
-                repair_tool_use_input_json_for_cli(&original_name, &full_input)
+            let output_input = if has_schema_key_map {
+                self.tool_schema_key_map
+                    .reverse_tool_input_json(&tool_use.name, &full_input)
             } else {
                 full_input
+            };
+            let output_input = if original_name == "AskUserQuestion" {
+                repair_tool_use_input_json_for_cli(&original_name, &output_input)
+            } else {
+                output_input
             };
             if defer_input_until_stop && !output_input.is_empty() {
                 self.output_tokens += (output_input.len() as i32 + 3) / 4;
@@ -4481,6 +4521,78 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_buffers_and_reverse_maps_sanitized_schema_keys() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut schema_key_map = ToolSchemaKeyMap::default();
+        schema_key_map.insert_tool_mapping(
+            "probe".to_string(),
+            HashMap::from([("key123456789abcdef0".to_string(), "bad key".to_string())]),
+        );
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools_and_schema_keys(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            schema_key_map,
+            HashSet::from(["probe".to_string()]),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let first = ctx.process_tool_use(&ToolUseEvent {
+            name: "probe".to_string(),
+            tool_use_id: "toolu_probe".to_string(),
+            input: r#"{"key12345678"#.to_string(),
+            stop: false,
+        });
+        let first_tool_uses = collect_tool_uses(&first);
+        assert_eq!(first_tool_uses.len(), 1);
+        assert_eq!(
+            first_tool_uses[0].1, "",
+            "sanitized schema key inputs must not stream partial JSON before reverse mapping"
+        );
+
+        let mut all = first;
+        all.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "probe".to_string(),
+            tool_use_id: "toolu_probe".to_string(),
+            input: r#"9abcdef0":"value"}"#.to_string(),
+            stop: true,
+        }));
+        let tool_uses = collect_tool_uses(&all);
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].0, "probe");
+        let input: Value = serde_json::from_str(&tool_uses[0].1).unwrap();
+        assert_eq!(input["bad key"], "value");
+        assert!(input.get("key123456789abcdef0").is_none());
+    }
+
+    #[test]
+    fn test_extract_invoke_reverse_maps_sanitized_schema_keys() {
+        let mut known = HashSet::new();
+        known.insert("probe".to_string());
+        let mut schema_key_map = ToolSchemaKeyMap::default();
+        schema_key_map.insert_tool_mapping(
+            "probe".to_string(),
+            HashMap::from([("key123456789abcdef0".to_string(), "bad key".to_string())]),
+        );
+
+        let blocks = extract_invoke_content_blocks(
+            r#"<invoke name="probe"><parameter name="key123456789abcdef0">value</parameter></invoke>"#,
+            &known,
+            &HashMap::new(),
+            &schema_key_map,
+        );
+
+        let tool = blocks
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("tool use");
+        assert_eq!(tool["input"]["bad key"], "value");
+        assert!(tool["input"].get("key123456789abcdef0").is_none());
+    }
+
+    #[test]
     fn test_extract_invoke_repairs_ask_user_question_input() {
         let mut known = HashSet::new();
         known.insert("AskUserQuestion".to_string());
@@ -4489,6 +4601,7 @@ mod tests {
 <invoke name="AskUserQuestion"><parameter name="questions">[{"header":"反补范围","options":[{"label":"A","description":"A"}]}]</parameter></invoke>"#,
             &known,
             &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
         );
 
         let tool = blocks
@@ -4866,6 +4979,7 @@ mod tests {
             "count\n<invoke name=\"exec_command\"><parameter name=\"flag\">true</parameter><parameter name=\"n\">42</parameter><parameter name=\"cmd\">echo hi</parameter></invoke>",
             &invoke_test_tools(),
             &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
         );
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "tool_use");
@@ -4888,6 +5002,7 @@ mod tests {
             "before\ncall\n<function_calls>\n<invoke name=\"shortTool\"><parameter name=\"x\">y</parameter></invoke>\n</function_calls>\nafter",
             &known,
             &map,
+            &ToolSchemaKeyMap::default(),
         );
 
         assert_eq!(

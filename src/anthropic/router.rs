@@ -123,7 +123,7 @@ impl AnthropicRouterConfig {
             kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             image_processing: config.image_processing.normalized(),
-            body_conversion: config.body_conversion,
+            body_conversion: config.body_conversion.clone(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),

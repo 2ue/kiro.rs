@@ -78,6 +78,8 @@ pub struct ToolUseFormatDiagnostics {
     pub duplicate_history_tool_result_ids: usize,
     pub duplicate_tool_names: usize,
     pub empty_tool_names: usize,
+    pub empty_tool_descriptions: usize,
+    pub invalid_tool_schema_property_keys: usize,
     pub empty_tool_use_ids: usize,
     pub empty_tool_result_ids: usize,
     pub non_object_tool_use_inputs: usize,
@@ -683,18 +685,27 @@ pub fn diagnose_kiro_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiag
     let mut tool_names = HashSet::new();
     let mut duplicate_tool_names = 0usize;
     let mut empty_tool_names = 0usize;
+    let mut empty_tool_descriptions = 0usize;
+    let mut invalid_tool_schema_property_keys = 0usize;
     for tool in &current_context.tools {
         if !claim_tool_diagnostic_item(&mut tool_items_scanned, &mut tool_item_scan_truncated) {
             break;
         }
-        let name = tool.tool_specification.name.trim();
+        let spec = &tool.tool_specification;
+        let name = spec.name.trim();
         if name.is_empty() {
             empty_tool_names += 1;
-            continue;
-        }
-        if !tool_names.insert(name.to_ascii_lowercase()) {
+        } else if !tool_names.insert(name.to_ascii_lowercase()) {
             duplicate_tool_names += 1;
         }
+        if spec.description.trim().is_empty() {
+            empty_tool_descriptions += 1;
+        }
+        invalid_tool_schema_property_keys += count_invalid_tool_schema_property_keys(
+            &spec.input_schema.json,
+            &mut tool_items_scanned,
+            &mut tool_item_scan_truncated,
+        );
     }
 
     let last_assistant_tool_use_ids: HashSet<String> =
@@ -828,11 +839,75 @@ pub fn diagnose_kiro_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiag
         duplicate_history_tool_result_ids,
         duplicate_tool_names,
         empty_tool_names,
+        empty_tool_descriptions,
+        invalid_tool_schema_property_keys,
         empty_tool_use_ids,
         empty_tool_result_ids,
         non_object_tool_use_inputs,
         history_tool_names_missing_from_tools,
     }
+}
+
+fn count_invalid_tool_schema_property_keys(
+    value: &serde_json::Value,
+    scanned: &mut usize,
+    truncated: &mut bool,
+) -> usize {
+    if *scanned >= TOOL_FORMAT_DIAGNOSTIC_MAX_ITEMS {
+        *truncated = true;
+        return 0;
+    }
+
+    match value {
+        serde_json::Value::Object(obj) => {
+            let mut invalid = 0usize;
+            for key in [
+                "properties",
+                "patternProperties",
+                "$defs",
+                "dependentSchemas",
+            ] {
+                let Some(serde_json::Value::Object(map)) = obj.get(key) else {
+                    continue;
+                };
+                for name in map.keys() {
+                    if !claim_tool_diagnostic_item(scanned, truncated) {
+                        return invalid;
+                    }
+                    if !is_valid_tool_schema_property_key(name) {
+                        invalid += 1;
+                    }
+                }
+            }
+
+            for child in obj.values() {
+                invalid += count_invalid_tool_schema_property_keys(child, scanned, truncated);
+                if *truncated {
+                    return invalid;
+                }
+            }
+            invalid
+        }
+        serde_json::Value::Array(items) => {
+            let mut invalid = 0usize;
+            for item in items {
+                invalid += count_invalid_tool_schema_property_keys(item, scanned, truncated);
+                if *truncated {
+                    return invalid;
+                }
+            }
+            invalid
+        }
+        _ => 0,
+    }
+}
+
+fn is_valid_tool_schema_property_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 fn claim_tool_diagnostic_item(scanned: &mut usize, truncated: &mut bool) -> bool {
@@ -5264,6 +5339,46 @@ mod tests {
         assert_eq!(diagnostics.empty_tool_use_ids, 1);
         assert_eq!(diagnostics.non_object_tool_use_inputs, 1);
         assert_eq!(diagnostics.history_tool_names_missing_from_tools, 1);
+        assert_eq!(diagnostics.empty_tool_descriptions, 0);
+        assert_eq!(diagnostics.invalid_tool_schema_property_keys, 0);
+    }
+
+    #[test]
+    fn tool_use_format_diagnostics_counts_empty_descriptions_and_invalid_schema_keys() {
+        let mut current = UserInputMessage::new("current", TEST_MODEL);
+        current.user_input_message_context =
+            UserInputMessageContext::new().with_tools(vec![Tool {
+                tool_specification: ToolSpecification {
+                    name: "probe".to_string(),
+                    description: "".to_string(),
+                    input_schema: InputSchema::from_json(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "bad key": {"type": "string"},
+                            "nested": {
+                                "type": "object",
+                                "properties": {
+                                    "path/to": {"type": "string"}
+                                }
+                            }
+                        }
+                    })),
+                },
+            }]);
+
+        let request = KiroRequest {
+            conversation_state: ConversationState::new("conv-test")
+                .with_current_message(CurrentMessage::new(current)),
+            profile_arn: None,
+            additional_model_request_fields: None,
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
+        };
+
+        let diagnostics = diagnose_kiro_tool_use_format(&request);
+
+        assert_eq!(diagnostics.empty_tool_descriptions, 1);
+        assert_eq!(diagnostics.invalid_tool_schema_property_keys, 2);
     }
 
     #[test]

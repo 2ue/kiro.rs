@@ -128,6 +128,18 @@ where
     Ok(value.min(MAX_BUDGET_TOKENS))
 }
 
+fn deserialize_nullable_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        Option::<HashMap<String, serde_json::Value>>::deserialize(deserializer)?
+            .unwrap_or_default(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +181,50 @@ mod tests {
 
         assert!(json.contains(r#""type":"disabled""#));
         assert!(!json.contains("budget_tokens"));
+    }
+
+    #[test]
+    fn tool_input_schema_null_deserializes_as_empty_map() {
+        let tool = serde_json::from_value::<Tool>(serde_json::json!({
+            "name": "computer",
+            "description": "Control the computer.",
+            "input_schema": null
+        }))
+        .expect("input_schema:null should be tolerated");
+
+        assert!(tool.input_schema.is_empty());
+    }
+
+    #[test]
+    fn tool_input_schema_missing_deserializes_as_empty_map() {
+        let tool = serde_json::from_value::<Tool>(serde_json::json!({
+            "name": "computer",
+            "description": "Control the computer."
+        }))
+        .expect("missing input_schema should use default");
+
+        assert!(tool.input_schema.is_empty());
+    }
+
+    #[test]
+    fn tool_input_schema_object_deserializes_normally() {
+        let tool = serde_json::from_value::<Tool>(serde_json::json!({
+            "name": "computer",
+            "description": "Control the computer.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                }
+            }
+        }))
+        .expect("object input_schema should deserialize");
+
+        assert_eq!(
+            tool.input_schema.get("type"),
+            Some(&serde_json::json!("object"))
+        );
+        assert!(tool.input_schema.get("properties").is_some());
     }
 }
 
@@ -322,7 +378,7 @@ pub struct Tool {
     #[serde(default)]
     pub description: String,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_map")]
     pub input_schema: HashMap<String, serde_json::Value>,
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1268,6 +1268,8 @@ mod tests {
             duplicate_history_tool_result_ids: 1,
             duplicate_tool_names: 0,
             empty_tool_names: 0,
+            empty_tool_descriptions: 0,
+            invalid_tool_schema_property_keys: 0,
             empty_tool_use_ids: 0,
             empty_tool_result_ids: 0,
             non_object_tool_use_inputs: 1,

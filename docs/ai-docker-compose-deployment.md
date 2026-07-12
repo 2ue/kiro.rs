@@ -1,5 +1,7 @@
 # Kiro.rs Docker Compose 部署文档（给 AI 执行）
 
+> **权威警告（2026-07-12）：** 本文档仅是旧系统/当前已发布版本的运维参考。目标系统改造以 `docs/plantree/plans/system-architecture-modernization/` 及已接受的 ADR 001、003-014 为准；本文档不是目标部署运行手册。下文中的 `latest` 和 `0.0.19` 仅为历史示例，不得作为最终候选版本的发布身份、部署依据或验收证据。
+
 本文档用于让 AI 或自动化脚本按 Docker Compose 方式部署 Kiro.rs。所有解释使用中文；JSON 字段名、环境变量名、命令参数保持真实名称，便于直接复制执行。
 
 ## 1. 部署目标

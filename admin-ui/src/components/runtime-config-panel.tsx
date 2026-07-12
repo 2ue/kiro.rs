@@ -136,6 +136,8 @@ const defaultImageProcessing = (): ImageProcessingConfig => ({
 const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
   toolSchemaNormalization: true,
   toolNameMapping: true,
+  toolSchemaKeyMapping: 'sanitize',
+  toolSchemaKeyValidationRegex: '^[a-zA-Z0-9_.-]{1,64}$',
   toolChoiceSteering: true,
   chunkedToolPolicy: true,
   thinkingPromptControls: true,
@@ -3116,6 +3118,54 @@ export function RuntimeConfigPanel() {
                 }
               />
             ))}
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">schema key 映射</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  sanitize 只清洗不符合正则的 property key 并在响应中映射回原 key；reject 明确拒绝；disabled 保持旧行为。
+                </div>
+              </div>
+              <select
+                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={draft.bodyConversion?.toolSchemaKeyMapping ?? 'sanitize'}
+                onChange={(event) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    bodyConversion: {
+                      ...defaultBodyConversion(),
+                      ...prev.bodyConversion,
+                      toolSchemaKeyMapping: event.target.value as RuntimeConfig['bodyConversion']['toolSchemaKeyMapping'],
+                    },
+                  }))
+                }
+              >
+                <option value="sanitize">sanitize：清洗并反向映射</option>
+                <option value="reject">reject：非法 key 明确报错</option>
+                <option value="disabled">disabled：不处理</option>
+              </select>
+            </label>
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">schema key 合法性正则</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  仅 schema key 映射为 sanitize/reject 时使用。默认来自问题分析文档。
+                </div>
+              </div>
+              <Input
+                className="font-mono text-xs"
+                value={draft.bodyConversion?.toolSchemaKeyValidationRegex ?? '^[a-zA-Z0-9_.-]{1,64}$'}
+                onChange={(event) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    bodyConversion: {
+                      ...defaultBodyConversion(),
+                      ...prev.bodyConversion,
+                      toolSchemaKeyValidationRegex: event.target.value,
+                    },
+                  }))
+                }
+              />
+            </label>
             <ToggleField
               title="启用 Kiro Payload 防护"
               description="按真实 Kiro JSON 字节数统计请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。"

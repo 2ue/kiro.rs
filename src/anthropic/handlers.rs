@@ -67,6 +67,7 @@ use super::request_facts::{
 };
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
+use super::tool_schema_keys::ToolSchemaKeyMap;
 use super::types::{
     CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, OutputConfig,
     Thinking,
@@ -672,7 +673,7 @@ impl RequestRuntimeConfig {
             kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
             image_processing: state.image_processing.normalized(),
-            body_conversion: state.body_conversion,
+            body_conversion: state.body_conversion.clone(),
             missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
             external_pools: state.external_pools.clone(),
@@ -730,7 +731,7 @@ impl RequestRuntimeConfig {
             kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             image_processing: config.image_processing.normalized(),
-            body_conversion: config.body_conversion,
+            body_conversion: config.body_conversion.clone(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
@@ -4406,6 +4407,7 @@ async fn post_messages_inner(
         payload_guard_elapsed,
         thinking_enabled,
         tool_name_map,
+        tool_schema_key_map,
         known_tool_names,
         warnings_header,
         extract_xml_thinking,
@@ -4453,6 +4455,7 @@ async fn post_messages_inner(
             thinking_enabled,
             extract_xml_thinking,
             tool_name_map,
+            tool_schema_key_map,
             known_tool_names,
             usage_context,
             warnings_header,
@@ -4479,6 +4482,7 @@ async fn post_messages_inner(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            tool_schema_key_map,
             known_tool_names,
             usage_context,
             warnings_header,
@@ -4712,6 +4716,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     extract_xml_thinking: bool,
     tool_name_map: HashMap<String, String>,
+    tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
@@ -5161,6 +5166,7 @@ async fn handle_stream_request(
         thinking_enabled,
         extract_xml_thinking,
         tool_name_map,
+        tool_schema_key_map,
         known_tool_names,
         credential_usage.request.simulated_usage,
         credential_usage.request.simulation_mode,
@@ -5874,6 +5880,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
@@ -6415,6 +6422,8 @@ async fn handle_non_stream_request(
                                     .get(&tool_use.name)
                                     .cloned()
                                     .unwrap_or_else(|| tool_use.name.clone());
+                                let input =
+                                    tool_schema_key_map.reverse_tool_input(&tool_use.name, input);
                                 let input = crate::anthropic::stream::repair_tool_use_input_for_cli(
                                     &original_name,
                                     input,
@@ -6544,9 +6553,12 @@ async fn handle_non_stream_request(
         if text.is_empty() {
             return;
         }
-        for block in
-            super::stream::extract_invoke_content_blocks(text, &known_tool_names, &tool_name_map)
-        {
+        for block in super::stream::extract_invoke_content_blocks(
+            text,
+            &known_tool_names,
+            &tool_name_map,
+            &tool_schema_key_map,
+        ) {
             if block["type"] == "tool_use" {
                 let name = block["name"].as_str().unwrap_or("");
                 let input = block["input"].clone();

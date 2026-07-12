@@ -51,6 +51,7 @@ pub(crate) mod request_facts;
 mod router;
 mod stream;
 pub(crate) mod tool_format_debug;
+pub(crate) mod tool_schema_keys;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;

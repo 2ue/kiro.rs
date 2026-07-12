@@ -780,6 +780,31 @@ export function RuntimePage() {
                   <TwoCol>
                     <TogField label="工具 schema 规范化" desc="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
                     <TogField label="工具名映射" desc="清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
+                    <div className="rounded-md border bg-background p-4">
+                      <div className="mb-3">
+                        <div className="text-sm font-medium">schema key 映射</div>
+                        <div className="mt-1 text-xs leading-5 text-muted-foreground">sanitize 只清洗不符合正则的 property key 并在响应中映射回原 key；reject 明确拒绝；disabled 保持旧行为。</div>
+                      </div>
+                      <Select value={draft.bodyConversion.toolSchemaKeyMapping} onValueChange={(v) => setBodyConversion('toolSchemaKeyMapping')(v as RuntimeConfig['bodyConversion']['toolSchemaKeyMapping'])}>
+                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="sanitize">sanitize：清洗并反向映射</SelectItem>
+                          <SelectItem value="reject">reject：非法 key 明确报错</SelectItem>
+                          <SelectItem value="disabled">disabled：不处理</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="rounded-md border bg-background p-4">
+                      <div className="mb-3">
+                        <div className="text-sm font-medium">schema key 合法性正则</div>
+                        <div className="mt-1 text-xs leading-5 text-muted-foreground">仅 schema key 映射为 sanitize/reject 时使用。默认来自问题分析文档。</div>
+                      </div>
+                      <Input
+                        className="font-mono text-xs"
+                        value={draft.bodyConversion.toolSchemaKeyValidationRegex}
+                        onChange={(event) => setBodyConversion('toolSchemaKeyValidationRegex')(event.target.value)}
+                      />
+                    </div>
                     <TogField label="tool_choice 引导" desc="按请求的 tool_choice 过滤工具并注入兼容提示。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
                     <TogField label="分块写入策略" desc="给 Write/Edit 工具和系统消息加入分块写入约束。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
                     <TogField label="thinking 提示控制" desc="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />

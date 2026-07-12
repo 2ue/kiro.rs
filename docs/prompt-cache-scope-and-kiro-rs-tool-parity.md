@@ -316,5 +316,4 @@ impl PromptCacheScope {
 ## 7. 与其他文档的关系
 
 - 本文档讲"缓存 scope 开关 + Kiro-RS-Tool 对齐"，是后端 Rust 改动。
-- `ui/FEATURE_PARITY_AUDIT.md`（前端功能审计）、`ui/docs/dashboard-enhancement/`（dashboard 增强）与本文档无依赖关系，但其中"用量/缓存口径展示"若改动，需与本文档 §5 的 reportedUsage 配置保持口径一致。
-
+- 已删除的历史前端功能审计与 [归档的 dashboard 增强方案](archive/ui-planning-2026-06-to-07/README.md) 与本文档无依赖关系；若 R8 重新采纳其中的“用量/缓存口径展示”候选，仍需与本文档 §5 的 reportedUsage 配置保持口径一致，并以当前 usage/cache 决策为准。

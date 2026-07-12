@@ -1,4 +1,4 @@
-use crate::model::config::{BodyConversionConfig, ImageProcessingConfig};
+use crate::model::config::{BodyConversionConfig, ImageProcessingConfig, ToolSchemaKeyMappingMode};
 
 use super::payload_guard::PayloadGuardConfig;
 
@@ -113,10 +113,12 @@ impl PayloadGuardStagePlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KiroConverterPlan {
     pub(crate) tool_schema_normalization: BodyStageState,
     pub(crate) tool_name_mapping: BodyStageState,
+    pub(crate) tool_schema_key_mapping: ToolSchemaKeyMappingMode,
+    pub(crate) tool_schema_key_validation_regex: String,
     pub(crate) tool_choice_steering: BodyStageState,
     pub(crate) chunked_tool_policy: BodyStageState,
     pub(crate) thinking_prompt_controls: BodyStageState,
@@ -130,6 +132,8 @@ impl KiroConverterPlan {
         Self {
             tool_schema_normalization: BodyStageState::from(config.tool_schema_normalization),
             tool_name_mapping: BodyStageState::from(config.tool_name_mapping),
+            tool_schema_key_mapping: config.tool_schema_key_mapping,
+            tool_schema_key_validation_regex: config.tool_schema_key_validation_regex,
             tool_choice_steering: BodyStageState::from(config.tool_choice_steering),
             chunked_tool_policy: BodyStageState::from(config.chunked_tool_policy),
             thinking_prompt_controls: BodyStageState::from(config.thinking_prompt_controls),
@@ -146,7 +150,7 @@ impl Default for KiroConverterPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalKiroBodyPlan {
     pub(crate) profile: BodyProcessingProfile,
     pub(crate) conversion: BodyStageState,

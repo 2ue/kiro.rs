@@ -33,11 +33,11 @@ pub(super) fn build_history(
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = if options.inject_thinking_prefix() {
-        generate_thinking_prefix_for_model(req, model_id, options)
+        generate_thinking_prefix_for_model(req, model_id, options.clone())
     } else {
         None
     };
-    let tool_choice_prefix = generate_tool_choice_prefix(req, options);
+    let tool_choice_prefix = generate_tool_choice_prefix(req, options.clone());
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -113,7 +113,8 @@ pub(super) fn build_history(
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, options)?;
+                let merged =
+                    merge_assistant_messages(&assistant_buffer, tool_name_map, options.clone())?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -132,7 +133,7 @@ pub(super) fn build_history(
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, options)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, options.clone())?;
         history.push(Message::Assistant(merged));
     }
 
@@ -240,7 +241,8 @@ pub(super) fn convert_assistant_message(
                                 let input = normalize_tool_use_input(
                                     block.input.unwrap_or(serde_json::json!({})),
                                 );
-                                let mapped_name = map_tool_name(name, tool_name_map, options);
+                                let mapped_name =
+                                    map_tool_name(name, tool_name_map, options.clone());
                                 tool_uses
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
@@ -297,7 +299,7 @@ pub(super) fn merge_assistant_messages(
     let mut content_parts: Vec<String> = Vec::new();
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map, options)?;
+        let converted = convert_assistant_message(msg, tool_name_map, options.clone())?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);

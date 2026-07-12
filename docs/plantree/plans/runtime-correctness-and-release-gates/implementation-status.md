@@ -1,12 +1,12 @@
 # Implementation Status
 
-Date: 2026-07-11
+Date: 2026-07-12
 
 Current Phase: Final validation and evidence closure
 
 Next Target: Rerun the isolated Docker gate through Rust compilation and final image export after the crates.io fetch timeout.
 
-Last Landed: 2026-07-10/11 static, real-storage, release, protocol, load/chaos, resource-recovery, and in-flight SIGTERM validation passed. See [history/evidence-index.md](history/evidence-index.md).
+Last Landed: 2026-07-12 current dirty-tree schema-key compatibility fix passed static/unit/frontend/local-release and real local-service stream/non-stream validation; 2026-07-10/11 static, real-storage, isolated Rust release build, protocol, load/chaos, resource-recovery, and in-flight SIGTERM validation passed. The end-to-end Docker image gate remains incomplete. See [history/evidence-index.md](history/evidence-index.md).
 
 Active TODO:
 
@@ -23,6 +23,8 @@ Last Verified:
 - Temporary-port protocol/load/chaos, restart, recovery, resource, and graceful SIGTERM validation passed with cleanup complete.
 - The final 143-file runtime evidence set passed a structured and high-signal credential scan; generated frontend/debug artifacts and validation-owned Redis, database, port, Docker, and temporary-file residue were absent after cleanup.
 - The Docker run built both frontend production bundles, then timed out only at the locked Cargo dependency fetch; its unique builder, container, newly pulled BuildKit image, config, and validation directory were cleaned, and no temporary output image existed.
+- Current dirty-tree schema-key mapping validation passed with default `sanitize`: invalid schema property key `bad key` was sent upstream through a legal generated key and returned to clients as `bad key` on both `/v1/messages` non-stream and `/cc/v1/messages` stream real local-service calls.
+- Current dirty-tree local release build passed after building both maintained UI bundles (`admin-ui/dist` and `ui/dist`); both bundles remain required embedded release inputs and are not optional.
 
 Handoff Notes:
 

@@ -12,6 +12,7 @@
 - Corrected the affected frontend types and shared contracts without removing either maintained frontend.
 - Passed the full default/no-default Rust suites, focused real-storage tests, lint baseline, formatting, release build, protocol/load/chaos, resource-recovery, and in-flight SIGTERM checks.
 - Verified both Docker frontend production builds and precisely cleaned the isolated builder after the later Cargo fetch timeout.
+- Landed the current schema-key compatibility fix: default reversible sanitize, explicit reject/disabled modes, both UI config controls, real local-service stream/non-stream validation, and local release build with both embedded UI bundles.
 - Scanned the final runtime evidence for credential-shaped data and removed generated frontend, debug, gate, Docker, Redis, database, port, and temporary-file residue owned by this validation.
 - Indexed the landed validation and cleanup evidence in [history/evidence-index.md](history/evidence-index.md).
 
