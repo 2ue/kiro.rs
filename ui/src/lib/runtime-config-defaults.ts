@@ -219,6 +219,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolsEnabled: false,
     externalPoolGlobalMaxConcurrentRequests: 0,
     externalPoolMaxQueuedRequests: 0,
+    externalPoolMaxInputTokens: 1000000,
     externalPoolCapacityMode: 'fail_fast' as const,
     externalPoolDispatchMaxWaitSecs: 30,
     externalPoolRetryMaxAttempts: 0,

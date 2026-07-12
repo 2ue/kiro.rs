@@ -110,10 +110,7 @@ fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionErro
             let (media_type, data) = normalize_inline_base64_source(&media_type, &data);
             let format =
                 image_format_from_base64_or_media_type(&media_type, &data).ok_or_else(|| {
-                    ConversionError::UnsupportedContent(format!(
-                        "unsupported image media_type: {}",
-                        media_type
-                    ))
+                    ConversionError::UnsupportedContent(invalid_image_source_message(&media_type))
                 })?;
             Ok(KiroImage::from_base64(format, data))
         }
@@ -124,9 +121,8 @@ fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionErro
             if let Some((media_type, data)) = parse_data_url(&url) {
                 let format = image_format_from_base64_or_media_type(&media_type, &data)
                     .ok_or_else(|| {
-                        ConversionError::UnsupportedContent(format!(
-                            "unsupported image media_type: {}",
-                            media_type
+                        ConversionError::UnsupportedContent(invalid_image_source_message(
+                            &media_type,
                         ))
                     })?;
                 Ok(KiroImage::from_base64(format, data))
@@ -425,6 +421,14 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
+fn invalid_image_source_message(media_type: &str) -> String {
+    if get_image_format(media_type).is_some() {
+        format!("invalid image data for media_type: {}", media_type)
+    } else {
+        format!("unsupported image media_type: {}", media_type)
+    }
+}
+
 fn normalize_media_type(media_type: &str) -> String {
     media_type
         .split(';')
@@ -436,19 +440,35 @@ fn normalize_media_type(media_type: &str) -> String {
 
 fn image_format_from_base64_or_media_type(media_type: &str, data: &str) -> Option<String> {
     let declared = get_image_format(media_type);
-    if let Ok(bytes) = BASE64_STANDARD.decode(data) {
-        if let Some(detected) = infer_image_format_from_bytes(&bytes) {
-            if declared.as_deref().is_some_and(|value| value != detected) {
-                tracing::warn!(
-                    declared_media_type = %media_type,
-                    detected_format = detected,
-                    "图片 media_type 与内容字节不一致，已按字节识别结果修正"
-                );
-            }
-            return Some(detected.to_string());
+    let bytes = match BASE64_STANDARD.decode(data) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                declared_media_type = %media_type,
+                error = %err,
+                "图片 base64 无法解码，已拒绝转发到上游"
+            );
+            return None;
         }
+    };
+    let detected = infer_image_format_from_bytes(&bytes)?;
+    if !image_bytes_are_structurally_valid(detected, &bytes) {
+        tracing::warn!(
+            declared_media_type = %media_type,
+            detected_format = detected,
+            image_bytes = bytes.len(),
+            "图片字节未通过轻量结构校验，已拒绝转发到上游"
+        );
+        return None;
     }
-    declared
+    if declared.as_deref().is_some_and(|value| value != detected) {
+        tracing::warn!(
+            declared_media_type = %media_type,
+            detected_format = detected,
+            "图片 media_type 与内容字节不一致，已按字节识别结果修正"
+        );
+    }
+    Some(detected.to_string())
 }
 
 fn infer_image_format_from_bytes(bytes: &[u8]) -> Option<&'static str> {
@@ -463,6 +483,77 @@ fn infer_image_format_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn image_bytes_are_structurally_valid(format: &str, bytes: &[u8]) -> bool {
+    match format {
+        "png" => png_bytes_have_iend(bytes),
+        "jpeg" => jpeg_bytes_have_eoi(bytes),
+        "gif" => gif_bytes_have_trailer(bytes),
+        "webp" => webp_bytes_have_riff_payload(bytes),
+        _ => false,
+    }
+}
+
+fn png_bytes_have_iend(bytes: &[u8]) -> bool {
+    const PNG_SIGNATURE_LEN: usize = 8;
+    if !bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return false;
+    }
+    let mut pos = PNG_SIGNATURE_LEN;
+    let mut saw_ihdr = false;
+    while pos.checked_add(12).is_some_and(|min| min <= bytes.len()) {
+        let length =
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
+        let chunk_type_start = pos + 4;
+        let chunk_type_end = pos + 8;
+        let Some(data_end) = chunk_type_end.checked_add(length) else {
+            return false;
+        };
+        let Some(next_pos) = data_end.checked_add(4) else {
+            return false;
+        };
+        if next_pos > bytes.len() {
+            return false;
+        }
+        let chunk_type = &bytes[chunk_type_start..chunk_type_end];
+        if !saw_ihdr {
+            if chunk_type != b"IHDR" || length != 13 {
+                return false;
+            }
+            saw_ihdr = true;
+        }
+        if chunk_type == b"IEND" {
+            return saw_ihdr && length == 0 && next_pos == bytes.len();
+        }
+        pos = next_pos;
+    }
+    false
+}
+
+fn jpeg_bytes_have_eoi(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes.starts_with(&[0xff, 0xd8]) && bytes.ends_with(&[0xff, 0xd9])
+}
+
+fn gif_bytes_have_trailer(bytes: &[u8]) -> bool {
+    bytes.len() >= 14
+        && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+        && bytes.last() == Some(&0x3b)
+}
+
+fn webp_bytes_have_riff_payload(bytes: &[u8]) -> bool {
+    if bytes.len() < 16 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
+        return false;
+    }
+    let riff_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    if riff_size
+        .checked_add(8)
+        .is_none_or(|declared| declared > bytes.len())
+    {
+        return false;
+    }
+    matches!(&bytes[12..16], b"VP8 " | b"VP8L" | b"VP8X")
 }
 
 pub(crate) fn infer_image_format_from_url(url: &str) -> Option<String> {

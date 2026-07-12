@@ -50,6 +50,92 @@ FROM credential_runtime_state
 "#;
 
 const CREDENTIAL_ID_SEQUENCE_LOCK_ID: i64 = 4_950_531_234_002;
+const POSTGRES_MIGRATION_LOCK_ID: i64 = 4_950_531_234_001;
+const USAGE_INDEX_STARTUP_MAX_BYTES: i64 = 64 * 1024 * 1024;
+
+struct UsageIndexDefinition {
+    table: &'static str,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_created_at",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_credential_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_credential_created ON usage_records (credential_id, created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_model_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_model_created ON usage_records (model, created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_upstream_model_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_upstream_model_created ON usage_records ((data->>'upstreamModel'), created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_external_outbound_model_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_external_outbound_model_created ON usage_records ((data->>'externalOutboundModel'), created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_external_pool_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_external_pool_created ON usage_records ((data->>'externalPoolId'), created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_status_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_status_created ON usage_records (status, created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_conversation",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_conversation ON usage_records (conversation_id) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_deleted_at",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_deleted_at ON usage_records (deleted_at ASC, id ASC) WHERE deleted_at IS NOT NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_rollup_totals",
+        name: "idx_usage_rollup_totals_dimension_cost",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_rollup_totals_dimension_cost ON usage_rollup_totals (dimension, total_estimated_cost_usd DESC, requests DESC)",
+    },
+    UsageIndexDefinition {
+        table: "usage_rollup_time_buckets",
+        name: "idx_usage_rollup_time_dimension_bucket",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_rollup_time_dimension_bucket ON usage_rollup_time_buckets (dimension, bucket_start)",
+    },
+    UsageIndexDefinition {
+        table: "usage_rollup_time_buckets",
+        name: "idx_usage_rollup_time_dimension_key_bucket",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_rollup_time_dimension_key_bucket ON usage_rollup_time_buckets (dimension, dimension_key, bucket_start)",
+    },
+    UsageIndexDefinition {
+        table: "usage_cache_read_rollup_time_buckets",
+        name: "idx_usage_cache_read_rollup_time_bucket",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_cache_read_rollup_time_bucket ON usage_cache_read_rollup_time_buckets (bucket_start, cache_read_input_tokens)",
+    },
+    UsageIndexDefinition {
+        table: "usage_duration_rollup_time_buckets",
+        name: "idx_usage_duration_rollup_time_bucket",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_duration_rollup_time_bucket ON usage_duration_rollup_time_buckets (bucket_start, duration_ms)",
+    },
+    UsageIndexDefinition {
+        table: "usage_credential_cost_summary",
+        name: "idx_usage_credential_cost_summary_cost",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_credential_cost_summary_cost ON usage_credential_cost_summary (estimated_cost_usd DESC, requests DESC)",
+    },
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,17 +226,17 @@ fn credential_hash_columns(
 }
 
 fn duplicate_credential_message(err: sqlx::Error) -> anyhow::Error {
-    if let sqlx::Error::Database(db_err) = &err
-        && db_err.is_unique_violation()
-    {
-        let constraint = db_err.constraint().unwrap_or_default();
-        if constraint.contains("api_key") {
-            return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
+    if let sqlx::Error::Database(db_err) = &err {
+        if db_err.is_unique_violation() {
+            let constraint = db_err.constraint().unwrap_or_default();
+            if constraint.contains("api_key") {
+                return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
+            }
+            if constraint.contains("refresh_token") {
+                return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
+            }
+            return anyhow::anyhow!("凭据已存在（唯一约束冲突）");
         }
-        if constraint.contains("refresh_token") {
-            return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
-        }
-        return anyhow::anyhow!("凭据已存在（唯一约束冲突）");
     }
     anyhow::Error::new(err)
 }
@@ -250,7 +336,7 @@ impl PostgresStore {
             .after_connect(move |conn, _meta| {
                 let schema = schema_for_connect.clone();
                 Box::pin(async move {
-                    sqlx::query(&format!(r#"SET search_path TO "{}", public"#, schema))
+                    sqlx::query(&format!(r#"SET search_path TO "{}""#, schema))
                         .execute(conn)
                         .await?;
                     Ok(())
@@ -296,10 +382,9 @@ impl PostgresStore {
     }
 
     pub async fn migrate_with_options(&self, compress_usage_rollups: bool) -> anyhow::Result<()> {
-        const MIGRATION_LOCK_ID: i64 = 4_950_531_234_001;
         let mut conn = self.pool.acquire().await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(MIGRATION_LOCK_ID)
+            .bind(POSTGRES_MIGRATION_LOCK_ID)
             .execute(&mut *conn)
             .await?;
 
@@ -316,7 +401,13 @@ impl PostgresStore {
             .execute(&mut *conn)
             .await?;
 
+            // Keep the default startup path bounded: schema expansion, small authority-table
+            // repair, and explicitly versioned non-usage migrations only. Historical
+            // usage_records backfills and rollup rebuilds must stay behind explicit
+            // maintenance commands, otherwise a normal docker compose upgrade can block on
+            // multi-GB production usage history before the service becomes available.
             execute_sql_statements(&mut conn, SCHEMA_SQL).await?;
+            ensure_usage_indexes_if_startup_safe(&mut conn).await?;
             repair_active_credential_hashes(&mut conn).await?;
             run_versioned_migration(
                 &mut conn,
@@ -374,7 +465,7 @@ impl PostgresStore {
         .await;
 
         let unlock_result = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(MIGRATION_LOCK_ID)
+            .bind(POSTGRES_MIGRATION_LOCK_ID)
             .execute(&mut *conn)
             .await;
         migration_result?;
@@ -382,9 +473,76 @@ impl PostgresStore {
         Ok(())
     }
 
-    #[cfg(test)]
     pub async fn compress_usage_rollups_to_hour_buckets(&self) -> anyhow::Result<()> {
         self.migrate_with_options(true).await
+    }
+
+    pub async fn create_usage_indexes_concurrently(&self) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .execute(&mut *conn)
+            .await?;
+
+        let result = async {
+            for definition in USAGE_INDEX_DEFINITIONS {
+                let sql = definition.sql.replacen(
+                    "CREATE INDEX IF NOT EXISTS",
+                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS",
+                    1,
+                );
+                sqlx::query(&sql).execute(&mut *conn).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        let unlock_result = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .execute(&mut *conn)
+            .await;
+        result?;
+        unlock_result?;
+        Ok(())
+    }
+
+    pub async fn backfill_usage_legacy_cost_fields(&self) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .execute(&mut *conn)
+            .await?;
+
+        let result = async {
+            sqlx::query(
+                r#"
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                "#,
+            )
+            .execute(&mut *conn)
+            .await?;
+            execute_sql_statements(&mut conn, SCHEMA_SQL).await?;
+            run_versioned_migration(
+                &mut conn,
+                "usage-legacy-cost-field-backfill-v1",
+                USAGE_LEGACY_COST_FIELD_BACKFILL_SQL,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        let unlock_result = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .execute(&mut *conn)
+            .await;
+        result?;
+        unlock_result?;
+        Ok(())
     }
 
     pub async fn load_runtime_config(&self) -> anyhow::Result<Option<Config>> {
@@ -3465,6 +3623,80 @@ async fn execute_sql_statements(
     Ok(())
 }
 
+async fn usage_index_exists(
+    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    definition: &UsageIndexDefinition,
+) -> anyhow::Result<bool> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = $1
+              AND indexname = $2
+        )
+        "#,
+    )
+    .bind(definition.table)
+    .bind(definition.name)
+    .fetch_one(&mut **conn)
+    .await?;
+    Ok(exists)
+}
+
+async fn relation_size_bytes(
+    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    table: &str,
+) -> anyhow::Result<i64> {
+    let size: i64 = sqlx::query_scalar("SELECT pg_total_relation_size($1::regclass)::bigint")
+        .bind(table)
+        .fetch_one(&mut **conn)
+        .await?;
+    Ok(size)
+}
+
+async fn ensure_usage_indexes_if_startup_safe(
+    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+) -> anyhow::Result<()> {
+    let mut skipped = Vec::new();
+    let mut sizes = HashMap::new();
+
+    for definition in USAGE_INDEX_DEFINITIONS {
+        if usage_index_exists(conn, definition).await? {
+            continue;
+        }
+
+        let table_size = if let Some(size) = sizes.get(definition.table) {
+            *size
+        } else {
+            let size = relation_size_bytes(conn, definition.table).await?;
+            sizes.insert(definition.table, size);
+            size
+        };
+
+        if table_size > USAGE_INDEX_STARTUP_MAX_BYTES {
+            skipped.push(format!(
+                "{} on {} ({} bytes)",
+                definition.name, definition.table, table_size
+            ));
+            continue;
+        }
+
+        sqlx::query(definition.sql).execute(&mut **conn).await?;
+    }
+
+    if !skipped.is_empty() {
+        tracing::warn!(
+            skipped_indexes = ?skipped,
+            max_startup_bytes = USAGE_INDEX_STARTUP_MAX_BYTES,
+            "跳过 usage 大表索引启动创建；如需补齐索引，请低峰期显式执行 maintenance usage-indexes"
+        );
+    }
+
+    Ok(())
+}
+
 async fn run_versioned_migration(
     conn: &mut sqlx::pool::PoolConnection<Postgres>,
     version: &str,
@@ -3548,11 +3780,10 @@ async fn repair_active_credential_hashes(
         credential.canonicalize_auth_method();
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&credential);
 
-        if existing_api_key_hash.is_none()
-            && let Some(api_key_hash) = api_key_hash.as_deref()
-        {
-            let conflicting_id: Option<i64> = sqlx::query_scalar(
-                r#"
+        if existing_api_key_hash.is_none() {
+            if let Some(api_key_hash) = api_key_hash.as_deref() {
+                let conflicting_id: Option<i64> = sqlx::query_scalar(
+                    r#"
                     SELECT id
                     FROM credentials
                     WHERE deleted_at IS NULL
@@ -3560,24 +3791,24 @@ async fn repair_active_credential_hashes(
                       AND api_key_hash = $2
                     LIMIT 1
                     "#,
-            )
-            .bind(credential_id)
-            .bind(api_key_hash)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(conflicting_id) = conflicting_id {
-                anyhow::bail!(
-                    "凭据 #{} 与 #{} 的 kiroApiKey 重复，无法回填 hash",
-                    credential_id,
-                    conflicting_id
-                );
+                )
+                .bind(credential_id)
+                .bind(api_key_hash)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(conflicting_id) = conflicting_id {
+                    anyhow::bail!(
+                        "凭据 #{} 与 #{} 的 kiroApiKey 重复，无法回填 hash",
+                        credential_id,
+                        conflicting_id
+                    );
+                }
             }
         }
-        if existing_refresh_token_hash.is_none()
-            && let Some(refresh_token_hash) = refresh_token_hash.as_deref()
-        {
-            let conflicting_id: Option<i64> = sqlx::query_scalar(
-                r#"
+        if existing_refresh_token_hash.is_none() {
+            if let Some(refresh_token_hash) = refresh_token_hash.as_deref() {
+                let conflicting_id: Option<i64> = sqlx::query_scalar(
+                    r#"
                     SELECT id
                     FROM credentials
                     WHERE deleted_at IS NULL
@@ -3585,17 +3816,18 @@ async fn repair_active_credential_hashes(
                       AND refresh_token_hash = $2
                     LIMIT 1
                     "#,
-            )
-            .bind(credential_id)
-            .bind(refresh_token_hash)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(conflicting_id) = conflicting_id {
-                anyhow::bail!(
-                    "凭据 #{} 与 #{} 的 refreshToken 重复，无法回填 hash",
-                    credential_id,
-                    conflicting_id
-                );
+                )
+                .bind(credential_id)
+                .bind(refresh_token_hash)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(conflicting_id) = conflicting_id {
+                    anyhow::bail!(
+                        "凭据 #{} 与 #{} 的 refreshToken 重复，无法回填 hash",
+                        credential_id,
+                        conflicting_id
+                    );
+                }
             }
         }
 
@@ -4038,7 +4270,11 @@ impl PostgresUsageStore {
                 COALESCE(t.total_cache_read_input_tokens, 0)::bigint AS total_cache_read_input_tokens,
                 COALESCE(t.total_cache_creation_input_tokens, 0)::bigint AS total_cache_creation_input_tokens,
                 COALESCE(t.total_estimated_cost_usd, 0)::double precision AS total_estimated_cost_usd,
-                COALESCE(t.total_original_cost_usd, 0)::double precision AS total_original_cost_usd,
+                CASE
+                    WHEN COALESCE(t.total_original_cost_usd, 0) <> 0
+                    THEN t.total_original_cost_usd
+                    ELSE COALESCE(t.total_estimated_cost_usd, 0)
+                END::double precision AS total_original_cost_usd,
                 COALESCE(t.priced_requests, 0)::bigint AS priced_requests,
                 COALESCE(t.unpriced_requests, 0)::bigint AS unpriced_requests,
                 COALESCE(t.local_prompt_cache_requests, 0)::bigint AS local_prompt_cache_requests,
@@ -4052,9 +4288,24 @@ impl PostgresUsageStore {
                 COALESCE(t.external_pool_unpriced_requests, 0)::bigint AS external_pool_unpriced_requests,
                 COALESCE(t.external_pool_cost_floor_applied_requests, 0)::bigint AS external_pool_cost_floor_applied_requests,
                 COALESCE(t.external_pool_raw_cost_usd, 0)::double precision AS external_pool_raw_cost_usd,
-                COALESCE(t.external_pool_shaped_cost_usd, 0)::double precision AS external_pool_shaped_cost_usd,
-                COALESCE(t.external_pool_uplifted_cost_usd, 0)::double precision AS external_pool_uplifted_cost_usd,
-                COALESCE(t.external_pool_profit_usd, 0)::double precision AS external_pool_profit_usd,
+                CASE
+                    WHEN COALESCE(t.external_pool_shaped_cost_usd, 0) <> 0
+                    THEN t.external_pool_shaped_cost_usd
+                    ELSE COALESCE(t.external_pool_reported_cost_usd, 0)
+                END::double precision AS external_pool_shaped_cost_usd,
+                CASE
+                    WHEN COALESCE(t.external_pool_uplifted_cost_usd, 0) <> 0
+                    THEN t.external_pool_uplifted_cost_usd
+                    ELSE COALESCE(t.external_pool_reported_cost_usd, 0)
+                END::double precision AS external_pool_uplifted_cost_usd,
+                CASE
+                    WHEN COALESCE(t.external_pool_profit_usd, 0) <> 0
+                    THEN t.external_pool_profit_usd
+                    WHEN COALESCE(t.external_pool_reported_cost_usd, 0) <> 0
+                      OR COALESCE(t.external_pool_raw_cost_usd, 0) <> 0
+                    THEN COALESCE(t.external_pool_reported_cost_usd, 0) - COALESCE(t.external_pool_raw_cost_usd, 0)
+                    ELSE 0
+                END::double precision AS external_pool_profit_usd,
                 COALESCE(t.external_pool_reported_cost_usd, 0)::double precision AS external_pool_reported_cost_usd,
                 COALESCE(t.external_pool_billable_cost_usd, 0)::double precision AS external_pool_billable_cost_usd,
                 COALESCE(t.external_pool_cost_floor_delta_usd, 0)::double precision AS external_pool_cost_floor_delta_usd,
@@ -4352,7 +4603,13 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
                 COALESCE(SUM(b.total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
                 COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
-                COALESCE(SUM(b.total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
+                        THEN b.total_original_cost_usd
+                        ELSE COALESCE(b.total_estimated_cost_usd, 0)
+                    END
+                ), 0)::double precision AS total_original_cost_usd,
                 COALESCE(SUM(b.priced_requests), 0)::bigint AS priced_requests,
                 COALESCE(SUM(b.unpriced_requests), 0)::bigint AS unpriced_requests,
                 CASE
@@ -4371,9 +4628,30 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
                 COALESCE(SUM(b.external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
                 COALESCE(SUM(b.external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
-                COALESCE(SUM(b.external_pool_shaped_cost_usd), 0)::double precision AS external_pool_shaped_cost_usd,
-                COALESCE(SUM(b.external_pool_uplifted_cost_usd), 0)::double precision AS external_pool_uplifted_cost_usd,
-                COALESCE(SUM(b.external_pool_profit_usd), 0)::double precision AS external_pool_profit_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.external_pool_shaped_cost_usd, 0) <> 0
+                        THEN b.external_pool_shaped_cost_usd
+                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                    END
+                ), 0)::double precision AS external_pool_shaped_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.external_pool_uplifted_cost_usd, 0) <> 0
+                        THEN b.external_pool_uplifted_cost_usd
+                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                    END
+                ), 0)::double precision AS external_pool_uplifted_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.external_pool_profit_usd, 0) <> 0
+                        THEN b.external_pool_profit_usd
+                        WHEN COALESCE(b.external_pool_reported_cost_usd, 0) <> 0
+                          OR COALESCE(b.external_pool_raw_cost_usd, 0) <> 0
+                        THEN COALESCE(b.external_pool_reported_cost_usd, 0) - COALESCE(b.external_pool_raw_cost_usd, 0)
+                        ELSE 0
+                    END
+                ), 0)::double precision AS external_pool_profit_usd,
                 COALESCE(SUM(b.external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
                 COALESCE(SUM(b.external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
                 COALESCE(SUM(b.external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd
@@ -4526,7 +4804,13 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
                 COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
                 COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
-                COALESCE(SUM(b.total_original_cost_usd), 0)::double precision AS total_original_cost_usd
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
+                        THEN b.total_original_cost_usd
+                        ELSE COALESCE(b.total_estimated_cost_usd, 0)
+                    END
+                ), 0)::double precision AS total_original_cost_usd
             FROM windows w
             LEFT JOIN usage_rollup_time_buckets b
                 ON b.dimension = 'global'
@@ -4564,9 +4848,30 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.external_pool_unpriced_requests), 0)::bigint AS unpriced_requests,
                 COALESCE(SUM(b.external_pool_cost_floor_applied_requests), 0)::bigint AS cost_floor_applied_requests,
                 COALESCE(SUM(b.external_pool_raw_cost_usd), 0)::double precision AS raw_cost_usd,
-                COALESCE(SUM(b.external_pool_shaped_cost_usd), 0)::double precision AS shaped_cost_usd,
-                COALESCE(SUM(b.external_pool_uplifted_cost_usd), 0)::double precision AS uplifted_cost_usd,
-                COALESCE(SUM(b.external_pool_profit_usd), 0)::double precision AS profit_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.external_pool_shaped_cost_usd, 0) <> 0
+                        THEN b.external_pool_shaped_cost_usd
+                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                    END
+                ), 0)::double precision AS shaped_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.external_pool_uplifted_cost_usd, 0) <> 0
+                        THEN b.external_pool_uplifted_cost_usd
+                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                    END
+                ), 0)::double precision AS uplifted_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(b.external_pool_profit_usd, 0) <> 0
+                        THEN b.external_pool_profit_usd
+                        WHEN COALESCE(b.external_pool_reported_cost_usd, 0) <> 0
+                          OR COALESCE(b.external_pool_raw_cost_usd, 0) <> 0
+                        THEN COALESCE(b.external_pool_reported_cost_usd, 0) - COALESCE(b.external_pool_raw_cost_usd, 0)
+                        ELSE 0
+                    END
+                ), 0)::double precision AS profit_usd,
                 COALESCE(SUM(b.external_pool_reported_cost_usd), 0)::double precision AS reported_cost_usd,
                 COALESCE(SUM(b.external_pool_billable_cost_usd), 0)::double precision AS billable_cost_usd,
                 COALESCE(SUM(b.external_pool_cost_floor_delta_usd), 0)::double precision AS cost_floor_delta_usd
@@ -4632,7 +4937,11 @@ impl PostgresUsageStore {
                 total_cache_read_input_tokens::bigint AS total_cache_read_input_tokens,
                 total_cache_creation_input_tokens::bigint AS total_cache_creation_input_tokens,
                 total_estimated_cost_usd::double precision AS total_estimated_cost_usd,
-                total_original_cost_usd::double precision AS total_original_cost_usd
+                CASE
+                    WHEN COALESCE(total_original_cost_usd, 0) <> 0
+                    THEN total_original_cost_usd
+                    ELSE COALESCE(total_estimated_cost_usd, 0)
+                END::double precision AS total_original_cost_usd
             FROM usage_rollup_totals
             WHERE dimension = "#,
         );
@@ -4657,7 +4966,11 @@ impl PostgresUsageStore {
             SELECT
                 credential_id,
                 estimated_cost_usd,
-                original_cost_usd,
+                CASE
+                    WHEN COALESCE(original_cost_usd, 0) <> 0
+                    THEN original_cost_usd
+                    ELSE COALESCE(estimated_cost_usd, 0)
+                END::double precision AS original_cost_usd,
                 kiro_metering_usage,
                 priced_requests,
                 unpriced_requests
@@ -4698,7 +5011,11 @@ impl PostgresUsageStore {
             SELECT
                 credential_id,
                 estimated_cost_usd,
-                original_cost_usd,
+                CASE
+                    WHEN COALESCE(original_cost_usd, 0) <> 0
+                    THEN original_cost_usd
+                    ELSE COALESCE(estimated_cost_usd, 0)
+                END::double precision AS original_cost_usd,
                 kiro_metering_usage,
                 priced_requests,
                 unpriced_requests
@@ -4737,7 +5054,11 @@ impl PostgresUsageStore {
                 total_cache_read_input_tokens AS cache_read_input_tokens,
                 total_cache_creation_input_tokens AS cache_creation_input_tokens,
                 total_estimated_cost_usd AS estimated_cost_usd,
-                total_original_cost_usd AS original_cost_usd
+                CASE
+                    WHEN COALESCE(total_original_cost_usd, 0) <> 0
+                    THEN total_original_cost_usd
+                    ELSE COALESCE(total_estimated_cost_usd, 0)
+                END AS original_cost_usd
             FROM usage_rollup_totals
             WHERE dimension = 'credential' AND requests > 0
             ORDER BY estimated_cost_usd DESC, requests DESC, cache_read_input_tokens DESC
@@ -4759,7 +5080,11 @@ impl PostgresUsageStore {
                 total_cache_read_input_tokens AS cache_read_input_tokens,
                 total_cache_creation_input_tokens AS cache_creation_input_tokens,
                 total_estimated_cost_usd AS estimated_cost_usd,
-                total_original_cost_usd AS original_cost_usd
+                CASE
+                    WHEN COALESCE(total_original_cost_usd, 0) <> 0
+                    THEN total_original_cost_usd
+                    ELSE COALESCE(total_estimated_cost_usd, 0)
+                END AS original_cost_usd
             FROM usage_rollup_totals
             WHERE dimension = 'conversation' AND requests > 0
             ORDER BY estimated_cost_usd DESC, requests DESC, cache_read_input_tokens DESC
@@ -4788,7 +5113,9 @@ impl PostgresUsageStore {
         let mut records = Vec::with_capacity(rows.len());
         for row in rows {
             let value: serde_json::Value = row.try_get("data")?;
-            records.push(serde_json::from_value(value)?);
+            let mut record: UsageRecord = serde_json::from_value(value)?;
+            apply_usage_record_legacy_cost_compatibility(&mut record);
+            records.push(record);
         }
         Ok(records)
     }
@@ -4799,6 +5126,23 @@ impl PostgresUsageStore {
         push_usage_filters(&mut builder, &query);
         let row = builder.build().fetch_one(self.store.pool()).await?;
         row_i64_to_usize(&row, "count")
+    }
+}
+
+fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
+    if record.original_cost_usd != 0.0 {
+        return;
+    }
+
+    if let Some(external_pool_billing) = &record.external_pool_billing {
+        if external_pool_billing.raw_cost_usd != 0.0 {
+            record.original_cost_usd = external_pool_billing.raw_cost_usd;
+            return;
+        }
+    }
+
+    if record.estimated_cost_usd != 0.0 {
+        record.original_cost_usd = record.estimated_cost_usd;
     }
 }
 
@@ -6813,30 +7157,6 @@ ALTER TABLE usage_records
     ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
 
-UPDATE usage_records
-SET original_cost_usd = COALESCE(
-    NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision,
-    NULLIF(data #>> '{originalCostUsd}', '')::double precision,
-    estimated_cost_usd,
-    0
-)
-WHERE original_cost_usd = 0
-  AND (
-      estimated_cost_usd <> 0
-      OR NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '') IS NOT NULL
-      OR NULLIF(data #>> '{originalCostUsd}', '') IS NOT NULL
-  );
-
-CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_credential_created ON usage_records (credential_id, created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_model_created ON usage_records (model, created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_upstream_model_created ON usage_records ((data->>'upstreamModel'), created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_external_outbound_model_created ON usage_records ((data->>'externalOutboundModel'), created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_external_pool_created ON usage_records ((data->>'externalPoolId'), created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_status_created ON usage_records (status, created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_conversation ON usage_records (conversation_id) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_usage_records_deleted_at ON usage_records (deleted_at ASC, id ASC) WHERE deleted_at IS NOT NULL;
-
 CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     dimension TEXT NOT NULL,
     dimension_key TEXT NOT NULL,
@@ -6881,9 +7201,6 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     PRIMARY KEY (dimension, dimension_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_usage_rollup_totals_dimension_cost
-    ON usage_rollup_totals (dimension, total_estimated_cost_usd DESC, requests DESC);
-
 ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
@@ -6897,15 +7214,6 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
-
-UPDATE usage_rollup_totals
-SET total_original_cost_usd = CASE
-    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
-    THEN external_pool_raw_cost_usd
-    ELSE total_estimated_cost_usd
-END
-WHERE total_original_cost_usd = 0
-  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
 
 CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     bucket_start TIMESTAMPTZ NOT NULL,
@@ -6952,12 +7260,6 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     PRIMARY KEY (bucket_start, dimension, dimension_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_usage_rollup_time_dimension_bucket
-    ON usage_rollup_time_buckets (dimension, bucket_start);
-
-CREATE INDEX IF NOT EXISTS idx_usage_rollup_time_dimension_key_bucket
-    ON usage_rollup_time_buckets (dimension, dimension_key, bucket_start);
-
 ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
@@ -6971,35 +7273,6 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
-
-UPDATE usage_rollup_time_buckets
-SET total_original_cost_usd = CASE
-    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
-    THEN external_pool_raw_cost_usd
-    ELSE total_estimated_cost_usd
-END
-WHERE total_original_cost_usd = 0
-  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
-
-UPDATE usage_rollup_totals
-SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
-    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
-    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
-WHERE external_pool_requests > 0
-  AND external_pool_reported_cost_usd <> 0
-  AND external_pool_shaped_cost_usd = 0
-  AND external_pool_uplifted_cost_usd = 0
-  AND external_pool_profit_usd = 0;
-
-UPDATE usage_rollup_time_buckets
-SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
-    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
-    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
-WHERE external_pool_requests > 0
-  AND external_pool_reported_cost_usd <> 0
-  AND external_pool_shaped_cost_usd = 0
-  AND external_pool_uplifted_cost_usd = 0
-  AND external_pool_profit_usd = 0;
 
 CREATE TABLE IF NOT EXISTS usage_cache_read_totals (
     cache_read_input_tokens INTEGER NOT NULL PRIMARY KEY,
@@ -7015,9 +7288,6 @@ CREATE TABLE IF NOT EXISTS usage_cache_read_rollup_time_buckets (
     PRIMARY KEY (bucket_start, cache_read_input_tokens)
 );
 
-CREATE INDEX IF NOT EXISTS idx_usage_cache_read_rollup_time_bucket
-    ON usage_cache_read_rollup_time_buckets (bucket_start, cache_read_input_tokens);
-
 CREATE TABLE IF NOT EXISTS usage_duration_rollup_time_buckets (
     bucket_start TIMESTAMPTZ NOT NULL,
     duration_ms INTEGER NOT NULL,
@@ -7025,9 +7295,6 @@ CREATE TABLE IF NOT EXISTS usage_duration_rollup_time_buckets (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (bucket_start, duration_ms)
 );
-
-CREATE INDEX IF NOT EXISTS idx_usage_duration_rollup_time_bucket
-    ON usage_duration_rollup_time_buckets (bucket_start, duration_ms);
 
 CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
     credential_id BIGINT NOT NULL PRIMARY KEY,
@@ -7040,265 +7307,9 @@ CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_usage_credential_cost_summary_cost
-    ON usage_credential_cost_summary (estimated_cost_usd DESC, requests DESC);
-
 ALTER TABLE usage_credential_cost_summary
     ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
-
-UPDATE usage_credential_cost_summary
-SET original_cost_usd = estimated_cost_usd
-WHERE original_cost_usd = 0
-  AND estimated_cost_usd <> 0;
-
-INSERT INTO usage_rollup_totals (
-    dimension, dimension_key, dimension_label, requests, success_requests, error_requests,
-    stream_requests, non_stream_requests, priced_requests, unpriced_requests,
-    local_prompt_cache_requests, simulated_requests, upstream_metadata_requests,
-    sticky_bound_requests, fallback_from_sticky_requests, total_input_tokens,
-    billable_input_tokens, total_output_tokens, total_cache_read_input_tokens,
-    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
-    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests,
-    external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
-    external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
-    external_pool_uplifted_cost_usd, external_pool_profit_usd,
-    external_pool_reported_cost_usd, external_pool_billable_cost_usd,
-    external_pool_cost_floor_delta_usd,
-    duration_ms_sum, duration_ms_count, duration_ms_max
-)
-SELECT
-    d.dimension,
-    d.dimension_key,
-    MAX(d.dimension_label),
-    COUNT(*)::bigint,
-    COUNT(*) FILTER (WHERE r.status = 'success')::bigint,
-    COUNT(*) FILTER (WHERE r.status <> 'success')::bigint,
-    COUNT(*) FILTER (WHERE r.stream)::bigint,
-    COUNT(*) FILTER (WHERE NOT r.stream)::bigint,
-    COUNT(*) FILTER (WHERE r.pricing_available)::bigint,
-    COUNT(*) FILTER (WHERE NOT r.pricing_available)::bigint,
-    COUNT(*) FILTER (WHERE r.usage_source = 'local_prompt_cache')::bigint,
-    COUNT(*) FILTER (WHERE r.simulated)::bigint,
-    COUNT(*) FILTER (WHERE r.usage_source = 'upstream_metadata')::bigint,
-    COUNT(*) FILTER (WHERE r.sticky_bound)::bigint,
-    COUNT(*) FILTER (WHERE r.fallback_from_sticky)::bigint,
-    COALESCE(SUM(r.total_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.billable_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.output_tokens), 0)::bigint,
-    COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.total_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
-    COALESCE(SUM(r.cache_read_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
-    COALESCE(SUM(r.cache_creation_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
-    COALESCE(SUM(r.estimated_cost_usd), 0)::double precision,
-    COALESCE(SUM(r.original_cost_usd), 0)::double precision,
-    COUNT(*) FILTER (WHERE r.data->>'routeKind' = 'external_pool')::bigint,
-    COUNT(*) FILTER (
-        WHERE r.data->>'routeKind' = 'external_pool'
-          AND r.data #>> '{externalPoolBilling,pricingAvailable}' = 'true'
-    )::bigint,
-    COUNT(*) FILTER (
-        WHERE r.data->>'routeKind' = 'external_pool'
-          AND COALESCE(r.data #>> '{externalPoolBilling,pricingAvailable}', 'false') <> 'true'
-    )::bigint,
-    COUNT(*) FILTER (
-        WHERE r.data->>'routeKind' = 'external_pool'
-          AND r.data #>> '{externalPoolBilling,costFloorApplied}' = 'true'
-    )::bigint,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(COALESCE(
-        NULLIF(r.data #>> '{externalPoolBilling,shapedCostUsd}', '')::double precision,
-        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
-        0
-    )), 0)::double precision,
-    COALESCE(SUM(COALESCE(
-        NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
-        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
-        0
-    )), 0)::double precision,
-    COALESCE(SUM(COALESCE(
-        NULLIF(r.data #>> '{externalPoolBilling,profitUsd}', '')::double precision,
-        COALESCE(
-            NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
-            NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
-            0
-        ) - COALESCE(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision, 0)
-    )), 0)::double precision,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,billableCostUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,costFloorDeltaUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(r.duration_ms), 0)::bigint,
-    COUNT(*)::bigint,
-    COALESCE(MAX(r.duration_ms), 0)::bigint
-FROM usage_records r
-CROSS JOIN LATERAL (
-    VALUES
-        ('global', 'all', NULL::text),
-        ('status', r.status, NULL::text),
-        ('usage_source', r.usage_source, NULL::text),
-        ('model', COALESCE(NULLIF(r.model, ''), 'unknown'), NULL::text),
-        ('endpoint', COALESCE(NULLIF(r.endpoint, ''), 'unknown'), NULL::text),
-        ('credential', r.credential_id::text, NULLIF(r.credential_label, '')),
-        ('external_pool', r.data->>'externalPoolId', NULLIF(r.data->>'externalPoolName', '')),
-        ('conversation', r.conversation_id, NULL::text),
-        ('error',
-            CASE WHEN r.status <> 'success'
-                 THEN COALESCE(NULLIF(r.error_type, ''), r.status, 'error')
-            END,
-            CASE WHEN r.status <> 'success' THEN NULLIF(r.error_message, '') END)
-) AS d(dimension, dimension_key, dimension_label)
-WHERE r.deleted_at IS NULL
-  AND d.dimension_key IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM usage_rollup_totals)
-GROUP BY d.dimension, d.dimension_key
-ON CONFLICT (dimension, dimension_key) DO NOTHING;
-
-INSERT INTO usage_rollup_time_buckets (
-    bucket_start, dimension, dimension_key, dimension_label, requests, success_requests,
-    error_requests, stream_requests, non_stream_requests, priced_requests, unpriced_requests,
-    local_prompt_cache_requests, simulated_requests, upstream_metadata_requests,
-    sticky_bound_requests, fallback_from_sticky_requests, total_input_tokens,
-    billable_input_tokens, total_output_tokens, total_cache_read_input_tokens,
-    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
-    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests, external_pool_priced_requests,
-    external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
-    external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
-    external_pool_uplifted_cost_usd, external_pool_profit_usd,
-    external_pool_reported_cost_usd, external_pool_billable_cost_usd,
-    external_pool_cost_floor_delta_usd,
-    duration_ms_sum, duration_ms_count, duration_ms_max
-)
-SELECT
-    date_trunc('hour', r.created_at) AS bucket_start,
-    d.dimension,
-    d.dimension_key,
-    MAX(d.dimension_label),
-    COUNT(*)::bigint,
-    COUNT(*) FILTER (WHERE r.status = 'success')::bigint,
-    COUNT(*) FILTER (WHERE r.status <> 'success')::bigint,
-    COUNT(*) FILTER (WHERE r.stream)::bigint,
-    COUNT(*) FILTER (WHERE NOT r.stream)::bigint,
-    COUNT(*) FILTER (WHERE r.pricing_available)::bigint,
-    COUNT(*) FILTER (WHERE NOT r.pricing_available)::bigint,
-    COUNT(*) FILTER (WHERE r.usage_source = 'local_prompt_cache')::bigint,
-    COUNT(*) FILTER (WHERE r.simulated)::bigint,
-    COUNT(*) FILTER (WHERE r.usage_source = 'upstream_metadata')::bigint,
-    COUNT(*) FILTER (WHERE r.sticky_bound)::bigint,
-    COUNT(*) FILTER (WHERE r.fallback_from_sticky)::bigint,
-    COALESCE(SUM(r.total_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.billable_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.output_tokens), 0)::bigint,
-    COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint,
-    COALESCE(SUM(r.total_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
-    COALESCE(SUM(r.cache_read_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
-    COALESCE(SUM(r.cache_creation_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
-    COALESCE(SUM(r.estimated_cost_usd), 0)::double precision,
-    COALESCE(SUM(r.original_cost_usd), 0)::double precision,
-    COUNT(*) FILTER (WHERE r.data->>'routeKind' = 'external_pool')::bigint,
-    COUNT(*) FILTER (
-        WHERE r.data->>'routeKind' = 'external_pool'
-          AND r.data #>> '{externalPoolBilling,pricingAvailable}' = 'true'
-    )::bigint,
-    COUNT(*) FILTER (
-        WHERE r.data->>'routeKind' = 'external_pool'
-          AND COALESCE(r.data #>> '{externalPoolBilling,pricingAvailable}', 'false') <> 'true'
-    )::bigint,
-    COUNT(*) FILTER (
-        WHERE r.data->>'routeKind' = 'external_pool'
-          AND r.data #>> '{externalPoolBilling,costFloorApplied}' = 'true'
-    )::bigint,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(COALESCE(
-        NULLIF(r.data #>> '{externalPoolBilling,shapedCostUsd}', '')::double precision,
-        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
-        0
-    )), 0)::double precision,
-    COALESCE(SUM(COALESCE(
-        NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
-        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
-        0
-    )), 0)::double precision,
-    COALESCE(SUM(COALESCE(
-        NULLIF(r.data #>> '{externalPoolBilling,profitUsd}', '')::double precision,
-        COALESCE(
-            NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
-            NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
-            0
-        ) - COALESCE(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision, 0)
-    )), 0)::double precision,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,billableCostUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,costFloorDeltaUsd}', '')::double precision), 0)::double precision,
-    COALESCE(SUM(r.duration_ms), 0)::bigint,
-    COUNT(*)::bigint,
-    COALESCE(MAX(r.duration_ms), 0)::bigint
-FROM usage_records r
-CROSS JOIN LATERAL (
-    VALUES
-        ('global', 'all', NULL::text),
-        ('status', r.status, NULL::text),
-        ('usage_source', r.usage_source, NULL::text),
-        ('model', COALESCE(NULLIF(r.model, ''), 'unknown'), NULL::text),
-        ('endpoint', COALESCE(NULLIF(r.endpoint, ''), 'unknown'), NULL::text),
-        ('credential', r.credential_id::text, NULLIF(r.credential_label, '')),
-        ('external_pool', r.data->>'externalPoolId', NULLIF(r.data->>'externalPoolName', '')),
-        ('error',
-            CASE WHEN r.status <> 'success'
-                 THEN COALESCE(NULLIF(r.error_type, ''), r.status, 'error')
-            END,
-            CASE WHEN r.status <> 'success' THEN NULLIF(r.error_message, '') END)
-) AS d(dimension, dimension_key, dimension_label)
-WHERE r.deleted_at IS NULL
-  AND d.dimension_key IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM usage_rollup_time_buckets)
-GROUP BY date_trunc('hour', r.created_at), d.dimension, d.dimension_key
-ON CONFLICT (bucket_start, dimension, dimension_key) DO NOTHING;
-
-INSERT INTO usage_cache_read_totals (cache_read_input_tokens, requests)
-SELECT GREATEST(cache_read_input_tokens, 0), COUNT(*)::bigint
-FROM usage_records
-WHERE deleted_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM usage_cache_read_totals)
-GROUP BY GREATEST(cache_read_input_tokens, 0)
-ON CONFLICT (cache_read_input_tokens) DO NOTHING;
-
-INSERT INTO usage_cache_read_rollup_time_buckets (bucket_start, cache_read_input_tokens, requests)
-SELECT date_trunc('hour', created_at), GREATEST(cache_read_input_tokens, 0), COUNT(*)::bigint
-FROM usage_records
-WHERE deleted_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM usage_cache_read_rollup_time_buckets)
-GROUP BY date_trunc('hour', created_at), GREATEST(cache_read_input_tokens, 0)
-ON CONFLICT (bucket_start, cache_read_input_tokens) DO NOTHING;
-
-INSERT INTO usage_duration_rollup_time_buckets (bucket_start, duration_ms, requests)
-SELECT date_trunc('hour', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer, COUNT(*)::bigint
-FROM usage_records
-WHERE deleted_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM usage_duration_rollup_time_buckets)
-GROUP BY date_trunc('hour', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer
-ON CONFLICT (bucket_start, duration_ms) DO NOTHING;
-
-INSERT INTO usage_credential_cost_summary (
-    credential_id, requests, estimated_cost_usd, original_cost_usd, kiro_metering_usage, priced_requests, unpriced_requests
-)
-SELECT
-    credential_id,
-    COUNT(*)::bigint,
-    COALESCE(SUM(estimated_cost_usd), 0)::double precision,
-    COALESCE(SUM(original_cost_usd), 0)::double precision,
-    COALESCE(SUM(kiro_metering_usage), 0)::double precision,
-    COUNT(*) FILTER (WHERE pricing_available)::bigint,
-    COUNT(*) FILTER (WHERE NOT pricing_available)::bigint
-FROM usage_records
-WHERE credential_id IS NOT NULL
-  AND deleted_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM usage_credential_cost_summary)
-GROUP BY credential_id
-ON CONFLICT (credential_id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS model_pricing (
     model TEXT PRIMARY KEY,
@@ -7376,6 +7387,67 @@ CREATE INDEX IF NOT EXISTS idx_credential_events_credential_created
     ON credential_events (credential_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_credential_events_type_created
     ON credential_events (event_type, created_at DESC);
+"#;
+
+// Explicit maintenance-only backfill. Do not call this from the default startup
+// migration path; it can scan/update historical usage tables on large installs.
+const USAGE_LEGACY_COST_FIELD_BACKFILL_SQL: &str = r#"
+UPDATE usage_records
+SET original_cost_usd = COALESCE(
+    NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision,
+    NULLIF(data #>> '{originalCostUsd}', '')::double precision,
+    estimated_cost_usd,
+    0
+)
+WHERE original_cost_usd = 0
+  AND (
+      estimated_cost_usd <> 0
+      OR NULLIF(data #>> '{externalPoolBilling,rawCostUsd}', '') IS NOT NULL
+      OR NULLIF(data #>> '{originalCostUsd}', '') IS NOT NULL
+  );
+
+UPDATE usage_rollup_totals
+SET total_original_cost_usd = CASE
+    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
+    THEN external_pool_raw_cost_usd
+    ELSE total_estimated_cost_usd
+END
+WHERE total_original_cost_usd = 0
+  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
+
+UPDATE usage_rollup_time_buckets
+SET total_original_cost_usd = CASE
+    WHEN dimension = 'external_pool' AND external_pool_raw_cost_usd <> 0
+    THEN external_pool_raw_cost_usd
+    ELSE total_estimated_cost_usd
+END
+WHERE total_original_cost_usd = 0
+  AND (total_estimated_cost_usd <> 0 OR external_pool_raw_cost_usd <> 0);
+
+UPDATE usage_rollup_totals
+SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
+    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
+    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
+WHERE external_pool_requests > 0
+  AND external_pool_reported_cost_usd <> 0
+  AND external_pool_shaped_cost_usd = 0
+  AND external_pool_uplifted_cost_usd = 0
+  AND external_pool_profit_usd = 0;
+
+UPDATE usage_rollup_time_buckets
+SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
+    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
+    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
+WHERE external_pool_requests > 0
+  AND external_pool_reported_cost_usd <> 0
+  AND external_pool_shaped_cost_usd = 0
+  AND external_pool_uplifted_cost_usd = 0
+  AND external_pool_profit_usd = 0;
+
+UPDATE usage_credential_cost_summary
+SET original_cost_usd = estimated_cost_usd
+WHERE original_cost_usd = 0
+  AND estimated_cost_usd <> 0;
 "#;
 
 const CREDENTIAL_RUNTIME_REVISION_SQL: &str = r#"
@@ -7672,6 +7744,80 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(bucket_start, expected);
+    }
+
+    #[test]
+    fn startup_migration_sql_does_not_scan_usage_history_tables() {
+        let startup_sql = [
+            ("SCHEMA_SQL", SCHEMA_SQL),
+            (
+                "CREDENTIAL_STORAGE_REVISION_SQL",
+                CREDENTIAL_STORAGE_REVISION_SQL,
+            ),
+            (
+                "CREDENTIAL_RUNTIME_REVISION_SQL",
+                CREDENTIAL_RUNTIME_REVISION_SQL,
+            ),
+            (
+                "CREDENTIAL_RUNTIME_GENERATION_SQL",
+                CREDENTIAL_RUNTIME_GENERATION_SQL,
+            ),
+            (
+                "CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL",
+                CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL,
+            ),
+            (
+                "CREDENTIAL_STATS_DELTA_BATCH_SQL",
+                CREDENTIAL_STATS_DELTA_BATCH_SQL,
+            ),
+        ];
+        let forbidden = [
+            "FROM usage_records",
+            "UPDATE usage_records",
+            "INSERT INTO usage_rollup",
+            "INSERT INTO usage_cache",
+            "INSERT INTO usage_duration",
+            "INSERT INTO usage_credential",
+            "CREATE INDEX IF NOT EXISTS idx_usage_records",
+            "CREATE INDEX IF NOT EXISTS idx_usage_rollup",
+            "CREATE INDEX IF NOT EXISTS idx_usage_cache",
+            "CREATE INDEX IF NOT EXISTS idx_usage_duration",
+        ];
+
+        for (name, sql) in startup_sql {
+            for forbidden in forbidden {
+                assert!(
+                    !sql.contains(forbidden),
+                    "{name} must not contain historical usage scan/backfill/index statement: {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn usage_legacy_cost_backfill_is_explicit_maintenance_sql() {
+        for expected in [
+            "UPDATE usage_records",
+            "UPDATE usage_rollup_totals",
+            "UPDATE usage_rollup_time_buckets",
+            "UPDATE usage_credential_cost_summary",
+        ] {
+            assert!(
+                USAGE_LEGACY_COST_FIELD_BACKFILL_SQL.contains(expected),
+                "legacy cost backfill maintenance SQL should contain expected statement: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_usage_record_cost_compatibility_falls_back_to_estimated_cost() {
+        let mut record = usage_record("legacy-cost", 10);
+        record.estimated_cost_usd = 0.42;
+        record.original_cost_usd = 0.0;
+
+        apply_usage_record_legacy_cost_compatibility(&mut record);
+
+        assert_eq!(record.original_cost_usd, 0.42);
     }
 
     #[tokio::test]

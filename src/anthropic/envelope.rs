@@ -39,6 +39,123 @@ pub(crate) fn public_rate_limit_message(retry_after_secs: Option<u64>) -> String
     }
 }
 
+pub(crate) fn kiro_official_upstream_message(raw: &str) -> Option<String> {
+    let value = extract_json_value(raw)?;
+    let message = json_string_at(
+        &value,
+        &[
+            "/message",
+            "/Message",
+            "/error/message",
+            "/error/Message",
+            "/error",
+        ],
+    )?;
+    let mut message = normalize_public_upstream_text(message)?;
+    if let Some(reason) = json_string_at(
+        &value,
+        &[
+            "/reason",
+            "/Reason",
+            "/error/reason",
+            "/error/Reason",
+            "/code",
+            "/Code",
+            "/error/code",
+            "/error/Code",
+        ],
+    )
+    .and_then(normalize_public_upstream_text)
+    {
+        if !message.contains(&reason) {
+            message.push_str(" (reason: ");
+            message.push_str(&reason);
+            message.push(')');
+        }
+    }
+    Some(truncate_public_upstream_message(&message))
+}
+
+fn extract_json_value(raw: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(raw.trim()) {
+        return Some(value);
+    }
+    for (idx, ch) in raw.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&raw[idx..]) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn json_string_at<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn normalize_public_upstream_text(raw: &str) -> Option<String> {
+    let text = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() || public_upstream_message_has_forbidden_content(&text) {
+        return None;
+    }
+    Some(text)
+}
+
+fn public_upstream_message_has_forbidden_content(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "credential",
+        "external pool",
+        "external_pool",
+        "fallback",
+        "scheduler",
+        "bearer token",
+        "api key",
+        "client secret",
+        "refresh token",
+        "access token",
+        "账号 #",
+        "凭据",
+        "凭证",
+        "外部池",
+        "调度",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn truncate_public_upstream_message(message: &str) -> String {
+    const MAX_BYTES: usize = 1024;
+    if message.len() <= MAX_BYTES {
+        return message.to_string();
+    }
+    let mut out = String::with_capacity(MAX_BYTES + 3);
+    for ch in message.chars() {
+        if out.len() + ch.len_utf8() > MAX_BYTES {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn random_anthropic_id(prefix: &str) -> String {
     let mut id = String::with_capacity(prefix.len() + 3 + ID_RANDOM_LEN);
     id.push_str(prefix);
@@ -237,5 +354,30 @@ mod tests {
             PUBLIC_RATE_LIMIT_MESSAGE
         );
         assert_eq!(public_rate_limit_message(None), PUBLIC_RATE_LIMIT_MESSAGE);
+    }
+
+    #[test]
+    fn kiro_official_upstream_message_extracts_json_body_without_internal_prefix() {
+        let message = kiro_official_upstream_message(
+            r#"流式 API 请求失败（账号 #170 test）: 400 Bad Request {"message":"Bedrock error message: Could not process image","reason":"IMAGE_FORMAT_UNSUPPORTED"}"#,
+        )
+        .expect("official message");
+
+        assert_eq!(
+            message,
+            "Bedrock error message: Could not process image (reason: IMAGE_FORMAT_UNSUPPORTED)"
+        );
+        assert!(!message.contains("账号"));
+        assert!(!message.contains("test"));
+    }
+
+    #[test]
+    fn kiro_official_upstream_message_rejects_sensitive_json_message() {
+        assert!(
+            kiro_official_upstream_message(
+                r#"{"message":"The bearer token included in the request is invalid"}"#
+            )
+            .is_none()
+        );
     }
 }

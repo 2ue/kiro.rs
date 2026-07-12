@@ -232,6 +232,10 @@ struct RequestLatencyTraceState {
     upstream_event_parse_errors_before_first_output: Arc<AtomicU32>,
     upstream_event_types_before_first_output: Arc<Mutex<HashMap<&'static str, u32>>>,
     terminal_reason: Arc<Mutex<Option<StreamTerminalReason>>>,
+    upstream_message_status: Arc<Mutex<Option<String>>>,
+    saw_upstream_completed: Arc<Mutex<Option<bool>>>,
+    stop_reason_source: Arc<Mutex<Option<String>>>,
+    suspected_intent_preamble_end_turn: Arc<Mutex<Option<bool>>>,
 }
 
 impl RequestLatencyTraceState {
@@ -258,6 +262,10 @@ impl RequestLatencyTraceState {
             upstream_event_parse_errors_before_first_output: Arc::new(AtomicU32::new(0)),
             upstream_event_types_before_first_output: Arc::new(Mutex::new(HashMap::new())),
             terminal_reason: Arc::new(Mutex::new(None)),
+            upstream_message_status: Arc::new(Mutex::new(None)),
+            saw_upstream_completed: Arc::new(Mutex::new(None)),
+            stop_reason_source: Arc::new(Mutex::new(None)),
+            suspected_intent_preamble_end_turn: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -561,6 +569,7 @@ struct ExternalFallbackContext {
     headers: HeaderMap,
     endpoint: String,
     payload: MessagesRequest,
+    request_input_tokens: i32,
     model_resolution: Option<ModelResolution>,
     reported_usage: ReportedUsageConfig,
     prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
@@ -1206,6 +1215,7 @@ fn build_external_fallback_context(
             headers,
             endpoint: endpoint.to_string(),
             payload: payload.clone(),
+            request_input_tokens: 0,
             model_resolution: None,
             reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
             prompt_cache: state.prompt_cache.clone(),
@@ -1237,6 +1247,12 @@ fn build_external_fallback_context(
 impl ExternalFallbackContext {
     fn refresh_payload(&mut self, payload: &MessagesRequest) {
         self.payload = payload.clone();
+        self.request_input_tokens = token::count_all_tokens(
+            &self.payload.model,
+            self.payload.system.as_deref(),
+            &self.payload.messages,
+            self.payload.tools.as_deref(),
+        ) as i32;
     }
 
     async fn should_fail_fast_local(&self) -> bool {
@@ -1448,7 +1464,7 @@ impl ExternalFallbackContext {
             body_mode_filter: None,
             model_hint: None,
             stream_hint: None,
-            request_input_tokens: 0,
+            request_input_tokens: self.request_input_tokens.max(0),
             upstream_model: self
                 .model_resolution
                 .as_ref()
@@ -1837,6 +1853,28 @@ impl RequestUsageContext {
         }
     }
 
+    fn mark_stream_completion_observability(
+        &self,
+        upstream_message_status: Option<&str>,
+        stop_reason_source: impl Into<String>,
+        suspected_intent_preamble_end_turn: bool,
+    ) {
+        if let Some(status) = upstream_message_status
+            .map(str::trim)
+            .filter(|status| !status.is_empty())
+        {
+            *self.latency.upstream_message_status.lock() = Some(status.to_string());
+            *self.latency.saw_upstream_completed.lock() =
+                Some(status.eq_ignore_ascii_case("COMPLETED"));
+        } else {
+            *self.latency.saw_upstream_completed.lock() = Some(false);
+        }
+        *self.latency.stop_reason_source.lock() = Some(stop_reason_source.into());
+        if suspected_intent_preamble_end_turn {
+            *self.latency.suspected_intent_preamble_end_turn.lock() = Some(true);
+        }
+    }
+
     fn set_downstream_stop_reason(&self, reason: impl Into<String>) {
         *self.downstream_stop_reason.lock() = Some(reason.into());
     }
@@ -1976,6 +2014,13 @@ impl RequestUsageContext {
             upstream_event_types_before_first_output,
             client_dropped_ms: load_latency_ms(&self.latency.client_dropped_latency_ms),
             terminal_reason: *self.latency.terminal_reason.lock(),
+            upstream_message_status: self.latency.upstream_message_status.lock().clone(),
+            saw_upstream_completed: *self.latency.saw_upstream_completed.lock(),
+            stop_reason_source: self.latency.stop_reason_source.lock().clone(),
+            suspected_intent_preamble_end_turn: *self
+                .latency
+                .suspected_intent_preamble_end_turn
+                .lock(),
         };
         (!trace.is_empty()).then_some(trace)
     }
@@ -2701,6 +2746,17 @@ impl CredentialUsageContext {
         };
         self.request
             .set_downstream_stop_reason(ctx.downstream_stop_reason());
+        let has_visible_text_output = self
+            .request
+            .latency
+            .first_visible_text_delta_latency_ms
+            .load(Ordering::Acquire)
+            > 0;
+        self.request.mark_stream_completion_observability(
+            ctx.upstream_message_status(),
+            ctx.stop_reason_source(),
+            ctx.suspected_intent_preamble_end_turn(has_visible_text_output),
+        );
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage
             .is_none_or(|usage| !super::cache::metadata_usage_has_signal(usage))
@@ -3497,20 +3553,24 @@ fn provider_public_error_for_message(
         );
     }
 
-    if is_upstream_improperly_formed_error(err_str) || is_upstream_bad_request_error(err_str) {
-        return usage_public_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            UPSTREAM_INVALID_REQUEST_MESSAGE,
-            error_id,
-        );
-    }
-
     if is_upstream_invalid_model_error(err_str) {
         return usage_public_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE,
+            error_id,
+        );
+    }
+
+    if let Some(public_error) = official_kiro_upstream_public_error(err_str, error_id) {
+        return public_error;
+    }
+
+    if is_upstream_improperly_formed_error(err_str) || is_upstream_bad_request_error(err_str) {
+        return usage_public_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            UPSTREAM_INVALID_REQUEST_MESSAGE,
             error_id,
         );
     }
@@ -3566,6 +3626,32 @@ fn provider_public_error_for_message(
     )
 }
 
+fn official_kiro_upstream_public_error(
+    err_str: &str,
+    error_id: Option<&str>,
+) -> Option<UsagePublicError> {
+    let message = envelope::kiro_official_upstream_message(err_str)?;
+    let lower = err_str.to_ascii_lowercase();
+    let (status, error_type) = if lower.contains("400 bad request") || lower.contains("bad_request")
+    {
+        (StatusCode::BAD_REQUEST, "invalid_request_error")
+    } else if lower.contains("408 request timeout") || lower.contains("timeout") {
+        (StatusCode::GATEWAY_TIMEOUT, "api_error")
+    } else if lower.contains("500 internal server error")
+        || lower.contains("502 bad gateway")
+        || lower.contains("503 service unavailable")
+        || lower.contains("504 gateway timeout")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("unexpectedly high load")
+        || lower.contains("unexpected error")
+    {
+        (StatusCode::BAD_GATEWAY, "api_error")
+    } else {
+        return None;
+    };
+    Some(usage_public_error(status, error_type, message, error_id))
+}
+
 fn map_provider_error(
     err: Error,
     request_id: Option<&str>,
@@ -3601,22 +3687,6 @@ fn map_provider_error(
         );
     }
 
-    if is_upstream_improperly_formed_error(&err_str) {
-        log_provider_warning_with_hint(
-            &err_str,
-            "请求被拒绝：Kiro payload 形态不合法（不应切换账号重试）",
-            error_id,
-        );
-        return public_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            UPSTREAM_INVALID_REQUEST_MESSAGE,
-            request_id,
-            error_id,
-            std::iter::empty::<(&'static str, String)>(),
-        );
-    }
-
     if is_upstream_invalid_model_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
@@ -3628,6 +3698,47 @@ fn map_provider_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             message,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
+    }
+
+    if let Some(public_error) = official_kiro_upstream_public_error(&err_str, error_id) {
+        log_provider_warning_with_hint(
+            &err_str,
+            "请求被 Kiro 官方上游拒绝，返回上游结构化错误信息",
+            error_id,
+        );
+        let status =
+            StatusCode::from_u16(public_error.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        let error_type = match public_error.error_type.as_str() {
+            "invalid_request_error" => "invalid_request_error",
+            "rate_limit_error" => "rate_limit_error",
+            _ => "api_error",
+        };
+        return public_error_response(
+            status,
+            error_type,
+            public_error.message,
+            request_id,
+            None,
+            error_id
+                .map(|error_id| vec![("x-kiro-rs-error-id", error_id.to_string())])
+                .unwrap_or_default(),
+        );
+    }
+
+    if is_upstream_improperly_formed_error(&err_str) {
+        log_provider_warning_with_hint(
+            &err_str,
+            "请求被拒绝：Kiro payload 形态不合法（不应切换账号重试）",
+            error_id,
+        );
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            UPSTREAM_INVALID_REQUEST_MESSAGE,
             request_id,
             error_id,
             std::iter::empty::<(&'static str, String)>(),
@@ -3718,6 +3829,7 @@ fn is_upstream_payload_too_long_error(value: &str) -> bool {
 
     let lower = value.to_ascii_lowercase();
     lower.contains("input is too long")
+        || lower.contains("prompt is too long")
         || lower.contains("payload is too large")
         || lower.contains("request payload is too large")
         || lower.contains("request body is too large")

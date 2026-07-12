@@ -695,6 +695,10 @@ export interface UsageLatencyTrace {
   upstreamEventTypesBeforeFirstOutput?: Record<string, number>
   clientDroppedMs?: number
   terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
+  upstreamMessageStatus?: string
+  sawUpstreamCompleted?: boolean
+  stopReasonSource?: string
+  suspectedIntentPreambleEndTurn?: boolean
 }
 
 export interface KiroCredentialAttempt {
@@ -1257,6 +1261,7 @@ export interface ExternalPoolsConfig {
   externalPoolsEnabled: boolean
   externalPoolGlobalMaxConcurrentRequests: number
   externalPoolMaxQueuedRequests: number
+  externalPoolMaxInputTokens: number
   externalPoolCapacityMode: 'fail_fast' | 'wait'
   externalPoolStreamResponseMode: ExternalPoolStreamResponseMode
   externalPoolDispatchMaxWaitSecs: number

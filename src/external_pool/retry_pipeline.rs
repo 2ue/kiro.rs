@@ -52,6 +52,7 @@ fn payload_too_long_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("context window is full")
         || lower.contains("input is too long")
+        || lower.contains("prompt is too long")
         || lower.contains("content_length_exceeds_threshold")
         || lower.contains("request payload is too large")
         || lower.contains("payload is too large")

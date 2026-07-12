@@ -140,8 +140,7 @@ impl CacheUsage {
             usage.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
         }
         let current_input = usage.input_tokens.max(0);
-        let can_sample_input = !policy.input_moves_delta_to_cache_read() || had_cache_read;
-        if current_input > 0 && can_sample_input {
+        if current_input > 0 {
             if let Some(reported_input) = policy.sample_input(usage, current_input) {
                 let input_delta = current_input.saturating_sub(reported_input);
                 usage.input_tokens = reported_input;
@@ -377,8 +376,7 @@ impl ReportedCacheUsagePolicy {
         let input = self.policy.input.normalized();
         let rewrites_input = matches!(input.mode, ReportedUsageFieldMode::SampleMax)
             && input.max_tokens > 0
-            && usage.input_tokens > input.max_tokens
-            && (!input.move_delta_to_cache_read || usage.cache_read_input_tokens > 0);
+            && usage.input_tokens > input.max_tokens;
         rewrites_input || self.should_cap_final_cache_read(usage)
     }
 
@@ -533,10 +531,6 @@ impl ReportedCacheUsagePolicy {
         if !self.should_cap_final_input(current_input) {
             return usage;
         }
-        if self.input_moves_delta_to_cache_read() && !had_cache_read {
-            return usage;
-        }
-
         let Some(reported_input) = self.sample_input(usage, current_input) else {
             return usage;
         };
@@ -1933,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_preserves_input_without_existing_read() {
+    fn reported_usage_policy_samples_input_without_existing_read() {
         let usage = CacheUsage {
             total_input_tokens: 150_000,
             input_tokens: 100_000,
@@ -1955,7 +1949,7 @@ mod tests {
 
         let reported = usage.with_reported_cache_usage_policy_and_raw(policy, raw);
 
-        assert_eq!(reported.input_tokens, raw.input_tokens);
+        assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(reported.cache_creation_input_tokens, 50_000);
         assert_eq!(
@@ -1992,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn final_input_guard_preserves_input_without_existing_read() {
+    fn final_input_guard_samples_input_without_existing_read() {
         let usage = CacheUsage {
             total_input_tokens: 1_234,
             input_tokens: 1_234,
@@ -2013,7 +2007,7 @@ mod tests {
 
         let reported = policy.apply_final_input_guard(usage);
 
-        assert_eq!(reported.input_tokens, usage.input_tokens);
+        assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(
@@ -2193,11 +2187,7 @@ mod tests {
                             RawUsage::uncached(request_input, output_tokens),
                         );
 
-                        if turn == 0 {
-                            assert_eq!(reported.input_tokens, request_input);
-                        } else {
-                            assert!((1..=input_cap).contains(&reported.input_tokens));
-                        }
+                        assert!((1..=input_cap).contains(&reported.input_tokens));
                         assert_eq!(
                             reported.total_input_tokens,
                             reported.reported_total_input_tokens()
@@ -2356,7 +2346,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_preserves_creation_only_uncached_input() {
+    fn reported_usage_policy_samples_creation_only_uncached_input() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 80_000,
@@ -2371,7 +2361,7 @@ mod tests {
         let reported = usage.with_reported_cache_usage_policy(policy);
 
         assert!((1..=3_300).contains(&reported.cache_creation_input_tokens));
-        assert_eq!(reported.input_tokens, usage.input_tokens);
+        assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(
             reported.total_input_tokens,
@@ -2380,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn input_only_reported_usage_policy_preserves_writer() {
+    fn input_only_reported_usage_policy_samples_input_without_cache_read() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 80_000,
@@ -2397,7 +2387,7 @@ mod tests {
         assert_eq!(reported.cache_creation_input_tokens, 40_000);
         assert_eq!(reported.cache_creation_5m_input_tokens, 30_000);
         assert_eq!(reported.cache_creation_1h_input_tokens, 10_000);
-        assert_eq!(reported.input_tokens, usage.input_tokens);
+        assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(
             reported.total_input_tokens,
@@ -2406,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_preserves_uncached_usage_without_cache_read() {
+    fn reported_usage_policy_samples_uncached_usage_without_cache_read() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 120_000,
@@ -2420,7 +2410,7 @@ mod tests {
 
         let reported = usage.with_reported_cache_usage_policy(policy);
 
-        assert_eq!(reported.input_tokens, usage.input_tokens);
+        assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(reported.output_tokens, usage.output_tokens);

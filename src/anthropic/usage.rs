@@ -242,6 +242,14 @@ pub struct UsageLatencyTrace {
     pub client_dropped_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<StreamTerminalReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_message_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_upstream_completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspected_intent_preamble_end_turn: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -285,6 +293,10 @@ impl UsageLatencyTrace {
             && self.upstream_event_types_before_first_output.is_none()
             && self.client_dropped_ms.is_none()
             && self.terminal_reason.is_none()
+            && self.upstream_message_status.is_none()
+            && self.saw_upstream_completed.is_none()
+            && self.stop_reason_source.is_none()
+            && self.suspected_intent_preamble_end_turn.is_none()
     }
 }
 

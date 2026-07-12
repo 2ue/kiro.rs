@@ -12,28 +12,48 @@
 - **程序缺陷（可根除）**：输入决定、必现，代理侧透传/校验缺失导致。工具与 schema 边界值三类，合计约占非成功请求的 74%。
 - **上游 / 客户端行为（只能优化，不可根除）**：依赖上游瞬态状态或客户端行为，无法在本地稳定复现，程序侧只能提升容错或体验。
 
-## 文档清单
+## 当前状态总览（2026-07-13，本地工作区口径）
+
+说明：
+
+- `tmp/analysis-usage-llm-errors` 是旧生产窗口证据，运行版本为 app `0.0.101` / revision `737f9f1`，不能直接代表当前工作区。
+- “已修复”表示当前源码已实现；“已定向验证”表示本地单测/协议测试已覆盖；“已真实回归”表示已用临时 release 服务和真实接口补过证据；最终仍需发布后看生产 recurrence。
+- 2026-07-13 新增跟踪文档：[runtime-usage-error-followup-2026-07-13.md](./runtime-usage-error-followup-2026-07-13.md)。
 
 ### A. 程序缺陷（优先修复）
 
-| 文档 | 根因 | 生产条数 | 上游 reason | 复现 | 可规避 |
-|---|---|---|---|---|---|
-| [empty-tool-description-400-invalid-tool-use-format.md](./empty-tool-description-400-invalid-tool-use-format.md) | 问题 A：工具 `description` 为空串 | 201（71.5%） | Kiro `REQUEST_BODY_INVALID` | ✅ 已复现并修复 | ✅ 已填非空占位符 |
-| ↑ 同文档 问题 B | `input_schema` 显式为 `null` | 7（2.5%） | 入口反序列化 400 | ✅ 已复现并修复 | ✅ 已容忍 null |
-| [tool-property-key-invalid-400-tool-schema-invalid.md](./tool-property-key-invalid-400-tool-schema-invalid.md) | 工具属性键不匹配 `^[a-zA-Z0-9_.-]{1,64}$` | 另有生产样本 | Bedrock `TOOL_SCHEMA_INVALID` | ✅ 已复现并修复 | ✅ 默认可逆 sanitize；支持 reject/disabled |
+| 文档 | 根因 | 生产条数 | 当前状态 | 已验证 | 后续 |
+|---|---|---:|---|---|---|
+| [empty-tool-description-400-invalid-tool-use-format.md](./empty-tool-description-400-invalid-tool-use-format.md) | 工具 `description` 为空串 | 201 | ✅ 源码已修复 | 单测覆盖空/空白 description；文档有真实调用证据 | 发布后查 `REQUEST_BODY_INVALID / Invalid tool use format` 是否回落 |
+| ↑ 同文档 问题 B | `input_schema` 显式为 `null` | 7 | ✅ 源码已修复 | 单测覆盖 null/missing/object；已真实回归 | 发布后查入口 JSON 类型错误是否回落 |
+| [tool-property-key-invalid-400-tool-schema-invalid.md](./tool-property-key-invalid-400-tool-schema-invalid.md) | 工具属性键不匹配 `^[a-zA-Z0-9_.-]{1,64}$` | 另有生产样本 | ✅ 源码已修复；2026-07-13 修正 diagnostics 误报 | 默认可逆 sanitize；stream/non-stream/leaked invoke 反向映射；新增 `$defs/patternProperties/dependentSchemas` 不误报单测；已真实回归 | 发布后观察 tool schema invalid 是否复发 |
+| Tool name 映射（合并到 schema 兼容项） | 上游 tool name 合法化后响应需还原 | 兼容性问题 | ✅ 源码已有 request-local 映射 | 单测已有短名/冲突映射覆盖；Claude CLI 工具调用已真实回归 | 发布后观察 CLI 工具消息是否异常 |
 
 三类同源：对客户端工具/schema 字段的边界值（空串 / null / 非法键）缺乏入口清洗与兜底，直接透传上游被拒。2026-07-12 已修复空 `description` 与 `input_schema:null`；非法 property key 采用默认可逆 `sanitize`：只清理不匹配正则的 key，发给上游前映射为唯一 `key<hash>`，并在 stream / non-stream 工具调用响应中还原为客户端原始 key。需要硬拒绝时可切换 `toolSchemaKeyMapping=reject`；需要旧透传行为时可切换 `disabled`。
 
+2026-07-13 修正：`ToolUseFormatDiagnostics.invalidToolSchemaPropertyKeys` 只统计真正的 `properties` key；不再把 `$defs` 定义名、`patternProperties` 正则 key、`dependentSchemas` 依赖 key 误报为非法 property key。
+
 ### B. 上游 / 客户端行为（优化，非根除）
 
-| 文档 | 根因 | 生产条数 | 性质 | 本地复现 | 程序可做 |
-|---|---|---|---|---|---|
-| [02-stream-upstream-idle-timeout.md](./02-stream-upstream-idle-timeout.md) | 流式上游空闲满 180s 被掐断 | 41 | 上游静默为主 | ❌ 依赖上游状态 | ⚠️ 首字前安全重试 + 调超时（**唯一有实质价值**） |
-| [03-client-dropped-downstream.md](./03-client-dropped-downstream.md) | 下游客户端提前断开 | 17 | 客户端行为，非缺陷 | ❌ | ❌ 忽略，不计入接口根因 |
-| [04-external-pool-prompt-too-long.md](./04-external-pool-prompt-too-long.md) | 本地 3 次 500 高负载耗尽 → 外部池撞 1M 上限 | 7 | 上游（高负载 + 硬限制） | ❌ | ⚠️ 外部池前 token 预检省一次往返 |
-| [06-stream-upstream-status-error.md](./06-stream-upstream-status-error.md) | 流中途上游返回错误事件 | 5 | 上游瞬态 | ❌ | ⚠️ 有限（首字后不可安全重试） |
-| [07-stream-internal-read-error.md](./07-stream-internal-read-error.md) | 流 body 解码失败 | 2 | 上游/网络瞬态 | ❌ | ⚠️ 有限 |
-| [08-image-format-unsupported-400.md](./08-image-format-unsupported-400.md) | 坏图/伪图无法被上游解码 | 1 | 上游为主 | ✅ 坏图/伪图已复现 | ⚠️ 可选完整解码校验提前拦截 |
+| 文档 | 根因 | 生产条数 | 当前状态 | 已验证 | 后续 |
+|---|---|---:|---|---|---|
+| [02-stream-upstream-idle-timeout.md](./02-stream-upstream-idle-timeout.md) | 流式上游空闲满 180s 被掐断 | 41 | ⏳ 未改行为；小改重试不安全 | 现有 latencyTrace 可区分首输出前/后；已确认当前实现先提交 `message_start` | 需独立响应提交重构后再做“未向下游发送任何 SSE bytes 前”的安全重试 |
+| [03-client-dropped-downstream.md](./03-client-dropped-downstream.md) | 下游客户端提前断开 | 17 | ✅ 无需修复 | usage 已标 `client_dropped/downstream_client` | 统计服务端错误率时剔除 |
+| [04-external-pool-prompt-too-long.md](./04-external-pool-prompt-too-long.md) | 本地 3 次 500 高负载耗尽 → 外部池撞 1M 上限 | 7 | ✅ 已修复体验链路：token 估算、分类、public message、max-input 预检 | `prompt is too long` 分类；外部池 public message 脱敏；`externalPoolMaxInputTokens` 预检单测；本地无外部池，未污染共享 DB 做真实外部池注入 | 发布后观察；后续可选扩展 per-pool/per-model 上限 |
+| [06-stream-upstream-status-error.md](./06-stream-upstream-status-error.md) | 流中途上游返回错误事件 | 5 | ✅ 维持保守策略 | 现有逻辑发 SSE error，不伪装成功 | 若做 02，可把首输出前子集纳入统一安全重试 |
+| [07-stream-internal-read-error.md](./07-stream-internal-read-error.md) | 流 body 解码失败 | 2 | ✅ 维持保守策略 | 现有逻辑发 SSE error，不伪装成功 | 同 06 |
+| [08-image-format-unsupported-400.md](./08-image-format-unsupported-400.md) | 坏图/伪图无法被上游解码 | 1 | ✅ 已实现轻量结构校验 | 合法 base64/data URL/工具结果图片继续通过；伪图/截断 PNG 本地拒绝；坏图已真实回归为本地 400 | 发布后观察坏图类错误是否更清晰 |
+| [09-intent-preamble-end-turn-no-tool-use.md](./09-intent-preamble-end-turn-no-tool-use.md) | 模型输出短开场白后 `end_turn`，未发 tool_use | 后续现网样本 | ✅ 2026-07-13 已实现 usage-only 诊断 | 定向单测：有工具、短可见文本、无 tool_use 命中；tool_use 轮不命中 | 真实长会话观察 `suspectedIntentPreambleEndTurn` 分布 |
+| [10-stream-end-turn-vs-silent-truncation.md](./10-stream-end-turn-vs-silent-truncation.md) | usage 无法区分上游显式完成和本地 EOF 兜底 | 观测盲区 | ✅ 2026-07-13 已实现 usage-only 观测字段 | 解析 `messageStatus`；写入 `upstreamMessageStatus/sawUpstreamCompleted/stopReasonSource`；两套 UI 已展示；真实 stream 落库已看到 `stopReasonSource` | 发布后用长会话分布判断 H1/H2/H3 |
+
+### C. 错误提示策略
+
+| 项 | 当前状态 | 规则 |
+|---|---|---|
+| Kiro 官方上游结构化错误 | ✅ 2026-07-13 已改为可公开 message 透出 | 从上游 JSON 提取 `message/reason/code`，过滤 credential/token/外部池/调度等敏感词后返回给下游 |
+| 外部池错误 | ✅ 继续脱敏 | 外部池可能返回广告、推广、非协议 HTML 或内部池信息；下游只返回 public message + error id，原文仅留 usage/内部日志 |
+| 本地调度/账号/队列/内部错误 | ✅ 继续归一化 | 避免泄露 credential、fallback、scheduler、pool、lease 等内部词 |
+| `/cc` / `/ha` reported usage | ✅ 2026-07-13 已修复 input sampling 漏应用 | `sample-max` 始终压低展示 input；只有 cache-read 证据存在时才把差额转入 cache read，不伪造首轮读取 |
 
 ## 重要更正记录
 
@@ -43,12 +63,12 @@
 ## 优先级建议
 
 1. **高**：工具/schema 三类（A）——必现、纯程序、约 74%，合并修复。
-2. **中**：02 首字前安全重试 —— 需严格区分首字前/后，涉及流式重试安全边界。
-3. **低**：04 外部池预检、08 图片解码校验 —— 体验优化，量小。
+2. **中**：02 首字前安全重试 —— 需先做响应提交重构，严格以“未发送任何 SSE bytes”为安全边界。
+3. **低**：04 外部池 per-pool/per-model 上限、08 更完整图片解码 —— 当前已做低风险版本，后续按生产复发再增强。
 4. **忽略**：03（客户端行为）、06/07（上游瞬态、量极小）。
 
 ## 公共前置（复现用）
 
-- 本地服务：`127.0.0.1:9022`，API Key `sk-kiro-rs-local-debug`（见 `config.json`）。
-- 本地测试账号仅支持 sonnet，模型统一用 `claude-sonnet-4-20250514`。
+- 本地服务：优先使用临时 release 端口，避免触碰 live `9022`；API key 从本地 `config.json` 读取，文档不记录原文。
+- 本地真实回归默认使用 sonnet 小流量请求；涉及 opus/长上下文只做低量诊断，避免真实账号压力。
 - 生产证据目录：`tmp/analysis-usage-llm-errors/`。

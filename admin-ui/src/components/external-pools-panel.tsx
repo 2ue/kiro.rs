@@ -284,6 +284,7 @@ export function ExternalPoolsPanel() {
           directExternalPathRules: splitRules(pathRulesText),
           externalPoolGlobalMaxConcurrentRequests: whole(configDraft.externalPoolGlobalMaxConcurrentRequests),
           externalPoolMaxQueuedRequests: whole(configDraft.externalPoolMaxQueuedRequests),
+          externalPoolMaxInputTokens: whole(configDraft.externalPoolMaxInputTokens),
           externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs),
           externalPoolRetryMaxAttempts: whole(configDraft.externalPoolRetryMaxAttempts),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
@@ -517,6 +518,7 @@ export function ExternalPoolsPanel() {
                   </SelectBox>
                   <NumberBox disabled={!externalEnabled} label="全局并发上限" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(externalPoolGlobalMaxConcurrentRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolGlobalMaxConcurrentRequests }))} />
                   <NumberBox disabled={!waitModeActive} label="排队上限" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
+                  <NumberBox disabled={!externalEnabled} label="输入上限预检" value={configDraft.externalPoolMaxInputTokens} onChange={(externalPoolMaxInputTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxInputTokens }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待秒数" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="最大重试次数" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
                   <SelectBox disabled={!externalEnabled} label="流式 SSE 默认转发" value={configDraft.externalPoolStreamResponseMode} onChange={(externalPoolStreamResponseMode) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamResponseMode: externalPoolStreamResponseMode as ExternalPoolsConfig['externalPoolStreamResponseMode'] }))}>

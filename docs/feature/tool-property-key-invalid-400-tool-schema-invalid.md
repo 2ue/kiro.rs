@@ -3,6 +3,7 @@
 > 规划归类（2026-07-12）：本文保留为 `COR-007` 的复现、修复和验证证据。目标行为以 `docs/plantree/plans/system-architecture-modernization/decisions/012-tool-definition-compatibility-and-reversible-schema-mapping.md` 为准；本文记录当前主线实现对该目标的落地状态。
 
 - 状态：已修复并通过真实本地服务调用验证。默认 `sanitize` 仅清理不匹配正则的 schema property key，并在响应侧把 `tool_use.input` 递归映射回客户端原始 key。
+- 2026-07-13 追加修正：诊断字段 `invalidToolSchemaPropertyKeys` 只统计真正的 `properties` key，不再把 `$defs` 定义名、`patternProperties` 正则 key、`dependentSchemas` 依赖 key 误报为非法 property key。
 - 严重级别：中高 —— 客户端工具 schema 含非法属性名时，修复前上游拒绝整个请求。
 - 影响端点：全部 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1`、`/dfcache/*`（共用同一套请求处理逻辑，端点仅 usage 上报不同）。
 - 相关配置：`bodyConversion.toolSchemaKeyMapping`、`bodyConversion.toolSchemaKeyValidationRegex`。

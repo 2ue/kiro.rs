@@ -23,6 +23,11 @@ pub enum Command {
         #[command(subcommand)]
         command: CredentialsCommand,
     },
+    /// 显式运行生产维护任务；不会在普通服务启动时自动执行
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -31,4 +36,16 @@ pub enum CredentialsCommand {
     Stats,
     /// 输出凭据配置诊断
     Diagnostics,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MaintenanceCommand {
+    /// 只运行默认启动 schema 迁移并退出，不连接 Redis、不导入凭据
+    Migrate,
+    /// 低峰期并发补齐 usage/rollup 相关索引
+    UsageIndexes,
+    /// 显式回填旧 usage 成本字段；大表环境可能耗时，应在低峰期运行
+    UsageLegacyCostBackfill,
+    /// 显式压缩历史 usage rollup 小桶到小时桶；大表环境可能耗时
+    UsageRollupCompression,
 }

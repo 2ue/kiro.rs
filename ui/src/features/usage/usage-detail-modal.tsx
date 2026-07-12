@@ -260,6 +260,18 @@ export function UsageDetailModal({
                 {record.latencyTrace.terminalReason && (
                   <MetricTile label="结束原因" value={record.latencyTrace.terminalReason} />
                 )}
+                {record.latencyTrace.upstreamMessageStatus && (
+                  <MetricTile label="上游完成状态" value={record.latencyTrace.upstreamMessageStatus} tone={record.latencyTrace.sawUpstreamCompleted ? 'success' : 'info'} />
+                )}
+                {typeof record.latencyTrace.sawUpstreamCompleted === 'boolean' && (
+                  <MetricTile label="上游显式完成" value={record.latencyTrace.sawUpstreamCompleted ? '是' : '否'} tone={record.latencyTrace.sawUpstreamCompleted ? 'success' : 'warning'} />
+                )}
+                {record.latencyTrace.stopReasonSource && (
+                  <MetricTile label="结束原因来源" value={record.latencyTrace.stopReasonSource} />
+                )}
+                {record.latencyTrace.suspectedIntentPreambleEndTurn && (
+                  <MetricTile label="疑似开场白空转" value="是" tone="warning" />
+                )}
               </>
             )}
           </div>

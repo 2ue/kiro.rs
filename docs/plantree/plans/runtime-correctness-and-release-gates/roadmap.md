@@ -15,13 +15,16 @@
 - Landed the current schema-key compatibility fix: default reversible sanitize, explicit reject/disabled modes, both UI config controls, real local-service stream/non-stream validation, and local release build with both embedded UI bundles.
 - Scanned the final runtime evidence for credential-shaped data and removed generated frontend, debug, gate, Docker, Redis, database, port, and temporary-file residue owned by this validation.
 - Indexed the landed validation and cleanup evidence in [history/evidence-index.md](history/evidence-index.md).
+- Recorded the 2026-07-13 `docs/feature` / `tmp/analysis-usage-llm-errors` follow-up status, including `/ha` high-input usage explanation and the remaining real-service validation checklist.
 
 ## In Progress
 
+- Validate the current usage/error correctness fixes before v0.0.103 release: schema diagnostics, external prompt-too-long handling, official Kiro upstream error message passthrough, stream completion observability, and both UI usage-detail surfaces.
 - Close the end-to-end Docker release gate without treating frontend-stage success as a complete image build.
 
 ## Next
 
+- Run C0, temporary local-service real calls, Claude CLI stream-json checks, and low-concurrency long-context resource smoke for the current dirty tree.
 - Rerun the isolated Buildx gate when crates.io throughput can complete `cargo fetch --locked`; require Rust compilation and final image export before recording a pass.
 - Close this plan after the complete Docker gate passes.
 

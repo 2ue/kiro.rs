@@ -563,6 +563,12 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 mod tests {
     use super::*;
 
+    const VALID_PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+    fn valid_jpeg_base64() -> String {
+        BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xdb, 0xff, 0xd9])
+    }
+
     #[test]
     fn test_map_model_sonnet() {
         assert!(
@@ -661,7 +667,7 @@ mod tests {
                 "source": {
                     "type": "base64",
                     "media_type": "image/png",
-                    "data": "aW1hZ2U="
+                    "data": VALID_PNG_1X1_BASE64
                 }
             }
         ]);
@@ -670,7 +676,10 @@ mod tests {
         assert_eq!(text, "describe");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
-        assert_eq!(images[0].source.bytes.as_deref(), Some("aW1hZ2U="));
+        assert_eq!(
+            images[0].source.bytes.as_deref(),
+            Some(VALID_PNG_1X1_BASE64)
+        );
         assert!(tool_results.is_empty());
     }
 
@@ -681,7 +690,7 @@ mod tests {
                 "type": "image",
                 "source": {
                     "type": "url",
-                    "url": "data:image/png;base64,aW1hZ2U="
+                    "url": format!("data:image/png;base64,{}", VALID_PNG_1X1_BASE64)
                 }
             }
         ]);
@@ -689,7 +698,49 @@ mod tests {
         let (_, images, _) = process_message_content(&content).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
-        assert_eq!(images[0].source.bytes.as_deref(), Some("aW1hZ2U="));
+        assert_eq!(
+            images[0].source.bytes.as_deref(),
+            Some(VALID_PNG_1X1_BASE64)
+        );
+    }
+
+    #[test]
+    fn test_process_message_content_rejects_fake_declared_image() {
+        let fake_png = BASE64_STANDARD.encode(b"not-an-image-at-all");
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": fake_png
+                }
+            }
+        ]);
+
+        let err = process_message_content(&content).expect_err("fake image should be rejected");
+        assert!(err.to_string().contains("invalid image data"));
+    }
+
+    #[test]
+    fn test_process_message_content_rejects_truncated_png() {
+        let truncated_png = BASE64_STANDARD.encode([
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R',
+        ]);
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": truncated_png
+                }
+            }
+        ]);
+
+        let err = process_message_content(&content).expect_err("truncated png should be rejected");
+        assert!(err.to_string().contains("invalid image data"));
     }
 
     #[test]
@@ -3216,7 +3267,7 @@ mod tests {
                 "tool_use_id": "toolu_ok",
                 "content": [
                     {"type": "text", "text": "plain"},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": VALID_PNG_1X1_BASE64}}
                 ]
             }
         ]);
@@ -3226,7 +3277,10 @@ mod tests {
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
-        assert_eq!(images[0].source.bytes.as_deref(), Some("iVBORw0KGgo="));
+        assert_eq!(
+            images[0].source.bytes.as_deref(),
+            Some(VALID_PNG_1X1_BASE64)
+        );
         assert!(text.contains("plain"));
         assert!(text.contains("[image attached]"));
         assert!(!text.contains("iVBOR"));
@@ -3234,7 +3288,7 @@ mod tests {
 
     #[test]
     fn test_base64_image_uses_detected_format_over_declared_media_type() {
-        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00]);
+        let jpeg = valid_jpeg_base64();
         let content = serde_json::json!([
             {
                 "type": "image",
@@ -3254,7 +3308,7 @@ mod tests {
 
     #[test]
     fn test_base64_image_accepts_data_url_in_data_field() {
-        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+        let jpeg = valid_jpeg_base64();
         let content = serde_json::json!([
             {
                 "type": "image",
@@ -3275,7 +3329,7 @@ mod tests {
 
     #[test]
     fn test_base64_image_data_url_can_supply_media_type() {
-        let png = BASE64_STANDARD.encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
+        let png = VALID_PNG_1X1_BASE64;
         let content = serde_json::json!([
             {
                 "type": "image",
@@ -3290,19 +3344,25 @@ mod tests {
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
-        assert_eq!(images[0].source.bytes.as_deref(), Some(png.as_str()));
+        assert_eq!(images[0].source.bytes.as_deref(), Some(png));
     }
 
     #[test]
     fn test_base64_image_strips_whitespace_before_kiro_conversion() {
-        let png = "iVBORw0KGgo=";
+        let png = VALID_PNG_1X1_BASE64;
+        let spaced_png = png
+            .as_bytes()
+            .chunks(12)
+            .map(|chunk| std::str::from_utf8(chunk).expect("valid b64 chunk"))
+            .collect::<Vec<_>>()
+            .join("\n ");
         let content = serde_json::json!([
             {
                 "type": "image",
                 "source": {
                     "type": "base64",
                     "media_type": "image/png",
-                    "data": "iVBO\nRw0K Ggo="
+                    "data": spaced_png
                 }
             }
         ]);
@@ -3315,7 +3375,7 @@ mod tests {
 
     #[test]
     fn test_data_url_image_uses_detected_format_over_declared_media_type() {
-        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+        let jpeg = valid_jpeg_base64();
         let content = serde_json::json!([
             {
                 "type": "image",
@@ -3574,14 +3634,14 @@ mod tests {
                 AnthropicMessage {
                     role: "user".to_string(),
                     content: serde_json::json!([{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_image",
-                        "content": [{
-                            "type": "image",
-                            "source": {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_image",
+                            "content": [{
+                                "type": "image",
+                                "source": {
                                 "type": "base64",
                                 "media_type": "image/png",
-                                "data": "iVBORw0KGgo="
+                                "data": VALID_PNG_1X1_BASE64
                             }
                         }]
                     }]),
@@ -3603,7 +3663,7 @@ mod tests {
         assert_eq!(current.images[0].format, "png");
         assert_eq!(
             current.images[0].source.bytes.as_deref(),
-            Some("iVBORw0KGgo=")
+            Some(VALID_PNG_1X1_BASE64)
         );
         assert_eq!(current.user_input_message_context.tool_results.len(), 1);
         assert_eq!(

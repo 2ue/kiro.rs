@@ -1416,7 +1416,7 @@ function FieldPolicyEditor({
       {allowMoveDelta && (
         <TogField
           label="差额计入缓存读取"
-          desc="如果输入显示被压低，少掉的部分加到缓存读取里，让总输入更接近原本的规模。"
+          desc="如果输入显示被压低，且响应已有缓存读取证据，少掉的部分加到缓存读取里；没有读取证据时只压低输入，不伪造缓存读取。"
           checked={policy.moveDeltaToCacheRead}
           disabled={policy.mode === 'preserve' || policy.mode === 'raw'}
           onChange={set('moveDeltaToCacheRead')}

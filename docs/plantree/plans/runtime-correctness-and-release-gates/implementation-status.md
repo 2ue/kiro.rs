@@ -1,18 +1,22 @@
 # Implementation Status
 
-Date: 2026-07-12
+Date: 2026-07-13
 
-Current Phase: Final validation and evidence closure
+Current Phase: Runtime usage/error correctness follow-up before v0.0.103 release validation
 
-Next Target: Rerun the isolated Docker gate through Rust compilation and final image export after the crates.io fetch timeout.
+Next Target: Finish C0 + temporary local-service real-call validation for `docs/feature` fixes, then rerun the isolated Docker gate through Rust compilation and final image export.
 
-Last Landed: 2026-07-12 current dirty-tree schema-key compatibility fix passed static/unit/frontend/local-release and real local-service stream/non-stream validation; 2026-07-10/11 static, real-storage, isolated Rust release build, protocol, load/chaos, resource-recovery, and in-flight SIGTERM validation passed. The end-to-end Docker image gate remains incomplete. See [history/evidence-index.md](history/evidence-index.md).
+Last Landed: 2026-07-13 feature follow-up analysis recorded in [../../../feature/runtime-usage-error-followup-2026-07-13.md](../../../feature/runtime-usage-error-followup-2026-07-13.md); current dirty-tree code now has schema diagnostics false-positive fix, `prompt is too long` classification, official Kiro upstream public message extraction, external parsed-route request input token estimation, and usage-only stream completion diagnostics. 2026-07-12 schema-key compatibility fix passed static/unit/frontend/local-release and real local-service stream/non-stream validation. The end-to-end Docker image gate remains incomplete. See [history/evidence-index.md](history/evidence-index.md).
 
 Active TODO:
 
-1. Rerun the end-to-end Docker Buildx gate; do not accept a frontend-only result.
+1. Run C0 gates for the current dirty tree: `cargo fmt --check`, `git diff --check`, `cargo check --all-targets`, `cargo test --all-targets`, release build, and both UI production builds.
+2. Validate current fixes through a temporary local release service and real direct `/v1` + `/cc/v1` calls without touching live `9022`.
+3. Run Claude CLI `--output-format=stream-json` for tool/schema key mapping, official-upstream error message shape, external masking, and final usage fields.
+4. Run low-concurrency long-context/resource smoke and capture RSS/FD before/after.
+5. Rerun the end-to-end Docker Buildx gate; do not accept a frontend-only result.
 
-Blocked By: Full Docker evidence is incomplete because slow crates.io downloads caused the isolated run's 1800-second outer timeout during `cargo fetch --locked`. The run did not reach Rust compilation or image export; this is not evidence that the Docker gate passed or that compilation failed.
+Blocked By: Full Docker evidence is incomplete because slow crates.io downloads caused the isolated run's 1800-second outer timeout during `cargo fetch --locked`. Current usage/error follow-up also still needs real local-service and Claude CLI validation before any release claim.
 
 Last Verified:
 

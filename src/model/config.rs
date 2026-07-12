@@ -2334,6 +2334,12 @@ pub struct ExternalPoolsConfig {
     pub external_pool_global_max_concurrent_requests: u32,
     #[serde(default)]
     pub external_pool_max_queued_requests: u32,
+    /// 外部池请求输入 token 预检上限。
+    ///
+    /// `0` 表示不做预检；默认 1,000,000，匹配当前外部池常见硬上限，避免
+    /// 本地已能估算出超限时仍把请求发到外部池再失败。
+    #[serde(default = "default_external_pool_max_input_tokens")]
+    pub external_pool_max_input_tokens: i32,
     #[serde(default)]
     pub external_pool_capacity_mode: ExternalPoolCapacityMode,
     #[serde(default = "default_external_pool_dispatch_max_wait_secs")]
@@ -2426,6 +2432,7 @@ impl Default for ExternalPoolsConfig {
             external_pools_enabled: false,
             external_pool_global_max_concurrent_requests: 0,
             external_pool_max_queued_requests: 0,
+            external_pool_max_input_tokens: default_external_pool_max_input_tokens(),
             external_pool_capacity_mode: ExternalPoolCapacityMode::default(),
             external_pool_dispatch_max_wait_secs: default_external_pool_dispatch_max_wait_secs(),
             external_pool_retry_max_attempts: 0,
@@ -3520,6 +3527,10 @@ fn default_external_pool_dispatch_max_wait_secs() -> u64 {
     30
 }
 
+fn default_external_pool_max_input_tokens() -> i32 {
+    1_000_000
+}
+
 fn default_external_pool_local_rescue_max_wait_secs() -> u64 {
     15
 }
@@ -4096,6 +4107,10 @@ mod tests {
             30
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 0);
+        assert_eq!(
+            config.external_pools.external_pool_max_input_tokens,
+            1_000_000
+        );
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
             ExternalPoolStreamResponseMode::EventPassthrough

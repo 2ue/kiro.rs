@@ -1050,9 +1050,18 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
+    /// 当前消息是否已经产生 tool_use 块。
+    pub fn has_tool_use(&self) -> bool {
+        self.has_tool_use
+    }
+
     /// 设置 stop_reason
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
         self.stop_reason = Some(reason.into());
+    }
+
+    fn explicit_stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
     }
 
     fn has_explicit_stop_reason(&self) -> bool {
@@ -1344,6 +1353,10 @@ pub struct StreamContext {
     final_reported_usage: Option<super::cache::CacheUsage>,
     /// Kiro 上游 meteringEvent 返回的本次请求积分用量。
     kiro_metering_usage: Option<f64>,
+    /// 上游 assistantResponseEvent 最近一次 messageStatus。
+    upstream_message_status: Option<String>,
+    /// 是否见过上游显式 `messageStatus: COMPLETED`。
+    saw_upstream_completed: bool,
     /// stray token 复读熔断：最近一行。
     repeat_guard_last_line: String,
     /// stray token 复读熔断：连续次数。
@@ -1491,6 +1504,8 @@ impl StreamContext {
             final_usage: None,
             final_reported_usage: None,
             kiro_metering_usage: None,
+            upstream_message_status: None,
+            saw_upstream_completed: false,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -1503,6 +1518,55 @@ impl StreamContext {
 
     pub fn downstream_stop_reason(&self) -> String {
         self.state_manager.get_stop_reason()
+    }
+
+    pub fn upstream_message_status(&self) -> Option<&str> {
+        self.upstream_message_status.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn saw_upstream_completed(&self) -> bool {
+        self.saw_upstream_completed
+    }
+
+    pub fn stop_reason_source(&self) -> &'static str {
+        if self.saw_upstream_completed {
+            return "upstream_message_status_completed";
+        }
+
+        if let Some(reason) = self.state_manager.explicit_stop_reason() {
+            return match reason {
+                "max_tokens" => "local_inferred_max_tokens",
+                "model_context_window_exceeded" => "local_context_window_exceeded",
+                _ => "local_explicit_stop_reason",
+            };
+        }
+
+        if self.state_manager.has_tool_use() {
+            "local_inferred_tool_use"
+        } else {
+            "local_inferred_end_turn"
+        }
+    }
+
+    pub fn suspected_intent_preamble_end_turn(&self, has_visible_text_output: bool) -> bool {
+        has_visible_text_output
+            && !self.known_tool_names.is_empty()
+            && !self.state_manager.has_tool_use()
+            && self.state_manager.get_stop_reason() == "end_turn"
+            && self.output_tokens > 0
+            && self.output_tokens <= 96
+    }
+
+    fn record_upstream_message_status(&mut self, status: Option<&str>) {
+        let Some(status) = status.map(str::trim).filter(|status| !status.is_empty()) else {
+            return;
+        };
+        let status = status.chars().take(128).collect::<String>();
+        if status.eq_ignore_ascii_case("COMPLETED") {
+            self.saw_upstream_completed = true;
+        }
+        self.upstream_message_status = Some(status);
     }
 
     pub fn set_reported_cache_usage_policy(
@@ -1665,7 +1729,10 @@ impl StreamContext {
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
-            Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::AssistantResponse(resp) => {
+                self.record_upstream_message_status(resp.message_status.as_deref());
+                self.process_assistant_response(&resp.content)
+            }
             Event::Code(code) => self.process_assistant_response(&code.content),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -1814,6 +1881,13 @@ impl StreamContext {
     }
 
     fn public_stream_error_message(&self, error_type: &str, raw_message: String) -> String {
+        if let Some(message) = envelope::kiro_official_upstream_message(&raw_message) {
+            return if let Some(error_id) = self.stream_error_id.as_deref() {
+                envelope::public_message_with_error_id(&message, error_id)
+            } else {
+                message
+            };
+        }
         let Some(error_id) = self.stream_error_id.as_deref() else {
             return raw_message;
         };
@@ -2833,6 +2907,17 @@ fn estimate_tokens(text: &str) -> i32 {
 mod tests {
     use super::*;
 
+    fn assistant_response_event(
+        content: &str,
+        message_status: Option<&str>,
+    ) -> crate::kiro::model::events::AssistantResponseEvent {
+        let mut value = json!({ "content": content });
+        if let Some(status) = message_status {
+            value["messageStatus"] = json!(status);
+        }
+        serde_json::from_value(value).expect("assistantResponseEvent test json")
+    }
+
     #[test]
     fn test_sse_event_format() {
         let event = SseEvent::new("message_start", json!({"type": "message_start"}));
@@ -2841,6 +2926,57 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn assistant_message_status_marks_upstream_completion_without_changing_sse_shape() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                "done",
+                Some("COMPLETED"),
+            ))),
+        );
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(ctx.upstream_message_status(), Some("COMPLETED"));
+        assert!(ctx.saw_upstream_completed());
+        assert_eq!(
+            ctx.stop_reason_source(),
+            "upstream_message_status_completed"
+        );
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn end_turn_with_tools_and_short_visible_text_sets_intent_preamble_diagnostic() {
+        let mut known_tools = HashSet::new();
+        known_tools.insert("todo_write".to_string());
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            known_tools,
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                "I'll inspect that first.",
+                None,
+            ))),
+        );
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(ctx.stop_reason_source(), "local_inferred_end_turn");
+        assert!(ctx.suspected_intent_preamble_end_turn(true));
+        assert!(!ctx.saw_upstream_completed());
+        assert!(events.iter().any(|event| event.event == "message_stop"));
     }
 
     #[test]
@@ -3348,7 +3484,11 @@ mod tests {
             .find(|event| event.event == "message_start")
             .expect("message_start should exist");
         let start_usage = &message_start.data["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], 100_000);
+        assert!(
+            start_usage["input_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| (1..=96).contains(&tokens))
+        );
         assert_eq!(start_usage["cache_creation_input_tokens"], 0);
         assert_eq!(start_usage["cache_read_input_tokens"], 0);
 
@@ -3361,7 +3501,11 @@ mod tests {
             .find(|event| event.event == "message_delta")
             .expect("message_delta should exist");
         let final_usage = &message_delta.data["usage"];
-        assert_eq!(final_usage["input_tokens"], 100_000);
+        assert!(
+            final_usage["input_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| (1..=96).contains(&tokens))
+        );
         assert_eq!(final_usage["cache_creation_input_tokens"], 0);
         assert_eq!(final_usage["cache_read_input_tokens"], 0);
     }
@@ -3621,6 +3765,75 @@ mod tests {
                 && e.data["delta"]["type"] == "text_delta"
                 && e.data["delta"]["text"] == "let value = 1;"
         }));
+    }
+
+    #[test]
+    fn test_assistant_message_status_is_observed_without_changing_sse_stop_reason() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1_000,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+            assistant_response_event("I will inspect the file first.", Some("COMPLETED")),
+        )));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(ctx.upstream_message_status(), Some("COMPLETED"));
+        assert!(ctx.saw_upstream_completed());
+        assert_eq!(
+            ctx.stop_reason_source(),
+            "upstream_message_status_completed"
+        );
+        assert!(
+            ctx.suspected_intent_preamble_end_turn(true),
+            "short visible end_turn text with tools but no tool_use should be flagged for usage diagnostics"
+        );
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+        assert!(
+            all_events.iter().any(|event| event.event == "message_stop"),
+            "observability must not remove normal message_stop"
+        );
+    }
+
+    #[test]
+    fn test_intent_preamble_diagnostic_does_not_flag_tool_use() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1_000,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+            "I will inspect the file first.",
+            Some("IN_PROGRESS"),
+        )));
+        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "toolu_read".to_string(),
+            input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+            stop: true,
+        }));
+        let _ = ctx.generate_final_events();
+
+        assert_eq!(ctx.upstream_message_status(), Some("IN_PROGRESS"));
+        assert_eq!(ctx.stop_reason_source(), "local_inferred_tool_use");
+        assert!(!ctx.suspected_intent_preamble_end_turn(true));
     }
 
     #[test]

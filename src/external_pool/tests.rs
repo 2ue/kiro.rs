@@ -678,6 +678,24 @@ fn external_public_error_masks_raw_message() {
     assert!(!public_error.message.contains("buy credits"));
 }
 
+#[test]
+fn external_public_error_reports_prompt_too_long_without_raw_pool_message() {
+    let public_error = external_public_error_from_parts(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        false,
+        "prompt is too long: > 1000000 maximum; pool banner buy credits",
+        "req_01long",
+    );
+
+    assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
+    assert_eq!(public_error.error_type, "invalid_request_error");
+    assert!(public_error.message.contains("Prompt is too long"));
+    assert!(public_error.message.contains("error ID: req_01long"));
+    assert!(!public_error.message.contains("1000000 maximum"));
+    assert!(!public_error.message.contains("buy credits"));
+}
+
 #[tokio::test]
 async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
     let mut headers = HeaderMap::new();
@@ -1263,6 +1281,40 @@ fn supported_model_filter_uses_original_payload_and_raw_model_candidates() {
         &pool,
         Some(&raw_route.model_candidates_for_support())
     ));
+}
+
+#[test]
+fn external_pool_max_input_preflight_only_rejects_known_oversized_routes() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_max_input_tokens: 100,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4.5");
+
+    route.request_input_tokens = 100;
+    assert_eq!(
+        external_pool_max_input_tokens_for_route(&config, &route),
+        None
+    );
+
+    route.request_input_tokens = 101;
+    assert_eq!(
+        external_pool_max_input_tokens_for_route(&config, &route),
+        Some(100)
+    );
+
+    route.request_input_tokens = 0;
+    assert_eq!(
+        external_pool_max_input_tokens_for_route(&config, &route),
+        None
+    );
+
+    config.external_pool_max_input_tokens = 0;
+    route.request_input_tokens = 1_500_000;
+    assert_eq!(
+        external_pool_max_input_tokens_for_route(&config, &route),
+        None
+    );
 }
 
 #[test]
@@ -2213,9 +2265,11 @@ fn usage_projection_applies_current_path_policy_to_json_body() {
 
     let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
     let usage = value.get("usage").expect("usage object");
-    assert_eq!(
-        usage.get("input_tokens").and_then(|value| value.as_i64()),
-        Some(i64::from(projection.raw_input_tokens))
+    assert!(
+        usage
+            .get("input_tokens")
+            .and_then(|value| value.as_i64())
+            .is_some_and(|tokens| (1..=96).contains(&tokens))
     );
     assert!(
         usage
@@ -2232,7 +2286,7 @@ fn usage_projection_applies_current_path_policy_to_json_body() {
             > 0
     );
     let reported = projected.usage_capture.reported.expect("reported usage");
-    assert_eq!(reported.input_tokens, projection.raw_input_tokens);
+    assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert_eq!(
         reported.total_input_tokens,
@@ -2326,10 +2380,7 @@ fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
     assert!(projected.usage_capture.projected);
     let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
     let usage = value.get("usage").expect("usage object");
-    assert_eq!(
-        usage["input_tokens"].as_i64().unwrap(),
-        i64::from(projection.raw_input_tokens)
-    );
+    assert_eq!(usage["input_tokens"].as_i64().unwrap(), 1);
     assert_eq!(usage["output_tokens"].as_i64().unwrap(), 2);
     assert_eq!(usage["cache_creation_input_tokens"].as_i64().unwrap(), 0);
     assert_eq!(usage["cache_read_input_tokens"].as_i64().unwrap(), 0);
@@ -2339,7 +2390,7 @@ fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
         Some(4165)
     );
     let reported = projected.usage_capture.reported.expect("reported usage");
-    assert_eq!(reported.input_tokens, projection.raw_input_tokens);
+    assert_eq!(reported.input_tokens, 1);
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert_eq!(
         reported.total_input_tokens,
@@ -2690,7 +2741,7 @@ fn usage_projection_final_cache_read_guard_runs_after_external_pool_uplift() {
 }
 
 #[test]
-fn usage_projection_final_input_guard_preserves_input_without_cache_read_after_uplift() {
+fn usage_projection_final_input_guard_samples_input_without_cache_read_after_uplift() {
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
@@ -2709,7 +2760,7 @@ fn usage_projection_final_input_guard_preserves_input_without_cache_read_after_u
     let projected = maybe_project_non_stream_usage(body, Some(&projection));
     let reported = projected.usage_capture.reported.expect("reported usage");
 
-    assert_eq!(reported.input_tokens, projection.raw_input_tokens);
+    assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert!(reported.cache_creation_input_tokens > 0);
     assert_eq!(
@@ -2946,7 +2997,7 @@ fn usage_projection_does_not_leak_uncommitted_read_evidence_to_next_request() {
     );
     let next_reported = next.usage_capture.reported.expect("next reported usage");
 
-    assert_eq!(next_reported.input_tokens, next_projection.raw_input_tokens);
+    assert!((1..=96).contains(&next_reported.input_tokens));
     assert_eq!(next_reported.cache_read_input_tokens, 0);
     assert_eq!(
         next_reported.total_input_tokens,
@@ -3409,10 +3460,7 @@ data: {"type":"message_delta","usage":{"input_tokens":4165,"output_tokens":2,"ca
     assert_ne!(projected, event);
     let value = event_data_value(&projected);
     let usage = &value["usage"];
-    assert_eq!(
-        usage["input_tokens"].as_i64().expect("projected input"),
-        i64::from(projection.raw_input_tokens)
-    );
+    assert_eq!(usage["input_tokens"].as_i64().expect("projected input"), 1);
     assert_eq!(
         usage["output_tokens"].as_i64().expect("projected output"),
         2
@@ -3434,7 +3482,7 @@ data: {"type":"message_delta","usage":{"input_tokens":4165,"output_tokens":2,"ca
     assert!(capture.projected);
     assert_eq!(capture.raw.map(|usage| usage.input_tokens), Some(4165));
     let reported = capture.reported.expect("reported usage");
-    assert_eq!(reported.input_tokens, projection.raw_input_tokens);
+    assert_eq!(reported.input_tokens, 1);
     assert_eq!(reported.cache_creation_input_tokens, 0);
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert_eq!(
@@ -3463,7 +3511,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
     let reported = capture.reported.expect("reported usage");
 
     assert_eq!(raw.input_tokens, 100000);
-    assert_eq!(reported.input_tokens, projection.raw_input_tokens);
+    assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert!(reported.cache_creation_input_tokens > 0);
     assert_eq!(
@@ -3746,7 +3794,7 @@ data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role"
     assert!(capture.projected);
     assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
     let reported = capture.reported.expect("reported usage");
-    assert_eq!(reported.input_tokens, projection.raw_input_tokens);
+    assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.output_tokens, 0);
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert_eq!(
@@ -3792,7 +3840,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
     );
     assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
     let reported = capture.reported.expect("reported usage");
-    assert_eq!(reported.input_tokens, projection.raw_input_tokens);
+    assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert!(reported.cache_creation_input_tokens > 0);
     assert_eq!(

@@ -655,6 +655,10 @@ impl ExternalLatencyTraceState {
             upstream_event_types_before_first_output: None,
             client_dropped_ms: None,
             terminal_reason: None,
+            upstream_message_status: None,
+            saw_upstream_completed: None,
+            stop_reason_source: None,
+            suspected_intent_preamble_end_turn: None,
         };
         (!trace.is_empty()).then_some(trace)
     }
@@ -782,6 +786,8 @@ impl ExternalPoolFinalError {
     fn public_message(&self, external_error_id: &str) -> String {
         let message = if self.is_rate_limit() {
             envelope::PUBLIC_RATE_LIMIT_MESSAGE
+        } else if self.is_external_prompt_too_long() {
+            "Prompt is too long for the external model context window. Reduce conversation history, system prompt, tools, documents, images, or tool results and retry."
         } else if self.is_public_invalid_request() {
             envelope::PUBLIC_INVALID_REQUEST_MESSAGE
         } else {
@@ -819,6 +825,17 @@ impl ExternalPoolFinalError {
             || lower.contains("timeout")
             || lower.contains("timed out")
             || lower.contains("deadline")
+    }
+
+    pub fn is_external_prompt_too_long(&self) -> bool {
+        if self.status != StatusCode::BAD_REQUEST {
+            return false;
+        }
+        let lower = self.message.to_ascii_lowercase();
+        lower.contains("prompt is too long")
+            || lower.contains("input is too long")
+            || lower.contains("context window is full")
+            || lower.contains("content_length_exceeds_threshold")
     }
 
     pub fn is_capacity_like(&self) -> bool {
@@ -873,6 +890,22 @@ fn effective_external_pool_stream_response_mode(
 ) -> ExternalPoolStreamResponseMode {
     pool.stream_response_mode
         .unwrap_or(config.external_pool_stream_response_mode)
+}
+
+fn external_pool_max_input_tokens_for_route(
+    config: &ExternalPoolsConfig,
+    route: &ExternalRouteRequest,
+) -> Option<i32> {
+    let max_input_tokens = config.external_pool_max_input_tokens.max(0);
+    if max_input_tokens == 0 {
+        return None;
+    }
+    let request_input_tokens = route.request_input_tokens.max(0);
+    if request_input_tokens > max_input_tokens {
+        Some(max_input_tokens)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -952,8 +985,8 @@ fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u
         )
         .await
     });
-    if !admitted
-        && let Err(err) = block_on_storage(
+    if !admitted {
+        if let Err(err) = block_on_storage(
             "关键队列拒绝后同步释放外部池 Redis 并发 lease",
             async move {
                 release_external_pool_lease_with_retry(
@@ -964,14 +997,14 @@ fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u
                 )
                 .await
             },
-        )
-    {
-        tracing::error!(
-            pool_id,
-            lease_id,
-            "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
-        );
+        ) {
+            tracing::error!(
+                pool_id,
+                lease_id,
+                "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+                err
+            );
+        }
     }
 }
 
@@ -1014,19 +1047,19 @@ fn release_external_pool_queue_lease_reliably(manager: ExternalPoolManager, leas
     let admitted = spawn_critical_storage_task("释放外部池 Redis 调度排队 lease", async move {
         release_external_pool_queue_lease_with_retry(manager, lease_id, 2).await
     });
-    if !admitted
-        && let Err(err) = block_on_storage(
+    if !admitted {
+        if let Err(err) = block_on_storage(
             "关键队列拒绝后同步释放外部池 Redis 调度排队 lease",
             async move {
                 release_external_pool_queue_lease_with_retry(fallback_manager, fallback_lease_id, 2)
                     .await
             },
-        )
-    {
-        tracing::error!(
-            "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
-        );
+        ) {
+            tracing::error!(
+                "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+                err
+            );
+        }
     }
 }
 
@@ -1416,6 +1449,44 @@ impl ExternalPoolManager {
                 response_error_type: "service_unavailable".to_string(),
                 route_error_type: "external_pool_unavailable".to_string(),
                 message: "request route is disabled".to_string(),
+                error_id: route.error_id.clone(),
+                retryable: false,
+                attempts: Vec::new(),
+                pool_id: None,
+                pool_name: None,
+            });
+        }
+
+        if let Some(max_input_tokens) = external_pool_max_input_tokens_for_route(&config, &route) {
+            let message = format!(
+                "prompt is too long: estimated input tokens {} exceed configured external pool maximum {}",
+                route.request_input_tokens.max(0),
+                max_input_tokens
+            );
+            tracing::warn!(
+                request_id = %route.request_id,
+                error_id = %route.error_id,
+                request_input_tokens = route.request_input_tokens,
+                external_pool_max_input_tokens = max_input_tokens,
+                "external pool request rejected before dispatch because prompt is too long"
+            );
+            self.record_external_failure(
+                &route,
+                None,
+                Vec::new(),
+                "bad_request",
+                &message,
+                synthetic_external_error_diagnostics(
+                    &route,
+                    StatusCode::BAD_REQUEST,
+                    "external_prompt_too_long_preflight",
+                ),
+            );
+            return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
+                status: StatusCode::BAD_REQUEST,
+                response_error_type: "invalid_request_error".to_string(),
+                route_error_type: "bad_request".to_string(),
+                message,
                 error_id: route.error_id.clone(),
                 retryable: false,
                 attempts: Vec::new(),
@@ -2373,29 +2444,29 @@ impl ExternalPoolManager {
                 }
             }
         }
-        if let Some(guard) = queue_guard.as_mut()
-            && let Err(err) = guard.renew_if_needed().await
-        {
-            tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
-            let message = "Request dispatch queue unavailable: Redis coordination unavailable";
-            self.record_external_failure(
-                route,
-                None,
-                attempts,
-                "external_pool_queue_error",
-                message,
-                synthetic_external_error_diagnostics(
+        if let Some(guard) = queue_guard.as_mut() {
+            if let Err(err) = guard.renew_if_needed().await {
+                tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
+                let message = "Request dispatch queue unavailable: Redis coordination unavailable";
+                self.record_external_failure(
                     route,
+                    None,
+                    attempts,
+                    "external_pool_queue_error",
+                    message,
+                    synthetic_external_error_diagnostics(
+                        route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                    ),
+                );
+                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "external_dispatch",
-                ),
-            );
-            return ExternalCapacityDecision::FinalError(external_capacity_final_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "external_pool_queue_error",
-                message,
-                &route.error_id,
-            ));
+                    "external_pool_queue_error",
+                    message,
+                    &route.error_id,
+                ));
+            }
         }
 
         let mut wakeup = wait_for

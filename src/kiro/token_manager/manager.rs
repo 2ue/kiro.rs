@@ -197,11 +197,11 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
         clear_access_token = true;
     }
 
-    if let Some(auth_method) = update.auth_method
-        && let Some(auth_method) = trimmed_optional(auth_method)
-    {
-        credential.auth_method = Some(auth_method);
-        clear_access_token = true;
+    if let Some(auth_method) = update.auth_method {
+        if let Some(auth_method) = trimmed_optional(auth_method) {
+            credential.auth_method = Some(auth_method);
+            clear_access_token = true;
+        }
     }
     if update.provider.is_some() {
         apply_optional_string(&mut credential.provider, update.provider);
@@ -887,22 +887,22 @@ impl MultiTokenManager {
         redis_store: Option<Arc<RedisStore>>,
         initial_runtime_states: Option<HashMap<u64, CredentialRuntimeStateRow>>,
     ) -> anyhow::Result<Self> {
-        if credentials.iter().any(|credential| credential.id.is_none())
-            && let Some(store) = &postgres_store
-        {
-            let store = store.clone();
-            credentials =
-                block_on_credential_pgsql("通过 PgSQL 为无 ID 凭据分配 ID", async move {
-                    let mut resolved = Vec::with_capacity(credentials.len());
-                    for credential in credentials {
-                        if credential.id.is_some() {
-                            resolved.push(credential);
-                        } else {
-                            resolved.push(store.insert_credential(&credential).await?);
+        if credentials.iter().any(|credential| credential.id.is_none()) {
+            if let Some(store) = &postgres_store {
+                let store = store.clone();
+                credentials =
+                    block_on_credential_pgsql("通过 PgSQL 为无 ID 凭据分配 ID", async move {
+                        let mut resolved = Vec::with_capacity(credentials.len());
+                        for credential in credentials {
+                            if credential.id.is_some() {
+                                resolved.push(credential);
+                            } else {
+                                resolved.push(store.insert_credential(&credential).await?);
+                            }
                         }
-                    }
-                    Ok(resolved)
-                })?;
+                        Ok(resolved)
+                    })?;
+            }
         }
 
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
@@ -2362,15 +2362,16 @@ impl MultiTokenManager {
         age: StdDuration,
     ) {
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == credential_id)
-            && let Some(lease) = entry
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == credential_id) {
+            if let Some(lease) = entry
                 .in_flight_leases
                 .iter_mut()
                 .find(|lease| lease.id == lease_id)
-        {
-            let now = Instant::now();
-            lease.acquired_at = now - age;
-            lease.last_seen_at = now - age;
+            {
+                let now = Instant::now();
+                lease.acquired_at = now - age;
+                lease.last_seen_at = now - age;
+            }
         }
     }
 
@@ -2585,10 +2586,10 @@ impl MultiTokenManager {
             return;
         }
         let _ = tokio::time::timeout(wakeup, self.in_flight_notify.notified()).await;
-        if self.redis_store.is_some()
-            && let Err(err) = self.refresh_scheduler_state_from_redis_force()
-        {
-            tracing::debug!("调度等待唤醒后同步 Redis 并发状态失败: {}", err);
+        if self.redis_store.is_some() {
+            if let Err(err) = self.refresh_scheduler_state_from_redis_force() {
+                tracing::debug!("调度等待唤醒后同步 Redis 并发状态失败: {}", err);
+            }
         }
     }
 
@@ -3611,19 +3612,20 @@ impl MultiTokenManager {
         let mut current_id = self.current_id.lock();
 
         // 选择优先级最高的未禁用凭据（不排除当前凭据）
-        if let Some(best) = entries
+        let best = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
-            && best.id != *current_id
-        {
-            tracing::info!(
-                "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
-                *current_id,
-                best.id,
-                best.credentials.priority
-            );
-            *current_id = best.id;
+            .min_by_key(|e| e.credentials.priority);
+        if let Some(best) = best {
+            if best.id != *current_id {
+                tracing::info!(
+                    "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
+                    *current_id,
+                    best.id,
+                    best.credentials.priority
+                );
+                *current_id = best.id;
+            }
         }
     }
 
@@ -4194,10 +4196,10 @@ impl MultiTokenManager {
                         .await?
                         .into_iter()
                         .find(|credential| credential.id == Some(id));
-                        if let Some(current) = current
-                            && Self::refresh_fields_match(&current, &patch)
-                        {
-                            return Ok(current);
+                        if let Some(current) = current {
+                            if Self::refresh_fields_match(&current, &patch) {
+                                return Ok(current);
+                            }
                         }
                         return Err(anyhow::anyhow!(
                             "Token 刷新 CAS 结果不确定；首次错误: {}；重试错误: {}",
@@ -4381,11 +4383,11 @@ impl MultiTokenManager {
         };
 
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id)
-            && saved.storage_revision >= entry.credentials.storage_revision
-        {
-            entry.credentials = saved.clone();
-            Self::recompute_entry_disabled(entry);
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            if saved.storage_revision >= entry.credentials.storage_revision {
+                entry.credentials = saved.clone();
+                Self::recompute_entry_disabled(entry);
+            }
         }
         Ok(saved)
     }
@@ -4557,15 +4559,15 @@ impl MultiTokenManager {
         })?;
 
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id)
-            && saved.storage_revision >= entry.credentials.storage_revision
-        {
-            entry.credentials = saved.clone();
-            entry.credentials.disabled = runtime.credential_disabled;
-            if runtime.state.revision > entry.runtime_revision {
-                Self::apply_runtime_state_if_newer(entry, &runtime.state);
-            } else {
-                Self::recompute_entry_disabled(entry);
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            if saved.storage_revision >= entry.credentials.storage_revision {
+                entry.credentials = saved.clone();
+                entry.credentials.disabled = runtime.credential_disabled;
+                if runtime.state.revision > entry.runtime_revision {
+                    Self::apply_runtime_state_if_newer(entry, &runtime.state);
+                } else {
+                    Self::recompute_entry_disabled(entry);
+                }
             }
         }
         Ok(saved)
@@ -5441,46 +5443,51 @@ impl MultiTokenManager {
                 },
             );
         }
-        if let Some(store) = &self.postgres_store
-            && !queue_without_attempt
-        {
-            let store = store.clone();
-            match block_on_credential_pgsql("原子记录 PgSQL 凭据调用成功", async move {
-                store
-                    .record_credential_success_at_generation(id, operation_id, expected_generation)
-                    .await
-            }) {
-                Ok(result) => {
-                    let disabled = {
-                        let mut entries = self.entries.lock();
-                        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
-                            return false;
-                        };
-                        Self::apply_runtime_mutation_result_to_entry(entry, &result);
-                        entry.disabled
-                    };
-                    let mut pending = self.pending_stats_deltas.lock();
-                    let entry = pending.entry(id).or_default();
-                    entry.success_delta = entry.success_delta.saturating_add(1);
-                    entry.last_used_at = Some(last_used_at.to_string());
-                    drop(pending);
-                    self.mark_stats_dirty();
-                    return disabled;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        credential_id = id,
-                        %operation_id,
-                        "{}；保留相同 operation ID 等待 PgSQL 恢复后重放",
-                        err
-                    );
-                    self.enqueue_pending_runtime_mutation(
-                        id,
-                        PendingCredentialRuntimeMutation::Success {
+        if !queue_without_attempt {
+            if let Some(store) = &self.postgres_store {
+                let store = store.clone();
+                match block_on_credential_pgsql("原子记录 PgSQL 凭据调用成功", async move {
+                    store
+                        .record_credential_success_at_generation(
+                            id,
                             operation_id,
                             expected_generation,
-                        },
-                    );
+                        )
+                        .await
+                }) {
+                    Ok(result) => {
+                        let disabled = {
+                            let mut entries = self.entries.lock();
+                            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id)
+                            else {
+                                return false;
+                            };
+                            Self::apply_runtime_mutation_result_to_entry(entry, &result);
+                            entry.disabled
+                        };
+                        let mut pending = self.pending_stats_deltas.lock();
+                        let entry = pending.entry(id).or_default();
+                        entry.success_delta = entry.success_delta.saturating_add(1);
+                        entry.last_used_at = Some(last_used_at.to_string());
+                        drop(pending);
+                        self.mark_stats_dirty();
+                        return disabled;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            credential_id = id,
+                            %operation_id,
+                            "{}；保留相同 operation ID 等待 PgSQL 恢复后重放",
+                            err
+                        );
+                        self.enqueue_pending_runtime_mutation(
+                            id,
+                            PendingCredentialRuntimeMutation::Success {
+                                operation_id,
+                                expected_generation,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -6199,29 +6206,31 @@ impl MultiTokenManager {
             (until.saturating_duration_since(now), coalesced)
         };
 
-        if !coalesced && let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let reason_for_redis = reason.clone();
-            let model_for_redis = model.map(str::to_string);
-            spawn_best_effort_storage_task("写入 Redis 凭据临时冷却与健康状态", async move {
-                redis
-                    .record_scheduler_transient_failure(
-                        id,
-                        model_for_redis.as_deref(),
-                        kind.as_str(),
-                        &reason_for_redis,
-                        retry_after,
-                        base,
-                        max,
-                        multiplier,
-                        jitter,
-                        probation,
-                        alpha,
-                        coalesce_window,
-                    )
-                    .await?;
-                Ok(())
-            });
+        if !coalesced {
+            if let Some(redis) = &self.redis_store {
+                let redis = redis.clone();
+                let reason_for_redis = reason.clone();
+                let model_for_redis = model.map(str::to_string);
+                spawn_best_effort_storage_task("写入 Redis 凭据临时冷却与健康状态", async move {
+                    redis
+                        .record_scheduler_transient_failure(
+                            id,
+                            model_for_redis.as_deref(),
+                            kind.as_str(),
+                            &reason_for_redis,
+                            retry_after,
+                            base,
+                            max,
+                            multiplier,
+                            jitter,
+                            probation,
+                            alpha,
+                            coalesce_window,
+                        )
+                        .await?;
+                    Ok(())
+                });
+            }
         }
 
         if coalesced {

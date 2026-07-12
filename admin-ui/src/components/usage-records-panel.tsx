@@ -381,13 +381,15 @@ function UsageMetric({
 }: {
   label: string
   value: string
-  tone?: 'default' | 'success' | 'info'
+  tone?: 'default' | 'success' | 'info' | 'warning'
 }) {
   const toneClass =
     tone === 'success'
       ? 'text-kiro-success'
       : tone === 'info'
         ? 'text-primary'
+        : tone === 'warning'
+          ? 'text-amber-600'
         : 'text-foreground'
   return (
     <div className="rounded-md border bg-card px-2.5 py-1.5">
@@ -430,6 +432,10 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="输出前上游类型" value={formatUpstreamEventTypeCounts(trace.upstreamEventTypesBeforeFirstOutput)} />
         <UsageMetric label="客户端断开" value={formatLatency(trace.clientDroppedMs)} />
         <UsageMetric label="结束原因" value={trace.terminalReason || '-'} />
+        <UsageMetric label="上游完成状态" value={trace.upstreamMessageStatus || '-'} tone={trace.sawUpstreamCompleted ? 'success' : 'info'} />
+        <UsageMetric label="上游显式完成" value={typeof trace.sawUpstreamCompleted === 'boolean' ? (trace.sawUpstreamCompleted ? '是' : '否') : '-'} tone={trace.sawUpstreamCompleted ? 'success' : 'warning'} />
+        <UsageMetric label="结束原因来源" value={trace.stopReasonSource || '-'} />
+        <UsageMetric label="疑似开场白空转" value={trace.suspectedIntentPreambleEndTurn ? '是' : '-'} tone={trace.suspectedIntentPreambleEndTurn ? 'warning' : 'default'} />
       </div>
     </div>
   )

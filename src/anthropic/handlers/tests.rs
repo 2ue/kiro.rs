@@ -913,7 +913,7 @@ fn path_reported_usage_policy_samples_natural_usage() {
         )
         .expect("policy should apply"),
     );
-    assert_eq!(reported.input_tokens, usage.input_tokens);
+    assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert!(reported.cache_creation_input_tokens > 0);
     assert_eq!(reported.output_tokens, 1);
@@ -928,7 +928,7 @@ fn path_reported_usage_policy_samples_natural_usage() {
         .expect("policy should apply"),
         cache::RawUsage::uncached(100_000, 1),
     );
-    assert_eq!(raw_reported.input_tokens, 100_000);
+    assert!((1..=96).contains(&raw_reported.input_tokens));
     assert_eq!(raw_reported.cache_read_input_tokens, 0);
     assert!(raw_reported.cache_creation_input_tokens > 0);
 }
@@ -1144,7 +1144,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
 
     let upstream_metadata =
         usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
-    assert_eq!(upstream_metadata.input_tokens, usage_context.input_tokens);
+    assert!((1..=96).contains(&upstream_metadata.input_tokens));
     assert_eq!(upstream_metadata.cache_creation_input_tokens, 0);
     assert_eq!(upstream_metadata.cache_read_input_tokens, 0);
 
@@ -1236,7 +1236,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
     let reported =
         usage_context.reported_usage_for_downstream(raw_usage, UsageSource::UpstreamMetadata);
 
-    assert_eq!(reported.input_tokens, raw_usage.input_tokens);
+    assert!((1..=500).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert_eq!(reported.cache_creation_input_tokens, 0);
     assert_eq!(reported.output_tokens, 7);
@@ -2142,7 +2142,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
     let reported =
         credential_usage.canonical_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
 
-    assert_eq!(reported.input_tokens, usage.input_tokens);
+    assert!((1..=96).contains(&reported.input_tokens));
     assert!((26_400..30_000).contains(&reported.cache_creation_input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert_eq!(
@@ -2305,7 +2305,74 @@ async fn content_length_threshold_error_is_not_reported_as_context_window_full()
 }
 
 #[tokio::test]
-async fn malformed_upstream_error_uses_generic_user_message() {
+async fn prompt_too_long_error_maps_to_input_length_message() {
+    let response = map_provider_error(
+        anyhow::anyhow!(
+            "{}",
+            r#"流式 API 请求失败（账号 #9 hidden）: 400 Bad Request {"error":{"message":"prompt is too long: > 1000000 maximum","type":"invalid_request_error"},"type":"error"}"#
+        ),
+        Some("req_test_prompt_too_long"),
+        None,
+        None,
+    );
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.contains("input content length exceeded"));
+    assert!(!message.contains("hidden"));
+    assert!(!message.contains("1000000"));
+}
+
+#[tokio::test]
+async fn official_kiro_upstream_400_message_is_exposed_without_internal_prefix() {
+    let response = map_provider_error(
+        anyhow::anyhow!(
+            "{}",
+            r#"流式 API 请求失败（账号 #7 secret-user）: 400 Bad Request {"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#
+        ),
+        Some("req_test_official_upstream"),
+        Some("req_01official"),
+        None,
+    );
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-kiro-rs-error-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_01official")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        value.pointer("/error/type").and_then(|v| v.as_str()),
+        Some("invalid_request_error")
+    );
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.contains("Invalid tool use format."));
+    assert!(message.contains("REQUEST_BODY_INVALID"));
+    assert!(message.contains("error ID: req_01official"));
+    assert!(!message.contains("账号"));
+    assert!(!message.contains("secret-user"));
+}
+
+#[tokio::test]
+async fn malformed_upstream_error_exposes_safe_official_message() {
     let response = map_provider_error(
         anyhow::anyhow!(
             "{}",
@@ -2326,9 +2393,77 @@ async fn malformed_upstream_error_uses_generic_user_message() {
         .and_then(|v| v.as_str())
         .expect("error message");
 
-    assert_eq!(message, UPSTREAM_INVALID_REQUEST_MESSAGE);
+    assert_eq!(message, "Improperly formed request.");
     assert!(!message.contains("tool_use"));
     assert!(!message.contains("转换"));
+    assert!(!message.contains("test@example.com"));
+    assert!(!message.contains("凭据"));
+}
+
+#[tokio::test]
+async fn official_kiro_bad_request_message_is_exposed_when_safe() {
+    let response = map_provider_error(
+        anyhow::anyhow!(
+            "{}",
+            r#"流式 API 请求失败（凭据 #1 hidden@example.com，请求无效）: 400 Bad Request {"message":"Bedrock error message: Could not process image","reason":"IMAGE_FORMAT_UNSUPPORTED"}"#
+        ),
+        Some("req_test_official_bad_request"),
+        Some("req_01official_bad_request"),
+        None,
+    );
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        value.pointer("/error/type").and_then(|v| v.as_str()),
+        Some("invalid_request_error")
+    );
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.contains("Bedrock error message: Could not process image"));
+    assert!(message.contains("IMAGE_FORMAT_UNSUPPORTED"));
+    assert!(message.contains("error ID: req_01official_bad_request"));
+    assert!(!message.contains("hidden@example.com"));
+    assert!(!message.contains("凭据"));
+}
+
+#[tokio::test]
+async fn official_kiro_high_load_message_is_exposed_when_safe() {
+    let response = map_provider_error(
+        anyhow::anyhow!(
+            "{}",
+            r#"流式 API 请求失败（账号 #157 hidden）: 500 Internal Server Error {"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ),
+        Some("req_test_official_high_load"),
+        Some("req_01official_high_load"),
+        None,
+    );
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        value.pointer("/error/type").and_then(|v| v.as_str()),
+        Some("api_error")
+    );
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.contains("Encountered unexpectedly high load"));
+    assert!(message.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
+    assert!(message.contains("error ID: req_01official_high_load"));
+    assert!(!message.contains("账号 #157"));
+    assert!(!message.contains("hidden"));
 }
 
 #[tokio::test]

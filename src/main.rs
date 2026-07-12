@@ -36,7 +36,7 @@ use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
-use model::arg::{Args, Command, CredentialsCommand};
+use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
 use model::config::Config;
 use serde_json::{Value, json};
 use storage::postgres::{PostgresStore, PostgresUsageStore};
@@ -72,17 +72,10 @@ async fn main() {
     });
 
     if let Some(command) = args.command {
-        // CLI 凭据诊断仍然面向本地文件，用于首次导入前排查 credentials.json。
         let credentials_path = args
             .credentials
             .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-        let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
-            tracing::error!("加载凭证失败: {}", e);
-            std::process::exit(1);
-        });
-        if let Err(err) =
-            handle_cli_command(command, &file_config, credentials_config, &credentials_path)
-        {
+        if let Err(err) = handle_cli_command(command, &file_config, &credentials_path).await {
             tracing::error!("{}", err);
             std::process::exit(1);
         }
@@ -969,17 +962,50 @@ fn spawn_redis_runtime_event_listener(
     })
 }
 
-fn handle_cli_command(
+async fn handle_cli_command(
     command: Command,
     config: &Config,
-    credentials_config: CredentialsConfig,
     credentials_path: &str,
 ) -> anyhow::Result<()> {
     match command {
         Command::Credentials { command } => {
+            // CLI 凭据诊断仍然面向本地文件，用于首次导入前排查 credentials.json。
+            let credentials_config = CredentialsConfig::load(credentials_path)?;
             handle_credentials_command(command, config, credentials_config, credentials_path)
         }
+        Command::Maintenance { command } => handle_maintenance_command(command, config).await,
     }
+}
+
+async fn handle_maintenance_command(
+    command: MaintenanceCommand,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let mut maintenance_config = config.clone();
+    maintenance_config.postgres.compress_usage_rollups_on_start = false;
+    if matches!(command, MaintenanceCommand::Migrate) {
+        maintenance_config.postgres.migrate_on_start = true;
+    }
+    let store = PostgresStore::connect(&maintenance_config).await?;
+    match command {
+        MaintenanceCommand::Migrate => {
+            println!("postgres startup migration completed");
+        }
+        MaintenanceCommand::UsageIndexes => {
+            store.migrate_with_options(false).await?;
+            store.create_usage_indexes_concurrently().await?;
+            println!("usage indexes maintenance completed");
+        }
+        MaintenanceCommand::UsageLegacyCostBackfill => {
+            store.backfill_usage_legacy_cost_fields().await?;
+            println!("usage legacy cost field backfill completed");
+        }
+        MaintenanceCommand::UsageRollupCompression => {
+            store.compress_usage_rollups_to_hour_buckets().await?;
+            println!("usage rollup compression completed");
+        }
+    }
+    Ok(())
 }
 
 fn handle_credentials_command(

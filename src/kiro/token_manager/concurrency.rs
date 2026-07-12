@@ -109,19 +109,19 @@ pub(super) fn release_redis_dispatch_queue_lease_reliably(
     let admitted = spawn_critical_storage_task("释放 Redis 调度排队 lease", async move {
         release_redis_dispatch_queue_lease_with_retry(redis, lease_id, 2).await
     });
-    if !admitted
-        && let Err(err) = block_on_storage(
+    if !admitted {
+        if let Err(err) = block_on_storage(
             "关键队列拒绝后同步释放 Redis 调度排队 lease",
             async move {
                 release_redis_dispatch_queue_lease_with_retry(fallback_redis, fallback_lease_id, 2)
                     .await
             },
-        )
-    {
-        tracing::error!(
-            "Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
-        );
+        ) {
+            tracing::error!(
+                "Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+                err
+            );
+        }
     }
 }
 

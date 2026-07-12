@@ -233,6 +233,7 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolsEnabled: false,
   externalPoolGlobalMaxConcurrentRequests: 0,
   externalPoolMaxQueuedRequests: 0,
+  externalPoolMaxInputTokens: 1000000,
   externalPoolCapacityMode: 'fail_fast' as const,
   externalPoolStreamResponseMode: 'event_passthrough' as const,
   externalPoolDispatchMaxWaitSecs: 30,
@@ -1362,7 +1363,7 @@ function ReportedUsageFieldEditor({
         {allowMoveDelta && (
           <ToggleField
             title="差值计入缓存读取"
-            description="开启后，input_tokens 被压低的差值会加到 cache_read_input_tokens，只改变下游上报外观。"
+            description="开启后，且响应已有缓存读取证据时，input_tokens 被压低的差值会加到 cache_read_input_tokens；没有读取证据时只压低输入，不伪造缓存读取。"
             checked={value.moveDeltaToCacheRead}
             disabled={disabled || value.mode === 'preserve' || value.mode === 'raw'}
             onCheckedChange={(moveDeltaToCacheRead) =>
@@ -2611,6 +2612,7 @@ export function RuntimeConfigPanel() {
         ...draft.externalPools,
         externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
         externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
+        externalPoolMaxInputTokens: toWhole(draft.externalPools.externalPoolMaxInputTokens),
         externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs),
         externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
         externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),

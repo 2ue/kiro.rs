@@ -861,29 +861,60 @@ fn count_invalid_tool_schema_property_keys(
     match value {
         serde_json::Value::Object(obj) => {
             let mut invalid = 0usize;
-            for key in [
-                "properties",
-                "patternProperties",
-                "$defs",
-                "dependentSchemas",
-            ] {
-                let Some(serde_json::Value::Object(map)) = obj.get(key) else {
-                    continue;
-                };
-                for name in map.keys() {
+            if let Some(serde_json::Value::Object(properties)) = obj.get("properties") {
+                for (name, schema) in properties {
                     if !claim_tool_diagnostic_item(scanned, truncated) {
                         return invalid;
                     }
                     if !is_valid_tool_schema_property_key(name) {
                         invalid += 1;
                     }
+                    invalid += count_invalid_tool_schema_property_keys(schema, scanned, truncated);
+                    if *truncated {
+                        return invalid;
+                    }
                 }
             }
 
-            for child in obj.values() {
-                invalid += count_invalid_tool_schema_property_keys(child, scanned, truncated);
-                if *truncated {
-                    return invalid;
+            for key in ["$defs", "patternProperties", "dependentSchemas"] {
+                if let Some(serde_json::Value::Object(map)) = obj.get(key) {
+                    for child in map.values() {
+                        invalid +=
+                            count_invalid_tool_schema_property_keys(child, scanned, truncated);
+                        if *truncated {
+                            return invalid;
+                        }
+                    }
+                }
+            }
+
+            for key in [
+                "items",
+                "contains",
+                "not",
+                "if",
+                "then",
+                "else",
+                "propertyNames",
+                "contentSchema",
+            ] {
+                if let Some(child) = obj.get(key) {
+                    invalid += count_invalid_tool_schema_property_keys(child, scanned, truncated);
+                    if *truncated {
+                        return invalid;
+                    }
+                }
+            }
+
+            for key in ["prefixItems", "oneOf", "anyOf", "allOf"] {
+                if let Some(serde_json::Value::Array(items)) = obj.get(key) {
+                    for child in items {
+                        invalid +=
+                            count_invalid_tool_schema_property_keys(child, scanned, truncated);
+                        if *truncated {
+                            return invalid;
+                        }
+                    }
                 }
             }
             invalid
@@ -5379,6 +5410,61 @@ mod tests {
 
         assert_eq!(diagnostics.empty_tool_descriptions, 1);
         assert_eq!(diagnostics.invalid_tool_schema_property_keys, 2);
+    }
+
+    #[test]
+    fn tool_schema_key_diagnostics_ignore_schema_map_keys() {
+        let mut current = UserInputMessage::new("current", TEST_MODEL);
+        current.user_input_message_context =
+            UserInputMessageContext::new().with_tools(vec![Tool {
+                tool_specification: ToolSpecification {
+                    name: "probe".to_string(),
+                    description: "probe".to_string(),
+                    input_schema: InputSchema::from_json(serde_json::json!({
+                        "type": "object",
+                        "$defs": {
+                            "bad def/key": {
+                                "type": "object",
+                                "properties": {
+                                    "nested bad": {"type": "string"}
+                                }
+                            }
+                        },
+                        "patternProperties": {
+                            "^bad pattern key .+$": {
+                                "type": "object",
+                                "properties": {
+                                    "another bad": {"type": "string"}
+                                }
+                            }
+                        },
+                        "dependentSchemas": {
+                            "not-a-property/key": {
+                                "type": "object",
+                                "properties": {
+                                    "third bad": {"type": "string"}
+                                }
+                            }
+                        }
+                    })),
+                },
+            }]);
+
+        let request = KiroRequest {
+            conversation_state: ConversationState::new("conv-test")
+                .with_current_message(CurrentMessage::new(current)),
+            profile_arn: None,
+            additional_model_request_fields: None,
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
+        };
+
+        let diagnostics = diagnose_kiro_tool_use_format(&request);
+
+        assert_eq!(
+            diagnostics.invalid_tool_schema_property_keys, 3,
+            "$defs, patternProperties, and dependentSchemas map keys are schema identifiers, not object property keys"
+        );
     }
 
     #[test]

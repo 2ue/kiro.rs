@@ -144,6 +144,7 @@ export function ExternalPoolsPage() {
           directExternalPathRules: splitRules(pathRulesText),
           externalPoolGlobalMaxConcurrentRequests: whole(configDraft.externalPoolGlobalMaxConcurrentRequests),
           externalPoolMaxQueuedRequests: whole(configDraft.externalPoolMaxQueuedRequests),
+          externalPoolMaxInputTokens: whole(configDraft.externalPoolMaxInputTokens),
           externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs),
           externalPoolRetryMaxAttempts: whole(configDraft.externalPoolRetryMaxAttempts),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
@@ -366,6 +367,7 @@ export function ExternalPoolsPage() {
                   </SelectBox>
                   <NumberBox disabled={!externalEnabled} label="全局并发上限" suffix="并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolGlobalMaxConcurrentRequests: v }))} />
                   <NumberBox disabled={!waitModeActive} label="排队上限" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxQueuedRequests: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="输入上限预检" suffix="Token" value={configDraft.externalPoolMaxInputTokens} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxInputTokens: v }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待" suffix="秒" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolDispatchMaxWaitSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="最大重试" suffix="次" value={configDraft.externalPoolRetryMaxAttempts} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryMaxAttempts: v }))} />
                 </div>

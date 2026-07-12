@@ -133,8 +133,8 @@ PostgreSQL 18 官方镜像默认使用版本化的数据目录，compose 中挂�
 | `KIRO_RS_POSTGRES_DB` | `kiro_rs` | 控制 PgSQL 数据库名。 |
 | `KIRO_RS_POSTGRES_USER` | `kiro_rs` | 控制 PgSQL 用户名。 |
 | `KIRO_RS_POSTGRES_PASSWORD` | `change-me` | 控制 PgSQL 密码，生产必须改成强密码。 |
-| `KIRO_RS_POSTGRES_MIGRATE_ON_START` | 配置文件默认值 | 覆盖 `postgres.migrateOnStart`；建议生产保持 `true`。 |
-| `KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START` | 配置文件默认值 | 覆盖 `postgres.compressUsageRollupsOnStart`；历史 usage rollup 压缩只在低峰维护窗口设为 `true`。 |
+| `KIRO_RS_POSTGRES_MIGRATE_ON_START` | 配置文件默认值 | 覆盖 `postgres.migrateOnStart`；建议生产保持 `true`。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
+| `KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START` | 配置文件默认值 | 覆盖 `postgres.compressUsageRollupsOnStart`；历史 usage rollup 压缩只在低峰维护窗口设为 `true`。普通升级保持 `false`。 |
 
 固定版本启动示例：
 
@@ -247,10 +247,39 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | --- | --- | --- |
 | `postgres.url` | Compose 自动注入 | 控制 PgSQL 连接地址。服务必须能连接 PgSQL 才能启动。 |
 | `postgres.maxConnections` | `10` | 控制 PgSQL 连接池最大连接数。 |
-| `postgres.migrateOnStart` | `true` | 控制启动时是否自动创建或升级数据库表。生产建议保持开启。 |
-| `postgres.compressUsageRollupsOnStart` | `false` | 控制启动时是否执行历史 usage rollup 小桶压缩。生产默认关闭，避免升级启动阶段长时间占用 PgSQL；需要整理历史数据时再低峰期显式开启一次。 |
+| `postgres.migrateOnStart` | `true` | 控制启动时是否自动创建或升级数据库表。生产建议保持开启。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
+| `postgres.compressUsageRollupsOnStart` | `false` | 控制启动时是否执行历史 usage rollup 小桶压缩。生产默认关闭，避免升级启动阶段长时间占用 PgSQL；需要整理历史数据时再低峰期显式开启一次。普通升级保持 `false`。 |
 | `redis.url` | Compose 自动注入 | 控制 Redis 连接地址。服务必须能连接 Redis 才能启动；会话绑定、临时冷却、限流、并发占用、刷新锁和余额缓存都写入 Redis。 |
 | `redis.keyPrefix` | `kiro_rs:prod` | 控制 Redis key 前缀，用于和同一个 Redis 中的其他业务隔离。 |
+
+#### Usage 历史数据维护
+
+普通升级只需要：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+默认启动迁移不会回填历史 `usage_records`，也不会在大表上无条件创建缺失索引。如果历史 usage 表很大且缺少 usage/rollup 索引，服务会跳过启动创建并写出 warning。需要补齐时，应在低峰期手动运行：
+
+```bash
+docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance usage-indexes
+```
+
+如果需要显式回填旧版本成本字段，可在低峰期手动运行：
+
+```bash
+docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance usage-legacy-cost-backfill
+```
+
+如果需要压缩历史 usage rollup 小桶，可在低峰期手动运行：
+
+```bash
+docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance usage-rollup-compression
+```
+
+这些维护命令都不应作为普通版本升级的必需步骤。运行前建议先做 PostgreSQL 备份，并监控 PgSQL CPU、IO、WAL 和锁等待。
 
 ### 基础监听和认证
 
