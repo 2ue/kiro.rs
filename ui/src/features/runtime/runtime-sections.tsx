@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
 import { defaultPromptCacheCreationControl, inputSamplePolicy, pathPolicy, preserveFieldPolicy, writerSamplePolicy } from '@/lib/runtime-config-defaults'
@@ -1359,11 +1359,12 @@ function fieldNeedsTarget(policy: ReportedUsageFieldPolicy): boolean {
 }
 
 function FieldPolicyEditor({
-  title, policy, allowMoveDelta, onChange,
+  title, policy, allowMoveDelta, extra, onChange,
 }: {
   title: string
   policy: ReportedUsageFieldPolicy
   allowMoveDelta?: boolean
+  extra?: ReactNode
   onChange: (next: ReportedUsageFieldPolicy) => void
 }) {
   const set = <K extends keyof ReportedUsageFieldPolicy>(key: K) => (v: ReportedUsageFieldPolicy[K]) =>
@@ -1416,12 +1417,13 @@ function FieldPolicyEditor({
       {allowMoveDelta && (
         <TogField
           label="差额计入缓存读取"
-          desc="如果输入显示被压低，且响应已有缓存读取证据，少掉的部分加到缓存读取里；没有读取证据时只压低输入，不伪造缓存读取。"
+          desc="如果输入显示被压低，且响应已有缓存读取证据，少掉的部分加到缓存读取里；没有读取证据时差额计入缓存写入，不伪造缓存读取。"
           checked={policy.moveDeltaToCacheRead}
           disabled={policy.mode === 'preserve' || policy.mode === 'raw'}
           onChange={set('moveDeltaToCacheRead')}
         />
       )}
+      {extra}
     </div>
   )
 }
@@ -1456,7 +1458,68 @@ function PathPolicyEditor({
       {policy.enabled && (
         <>
           <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
-          <FieldPolicyEditor title="展示输出" policy={policy.output} onChange={set('output')} />
+          <FieldPolicyEditor
+            title="展示输出"
+            policy={policy.output}
+            onChange={set('output')}
+            extra={(
+              <div className="space-y-3 rounded-md border border-dashed bg-muted/20 p-3">
+                <div>
+                  <div className="text-sm font-semibold">输出后处理</div>
+                  <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                    先完成上面的输出字段改写，再按阈值百分比放大，最后用“输出最终上限 - 扣减值”保护结果。
+                  </div>
+                </div>
+                <TwoCol>
+                  <NumField
+                    label="输出放大阈值"
+                    desc="展示输出完成 raw / preserve / sample-max / sample-target 后，大于这个值才按百分比放大；0 表示只要输出大于 0 且配置了百分比就生效。"
+                    value={policy.outputUpliftMinTokens ?? 0}
+                    min={0}
+                    suffix="Token"
+                    onChange={set('outputUpliftMinTokens')}
+                  />
+                  <NumField
+                    label="输出放大百分比"
+                    desc="输出超过阈值后增加多少百分比；0 表示关闭放大，最大 200%。"
+                    value={policy.outputUpliftPercent ?? 0}
+                    min={0}
+                    max={200}
+                    suffix="%"
+                    onChange={set('outputUpliftPercent')}
+                  />
+                </TwoCol>
+                <TwoCol>
+                  <NumField
+                    label="输出最终上限"
+                    desc="展示输出放大后最多显示多少 Token；0 表示不限制。生效时会先扣减下面的随机扣减值，再作为最终有效上限。"
+                    value={policy.finalOutputMaxTokens ?? 0}
+                    min={0}
+                    suffix="Token"
+                    onChange={set('finalOutputMaxTokens')}
+                  />
+                  <NumField
+                    label="输出上限扣减下限"
+                    desc="输出触顶时至少从最终上限里扣掉多少 Token，避免每次都显示同一个最大值。"
+                    value={policy.finalOutputJitterMinTokens ?? 0}
+                    min={0}
+                    suffix="Token"
+                    onChange={set('finalOutputJitterMinTokens')}
+                  />
+                </TwoCol>
+                <TwoCol>
+                  <NumField
+                    label="输出上限扣减上限"
+                    desc="输出触顶时最多从最终上限里扣掉多少 Token；必须大于等于扣减下限，且不能超过输出最终上限。"
+                    value={policy.finalOutputJitterMaxTokens ?? 0}
+                    min={0}
+                    suffix="Token"
+                    onChange={set('finalOutputJitterMaxTokens')}
+                  />
+                </TwoCol>
+              </div>
+            )}
+          />
           <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />
           <FieldPolicyEditor title="展示缓存写入" policy={policy.cacheCreation} onChange={set('cacheCreation')} />
           <TwoCol>

@@ -80,6 +80,11 @@ const pathPolicy = (
   finalCacheReadMaxTokens: 700000,
   finalCacheReadJitterMinTokens: 0,
   finalCacheReadJitterMaxTokens: 0,
+  outputUpliftMinTokens: 0,
+  outputUpliftPercent: 0,
+  finalOutputMaxTokens: 0,
+  finalOutputJitterMinTokens: 0,
+  finalOutputJitterMaxTokens: 0,
   input,
   output: rawFieldPolicy(),
   cacheRead: preserveFieldPolicy(),
@@ -1241,6 +1246,7 @@ interface PolicyNumberInputProps {
   description: string
   value: number
   min?: number
+  max?: number
   step?: number
   suffix: string
   disabled?: boolean
@@ -1252,6 +1258,7 @@ function PolicyNumberInput({
   description,
   value,
   min,
+  max,
   step,
   suffix,
   disabled,
@@ -1266,6 +1273,7 @@ function PolicyNumberInput({
           type="number"
           value={value}
           min={min}
+          max={max}
           step={step}
           inputMode={step ? 'decimal' : 'numeric'}
           disabled={disabled}
@@ -1298,6 +1306,7 @@ interface ReportedUsageFieldEditorProps {
   value: ReportedUsageFieldPolicy
   allowMoveDelta?: boolean
   disabled?: boolean
+  extra?: ReactNode
   onChange: (value: ReportedUsageFieldPolicy) => void
 }
 
@@ -1307,6 +1316,7 @@ function ReportedUsageFieldEditor({
   value,
   allowMoveDelta,
   disabled,
+  extra,
   onChange,
 }: ReportedUsageFieldEditorProps) {
   return (
@@ -1363,7 +1373,7 @@ function ReportedUsageFieldEditor({
         {allowMoveDelta && (
           <ToggleField
             title="差值计入缓存读取"
-            description="开启后，且响应已有缓存读取证据时，input_tokens 被压低的差值会加到 cache_read_input_tokens；没有读取证据时只压低输入，不伪造缓存读取。"
+            description="开启后，且响应已有缓存读取证据时，input_tokens 被压低的差值会加到 cache_read_input_tokens；没有读取证据时差值计入 cache_creation_input_tokens，不伪造缓存读取。"
             checked={value.moveDeltaToCacheRead}
             disabled={disabled || value.mode === 'preserve' || value.mode === 'raw'}
             onCheckedChange={(moveDeltaToCacheRead) =>
@@ -1371,6 +1381,7 @@ function ReportedUsageFieldEditor({
             }
           />
         )}
+        {extra}
       </div>
     </div>
   )
@@ -1437,7 +1448,7 @@ function ReportedUsagePathEditor({
           <div className="grid gap-4 lg:grid-cols-2">
             <ReportedUsageFieldEditor
               title="输入字段改写（input_tokens）"
-              description="控制给下游和后台记录的 input_tokens。原始值表示请求输入是多少就报多少；保留计算值表示使用 high-cache 计算后的 input；采样可把 input 压到几十以内并把差值计入缓存读取。"
+              description="控制给下游和后台记录的 input_tokens。原始值表示请求输入是多少就报多少；保留计算值表示使用 high-cache 计算后的 input；采样可把 input 压到几十以内，并按证据把差值计入缓存读取或缓存写入。"
               value={value.input}
               allowMoveDelta
               onChange={(input) => onChange({ ...value, input })}
@@ -1447,6 +1458,71 @@ function ReportedUsagePathEditor({
               description="控制给下游和后台记录的 output_tokens。默认建议使用原始值，避免本地模拟影响客户端对输出量的判断。"
               value={value.output}
               onChange={(output) => onChange({ ...value, output })}
+              extra={(
+                <div className="grid gap-3 rounded-md border border-dashed bg-muted/20 p-3">
+                  <div>
+                    <div className="text-xs font-medium">输出后处理</div>
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      先完成上面的 output_tokens 改写，再按阈值百分比放大，最后用“输出最终上限 - 扣减值”保护结果。
+                    </div>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <PolicyNumberInput
+                      title="输出放大阈值"
+                      description="output_tokens 完成原始/保留/采样策略后，大于这个值才按百分比放大。"
+                      value={value.outputUpliftMinTokens ?? 0}
+                      min={0}
+                      suffix="tokens"
+                      onChange={(outputUpliftMinTokens) =>
+                        onChange({ ...value, outputUpliftMinTokens })
+                      }
+                    />
+                    <PolicyNumberInput
+                      title="输出放大百分比"
+                      description="输出超过阈值后增加多少百分比；0 表示关闭，最大 200%。"
+                      value={value.outputUpliftPercent ?? 0}
+                      min={0}
+                      max={200}
+                      suffix="%"
+                      onChange={(outputUpliftPercent) =>
+                        onChange({ ...value, outputUpliftPercent })
+                      }
+                    />
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <PolicyNumberInput
+                      title="输出最终上限"
+                      description="输出放大后最多显示多少 Token；0 表示不限制。生效时会先扣减下面的随机扣减值，再作为有效上限。"
+                      value={value.finalOutputMaxTokens ?? 0}
+                      min={0}
+                      suffix="tokens"
+                      onChange={(finalOutputMaxTokens) =>
+                        onChange({ ...value, finalOutputMaxTokens })
+                      }
+                    />
+                    <PolicyNumberInput
+                      title="输出上限扣减下限"
+                      description="输出触顶时至少从最终上限扣减多少 Token，避免每次都显示同一个最大值。"
+                      value={value.finalOutputJitterMinTokens ?? 0}
+                      min={0}
+                      suffix="tokens"
+                      onChange={(finalOutputJitterMinTokens) =>
+                        onChange({ ...value, finalOutputJitterMinTokens })
+                      }
+                    />
+                    <PolicyNumberInput
+                      title="输出上限扣减上限"
+                      description="输出触顶时最多从最终上限扣减多少 Token；不会超过输出最终上限。"
+                      value={value.finalOutputJitterMaxTokens ?? 0}
+                      min={0}
+                      suffix="tokens"
+                      onChange={(finalOutputJitterMaxTokens) =>
+                        onChange({ ...value, finalOutputJitterMaxTokens })
+                      }
+                    />
+                  </div>
+                </div>
+              )}
             />
             <ReportedUsageFieldEditor
               title="缓存读取字段改写（cache_read_input_tokens）"
@@ -1545,12 +1621,27 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
     0,
     finalCacheReadJitterMaxTokens
   )
+  const finalOutputMaxTokens = toWhole(policy.finalOutputMaxTokens ?? 0)
+  const finalOutputJitterMaxTokens =
+    finalOutputMaxTokens > 0
+      ? toWhole(policy.finalOutputJitterMaxTokens ?? 0, 0, finalOutputMaxTokens)
+      : 0
+  const finalOutputJitterMinTokens = toWhole(
+    policy.finalOutputJitterMinTokens ?? 0,
+    0,
+    finalOutputJitterMaxTokens
+  )
   return {
     ...policy,
     skipNonStreamUsageProjection: Boolean(policy.skipNonStreamUsageProjection),
     finalCacheReadMaxTokens,
     finalCacheReadJitterMinTokens,
     finalCacheReadJitterMaxTokens,
+    outputUpliftMinTokens: toWhole(policy.outputUpliftMinTokens ?? 0),
+    outputUpliftPercent: toWhole(policy.outputUpliftPercent ?? 0, 0, 200),
+    finalOutputMaxTokens,
+    finalOutputJitterMinTokens,
+    finalOutputJitterMaxTokens,
     input: normalizeFieldPolicy(policy.input),
     output: normalizeFieldPolicy(policy.output),
     cacheRead: normalizeFieldPolicy(policy.cacheRead),
