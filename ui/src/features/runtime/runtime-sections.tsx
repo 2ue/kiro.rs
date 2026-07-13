@@ -261,64 +261,58 @@ function SimulationOverrideForm({
         checked={merged.enabled ?? true}
         onChange={set('enabled')}
       />
-      <TwoCol>
-        <NumField
-          label="目标缓存读取比例"
-          desc="希望输入里大约多少比例显示成缓存读取。越高，看起来命中越多；最高 0.99。"
-          value={merged.targetReadRatio ?? 0.98}
-          min={0}
-          max={0.99}
-          step={0.01}
-          suffix="比例"
-          onChange={set('targetReadRatio')}
-        />
-        <NumField
-          label="输入放大倍数"
-          desc="计算展示用量前先把输入按这个倍数放大，用来模拟更长上下文；1 表示不放大。"
-          value={merged.tokenScale ?? 1.6}
-          min={1}
-          max={3}
-          step={0.1}
-          suffix="倍"
-          onChange={set('tokenScale')}
-        />
-      </TwoCol>
-      <TwoCol>
-        <NumField
-          label="模拟输入上限"
-          desc="放大后的展示输入最多到这个数；0 表示不设上限。"
-          value={merged.maxSimulatedInputTokens ?? 300000}
-          min={0}
-          suffix="Token"
-          onChange={set('maxSimulatedInputTokens')}
-        />
-        <NumField
-          label="放大生效门槛"
-          desc="原始输入低于这个值时不放大，避免小请求也显示成很大的用量。"
-          value={merged.scaleMinInputTokens ?? 20000}
-          min={0}
-          suffix="Token"
-          onChange={set('scaleMinInputTokens')}
-        />
-      </TwoCol>
-      <TwoCol>
-        <NumField
-          label="上限扣减下限"
-          desc="接近上限时至少少显示这么多，避免每次都卡在同一个上限数字。"
-          value={merged.capJitterMinTokens ?? 12000}
-          min={0}
-          suffix="Token"
-          onChange={set('capJitterMinTokens')}
-        />
-        <NumField
-          label="上限扣减上限"
-          desc="接近上限时最多少显示这么多；必须大于等于扣减下限。"
-          value={merged.capJitterMaxTokens ?? 24000}
-          min={0}
-          suffix="Token"
-          onChange={set('capJitterMaxTokens')}
-        />
-      </TwoCol>
+      <NumField
+        label="目标缓存读取比例"
+        desc="希望输入里大约多少比例显示成缓存读取。越高，看起来命中越多；最高 0.99。"
+        value={merged.targetReadRatio ?? 0.98}
+        min={0}
+        max={0.99}
+        step={0.01}
+        suffix="比例"
+        onChange={set('targetReadRatio')}
+      />
+      <NumField
+        label="输入放大倍数"
+        desc="计算展示用量前先把输入按这个倍数放大，用来模拟更长上下文；1 表示不放大。"
+        value={merged.tokenScale ?? 1.6}
+        min={1}
+        max={3}
+        step={0.1}
+        suffix="倍"
+        onChange={set('tokenScale')}
+      />
+      <NumField
+        label="模拟输入上限"
+        desc="放大后的展示输入最多到这个数；0 表示不设上限。"
+        value={merged.maxSimulatedInputTokens ?? 300000}
+        min={0}
+        suffix="Token"
+        onChange={set('maxSimulatedInputTokens')}
+      />
+      <NumField
+        label="放大生效门槛"
+        desc="原始输入低于这个值时不放大，避免小请求也显示成很大的用量。"
+        value={merged.scaleMinInputTokens ?? 20000}
+        min={0}
+        suffix="Token"
+        onChange={set('scaleMinInputTokens')}
+      />
+      <NumField
+        label="上限扣减下限"
+        desc="接近上限时至少少显示这么多，避免每次都卡在同一个上限数字。"
+        value={merged.capJitterMinTokens ?? 12000}
+        min={0}
+        suffix="Token"
+        onChange={set('capJitterMinTokens')}
+      />
+      <NumField
+        label="上限扣减上限"
+        desc="接近上限时最多少显示这么多；必须大于等于扣减下限。"
+        value={merged.capJitterMaxTokens ?? 24000}
+        min={0}
+        suffix="Token"
+        onChange={set('capJitterMaxTokens')}
+      />
     </div>
   )
 }
@@ -342,77 +336,69 @@ function CreationControlOverrideForm({
         checked={merged.enabled}
         onChange={set('enabled')}
       />
-      <TwoCol>
-        <NumField
-          label="最小成功请求间隔"
-          desc="两次显示缓存写入之间至少隔多少次成功请求；0 表示不按次数限制。"
-          value={merged.minSuccessfulRequestsBetweenCreation}
-          min={0}
-          suffix="次"
-          disabled={!merged.enabled}
-          onChange={set('minSuccessfulRequestsBetweenCreation')}
-        />
-        <NumField
-          label="最小时间间隔"
-          desc="两次显示缓存写入之间至少间隔多久；0 表示不按时间限制。"
-          value={merged.minCreationIntervalSecs}
-          min={0}
-          suffix="秒"
-          disabled={!merged.enabled}
-          onChange={set('minCreationIntervalSecs')}
-        />
-      </TwoCol>
-      <TwoCol>
-        <NumField
-          label="最小累计增量"
-          desc="累计新增输入达到多少 Token 后，才允许再次显示缓存写入；0 表示不限制。"
-          value={merged.minCreationDeltaTokens}
-          min={0}
-          suffix="Token"
-          disabled={!merged.enabled}
-          onChange={set('minCreationDeltaTokens')}
-        />
-        <NumField
-          label="单次展示上限"
-          desc="一次响应里最多显示多少缓存写入 Token；0 表示不限制。"
-          value={merged.maxCreationTokensPerEvent}
-          min={0}
-          suffix="Token"
-          disabled={!merged.enabled}
-          onChange={set('maxCreationTokensPerEvent')}
-        />
-      </TwoCol>
-      <TwoCol>
-        <NumField
-          label="额度窗口长度"
-          desc="按多长时间统计一次缓存写入展示额度；0 表示关闭窗口额度控制。"
-          value={merged.creationBudgetWindowSecs}
-          min={0}
-          suffix="秒"
-          disabled={!merged.enabled}
-          onChange={set('creationBudgetWindowSecs')}
-        />
-        <NumField
-          label="窗口展示额度"
-          desc="一个时间窗口内最多显示多少缓存写入 Token；0 表示不限制。"
-          value={merged.maxCreationTokensPerWindow}
-          min={0}
-          suffix="Token"
-          disabled={!merged.enabled}
-          onChange={set('maxCreationTokensPerWindow')}
-        />
-      </TwoCol>
-      <TwoCol>
-        <NumField
-          label="空闲后清理状态"
-          desc="这个路径多久没有新请求后清理临时计数，减少长期占用；0 表示不按空闲时间清理。"
-          value={merged.expireAfterIdleSecs}
-          min={0}
-          suffix="秒"
-          disabled={!merged.enabled}
-          onChange={set('expireAfterIdleSecs')}
-        />
-      </TwoCol>
+      <NumField
+        label="最小成功请求间隔"
+        desc="两次显示缓存写入之间至少隔多少次成功请求；0 表示不按次数限制。"
+        value={merged.minSuccessfulRequestsBetweenCreation}
+        min={0}
+        suffix="次"
+        disabled={!merged.enabled}
+        onChange={set('minSuccessfulRequestsBetweenCreation')}
+      />
+      <NumField
+        label="最小时间间隔"
+        desc="两次显示缓存写入之间至少间隔多久；0 表示不按时间限制。"
+        value={merged.minCreationIntervalSecs}
+        min={0}
+        suffix="秒"
+        disabled={!merged.enabled}
+        onChange={set('minCreationIntervalSecs')}
+      />
+      <NumField
+        label="最小累计增量"
+        desc="累计新增输入达到多少 Token 后，才允许再次显示缓存写入；0 表示不限制。"
+        value={merged.minCreationDeltaTokens}
+        min={0}
+        suffix="Token"
+        disabled={!merged.enabled}
+        onChange={set('minCreationDeltaTokens')}
+      />
+      <NumField
+        label="单次展示上限"
+        desc="一次响应里最多显示多少缓存写入 Token；0 表示不限制。"
+        value={merged.maxCreationTokensPerEvent}
+        min={0}
+        suffix="Token"
+        disabled={!merged.enabled}
+        onChange={set('maxCreationTokensPerEvent')}
+      />
+      <NumField
+        label="额度窗口长度"
+        desc="按多长时间统计一次缓存写入展示额度；0 表示关闭窗口额度控制。"
+        value={merged.creationBudgetWindowSecs}
+        min={0}
+        suffix="秒"
+        disabled={!merged.enabled}
+        onChange={set('creationBudgetWindowSecs')}
+      />
+      <NumField
+        label="窗口展示额度"
+        desc="一个时间窗口内最多显示多少缓存写入 Token；0 表示不限制。"
+        value={merged.maxCreationTokensPerWindow}
+        min={0}
+        suffix="Token"
+        disabled={!merged.enabled}
+        onChange={set('maxCreationTokensPerWindow')}
+      />
+      <NumField
+        label="空闲后清理状态"
+        desc="这个路径多久没有新请求后清理临时计数，减少长期占用；0 表示不按空闲时间清理。"
+        value={merged.expireAfterIdleSecs}
+        min={0}
+        suffix="秒"
+        disabled={!merged.enabled}
+        onChange={set('expireAfterIdleSecs')}
+      />
     </div>
   )
 }
@@ -430,59 +416,53 @@ function KiroRsToolPolicyForm({
 
   return (
     <div className="space-y-4">
-      <TwoCol>
-        <NumField
-          label="缓存覆盖比例"
-          desc="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。"
-          value={merged.coverageRatio ?? 1}
-          min={0}
-          max={1}
-          step={0.05}
-          suffix="比例"
-          onChange={set('coverageRatio')}
-        />
-        <NumField
-          label="覆盖上限"
-          desc="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。"
-          value={merged.maxCoverageTokens ?? 0}
-          min={0}
-          suffix="Token"
-          onChange={set('maxCoverageTokens')}
-        />
-      </TwoCol>
-      <TwoCol>
-        <NumField
-          label="单次新增创建上限"
-          desc="一次请求最多新增多少缓存。0 表示不限制；后续读取不会超过之前真正创建过的数量。"
-          value={merged.maxNewCreationTokensPerRequest ?? 0}
-          min={0}
-          suffix="Token"
-          onChange={set('maxNewCreationTokensPerRequest')}
-        />
-        <NumField
-          label="当前用户前缀上限"
-          desc="开启下方选项后，最多取当前用户文本前段多少 Token。0 表示不取。"
-          value={merged.currentUserStablePrefixMaxTokens ?? 0}
-          min={0}
-          suffix="Token"
-          disabled={!merged.cacheCurrentUserStablePrefix}
-          onChange={set('currentUserStablePrefixMaxTokens')}
-        />
-      </TwoCol>
-      <TwoCol>
-        <TogField
-          label="允许后续继续创建"
-          desc="同一会话命中旧缓存后，如果又出现新的稳定内容，是否继续补创建。关闭后命中时只读不补建。"
-          checked={merged.incrementalCreateEnabled ?? true}
-          onChange={set('incrementalCreateEnabled')}
-        />
-        <TogField
-          label="缓存当前用户稳定前缀"
-          desc="默认关闭，和当前 Kiro-RS Tool 表现一致。开启后只取当前用户文本前段，适合确实有稳定长前缀的请求。"
-          checked={merged.cacheCurrentUserStablePrefix ?? false}
-          onChange={set('cacheCurrentUserStablePrefix')}
-        />
-      </TwoCol>
+      <NumField
+        label="缓存覆盖比例"
+        desc="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。"
+        value={merged.coverageRatio ?? 1}
+        min={0}
+        max={1}
+        step={0.05}
+        suffix="比例"
+        onChange={set('coverageRatio')}
+      />
+      <NumField
+        label="覆盖上限"
+        desc="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。"
+        value={merged.maxCoverageTokens ?? 0}
+        min={0}
+        suffix="Token"
+        onChange={set('maxCoverageTokens')}
+      />
+      <NumField
+        label="单次新增创建上限"
+        desc="一次请求最多新增多少缓存。0 表示不限制；后续读取不会超过之前真正创建过的数量。"
+        value={merged.maxNewCreationTokensPerRequest ?? 0}
+        min={0}
+        suffix="Token"
+        onChange={set('maxNewCreationTokensPerRequest')}
+      />
+      <NumField
+        label="当前用户前缀上限"
+        desc="开启下方选项后，最多取当前用户文本前段多少 Token。0 表示不取。"
+        value={merged.currentUserStablePrefixMaxTokens ?? 0}
+        min={0}
+        suffix="Token"
+        disabled={!merged.cacheCurrentUserStablePrefix}
+        onChange={set('currentUserStablePrefixMaxTokens')}
+      />
+      <TogField
+        label="允许后续继续创建"
+        desc="同一会话命中旧缓存后，如果又出现新的稳定内容，是否继续补创建。关闭后命中时只读不补建。"
+        checked={merged.incrementalCreateEnabled ?? true}
+        onChange={set('incrementalCreateEnabled')}
+      />
+      <TogField
+        label="缓存当前用户稳定前缀"
+        desc="默认关闭，和当前 Kiro-RS Tool 表现一致。开启后只取当前用户文本前段，适合确实有稳定长前缀的请求。"
+        checked={merged.cacheCurrentUserStablePrefix ?? false}
+        onChange={set('cacheCurrentUserStablePrefix')}
+      />
     </div>
   )
 }
@@ -1465,17 +1445,24 @@ function PathPolicyEditor({
             extra={(
               <div className="space-y-3 rounded-md border border-dashed bg-muted/20 p-3">
                 <div>
-                  <div className="text-sm font-semibold">输出后处理</div>
+                  <div className="text-sm font-semibold">最终输出限制</div>
                   <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                    先完成上面的输出字段改写，再按阈值百分比放大，最后用“输出最终上限 - 扣减值”保护结果。
+                    这里会改最终返回给下游和后台记录的 usage.output_tokens。关闭开关后，只使用上面的输出字段改写结果。
                   </div>
                 </div>
+                <TogField
+                  label="启用最终输出限制"
+                  desc="开启后，先按阈值百分比放大 output_tokens，再用“输出最终上限 - 扣减值”在最后限制住。"
+                  checked={policy.finalOutputGuardEnabled ?? true}
+                  onChange={set('finalOutputGuardEnabled')}
+                />
                 <TwoCol>
                   <NumField
                     label="输出放大阈值"
                     desc="展示输出完成 raw / preserve / sample-max / sample-target 后，大于这个值才按百分比放大；0 表示只要输出大于 0 且配置了百分比就生效。"
                     value={policy.outputUpliftMinTokens ?? 0}
                     min={0}
+                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
                     suffix="Token"
                     onChange={set('outputUpliftMinTokens')}
                   />
@@ -1485,6 +1472,7 @@ function PathPolicyEditor({
                     value={policy.outputUpliftPercent ?? 0}
                     min={0}
                     max={200}
+                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
                     suffix="%"
                     onChange={set('outputUpliftPercent')}
                   />
@@ -1495,6 +1483,7 @@ function PathPolicyEditor({
                     desc="展示输出放大后最多显示多少 Token；0 表示不限制。生效时会先扣减下面的随机扣减值，再作为最终有效上限。"
                     value={policy.finalOutputMaxTokens ?? 0}
                     min={0}
+                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
                     suffix="Token"
                     onChange={set('finalOutputMaxTokens')}
                   />
@@ -1503,6 +1492,7 @@ function PathPolicyEditor({
                     desc="输出触顶时至少从最终上限里扣掉多少 Token，避免每次都显示同一个最大值。"
                     value={policy.finalOutputJitterMinTokens ?? 0}
                     min={0}
+                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
                     suffix="Token"
                     onChange={set('finalOutputJitterMinTokens')}
                   />
@@ -1513,6 +1503,7 @@ function PathPolicyEditor({
                     desc="输出触顶时最多从最终上限里扣掉多少 Token；必须大于等于扣减下限，且不能超过输出最终上限。"
                     value={policy.finalOutputJitterMaxTokens ?? 0}
                     min={0}
+                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
                     suffix="Token"
                     onChange={set('finalOutputJitterMaxTokens')}
                   />

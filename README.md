@@ -281,6 +281,12 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `reportedUsage.*.finalCacheReadMaxTokens` | number | `700000` | 每个路径策略最终上报的 `cache_read_input_tokens` 上限；在 input 差值转入 cache read 后执行，0 表示关闭 |
 | `reportedUsage.*.finalCacheReadJitterMinTokens` | number | `0` | 最终读取缓存上限的确定性扣减下限 |
 | `reportedUsage.*.finalCacheReadJitterMaxTokens` | number | `0` | 最终读取缓存上限的确定性扣减上限 |
+| `reportedUsage.*.finalOutputGuardEnabled` | boolean | `true` | 是否启用最终输出限制。关闭后不执行 output 百分比放大和最终上限裁剪，只保留 `output` 字段自身的改写结果 |
+| `reportedUsage.*.outputUpliftMinTokens` | number | `1000` | `output_tokens` 完成字段改写后，大于该阈值才进入百分比放大；等于阈值不放大 |
+| `reportedUsage.*.outputUpliftPercent` | number | `50` | `output_tokens` 超过阈值后的放大百分比；0 表示关闭放大，最大 200 |
+| `reportedUsage.*.finalOutputMaxTokens` | number | `200000` | 放大后的 `output_tokens` 最终上限；0 表示关闭最终上限 |
+| `reportedUsage.*.finalOutputJitterMinTokens` | number | `5000` | 最终输出上限的确定性扣减下限 |
+| `reportedUsage.*.finalOutputJitterMaxTokens` | number | `12000` | 最终输出上限的确定性扣减上限，避免稳定撞到模型或展示硬上限 |
 | `usageRecordLimit` | number | `5000` | 内存中保留的最近 usage 记录数量；完整 usage 记录写入 PgSQL |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide`、`cli` |

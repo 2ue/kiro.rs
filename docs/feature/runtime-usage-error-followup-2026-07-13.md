@@ -11,7 +11,7 @@
 | schema property key 非法 | 真实兼容问题 | 已有默认可逆 sanitize；本轮修正 diagnostics 误报，避免把 `$defs`/`patternProperties`/`dependentSchemas` map key 算作 property key |
 | tool name 合法化与响应还原 | 真实兼容问题 | 源码已有 request-local 映射；文档已补状态 |
 | `/cc` / `/ha` usage 展示输入异常过大 | 真实 reported usage policy 漏应用问题 | 已修复：`sample-max` 会始终压低展示 input；有 cache-read 证据时差额转入 `cache_read_input_tokens`，无 read 证据时转入 `cache_creation_input_tokens/cache_creation_5m_input_tokens`，不伪造首轮 cache read，也不丢差额 |
-| reported usage 输出字段后处理 | 新增可配置策略 | 在既有 `output` 四种策略（`raw`/`preserve`/`sample-max`/`sample-target`）计算完成后，可配置超过阈值时按百分比放大；最后可配置 `finalOutputMaxTokens - jitter` 有效上限，默认全 0 关闭 |
+| reported usage 最终输出限制 | 新增可配置策略 | 在既有 `output` 四种策略（`raw`/`preserve`/`sample-max`/`sample-target`）计算完成后，可通过 `finalOutputGuardEnabled` 开关决定是否启用；开启时超过阈值可按百分比放大，最后用 `finalOutputMaxTokens - jitter` 限制最终上报值。默认保守启用：`>1000` 放大 50%，上限 `200000 - 5000..12000` |
 | `prompt is too long` | 真实外部池上限问题 | 已修复分类与 public message；parsed external route 不再把 request input tokens 恒置 0；新增 `externalPoolMaxInputTokens` 预检，默认 1,000,000，超过时本地拒绝、不发外部池 |
 | `messageStatus` 丢失 | 真实观测盲区 | 已解析 `messageStatus`，usage latencyTrace 写入 `upstreamMessageStatus`、`sawUpstreamCompleted`、`stopReasonSource` |
 | “开场白后 end_turn 空转” | 模型/CLI 时序行为，代理只能观测 | 新增 `suspectedIntentPreambleEndTurn` usage-only 诊断，不改变 SSE |
@@ -87,23 +87,25 @@
 - UI 文案继续强调“本地估算输入仅用于诊断；返回给客户端的用量以展示字段为准”。新 UI 使用“展示输入”，旧 admin-ui 使用“上报输入”，两者语义应在后续统一。
 - 长上下文不会因 schema key 映射产生跨请求内存增长：映射为 request-local map，随请求释放；高内存风险主要来自大请求体、图片历史、工具定义和 usage/payload diagnostics，而不是 key hash 本身。
 
-## 5. reported usage 输出后处理配置
+## 5. reported usage 最终输出限制配置
 
-新增字段位于 `reportedUsage.default` 和 `reportedUsage.pathOverrides.<path>`，均为 camelCase。默认值全部为 0，即默认不改变现有 output 上报行为。
+新增字段位于 `reportedUsage.default` 和 `reportedUsage.pathOverrides.<path>`，均为 camelCase。这里改的是最终返回给下游和后台记录的标准 `usage.output_tokens`。默认值为一套保守启用的 output 补偿；如果要关闭整组逻辑，把 `finalOutputGuardEnabled` 设为 `false`；如果只关闭放大，把 `outputUpliftPercent` 设为 `0`；如果只关闭最终上限，把 `finalOutputMaxTokens` 设为 `0`。
 
 | 字段 | 作用 | 默认 |
 |---|---|---:|
-| `outputUpliftMinTokens` | output 完成 `raw`/`preserve`/`sample-max`/`sample-target` 后，只有大于该阈值才进入百分比放大；等于阈值不放大 | 0 |
-| `outputUpliftPercent` | output 超过阈值后的放大百分比，归一化最大 200；计算使用向上取整，避免小值比例被抹掉 | 0 |
-| `finalOutputMaxTokens` | output 最终上限；0 表示关闭 | 0 |
-| `finalOutputJitterMinTokens` | 从最终上限扣减的确定性随机下限 | 0 |
-| `finalOutputJitterMaxTokens` | 从最终上限扣减的确定性随机上限 | 0 |
+| `finalOutputGuardEnabled` | 是否启用最终输出限制。关闭后不执行 output 百分比放大和最终上限裁剪，只保留 `output` 字段自身改写结果 | true |
+| `outputUpliftMinTokens` | output 完成 `raw`/`preserve`/`sample-max`/`sample-target` 后，只有大于该阈值才进入百分比放大；等于阈值不放大 | 1000 |
+| `outputUpliftPercent` | output 超过阈值后的放大百分比，归一化最大 200；计算使用向上取整，避免小值比例被抹掉 | 50 |
+| `finalOutputMaxTokens` | output 最终上限；0 表示关闭 | 200000 |
+| `finalOutputJitterMinTokens` | 从最终上限扣减的确定性随机下限 | 5000 |
+| `finalOutputJitterMaxTokens` | 从最终上限扣减的确定性随机上限 | 12000 |
 
 执行顺序固定：
 
 1. 先按既有 `output` 字段策略得到基准 output：`raw`、`preserve`、`sample-max` 或 `sample-target`。
-2. 如果 `output > outputUpliftMinTokens` 且 `outputUpliftPercent > 0`，再按百分比放大。
-3. 如果 `finalOutputMaxTokens > 0`，计算有效上限：`finalOutputMaxTokens - deterministic_jitter(finalOutputJitterMinTokens..finalOutputJitterMaxTokens)`，最终 output 不超过该有效上限。
+2. 如果 `finalOutputGuardEnabled=false`，直接返回第 1 步结果。
+3. 如果 `output > outputUpliftMinTokens` 且 `outputUpliftPercent > 0`，再按百分比放大。
+4. 如果 `finalOutputMaxTokens > 0`，计算有效上限：`finalOutputMaxTokens - deterministic_jitter(finalOutputJitterMinTokens..finalOutputJitterMaxTokens)`，最终 output 不超过该有效上限。
 
 设计约束：
 

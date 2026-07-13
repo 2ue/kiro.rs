@@ -1135,6 +1135,7 @@ export interface ReportedUsagePathPolicy {
   finalCacheReadMaxTokens: number
   finalCacheReadJitterMinTokens: number
   finalCacheReadJitterMaxTokens: number
+  finalOutputGuardEnabled: boolean
   outputUpliftMinTokens: number
   outputUpliftPercent: number
   finalOutputMaxTokens: number

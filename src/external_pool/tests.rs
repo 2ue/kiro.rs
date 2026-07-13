@@ -2106,6 +2106,13 @@ fn projection_context_with_output_uplift(
     )
 }
 
+fn disable_path_output_postprocess(route: &mut ExternalRouteRequest) {
+    route.reported_usage.default.final_output_guard_enabled = false;
+    for policy in route.reported_usage.path_overrides.values_mut() {
+        policy.final_output_guard_enabled = false;
+    }
+}
+
 fn event_usage_i64(event: &str, key: &str) -> i64 {
     event
         .lines()
@@ -3069,6 +3076,7 @@ fn usage_projection_output_uplift_changes_only_final_reported_usage() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -3426,6 +3434,7 @@ fn external_pool_billing_uses_output_uplift_as_final_reported_cost() {
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection =
@@ -4002,6 +4011,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":120
     let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/v1/messages".to_string();
+    disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection =

@@ -517,11 +517,21 @@ impl ReportedCacheUsagePolicy {
     }
 
     fn apply_output_post_processing(&self, usage: CacheUsage, output_tokens: i32) -> i32 {
+        if !self.final_output_guard_enabled() {
+            return output_tokens.max(0);
+        }
         let output_tokens = self.apply_output_uplift(output_tokens);
         self.apply_final_output_guard(usage, output_tokens)
     }
 
+    fn final_output_guard_enabled(&self) -> bool {
+        self.policy.final_output_guard_enabled
+    }
+
     fn output_uplift_would_apply(&self, output_tokens: i32) -> bool {
+        if !self.final_output_guard_enabled() {
+            return false;
+        }
         let min_tokens = self.policy.output_uplift_min_tokens.max(0);
         let percent = self.policy.output_uplift_percent.min(200);
         percent > 0 && min_tokens > 0 && output_tokens > min_tokens
@@ -566,6 +576,9 @@ impl ReportedCacheUsagePolicy {
 
     pub fn apply_final_output_guard_to_usage(&self, mut usage: CacheUsage) -> CacheUsage {
         if !self.reports_local_prompt_cache() {
+            return usage;
+        }
+        if !self.final_output_guard_enabled() {
             return usage;
         }
         usage.output_tokens = self.apply_final_output_guard(usage, usage.output_tokens);
@@ -655,6 +668,9 @@ impl ReportedCacheUsagePolicy {
     }
 
     fn final_output_effective_cap(&self, usage: CacheUsage) -> Option<i32> {
+        if !self.final_output_guard_enabled() {
+            return None;
+        }
         let max_tokens = self.policy.final_output_max_tokens.max(0);
         if max_tokens <= 0 {
             return None;
@@ -2369,6 +2385,36 @@ mod tests {
         let reported = usage.with_reported_cache_usage_policy(policy);
 
         assert_eq!(reported.output_tokens, 11_500);
+    }
+
+    #[test]
+    fn reported_usage_policy_final_output_guard_can_be_disabled() {
+        let usage = CacheUsage {
+            total_input_tokens: 50_000,
+            input_tokens: 50_000,
+            output_tokens: 10_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                final_output_guard_enabled: false,
+                output_uplift_min_tokens: 1_000,
+                output_uplift_percent: 50,
+                final_output_max_tokens: 12_000,
+                final_output_jitter_min_tokens: 500,
+                final_output_jitter_max_tokens: 500,
+                ..ReportedUsagePathPolicy::default()
+            },
+            7,
+        )
+        .unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy(policy);
+
+        assert_eq!(reported.output_tokens, 10_000);
     }
 
     #[test]

@@ -361,7 +361,7 @@ export function RuntimePage() {
         },
         payloadShaping: normalizePayloadShaping(config.data.payloadShaping),
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
-        reportedUsage: config.data.reportedUsage ?? defaultReportedUsage(),
+        reportedUsage: normalizeReportedUsage(config.data.reportedUsage ?? defaultReportedUsage()),
         cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),

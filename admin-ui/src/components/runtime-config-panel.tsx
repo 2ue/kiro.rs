@@ -40,6 +40,12 @@ import type {
   RuntimeConfig,
 } from '@/types/api'
 
+const DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS = 1000
+const DEFAULT_OUTPUT_UPLIFT_PERCENT = 50
+const DEFAULT_FINAL_OUTPUT_MAX_TOKENS = 200000
+const DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS = 5000
+const DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS = 12000
+
 const preserveFieldPolicy = (): ReportedUsageFieldPolicy => ({
   mode: 'preserve',
   maxTokens: 0,
@@ -80,11 +86,12 @@ const pathPolicy = (
   finalCacheReadMaxTokens: 700000,
   finalCacheReadJitterMinTokens: 0,
   finalCacheReadJitterMaxTokens: 0,
-  outputUpliftMinTokens: 0,
-  outputUpliftPercent: 0,
-  finalOutputMaxTokens: 0,
-  finalOutputJitterMinTokens: 0,
-  finalOutputJitterMaxTokens: 0,
+  finalOutputGuardEnabled: true,
+  outputUpliftMinTokens: DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS,
+  outputUpliftPercent: DEFAULT_OUTPUT_UPLIFT_PERCENT,
+  finalOutputMaxTokens: DEFAULT_FINAL_OUTPUT_MAX_TOKENS,
+  finalOutputJitterMinTokens: DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS,
+  finalOutputJitterMaxTokens: DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS,
   input,
   output: rawFieldPolicy(),
   cacheRead: preserveFieldPolicy(),
@@ -1461,17 +1468,26 @@ function ReportedUsagePathEditor({
               extra={(
                 <div className="grid gap-3 rounded-md border border-dashed bg-muted/20 p-3">
                   <div>
-                    <div className="text-xs font-medium">输出后处理</div>
+                    <div className="text-xs font-medium">最终输出限制</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      先完成上面的 output_tokens 改写，再按阈值百分比放大，最后用“输出最终上限 - 扣减值”保护结果。
+                      这里会改最终返回给下游和后台记录的 usage.output_tokens。关闭开关后，只使用上面的 output_tokens 改写结果。
                     </div>
                   </div>
+                  <ToggleField
+                    title="启用最终输出限制"
+                    description="开启后，先按阈值百分比放大 output_tokens，再用“输出最终上限 - 扣减值”在最后限制住。"
+                    checked={value.finalOutputGuardEnabled ?? true}
+                    onCheckedChange={(finalOutputGuardEnabled) =>
+                      onChange({ ...value, finalOutputGuardEnabled })
+                    }
+                  />
                   <div className="grid gap-3 sm:grid-cols-2">
                     <PolicyNumberInput
                       title="输出放大阈值"
                       description="output_tokens 完成原始/保留/采样策略后，大于这个值才按百分比放大。"
                       value={value.outputUpliftMinTokens ?? 0}
                       min={0}
+                      disabled={!(value.finalOutputGuardEnabled ?? true)}
                       suffix="tokens"
                       onChange={(outputUpliftMinTokens) =>
                         onChange({ ...value, outputUpliftMinTokens })
@@ -1483,6 +1499,7 @@ function ReportedUsagePathEditor({
                       value={value.outputUpliftPercent ?? 0}
                       min={0}
                       max={200}
+                      disabled={!(value.finalOutputGuardEnabled ?? true)}
                       suffix="%"
                       onChange={(outputUpliftPercent) =>
                         onChange({ ...value, outputUpliftPercent })
@@ -1495,6 +1512,7 @@ function ReportedUsagePathEditor({
                       description="输出放大后最多显示多少 Token；0 表示不限制。生效时会先扣减下面的随机扣减值，再作为有效上限。"
                       value={value.finalOutputMaxTokens ?? 0}
                       min={0}
+                      disabled={!(value.finalOutputGuardEnabled ?? true)}
                       suffix="tokens"
                       onChange={(finalOutputMaxTokens) =>
                         onChange({ ...value, finalOutputMaxTokens })
@@ -1505,6 +1523,7 @@ function ReportedUsagePathEditor({
                       description="输出触顶时至少从最终上限扣减多少 Token，避免每次都显示同一个最大值。"
                       value={value.finalOutputJitterMinTokens ?? 0}
                       min={0}
+                      disabled={!(value.finalOutputGuardEnabled ?? true)}
                       suffix="tokens"
                       onChange={(finalOutputJitterMinTokens) =>
                         onChange({ ...value, finalOutputJitterMinTokens })
@@ -1515,6 +1534,7 @@ function ReportedUsagePathEditor({
                       description="输出触顶时最多从最终上限扣减多少 Token；不会超过输出最终上限。"
                       value={value.finalOutputJitterMaxTokens ?? 0}
                       min={0}
+                      disabled={!(value.finalOutputGuardEnabled ?? true)}
                       suffix="tokens"
                       onChange={(finalOutputJitterMaxTokens) =>
                         onChange({ ...value, finalOutputJitterMaxTokens })
@@ -1621,13 +1641,17 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
     0,
     finalCacheReadJitterMaxTokens
   )
-  const finalOutputMaxTokens = toWhole(policy.finalOutputMaxTokens ?? 0)
+  const finalOutputMaxTokens = toWhole(policy.finalOutputMaxTokens ?? DEFAULT_FINAL_OUTPUT_MAX_TOKENS)
   const finalOutputJitterMaxTokens =
     finalOutputMaxTokens > 0
-      ? toWhole(policy.finalOutputJitterMaxTokens ?? 0, 0, finalOutputMaxTokens)
+      ? toWhole(
+          policy.finalOutputJitterMaxTokens ?? DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS,
+          0,
+          finalOutputMaxTokens
+        )
       : 0
   const finalOutputJitterMinTokens = toWhole(
-    policy.finalOutputJitterMinTokens ?? 0,
+    policy.finalOutputJitterMinTokens ?? DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS,
     0,
     finalOutputJitterMaxTokens
   )
@@ -1637,8 +1661,9 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
     finalCacheReadMaxTokens,
     finalCacheReadJitterMinTokens,
     finalCacheReadJitterMaxTokens,
-    outputUpliftMinTokens: toWhole(policy.outputUpliftMinTokens ?? 0),
-    outputUpliftPercent: toWhole(policy.outputUpliftPercent ?? 0, 0, 200),
+    finalOutputGuardEnabled: policy.finalOutputGuardEnabled ?? true,
+    outputUpliftMinTokens: toWhole(policy.outputUpliftMinTokens ?? DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS),
+    outputUpliftPercent: toWhole(policy.outputUpliftPercent ?? DEFAULT_OUTPUT_UPLIFT_PERCENT, 0, 200),
     finalOutputMaxTokens,
     finalOutputJitterMinTokens,
     finalOutputJitterMaxTokens,
@@ -1908,7 +1933,7 @@ function SimulationOverrideForm({
     onChange({ ...merged, [key]: nextValue })
 
   return (
-    <div className="grid gap-4 md:grid-cols-2">
+    <div className="grid gap-4">
       <ToggleField
         title="启用本地模拟缓存"
         description="只覆盖当前路径的本地模拟缓存开关，不影响其他入口。"
@@ -1938,7 +1963,7 @@ function CreationControlOverrideForm({
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid gap-4">
         <ToggleField
           title="启用缓存创建频次控制"
           description="只控制缓存创建数值的展示节奏；范围固定按会话和路径计算。"
@@ -1949,7 +1974,7 @@ function CreationControlOverrideForm({
           已固定按会话和路径计算，不再按账号或模型拆分；旧配置里的 scopeMode 会保留但后端不会使用。
         </div>
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid gap-4">
         <NumberField title="最小成功请求间隔" description="两次缓存创建展示之间至少间隔多少次成功请求。" value={merged.minSuccessfulRequestsBetweenCreation} disabled={!merged.enabled} min={0} suffix="次" onChange={set('minSuccessfulRequestsBetweenCreation')} />
         <NumberField title="最小时间间隔" description="两次缓存创建展示之间至少间隔多少秒。" value={merged.minCreationIntervalSecs} disabled={!merged.enabled} min={0} suffix="秒" onChange={set('minCreationIntervalSecs')} />
         <NumberField title="最小累计增量" description="累计新增缓存写入达到多少 Token 后才展示。" value={merged.minCreationDeltaTokens} disabled={!merged.enabled} min={0} suffix="Token" onChange={set('minCreationDeltaTokens')} />
@@ -1974,7 +1999,7 @@ function KiroRsToolPolicyForm({
     onChange({ ...merged, [key]: nextValue })
 
   return (
-    <div className="grid gap-4 md:grid-cols-2">
+    <div className="grid gap-4">
       <NumberField title="缓存覆盖比例" description="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。" value={merged.coverageRatio ?? 1} min={0} max={1} step={0.05} suffix="比例" onChange={set('coverageRatio')} />
       <NumberField title="覆盖上限" description="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。" value={merged.maxCoverageTokens ?? 0} min={0} suffix="Token" onChange={set('maxCoverageTokens')} />
       <NumberField title="单次新增创建上限" description="一次请求最多新增多少缓存。0 表示不限制；后续读取不会超过之前真正创建过的数量。" value={merged.maxNewCreationTokensPerRequest ?? 0} min={0} suffix="Token" onChange={set('maxNewCreationTokensPerRequest')} />
@@ -2427,7 +2452,7 @@ function CachePolicyEditor({
 
   return (
     <div className="md:col-span-2 space-y-5">
-      <div className="grid gap-4 xl:grid-cols-2">
+      <div className="grid gap-4">
         <StrategyTemplateCard
           title="本地模拟缓存策略默认参数"
           description="使用本策略的路径会先读取这里的参数，再合并路径自己的参数。"
@@ -2623,6 +2648,7 @@ export function RuntimeConfigPanel() {
           ...defaultPromptCacheCreationControl(),
           ...config.data.promptCacheCreationControl,
         },
+        reportedUsage: normalizeReportedUsage(config.data.reportedUsage ?? defaultReportedUsage()),
         cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),

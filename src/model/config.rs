@@ -808,30 +808,36 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default)]
     pub final_cache_read_jitter_max_tokens: i32,
 
+    /// 是否启用 output 字段最终限制逻辑。
+    ///
+    /// 关闭后，只执行 output 字段自身的 raw/preserve/sample-* 改写，不再执行放大或最终上限裁剪。
+    #[serde(default = "default_true")]
+    pub final_output_guard_enabled: bool,
+
     /// output 字段完成 raw/preserve/sample-* 改写后的放大阈值。
     ///
     /// 0 表示关闭。大于该阈值时才按 output_uplift_percent 放大。
-    #[serde(default)]
+    #[serde(default = "default_reported_usage_output_uplift_min_tokens")]
     pub output_uplift_min_tokens: i32,
 
     /// output 字段完成 raw/preserve/sample-* 改写后的放大百分比。
     ///
     /// 0 表示关闭，最大按 200% 归一化。
-    #[serde(default)]
+    #[serde(default = "default_reported_usage_output_uplift_percent")]
     pub output_uplift_percent: u32,
 
     /// output 字段最终上限。
     ///
     /// 0 表示关闭。生效时会先扣减 final_output_jitter_* 得到有效上限，再向下裁剪。
-    #[serde(default)]
+    #[serde(default = "default_reported_usage_final_output_max_tokens")]
     pub final_output_max_tokens: i32,
 
     /// output 最终上限的确定性扣减下限。
-    #[serde(default)]
+    #[serde(default = "default_reported_usage_final_output_jitter_min_tokens")]
     pub final_output_jitter_min_tokens: i32,
 
     /// output 最终上限的确定性扣减上限。
-    #[serde(default)]
+    #[serde(default = "default_reported_usage_final_output_jitter_max_tokens")]
     pub final_output_jitter_max_tokens: i32,
 
     #[serde(default)]
@@ -855,11 +861,12 @@ impl Default for ReportedUsagePathPolicy {
             final_cache_read_max_tokens: default_final_cache_read_max_tokens(),
             final_cache_read_jitter_min_tokens: 0,
             final_cache_read_jitter_max_tokens: 0,
-            output_uplift_min_tokens: 0,
-            output_uplift_percent: 0,
-            final_output_max_tokens: 0,
-            final_output_jitter_min_tokens: 0,
-            final_output_jitter_max_tokens: 0,
+            final_output_guard_enabled: true,
+            output_uplift_min_tokens: default_reported_usage_output_uplift_min_tokens(),
+            output_uplift_percent: default_reported_usage_output_uplift_percent(),
+            final_output_max_tokens: default_reported_usage_final_output_max_tokens(),
+            final_output_jitter_min_tokens: default_reported_usage_final_output_jitter_min_tokens(),
+            final_output_jitter_max_tokens: default_reported_usage_final_output_jitter_max_tokens(),
             input: ReportedUsageFieldPolicy::raw(),
             output: ReportedUsageFieldPolicy::raw(),
             cache_read: ReportedUsageFieldPolicy::preserve(),
@@ -908,6 +915,7 @@ impl ReportedUsagePathPolicy {
             final_cache_read_max_tokens,
             final_cache_read_jitter_min_tokens,
             final_cache_read_jitter_max_tokens,
+            final_output_guard_enabled: self.final_output_guard_enabled,
             output_uplift_min_tokens: self.output_uplift_min_tokens.max(0),
             output_uplift_percent: self.output_uplift_percent.min(200),
             final_output_max_tokens,
@@ -3656,6 +3664,26 @@ fn default_final_cache_read_max_tokens() -> i32 {
     700_000
 }
 
+fn default_reported_usage_output_uplift_min_tokens() -> i32 {
+    1_000
+}
+
+fn default_reported_usage_output_uplift_percent() -> u32 {
+    50
+}
+
+fn default_reported_usage_final_output_max_tokens() -> i32 {
+    200_000
+}
+
+fn default_reported_usage_final_output_jitter_min_tokens() -> i32 {
+    5_000
+}
+
+fn default_reported_usage_final_output_jitter_max_tokens() -> i32 {
+    12_000
+}
+
 fn normalize_reported_usage_normal_max_multiplier(value: f64) -> f64 {
     if value.is_finite() && value >= 1.0 {
         value.min(10.0)
@@ -4444,6 +4472,7 @@ mod tests {
 	                            "finalCacheReadMaxTokens": 300000,
 	                            "finalCacheReadJitterMinTokens": 8000,
 	                            "finalCacheReadJitterMaxTokens": 24000,
+	                            "finalOutputGuardEnabled": false,
 	                            "outputUpliftMinTokens": 1000,
 	                            "outputUpliftPercent": 50,
 	                            "finalOutputMaxTokens": 200000,
@@ -4484,6 +4513,7 @@ mod tests {
         assert_eq!(policy.final_cache_read_max_tokens, 300_000);
         assert_eq!(policy.final_cache_read_jitter_min_tokens, 8_000);
         assert_eq!(policy.final_cache_read_jitter_max_tokens, 24_000);
+        assert!(!policy.final_output_guard_enabled);
         assert_eq!(policy.output_uplift_min_tokens, 1_000);
         assert_eq!(policy.output_uplift_percent, 50);
         assert_eq!(policy.final_output_max_tokens, 200_000);
@@ -5625,6 +5655,12 @@ mod tests {
         assert_eq!(default_policy.final_cache_read_max_tokens, 700_000);
         assert_eq!(default_policy.final_cache_read_jitter_min_tokens, 0);
         assert_eq!(default_policy.final_cache_read_jitter_max_tokens, 0);
+        assert!(default_policy.final_output_guard_enabled);
+        assert_eq!(default_policy.output_uplift_min_tokens, 1_000);
+        assert_eq!(default_policy.output_uplift_percent, 50);
+        assert_eq!(default_policy.final_output_max_tokens, 200_000);
+        assert_eq!(default_policy.final_output_jitter_min_tokens, 5_000);
+        assert_eq!(default_policy.final_output_jitter_max_tokens, 12_000);
         assert_eq!(
             default_policy.cache_read.mode,
             ReportedUsageFieldMode::Preserve
@@ -5636,6 +5672,12 @@ mod tests {
 
         let cc_policy = config.reported_usage.policy_for_path("/cc/v1/messages");
         assert_eq!(cc_policy.final_cache_read_max_tokens, 700_000);
+        assert!(cc_policy.final_output_guard_enabled);
+        assert_eq!(cc_policy.output_uplift_min_tokens, 1_000);
+        assert_eq!(cc_policy.output_uplift_percent, 50);
+        assert_eq!(cc_policy.final_output_max_tokens, 200_000);
+        assert_eq!(cc_policy.final_output_jitter_min_tokens, 5_000);
+        assert_eq!(cc_policy.final_output_jitter_max_tokens, 12_000);
         assert_eq!(cc_policy.input.mode, ReportedUsageFieldMode::SampleMax);
         assert_eq!(cc_policy.input.max_tokens, 96);
         assert!(cc_policy.input.move_delta_to_cache_read);
@@ -5647,6 +5689,12 @@ mod tests {
         assert_eq!(cc_policy.cache_creation.normal_max_multiplier, 1.2);
 
         let ha_policy = config.reported_usage.policy_for_path("/ha/v1/messages");
+        assert!(ha_policy.final_output_guard_enabled);
+        assert_eq!(ha_policy.output_uplift_min_tokens, 1_000);
+        assert_eq!(ha_policy.output_uplift_percent, 50);
+        assert_eq!(ha_policy.final_output_max_tokens, 200_000);
+        assert_eq!(ha_policy.final_output_jitter_min_tokens, 5_000);
+        assert_eq!(ha_policy.final_output_jitter_max_tokens, 12_000);
         assert_eq!(ha_policy.input.mode, ReportedUsageFieldMode::SampleMax);
         assert_eq!(
             ha_policy.cache_creation.mode,

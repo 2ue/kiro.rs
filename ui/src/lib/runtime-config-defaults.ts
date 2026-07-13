@@ -15,6 +15,12 @@ import type {
   WeightedCapacityConfig,
 } from '@/types/api'
 
+const DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS = 1000
+const DEFAULT_OUTPUT_UPLIFT_PERCENT = 50
+const DEFAULT_FINAL_OUTPUT_MAX_TOKENS = 200000
+const DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS = 5000
+const DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS = 12000
+
 export function preserveFieldPolicy(): ReportedUsageFieldPolicy {
   return {
     mode: 'preserve',
@@ -48,11 +54,12 @@ export function pathPolicy(
     finalCacheReadMaxTokens: 700000,
     finalCacheReadJitterMinTokens: 0,
     finalCacheReadJitterMaxTokens: 0,
-    outputUpliftMinTokens: 0,
-    outputUpliftPercent: 0,
-    finalOutputMaxTokens: 0,
-    finalOutputJitterMinTokens: 0,
-    finalOutputJitterMaxTokens: 0,
+    finalOutputGuardEnabled: true,
+    outputUpliftMinTokens: DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS,
+    outputUpliftPercent: DEFAULT_OUTPUT_UPLIFT_PERCENT,
+    finalOutputMaxTokens: DEFAULT_FINAL_OUTPUT_MAX_TOKENS,
+    finalOutputJitterMinTokens: DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS,
+    finalOutputJitterMaxTokens: DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS,
     input,
     output: rawFieldPolicy(),
     cacheRead: preserveFieldPolicy(),
@@ -436,13 +443,17 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
     0,
     finalCacheReadJitterMaxTokens
   )
-  const finalOutputMaxTokens = toWhole(policy.finalOutputMaxTokens ?? 0)
+  const finalOutputMaxTokens = toWhole(policy.finalOutputMaxTokens ?? DEFAULT_FINAL_OUTPUT_MAX_TOKENS)
   const finalOutputJitterMaxTokens =
     finalOutputMaxTokens > 0
-      ? toWhole(policy.finalOutputJitterMaxTokens ?? 0, 0, finalOutputMaxTokens)
+      ? toWhole(
+          policy.finalOutputJitterMaxTokens ?? DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS,
+          0,
+          finalOutputMaxTokens
+        )
       : 0
   const finalOutputJitterMinTokens = toWhole(
-    policy.finalOutputJitterMinTokens ?? 0,
+    policy.finalOutputJitterMinTokens ?? DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS,
     0,
     finalOutputJitterMaxTokens
   )
@@ -452,8 +463,9 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
     finalCacheReadMaxTokens,
     finalCacheReadJitterMinTokens,
     finalCacheReadJitterMaxTokens,
-    outputUpliftMinTokens: toWhole(policy.outputUpliftMinTokens ?? 0),
-    outputUpliftPercent: toWhole(policy.outputUpliftPercent ?? 0, 0, 200),
+    finalOutputGuardEnabled: policy.finalOutputGuardEnabled ?? true,
+    outputUpliftMinTokens: toWhole(policy.outputUpliftMinTokens ?? DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS),
+    outputUpliftPercent: toWhole(policy.outputUpliftPercent ?? DEFAULT_OUTPUT_UPLIFT_PERCENT, 0, 200),
     finalOutputMaxTokens,
     finalOutputJitterMinTokens,
     finalOutputJitterMaxTokens,
