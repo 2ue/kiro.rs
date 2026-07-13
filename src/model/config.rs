@@ -2374,18 +2374,13 @@ impl Default for ExternalPoolCapacityMode {
 ///
 /// `model` 是默认值：只短暂避开当前外部池的当前模型，避免一个不支持模型把
 /// 整个外部池冷却并把后续请求推入全局排队队列。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalPoolModelUnavailableCooldownMode {
     Disabled,
+    #[default]
     Model,
     Pool,
-}
-
-impl Default for ExternalPoolModelUnavailableCooldownMode {
-    fn default() -> Self {
-        Self::Model
-    }
 }
 
 /// 外部池流式响应处理模式。

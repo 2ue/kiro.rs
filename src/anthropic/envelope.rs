@@ -66,12 +66,11 @@ pub(crate) fn kiro_official_upstream_message(raw: &str) -> Option<String> {
         ],
     )
     .and_then(normalize_public_upstream_text)
+    .filter(|reason| !message.contains(reason))
     {
-        if !message.contains(&reason) {
-            message.push_str(" (reason: ");
-            message.push_str(&reason);
-            message.push(')');
-        }
+        message.push_str(" (reason: ");
+        message.push_str(&reason);
+        message.push(')');
     }
     Some(truncate_public_upstream_message(&message))
 }

@@ -6001,6 +6001,7 @@ async fn retry_stream_before_downstream_commit(
 }
 
 /// 创建 SSE 事件流
+#[allow(clippy::too_many_arguments)]
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,

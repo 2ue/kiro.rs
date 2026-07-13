@@ -197,11 +197,9 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
         clear_access_token = true;
     }
 
-    if let Some(auth_method) = update.auth_method {
-        if let Some(auth_method) = trimmed_optional(auth_method) {
-            credential.auth_method = Some(auth_method);
-            clear_access_token = true;
-        }
+    if let Some(auth_method) = update.auth_method.and_then(trimmed_optional) {
+        credential.auth_method = Some(auth_method);
+        clear_access_token = true;
     }
     if update.provider.is_some() {
         apply_optional_string(&mut credential.provider, update.provider);

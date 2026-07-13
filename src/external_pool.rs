@@ -586,10 +586,10 @@ impl ExternalRouteRequest {
         .into_iter()
         .flatten()
         {
-            if let Some(normalized) = normalize_external_pool_model_cooldown_key_model(model) {
-                if !out.iter().any(|existing| existing == &normalized) {
-                    out.push(normalized);
-                }
+            if let Some(normalized) = normalize_external_pool_model_cooldown_key_model(model)
+                .filter(|normalized| !out.iter().any(|existing| existing == normalized))
+            {
+                out.push(normalized);
             }
         }
         out
@@ -1008,26 +1008,27 @@ fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u
         )
         .await
     });
-    if !admitted {
-        if let Err(err) = block_on_storage(
-            "关键队列拒绝后同步释放外部池 Redis 并发 lease",
-            async move {
-                release_external_pool_lease_with_retry(
-                    fallback_manager,
-                    pool_id,
-                    lease_id,
-                    EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS,
-                )
-                .await
-            },
-        ) {
-            tracing::error!(
+    if admitted {
+        return;
+    }
+    if let Err(err) = block_on_storage(
+        "关键队列拒绝后同步释放外部池 Redis 并发 lease",
+        async move {
+            release_external_pool_lease_with_retry(
+                fallback_manager,
                 pool_id,
                 lease_id,
-                "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-                err
-            );
-        }
+                EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS,
+            )
+            .await
+        },
+    ) {
+        tracing::error!(
+            pool_id,
+            lease_id,
+            "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+            err
+        );
     }
 }
 
@@ -1070,19 +1071,20 @@ fn release_external_pool_queue_lease_reliably(manager: ExternalPoolManager, leas
     let admitted = spawn_critical_storage_task("释放外部池 Redis 调度排队 lease", async move {
         release_external_pool_queue_lease_with_retry(manager, lease_id, 2).await
     });
-    if !admitted {
-        if let Err(err) = block_on_storage(
-            "关键队列拒绝后同步释放外部池 Redis 调度排队 lease",
-            async move {
-                release_external_pool_queue_lease_with_retry(fallback_manager, fallback_lease_id, 2)
-                    .await
-            },
-        ) {
-            tracing::error!(
-                "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-                err
-            );
-        }
+    if admitted {
+        return;
+    }
+    if let Err(err) = block_on_storage(
+        "关键队列拒绝后同步释放外部池 Redis 调度排队 lease",
+        async move {
+            release_external_pool_queue_lease_with_retry(fallback_manager, fallback_lease_id, 2)
+                .await
+        },
+    ) {
+        tracing::error!(
+            "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+            err
+        );
     }
 }
 
@@ -1796,18 +1798,19 @@ impl ExternalPoolManager {
                         error_type: Some(error_type_for_external_error(&err).to_string()),
                         error_message: Some(err.message.clone()),
                     });
-                    if pool.request_body_mode == ExternalPoolRequestBodyMode::Normalized
-                        && should_retry_external_payload_guard(&route, &err)
+                    if let Some(retry_route) = (pool.request_body_mode
+                        == ExternalPoolRequestBodyMode::Normalized
+                        && should_retry_external_payload_guard(&route, &err))
+                    .then(|| external_payload_guard_retry_route(&route))
+                    .flatten()
                     {
-                        if let Some(retry_route) = external_payload_guard_retry_route(&route) {
-                            if let Some(last) = attempts.last_mut() {
-                                last.action = "payload_guard_retry".to_string();
-                            }
-                            route = retry_route;
-                            excluded.clear();
-                            last_error = None;
-                            continue;
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "payload_guard_retry".to_string();
                         }
+                        route = retry_route;
+                        excluded.clear();
+                        last_error = None;
+                        continue;
                     }
                     if let Some((duration, reason)) = &err.cooldown {
                         if reason == "model_mapping_miss" {
@@ -1821,10 +1824,11 @@ impl ExternalPoolManager {
                                     if let Some(model) = outbound_model
                                         .as_deref()
                                         .and_then(normalize_external_pool_model_cooldown_key_model)
+                                        .filter(|model| {
+                                            !models.iter().any(|existing| existing == model)
+                                        })
                                     {
-                                        if !models.iter().any(|existing| existing == &model) {
-                                            models.push(model);
-                                        }
+                                        models.push(model);
                                     }
                                     self.mark_pool_model_cooldowns(
                                         pool_id,
@@ -2382,30 +2386,29 @@ impl ExternalPoolManager {
                 };
             let mut cooldown_scope =
                 (cooldown_remaining_secs > 0).then_some(PoolCooldownScope::Pool);
-            if cooldown_remaining_secs == 0
+            let model_cooldown_candidates = (cooldown_remaining_secs == 0
                 && config.external_pool_model_unavailable_cooldown_mode
-                    == ExternalPoolModelUnavailableCooldownMode::Model
-            {
-                if let Some(model_cooldown_candidates) = model_cooldown_candidates {
-                    if !model_cooldown_candidates.is_empty() {
-                        match self
-                            .pool_model_cooldown_snapshot(pool.id, model_cooldown_candidates)
-                            .await
-                        {
-                            Ok(Some((model_remaining_secs, model_reason))) => {
-                                cooldown_remaining_secs = model_remaining_secs;
-                                cooldown_reason = model_reason;
-                                cooldown_scope = Some(PoolCooldownScope::Model);
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                tracing::warn!(
-                                    pool_id = pool.id,
-                                    error = %err,
-                                    "读取外部池模型级 cooldown 失败，继续按池级状态调度"
-                                );
-                            }
-                        }
+                    == ExternalPoolModelUnavailableCooldownMode::Model)
+                .then_some(model_cooldown_candidates)
+                .flatten()
+                .filter(|candidates| !candidates.is_empty());
+            if let Some(model_cooldown_candidates) = model_cooldown_candidates {
+                match self
+                    .pool_model_cooldown_snapshot(pool.id, model_cooldown_candidates)
+                    .await
+                {
+                    Ok(Some((model_remaining_secs, model_reason))) => {
+                        cooldown_remaining_secs = model_remaining_secs;
+                        cooldown_reason = model_reason;
+                        cooldown_scope = Some(PoolCooldownScope::Model);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            pool_id = pool.id,
+                            error = %err,
+                            "读取外部池模型级 cooldown 失败，继续按池级状态调度"
+                        );
                     }
                 }
             }
@@ -2472,16 +2475,17 @@ impl ExternalPoolManager {
         }
         let cacheable = allow_cache && excluded.is_empty();
         let now = Instant::now();
-        if cacheable {
-            if let Some(snapshot) = self
-                .availability_cache
-                .lock()
-                .as_ref()
-                .filter(|cached| cached.expires_at > now)
-                .map(|cached| cached.snapshot.clone())
-            {
-                return snapshot;
-            }
+        let cached_snapshot = cacheable
+            .then(|| {
+                self.availability_cache
+                    .lock()
+                    .as_ref()
+                    .filter(|cached| cached.expires_at > now)
+                    .map(|cached| cached.snapshot.clone())
+            })
+            .flatten();
+        if let Some(snapshot) = cached_snapshot {
+            return snapshot;
         }
 
         let snapshot = self
@@ -2543,33 +2547,31 @@ impl ExternalPoolManager {
                 config.external_pool_dispatch_max_wait_secs,
             ))
         };
-        if let Some(max_wait) = max_wait {
-            if started.elapsed() >= max_wait {
-                let message = format!(
-                    "Request capacity wait timed out after {} seconds",
-                    max_wait.as_secs()
-                );
-                self.record_external_failure(
+        if let Some(max_wait) = max_wait.filter(|max_wait| started.elapsed() >= *max_wait) {
+            let message = format!(
+                "Request capacity wait timed out after {} seconds",
+                max_wait.as_secs()
+            );
+            self.record_external_failure(
+                route,
+                None,
+                attempts,
+                "external_pool_wait_timeout",
+                &message,
+                synthetic_external_capacity_error_diagnostics(
                     route,
-                    None,
-                    attempts,
-                    "external_pool_wait_timeout",
-                    &message,
-                    synthetic_external_capacity_error_diagnostics(
-                        route,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "external_dispatch",
-                        config,
-                        Some(&context),
-                    ),
-                );
-                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "external_pool_wait_timeout",
-                    message,
-                    &route.error_id,
-                ));
-            }
+                    "external_dispatch",
+                    config,
+                    Some(&context),
+                ),
+            );
+            return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "external_pool_wait_timeout",
+                message,
+                &route.error_id,
+            ));
         }
 
         if queue_guard.is_none() {
@@ -2628,31 +2630,33 @@ impl ExternalPoolManager {
                 }
             }
         }
-        if let Some(guard) = queue_guard.as_mut() {
-            if let Err(err) = guard.renew_if_needed().await {
-                tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
-                let message = "Request dispatch queue unavailable: Redis coordination unavailable";
-                self.record_external_failure(
+        let queue_renew_error = match queue_guard.as_mut() {
+            Some(guard) => guard.renew_if_needed().await.err(),
+            None => None,
+        };
+        if let Some(err) = queue_renew_error {
+            tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
+            let message = "Request dispatch queue unavailable: Redis coordination unavailable";
+            self.record_external_failure(
+                route,
+                None,
+                attempts,
+                "external_pool_queue_error",
+                message,
+                synthetic_external_capacity_error_diagnostics(
                     route,
-                    None,
-                    attempts,
-                    "external_pool_queue_error",
-                    message,
-                    synthetic_external_capacity_error_diagnostics(
-                        route,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "external_dispatch",
-                        config,
-                        Some(&context),
-                    ),
-                );
-                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "external_pool_queue_error",
-                    message,
-                    &route.error_id,
-                ));
-            }
+                    "external_dispatch",
+                    config,
+                    Some(&context),
+                ),
+            );
+            return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "external_pool_queue_error",
+                message,
+                &route.error_id,
+            ));
         }
 
         let mut wakeup = wait_for
@@ -4530,20 +4534,19 @@ fn error_type_for_external_error(err: &ExternalPoolError) -> String {
     if external_error_message_indicates_model_unavailable(&err.message.to_ascii_lowercase()) {
         return "model_unavailable".to_string();
     }
-    if let Some((_, reason)) = err.cooldown.as_ref() {
-        if reason == "rate_limit"
+    if let Some((_, reason)) = err.cooldown.as_ref().filter(|(_, reason)| {
+        reason == "rate_limit"
             || reason == "database_busy"
             || reason == "model_unavailable"
             || reason == "model_mapping_miss"
             || reason == "server_error"
             || reason.starts_with("network_error")
-        {
-            return reason
-                .split_whitespace()
-                .next()
-                .unwrap_or("external_pool_error")
-                .to_string();
-        }
+    }) {
+        return reason
+            .split_whitespace()
+            .next()
+            .unwrap_or("external_pool_error")
+            .to_string();
     }
     match err.status {
         Some(StatusCode::TOO_MANY_REQUESTS) => "rate_limit",
@@ -4712,13 +4715,15 @@ fn process_usage_slots_in_sse_value(
     {
         result.changed |= process_single_usage_value(usage, projection, capture, rewrite, false);
     }
-    if !handled_top_level {
-        if let Some(usage) = value
-            .get_mut("delta")
-            .and_then(|delta| delta.get_mut("usage"))
-        {
-            result.changed |= process_single_usage_value(usage, projection, capture, rewrite, true);
-        }
+    let delta_usage = (!handled_top_level)
+        .then(|| {
+            value
+                .get_mut("delta")
+                .and_then(|delta| delta.get_mut("usage"))
+        })
+        .flatten();
+    if let Some(usage) = delta_usage {
+        result.changed |= process_single_usage_value(usage, projection, capture, rewrite, true);
     }
     result
 }
@@ -4756,12 +4761,12 @@ fn process_sse_event_with_plan(
     stream_error_mask: Option<&ExternalStreamErrorMask>,
     plan: ExternalStreamProcessingPlan,
 ) -> Vec<u8> {
-    if plan.mask_errors {
-        if let Some(masked) =
-            maybe_mask_external_stream_error_event(event, capture, stream_error_mask)
-        {
-            return masked;
-        }
+    let masked = plan
+        .mask_errors
+        .then(|| maybe_mask_external_stream_error_event(event, capture, stream_error_mask))
+        .flatten();
+    if let Some(masked) = masked {
+        return masked;
     }
     if projection.is_some() {
         return rewrite_sse_event_usage(event, projection, capture);
