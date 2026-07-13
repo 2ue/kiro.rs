@@ -3489,8 +3489,14 @@ mod tests {
                 .as_i64()
                 .is_some_and(|tokens| (1..=96).contains(&tokens))
         );
-        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
         assert_eq!(start_usage["cache_read_input_tokens"], 0);
+        let start_input = start_usage["input_tokens"]
+            .as_i64()
+            .expect("start input should be numeric");
+        assert_eq!(
+            start_usage["cache_creation_input_tokens"],
+            serde_json::json!(100_000_i64.saturating_sub(start_input))
+        );
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("hello"));
@@ -3506,8 +3512,14 @@ mod tests {
                 .as_i64()
                 .is_some_and(|tokens| (1..=96).contains(&tokens))
         );
-        assert_eq!(final_usage["cache_creation_input_tokens"], 0);
         assert_eq!(final_usage["cache_read_input_tokens"], 0);
+        let final_input = final_usage["input_tokens"]
+            .as_i64()
+            .expect("final input should be numeric");
+        assert_eq!(
+            final_usage["cache_creation_input_tokens"],
+            serde_json::json!(100_000_i64.saturating_sub(final_input))
+        );
     }
 
     #[test]

@@ -123,6 +123,7 @@ impl CacheUsage {
         if let Some(output_tokens) = policy.sample_output(usage, usage.output_tokens.max(0)) {
             usage.output_tokens = output_tokens;
         }
+        usage.output_tokens = policy.apply_output_post_processing(usage, usage.output_tokens);
         if let Some(cache_read_input_tokens) =
             policy.sample_cache_read(usage, usage.cache_read_input_tokens.max(0))
         {
@@ -144,11 +145,8 @@ impl CacheUsage {
             if let Some(reported_input) = policy.sample_input(usage, current_input) {
                 let input_delta = current_input.saturating_sub(reported_input);
                 usage.input_tokens = reported_input;
-                if input_delta > 0 && policy.input_moves_delta_to_cache_read() && had_cache_read {
-                    usage.cache_read_input_tokens = usage
-                        .cache_read_input_tokens
-                        .max(0)
-                        .saturating_add(input_delta);
+                if input_delta > 0 && policy.input_moves_delta_to_cache_read() {
+                    add_input_delta_to_reported_cache(&mut usage, input_delta, had_cache_read);
                 }
             }
         }
@@ -377,7 +375,9 @@ impl ReportedCacheUsagePolicy {
         let rewrites_input = matches!(input.mode, ReportedUsageFieldMode::SampleMax)
             && input.max_tokens > 0
             && usage.input_tokens > input.max_tokens;
-        rewrites_input || self.should_cap_final_cache_read(usage)
+        rewrites_input
+            || self.should_rewrite_output(usage)
+            || self.should_cap_final_cache_read(usage)
     }
 
     fn reports_local_prompt_cache(&self) -> bool {
@@ -497,6 +497,52 @@ impl ReportedCacheUsagePolicy {
         )
     }
 
+    fn should_rewrite_output(&self, usage: CacheUsage) -> bool {
+        let output = self.policy.output.normalized();
+        let output_tokens = usage.output_tokens.max(0);
+        if output_tokens <= 0 {
+            return false;
+        }
+        let rewrites_output_field = match output.mode {
+            ReportedUsageFieldMode::SampleMax => output.max_tokens > 0,
+            ReportedUsageFieldMode::SampleTarget => output.target_tokens > 0,
+            ReportedUsageFieldMode::Raw | ReportedUsageFieldMode::Preserve => false,
+        };
+
+        rewrites_output_field
+            || self.output_uplift_would_apply(output_tokens)
+            || self
+                .final_output_effective_cap(usage)
+                .is_some_and(|cap| output_tokens > cap)
+    }
+
+    fn apply_output_post_processing(&self, usage: CacheUsage, output_tokens: i32) -> i32 {
+        let output_tokens = self.apply_output_uplift(output_tokens);
+        self.apply_final_output_guard(usage, output_tokens)
+    }
+
+    fn output_uplift_would_apply(&self, output_tokens: i32) -> bool {
+        let min_tokens = self.policy.output_uplift_min_tokens.max(0);
+        let percent = self.policy.output_uplift_percent.min(200);
+        percent > 0 && min_tokens > 0 && output_tokens > min_tokens
+    }
+
+    fn apply_output_uplift(&self, output_tokens: i32) -> i32 {
+        let output_tokens = output_tokens.max(0);
+        if !self.output_uplift_would_apply(output_tokens) {
+            return output_tokens;
+        }
+        uplift_tokens_by_percent(output_tokens, self.policy.output_uplift_percent)
+    }
+
+    fn apply_final_output_guard(&self, usage: CacheUsage, output_tokens: i32) -> i32 {
+        let output_tokens = output_tokens.max(0);
+        let Some(cap) = self.final_output_effective_cap(usage) else {
+            return output_tokens;
+        };
+        output_tokens.min(cap)
+    }
+
     fn sample_cache_read(&self, usage: CacheUsage, current_read: i32) -> Option<i32> {
         self.sample_field(
             self.policy.cache_read.normalized(),
@@ -518,6 +564,14 @@ impl ReportedCacheUsagePolicy {
         usage
     }
 
+    pub fn apply_final_output_guard_to_usage(&self, mut usage: CacheUsage) -> CacheUsage {
+        if !self.reports_local_prompt_cache() {
+            return usage;
+        }
+        usage.output_tokens = self.apply_final_output_guard(usage, usage.output_tokens);
+        usage
+    }
+
     pub fn apply_final_input_guard(&self, mut usage: CacheUsage) -> CacheUsage {
         if !self.reports_local_prompt_cache() {
             return usage;
@@ -536,11 +590,8 @@ impl ReportedCacheUsagePolicy {
         };
         let input_delta = current_input.saturating_sub(reported_input);
         usage.input_tokens = reported_input;
-        if input_delta > 0 && self.input_moves_delta_to_cache_read() && had_cache_read {
-            usage.cache_read_input_tokens = usage
-                .cache_read_input_tokens
-                .max(0)
-                .saturating_add(input_delta);
+        if input_delta > 0 && self.input_moves_delta_to_cache_read() {
+            add_input_delta_to_reported_cache(&mut usage, input_delta, had_cache_read);
         }
         usage.total_input_tokens = usage.reported_total_input_tokens();
         usage
@@ -594,6 +645,40 @@ impl ReportedCacheUsagePolicy {
         let jitter = if jitter_max > 0 {
             sample_zero_based_range(
                 splitmix64(self.random_for_usage(usage) ^ 0x4d52_8db9_f7a6_2b3c),
+                jitter_min,
+                jitter_max,
+            )
+        } else {
+            0
+        };
+        Some(max_tokens.saturating_sub(jitter))
+    }
+
+    fn final_output_effective_cap(&self, usage: CacheUsage) -> Option<i32> {
+        let max_tokens = self.policy.final_output_max_tokens.max(0);
+        if max_tokens <= 0 {
+            return None;
+        }
+
+        let jitter_min = self
+            .policy
+            .final_output_jitter_min_tokens
+            .max(0)
+            .min(max_tokens);
+        let jitter_max = self
+            .policy
+            .final_output_jitter_max_tokens
+            .max(0)
+            .min(max_tokens);
+        let (jitter_min, jitter_max) = if jitter_min <= jitter_max {
+            (jitter_min, jitter_max)
+        } else {
+            (jitter_max, jitter_min)
+        };
+
+        let jitter = if jitter_max > 0 {
+            sample_zero_based_range(
+                splitmix64(self.random_for_usage(usage) ^ 0xb31a_1269_53f0_9d41),
                 jitter_min,
                 jitter_max,
             )
@@ -694,6 +779,55 @@ fn sample_zero_based_range(random: u64, low: i32, high: i32) -> i32 {
     let high = high.max(low);
     let span = (i64::from(high) - i64::from(low) + 1) as u64;
     low + (random % span) as i32
+}
+
+fn uplift_tokens_by_percent(tokens: i32, percent: u32) -> i32 {
+    let tokens = tokens.max(0);
+    let percent = percent.min(200);
+    if tokens <= 0 || percent == 0 {
+        return tokens;
+    }
+    let numerator = tokens as i64 * (100 + percent) as i64;
+    ((numerator + 99) / 100).clamp(0, i32::MAX as i64) as i32
+}
+
+fn add_input_delta_to_reported_cache(
+    usage: &mut CacheUsage,
+    input_delta: i32,
+    had_cache_read: bool,
+) {
+    let input_delta = input_delta.max(0);
+    if input_delta <= 0 {
+        return;
+    }
+
+    if had_cache_read {
+        usage.cache_read_input_tokens = usage
+            .cache_read_input_tokens
+            .max(0)
+            .saturating_add(input_delta);
+        return;
+    }
+
+    add_cache_creation_delta(usage, input_delta);
+}
+
+fn add_cache_creation_delta(usage: &mut CacheUsage, delta: i32) {
+    let delta = delta.max(0);
+    if delta <= 0 {
+        return;
+    }
+
+    let existing_creation = usage.cache_creation_input_tokens.max(0);
+    let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+        cap_cache_creation_breakdown(
+            usage.cache_creation_5m_input_tokens,
+            usage.cache_creation_1h_input_tokens,
+            existing_creation,
+        );
+    usage.cache_creation_input_tokens = existing_creation.saturating_add(delta);
+    usage.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens.saturating_add(delta);
+    usage.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
 }
 
 fn splitmix64(mut value: u64) -> u64 {
@@ -1951,7 +2085,15 @@ mod tests {
 
         assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
-        assert_eq!(reported.cache_creation_input_tokens, 50_000);
+        assert_eq!(
+            reported.cache_creation_input_tokens,
+            50_000 + raw.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(
+            reported.cache_creation_5m_input_tokens,
+            50_000 + raw.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(reported.cache_creation_1h_input_tokens, 0);
         assert_eq!(
             reported.total_input_tokens,
             reported.reported_total_input_tokens()
@@ -2009,7 +2151,15 @@ mod tests {
 
         assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
-        assert_eq!(reported.cache_creation_input_tokens, 0);
+        assert_eq!(
+            reported.cache_creation_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(
+            reported.cache_creation_5m_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(reported.cache_creation_1h_input_tokens, 0);
         assert_eq!(
             reported.total_input_tokens,
             reported.reported_total_input_tokens()
@@ -2127,6 +2277,101 @@ mod tests {
     }
 
     #[test]
+    fn reported_usage_policy_applies_output_uplift_after_output_sampling() {
+        let usage = CacheUsage {
+            total_input_tokens: 50_000,
+            input_tokens: 50_000,
+            output_tokens: 4_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let base_policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                output: ReportedUsageFieldPolicy::sample_max(5_000),
+                ..ReportedUsagePathPolicy::default()
+            },
+            131,
+        )
+        .unwrap();
+        let uplift_policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                output: ReportedUsageFieldPolicy::sample_max(5_000),
+                output_uplift_min_tokens: 1,
+                output_uplift_percent: 50,
+                ..ReportedUsagePathPolicy::default()
+            },
+            131,
+        )
+        .unwrap();
+
+        let base = usage.with_reported_cache_usage_policy(base_policy);
+        let uplifted = usage.with_reported_cache_usage_policy(uplift_policy);
+
+        assert!(base.output_tokens > 1);
+        assert_eq!(
+            uplifted.output_tokens,
+            uplift_tokens_by_percent(base.output_tokens, 50)
+        );
+    }
+
+    #[test]
+    fn reported_usage_policy_output_uplift_uses_strict_threshold() {
+        let usage = CacheUsage {
+            total_input_tokens: 50_000,
+            input_tokens: 50_000,
+            output_tokens: 1_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                output_uplift_min_tokens: 1_000,
+                output_uplift_percent: 50,
+                ..ReportedUsagePathPolicy::default()
+            },
+            7,
+        )
+        .unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy(policy);
+
+        assert_eq!(reported.output_tokens, 1_000);
+    }
+
+    #[test]
+    fn reported_usage_policy_caps_output_after_uplift_with_jitter() {
+        let usage = CacheUsage {
+            total_input_tokens: 50_000,
+            input_tokens: 50_000,
+            output_tokens: 10_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                output_uplift_min_tokens: 1_000,
+                output_uplift_percent: 50,
+                final_output_max_tokens: 12_000,
+                final_output_jitter_min_tokens: 500,
+                final_output_jitter_max_tokens: 500,
+                ..ReportedUsagePathPolicy::default()
+            },
+            7,
+        )
+        .unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy(policy);
+
+        assert_eq!(reported.output_tokens, 11_500);
+    }
+
+    #[test]
     fn reported_usage_parameter_sweep_does_not_create_first_turn_cache_read() {
         let mut first_turn_read_violations = 0;
         let mut later_turn_delta_merges = 0;
@@ -2205,7 +2450,12 @@ mod tests {
                                 later_turn_delta_merges += 1;
                             }
                         }
-                        if reported.cache_creation_input_tokens > 0 {
+                        if turn == 0 {
+                            assert!(
+                                reported.cache_creation_input_tokens
+                                    >= request_input.saturating_sub(reported.input_tokens)
+                            );
+                        } else if reported.cache_creation_input_tokens > 0 {
                             sampled_creation_values.push(reported.cache_creation_input_tokens);
                             assert!(
                                 reported.cache_creation_input_tokens
@@ -2360,9 +2610,19 @@ mod tests {
 
         let reported = usage.with_reported_cache_usage_policy(policy);
 
-        assert!((1..=3_300).contains(&reported.cache_creation_input_tokens));
         assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
+        let input_delta = usage.input_tokens.saturating_sub(reported.input_tokens);
+        assert!(
+            (input_delta.saturating_add(1)..=input_delta.saturating_add(3_300))
+                .contains(&reported.cache_creation_input_tokens)
+        );
+        assert_eq!(
+            reported.cache_creation_input_tokens,
+            reported
+                .cache_creation_5m_input_tokens
+                .saturating_add(reported.cache_creation_1h_input_tokens)
+        );
         assert_eq!(
             reported.total_input_tokens,
             reported.reported_total_input_tokens()
@@ -2384,8 +2644,12 @@ mod tests {
 
         let reported = usage.with_reported_cache_usage_policy(policy);
 
-        assert_eq!(reported.cache_creation_input_tokens, 40_000);
-        assert_eq!(reported.cache_creation_5m_input_tokens, 30_000);
+        let input_delta = usage.input_tokens.saturating_sub(reported.input_tokens);
+        assert_eq!(reported.cache_creation_input_tokens, 40_000 + input_delta);
+        assert_eq!(
+            reported.cache_creation_5m_input_tokens,
+            30_000 + input_delta
+        );
         assert_eq!(reported.cache_creation_1h_input_tokens, 10_000);
         assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
@@ -2412,7 +2676,15 @@ mod tests {
 
         assert!((1..=96).contains(&reported.input_tokens));
         assert_eq!(reported.cache_read_input_tokens, 0);
-        assert_eq!(reported.cache_creation_input_tokens, 0);
+        assert_eq!(
+            reported.cache_creation_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(
+            reported.cache_creation_5m_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(reported.cache_creation_1h_input_tokens, 0);
         assert_eq!(reported.output_tokens, usage.output_tokens);
         assert_eq!(
             reported.total_input_tokens,

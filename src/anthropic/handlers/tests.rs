@@ -900,7 +900,7 @@ fn path_reported_usage_policy_samples_natural_usage() {
         })
         .collect();
 
-    assert!(values.iter().all(|value| (1..=3_600).contains(value)));
+    assert!(values.iter().all(|value| (49_905..=53_599).contains(value)));
     assert!(values.windows(2).any(|pair| pair[1] < pair[0]));
     assert!(values.iter().any(|value| value % 10 != 0));
 
@@ -915,7 +915,10 @@ fn path_reported_usage_policy_samples_natural_usage() {
     );
     assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
-    assert!(reported.cache_creation_input_tokens > 0);
+    assert!(
+        reported.cache_creation_input_tokens
+            >= usage.input_tokens.saturating_sub(reported.input_tokens)
+    );
     assert_eq!(reported.output_tokens, 1);
 
     let raw_reported = usage.with_reported_cache_usage_policy_and_raw(
@@ -930,7 +933,10 @@ fn path_reported_usage_policy_samples_natural_usage() {
     );
     assert!((1..=96).contains(&raw_reported.input_tokens));
     assert_eq!(raw_reported.cache_read_input_tokens, 0);
-    assert!(raw_reported.cache_creation_input_tokens > 0);
+    assert!(
+        raw_reported.cache_creation_input_tokens
+            >= 100_000_i32.saturating_sub(raw_reported.input_tokens)
+    );
 }
 
 #[test]
@@ -1145,8 +1151,13 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
     let upstream_metadata =
         usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
     assert!((1..=96).contains(&upstream_metadata.input_tokens));
-    assert_eq!(upstream_metadata.cache_creation_input_tokens, 0);
     assert_eq!(upstream_metadata.cache_read_input_tokens, 0);
+    assert_eq!(
+        upstream_metadata.cache_creation_input_tokens,
+        usage_context
+            .input_tokens
+            .saturating_sub(upstream_metadata.input_tokens)
+    );
 
     let upstream_metadata_with_raw = usage_context.reported_usage_for_downstream_with_raw(
         usage,
@@ -1238,7 +1249,10 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
 
     assert!((1..=500).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
-    assert_eq!(reported.cache_creation_input_tokens, 0);
+    assert_eq!(
+        reported.cache_creation_input_tokens,
+        raw_usage.input_tokens.saturating_sub(reported.input_tokens)
+    );
     assert_eq!(reported.output_tokens, 7);
     assert_eq!(
         reported.total_input_tokens,
@@ -2147,8 +2161,12 @@ fn creation_control_preserves_reported_usage_input_policy() {
         credential_usage.canonical_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
 
     assert!((1..=96).contains(&reported.input_tokens));
-    assert!((26_400..30_000).contains(&reported.cache_creation_input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
+    let input_delta = usage.input_tokens.saturating_sub(reported.input_tokens);
+    assert!(
+        (input_delta.saturating_add(26_400)..input_delta.saturating_add(30_000))
+            .contains(&reported.cache_creation_input_tokens)
+    );
     assert_eq!(
         reported.total_input_tokens,
         reported

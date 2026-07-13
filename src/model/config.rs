@@ -689,7 +689,10 @@ pub struct ReportedUsageFieldPolicy {
     #[serde(default = "default_reported_usage_normal_max_multiplier")]
     pub normal_max_multiplier: f64,
 
-    /// input 被压低后的差值是否转入 cache_read_input_tokens。
+    /// input 被压低后的差值是否转入缓存口径。
+    ///
+    /// 有 cache-read 证据时转入 cache_read_input_tokens；没有 read 证据时转入
+    /// cache_creation_input_tokens，避免首轮/无 read 请求把真实输入差额直接丢掉。
     #[serde(default)]
     pub move_delta_to_cache_read: bool,
 }
@@ -805,6 +808,32 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default)]
     pub final_cache_read_jitter_max_tokens: i32,
 
+    /// output 字段完成 raw/preserve/sample-* 改写后的放大阈值。
+    ///
+    /// 0 表示关闭。大于该阈值时才按 output_uplift_percent 放大。
+    #[serde(default)]
+    pub output_uplift_min_tokens: i32,
+
+    /// output 字段完成 raw/preserve/sample-* 改写后的放大百分比。
+    ///
+    /// 0 表示关闭，最大按 200% 归一化。
+    #[serde(default)]
+    pub output_uplift_percent: u32,
+
+    /// output 字段最终上限。
+    ///
+    /// 0 表示关闭。生效时会先扣减 final_output_jitter_* 得到有效上限，再向下裁剪。
+    #[serde(default)]
+    pub final_output_max_tokens: i32,
+
+    /// output 最终上限的确定性扣减下限。
+    #[serde(default)]
+    pub final_output_jitter_min_tokens: i32,
+
+    /// output 最终上限的确定性扣减上限。
+    #[serde(default)]
+    pub final_output_jitter_max_tokens: i32,
+
     #[serde(default)]
     pub input: ReportedUsageFieldPolicy,
 
@@ -826,6 +855,11 @@ impl Default for ReportedUsagePathPolicy {
             final_cache_read_max_tokens: default_final_cache_read_max_tokens(),
             final_cache_read_jitter_min_tokens: 0,
             final_cache_read_jitter_max_tokens: 0,
+            output_uplift_min_tokens: 0,
+            output_uplift_percent: 0,
+            final_output_max_tokens: 0,
+            final_output_jitter_min_tokens: 0,
+            final_output_jitter_max_tokens: 0,
             input: ReportedUsageFieldPolicy::raw(),
             output: ReportedUsageFieldPolicy::raw(),
             cache_read: ReportedUsageFieldPolicy::preserve(),
@@ -855,6 +889,18 @@ impl ReportedUsagePathPolicy {
         if final_cache_read_jitter_min_tokens > final_cache_read_jitter_max_tokens {
             final_cache_read_jitter_min_tokens = final_cache_read_jitter_max_tokens;
         }
+        let final_output_max_tokens = self.final_output_max_tokens.max(0);
+        let mut final_output_jitter_min_tokens = self
+            .final_output_jitter_min_tokens
+            .max(0)
+            .min(final_output_max_tokens);
+        let final_output_jitter_max_tokens = self
+            .final_output_jitter_max_tokens
+            .max(0)
+            .min(final_output_max_tokens);
+        if final_output_jitter_min_tokens > final_output_jitter_max_tokens {
+            final_output_jitter_min_tokens = final_output_jitter_max_tokens;
+        }
 
         Self {
             enabled: self.enabled,
@@ -862,6 +908,11 @@ impl ReportedUsagePathPolicy {
             final_cache_read_max_tokens,
             final_cache_read_jitter_min_tokens,
             final_cache_read_jitter_max_tokens,
+            output_uplift_min_tokens: self.output_uplift_min_tokens.max(0),
+            output_uplift_percent: self.output_uplift_percent.min(200),
+            final_output_max_tokens,
+            final_output_jitter_min_tokens,
+            final_output_jitter_max_tokens,
             input: self.input.normalized(),
             output: self.output.normalized(),
             cache_read: self.cache_read.normalized(),
@@ -897,6 +948,32 @@ impl ReportedUsagePathPolicy {
         {
             return Err(format!(
                 "{} finalCacheReadJitterMaxTokens 不能大于 finalCacheReadMaxTokens",
+                label
+            ));
+        }
+        if self.output_uplift_min_tokens < 0 {
+            return Err(format!("{} outputUpliftMinTokens 不能小于 0", label));
+        }
+        if self.final_output_max_tokens < 0 {
+            return Err(format!("{} finalOutputMaxTokens 不能小于 0", label));
+        }
+        if self.final_output_jitter_min_tokens < 0 || self.final_output_jitter_max_tokens < 0 {
+            return Err(format!(
+                "{} finalOutputJitterMinTokens 和 finalOutputJitterMaxTokens 不能小于 0",
+                label
+            ));
+        }
+        if self.final_output_jitter_min_tokens > self.final_output_jitter_max_tokens {
+            return Err(format!(
+                "{} finalOutputJitterMinTokens 不能大于 finalOutputJitterMaxTokens",
+                label
+            ));
+        }
+        if self.final_output_max_tokens > 0
+            && self.final_output_jitter_max_tokens > self.final_output_max_tokens
+        {
+            return Err(format!(
+                "{} finalOutputJitterMaxTokens 不能大于 finalOutputMaxTokens",
                 label
             ));
         }
@@ -4362,15 +4439,20 @@ mod tests {
                         "finalCacheReadMaxTokens": 800000,
                         "input": { "mode": "raw" }
                     },
-                    "pathOverrides": {
-                        "cc": {
-                            "finalCacheReadMaxTokens": 300000,
-                            "finalCacheReadJitterMinTokens": 8000,
-                            "finalCacheReadJitterMaxTokens": 24000,
-                            "input": {
-                                "mode": "sample-max",
-                                "maxTokens": 64,
-                                "moveDeltaToCacheRead": true
+	                    "pathOverrides": {
+	                        "cc": {
+	                            "finalCacheReadMaxTokens": 300000,
+	                            "finalCacheReadJitterMinTokens": 8000,
+	                            "finalCacheReadJitterMaxTokens": 24000,
+	                            "outputUpliftMinTokens": 1000,
+	                            "outputUpliftPercent": 50,
+	                            "finalOutputMaxTokens": 200000,
+	                            "finalOutputJitterMinTokens": 5000,
+	                            "finalOutputJitterMaxTokens": 12000,
+	                            "input": {
+	                                "mode": "sample-max",
+	                                "maxTokens": 64,
+	                                "moveDeltaToCacheRead": true
                             },
                             "cacheCreation": {
                                 "mode": "sample-target",
@@ -4402,6 +4484,11 @@ mod tests {
         assert_eq!(policy.final_cache_read_max_tokens, 300_000);
         assert_eq!(policy.final_cache_read_jitter_min_tokens, 8_000);
         assert_eq!(policy.final_cache_read_jitter_max_tokens, 24_000);
+        assert_eq!(policy.output_uplift_min_tokens, 1_000);
+        assert_eq!(policy.output_uplift_percent, 50);
+        assert_eq!(policy.final_output_max_tokens, 200_000);
+        assert_eq!(policy.final_output_jitter_min_tokens, 5_000);
+        assert_eq!(policy.final_output_jitter_max_tokens, 12_000);
         assert_eq!(policy.input.mode, ReportedUsageFieldMode::SampleMax);
         assert_eq!(policy.input.max_tokens, 64);
         assert!(policy.input.move_delta_to_cache_read);

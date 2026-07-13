@@ -4727,6 +4727,11 @@ fn project_usage_value(
         .clone()
         .map(|policy| policy.apply_final_cache_read_guard(projected))
         .unwrap_or(projected);
+    let projected = projection
+        .reported_policy
+        .clone()
+        .map(|policy| policy.apply_final_output_guard_to_usage(projected))
+        .unwrap_or(projected);
     let projected_json = projected.to_anthropic_usage_json();
     let Some(obj) = usage.as_object_mut() else {
         return None;

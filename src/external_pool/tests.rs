@@ -2382,9 +2382,9 @@ fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
     let usage = value.get("usage").expect("usage object");
     assert_eq!(usage["input_tokens"].as_i64().unwrap(), 1);
     assert_eq!(usage["output_tokens"].as_i64().unwrap(), 2);
-    assert_eq!(usage["cache_creation_input_tokens"].as_i64().unwrap(), 0);
     assert_eq!(usage["cache_read_input_tokens"].as_i64().unwrap(), 0);
-    assert!(usage.get("cache_creation").is_none());
+    assert_eq!(usage["cache_creation_input_tokens"].as_i64().unwrap(), 4164);
+    assert_projected_cache_creation_consistent(usage);
     assert_eq!(
         projected.usage_capture.raw.map(|usage| usage.input_tokens),
         Some(4165)
@@ -2392,6 +2392,7 @@ fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
     let reported = projected.usage_capture.reported.expect("reported usage");
     assert_eq!(reported.input_tokens, 1);
     assert_eq!(reported.cache_read_input_tokens, 0);
+    assert_eq!(reported.cache_creation_input_tokens, 4164);
     assert_eq!(
         reported.total_input_tokens,
         reported
@@ -2399,6 +2400,39 @@ fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
             .saturating_add(reported.cache_read_input_tokens)
             .saturating_add(reported.cache_creation_input_tokens)
     );
+}
+
+#[test]
+fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":4165,"output_tokens":80,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-opus-4-6");
+    route.request_input_tokens = 4165;
+    route.reported_usage.path_overrides.insert(
+        "/cc".to_string(),
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(1),
+            final_output_max_tokens: 80,
+            final_output_jitter_min_tokens: 10,
+            final_output_jitter_max_tokens: 10,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+    let projection =
+        projection_context_with_output_uplift(&route, &pool, 0, 1, 100).expect("projection");
+    let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+
+    assert_ne!(projected.body, body);
+    assert!(projected.usage_capture.projected);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    assert_eq!(usage["output_tokens"].as_i64().unwrap(), 70);
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    assert_eq!(reported.output_tokens, 70);
 }
 
 #[test]
@@ -3466,24 +3500,24 @@ data: {"type":"message_delta","usage":{"input_tokens":4165,"output_tokens":2,"ca
         2
     );
     assert_eq!(
-        usage["cache_creation_input_tokens"]
-            .as_i64()
-            .expect("projected cache creation"),
-        0
-    );
-    assert_eq!(
         usage["cache_read_input_tokens"]
             .as_i64()
             .expect("projected cache read"),
         0
     );
-    assert!(usage.get("cache_creation").is_none());
+    assert_eq!(
+        usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("projected cache creation"),
+        4164
+    );
+    assert_projected_cache_creation_consistent(usage);
     let capture = capture.lock().clone();
     assert!(capture.projected);
     assert_eq!(capture.raw.map(|usage| usage.input_tokens), Some(4165));
     let reported = capture.reported.expect("reported usage");
     assert_eq!(reported.input_tokens, 1);
-    assert_eq!(reported.cache_creation_input_tokens, 0);
+    assert_eq!(reported.cache_creation_input_tokens, 4164);
     assert_eq!(reported.cache_read_input_tokens, 0);
     assert_eq!(
         reported.total_input_tokens,

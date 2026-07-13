@@ -10,7 +10,8 @@
 | `input_schema:null` | 真实问题 | 已有修复：入口反序列化把 explicit null 归一为空 map |
 | schema property key 非法 | 真实兼容问题 | 已有默认可逆 sanitize；本轮修正 diagnostics 误报，避免把 `$defs`/`patternProperties`/`dependentSchemas` map key 算作 property key |
 | tool name 合法化与响应还原 | 真实兼容问题 | 源码已有 request-local 映射；文档已补状态 |
-| `/cc` / `/ha` usage 展示输入异常过大 | 真实 reported usage policy 漏应用问题 | 已修复：`sample-max` 会始终压低展示 input；只有已有 cache-read 证据时才把差额转入 `cache_read_input_tokens`，没有证据时不伪造 cache read |
+| `/cc` / `/ha` usage 展示输入异常过大 | 真实 reported usage policy 漏应用问题 | 已修复：`sample-max` 会始终压低展示 input；有 cache-read 证据时差额转入 `cache_read_input_tokens`，无 read 证据时转入 `cache_creation_input_tokens/cache_creation_5m_input_tokens`，不伪造首轮 cache read，也不丢差额 |
+| reported usage 输出字段后处理 | 新增可配置策略 | 在既有 `output` 四种策略（`raw`/`preserve`/`sample-max`/`sample-target`）计算完成后，可配置超过阈值时按百分比放大；最后可配置 `finalOutputMaxTokens - jitter` 有效上限，默认全 0 关闭 |
 | `prompt is too long` | 真实外部池上限问题 | 已修复分类与 public message；parsed external route 不再把 request input tokens 恒置 0；新增 `externalPoolMaxInputTokens` 预检，默认 1,000,000，超过时本地拒绝、不发外部池 |
 | `messageStatus` 丢失 | 真实观测盲区 | 已解析 `messageStatus`，usage latencyTrace 写入 `upstreamMessageStatus`、`sawUpstreamCompleted`、`stopReasonSource` |
 | “开场白后 end_turn 空转” | 模型/CLI 时序行为，代理只能观测 | 新增 `suspectedIntentPreambleEndTurn` usage-only 诊断，不改变 SSE |
@@ -74,19 +75,45 @@
 2. 请求体本身极大：样本 A 是 3.8MB，其中 3.1MB 是历史图片，另有 556 条历史与 53 个当前工具定义。`src/token.rs` 对 base64 图片按图片尺寸/默认图片 token 估算，不把 3.1MB base64 全量当文本；因此 317k input tokens 更可能来自长历史、多图片、多工具的真实上下文规模，而不是 base64 文本双算。
 3. `guard.maxBytes=0` 不是简单等价于“payload guard 总开关关闭”。当前默认 `payloadGuardMode=on_too_long` 时，首发请求使用 `maxBytes=0`（不预裁剪），只有上游返回 payload/context too-long 后才用实际 `payloadGuardMaxBytes` 裁剪并重试。样本是成功请求，所以没有触发第二阶段裁剪。
 4. 真正的 reported usage bug 在策略应用：`/cc` 与 `/ha` 默认策略是 `input sample-max 96`。旧实现为了避免首轮伪造 cache read，在 `moveDeltaToCacheRead=true` 且没有 cache-read 证据时，直接跳过 input sampling，导致 `317,054` / `104,005` 这种本地估算值被当成“上报输入”展示给下游。
-5. 当前修复后：只要路径策略启用 `sample-max`，展示 input 都会被压到配置上限内；只有响应已有 cache-read 证据时，少掉的 input delta 才会转入 `cache_read_input_tokens`。没有 cache-read 证据时，`cache_read_input_tokens` 保持 0，不伪造缓存读取。
+5. 当前修复后：只要路径策略启用 `sample-max`，展示 input 都会被压到配置上限内；响应已有 cache-read 证据时，少掉的 input delta 转入 `cache_read_input_tokens`；没有 cache-read 证据时，`cache_read_input_tokens` 保持 0，delta 转入 `cache_creation_input_tokens`，并同步进入 `cache_creation_5m_input_tokens`。这样既不伪造首轮缓存读取，也不会把本轮真实输入差额直接丢掉。
 6. 原始大输入不会丢：usage 诊断字段仍保留本地估算 / raw usage。也就是说页面应该能同时表达“本地估算输入很大”和“返回给下游的展示 input 已按策略压低”。
-7. `内部成本输入 = 上报输入 + cache write` 是本系统历史兼容/费用估算口径，不是 Anthropic/Kiro 响应中的独立字段。样本 A 中 `317,054 + 28,779 = 345,833`，与页面一致；修复后该公式仍成立，但 `上报输入` 不应再是 317,054。
+7. `内部成本输入 = 上报输入 + cache write` 是本系统历史兼容/费用估算口径，不是 Anthropic/Kiro 响应中的独立字段。样本 A 中 `317,054 + 28,779 = 345,833`，与页面一致；修复后该公式仍成立，但 `上报输入` 不应再是 317,054，缺少 cache-read 证据的差额会进入 cache writer 口径。
 8. `output=1` 只表示该轮最终上报的输出 token 很少；`max_tokens=64,000` 是上限，不代表模型一定输出 64k。
 
 验证重点：
 
-- 本地真实服务回归要覆盖 `/cc` 与 `/ha`：构造长历史/工具定义请求，在没有 cache-read 证据时确认 final `message_delta.usage.input_tokens <= 96` 且 `cache_read_input_tokens=0`。
+- 本地真实服务回归要覆盖 `/cc` 与 `/ha`：构造长历史/工具定义请求，在没有 cache-read 证据时确认 final `message_delta.usage.input_tokens <= 96`、`cache_read_input_tokens=0`，且 input delta 进入 `cache_creation_input_tokens/cache_creation_5m_input_tokens`。
 - 再覆盖已有 cache-read 证据的情况：确认 input delta 只在有读证据时进入 cache read。
 - UI 文案继续强调“本地估算输入仅用于诊断；返回给客户端的用量以展示字段为准”。新 UI 使用“展示输入”，旧 admin-ui 使用“上报输入”，两者语义应在后续统一。
 - 长上下文不会因 schema key 映射产生跨请求内存增长：映射为 request-local map，随请求释放；高内存风险主要来自大请求体、图片历史、工具定义和 usage/payload diagnostics，而不是 key hash 本身。
 
-## 5. 性能/内存判断
+## 5. reported usage 输出后处理配置
+
+新增字段位于 `reportedUsage.default` 和 `reportedUsage.pathOverrides.<path>`，均为 camelCase。默认值全部为 0，即默认不改变现有 output 上报行为。
+
+| 字段 | 作用 | 默认 |
+|---|---|---:|
+| `outputUpliftMinTokens` | output 完成 `raw`/`preserve`/`sample-max`/`sample-target` 后，只有大于该阈值才进入百分比放大；等于阈值不放大 | 0 |
+| `outputUpliftPercent` | output 超过阈值后的放大百分比，归一化最大 200；计算使用向上取整，避免小值比例被抹掉 | 0 |
+| `finalOutputMaxTokens` | output 最终上限；0 表示关闭 | 0 |
+| `finalOutputJitterMinTokens` | 从最终上限扣减的确定性随机下限 | 0 |
+| `finalOutputJitterMaxTokens` | 从最终上限扣减的确定性随机上限 | 0 |
+
+执行顺序固定：
+
+1. 先按既有 `output` 字段策略得到基准 output：`raw`、`preserve`、`sample-max` 或 `sample-target`。
+2. 如果 `output > outputUpliftMinTokens` 且 `outputUpliftPercent > 0`，再按百分比放大。
+3. 如果 `finalOutputMaxTokens > 0`，计算有效上限：`finalOutputMaxTokens - deterministic_jitter(finalOutputJitterMinTokens..finalOutputJitterMaxTokens)`，最终 output 不超过该有效上限。
+
+设计约束：
+
+- 该策略是 request-local 的纯数字后处理，不写 Redis，不引入跨会话状态，不会导致多会话串数据。
+- jitter 使用请求 usage seed 的确定性随机，不依赖全局 RNG；同一请求重复计算稳定，不影响并发安全。
+- 不直接硬截到 `finalOutputMaxTokens`，而是先扣减 jitter，避免稳定撞 200k / 1m 这类模型或展示上限。
+- `finalOutputMaxTokens=200000`、`finalOutputJitterMinTokens=5000`、`finalOutputJitterMaxTokens=12000` 时，有效上限在 188000 到 195000 之间。
+- 如果需要防止 output 超过 1m，应把 `finalOutputMaxTokens` 配为小于 1m，并设置合理 jitter；如果要防止超过 Claude 常见 200k 级限制，应配为 200000 或更低，并扣减 jitter。
+
+## 6. 性能/内存判断
 
 schema key 清洗/映射的成本：
 
@@ -99,12 +126,12 @@ schema key 清洗/映射的成本：
 
 - 大历史图片和长上下文会提高 body parse、payload guard、token estimate、usage diagnostics 的 CPU/RSS。
 - 外部池 max-input 预检不增加额外长上下文扫描：它复用已存在的 `request_input_tokens`，转发前只是一次整数比较。
-- usage sampling 修复是 O(1) 数字改写，不随上下文长度增长；不会新增 Redis、不会新增跨会话映射状态。
+- usage sampling 修复和 output uplift/final cap 都是 O(1) 数字改写，不随上下文长度增长；不会新增 Redis、不会新增跨会话映射状态。
 - 图片轻量结构校验只扫描当前内联图片字节，不做完整像素解码；相比上游网络和大请求体解析，成本可控，但真实长上下文并发仍需看 RSS/FD。
 - 高并发长上下文时，必须用临时 release 服务做低并发到小规模 burst 的 RSS/FD 观测。
 - usage/payload diagnostics 不应在 success 路径无条件持久化大 JSON；当前仅在修改/超阈值/诊断需要时持久化，仍需回归确认。
 
-## 6. 验证清单
+## 7. 验证清单
 
 - [x] `cargo test tool_schema_key_diagnostics_ignore_schema_map_keys`
 - [x] `cargo test prompt_too_long_error_maps_to_input_length_message`
@@ -113,6 +140,7 @@ schema key 清洗/映射的成本：
 - [x] `cargo test assistant_message_status_marks_upstream_completion_without_changing_sse_shape`
 - [x] `cargo test end_turn_with_tools_and_short_visible_text_sets_intent_preamble_diagnostic`
 - [x] `cargo test reported_usage -- --nocapture`
+- [x] output uplift/final cap 定向用例：四种 output 策略之后再放大、严格大于阈值才放大、放大后按 jitter 有效上限裁剪
 - [x] `cargo test base64_image -- --nocapture`
 - [x] `cargo test test_process_message_content -- --nocapture`
 - [x] `cargo test external_pool_max_input_preflight -- --nocapture`
@@ -122,6 +150,8 @@ schema key 清洗/映射的成本：
 - [x] `rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs`
 - [x] `cargo check --all-targets`
 - [x] `cargo test --all-targets`
+- [x] `cargo test --all-targets --no-default-features`
+- [x] `cargo test usage_projection -- --nocapture`
 - [x] `cargo build --release`
 - [x] `admin-ui` production build
 - [x] `ui` production build
@@ -129,23 +159,31 @@ schema key 清洗/映射的成本：
 - [x] Claude CLI `--output-format=stream-json` 普通/工具/usage 回归；错误路径用 direct API 回归
 - [x] 低并发长上下文资源观测（RSS/FD/延迟）
 
-## 7. 本轮验证证据（2026-07-13）
+## 8. 本轮验证证据（2026-07-13）
 
 静态/构建：
 
 - `cargo fmt --check` 通过。
 - `git diff --check` 通过。
 - `rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs` 通过；本轮修复后 Clippy warning 为 683，低于 baseline 711。
-- `cargo check --all-targets` 通过，无 warning。
-- `rustup run 1.92.0 cargo test --locked --all-targets` 通过：主程序 1130/1130，`kiro_loadtest` 26/26。
+- `rustup run 1.92.0 cargo check --all-targets` 通过；当前仍有少量 dead-code warning，不影响 CI baseline。
+- `rustup run 1.92.0 cargo test --locked --all-targets --no-default-features` 通过：主程序 1134/1134，`kiro_loadtest` 26/26。
+- `rustup run 1.92.0 cargo test --locked --all-targets` 通过：主程序 1134/1134，`kiro_loadtest` 26/26。
+- `rustup run 1.92.0 cargo test usage_projection -- --nocapture` 通过：35 个 external pool usage projection 相关测试通过，覆盖外部池 output uplift 后再次应用 final output cap。
 - `pnpm build` 通过：`ui/` 与 `admin-ui/` 两套生产构建均通过。
-- `rustup run 1.92.0 cargo build --release --locked` 通过，release binary 成功构建并可启动。
+- `cargo build --release --locked` 通过，release binary 成功构建并可启动；当前保留 2 个既有 dead-code warning。
 
 真实本地服务（临时端口 `127.0.0.1:19022`，未触碰 live `9022`）：
 
 - `/cc/v1/messages` 长上下文流式真实调用：`req_01B236A19zHpuT1y1pdLpJ1G`，final usage `input_tokens=12/cache_read=0/cache_creation=271/output=1`，SSE 顺序含 `message_start -> content_block_* -> message_delta -> message_stop`。
 - `/ha/v1/messages` 长上下文流式真实调用：`req_01UFBqVPKrA3nkv6x2koWWWh`，final usage `input_tokens=23/cache_read=0/cache_creation=0/output=1`。
-- 数据库落库核对：上述两条 raw `total_input_tokens=8607` 仍保留，展示口径 `compat_input_tokens=12/23` 已按 `/cc`、`/ha` `sample-max` 生效；没有 cache-read 证据时 `cache_read_input_tokens=0`，未伪造首轮缓存读取。
+- 上述两条是“先修 input sampling 不漏应用”阶段的证据：raw `total_input_tokens=8607` 仍保留，展示口径 `compat_input_tokens=12/23` 已按 `/cc`、`/ha` `sample-max` 生效；没有 cache-read 证据时 `cache_read_input_tokens=0`，未伪造首轮缓存读取。
+- 本轮按“无 cache-read 证据的 delta 进入 writer”修正后，再次用临时 release 服务真实调用：
+  - `/ha/v1/messages`：`req_01k222eaTkizhgQyp1gKFG7H`，final usage `input_tokens=16/cache_read=0/cache_creation=36450/output=1`；落库 `compat_input_tokens=16`、`cache_creation_input_tokens=36450`、`cache_creation_5m_input_tokens=36450`、`cache_read_input_tokens=0`。
+  - `/cc/v1/messages`：`req_01TnQjvbtN5sSsggukgKpLRW`，final usage `input_tokens=13/cache_read=0/cache_creation=18524/output=1`；落库 `total_input_tokens=18537`、`compat_input_tokens=13`、`cache_creation_input_tokens=18524`、`cache_read_input_tokens=0`。
+  - 4 并发真实 smoke：`req_011ZRg5wY3AQB4tWNQYgWsy4`、`req_01NkT6o92NxknQmyhR5xpo6V`、`req_01GmGAe2cPx4udfhvbKP2Jn2`、`req_011prP1fhAN8Y26QnwARfYLX`，全部 HTTP 200；final `input_tokens <= 96`，`cache_read=0`，`cache_creation > 1000`。
+  - 资源观测：RSS `22176KB -> 38304KB -> 37616KB`，FD `30 -> 38 -> 31`，未见 FD 泄漏或线性 RSS 失控。
+- output uplift/final cap 真实调用使用隔离数据库 `kiro_rs_output_uplift_validation` 和独立 Redis key prefix，避免污染当前运行态配置。`/ha/v1/messages` 请求 `req_01uxhatXzFF7DCfvLCLKuhEQ`：配置 `outputUpliftMinTokens=1`、`outputUpliftPercent=50`、`finalOutputMaxTokens=80`、`finalOutputJitterMinTokens=10`、`finalOutputJitterMaxTokens=10`；raw output `73`，先放大为 `ceil(73 * 1.5)=110`，再按有效上限 `80-10=70` 裁剪，最终响应和落库 output 均为 `70`。验证后已停止临时服务并删除隔离数据库。
 - `/cc/v1/messages` 非流式真实工具调用：`req_01nU6gYLh2NKnNTLzJJd5Djv`，非法 schema key `"foo-bar"`、`"中文 key"` 与合法 key `"legal_key"` 均按原始 key 返回，未泄漏内部 `key<hash>`。
 - `/cc/v1/messages` 流式真实工具调用：`req_01D6LGwpSJiP8LzCXVcjqGky`，SSE `input_json_delta` 为 `{"foo-bar":"ok","legal_key":"legal","中文 key":"cn"}`，未泄漏内部 `key<hash>`；落库 `stopReasonSource=local_inferred_tool_use`。
 - 坏图真实调用：`req_01ppmFifaRP5MYu2jBQH8s2N` 返回 HTTP 400 / `invalid_request_error`，message 为 `invalid image data for media_type: image/png`，未暴露账号/凭据/外部池/调度等内部词。

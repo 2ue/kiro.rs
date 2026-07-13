@@ -53,7 +53,8 @@
 | Kiro 官方上游结构化错误 | ✅ 2026-07-13 已改为可公开 message 透出 | 从上游 JSON 提取 `message/reason/code`，过滤 credential/token/外部池/调度等敏感词后返回给下游 |
 | 外部池错误 | ✅ 继续脱敏 | 外部池可能返回广告、推广、非协议 HTML 或内部池信息；下游只返回 public message + error id，原文仅留 usage/内部日志 |
 | 本地调度/账号/队列/内部错误 | ✅ 继续归一化 | 避免泄露 credential、fallback、scheduler、pool、lease 等内部词 |
-| `/cc` / `/ha` reported usage | ✅ 2026-07-13 已修复 input sampling 漏应用 | `sample-max` 始终压低展示 input；只有 cache-read 证据存在时才把差额转入 cache read，不伪造首轮读取 |
+| `/cc` / `/ha` reported usage input | ✅ 2026-07-13 已修复 input sampling 漏应用与无 read 证据 delta 丢失 | `sample-max` 始终压低展示 input；有 cache-read 证据时差额转入 cache read，无 read 证据时转入 cache writer，不伪造首轮读取，也不丢差额 |
+| `/cc` / `/ha` reported usage output | ✅ 2026-07-13 已新增可配置后处理，默认关闭 | 既有 `output` 四种策略先执行；超过阈值后可按百分比放大；最后可用 `finalOutputMaxTokens - jitter` 限制有效上限，避免撞 200k/1m |
 
 ## 重要更正记录
 
