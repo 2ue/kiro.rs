@@ -378,7 +378,7 @@ async fn external_pool_manager_uncached_snapshot_detects_full_pool_after_availab
         PoolAcquireResult::Unavailable(_) => panic!("pool lease should be acquired"),
     };
     let selection = manager
-        .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
+        .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None, None)
         .await;
     assert!(selection.selected_pool.is_none());
     let uncached_full = selection.availability;
@@ -567,8 +567,16 @@ async fn external_pool_coordinator_failure_fails_closed_without_queue_admission(
             &route,
             Vec::new(),
             &config,
-            PoolCapacityWaitReason::CoordinatorUnavailable,
-            None,
+            PoolCapacityWaitContext {
+                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                wait_for: None,
+                cooldown_reason: None,
+                cooldown_scope: None,
+                cooldown_remaining_secs: None,
+                eligible_pools: 0,
+                available_pools: 0,
+                temporary_unavailable_pools: 0,
+            },
             &mut queue_guard,
             &mut wait_started_at,
         )
@@ -590,6 +598,86 @@ async fn external_pool_coordinator_failure_fails_closed_without_queue_admission(
             .unwrap(),
         0
     );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_model_unavailable_cooldown_is_model_scoped_and_does_not_queue() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_capacity_mode: ExternalPoolCapacityMode::Wait,
+        external_pool_max_queued_requests: 1,
+        external_pool_model_unavailable_cooldown_mode:
+            ExternalPoolModelUnavailableCooldownMode::Model,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-model-cooldown", 1, true))
+        .await
+        .unwrap();
+    let route_a = test_route("claude-opus-4-8");
+    let route_b = test_route("claude-sonnet-4-6");
+    manager
+        .mark_pool_model_cooldowns(
+            pool.id,
+            Duration::from_secs(30),
+            "model_unavailable".to_string(),
+            &route_a.model_cooldown_candidates(),
+        )
+        .await;
+
+    let unavailable_for_a = manager
+        .select_pool_for_route(&HashSet::new(), &config, &route_a)
+        .await;
+    assert!(unavailable_for_a.selected_pool.is_none());
+    assert_eq!(
+        unavailable_for_a.availability.wait_reason,
+        Some(PoolCapacityWaitReason::ModelUnavailable)
+    );
+    assert_eq!(
+        unavailable_for_a.availability.cooldown_scope,
+        Some(PoolCooldownScope::Model)
+    );
+    assert_eq!(
+        unavailable_for_a.availability.cooldown_reason.as_deref(),
+        Some("model_unavailable")
+    );
+
+    let mut queue_guard = None;
+    let mut wait_started_at = None;
+    let decision = manager
+        .handle_capacity_unavailable(
+            &route_a,
+            Vec::new(),
+            &config,
+            unavailable_for_a.availability.capacity_context(),
+            &mut queue_guard,
+            &mut wait_started_at,
+        )
+        .await;
+    let ExternalCapacityDecision::FinalError(error) = decision else {
+        panic!("model_unavailable cooldown must fail fast instead of queueing");
+    };
+    assert_eq!(error.route_error_type, "model_unavailable");
+    assert!(queue_guard.is_none());
+    assert_eq!(
+        manager
+            .redis
+            .external_pool_dispatch_queue_size()
+            .await
+            .unwrap(),
+        0
+    );
+
+    let available_for_b = manager
+        .select_pool_for_route(&HashSet::new(), &config, &route_b)
+        .await;
+    assert!(available_for_b.selected_pool.is_some());
+    assert_eq!(available_for_b.availability.available_pools, 1);
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -837,6 +925,29 @@ fn external_pool_error_classifies_model_unavailable_as_retryable() {
     assert!(err.retryable);
     assert_eq!(error_type_for_external_error(&err), "model_unavailable");
     assert!(err.auto_disable_reason.is_none());
+    assert_eq!(
+        err.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
+        Some("model_unavailable")
+    );
+}
+
+#[test]
+fn external_pool_error_classifies_model_unavailable_without_cooldown_when_disabled() {
+    let config = ExternalPoolsConfig {
+        external_pool_model_unavailable_cooldown_mode:
+            ExternalPoolModelUnavailableCooldownMode::Disabled,
+        ..ExternalPoolsConfig::default()
+    };
+    let err = classify_external_error(
+        StatusCode::BAD_REQUEST,
+        Bytes::from_static(br#"{"error":{"message":"No available channel for model x"}}"#),
+        HeaderMap::new(),
+        &config,
+    );
+
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+    assert!(err.cooldown.is_none());
 }
 
 #[test]

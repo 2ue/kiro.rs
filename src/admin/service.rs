@@ -3850,6 +3850,14 @@ impl AdminService {
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
+            kiro_upstream_stream_retry_max_attempts: config.kiro_upstream_stream_retry_max_attempts,
+            kiro_upstream_stream_retry_on_idle_timeout: config
+                .kiro_upstream_stream_retry_on_idle_timeout,
+            kiro_upstream_stream_retry_on_read_error: config
+                .kiro_upstream_stream_retry_on_read_error,
+            kiro_upstream_stream_retry_on_status_error: config
+                .kiro_upstream_stream_retry_on_status_error,
             credential_retry_max_attempts: config.credential_retry_max_attempts,
             credential_prompt_logic_retry_enabled: config.credential_prompt_logic_retry_enabled,
             credential_prompt_logic_retry_max_attempts: config
@@ -3933,6 +3941,21 @@ impl AdminService {
         let kiro_upstream_stream_idle_timeout_secs = req
             .kiro_upstream_stream_idle_timeout_secs
             .unwrap_or(current_config.kiro_upstream_stream_idle_timeout_secs);
+        let kiro_upstream_stream_retry_enabled = req
+            .kiro_upstream_stream_retry_enabled
+            .unwrap_or(current_config.kiro_upstream_stream_retry_enabled);
+        let kiro_upstream_stream_retry_max_attempts = req
+            .kiro_upstream_stream_retry_max_attempts
+            .unwrap_or(current_config.kiro_upstream_stream_retry_max_attempts);
+        let kiro_upstream_stream_retry_on_idle_timeout = req
+            .kiro_upstream_stream_retry_on_idle_timeout
+            .unwrap_or(current_config.kiro_upstream_stream_retry_on_idle_timeout);
+        let kiro_upstream_stream_retry_on_read_error = req
+            .kiro_upstream_stream_retry_on_read_error
+            .unwrap_or(current_config.kiro_upstream_stream_retry_on_read_error);
+        let kiro_upstream_stream_retry_on_status_error = req
+            .kiro_upstream_stream_retry_on_status_error
+            .unwrap_or(current_config.kiro_upstream_stream_retry_on_status_error);
         let credential_retry_max_attempts = req
             .credential_retry_max_attempts
             .unwrap_or(current_config.credential_retry_max_attempts);
@@ -4205,6 +4228,11 @@ impl AdminService {
                 "kiroUpstreamStreamIdleTimeoutSecs 不能大于 86400".to_string(),
             ));
         }
+        if kiro_upstream_stream_retry_max_attempts > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "kiroUpstreamStreamRetryMaxAttempts 不能大于 100".to_string(),
+            ));
+        }
         if !scheduler_error_ewma_alpha.is_finite()
             || !(0.01..=1.0).contains(&scheduler_error_ewma_alpha)
         {
@@ -4382,6 +4410,15 @@ impl AdminService {
                 config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
                 config.kiro_upstream_stream_idle_timeout_secs =
                     kiro_upstream_stream_idle_timeout_secs;
+                config.kiro_upstream_stream_retry_enabled = kiro_upstream_stream_retry_enabled;
+                config.kiro_upstream_stream_retry_max_attempts =
+                    kiro_upstream_stream_retry_max_attempts;
+                config.kiro_upstream_stream_retry_on_idle_timeout =
+                    kiro_upstream_stream_retry_on_idle_timeout;
+                config.kiro_upstream_stream_retry_on_read_error =
+                    kiro_upstream_stream_retry_on_read_error;
+                config.kiro_upstream_stream_retry_on_status_error =
+                    kiro_upstream_stream_retry_on_status_error;
                 config.credential_retry_max_attempts = credential_retry_max_attempts;
                 config.credential_prompt_logic_retry_enabled =
                     credential_prompt_logic_retry_enabled;
@@ -4980,6 +5017,7 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
         || config.external_pool_server_error_cooldown_secs == 0
         || config.external_pool_network_error_cooldown_secs == 0
         || config.external_pool_protocol_error_cooldown_secs == 0
+        || config.external_pool_model_unavailable_cooldown_secs == 0
     {
         return Err("外部池错误冷却秒数必须大于 0".to_string());
     }

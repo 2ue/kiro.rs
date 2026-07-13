@@ -693,6 +693,8 @@ export interface UsageLatencyTrace {
   upstreamFrameDecodeErrorsBeforeFirstOutput?: number
   upstreamEventParseErrorsBeforeFirstOutput?: number
   upstreamEventTypesBeforeFirstOutput?: Record<string, number>
+  streamRetryAttempts?: number
+  streamRetryReasons?: string[]
   clientDroppedMs?: number
   terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
   upstreamMessageStatus?: string
@@ -1092,6 +1094,7 @@ export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolStreamResponseMode = 'event_passthrough'
+export type ExternalPoolModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
 export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
@@ -1303,6 +1306,8 @@ export interface ExternalPoolsConfig {
   externalPoolServerErrorCooldownSecs: number
   externalPoolNetworkErrorCooldownSecs: number
   externalPoolProtocolErrorCooldownSecs: number
+  externalPoolModelUnavailableCooldownMode: ExternalPoolModelUnavailableCooldownMode
+  externalPoolModelUnavailableCooldownSecs: number
   externalPoolRequestTimeoutSecs: number
   externalPoolStreamRequestTimeoutSecs: number
   externalPoolStreamIdleTimeoutSecs: number
@@ -1472,6 +1477,11 @@ export interface RuntimeConfig {
   credentialDispatchMaxWaitSecs: number
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
+  kiroUpstreamStreamRetryEnabled: boolean
+  kiroUpstreamStreamRetryMaxAttempts: number
+  kiroUpstreamStreamRetryOnIdleTimeout: boolean
+  kiroUpstreamStreamRetryOnReadError: boolean
+  kiroUpstreamStreamRetryOnStatusError: boolean
   credentialRetryMaxAttempts: number
   credentialPromptLogicRetryEnabled: boolean
   credentialPromptLogicRetryMaxAttempts: number

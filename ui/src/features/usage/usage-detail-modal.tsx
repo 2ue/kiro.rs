@@ -254,6 +254,12 @@ export function UsageDetailModal({
                 {record.latencyTrace.upstreamEventTypesBeforeFirstOutput && (
                   <MetricTile label="输出前上游类型" value={formatUpstreamEventTypeCounts(record.latencyTrace.upstreamEventTypesBeforeFirstOutput)} />
                 )}
+                {typeof record.latencyTrace.streamRetryAttempts === 'number' && (
+                  <MetricTile label="首输出前重试" value={formatNumber(record.latencyTrace.streamRetryAttempts)} tone="warning" />
+                )}
+                {record.latencyTrace.streamRetryReasons?.length ? (
+                  <MetricTile label="重试原因" value={record.latencyTrace.streamRetryReasons.join(' / ')} />
+                ) : null}
                 {typeof record.latencyTrace.clientDroppedMs === 'number' && (
                   <MetricTile label="客户端断开" value={formatLatency(record.latencyTrace.clientDroppedMs)} />
                 )}

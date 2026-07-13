@@ -19,6 +19,7 @@
 - `tmp/analysis-usage-llm-errors` 是旧生产窗口证据，运行版本为 app `0.0.101` / revision `737f9f1`，不能直接代表当前工作区。
 - “已修复”表示当前源码已实现；“已定向验证”表示本地单测/协议测试已覆盖；“已真实回归”表示已用临时 release 服务和真实接口补过证据；最终仍需发布后看生产 recurrence。
 - 2026-07-13 新增跟踪文档：[runtime-usage-error-followup-2026-07-13.md](./runtime-usage-error-followup-2026-07-13.md)。
+- 2026-07-14 本地待裁定 Todo：[local-todo-for-confirmation-2026-07-14.md](./local-todo-for-confirmation-2026-07-14.md)。
 
 ### A. 程序缺陷（优先修复）
 
@@ -37,7 +38,7 @@
 
 | 文档 | 根因 | 生产条数 | 当前状态 | 已验证 | 后续 |
 |---|---|---:|---|---|---|
-| [02-stream-upstream-idle-timeout.md](./02-stream-upstream-idle-timeout.md) | 流式上游空闲满 180s 被掐断 | 41 | ⏳ 未改行为；小改重试不安全 | 现有 latencyTrace 可区分首输出前/后；已确认当前实现先提交 `message_start` | 需独立响应提交重构后再做“未向下游发送任何 SSE bytes 前”的安全重试 |
+| [02-stream-upstream-idle-timeout.md](./02-stream-upstream-idle-timeout.md) | 流式上游空闲满 180s 被掐断 | 41 | ✅ 已实现首输出前安全重试 | runtime/API/direct SSE/Claude CLI 正常流已回归；usage 记录 retry attempts/reasons | 发布后观察生产复发；如需更强证据，可用隔离 DB 补首输出前故障注入 |
 | [03-client-dropped-downstream.md](./03-client-dropped-downstream.md) | 下游客户端提前断开 | 17 | ✅ 无需修复 | usage 已标 `client_dropped/downstream_client` | 统计服务端错误率时剔除 |
 | [04-external-pool-prompt-too-long.md](./04-external-pool-prompt-too-long.md) | 本地 3 次 500 高负载耗尽 → 外部池撞 1M 上限 | 7 | ✅ 已修复体验链路：token 估算、分类、public message、max-input 预检 | `prompt is too long` 分类；外部池 public message 脱敏；`externalPoolMaxInputTokens` 预检单测；本地无外部池，未污染共享 DB 做真实外部池注入 | 发布后观察；后续可选扩展 per-pool/per-model 上限 |
 | [06-stream-upstream-status-error.md](./06-stream-upstream-status-error.md) | 流中途上游返回错误事件 | 5 | ✅ 维持保守策略 | 现有逻辑发 SSE error，不伪装成功 | 若做 02，可把首输出前子集纳入统一安全重试 |

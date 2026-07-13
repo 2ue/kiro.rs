@@ -430,6 +430,8 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="输出前帧解码错" value={typeof trace.upstreamFrameDecodeErrorsBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamFrameDecodeErrorsBeforeFirstOutput) : '-'} />
         <UsageMetric label="输出前事件解析错" value={typeof trace.upstreamEventParseErrorsBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamEventParseErrorsBeforeFirstOutput) : '-'} />
         <UsageMetric label="输出前上游类型" value={formatUpstreamEventTypeCounts(trace.upstreamEventTypesBeforeFirstOutput)} />
+        <UsageMetric label="首输出前重试" value={typeof trace.streamRetryAttempts === 'number' ? formatNumber(trace.streamRetryAttempts) : '-'} tone="warning" />
+        <UsageMetric label="重试原因" value={trace.streamRetryReasons?.length ? trace.streamRetryReasons.join(' / ') : '-'} />
         <UsageMetric label="客户端断开" value={formatLatency(trace.clientDroppedMs)} />
         <UsageMetric label="结束原因" value={trace.terminalReason || '-'} />
         <UsageMetric label="上游完成状态" value={trace.upstreamMessageStatus || '-'} tone={trace.sawUpstreamCompleted ? 'success' : 'info'} />

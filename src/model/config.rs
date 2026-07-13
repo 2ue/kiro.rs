@@ -2370,6 +2370,24 @@ impl Default for ExternalPoolCapacityMode {
     }
 }
 
+/// 外部池返回模型不可用时的冷却范围。
+///
+/// `model` 是默认值：只短暂避开当前外部池的当前模型，避免一个不支持模型把
+/// 整个外部池冷却并把后续请求推入全局排队队列。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolModelUnavailableCooldownMode {
+    Disabled,
+    Model,
+    Pool,
+}
+
+impl Default for ExternalPoolModelUnavailableCooldownMode {
+    fn default() -> Self {
+        Self::Model
+    }
+}
+
 /// 外部池流式响应处理模式。
 ///
 /// `event_passthrough` 保持 SSE event 级透传，并会屏蔽上游流式错误事件中的
@@ -2493,6 +2511,10 @@ pub struct ExternalPoolsConfig {
     pub external_pool_network_error_cooldown_secs: u64,
     #[serde(default = "default_external_pool_protocol_error_cooldown_secs")]
     pub external_pool_protocol_error_cooldown_secs: u64,
+    #[serde(default)]
+    pub external_pool_model_unavailable_cooldown_mode: ExternalPoolModelUnavailableCooldownMode,
+    #[serde(default = "default_external_pool_model_unavailable_cooldown_secs")]
+    pub external_pool_model_unavailable_cooldown_secs: u64,
     #[serde(default = "default_external_pool_request_timeout_secs")]
     pub external_pool_request_timeout_secs: u64,
     #[serde(default)]
@@ -2561,6 +2583,10 @@ impl Default for ExternalPoolsConfig {
                 default_external_pool_network_error_cooldown_secs(),
             external_pool_protocol_error_cooldown_secs:
                 default_external_pool_protocol_error_cooldown_secs(),
+            external_pool_model_unavailable_cooldown_mode:
+                ExternalPoolModelUnavailableCooldownMode::default(),
+            external_pool_model_unavailable_cooldown_secs:
+                default_external_pool_model_unavailable_cooldown_secs(),
             external_pool_request_timeout_secs: default_external_pool_request_timeout_secs(),
             external_pool_stream_request_timeout_secs: 0,
             external_pool_stream_idle_timeout_secs: default_external_pool_stream_idle_timeout_secs(
@@ -2790,6 +2816,32 @@ pub struct Config {
     /// stream idle 处理并释放并发占用。`0` 表示使用默认值，避免错误关闭保护。
     #[serde(default = "default_kiro_upstream_stream_idle_timeout_secs")]
     pub kiro_upstream_stream_idle_timeout_secs: u64,
+
+    /// 是否允许流式响应在尚未向下游发送任何 SSE 字节前，对上游流读取/空闲/错误事件进行重试。
+    ///
+    /// 该开关只覆盖“下游尚未提交”的安全窗口。只要已经发送过 message_start、ping、
+    /// text/thinking/tool_use 或 error 等任意 SSE 字节，就不会自动换号重试，避免重复工具调用
+    /// 或事件乱序。
+    #[serde(default = "default_kiro_upstream_stream_retry_enabled")]
+    pub kiro_upstream_stream_retry_enabled: bool,
+
+    /// 单个流式请求在“未向下游提交”窗口内最多尝试多少次上游流。
+    ///
+    /// 包含首次调用；默认 2 表示最多补一次重试。0/1 都等价于不额外重试。
+    #[serde(default = "default_kiro_upstream_stream_retry_max_attempts")]
+    pub kiro_upstream_stream_retry_max_attempts: u32,
+
+    /// 上游 eventstream idle timeout 发生在下游提交前时是否允许重试。
+    #[serde(default = "default_true")]
+    pub kiro_upstream_stream_retry_on_idle_timeout: bool,
+
+    /// 上游 body read error 发生在下游提交前时是否允许重试。
+    #[serde(default = "default_true")]
+    pub kiro_upstream_stream_retry_on_read_error: bool,
+
+    /// 上游 2xx JSON 错误体、流内 error/invalidState 等状态错误发生在下游提交前时是否允许重试。
+    #[serde(default = "default_true")]
+    pub kiro_upstream_stream_retry_on_status_error: bool,
 
     /// Kiro 上游基础 URL 覆盖。
     ///
@@ -3209,6 +3261,14 @@ fn default_kiro_upstream_response_timeout_secs() -> u64 {
 
 fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
     180
+}
+
+fn default_kiro_upstream_stream_retry_enabled() -> bool {
+    true
+}
+
+fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
+    2
 }
 
 fn default_credential_in_flight_lease_max_secs() -> u64 {
@@ -3636,6 +3696,10 @@ fn default_external_pool_protocol_error_cooldown_secs() -> u64 {
     10
 }
 
+fn default_external_pool_model_unavailable_cooldown_secs() -> u64 {
+    10
+}
+
 fn default_external_pool_request_timeout_secs() -> u64 {
     180
 }
@@ -3810,6 +3874,12 @@ impl Default for Config {
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
             kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
             ),
+            kiro_upstream_stream_retry_enabled: default_kiro_upstream_stream_retry_enabled(),
+            kiro_upstream_stream_retry_max_attempts:
+                default_kiro_upstream_stream_retry_max_attempts(),
+            kiro_upstream_stream_retry_on_idle_timeout: true,
+            kiro_upstream_stream_retry_on_read_error: true,
+            kiro_upstream_stream_retry_on_status_error: true,
             kiro_upstream_base_url: None,
             credential_retry_max_attempts: 0,
             credential_prompt_logic_retry_enabled: false,
@@ -4164,6 +4234,11 @@ mod tests {
         assert_eq!(config.credential_dispatch_max_wait_secs, 120);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
+        assert!(config.kiro_upstream_stream_retry_enabled);
+        assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 2);
+        assert!(config.kiro_upstream_stream_retry_on_idle_timeout);
+        assert!(config.kiro_upstream_stream_retry_on_read_error);
+        assert!(config.kiro_upstream_stream_retry_on_status_error);
         assert_eq!(config.kiro_upstream_base_url, None);
         assert_eq!(config.credential_retry_max_attempts, 0);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
@@ -4415,13 +4490,27 @@ mod tests {
             config.external_pools.external_pool_stream_response_mode,
             ExternalPoolStreamResponseMode::EventPassthrough
         );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_model_unavailable_cooldown_mode,
+            ExternalPoolModelUnavailableCooldownMode::Model
+        );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_model_unavailable_cooldown_secs,
+            10
+        );
 
         let wait_config: Config = serde_json::from_str(
             r#"{
                 "apiKey": "sk-test",
                 "externalPools": {
                     "externalPoolCapacityMode": "wait",
-                    "externalPoolDispatchMaxWaitSecs": 3
+                    "externalPoolDispatchMaxWaitSecs": 3,
+                    "externalPoolModelUnavailableCooldownMode": "pool",
+                    "externalPoolModelUnavailableCooldownSecs": 7
                 }
             }"#,
         )
@@ -4436,6 +4525,18 @@ mod tests {
                 .external_pools
                 .external_pool_dispatch_max_wait_secs,
             3
+        );
+        assert_eq!(
+            wait_config
+                .external_pools
+                .external_pool_model_unavailable_cooldown_mode,
+            ExternalPoolModelUnavailableCooldownMode::Pool
+        );
+        assert_eq!(
+            wait_config
+                .external_pools
+                .external_pool_model_unavailable_cooldown_secs,
+            7
         );
     }
 

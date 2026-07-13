@@ -262,6 +262,11 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
     kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
     kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
+    kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
+    kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
+    kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
+    kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
+    kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
     credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
     credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
     credentialPromptLogicRetryMaxAttempts: toWhole(draft.credentialPromptLogicRetryMaxAttempts),
@@ -324,6 +329,8 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
       externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
       externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
+      externalPoolModelUnavailableCooldownMode: draft.externalPools.externalPoolModelUnavailableCooldownMode,
+      externalPoolModelUnavailableCooldownSecs: toWhole(draft.externalPools.externalPoolModelUnavailableCooldownSecs, 1),
       externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
       externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
       externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
@@ -637,6 +644,11 @@ export function RuntimePage() {
                 <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
                 <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
+                <TogField label="首输出前流式换号" desc="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试。" checked={draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryEnabled')} />
+                <NumField label="首输出前最多尝试" desc="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。" value={draft.kiroUpstreamStreamRetryMaxAttempts} min={1} max={100} suffix="次" disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryMaxAttempts')} />
+                <TogField label="静默超时可换号" desc="上游流在首输出前长时间无内容时允许换号。" checked={draft.kiroUpstreamStreamRetryOnIdleTimeout} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnIdleTimeout')} />
+                <TogField label="读取错误可换号" desc="首输出前连接中断、流读取失败时允许换号。" checked={draft.kiroUpstreamStreamRetryOnReadError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnReadError')} />
+                <TogField label="状态错误可换号" desc="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。" checked={draft.kiroUpstreamStreamRetryOnStatusError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnStatusError')} />
                 <NumField label="单请求最大重试次数" desc="一个请求失败后最多重试几次；0 表示系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
                 <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />

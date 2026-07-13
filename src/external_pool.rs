@@ -19,6 +19,7 @@ use parking_lot::Mutex as SyncMutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tokio::time::{Instant, timeout};
 
@@ -55,9 +56,10 @@ use crate::{
         block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
     },
     model::config::{
-        ExternalPoolCapacityMode, ExternalPoolStreamResponseMode, ExternalPoolsConfig,
-        KiroRsToolCachePolicy, ModelMappingRule, PromptCacheCreationControlConfig,
-        PromptCacheSimulationMode, PromptCacheStrategyType, ReportedUsageConfig,
+        ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode,
+        ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
+        ModelMappingRule, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+        PromptCacheStrategyType, ReportedUsageConfig,
     },
     model::model_processing::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
@@ -574,6 +576,25 @@ impl ExternalRouteRequest {
         ]
     }
 
+    fn model_cooldown_candidates(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for model in [
+            self.payload.as_ref().map(|payload| payload.model.as_str()),
+            self.model_hint.as_deref(),
+            self.upstream_model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(normalized) = normalize_external_pool_model_cooldown_key_model(model) {
+                if !out.iter().any(|existing| existing == &normalized) {
+                    out.push(normalized);
+                }
+            }
+        }
+        out
+    }
+
     fn requested_max_tokens(&self) -> Option<i32> {
         self.payload
             .as_ref()
@@ -653,6 +674,8 @@ impl ExternalLatencyTraceState {
             upstream_frame_decode_errors_before_first_output: None,
             upstream_event_parse_errors_before_first_output: None,
             upstream_event_types_before_first_output: None,
+            stream_retry_attempts: None,
+            stream_retry_reasons: None,
             client_dropped_ms: None,
             terminal_reason: None,
             upstream_message_status: None,
@@ -985,8 +1008,8 @@ fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u
         )
         .await
     });
-    if !admitted
-        && let Err(err) = block_on_storage(
+    if !admitted {
+        if let Err(err) = block_on_storage(
             "关键队列拒绝后同步释放外部池 Redis 并发 lease",
             async move {
                 release_external_pool_lease_with_retry(
@@ -997,14 +1020,14 @@ fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u
                 )
                 .await
             },
-        )
-    {
-        tracing::error!(
-            pool_id,
-            lease_id,
-            "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
-        );
+        ) {
+            tracing::error!(
+                pool_id,
+                lease_id,
+                "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+                err
+            );
+        }
     }
 }
 
@@ -1047,19 +1070,19 @@ fn release_external_pool_queue_lease_reliably(manager: ExternalPoolManager, leas
     let admitted = spawn_critical_storage_task("释放外部池 Redis 调度排队 lease", async move {
         release_external_pool_queue_lease_with_retry(manager, lease_id, 2).await
     });
-    if !admitted
-        && let Err(err) = block_on_storage(
+    if !admitted {
+        if let Err(err) = block_on_storage(
             "关键队列拒绝后同步释放外部池 Redis 调度排队 lease",
             async move {
                 release_external_pool_queue_lease_with_retry(fallback_manager, fallback_lease_id, 2)
                     .await
             },
-        )
-    {
-        tracing::error!(
-            "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
-        );
+        ) {
+            tracing::error!(
+                "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
+                err
+            );
+        }
     }
 }
 
@@ -1149,13 +1172,43 @@ struct UsageErrorDiagnostics {
 struct ExternalPoolCooldownState {
     until: DateTime<Utc>,
     reason: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolCapacityWaitReason {
     Full,
     Cooldown,
+    ModelUnavailable,
     CoordinatorUnavailable,
+}
+
+impl PoolCapacityWaitReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Cooldown => "cooldown",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::CoordinatorUnavailable => "coordinator_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolCooldownScope {
+    Pool,
+    Model,
+}
+
+impl PoolCooldownScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::Model => "model",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1179,6 +1232,9 @@ struct PoolAvailabilitySnapshot {
     coordinator_unavailable: bool,
     wait_reason: Option<PoolCapacityWaitReason>,
     wait_for: Option<Duration>,
+    cooldown_reason: Option<String>,
+    cooldown_scope: Option<PoolCooldownScope>,
+    cooldown_remaining_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1206,6 +1262,82 @@ impl PoolAvailabilitySnapshot {
         self.eligible_pools
             .max(1)
             .saturating_add(usize::from(payload_guard_retry_enabled))
+    }
+
+    fn mark_cooldown(
+        &mut self,
+        remaining_secs: u64,
+        reason: Option<String>,
+        scope: PoolCooldownScope,
+    ) {
+        let remaining_secs = remaining_secs.max(1);
+        let wait_for = Duration::from_secs(remaining_secs);
+        let should_replace = self
+            .wait_for
+            .map(|existing| wait_for < existing)
+            .unwrap_or(true);
+        if should_replace {
+            self.wait_for = Some(wait_for);
+            self.cooldown_remaining_secs = Some(remaining_secs);
+            self.cooldown_reason = reason;
+            self.cooldown_scope = Some(scope);
+        }
+        let wait_reason = if self.cooldown_reason.as_deref() == Some("model_unavailable") {
+            PoolCapacityWaitReason::ModelUnavailable
+        } else {
+            PoolCapacityWaitReason::Cooldown
+        };
+        self.wait_reason.get_or_insert(wait_reason);
+        if self.wait_reason == Some(PoolCapacityWaitReason::Cooldown)
+            && wait_reason == PoolCapacityWaitReason::ModelUnavailable
+        {
+            self.wait_reason = Some(wait_reason);
+        }
+    }
+
+    fn capacity_context(&self) -> PoolCapacityWaitContext {
+        PoolCapacityWaitContext {
+            reason: self.wait_reason.unwrap_or(PoolCapacityWaitReason::Full),
+            wait_for: self.wait_for,
+            cooldown_reason: self.cooldown_reason.clone(),
+            cooldown_scope: self.cooldown_scope,
+            cooldown_remaining_secs: self.cooldown_remaining_secs,
+            eligible_pools: self.eligible_pools,
+            available_pools: self.available_pools,
+            temporary_unavailable_pools: self.temporary_unavailable_pools,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PoolCapacityWaitContext {
+    reason: PoolCapacityWaitReason,
+    wait_for: Option<Duration>,
+    cooldown_reason: Option<String>,
+    cooldown_scope: Option<PoolCooldownScope>,
+    cooldown_remaining_secs: Option<u64>,
+    eligible_pools: usize,
+    available_pools: usize,
+    temporary_unavailable_pools: usize,
+}
+
+impl PoolCapacityWaitContext {
+    fn from_unavailable(unavailable: &PoolAcquireUnavailable) -> Self {
+        Self {
+            reason: unavailable.reason,
+            wait_for: unavailable.wait_for,
+            cooldown_reason: None,
+            cooldown_scope: None,
+            cooldown_remaining_secs: unavailable.wait_for.map(|duration| duration.as_secs()),
+            eligible_pools: 0,
+            available_pools: 0,
+            temporary_unavailable_pools: 0,
+        }
+    }
+
+    fn is_model_unavailable(&self) -> bool {
+        self.reason == PoolCapacityWaitReason::ModelUnavailable
+            || self.cooldown_reason.as_deref() == Some("model_unavailable")
     }
 }
 
@@ -1324,10 +1456,17 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         body_mode: ExternalPoolRequestBodyMode,
     ) -> bool {
-        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode), None)
-            .await
-            .availability
-            .has_eligible_pool()
+        self.scan_pool_availability_uncached(
+            &HashSet::new(),
+            config,
+            false,
+            Some(body_mode),
+            None,
+            None,
+        )
+        .await
+        .availability
+        .has_eligible_pool()
     }
 
     pub async fn has_available_pool_for_body_mode(
@@ -1335,10 +1474,17 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         body_mode: ExternalPoolRequestBodyMode,
     ) -> bool {
-        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode), None)
-            .await
-            .availability
-            .available_pools
+        self.scan_pool_availability_uncached(
+            &HashSet::new(),
+            config,
+            false,
+            Some(body_mode),
+            None,
+            None,
+        )
+        .await
+        .availability
+        .available_pools
             > 0
     }
 
@@ -1516,14 +1662,7 @@ impl ExternalPoolManager {
             if max_attempts.is_some_and(|max_attempts| attempt_index >= max_attempts) {
                 break;
             }
-            let selection = self
-                .select_pool_with_availability_uncached(
-                    &excluded,
-                    &config,
-                    route.body_mode_filter,
-                    Some(&route.model_candidates_for_support()),
-                )
-                .await;
+            let selection = self.select_pool_for_route(&excluded, &config, &route).await;
             if max_attempts.is_none() {
                 max_attempts = Some(
                     selection
@@ -1539,8 +1678,7 @@ impl ExternalPoolManager {
                             &route,
                             attempts.clone(),
                             &config,
-                            snapshot.wait_reason.unwrap_or(PoolCapacityWaitReason::Full),
-                            snapshot.wait_for,
+                            snapshot.capacity_context(),
                             &mut queue_guard,
                             &mut wait_started_at,
                         )
@@ -1589,8 +1727,7 @@ impl ExternalPoolManager {
                             &route,
                             attempts.clone(),
                             &config,
-                            unavailable.reason,
-                            unavailable.wait_for,
+                            PoolCapacityWaitContext::from_unavailable(&unavailable),
                             &mut queue_guard,
                             &mut wait_started_at,
                         )
@@ -1652,7 +1789,7 @@ impl ExternalPoolManager {
                         attempt: current_attempt,
                         pool_id,
                         pool_name: pool.name.clone(),
-                        outbound_model,
+                        outbound_model: outbound_model.clone(),
                         status: err.status.map(|status| status.as_u16()),
                         action: action.to_string(),
                         duration_ms: started.elapsed().as_millis() as u64,
@@ -1676,6 +1813,32 @@ impl ExternalPoolManager {
                         if reason == "model_mapping_miss" {
                             // Request-scoped mismatch: skip this pool for the current request, but
                             // do not cool down the pool globally for other models.
+                        } else if reason == "model_unavailable" {
+                            match config.external_pool_model_unavailable_cooldown_mode {
+                                ExternalPoolModelUnavailableCooldownMode::Disabled => {}
+                                ExternalPoolModelUnavailableCooldownMode::Model => {
+                                    let mut models = route.model_cooldown_candidates();
+                                    if let Some(model) = outbound_model
+                                        .as_deref()
+                                        .and_then(normalize_external_pool_model_cooldown_key_model)
+                                    {
+                                        if !models.iter().any(|existing| existing == &model) {
+                                            models.push(model);
+                                        }
+                                    }
+                                    self.mark_pool_model_cooldowns(
+                                        pool_id,
+                                        *duration,
+                                        reason.clone(),
+                                        &models,
+                                    )
+                                    .await;
+                                }
+                                ExternalPoolModelUnavailableCooldownMode::Pool => {
+                                    self.mark_pool_cooldown(pool_id, *duration, reason.clone())
+                                        .await;
+                                }
+                            }
                         } else {
                             self.mark_pool_cooldown(pool_id, *duration, reason.clone())
                                 .await;
@@ -2146,7 +2309,7 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
     ) -> Option<ExternalPool> {
-        self.scan_pool_availability_uncached(excluded, config, true, None, None)
+        self.scan_pool_availability_uncached(excluded, config, true, None, None, None)
             .await
             .selected_pool
     }
@@ -2157,29 +2320,15 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         route: &ExternalRouteRequest,
     ) -> PoolSelectionSnapshot {
+        let support_candidates = route.model_candidates_for_support();
+        let cooldown_candidates = route.model_cooldown_candidates();
         self.scan_pool_availability_uncached(
             excluded,
             config,
             true,
             route.body_mode_filter,
-            Some(&route.model_candidates_for_support()),
-        )
-        .await
-    }
-
-    async fn select_pool_with_availability_uncached(
-        &self,
-        excluded: &HashSet<u64>,
-        config: &ExternalPoolsConfig,
-        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
-        model_candidates: Option<&[Option<&str>]>,
-    ) -> PoolSelectionSnapshot {
-        self.scan_pool_availability_uncached(
-            excluded,
-            config,
-            true,
-            body_mode_filter,
-            model_candidates,
+            Some(&support_candidates),
+            Some(&cooldown_candidates),
         )
         .await
     }
@@ -2191,6 +2340,7 @@ impl ExternalPoolManager {
         include_selection: bool,
         body_mode_filter: Option<ExternalPoolRequestBodyMode>,
         model_candidates: Option<&[Option<&str>]>,
+        model_cooldown_candidates: Option<&[String]>,
     ) -> PoolSelectionSnapshot {
         if !config.external_pools_enabled {
             return PoolSelectionSnapshot::default();
@@ -2214,7 +2364,7 @@ impl ExternalPoolManager {
                 continue;
             }
             availability.eligible_pools += 1;
-            let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
+            let (in_flight, global_in_flight, mut cooldown_remaining_secs, mut cooldown_reason) =
                 match self.pool_runtime_snapshot(pool.id).await {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
@@ -2230,6 +2380,35 @@ impl ExternalPoolManager {
                         continue;
                     }
                 };
+            let mut cooldown_scope =
+                (cooldown_remaining_secs > 0).then_some(PoolCooldownScope::Pool);
+            if cooldown_remaining_secs == 0
+                && config.external_pool_model_unavailable_cooldown_mode
+                    == ExternalPoolModelUnavailableCooldownMode::Model
+            {
+                if let Some(model_cooldown_candidates) = model_cooldown_candidates {
+                    if !model_cooldown_candidates.is_empty() {
+                        match self
+                            .pool_model_cooldown_snapshot(pool.id, model_cooldown_candidates)
+                            .await
+                        {
+                            Ok(Some((model_remaining_secs, model_reason))) => {
+                                cooldown_remaining_secs = model_remaining_secs;
+                                cooldown_reason = model_reason;
+                                cooldown_scope = Some(PoolCooldownScope::Model);
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    pool_id = pool.id,
+                                    error = %err,
+                                    "读取外部池模型级 cooldown 失败，继续按池级状态调度"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             match Self::skip_reason(
                 &pool,
                 in_flight,
@@ -2253,15 +2432,10 @@ impl ExternalPoolManager {
                 }
                 Some("cooldown") => {
                     availability.temporary_unavailable_pools += 1;
-                    availability
-                        .wait_reason
-                        .get_or_insert(PoolCapacityWaitReason::Cooldown);
-                    let wait_for = Duration::from_secs(cooldown_remaining_secs.max(1));
-                    availability.wait_for = Some(
-                        availability
-                            .wait_for
-                            .map(|existing| existing.min(wait_for))
-                            .unwrap_or(wait_for),
+                    availability.mark_cooldown(
+                        cooldown_remaining_secs,
+                        cooldown_reason,
+                        cooldown_scope.unwrap_or(PoolCooldownScope::Pool),
                     );
                 }
                 _ => {}
@@ -2311,7 +2485,7 @@ impl ExternalPoolManager {
         }
 
         let snapshot = self
-            .scan_pool_availability_uncached(excluded, config, false, None, None)
+            .scan_pool_availability_uncached(excluded, config, false, None, None, None)
             .await
             .availability;
         if cacheable {
@@ -2328,12 +2502,14 @@ impl ExternalPoolManager {
         route: &ExternalRouteRequest,
         attempts: Vec<ExternalPoolAttempt>,
         config: &ExternalPoolsConfig,
-        reason: PoolCapacityWaitReason,
-        wait_for: Option<Duration>,
+        context: PoolCapacityWaitContext,
         queue_guard: &mut Option<ExternalPoolQueueGuard>,
         wait_started_at: &mut Option<Instant>,
     ) -> ExternalCapacityDecision {
+        let reason = context.reason;
+        let wait_for = context.wait_for;
         if reason == PoolCapacityWaitReason::CoordinatorUnavailable
+            || context.is_model_unavailable()
             || config.external_pool_capacity_mode != ExternalPoolCapacityMode::Wait
         {
             let (error_type, message) = external_capacity_error(reason);
@@ -2343,10 +2519,12 @@ impl ExternalPoolManager {
                 attempts,
                 error_type,
                 message,
-                synthetic_external_error_diagnostics(
+                synthetic_external_capacity_error_diagnostics(
                     route,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "external_dispatch",
+                    config,
+                    Some(&context),
                 ),
             );
             return ExternalCapacityDecision::FinalError(external_capacity_final_error(
@@ -2377,10 +2555,12 @@ impl ExternalPoolManager {
                     attempts,
                     "external_pool_wait_timeout",
                     &message,
-                    synthetic_external_error_diagnostics(
+                    synthetic_external_capacity_error_diagnostics(
                         route,
                         StatusCode::SERVICE_UNAVAILABLE,
                         "external_dispatch",
+                        config,
+                        Some(&context),
                     ),
                 );
                 return ExternalCapacityDecision::FinalError(external_capacity_final_error(
@@ -2406,10 +2586,12 @@ impl ExternalPoolManager {
                         attempts,
                         "external_pool_queue_full",
                         message,
-                        synthetic_external_error_diagnostics(
+                        synthetic_external_capacity_error_diagnostics(
                             route,
                             StatusCode::SERVICE_UNAVAILABLE,
                             "external_dispatch",
+                            config,
+                            Some(&context),
                         ),
                     );
                     return ExternalCapacityDecision::FinalError(external_capacity_final_error(
@@ -2429,10 +2611,12 @@ impl ExternalPoolManager {
                         attempts,
                         "external_pool_queue_error",
                         message,
-                        synthetic_external_error_diagnostics(
+                        synthetic_external_capacity_error_diagnostics(
                             route,
                             StatusCode::SERVICE_UNAVAILABLE,
                             "external_dispatch",
+                            config,
+                            Some(&context),
                         ),
                     );
                     return ExternalCapacityDecision::FinalError(external_capacity_final_error(
@@ -2444,29 +2628,31 @@ impl ExternalPoolManager {
                 }
             }
         }
-        if let Some(guard) = queue_guard.as_mut()
-            && let Err(err) = guard.renew_if_needed().await
-        {
-            tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
-            let message = "Request dispatch queue unavailable: Redis coordination unavailable";
-            self.record_external_failure(
-                route,
-                None,
-                attempts,
-                "external_pool_queue_error",
-                message,
-                synthetic_external_error_diagnostics(
+        if let Some(guard) = queue_guard.as_mut() {
+            if let Err(err) = guard.renew_if_needed().await {
+                tracing::warn!(error = %err, "续期外部池 Redis 调度排队 lease 失败");
+                let message = "Request dispatch queue unavailable: Redis coordination unavailable";
+                self.record_external_failure(
                     route,
+                    None,
+                    attempts,
+                    "external_pool_queue_error",
+                    message,
+                    synthetic_external_capacity_error_diagnostics(
+                        route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                        config,
+                        Some(&context),
+                    ),
+                );
+                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "external_dispatch",
-                ),
-            );
-            return ExternalCapacityDecision::FinalError(external_capacity_final_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "external_pool_queue_error",
-                message,
-                &route.error_id,
-            ));
+                    "external_pool_queue_error",
+                    message,
+                    &route.error_id,
+                ));
+            }
         }
 
         let mut wakeup = wait_for
@@ -2485,10 +2671,12 @@ impl ExternalPoolManager {
                     attempts,
                     "external_pool_wait_timeout",
                     &message,
-                    synthetic_external_error_diagnostics(
+                    synthetic_external_capacity_error_diagnostics(
                         route,
                         StatusCode::SERVICE_UNAVAILABLE,
                         "external_dispatch",
+                        config,
+                        Some(&context),
                     ),
                 );
                 return ExternalCapacityDecision::FinalError(external_capacity_final_error(
@@ -2742,6 +2930,75 @@ impl ExternalPoolManager {
         {
             tracing::warn!(pool_id, "写入外部池 Redis cooldown 失败: {}", err);
         }
+    }
+
+    async fn mark_pool_model_cooldowns(
+        &self,
+        pool_id: u64,
+        duration: Duration,
+        reason: String,
+        models: &[String],
+    ) {
+        if models.is_empty() {
+            return;
+        }
+        let until = Utc::now() + chrono::Duration::from_std(duration).unwrap_or_default();
+        let ttl = duration.as_secs().max(1) as usize;
+        for model in models {
+            let key = external_pool_model_cooldown_key(pool_id, model);
+            if let Err(err) = self
+                .redis
+                .set_json(
+                    key,
+                    &json!({
+                        "until": until.to_rfc3339(),
+                        "reason": reason,
+                        "model": model,
+                    }),
+                    ttl,
+                )
+                .await
+            {
+                tracing::warn!(
+                    pool_id,
+                    model = %model,
+                    "写入外部池模型级 Redis cooldown 失败: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    async fn pool_model_cooldown_snapshot(
+        &self,
+        pool_id: u64,
+        models: &[String],
+    ) -> anyhow::Result<Option<(u64, Option<String>)>> {
+        let now = Utc::now();
+        let mut selected: Option<(u64, Option<String>)> = None;
+        for model in models {
+            let key = external_pool_model_cooldown_key(pool_id, model);
+            let cooldown = self
+                .redis
+                .get_json::<ExternalPoolCooldownState>(key.clone())
+                .await?;
+            let Some(cooldown) = cooldown else {
+                continue;
+            };
+            if cooldown.until <= now {
+                let _ = self.redis.del(key).await;
+                continue;
+            }
+            let remaining_secs = (cooldown.until - now).num_seconds().max(1) as u64;
+            if selected
+                .as_ref()
+                .map(|(selected_secs, _)| remaining_secs < *selected_secs)
+                .unwrap_or(true)
+            {
+                selected = Some((remaining_secs, cooldown.reason));
+            }
+        }
+        Ok(selected)
     }
 
     async fn pool_runtime_snapshot(
@@ -3573,6 +3830,18 @@ fn external_pool_matches_supported_models(
     model_is_supported_by_list(&pool.supported_models, model_candidates)
 }
 
+fn normalize_external_pool_model_cooldown_key_model(model: &str) -> Option<String> {
+    let normalized = model.trim().to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn external_pool_model_cooldown_key(pool_id: u64, normalized_model: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(normalized_model.as_bytes());
+    let digest = hasher.finalize();
+    format!("external_pool:{}:model_cooldown:{:x}", pool_id, digest)
+}
+
 fn external_pool_prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -3859,6 +4128,10 @@ fn external_capacity_error(reason: PoolCapacityWaitReason) -> (&'static str, &'s
             "external_pool_cooldown",
             "Request capacity is temporarily cooling down",
         ),
+        PoolCapacityWaitReason::ModelUnavailable => (
+            "model_unavailable",
+            "External fallback model is temporarily unavailable",
+        ),
         PoolCapacityWaitReason::CoordinatorUnavailable => (
             "external_pool_coordinator_unavailable",
             "Request capacity coordinator is temporarily unavailable",
@@ -3990,6 +4263,70 @@ fn synthetic_external_error_diagnostics(
     }
 }
 
+fn synthetic_external_capacity_error_diagnostics(
+    route: &ExternalRouteRequest,
+    status: StatusCode,
+    source: &'static str,
+    config: &ExternalPoolsConfig,
+    context: Option<&PoolCapacityWaitContext>,
+) -> UsageErrorDiagnostics {
+    let mut metadata = serde_json::Map::new();
+    metadata_insert(&mut metadata, "syntheticStatus", true);
+    metadata_insert(
+        &mut metadata,
+        "externalPoolCapacityMode",
+        match config.external_pool_capacity_mode {
+            ExternalPoolCapacityMode::FailFast => "fail_fast",
+            ExternalPoolCapacityMode::Wait => "wait",
+        },
+    );
+    metadata_insert(
+        &mut metadata,
+        "externalPoolMaxQueuedRequests",
+        config.external_pool_max_queued_requests,
+    );
+    if let Some(context) = context {
+        metadata_insert(&mut metadata, "capacityWaitReason", context.reason.as_str());
+        metadata_insert(
+            &mut metadata,
+            "eligiblePools",
+            context.eligible_pools as u64,
+        );
+        metadata_insert(
+            &mut metadata,
+            "availablePools",
+            context.available_pools as u64,
+        );
+        metadata_insert(
+            &mut metadata,
+            "temporaryUnavailablePools",
+            context.temporary_unavailable_pools as u64,
+        );
+        if let Some(reason) = context.cooldown_reason.as_deref() {
+            metadata_insert(&mut metadata, "cooldownReason", reason);
+        }
+        if let Some(scope) = context.cooldown_scope {
+            metadata_insert(&mut metadata, "cooldownScope", scope.as_str());
+        }
+        if let Some(remaining_secs) = context.cooldown_remaining_secs {
+            metadata_insert(&mut metadata, "cooldownRemainingSecs", remaining_secs);
+        }
+    }
+    UsageErrorDiagnostics {
+        status_code: Some(status.as_u16()),
+        source: Some(source.to_string()),
+        error_id: Some(route.error_id.clone()),
+        metadata: Some(serde_json::Value::Object(metadata)),
+        public_error: None,
+    }
+}
+
+fn external_error_message_indicates_model_unavailable(lower_message: &str) -> bool {
+    lower_message.contains("model_not_found")
+        || lower_message.contains("failed to get available channel for model")
+        || lower_message.contains("no available channel")
+}
+
 fn classify_external_error(
     status: StatusCode,
     body: Bytes,
@@ -4054,19 +4391,22 @@ fn classify_external_error(
             response_body: Some(body),
         };
     }
-    if lower.contains("model_not_found")
-        || lower.contains("failed to get available channel for model")
-        || lower.contains("no available channel")
-    {
+    if external_error_message_indicates_model_unavailable(&lower) {
         return ExternalPoolError {
             status: Some(status),
             message,
             retryable: true,
             auto_disable_reason: None,
-            cooldown: Some((
-                Duration::from_secs(config.external_pool_server_error_cooldown_secs.max(1)),
-                "model_unavailable".to_string(),
-            )),
+            cooldown: (config.external_pool_model_unavailable_cooldown_mode
+                != ExternalPoolModelUnavailableCooldownMode::Disabled)
+                .then(|| {
+                    (
+                        Duration::from_secs(
+                            config.external_pool_model_unavailable_cooldown_secs.max(1),
+                        ),
+                        "model_unavailable".to_string(),
+                    )
+                }),
             response_body: Some(body),
         };
     }
@@ -4186,6 +4526,9 @@ fn auto_disable_reason_enabled(config: &ExternalPoolsConfig, reason: &str) -> bo
 fn error_type_for_external_error(err: &ExternalPoolError) -> String {
     if let Some(reason) = err.auto_disable_reason.as_deref() {
         return reason.to_string();
+    }
+    if external_error_message_indicates_model_unavailable(&err.message.to_ascii_lowercase()) {
+        return "model_unavailable".to_string();
     }
     if let Some((_, reason)) = err.cooldown.as_ref() {
         if reason == "rate_limit"

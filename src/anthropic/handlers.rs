@@ -33,7 +33,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, stream, stream::BoxStream};
 use parking_lot::Mutex;
 use reqwest::header::CONTENT_TYPE as REQWEST_CONTENT_TYPE;
 use serde_json::{Value, json};
@@ -101,6 +101,56 @@ const SLOW_FIRST_VISIBLE_TEXT_MS: u64 = 10_000;
 const SLOW_STREAM_GAP_MS: u64 = 10_000;
 const SLOW_RESPONSE_MS: u64 = 60_000;
 const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
+
+#[derive(Debug, Clone, Copy)]
+struct LocalStreamRetryConfig {
+    enabled: bool,
+    max_attempts: u32,
+    on_idle_timeout: bool,
+    on_read_error: bool,
+    on_status_error: bool,
+}
+
+impl LocalStreamRetryConfig {
+    fn from_runtime_config(config: &RequestRuntimeConfig) -> Self {
+        Self {
+            enabled: config.kiro_upstream_stream_retry_enabled,
+            max_attempts: config.kiro_upstream_stream_retry_max_attempts.clamp(1, 100),
+            on_idle_timeout: config.kiro_upstream_stream_retry_on_idle_timeout,
+            on_read_error: config.kiro_upstream_stream_retry_on_read_error,
+            on_status_error: config.kiro_upstream_stream_retry_on_status_error,
+        }
+    }
+
+    fn active(self) -> bool {
+        self.enabled && self.max_attempts > 1
+    }
+
+    fn allows(self, reason: StreamRetryReason) -> bool {
+        match reason {
+            StreamRetryReason::IdleTimeout => self.on_idle_timeout,
+            StreamRetryReason::ReadError => self.on_read_error,
+            StreamRetryReason::StatusError => self.on_status_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamRetryReason {
+    IdleTimeout,
+    ReadError,
+    StatusError,
+}
+
+impl StreamRetryReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            StreamRetryReason::IdleTimeout => "idle_timeout",
+            StreamRetryReason::ReadError => "read_error",
+            StreamRetryReason::StatusError => "status_error",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct TextDigestSummary {
@@ -231,6 +281,8 @@ struct RequestLatencyTraceState {
     upstream_frame_decode_errors_before_first_output: Arc<AtomicU32>,
     upstream_event_parse_errors_before_first_output: Arc<AtomicU32>,
     upstream_event_types_before_first_output: Arc<Mutex<HashMap<&'static str, u32>>>,
+    stream_retry_attempts: Arc<AtomicU32>,
+    stream_retry_reasons: Arc<Mutex<Vec<String>>>,
     terminal_reason: Arc<Mutex<Option<StreamTerminalReason>>>,
     upstream_message_status: Arc<Mutex<Option<String>>>,
     saw_upstream_completed: Arc<Mutex<Option<bool>>>,
@@ -261,6 +313,8 @@ impl RequestLatencyTraceState {
             upstream_frame_decode_errors_before_first_output: Arc::new(AtomicU32::new(0)),
             upstream_event_parse_errors_before_first_output: Arc::new(AtomicU32::new(0)),
             upstream_event_types_before_first_output: Arc::new(Mutex::new(HashMap::new())),
+            stream_retry_attempts: Arc::new(AtomicU32::new(0)),
+            stream_retry_reasons: Arc::new(Mutex::new(Vec::new())),
             terminal_reason: Arc::new(Mutex::new(None)),
             upstream_message_status: Arc::new(Mutex::new(None)),
             saw_upstream_completed: Arc::new(Mutex::new(None)),
@@ -643,6 +697,11 @@ struct RequestRuntimeConfig {
     kiro_cache_point_tools_only: bool,
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
+    kiro_upstream_stream_retry_enabled: bool,
+    kiro_upstream_stream_retry_max_attempts: u32,
+    kiro_upstream_stream_retry_on_idle_timeout: bool,
+    kiro_upstream_stream_retry_on_read_error: bool,
+    kiro_upstream_stream_retry_on_status_error: bool,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
     missing_max_tokens: MissingMaxTokensConfig,
@@ -681,6 +740,11 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: state.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
+            kiro_upstream_stream_retry_enabled: true,
+            kiro_upstream_stream_retry_max_attempts: 2,
+            kiro_upstream_stream_retry_on_idle_timeout: true,
+            kiro_upstream_stream_retry_on_read_error: true,
+            kiro_upstream_stream_retry_on_status_error: true,
             image_processing: state.image_processing.normalized(),
             body_conversion: state.body_conversion.clone(),
             missing_max_tokens: state.missing_max_tokens.normalized(),
@@ -739,6 +803,16 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
+            kiro_upstream_stream_retry_max_attempts: config
+                .kiro_upstream_stream_retry_max_attempts
+                .clamp(1, 100),
+            kiro_upstream_stream_retry_on_idle_timeout: config
+                .kiro_upstream_stream_retry_on_idle_timeout,
+            kiro_upstream_stream_retry_on_read_error: config
+                .kiro_upstream_stream_retry_on_read_error,
+            kiro_upstream_stream_retry_on_status_error: config
+                .kiro_upstream_stream_retry_on_status_error,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
@@ -1853,6 +1927,15 @@ impl RequestUsageContext {
         }
     }
 
+    fn mark_stream_retry_before_downstream_commit(&self, reason: impl Into<String>) {
+        saturating_fetch_add_u32(&self.latency.stream_retry_attempts, 1);
+        let reason = reason.into();
+        let mut reasons = self.latency.stream_retry_reasons.lock();
+        if reasons.len() < 8 {
+            reasons.push(reason.chars().take(160).collect());
+        }
+    }
+
     fn mark_stream_completion_observability(
         &self,
         upstream_message_status: Option<&str>,
@@ -1957,6 +2040,14 @@ impl RequestUsageContext {
                     .collect()
             })
         };
+        let stream_retry_attempts = {
+            let value = self.latency.stream_retry_attempts.load(Ordering::Acquire);
+            (value > 0).then_some(value)
+        };
+        let stream_retry_reasons = {
+            let reasons = self.latency.stream_retry_reasons.lock();
+            (!reasons.is_empty()).then(|| reasons.clone())
+        };
         let trace = UsageLatencyTrace {
             capacity_weight_units: (capacity_weight_units > 1).then_some(capacity_weight_units),
             estimated_input_tokens: (capacity_weight_units > 1).then_some(self.input_tokens),
@@ -2012,6 +2103,8 @@ impl RequestUsageContext {
                         .load(Ordering::Acquire),
                 ),
             upstream_event_types_before_first_output,
+            stream_retry_attempts,
+            stream_retry_reasons,
             client_dropped_ms: load_latency_ms(&self.latency.client_dropped_latency_ms),
             terminal_reason: *self.latency.terminal_reason.lock(),
             upstream_message_status: self.latency.upstream_message_status.lock().clone(),
@@ -4575,6 +4668,7 @@ async fn post_messages_inner(
             cache_point_retry,
             external_fallback,
             runtime_config.kiro_upstream_stream_idle_timeout_secs,
+            LocalStreamRetryConfig::from_runtime_config(&runtime_config),
             capacity_weight_units,
             claude_code_noop_delta_keepalive,
         )
@@ -4801,6 +4895,151 @@ async fn call_non_stream_local_rescue_after_external_error(
         .await
 }
 
+#[derive(Clone)]
+struct StreamContextTemplate {
+    model: String,
+    requested_max_tokens: i32,
+    input_tokens: i32,
+    context_window_tokens: i32,
+    thinking_enabled: bool,
+    extract_xml_thinking: bool,
+    tool_name_map: HashMap<String, String>,
+    tool_schema_key_map: ToolSchemaKeyMap,
+    known_tool_names: HashSet<String>,
+}
+
+impl StreamContextTemplate {
+    fn build(&self, credential_usage: &CredentialUsageContext) -> (StreamContext, Vec<SseEvent>) {
+        let mut ctx = StreamContext::new_with_simulation_with_known_tools(
+            &self.model,
+            self.input_tokens,
+            self.context_window_tokens,
+            self.thinking_enabled,
+            self.extract_xml_thinking,
+            self.tool_name_map.clone(),
+            self.tool_schema_key_map.clone(),
+            self.known_tool_names.clone(),
+            credential_usage.request.simulated_usage,
+            credential_usage.request.simulation_mode,
+        );
+        ctx.set_requested_max_tokens(self.requested_max_tokens);
+        ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
+        ctx.set_local_prompt_cache_projection_enabled(
+            credential_usage.request.uses_local_prompt_cache_strategy(),
+        );
+        ctx.set_stream_error_id(credential_usage.request.error_id.clone());
+
+        let initial_events =
+            ctx.generate_initial_events_with_reported_usage_mapper(|reported_usage| {
+                credential_usage.preview_creation_frequency_control(
+                    reported_usage,
+                    UsageSource::LocalPromptCache,
+                )
+            });
+        (ctx, initial_events)
+    }
+}
+
+#[derive(Clone)]
+struct StreamRetryPlan {
+    config: LocalStreamRetryConfig,
+    provider: Arc<KiroProvider>,
+    request_body: Arc<str>,
+    request_id: String,
+    external_fallback: Option<ExternalFallbackContext>,
+    capacity_weight_units: u32,
+    dispatch_model_filter: Option<String>,
+    base_usage_context: RequestUsageContext,
+    context_template: StreamContextTemplate,
+}
+
+struct SseStreamState {
+    body_stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    ctx: StreamContext,
+    decoder: EventStreamDecoder,
+    json_sniffer: JsonStreamErrorSniffer,
+    finished: bool,
+    completion: KiroStreamCompletion,
+    usage_guard: StreamUsageGuard,
+    ping_interval: tokio::time::Interval,
+    idle_deadline: Instant,
+    stream_idle_timeout_secs: u64,
+    initial_events: Vec<SseEvent>,
+    downstream_committed: bool,
+    retry_plan: Option<StreamRetryPlan>,
+    attempt_number: u32,
+    prior_attempts: Vec<KiroCredentialAttempt>,
+}
+
+impl SseStreamState {
+    fn from_attempt(
+        response: reqwest::Response,
+        ctx: StreamContext,
+        initial_events: Vec<SseEvent>,
+        completion: KiroStreamCompletion,
+        usage_guard: StreamUsageGuard,
+        stream_idle_timeout_secs: u64,
+        retry_plan: Option<StreamRetryPlan>,
+    ) -> Self {
+        let upstream_content_type = response
+            .headers()
+            .get(REQWEST_CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        Self {
+            body_stream: response.bytes_stream().boxed(),
+            ctx,
+            decoder: EventStreamDecoder::new(),
+            json_sniffer: JsonStreamErrorSniffer::new(upstream_content_type.as_deref()),
+            finished: false,
+            completion,
+            usage_guard,
+            ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            idle_deadline: Instant::now() + Duration::from_secs(stream_idle_timeout_secs),
+            stream_idle_timeout_secs,
+            initial_events,
+            downstream_committed: false,
+            retry_plan,
+            attempt_number: 1,
+            prior_attempts: Vec::new(),
+        }
+    }
+
+    fn with_retry_attempt(
+        mut self,
+        response: reqwest::Response,
+        completion: KiroStreamCompletion,
+        credential_usage: CredentialUsageContext,
+    ) -> Self {
+        let retry_plan = self.retry_plan.clone();
+        let context_template = retry_plan
+            .as_ref()
+            .expect("retry attempt requires plan")
+            .context_template
+            .clone();
+        let (ctx, initial_events) = context_template.build(&credential_usage);
+        let upstream_content_type = response
+            .headers()
+            .get(REQWEST_CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        self.body_stream = response.bytes_stream().boxed();
+        self.ctx = ctx;
+        self.decoder = EventStreamDecoder::new();
+        self.json_sniffer = JsonStreamErrorSniffer::new(upstream_content_type.as_deref());
+        self.finished = false;
+        self.completion = completion;
+        self.usage_guard = StreamUsageGuard::new(credential_usage);
+        self.ping_interval = interval(Duration::from_secs(self.stream_idle_timeout_secs));
+        self.idle_deadline = Instant::now() + Duration::from_secs(self.stream_idle_timeout_secs);
+        self.initial_events = initial_events;
+        self.downstream_committed = false;
+        self.attempt_number = self.attempt_number.saturating_add(1);
+        self
+    }
+}
+
 fn external_rescue_preflight(reason: &str, err: &ExternalPoolFinalError) -> serde_json::Value {
     json!({
         "reason": reason,
@@ -4836,6 +5075,7 @@ async fn handle_stream_request(
     cache_point_retry: Option<CachePointRetryRequest>,
     external_fallback: Option<ExternalFallbackContext>,
     stream_idle_timeout_secs: u64,
+    stream_retry_config: LocalStreamRetryConfig,
     capacity_weight_units: u32,
     claude_code_noop_delta_keepalive: bool,
 ) -> Response {
@@ -5261,6 +5501,7 @@ async fn handle_stream_request(
     let (response, completion) = response.into_parts();
     let credential_attempts =
         merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
+    let base_usage_context = usage_context.clone();
     let credential_usage = prepare_credential_usage_context(
         usage_context,
         &provider,
@@ -5270,9 +5511,9 @@ async fn handle_stream_request(
         credential_attempts,
     );
 
-    // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_simulation_with_known_tools(
-        model,
+    let context_template = StreamContextTemplate {
+        model: model.to_string(),
+        requested_max_tokens,
         input_tokens,
         context_window_tokens,
         thinking_enabled,
@@ -5280,20 +5521,18 @@ async fn handle_stream_request(
         tool_name_map,
         tool_schema_key_map,
         known_tool_names,
-        credential_usage.request.simulated_usage,
-        credential_usage.request.simulation_mode,
-    );
-    ctx.set_requested_max_tokens(requested_max_tokens);
-    ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
-    ctx.set_local_prompt_cache_projection_enabled(
-        credential_usage.request.uses_local_prompt_cache_strategy(),
-    );
-    ctx.set_stream_error_id(credential_usage.request.error_id.clone());
-
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events_with_reported_usage_mapper(|reported_usage| {
-        credential_usage
-            .preview_creation_frequency_control(reported_usage, UsageSource::LocalPromptCache)
+    };
+    let (ctx, initial_events) = context_template.build(&credential_usage);
+    let retry_plan = stream_retry_config.active().then(|| StreamRetryPlan {
+        config: stream_retry_config,
+        provider: provider.clone(),
+        request_body: Arc::<str>::from(request_body.to_string()),
+        request_id: request_id.clone(),
+        external_fallback: external_fallback.clone(),
+        capacity_weight_units,
+        dispatch_model_filter: Some(model.to_string()),
+        base_usage_context,
+        context_template,
     });
 
     // 创建 SSE 流
@@ -5305,6 +5544,7 @@ async fn handle_stream_request(
         completion,
         credential_usage,
         stream_idle_timeout_secs,
+        retry_plan,
         claude_code_noop_delta_keepalive,
     );
 
@@ -5632,6 +5872,134 @@ fn finish_stream_with_recorded_error(
         .collect()
 }
 
+fn sse_bytes_from_events(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>> {
+    events
+        .into_iter()
+        .map(|event| Ok(Bytes::from(event.to_sse_string())))
+        .collect()
+}
+
+fn prepend_initial_bytes_if_needed(
+    state: &mut SseStreamState,
+    mut bytes: Vec<Result<Bytes, Infallible>>,
+    commit_initial: bool,
+) -> Vec<Result<Bytes, Infallible>> {
+    if !state.downstream_committed && (commit_initial || !bytes.is_empty()) {
+        let mut combined = sse_bytes_from_events(std::mem::take(&mut state.initial_events));
+        combined.append(&mut bytes);
+        state.downstream_committed = true;
+        return combined;
+    }
+
+    if !bytes.is_empty() {
+        state.downstream_committed = true;
+    }
+    bytes
+}
+
+fn sse_bytes_from_events_with_initial(
+    state: &mut SseStreamState,
+    events: Vec<SseEvent>,
+    commit_initial: bool,
+) -> Vec<Result<Bytes, Infallible>> {
+    let bytes = sse_bytes_from_events(events);
+    prepend_initial_bytes_if_needed(state, bytes, commit_initial)
+}
+
+enum StreamRetryOutcome {
+    Retried(SseStreamState),
+    NotRetried(SseStreamState),
+}
+
+async fn retry_stream_before_downstream_commit(
+    mut state: SseStreamState,
+    reason: StreamRetryReason,
+    detail: String,
+) -> StreamRetryOutcome {
+    if state.downstream_committed {
+        return StreamRetryOutcome::NotRetried(state);
+    }
+
+    let Some(plan) = state.retry_plan.clone() else {
+        return StreamRetryOutcome::NotRetried(state);
+    };
+    if !plan.config.allows(reason) || state.attempt_number >= plan.config.max_attempts {
+        return StreamRetryOutcome::NotRetried(state);
+    }
+
+    let next_attempt = state.attempt_number.saturating_add(1);
+    tracing::warn!(
+        request_id = %plan.request_id,
+        attempt = state.attempt_number,
+        next_attempt,
+        max_attempts = plan.config.max_attempts,
+        reason = reason.as_str(),
+        detail = %detail,
+        "本地 Kiro 流式响应在首个下游事件前失败，准备换号重试"
+    );
+
+    state
+        .completion
+        .report_upstream_stream_failure(detail.clone());
+    let previous_attempts = state.completion.attempts().to_vec();
+    state.prior_attempts =
+        merge_credential_attempts(std::mem::take(&mut state.prior_attempts), previous_attempts);
+    state.usage_guard.complete();
+    plan.base_usage_context
+        .mark_stream_retry_before_downstream_commit(format!("{}: {}", reason.as_str(), detail));
+
+    match call_api_stream_maybe_fail_fast(
+        &plan.provider,
+        plan.request_body.as_ref(),
+        Some(&plan.request_id),
+        plan.external_fallback.as_ref(),
+        plan.capacity_weight_units,
+        plan.dispatch_model_filter.as_deref(),
+    )
+    .await
+    {
+        Ok(response) => {
+            let (response, completion) = response.into_parts();
+            let credential_attempts = merge_credential_attempts(
+                state.prior_attempts.clone(),
+                completion.attempts().to_vec(),
+            );
+            let credential_usage = prepare_credential_usage_context(
+                plan.base_usage_context.clone(),
+                &plan.provider,
+                completion.credential_id(),
+                completion.sticky_bound(),
+                completion.fallback_from_sticky(),
+                credential_attempts,
+            );
+            StreamRetryOutcome::Retried(state.with_retry_attempt(
+                response,
+                completion,
+                credential_usage,
+            ))
+        }
+        Err(err) => {
+            let retry_detail = format!("stream retry dispatch failed: {}", err);
+            tracing::error!(
+                request_id = %plan.request_id,
+                reason = reason.as_str(),
+                error = %retry_detail,
+                "本地 Kiro 流式首输出前重试失败"
+            );
+            plan.base_usage_context
+                .mark_stream_retry_before_downstream_commit(format!(
+                    "{}: {}",
+                    reason.as_str(),
+                    retry_detail
+                ));
+            state
+                .ctx
+                .record_stream_error("api_error", format!("{}; {}", detail, retry_detail));
+            StreamRetryOutcome::NotRetried(state)
+        }
+    }
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -5640,76 +6008,58 @@ fn create_sse_stream(
     completion: KiroStreamCompletion,
     usage_context: CredentialUsageContext,
     stream_idle_timeout_secs: u64,
+    retry_plan: Option<StreamRetryPlan>,
     claude_code_noop_delta_keepalive: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let usage_guard = StreamUsageGuard::new(usage_context);
     let stream_idle_timeout_secs = normalize_stream_idle_timeout_secs(stream_idle_timeout_secs);
-    // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
+    let state = SseStreamState::from_attempt(
+        response,
+        ctx,
+        initial_events,
+        completion,
+        usage_guard,
+        stream_idle_timeout_secs,
+        retry_plan,
     );
 
-    // 然后处理 Kiro 响应流，同时定期发送 ping 保活
-    let upstream_content_type = response
-        .headers()
-        .get(REQWEST_CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let json_sniffer = JsonStreamErrorSniffer::new(upstream_content_type.as_deref());
-    let body_stream = response.bytes_stream();
-
-    let processing_stream = stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            json_sniffer,
-            false,
-            completion,
-            usage_guard,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            Instant::now() + Duration::from_secs(stream_idle_timeout_secs),
-            stream_idle_timeout_secs,
-        ),
-        move |(
-            mut body_stream,
-            mut ctx,
-            mut decoder,
-            mut json_sniffer,
-            finished,
-            completion,
-            usage_guard,
-            mut ping_interval,
-            mut idle_deadline,
-            stream_idle_timeout_secs,
-        )| async move {
-            if finished {
+    stream::unfold(
+        state,
+        move |mut state| async move {
+            if state.finished {
                 return None;
             }
 
-            let idle_sleep = sleep_until(idle_deadline);
+            if !state.downstream_committed && state.retry_plan.is_none() {
+                let bytes = sse_bytes_from_events(std::mem::take(&mut state.initial_events));
+                state.downstream_committed = true;
+                return Some((stream::iter(bytes), state));
+            }
+
+            let idle_sleep = sleep_until(state.idle_deadline);
             tokio::pin!(idle_sleep);
 
-            // 使用 select! 同时等待数据、ping 定时器和上游空闲超时
+            // 使用 select! 同时等待数据、ping 定时器和上游空闲超时。
+            // 如果开启了首输出前重试，在未向客户端发送任何 SSE 字节前不发送 ping，
+            // 防止 ping 本身提交下游流导致后续无法安全换号重试。
             tokio::select! {
-                // 处理数据流
-                chunk_result = body_stream.next() => {
+                chunk_result = state.body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            usage_guard
+                            state
+                                .usage_guard
                                 .context()
                                 .request
                                 .mark_first_upstream_chunk();
-                            idle_deadline = Instant::now() + Duration::from_secs(stream_idle_timeout_secs);
-                            completion.touch();
+                            state.idle_deadline = Instant::now()
+                                + Duration::from_secs(state.stream_idle_timeout_secs);
+                            state.completion.touch();
 
-                            let chunk = match json_sniffer.inspect(chunk) {
+                            let chunk = match state.json_sniffer.inspect(chunk) {
                                 JsonStreamSniffResult::Pass(chunk) => chunk,
                                 JsonStreamSniffResult::Pending => {
                                     let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
-                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)));
+                                    return Some((stream::iter(bytes), state));
                                 }
                                 JsonStreamSniffResult::Error(error) => {
                                     tracing::warn!(
@@ -5718,22 +6068,44 @@ fn create_sse_stream(
                                         body = %error.body_preview,
                                         "流式 API 返回 2xx JSON 错误体"
                                     );
-                                    completion.report_upstream_stream_failure(error.internal_detail.clone());
-                                    ctx.record_stream_error(error.error_type, error.internal_detail);
+                                    let retry_detail = error.internal_detail.clone();
+                                    if !state.downstream_committed {
+                                        match retry_stream_before_downstream_commit(
+                                            state,
+                                            StreamRetryReason::StatusError,
+                                            retry_detail,
+                                        )
+                                        .await
+                                        {
+                                            StreamRetryOutcome::Retried(state) => {
+                                                let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                                return Some((stream::iter(bytes), state));
+                                            }
+                                            StreamRetryOutcome::NotRetried(next_state) => {
+                                                state = next_state;
+                                            }
+                                        }
+                                    }
+                                    state
+                                        .completion
+                                        .report_upstream_stream_failure(error.internal_detail.clone());
+                                    state.ctx.record_stream_error(error.error_type, error.internal_detail);
                                     let bytes = finish_stream_with_recorded_error(
-                                        &mut ctx,
-                                        &usage_guard,
+                                        &mut state.ctx,
+                                        &state.usage_guard,
                                         UsageRecordStatus::StreamError,
                                         StreamTerminalReason::UpstreamJsonException,
                                     );
-                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)));
+                                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                                    state.finished = true;
+                                    return Some((stream::iter(bytes), state));
                                 }
                             };
 
-                            // 解码事件
-                            if let Err(e) = decoder.feed(&chunk) {
+                            if let Err(e) = state.decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
-                                usage_guard
+                                state
+                                    .usage_guard
                                     .context()
                                     .request
                                     .mark_upstream_frame_decode_error_before_first_output();
@@ -5742,28 +6114,30 @@ fn create_sse_stream(
                             let mut events = Vec::new();
                             let mut decoded_frames_in_chunk = 0_u32;
                             let mut first_output_reached_in_chunk =
-                                usage_guard.context().request.has_first_output();
-                            for result in decoder.decode_iter() {
+                                state.usage_guard.context().request.has_first_output();
+                            for result in state.decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
                                         decoded_frames_in_chunk =
                                             decoded_frames_in_chunk.saturating_add(1);
                                         let before_first_output =
                                             !first_output_reached_in_chunk
-                                                && !usage_guard.context().request.has_first_output();
+                                                && !state.usage_guard.context().request.has_first_output();
                                         match Event::from_frame(frame) {
                                             Ok(event) => {
-                                                let sse_events = ctx.process_kiro_event(&event);
+                                                let sse_events = state.ctx.process_kiro_event(&event);
                                                 let frame_has_first_output = sse_events
                                                     .iter()
                                                     .any(is_first_token_output_event);
 
                                                 if before_first_output && !frame_has_first_output {
-                                                    usage_guard
+                                                    state
+                                                        .usage_guard
                                                         .context()
                                                         .request
                                                         .mark_upstream_frame_before_first_output();
-                                                    usage_guard
+                                                    state
+                                                        .usage_guard
                                                         .context()
                                                         .request
                                                         .mark_upstream_event_before_first_output(
@@ -5779,11 +6153,13 @@ fn create_sse_stream(
                                             }
                                             Err(_) => {
                                                 if before_first_output {
-                                                    usage_guard
+                                                    state
+                                                        .usage_guard
                                                         .context()
                                                         .request
                                                         .mark_upstream_frame_before_first_output();
-                                                    usage_guard
+                                                    state
+                                                        .usage_guard
                                                         .context()
                                                         .request
                                                         .mark_upstream_event_parse_error_before_first_output();
@@ -5794,9 +6170,10 @@ fn create_sse_stream(
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
                                         if !first_output_reached_in_chunk
-                                            && !usage_guard.context().request.has_first_output()
+                                            && !state.usage_guard.context().request.has_first_output()
                                         {
-                                            usage_guard
+                                            state
+                                                .usage_guard
                                                 .context()
                                                 .request
                                                 .mark_upstream_frame_decode_error_before_first_output();
@@ -5805,88 +6182,126 @@ fn create_sse_stream(
                                 }
                             }
                             if !first_output_reached_in_chunk
-                                && !usage_guard.context().request.has_first_output()
+                                && !state.usage_guard.context().request.has_first_output()
                             {
-                                usage_guard
+                                state
+                                    .usage_guard
                                     .context()
                                     .request
                                     .mark_upstream_bytes_before_first_output(chunk.len());
                                 if decoded_frames_in_chunk == 0 {
-                                    usage_guard
+                                    state
+                                        .usage_guard
                                         .context()
                                         .request
                                         .mark_upstream_pending_chunk_before_first_output();
                                 }
                             }
 
-                            // 转换为 SSE 字节流
-                            usage_guard
+                            state
+                                .usage_guard
                                 .context()
                                 .request
                                 .mark_stream_events(&events);
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            let bytes = sse_bytes_from_events_with_initial(&mut state, events, false);
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
+                            Some((stream::iter(bytes), state))
                         }
                         Some(Err(e)) => {
+                            let detail = format!("upstream stream read error: {}", e);
                             tracing::error!("读取响应流失败: {}", e);
-                            completion.report_upstream_stream_failure(format!(
-                                "upstream stream read error: {}",
-                                e
-                            ));
+                            if !state.downstream_committed {
+                                match retry_stream_before_downstream_commit(
+                                    state,
+                                    StreamRetryReason::ReadError,
+                                    detail.clone(),
+                                )
+                                .await
+                                {
+                                    StreamRetryOutcome::Retried(state) => {
+                                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                        return Some((stream::iter(bytes), state));
+                                    }
+                                    StreamRetryOutcome::NotRetried(next_state) => {
+                                        state = next_state;
+                                    }
+                                }
+                            }
+                            state.completion.report_upstream_stream_failure(detail.clone());
                             // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
-                            ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
+                            state.ctx.record_stream_error("api_error", detail);
                             let bytes = finish_stream_with_recorded_error(
-                                &mut ctx,
-                                &usage_guard,
+                                &mut state.ctx,
+                                &state.usage_guard,
                                 UsageRecordStatus::StreamError,
                                 StreamTerminalReason::InternalError,
                             );
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
+                            let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                            state.finished = true;
+                            Some((stream::iter(bytes), state))
                         }
                         None => {
-                            if let Some(error) = json_sniffer.finish() {
+                            if let Some(error) = state.json_sniffer.finish() {
                                 tracing::warn!(
                                     error_type = error.error_type,
                                     error_detail = %error.internal_detail,
                                     body = %error.body_preview,
                                     "流式 API 返回未完成的 JSON 错误体"
                                 );
-                                completion.report_upstream_stream_failure(error.internal_detail.clone());
-                                ctx.record_stream_error(error.error_type, error.internal_detail);
+                                let retry_detail = error.internal_detail.clone();
+                                if !state.downstream_committed {
+                                    match retry_stream_before_downstream_commit(
+                                        state,
+                                        StreamRetryReason::StatusError,
+                                        retry_detail,
+                                    )
+                                    .await
+                                    {
+                                        StreamRetryOutcome::Retried(state) => {
+                                            let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                            return Some((stream::iter(bytes), state));
+                                        }
+                                        StreamRetryOutcome::NotRetried(next_state) => {
+                                            state = next_state;
+                                        }
+                                    }
+                                }
+                                state
+                                    .completion
+                                    .report_upstream_stream_failure(error.internal_detail.clone());
+                                state.ctx.record_stream_error(error.error_type, error.internal_detail);
                                 let bytes = finish_stream_with_recorded_error(
-                                    &mut ctx,
-                                    &usage_guard,
+                                    &mut state.ctx,
+                                    &state.usage_guard,
                                     UsageRecordStatus::StreamError,
                                     StreamTerminalReason::UpstreamJsonException,
                                 );
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)));
+                                let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                                state.finished = true;
+                                return Some((stream::iter(bytes), state));
                             }
-                            // 流结束，发送最终事件
-                            if ctx.has_stream_error() {
-                                let scheduler_reason = ctx
+
+                            if state.ctx.has_stream_error() {
+                                let scheduler_reason = state.ctx
                                     .stream_error_detail()
                                     .map(|(kind, detail)| format!("{}: {}", kind, detail))
                                     .unwrap_or_else(|| "upstream stream error event".to_string());
-                                completion.report_upstream_stream_failure(scheduler_reason);
+                                state.completion.report_upstream_stream_failure(scheduler_reason);
                             } else {
-                                completion.report_success();
+                                state.completion.report_success();
                             }
-                            let had_stream_error = ctx.has_stream_error();
-                            let error_detail = ctx.stream_error_detail();
+                            let had_stream_error = state.ctx.has_stream_error();
+                            let error_detail = state.ctx.stream_error_detail();
                             let final_events = if had_stream_error {
-                                ctx.generate_final_events()
+                                state.ctx.generate_final_events()
                             } else {
-                                ctx.generate_final_events_with_reported_usage_mapper(
+                                state.ctx.generate_final_events_with_reported_usage_mapper(
                                     |final_usage,
                                      _reported_usage,
                                      metadata_usage,
                                      context_estimated,
                                      estimated_input_tokens| {
-                                        usage_guard.context().final_reported_usage_for_stream(
+                                        state.usage_guard.context().final_reported_usage_for_stream(
                                             final_usage,
                                             metadata_usage,
                                             context_estimated,
@@ -5895,7 +6310,8 @@ fn create_sse_stream(
                                     },
                                 )
                             };
-                            usage_guard
+                            state
+                                .usage_guard
                                 .context()
                                 .request
                                 .mark_stream_terminal(if had_stream_error {
@@ -5903,50 +6319,76 @@ fn create_sse_stream(
                                 } else {
                                     StreamTerminalReason::Completed
                                 });
-                            usage_guard
+                            state
+                                .usage_guard
                                 .context()
                                 .request
                                 .mark_stream_events(&final_events);
                             if had_stream_error {
-                                usage_guard.context().record_stream_failure_from_context(
+                                state.usage_guard.context().record_stream_failure_from_context(
                                     UsageRecordStatus::StreamError,
-                                    ctx.final_usage(),
+                                    state.ctx.final_usage(),
                                     error_detail,
-                                    ctx.metadata_usage(),
-                                    ctx.context_input_tokens,
-                                    ctx.kiro_metering_usage(),
+                                    state.ctx.metadata_usage(),
+                                    state.ctx.context_input_tokens,
+                                    state.ctx.kiro_metering_usage(),
                                 );
                             } else {
-                                usage_guard.context().record_success_from_stream(&ctx);
+                                state.usage_guard.context().record_success_from_stream(&state.ctx);
                             }
-                            usage_guard.complete();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
+                            state.usage_guard.complete();
+                            let bytes = sse_bytes_from_events_with_initial(
+                                &mut state,
+                                final_events,
+                                true,
+                            );
+                            state.finished = true;
+                            Some((stream::iter(bytes), state))
                         }
                     }
                 }
                 _ = &mut idle_sleep => {
                     tracing::error!(
                         "上游响应流超过 {} 秒未产生数据，结束流并发送错误事件",
-                        stream_idle_timeout_secs
+                        state.stream_idle_timeout_secs
                     );
-                    completion.report_upstream_stream_failure("upstream stream idle timeout");
-                    ctx.record_stream_error("api_error", "upstream stream idle timeout");
+                    let detail = "upstream stream idle timeout".to_string();
+                    if !state.downstream_committed {
+                        match retry_stream_before_downstream_commit(
+                            state,
+                            StreamRetryReason::IdleTimeout,
+                            detail.clone(),
+                        )
+                        .await
+                        {
+                            StreamRetryOutcome::Retried(state) => {
+                                let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                return Some((stream::iter(bytes), state));
+                            }
+                            StreamRetryOutcome::NotRetried(next_state) => {
+                                state = next_state;
+                            }
+                        }
+                    }
+                    state.completion.report_upstream_stream_failure(detail.clone());
+                    state.ctx.record_stream_error("api_error", detail);
                     let bytes = finish_stream_with_recorded_error(
-                        &mut ctx,
-                        &usage_guard,
+                        &mut state.ctx,
+                        &state.usage_guard,
                         UsageRecordStatus::UpstreamTimeout,
                         StreamTerminalReason::UpstreamIdleTimeout,
                     );
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
+                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                    state.finished = true;
+                    Some((stream::iter(bytes), state))
                 }
-                // 发送 ping 保活
-                _ = ping_interval.tick() => {
+                _ = state.ping_interval.tick() => {
+                    if !state.downstream_committed && state.retry_plan.is_some() {
+                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                        return Some((stream::iter(bytes), state));
+                    }
                     let keepalive = if claude_code_noop_delta_keepalive {
-                        ctx.claude_code_noop_delta_keepalive_event()
+                        state.ctx.claude_code_noop_delta_keepalive_event()
                             .map(|event| Bytes::from(event.to_sse_string()))
                     } else {
                         None
@@ -5961,15 +6403,14 @@ fn create_sse_stream(
                             create_ping_sse()
                         }
                     };
+                    state.downstream_committed = true;
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(bytes)];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
+                    Some((stream::iter(bytes), state))
                 }
             }
         },
     )
-    .flatten();
-
-    initial_stream.chain(processing_stream)
+    .flatten()
 }
 
 fn normalize_stream_idle_timeout_secs(value: u64) -> u64 {

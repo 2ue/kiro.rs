@@ -159,6 +159,8 @@ export function ExternalPoolsPage() {
           externalPoolServerErrorCooldownSecs: whole(configDraft.externalPoolServerErrorCooldownSecs, 1),
           externalPoolNetworkErrorCooldownSecs: whole(configDraft.externalPoolNetworkErrorCooldownSecs, 1),
           externalPoolProtocolErrorCooldownSecs: whole(configDraft.externalPoolProtocolErrorCooldownSecs, 1),
+          externalPoolModelUnavailableCooldownMode: configDraft.externalPoolModelUnavailableCooldownMode,
+          externalPoolModelUnavailableCooldownSecs: whole(configDraft.externalPoolModelUnavailableCooldownSecs, 1),
           externalPoolRequestTimeoutSecs: whole(configDraft.externalPoolRequestTimeoutSecs),
           externalPoolStreamRequestTimeoutSecs: whole(configDraft.externalPoolStreamRequestTimeoutSecs),
           externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
@@ -365,8 +367,8 @@ export function ExternalPoolsPage() {
                     <SelectItem value="fail_fast">立即失败</SelectItem>
                     <SelectItem value="wait">等待容量</SelectItem>
                   </SelectBox>
-                  <NumberBox disabled={!externalEnabled} label="全局并发上限" suffix="并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolGlobalMaxConcurrentRequests: v }))} />
-                  <NumberBox disabled={!waitModeActive} label="排队上限" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxQueuedRequests: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="全局并发上限" description="限制同时进行的外部账号请求数；不是 RPM。0 表示不限。" suffix="并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolGlobalMaxConcurrentRequests: v }))} />
+                  <NumberBox disabled={!waitModeActive} label="外部池排队上限" description="externalPoolMaxQueuedRequests；只限制外部池 wait 队列，不是本地账号 dispatch 队列。" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxQueuedRequests: v }))} />
                   <NumberBox disabled={!externalEnabled} label="输入上限预检" suffix="Token" value={configDraft.externalPoolMaxInputTokens} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxInputTokens: v }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待" suffix="秒" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolDispatchMaxWaitSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="最大重试" suffix="次" value={configDraft.externalPoolRetryMaxAttempts} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryMaxAttempts: v }))} />
@@ -378,6 +380,12 @@ export function ExternalPoolsPage() {
                   <NumberBox disabled={!externalEnabled} label="5xx 冷却" suffix="秒" value={configDraft.externalPoolServerErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolServerErrorCooldownSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="网络错误冷却" suffix="秒" value={configDraft.externalPoolNetworkErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolNetworkErrorCooldownSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="协议/认证冷却" suffix="秒" value={configDraft.externalPoolProtocolErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolProtocolErrorCooldownSecs: v }))} />
+                  <SelectBox disabled={!externalEnabled} label="模型不可用冷却范围" value={configDraft.externalPoolModelUnavailableCooldownMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownMode: v as ExternalPoolsConfig['externalPoolModelUnavailableCooldownMode'] }))}>
+                    <SelectItem value="model">仅当前模型</SelectItem>
+                    <SelectItem value="pool">整个外部账号</SelectItem>
+                    <SelectItem value="disabled">不写冷却</SelectItem>
+                  </SelectBox>
+                  <NumberBox disabled={!externalEnabled || configDraft.externalPoolModelUnavailableCooldownMode === 'disabled'} label="模型不可用冷却" suffix="秒" value={configDraft.externalPoolModelUnavailableCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="非流式总超时" suffix="秒" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRequestTimeoutSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="流式总超时" suffix="秒" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamRequestTimeoutSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="流式空闲超时" suffix="秒" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamIdleTimeoutSecs: v }))} />

@@ -1432,6 +1432,11 @@ pub struct RuntimeConfigResponse {
     pub credential_dispatch_max_wait_secs: u64,
     pub kiro_upstream_response_timeout_secs: u64,
     pub kiro_upstream_stream_idle_timeout_secs: u64,
+    pub kiro_upstream_stream_retry_enabled: bool,
+    pub kiro_upstream_stream_retry_max_attempts: u32,
+    pub kiro_upstream_stream_retry_on_idle_timeout: bool,
+    pub kiro_upstream_stream_retry_on_read_error: bool,
+    pub kiro_upstream_stream_retry_on_status_error: bool,
     pub credential_retry_max_attempts: u32,
     pub credential_prompt_logic_retry_enabled: bool,
     pub credential_prompt_logic_retry_max_attempts: u32,
@@ -1525,6 +1530,16 @@ pub struct UpdateRuntimeConfigRequest {
     pub kiro_upstream_response_timeout_secs: Option<u64>,
     #[serde(default)]
     pub kiro_upstream_stream_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub kiro_upstream_stream_retry_enabled: Option<bool>,
+    #[serde(default)]
+    pub kiro_upstream_stream_retry_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub kiro_upstream_stream_retry_on_idle_timeout: Option<bool>,
+    #[serde(default)]
+    pub kiro_upstream_stream_retry_on_read_error: Option<bool>,
+    #[serde(default)]
+    pub kiro_upstream_stream_retry_on_status_error: Option<bool>,
     #[serde(default)]
     pub credential_retry_max_attempts: Option<u32>,
     #[serde(default)]

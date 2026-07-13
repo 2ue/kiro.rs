@@ -108,6 +108,11 @@ fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionErro
                     )
                 })?;
             let (media_type, data) = normalize_inline_base64_source(&media_type, &data);
+            if data.is_empty() {
+                return Err(ConversionError::UnsupportedContent(
+                    empty_image_source_message(&media_type),
+                ));
+            }
             let format =
                 image_format_from_base64_or_media_type(&media_type, &data).ok_or_else(|| {
                     ConversionError::UnsupportedContent(invalid_image_source_message(&media_type))
@@ -119,6 +124,13 @@ fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionErro
                 ConversionError::UnsupportedContent("image URL source missing url".to_string())
             })?;
             if let Some((media_type, data)) = parse_data_url(&url) {
+                let media_type = normalize_media_type(&media_type);
+                let data = strip_base64_whitespace(&data);
+                if data.is_empty() {
+                    return Err(ConversionError::UnsupportedContent(
+                        empty_image_source_message(&media_type),
+                    ));
+                }
                 let format = image_format_from_base64_or_media_type(&media_type, &data)
                     .ok_or_else(|| {
                         ConversionError::UnsupportedContent(invalid_image_source_message(
@@ -429,6 +441,10 @@ fn invalid_image_source_message(media_type: &str) -> String {
     }
 }
 
+fn empty_image_source_message(media_type: &str) -> String {
+    format!("Image data cannot be empty. media_type={}", media_type)
+}
+
 fn normalize_media_type(media_type: &str) -> String {
     media_type
         .split(';')
@@ -686,4 +702,76 @@ pub(super) fn sanitize_tool_use_id(id: &str) -> Option<String> {
         "{}_{:02x}{:02x}{:02x}{:02x}",
         prefix, digest[0], digest[1], digest[2], digest[3]
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn assert_empty_image_error(err: ConversionError) {
+        match err {
+            ConversionError::UnsupportedContent(message) => {
+                assert!(
+                    message.contains("Image data cannot be empty."),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_base64_image_is_rejected_with_clear_error() {
+        let err = convert_image_source(ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some("image/png".to_string()),
+            data: Some(" \n\t ".to_string()),
+            url: None,
+            file_id: None,
+        })
+        .expect_err("empty image data should be rejected");
+
+        assert_empty_image_error(err);
+    }
+
+    #[test]
+    fn empty_data_url_image_is_rejected_with_clear_error() {
+        let err = convert_image_source(ImageSource {
+            source_type: "url".to_string(),
+            media_type: None,
+            data: None,
+            url: Some("data:image/png;base64, \n".to_string()),
+            file_id: None,
+        })
+        .expect_err("empty data URL image should be rejected");
+
+        assert_empty_image_error(err);
+    }
+
+    #[test]
+    fn empty_tool_result_image_is_rejected_with_clear_error() {
+        let content = json!([
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_123",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": ""
+                        }
+                    }
+                ]
+            }
+        ]);
+
+        let err = process_message_content(&content)
+            .expect_err("empty tool_result image should be rejected");
+
+        assert_empty_image_error(err);
+    }
 }

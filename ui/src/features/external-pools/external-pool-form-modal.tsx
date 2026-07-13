@@ -156,7 +156,7 @@ export function ExternalPoolFormModal({
         <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
           <FormSection title="调度设置" description="这些设置只影响当前外部账号，不改变全局排队和冷却策略。">
             <div className="grid gap-3 sm:grid-cols-2">
-              <NumberBox label="单账号最大并发" description="当前外部账号同时处理的最大请求数。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(v) => set('maxConcurrentRequests', v)} />
+              <NumberBox label="单账号最大并发" description="当前外部账号同时处理的最大请求数，不是 RPM。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(v) => set('maxConcurrentRequests', v)} />
               <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" suffix="值" value={draft.priority} disabled={saving} onChange={(v) => set('priority', v)} />
               <ToggleRow label={isEdit ? '启用外部账号' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(v) => set('enabled', v)} />
               <ToggleRow label="保留请求路径" checked={Boolean(draft.preservePath)} disabled={saving} onChange={(v) => set('preservePath', v)} />

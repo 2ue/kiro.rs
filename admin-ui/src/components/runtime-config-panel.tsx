@@ -281,6 +281,8 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolServerErrorCooldownSecs: 10,
   externalPoolNetworkErrorCooldownSecs: 10,
   externalPoolProtocolErrorCooldownSecs: 10,
+  externalPoolModelUnavailableCooldownMode: 'model' as const,
+  externalPoolModelUnavailableCooldownSecs: 10,
   externalPoolRequestTimeoutSecs: 180,
   externalPoolStreamRequestTimeoutSecs: 0,
   externalPoolStreamIdleTimeoutSecs: 180,
@@ -400,6 +402,11 @@ const emptyConfig: RuntimeConfig = {
   credentialDispatchMaxWaitSecs: 120,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
+  kiroUpstreamStreamRetryEnabled: true,
+  kiroUpstreamStreamRetryMaxAttempts: 2,
+  kiroUpstreamStreamRetryOnIdleTimeout: true,
+  kiroUpstreamStreamRetryOnReadError: true,
+  kiroUpstreamStreamRetryOnStatusError: true,
   credentialRetryMaxAttempts: 0,
   credentialPromptLogicRetryEnabled: false,
   credentialPromptLogicRetryMaxAttempts: 0,
@@ -2681,6 +2688,11 @@ export function RuntimeConfigPanel() {
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
+      kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
+      kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
+      kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
+      kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
+      kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
       credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
       credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
       credentialPromptLogicRetryMaxAttempts: toWhole(
@@ -2744,6 +2756,8 @@ export function RuntimeConfigPanel() {
         externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
         externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
         externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
+        externalPoolModelUnavailableCooldownMode: draft.externalPools.externalPoolModelUnavailableCooldownMode,
+        externalPoolModelUnavailableCooldownSecs: toWhole(draft.externalPools.externalPoolModelUnavailableCooldownSecs, 1),
         externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
         externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
         externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
@@ -2917,6 +2931,53 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(kiroUpstreamStreamIdleTimeoutSecs) =>
                 setDraft((prev) => ({ ...prev, kiroUpstreamStreamIdleTimeoutSecs }))
+              }
+            />
+            <ToggleField
+              title="首输出前流式换号"
+              description="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试，避免重复消息和重复工具调用。"
+              checked={draft.kiroUpstreamStreamRetryEnabled}
+              onCheckedChange={(kiroUpstreamStreamRetryEnabled) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryEnabled }))
+              }
+            />
+            <NumberField
+              title="首输出前最多尝试"
+              description="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。"
+              value={draft.kiroUpstreamStreamRetryMaxAttempts}
+              min={1}
+              max={100}
+              suffix="次"
+              disabled={!draft.kiroUpstreamStreamRetryEnabled}
+              onChange={(kiroUpstreamStreamRetryMaxAttempts) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryMaxAttempts }))
+              }
+            />
+            <ToggleField
+              title="静默超时可换号"
+              description="上游流在首输出前长时间无内容时允许换号。"
+              checked={draft.kiroUpstreamStreamRetryOnIdleTimeout}
+              disabled={!draft.kiroUpstreamStreamRetryEnabled}
+              onCheckedChange={(kiroUpstreamStreamRetryOnIdleTimeout) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryOnIdleTimeout }))
+              }
+            />
+            <ToggleField
+              title="读取错误可换号"
+              description="首输出前连接中断、流读取失败时允许换号。"
+              checked={draft.kiroUpstreamStreamRetryOnReadError}
+              disabled={!draft.kiroUpstreamStreamRetryEnabled}
+              onCheckedChange={(kiroUpstreamStreamRetryOnReadError) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryOnReadError }))
+              }
+            />
+            <ToggleField
+              title="状态错误可换号"
+              description="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。"
+              checked={draft.kiroUpstreamStreamRetryOnStatusError}
+              disabled={!draft.kiroUpstreamStreamRetryEnabled}
+              onCheckedChange={(kiroUpstreamStreamRetryOnStatusError) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryOnStatusError }))
               }
             />
             <NumberField

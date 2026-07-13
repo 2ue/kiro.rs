@@ -226,17 +226,17 @@ fn credential_hash_columns(
 }
 
 fn duplicate_credential_message(err: sqlx::Error) -> anyhow::Error {
-    if let sqlx::Error::Database(db_err) = &err
-        && db_err.is_unique_violation()
-    {
-        let constraint = db_err.constraint().unwrap_or_default();
-        if constraint.contains("api_key") {
-            return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
+    if let sqlx::Error::Database(db_err) = &err {
+        if db_err.is_unique_violation() {
+            let constraint = db_err.constraint().unwrap_or_default();
+            if constraint.contains("api_key") {
+                return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
+            }
+            if constraint.contains("refresh_token") {
+                return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
+            }
+            return anyhow::anyhow!("凭据已存在（唯一约束冲突）");
         }
-        if constraint.contains("refresh_token") {
-            return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
-        }
-        return anyhow::anyhow!("凭据已存在（唯一约束冲突）");
     }
     anyhow::Error::new(err)
 }
@@ -3780,11 +3780,10 @@ async fn repair_active_credential_hashes(
         credential.canonicalize_auth_method();
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&credential);
 
-        if existing_api_key_hash.is_none()
-            && let Some(api_key_hash) = api_key_hash.as_deref()
-        {
-            let conflicting_id: Option<i64> = sqlx::query_scalar(
-                r#"
+        if existing_api_key_hash.is_none() {
+            if let Some(api_key_hash) = api_key_hash.as_deref() {
+                let conflicting_id: Option<i64> = sqlx::query_scalar(
+                    r#"
                     SELECT id
                     FROM credentials
                     WHERE deleted_at IS NULL
@@ -3792,24 +3791,24 @@ async fn repair_active_credential_hashes(
                       AND api_key_hash = $2
                     LIMIT 1
                     "#,
-            )
-            .bind(credential_id)
-            .bind(api_key_hash)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(conflicting_id) = conflicting_id {
-                anyhow::bail!(
-                    "凭据 #{} 与 #{} 的 kiroApiKey 重复，无法回填 hash",
-                    credential_id,
-                    conflicting_id
-                );
+                )
+                .bind(credential_id)
+                .bind(api_key_hash)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(conflicting_id) = conflicting_id {
+                    anyhow::bail!(
+                        "凭据 #{} 与 #{} 的 kiroApiKey 重复，无法回填 hash",
+                        credential_id,
+                        conflicting_id
+                    );
+                }
             }
         }
-        if existing_refresh_token_hash.is_none()
-            && let Some(refresh_token_hash) = refresh_token_hash.as_deref()
-        {
-            let conflicting_id: Option<i64> = sqlx::query_scalar(
-                r#"
+        if existing_refresh_token_hash.is_none() {
+            if let Some(refresh_token_hash) = refresh_token_hash.as_deref() {
+                let conflicting_id: Option<i64> = sqlx::query_scalar(
+                    r#"
                     SELECT id
                     FROM credentials
                     WHERE deleted_at IS NULL
@@ -3817,17 +3816,18 @@ async fn repair_active_credential_hashes(
                       AND refresh_token_hash = $2
                     LIMIT 1
                     "#,
-            )
-            .bind(credential_id)
-            .bind(refresh_token_hash)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(conflicting_id) = conflicting_id {
-                anyhow::bail!(
-                    "凭据 #{} 与 #{} 的 refreshToken 重复，无法回填 hash",
-                    credential_id,
-                    conflicting_id
-                );
+                )
+                .bind(credential_id)
+                .bind(refresh_token_hash)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(conflicting_id) = conflicting_id {
+                    anyhow::bail!(
+                        "凭据 #{} 与 #{} 的 refreshToken 重复，无法回填 hash",
+                        credential_id,
+                        conflicting_id
+                    );
+                }
             }
         }
 
@@ -5134,11 +5134,11 @@ fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
         return;
     }
 
-    if let Some(external_pool_billing) = &record.external_pool_billing
-        && external_pool_billing.raw_cost_usd != 0.0
-    {
-        record.original_cost_usd = external_pool_billing.raw_cost_usd;
-        return;
+    if let Some(external_pool_billing) = &record.external_pool_billing {
+        if external_pool_billing.raw_cost_usd != 0.0 {
+            record.original_cost_usd = external_pool_billing.raw_cost_usd;
+            return;
+        }
     }
 
     if record.estimated_cost_usd != 0.0 {

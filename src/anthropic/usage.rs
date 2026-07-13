@@ -239,6 +239,10 @@ pub struct UsageLatencyTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_event_types_before_first_output: Option<HashMap<String, u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_retry_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_retry_reasons: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_dropped_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<StreamTerminalReason>,
@@ -291,6 +295,8 @@ impl UsageLatencyTrace {
                 .upstream_event_parse_errors_before_first_output
                 .is_none()
             && self.upstream_event_types_before_first_output.is_none()
+            && self.stream_retry_attempts.is_none()
+            && self.stream_retry_reasons.is_none()
             && self.client_dropped_ms.is_none()
             && self.terminal_reason.is_none()
             && self.upstream_message_status.is_none()
