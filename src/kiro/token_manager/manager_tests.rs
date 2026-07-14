@@ -5812,6 +5812,12 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
     .unwrap();
     *manager.scheduler_redis_degraded_until.lock() =
         Some(Instant::now() + StdDuration::from_secs(1));
+    let route_state = manager.local_pool_route_state(None);
+    assert_eq!(
+        route_state.kind,
+        LocalPoolRouteStateKind::SchedulerRedisDegraded
+    );
+    assert!(route_state.retry_after_secs.is_some());
 
     let queue_error = manager
         .acquire_context(None)

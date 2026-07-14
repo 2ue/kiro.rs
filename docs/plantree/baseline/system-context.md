@@ -137,4 +137,4 @@ Large files are therefore a symptom of wide responsibility and dependency direct
 - background write acceptance versus durable completion;
 - Admin commands versus runtime state mutation and broadcast.
 
-The system-architecture modernization plan must stabilize these internal boundaries while preserving the external ones.
+The [Greenfield AI Gateway plan](../plans/greenfield-ai-gateway/README.md) must replace these unstable internal boundaries while preserving or explicitly superseding the external behavior.

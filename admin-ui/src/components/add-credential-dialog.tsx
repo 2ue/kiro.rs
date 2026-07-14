@@ -63,6 +63,15 @@ function SecretInput({
   )
 }
 
+function splitKiroApiKeyDraft(value: string): { key: string; region?: string } {
+  const trimmed = value.trim()
+  const [rawKey, rawRegion] = trimmed.split('|', 2)
+  return {
+    key: rawKey?.trim() || value,
+    region: rawRegion?.trim() || undefined,
+  }
+}
+
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
@@ -218,6 +227,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setRegion(value)
     if (value.trim() && !authRegion.trim()) {
       setAuthRegion(value)
+    }
+  }
+
+  const handleKiroApiKeyChange = (value: string) => {
+    const parsed = splitKiroApiKeyDraft(value)
+    setKiroApiKey(parsed.region ? parsed.key : value)
+    if (parsed.region) {
+      if (!region.trim()) setRegion(parsed.region)
+      if (!authRegion.trim()) setAuthRegion(parsed.region)
+      if (!apiRegion.trim()) setApiRegion(parsed.region)
+      if (!endpoint.trim()) setEndpoint('cli')
     }
   }
 
@@ -423,9 +443,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <Input
                   id="kiroApiKey"
                   type="password"
-                  placeholder="格式: ksk_xxxxxxxx"
+                  placeholder="格式: ksk_xxxxxxxx 或 ksk_xxxxxxxx|eu-central-1"
                   value={kiroApiKey}
-                  onChange={(e) => setKiroApiKey(e.target.value)}
+                  onChange={(e) => handleKiroApiKeyChange(e.target.value)}
                   disabled={isPending}
                 />
               </div>

@@ -7,8 +7,8 @@ use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
     ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
     ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
-    PromptCacheCreationControlConfig, ReportedUsageConfig, ThinkingTriggerMode,
-    WeightedCapacityConfig,
+    PromptCacheCreationControlConfig, PromptSteeringConfig, ReportedUsageConfig,
+    ThinkingTriggerMode, WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -1462,6 +1462,7 @@ pub struct RuntimeConfigResponse {
     pub whitespace_compression: bool,
     pub image_processing: ImageProcessingConfig,
     pub body_conversion: BodyConversionConfig,
+    pub prompt_steering: PromptSteeringConfig,
     pub missing_max_tokens: MissingMaxTokensConfig,
     pub payload_guard_enabled: bool,
     pub payload_guard_mode: PayloadGuardMode,
@@ -1588,6 +1589,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub image_processing: Option<ImageProcessingConfig>,
     #[serde(default)]
     pub body_conversion: Option<BodyConversionConfig>,
+    #[serde(default)]
+    pub prompt_steering: Option<PromptSteeringConfig>,
     #[serde(default)]
     pub missing_max_tokens: Option<MissingMaxTokensConfig>,
     #[serde(default)]

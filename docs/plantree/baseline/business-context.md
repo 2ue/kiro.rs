@@ -2,7 +2,7 @@
 
 Role: Project-wide product context and current-capability baseline
 Status: Current product definition and accepted trust boundary as of 2026-07-11
-Authority: Defines product scope, accepted single-user boundary, current business capabilities, and non-goals; detailed target requirements live in the modernization plan
+Authority: Defines current Rust product scope, accepted single-user boundary, business capabilities, and compatibility inputs; detailed target requirements live in the Greenfield AI Gateway plan
 As of: `v0.0.102`, commit `e9479df71ee0`, 2026-07-11
 Read when: Evaluating a feature, architecture change, compatibility decision, or severity classification
 Related: [System context](system-context.md), [Runtime flows](runtime-flows.md), [Storage and state](storage-and-state.md)
@@ -126,17 +126,19 @@ For the current local high-cache policy, input sampling that moves a delta to ca
 
 These are current behavior/compatibility statements, not proof that every failure path is defect-free.
 
-## Proposed Modernization Requirements
+## Target Reconstruction Relationship
 
-Runtime config CAS, immutable request snapshots, durable outbox semantics, exact cache conservation, header allowlists, aggregate resource budgets, bounded diagnostics, performance gates, and strict shutdown residue behavior are proposed target requirements, not current facts. Their authoritative proposal and acceptance status are in [requirements and quality attributes](../plans/system-architecture-modernization/topics/requirements-and-quality-attributes.md) and the [decision index](../plans/system-architecture-modernization/decisions/README.md).
+Runtime config CAS, immutable request snapshots, durable outbox semantics, exact cache conservation, header allowlists, aggregate resource budgets, bounded diagnostics, performance gates, and strict shutdown residue behavior are target requirements, not current facts. The [Greenfield AI Gateway plan](../plans/greenfield-ai-gateway/README.md) now owns their target form. The superseded Rust [requirements](../plans/system-architecture-modernization/topics/requirements-and-quality-attributes.md) and [decision index](../plans/system-architecture-modernization/decisions/README.md) remain historical rationale and behavioral input.
 
-## Explicit Non-Goals
+## Current Rust Product Non-Goals
+
+These statements describe the current Rust product/maintenance boundary at the baseline revision. [Greenfield decision 001](../plans/greenfield-ai-gateway/decisions/001-greenfield-go-modular-ai-gateway.md) explicitly supersedes them where it defines a separate target repository, one new Admin application and one characterized whole-system cutover.
 
 - Multi-user or multi-tenant identity, authorization, billing, quotas, or data partitioning.
 - Replacing Kiro or external upstream business logic with an in-process model runtime.
 - A public plugin ABI for every request stage before a second independently developed extension requires it.
-- An uncharacterized single all-system cutover without module-level compatibility and rollback gates. The delivery strategy is owned by [modernization decision 002](../plans/system-architecture-modernization/decisions/002-complete-module-by-module-rewrite.md), not by this current-product baseline.
-- Removing either maintained Admin UI without a separate product decision and migration plan.
+- An uncharacterized all-system cutover without complete compatibility, recovery and rollback gates. The greenfield target uses one fully characterized whole-system cutover.
+- Removing either maintained Admin UI from current Rust maintenance without a separate product decision. Greenfield decision 001 supplies that decision for the separate target only.
 - Treating simulated cache usage as proof of real upstream cache behavior.
 - Hiding lossy or approximate accounting behind a field named as authoritative usage.
 

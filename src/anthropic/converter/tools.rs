@@ -300,7 +300,7 @@ pub(super) fn convert_tools(
     let Some(tools) = tools else {
         return Ok(ConvertedTools::default());
     };
-    let directive = if options.conversion.tool_choice_steering.is_enabled() {
+    let directive = if options.tool_choice_steering_enabled() {
         parse_tool_choice(tool_choice)
     } else {
         ToolChoiceDirective::Auto
@@ -334,7 +334,7 @@ pub(super) fn convert_tools(
         let mut description = normalize_tool_description(&t.name, &t.description);
 
         // 对 Write/Edit 工具追加自定义描述后缀
-        let suffix = if options.conversion.chunked_tool_policy.is_enabled() {
+        let suffix = if options.inject_chunked_tool_descriptions() {
             match t.name.as_str() {
                 "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
                 "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,

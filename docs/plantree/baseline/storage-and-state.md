@@ -167,4 +167,4 @@ There is no current project-wide definition of `accepted`, `committed`, `retryin
 | `REL-001` | Accepted background mutations lack one durable outbox contract | Timeout/restart can abandon accepted work |
 | `COR-005` | Request can read dynamic config more than once | One request can use mixed policy versions |
 
-These gaps are analyzed and prioritized in the system-architecture modernization plan. This baseline only records current behavior.
+These gaps remain current-system evidence. The [Greenfield AI Gateway plan](../plans/greenfield-ai-gateway/README.md) owns their target resolution; the superseded Rust modernization plan retains deeper historical analysis. This baseline only records current behavior.

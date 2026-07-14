@@ -701,6 +701,21 @@ export interface UsageLatencyTrace {
   sawUpstreamCompleted?: boolean
   stopReasonSource?: string
   suspectedIntentPreambleEndTurn?: boolean
+  intentPreambleRisk?: 'none' | 'low' | 'medium' | 'high' | string
+  suspectedToolContextLeakEndTurn?: boolean
+  toolContextLeakMarkers?: string[]
+  assistantTailIntentHint?: boolean
+  endTurnAnomalyReason?: string
+  endTurnAnomalyRisk?: 'none' | 'low' | 'medium' | 'high' | string
+  upstreamEofWithoutCompleted?: boolean
+  lastUpstreamEventType?: string
+  lastUpstreamEvents?: string[]
+  sawUpstreamAssistantResponse?: boolean
+  sawUpstreamToolUse?: boolean
+  sawUpstreamMetadata?: boolean
+  lastAssistantContentChars?: number
+  filteredTrivialTextBlocks?: number
+  filteredTrivialTextChars?: number
 }
 
 export interface KiroCredentialAttempt {
@@ -1241,6 +1256,36 @@ export interface BodyConversionConfig {
   historyPlaceholderTools: boolean
 }
 
+export type PromptSteeringScope = 'cc_only' | 'claude_code_profile' | 'all_routes'
+
+export interface PromptSteeringTextBlock {
+  enabled: boolean
+  prompt: string
+}
+
+export interface PromptSteeringToggle {
+  enabled: boolean
+}
+
+export interface ChunkedWritePromptSteeringConfig {
+  enabled: boolean
+  systemPromptEnabled: boolean
+  toolDescriptionEnabled: boolean
+}
+
+export interface PromptSteeringConfig {
+  enabled: boolean
+  scope: PromptSteeringScope
+  applyToExternalPool: boolean
+  applyToCountTokens: boolean
+  languageConstraint: PromptSteeringTextBlock
+  taskQuality: PromptSteeringTextBlock
+  toolChoice: PromptSteeringToggle
+  chunkedWrite: ChunkedWritePromptSteeringConfig
+  thinking: PromptSteeringToggle
+  custom: PromptSteeringTextBlock
+}
+
 export interface PayloadShapingConfig {
   enabled: boolean
   truncateHistoricalToolResults: boolean
@@ -1280,6 +1325,7 @@ export interface ExternalPoolsConfig {
   directExternalModelRules: string[]
   directExternalPathRules: string[]
   fallbackOnLocalCapacityExhausted: boolean
+  fallbackOnSchedulerRedisDegraded: boolean
   fallbackOnNoAvailableCredentials: boolean
   fallbackOnLocalTransientExhausted: boolean
   fallbackOnUnsupportedModel: boolean
@@ -1507,6 +1553,7 @@ export interface RuntimeConfig {
   whitespaceCompression: boolean
   imageProcessing: ImageProcessingConfig
   bodyConversion: BodyConversionConfig
+  promptSteering: PromptSteeringConfig
   missingMaxTokens: MissingMaxTokensConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode

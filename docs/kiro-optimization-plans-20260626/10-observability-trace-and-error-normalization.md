@@ -15,7 +15,7 @@
 已有能力：
 
 - `request-id` / `anthropic-request-id` headers。
-- `x-kiro-rs-error-id`。
+- `x-error-id`。
 - usage record。
 - usage latency trace。
 - 外部账号错误 diagnostics。
@@ -249,4 +249,3 @@ span attribute 不得包含 token、完整 prompt、完整 response。
 ## 后续可选扩展
 
 后续可以做管理端 error id 搜索页，输入 error id 后展示 request id、账号、route、model、内部原因和原始错误摘要。
-

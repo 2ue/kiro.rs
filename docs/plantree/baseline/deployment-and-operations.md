@@ -233,7 +233,7 @@ The [Runtime correctness and release gates plan](../plans/runtime-correctness-an
 
 ## 未实现要求
 
-The following required outcomes are not current baseline behavior. Detailed ownership, design, sequence, and acceptance criteria belong to the [System architecture modernization plan](../plans/system-architecture-modernization/README.md) and must respect already deferred scope:
+The following required outcomes are not current baseline behavior. Their target ownership, design, work graph and acceptance criteria belong to the [Greenfield AI Gateway plan](../plans/greenfield-ai-gateway/README.md); current Rust maintenance still respects already deferred scope:
 
 - make deployment health checks use `/readyz` where serving readiness is required, while retaining `/healthz` only for liveness;
 - complete cross-replica invalidation/convergence for Admin key, catalogs, cleanup jobs, prompt-cache/Files compatibility decisions, and every runtime mutation advertised as immediately effective;

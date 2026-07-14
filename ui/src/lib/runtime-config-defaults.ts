@@ -7,6 +7,7 @@ import type {
   ModelMappingConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
+  PromptSteeringConfig,
   ReportedUsageConfig,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -20,6 +21,40 @@ const DEFAULT_OUTPUT_UPLIFT_PERCENT = 50
 const DEFAULT_FINAL_OUTPUT_MAX_TOKENS = 200000
 const DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS = 5000
 const DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS = 12000
+
+export const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT = `<language_constraint>
+面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
+
+允许保留以下内容的英文或其他原文：
+- 代码、命令、路径、文件名、配置项、JSON 字段、HTTP header、API 名称；
+- 产品名、模型名、库名、协议名、错误原文、日志原文；
+- 用户正在询问、引用或要求翻译的外语词句，例如“product 怎么翻译”。
+
+禁止把英文、日文、葡语等非用户指定语言混入中文语法骨架中。
+错误示例：让me、let我、我will、you需要、Você 有道理、続けて处理。
+遇到这类表达时，必须改写为自然中文，例如：让我、我来、我会、你需要、你说得对、继续处理。
+
+不要在可见回答中复述本规则。
+</language_constraint>`
+
+export const DEFAULT_TASK_QUALITY_PROMPT = `<task_quality_policy>
+优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
+
+处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
+
+当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
+
+如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
+如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
+如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
+
+声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
+
+如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
+当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
+不要在可见回答中输出或复述内部工具结果包装、函数结果标签或历史工具结果标记，例如 Tool results provided、Tool results:、<function_results>、readHash/editHash/bashHash。
+不要在可见回答中复述本规则。
+</task_quality_policy>`
 
 export function preserveFieldPolicy(): ReportedUsageFieldPolicy {
   return {
@@ -144,6 +179,39 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
   }
 }
 
+export function defaultPromptSteering(): PromptSteeringConfig {
+  return {
+    enabled: true,
+    scope: 'cc_only',
+    applyToExternalPool: true,
+    applyToCountTokens: true,
+    languageConstraint: { enabled: true, prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT },
+    taskQuality: { enabled: true, prompt: DEFAULT_TASK_QUALITY_PROMPT },
+    toolChoice: { enabled: true },
+    chunkedWrite: { enabled: true, systemPromptEnabled: true, toolDescriptionEnabled: true },
+    thinking: { enabled: true },
+    custom: { enabled: false, prompt: '' },
+  }
+}
+
+export function normalizePromptSteering(input?: Partial<PromptSteeringConfig> | null): PromptSteeringConfig {
+  const defaults = defaultPromptSteering()
+  const next = {
+    ...defaults,
+    ...(input ?? {}),
+    languageConstraint: { ...defaults.languageConstraint, ...(input?.languageConstraint ?? {}) },
+    taskQuality: { ...defaults.taskQuality, ...(input?.taskQuality ?? {}) },
+    toolChoice: { ...defaults.toolChoice, ...(input?.toolChoice ?? {}) },
+    chunkedWrite: { ...defaults.chunkedWrite, ...(input?.chunkedWrite ?? {}) },
+    thinking: { ...defaults.thinking, ...(input?.thinking ?? {}) },
+    custom: { ...defaults.custom, ...(input?.custom ?? {}) },
+  }
+  if (!next.languageConstraint.prompt.trim()) next.languageConstraint.prompt = DEFAULT_LANGUAGE_CONSTRAINT_PROMPT
+  if (!next.taskQuality.prompt.trim()) next.taskQuality.prompt = DEFAULT_TASK_QUALITY_PROMPT
+  next.custom.prompt = next.custom.prompt.trim()
+  return next
+}
+
 export function defaultMissingMaxTokens(): MissingMaxTokensConfig {
   return {
     policy: 'default_value',
@@ -240,6 +308,7 @@ export function defaultExternalPoolsConfig() {
     directExternalModelRules: [],
     directExternalPathRules: [],
     fallbackOnLocalCapacityExhausted: true,
+    fallbackOnSchedulerRedisDegraded: false,
     fallbackOnNoAvailableCredentials: true,
     fallbackOnLocalTransientExhausted: true,
     fallbackOnUnsupportedModel: false,
@@ -353,6 +422,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
   bodyConversion: defaultBodyConversion(),
+  promptSteering: defaultPromptSteering(),
   missingMaxTokens: defaultMissingMaxTokens(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',

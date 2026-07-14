@@ -248,6 +248,7 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
     if explicit_expires_at.is_some() {
         apply_optional_string(&mut credential.expires_at, explicit_expires_at);
     }
+    credential.normalize_api_key_defaults();
     credential.normalize_external_idp_defaults();
 }
 
@@ -915,6 +916,8 @@ impl MultiTokenManager {
             .map(|mut cred| {
                 cred.canonicalize_auth_method();
                 cred.normalize_supported_models();
+                cred.normalize_api_key_defaults();
+                cred.normalize_external_idp_defaults();
                 let id = cred.id.unwrap_or_else(|| {
                     let id = next_id;
                     next_id += 1;
@@ -1450,6 +1453,10 @@ impl MultiTokenManager {
                     )
                 }
             }
+            LocalPoolRouteStateKind::SchedulerRedisDegraded => (
+                SelectionFailureStage::DispatchQueue,
+                AccountRejectReason::Unknown,
+            ),
             LocalPoolRouteStateKind::Ready => (
                 SelectionFailureStage::AccountEligibility,
                 AccountRejectReason::Unknown,
@@ -1564,6 +1571,7 @@ impl MultiTokenManager {
             config.dispatch_global_max_concurrent_requests,
             1,
         );
+        let scheduler_redis_retry_after_secs = self.scheduler_redis_degraded_retry_after_secs();
         let mut model_usable = 0usize;
         let mut usable = 0usize;
         let mut proxy_blocked = 0usize;
@@ -1627,6 +1635,7 @@ impl MultiTokenManager {
         let dispatch_candidate_count = usable;
         let retry_after_secs = wait_for
             .map(|duration| duration.as_secs().saturating_add(1))
+            .or(scheduler_redis_retry_after_secs)
             .filter(|value| *value > 0);
         let effective_credential_max_concurrent_requests =
             format_effective_concurrency_range(effective_concurrency_range);
@@ -1639,6 +1648,8 @@ impl MultiTokenManager {
             LocalPoolRouteStateKind::NoModelCompatible
         } else if model_usable > 0 && usable == 0 && proxy_blocked >= model_usable {
             LocalPoolRouteStateKind::ProxyBlocked
+        } else if scheduler_redis_retry_after_secs.is_some() {
+            LocalPoolRouteStateKind::SchedulerRedisDegraded
         } else if dispatchable > 0 {
             LocalPoolRouteStateKind::Ready
         } else if dispatch_candidate_count > 0
@@ -1809,6 +1820,15 @@ impl MultiTokenManager {
             .map(|remaining| remaining.as_secs().saturating_add(1))
             .unwrap_or(1)
             .max(1)
+    }
+
+    fn scheduler_redis_degraded_retry_after_secs(&self) -> Option<u64> {
+        self.redis_store.as_ref()?;
+        let now = Instant::now();
+        let degraded_until = *self.scheduler_redis_degraded_until.lock();
+        degraded_until
+            .and_then(|until| until.checked_duration_since(now))
+            .map(|remaining| remaining.as_secs().saturating_add(1).max(1))
     }
 
     fn mark_scheduler_redis_degraded(&self, operation: &'static str, err: &anyhow::Error) {
@@ -3983,6 +4003,8 @@ impl MultiTokenManager {
         };
         cred.canonicalize_auth_method();
         cred.normalize_supported_models();
+        cred.normalize_api_key_defaults();
+        cred.normalize_external_idp_defaults();
         cred
     }
 
@@ -4043,6 +4065,8 @@ impl MultiTokenManager {
         merged.storage_revision = current.storage_revision;
         merged.canonicalize_auth_method();
         merged.normalize_supported_models();
+        merged.normalize_api_key_defaults();
+        merged.normalize_external_idp_defaults();
         Ok(merged)
     }
 
@@ -4588,6 +4612,8 @@ impl MultiTokenManager {
         mutate(&mut requested)?;
         requested.canonicalize_auth_method();
         requested.normalize_supported_models();
+        requested.normalize_api_key_defaults();
+        requested.normalize_external_idp_defaults();
         self.persist_credential_update(&base, &requested)
     }
 
@@ -4630,6 +4656,8 @@ impl MultiTokenManager {
                 let mut credential = credential.clone();
                 credential.canonicalize_auth_method();
                 credential.normalize_supported_models();
+                credential.normalize_api_key_defaults();
+                credential.normalize_external_idp_defaults();
                 if entry.credentials.disabled != credential.disabled
                     || !entry.credentials.same_dispatch_config(&credential)
                 {
@@ -4671,6 +4699,8 @@ impl MultiTokenManager {
             }
             credential.canonicalize_auth_method();
             credential.normalize_supported_models();
+            credential.normalize_api_key_defaults();
+            credential.normalize_external_idp_defaults();
             let mut entry = CredentialEntry {
                 id,
                 disabled: credential.disabled,
@@ -7096,6 +7126,8 @@ impl MultiTokenManager {
                 .map(|entry| {
                     let mut credentials = entry.credentials.clone();
                     credentials.canonicalize_auth_method();
+                    credentials.normalize_api_key_defaults();
+                    credentials.normalize_external_idp_defaults();
                     credentials.disabled = entry.disabled;
                     credentials
                 })
@@ -7307,6 +7339,8 @@ impl MultiTokenManager {
 
         apply_credential_auth_update(&mut credential, update);
         credential.canonicalize_auth_method();
+        credential.normalize_api_key_defaults();
+        credential.normalize_external_idp_defaults();
         if credential.is_api_key_credential() {
             let api_key = credential
                 .kiro_api_key
@@ -7541,6 +7575,8 @@ impl MultiTokenManager {
         mut credentials: KiroCredentials,
     ) -> anyhow::Result<CallContext> {
         credentials.canonicalize_auth_method();
+        credentials.normalize_api_key_defaults();
+        credentials.normalize_external_idp_defaults();
 
         if credentials.is_api_key_credential() {
             let credentials = self.resolve_proxy_for_credential(credentials)?;
@@ -7611,6 +7647,7 @@ impl MultiTokenManager {
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         let mut new_cred = new_cred;
         new_cred.canonicalize_auth_method();
+        new_cred.normalize_api_key_defaults();
         new_cred.normalize_external_idp_defaults();
 
         // 1. 基本验证
@@ -7626,7 +7663,7 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
-            if api_key.is_empty() {
+            if api_key.trim().is_empty() {
                 anyhow::bail!("kiroApiKey 为空");
             }
         } else {
@@ -7716,6 +7753,8 @@ impl MultiTokenManager {
         validated_cred.proxy_resource_id = new_cred.proxy_resource_id;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
         validated_cred.endpoint = new_cred.endpoint;
+        validated_cred.normalize_api_key_defaults();
+        validated_cred.normalize_external_idp_defaults();
         if validated_cred.machine_id.is_none() {
             validated_cred.machine_id = Some(machine_id::generate_from_credentials(
                 &validated_cred,

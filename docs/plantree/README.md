@@ -2,7 +2,7 @@
 
 Role: Durable planning registry and authority entrypoint
 
-Status: Current as of 2026-07-12
+Status: Current as of 2026-07-13
 
 Authority: Defines how project-wide facts, accepted decisions, plan state, and historical evidence are retrieved
 
@@ -25,19 +25,21 @@ Current-state facts and target-state decisions answer different questions and mu
 
 ## Reading Path
 
-1. Read the [business and product context](baseline/business-context.md) for the single-operator trust model, business capabilities, compatibility invariants, and non-goals.
+1. Read the [business and product context](baseline/business-context.md) for the current Rust product, single-operator trust model, business capabilities and compatibility invariants.
 2. Read the [current system context](baseline/system-context.md), then only the baseline maps relevant to the change.
 3. Select the owning registered plan below and read its `README.md` before its roadmap, topics, questions, decisions, or evidence.
-4. For cross-system refactoring, begin with the [system architecture modernization plan](plans/system-architecture-modernization/README.md).
-5. Treat older analysis files as historical input unless the owning plan's source map gives them stronger authority; moved historical material is retrieved through the [documentation archive](../archive/README.md).
+4. For the new system target, begin with the [Greenfield AI Gateway plan](plans/greenfield-ai-gateway/README.md).
+5. Use the [superseded Rust modernization plan](plans/system-architecture-modernization/README.md) only for historical design, verified findings and explicitly inherited semantic invariants.
+6. Treat older analysis files as historical input unless the owning plan's source map gives them stronger authority; moved historical material is retrieved through the [documentation archive](../archive/README.md).
 
 ## Registered Plans
 
 | Plan | Status | Current Phase | Last Landed | Next Target |
 | --- | --- | --- | --- | --- |
-| [System architecture modernization](plans/system-architecture-modernization/README.md) | Target Implementation Ready | One complete target-only modular rewrite specification; production implementation Not Started and final cutover Not Ready | [2026-07-12 final-plan readiness review](plans/system-architecture-modernization/history/final-plan-readiness-review-2026-07-12.md) records 47 open-ended findings, 50 technical-authority modules, 100 binding requirements/invariants, 16 finding candidates, accepted ADR 001/003-014, resolved `Q-001`-`Q-013`, exact modular work, final cutover/rollback, and no implementation evidence | Begin the one complete target implementation from the accepted dependency work map; create `implementation-status.md` only when source implementation starts |
+| [Greenfield AI Gateway](plans/greenfield-ai-gateway/README.md) | Architecture Plan Ready For Review | New-repository Go/React target, module contracts, Kiro V1 scope, technology stack, references, complete work graph and acceptance gates documented; implementation Not Started | 2026-07-13: [complete reconstruction plan](plans/greenfield-ai-gateway/topics/complete-reconstruction-plan.md), [reference review](plans/greenfield-ai-gateway/topics/reference-projects-and-template-selection.md) and [decision 001](plans/greenfield-ai-gateway/decisions/001-greenfield-go-modular-ai-gateway.md) created | Accept the plan, choose the new repository name/location and create the target repository |
+| [System architecture modernization](plans/system-architecture-modernization/README.md) | Superseded / Historical Reference | Rust target implementation never started; findings and selected invariants remain reference inputs for the greenfield plan | 2026-07-13: [supersession record](plans/system-architecture-modernization/history/superseded-by-greenfield-ai-gateway-2026-07-13.md) maps retained evidence and rejected target topology | No target implementation; preserve until a link-safe archive pass |
 | [Runtime correctness and release gates](plans/runtime-correctness-and-release-gates/README.md) | In Progress | Runtime usage/error correctness follow-up before v0.0.103 release validation | 2026-07-13: [feature follow-up status](../feature/runtime-usage-error-followup-2026-07-13.md) records current fixes, `/ha` usage explanation, and remaining real-service gates; earlier static/storage/protocol/load/shutdown evidence remains indexed | Finish C0 + temporary local-service real-call validation, then complete the end-to-end Docker gate after the crates.io fetch timeout |
-| [Request body capability modularization](plans/request-body-capability-modularization/README.md) | Implemented And Validated | Maintenance | 2026-07-06: capability plans, converter split, configuration, UI, and fake-upstream regression landed | No active implementation; preserve contracts and route future cross-system work through the modernization plan |
+| [Request body capability modularization](plans/request-body-capability-modularization/README.md) | Implemented And Validated | Maintenance | 2026-07-06: capability plans, converter split, configuration, UI, and fake-upstream regression landed | No active implementation; preserve behavior as an oracle and route future target-system work through the Greenfield AI Gateway plan |
 | [Admin observability, routing model support, and config IA](plans/admin-observability-routing-config/README.md) | Implemented And Locally Verified | Maintenance | 2026-07-07: exact usage search, supported-model routing, bounded prompt retry, and UI grouping landed | Optional low-volume real-upstream smoke only when explicitly requested |
 
 ## Baseline
@@ -61,5 +63,6 @@ Current-state facts and target-state decisions answer different questions and mu
 ## Historical Documentation
 
 - [Documentation archive](../archive/README.md): moved historical rationale/evidence that no longer owns current facts or active execution order.
+- [Rust modernization supersession record](plans/system-architecture-modernization/history/superseded-by-greenfield-ai-gateway-2026-07-13.md): explains which old findings/invariants remain useful and which target choices were replaced.
 - [Modernization authority and source map](plans/system-architecture-modernization/indexes/authority-and-source-map.md): classification of retained and archived legacy sources.
 - [Legacy document disposition](plans/system-architecture-modernization/indexes/legacy-document-disposition.md): reviewed keep/archive/delete decisions, provenance and recovery rules.

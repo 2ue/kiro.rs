@@ -16,6 +16,13 @@ use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 use crate::model::model_support::{model_is_supported_by_list, normalize_supported_models};
 
+/// Kiro API Key/headless 凭据默认应走 CLI runtime 协议。
+///
+/// `Config.defaultEndpoint` 默认为 `ide`，OAuth/IDE 登录账号继续使用该默认值；
+/// 但 `ksk_...` API Key 是 Kiro CLI/headless 认证形态，默认走 `cli` 可以避免
+/// 误带 IDE/profile 语义。
+pub const KIRO_API_KEY_DEFAULT_ENDPOINT: &str = "cli";
+
 /// Kiro OAuth 凭证
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -242,6 +249,82 @@ fn compact_protocol_value(value: &str) -> String {
         .collect()
 }
 
+fn normalized_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 解析 Kiro API Key 便捷格式：`ksk_xxx|region`。
+///
+/// 返回 `(api_key, region)`。没有 `|region` 时只返回 key。
+/// 该函数不打印、不记录原始 key，调用方负责继续按敏感字段处理。
+pub fn split_kiro_api_key_and_region(raw: &str) -> Option<(String, Option<String>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let Some((key, region)) = trimmed.split_once('|') else {
+        return Some((trimmed.to_string(), None));
+    };
+
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let region = region.trim();
+    Some((
+        key.to_string(),
+        (!region.is_empty()).then(|| region.to_string()),
+    ))
+}
+
+fn looks_like_kiro_api_key_text(value: &str) -> bool {
+    let key = value
+        .trim()
+        .split_once('|')
+        .map(|(key, _)| key)
+        .unwrap_or_else(|| value.trim())
+        .trim();
+    key.starts_with("ksk_")
+}
+
+fn api_key_credential_from_text(raw: &str, priority: u32) -> Option<KiroCredentials> {
+    let (api_key, region) = split_kiro_api_key_and_region(raw)?;
+    if !looks_like_kiro_api_key_text(&api_key) {
+        return None;
+    }
+
+    let mut credential = KiroCredentials {
+        auth_method: Some("api_key".to_string()),
+        kiro_api_key: Some(api_key),
+        priority,
+        region: region.clone(),
+        auth_region: region.clone(),
+        api_region: region,
+        endpoint: Some(KIRO_API_KEY_DEFAULT_ENDPOINT.to_string()),
+        ..Default::default()
+    };
+    credential.normalize_api_key_defaults();
+    Some(credential)
+}
+
+fn api_key_credentials_from_plain_text(content: &str) -> Option<Vec<KiroCredentials>> {
+    let mut credentials = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let credential = api_key_credential_from_text(line, credentials.len() as u32)?;
+        credentials.push(credential);
+    }
+
+    (!credentials.is_empty()).then_some(credentials)
+}
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
     match compact_protocol_value(value).as_str() {
         "builderid" | "iam" | "idc" => "idc",
@@ -349,8 +432,16 @@ impl CredentialsConfig {
             return Ok(CredentialsConfig::Multiple(vec![]));
         }
 
-        let config = serde_json::from_str(&content)?;
-        Ok(config)
+        match serde_json::from_str(&content) {
+            Ok(config) => Ok(config),
+            Err(json_error) => {
+                if let Some(credentials) = api_key_credentials_from_plain_text(&content) {
+                    Ok(CredentialsConfig::Multiple(credentials))
+                } else {
+                    Err(json_error.into())
+                }
+            }
+        }
     }
 
     /// 转换为按优先级排序的凭据列表
@@ -359,6 +450,7 @@ impl CredentialsConfig {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
                 cred.normalize_supported_models();
+                cred.normalize_api_key_defaults();
                 cred.normalize_external_idp_defaults();
                 vec![cred]
             }
@@ -368,6 +460,7 @@ impl CredentialsConfig {
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
                     cred.normalize_supported_models();
+                    cred.normalize_api_key_defaults();
                     cred.normalize_external_idp_defaults();
                 }
                 creds
@@ -476,6 +569,68 @@ impl KiroCredentials {
         if canonical != auth_method {
             self.auth_method = Some(canonical.to_string());
         }
+    }
+
+    /// 规范化 Kiro API Key/headless 凭据。
+    ///
+    /// 支持把 `kiroApiKey: "ksk_xxx|eu-central-1"` 拆成真实 key 和区域；
+    /// API Key 凭据默认走 `cli` endpoint；如果只给了 `region`，同步补齐
+    /// `authRegion/apiRegion`，避免 API 请求仍回退到全局区域。
+    pub fn normalize_api_key_defaults(&mut self) {
+        self.canonicalize_auth_method();
+        if !self.is_api_key_credential() {
+            return;
+        }
+
+        let Some(raw_key) = self.kiro_api_key.clone() else {
+            return;
+        };
+        if raw_key.trim().is_empty() {
+            return;
+        }
+
+        if let Some((api_key, parsed_region)) = split_kiro_api_key_and_region(&raw_key) {
+            self.kiro_api_key = Some(api_key);
+            if let Some(region) = parsed_region {
+                if self.region.as_deref().is_none_or(str::is_empty) {
+                    self.region = Some(region.clone());
+                }
+                if self.auth_region.as_deref().is_none_or(str::is_empty) {
+                    self.auth_region = Some(region.clone());
+                }
+                if self.api_region.as_deref().is_none_or(str::is_empty) {
+                    self.api_region = Some(region);
+                }
+            }
+        }
+
+        self.auth_method = Some("api_key".to_string());
+        self.refresh_token = None;
+        self.provider = None;
+        self.client_id = None;
+        self.client_secret = None;
+        self.token_endpoint = None;
+        self.issuer_url = None;
+        self.scopes = None;
+        self.access_token = None;
+        self.expires_at = None;
+        self.profile_arn = None;
+
+        if self.auth_region.as_deref().is_none_or(str::is_empty) {
+            self.auth_region = self.region.clone();
+        }
+        if self.api_region.as_deref().is_none_or(str::is_empty) {
+            self.api_region = self.region.clone();
+        }
+        if self.endpoint.as_deref().is_none_or(str::is_empty) {
+            self.endpoint = Some(KIRO_API_KEY_DEFAULT_ENDPOINT.to_string());
+        }
+
+        self.kiro_api_key = normalized_optional(self.kiro_api_key.take());
+        self.region = normalized_optional(self.region.take());
+        self.auth_region = normalized_optional(self.auth_region.take());
+        self.api_region = normalized_optional(self.api_region.take());
+        self.endpoint = normalized_optional(self.endpoint.take());
     }
 
     /// 补齐 external_idp 账号的可推导字段。
@@ -1025,6 +1180,76 @@ mod tests {
         assert_eq!(creds.auth_method.as_deref(), Some("api_key"));
         assert!(creds.is_api_key_credential());
         assert!(!creds.is_idc_refresh_credential());
+    }
+
+    #[test]
+    fn test_api_key_pipe_region_normalizes_to_cli_endpoint_and_regions() {
+        let mut creds = KiroCredentials {
+            auth_method: Some("API KEY".to_string()),
+            kiro_api_key: Some("ksk_test_key|eu-central-1".to_string()),
+            endpoint: None,
+            ..Default::default()
+        };
+
+        creds.normalize_api_key_defaults();
+
+        assert_eq!(creds.auth_method.as_deref(), Some("api_key"));
+        assert_eq!(creds.kiro_api_key.as_deref(), Some("ksk_test_key"));
+        assert_eq!(creds.region.as_deref(), Some("eu-central-1"));
+        assert_eq!(creds.auth_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(creds.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(
+            creds.endpoint.as_deref(),
+            Some(KIRO_API_KEY_DEFAULT_ENDPOINT)
+        );
+        assert!(creds.refresh_token.is_none());
+        assert!(creds.profile_arn.is_none());
+        assert!(creds.client_id.is_none());
+    }
+
+    #[test]
+    fn test_api_key_normalization_preserves_explicit_endpoint_and_api_region() {
+        let mut creds = KiroCredentials {
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("ksk_test_key|eu-central-1".to_string()),
+            region: Some("us-east-1".to_string()),
+            api_region: Some("us-west-2".to_string()),
+            endpoint: Some("ide".to_string()),
+            ..Default::default()
+        };
+
+        creds.normalize_api_key_defaults();
+
+        assert_eq!(creds.region.as_deref(), Some("us-east-1"));
+        assert_eq!(creds.auth_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(creds.api_region.as_deref(), Some("us-west-2"));
+        assert_eq!(creds.endpoint.as_deref(), Some("ide"));
+    }
+
+    #[test]
+    fn test_credentials_config_plain_text_api_key_with_region() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-rs-credentials-api-key-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            "ksk_first|eu-central-1\n# comment\nksk_second|us-east-1\n",
+        )
+        .unwrap();
+
+        let config = CredentialsConfig::load(&path).unwrap();
+        let credentials = config.into_sorted_credentials();
+
+        assert_eq!(credentials.len(), 2);
+        assert_eq!(credentials[0].auth_method.as_deref(), Some("api_key"));
+        assert_eq!(credentials[0].kiro_api_key.as_deref(), Some("ksk_first"));
+        assert_eq!(credentials[0].api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(credentials[0].endpoint.as_deref(), Some("cli"));
+        assert_eq!(credentials[1].kiro_api_key.as_deref(), Some("ksk_second"));
+        assert_eq!(credentials[1].api_region.as_deref(), Some("us-east-1"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

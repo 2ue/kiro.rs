@@ -119,6 +119,7 @@ fn normalize_public_upstream_text(raw: &str) -> Option<String> {
 fn public_upstream_message_has_forbidden_content(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
+        "kiro",
         "credential",
         "external pool",
         "external_pool",
@@ -309,6 +310,7 @@ mod tests {
         ] {
             let lower = message.to_ascii_lowercase();
             for forbidden in [
+                "kiro",
                 "credential",
                 "external pool",
                 "external_pool",
@@ -378,5 +380,26 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn kiro_official_upstream_message_rejects_kiro_branded_json_message() {
+        assert!(
+            kiro_official_upstream_message(
+                r#"{"message":"Kiro service rejected this model request"}"#
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn kiro_official_upstream_message_drops_forbidden_reason_without_leaking_it() {
+        let message = kiro_official_upstream_message(
+            r#"{"message":"The requested model is temporarily unavailable.","reason":"KIRO_MODEL_GATEWAY"}"#,
+        )
+        .expect("safe message remains available");
+
+        assert_eq!(message, "The requested model is temporarily unavailable.");
+        assert!(!message.to_ascii_lowercase().contains("kiro"));
     }
 }

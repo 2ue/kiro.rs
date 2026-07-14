@@ -96,10 +96,7 @@ pub(super) fn validate_tool_pairing(
             warnings.duplicate_tool_results += 1;
             if let Some(text) = kiro_tool_result_to_text(result) {
                 warnings.duplicate_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!(
-                    "[duplicate tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
+                orphan_tool_result_texts.push(format!("[duplicate output]\n{}", text));
             }
             tracing::warn!(
                 "跳过重复的当前结构化 tool_result，并在兼容模式下转为普通文本：tool_use_id={}",
@@ -112,10 +109,7 @@ pub(super) fn validate_tool_pairing(
             warnings.orphan_tool_results += 1;
             if let Some(text) = kiro_tool_result_to_text(result) {
                 warnings.orphan_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!(
-                    "[orphan tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
+                orphan_tool_result_texts.push(format!("[previous output]\n{}", text));
             }
             tracing::warn!(
                 "tool_result 不属于最后一条 assistant tool_use，已从 tool_results 移除并在兼容模式下转为普通文本，tool_use_id={}",
@@ -126,10 +120,7 @@ pub(super) fn validate_tool_pairing(
             warnings.orphan_tool_results += 1;
             if let Some(text) = kiro_tool_result_to_text(result) {
                 warnings.orphan_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!(
-                    "[orphan tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
+                orphan_tool_result_texts.push(format!("[previous output]\n{}", text));
             }
             tracing::warn!(
                 "孤立的 tool_result 找不到对应 tool_use，已从 tool_results 移除并在兼容模式下转为普通文本，tool_use_id={}",

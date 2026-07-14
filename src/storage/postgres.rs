@@ -259,6 +259,8 @@ fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
     credential.disabled = disabled;
     credential.canonicalize_auth_method();
     credential.normalize_supported_models();
+    credential.normalize_api_key_defaults();
+    credential.normalize_external_idp_defaults();
     Ok(credential)
 }
 
@@ -1032,24 +1034,30 @@ impl PostgresStore {
         &self,
         api_key: &str,
     ) -> anyhow::Result<KiroCredentials> {
-        let api_key = api_key.trim();
-        if api_key.is_empty() {
+        let (api_key, region) =
+            crate::kiro::model::credentials::split_kiro_api_key_and_region(api_key)
+                .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 为空"))?;
+        if api_key.trim().is_empty() {
             anyhow::bail!("KIRO_API_KEY 为空");
         }
-        if let Some(existing) = self.find_existing_api_key_credential(api_key).await? {
+        if let Some(existing) = self.find_existing_api_key_credential(&api_key).await? {
             return Ok(existing);
         }
 
-        let credential = KiroCredentials {
+        let mut credential = KiroCredentials {
             kiro_api_key: Some(api_key.to_string()),
             auth_method: Some("api_key".to_string()),
             priority: 0,
+            region: region.clone(),
+            auth_region: region.clone(),
+            api_region: region,
             ..Default::default()
         };
+        credential.normalize_api_key_defaults();
         match self.insert_credential(&credential).await {
             Ok(inserted) => Ok(inserted),
             Err(err) if err.to_string().contains("kiroApiKey 重复") => self
-                .find_existing_api_key_credential(api_key)
+                .find_existing_api_key_credential(&api_key)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 已存在但重新查询失败")),
             Err(err) => Err(err),
@@ -1205,6 +1213,8 @@ impl PostgresStore {
         canonical.id = Some(id);
         canonical.canonicalize_auth_method();
         canonical.normalize_supported_models();
+        canonical.normalize_api_key_defaults();
+        canonical.normalize_external_idp_defaults();
         let priority = i32::try_from(canonical.priority)
             .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
@@ -1334,6 +1344,8 @@ impl PostgresStore {
         }
         canonical.canonicalize_auth_method();
         canonical.normalize_supported_models();
+        canonical.normalize_api_key_defaults();
+        canonical.normalize_external_idp_defaults();
         let priority = i32::try_from(canonical.priority)
             .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
@@ -1417,6 +1429,8 @@ impl PostgresStore {
         }
         canonical.canonicalize_auth_method();
         canonical.normalize_supported_models();
+        canonical.normalize_api_key_defaults();
+        canonical.normalize_external_idp_defaults();
         let priority = i32::try_from(canonical.priority)
             .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
@@ -3779,6 +3793,8 @@ async fn repair_active_credential_hashes(
         let mut credential: KiroCredentials = serde_json::from_value(data)?;
         credential.id = Some(credential_id.max(0) as u64);
         credential.canonicalize_auth_method();
+        credential.normalize_api_key_defaults();
+        credential.normalize_external_idp_defaults();
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&credential);
 
         if let Some(api_key_hash) = api_key_hash
@@ -4055,6 +4071,7 @@ impl PostgresUsageStore {
         Self { store }
     }
 
+    #[cfg(test)]
     pub async fn record(&self, record: UsageRecord) -> anyhow::Result<()> {
         self.record_batch(vec![record]).await
     }

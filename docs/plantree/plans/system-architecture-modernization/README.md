@@ -1,30 +1,38 @@
 # System Architecture Modernization
 
-Role: Final complete implementation specification for the system-wide rewrite
+Role: Historical complete implementation specification for the superseded Rust rewrite target
 
-Status: Target implementation ready; production implementation Not Started; final cutover Not Ready
+Status: Superseded on 2026-07-13; production implementation never started; archive/reference only
 
-Authority: Owns the accepted target architecture, complete scope, dependency work graph, technical policies, implementation contract, final acceptance, one system cutover and whole-system rollback
+Authority: Historical Rust target and verified-analysis source only; the Greenfield AI Gateway plan owns current target architecture and implementation
 
-As of: `v0.0.102` / `e9479df` / plan updated 2026-07-12
+As of: `v0.0.102` / `e9479df` / superseded 2026-07-13
 
-Read when: Changing system-wide authority, dependency direction, request flow, scheduling, state consistency, resources, operations, frontends, validation, release, or implementing any modernization work unit
+Read when: Retrieving historical Rust target reasoning, verified findings, current-system evidence, or semantic invariants explicitly inherited by the greenfield plan
 
-Related: [Plan Tree](../../README.md), [Business context](../../baseline/business-context.md), [Current system context](../../baseline/system-context.md), [Index registry](indexes/README.md), [Authority/source map](indexes/authority-and-source-map.md), [Continuous audit](topics/problems/continuous-audit-and-finding-lifecycle.md), [Traceability](indexes/traceability-matrix.md)
+Related: [Greenfield AI Gateway](../greenfield-ai-gateway/README.md), [supersession record](history/superseded-by-greenfield-ai-gateway-2026-07-13.md), [Plan Tree](../../README.md), [Business context](../../baseline/business-context.md), [Current system context](../../baseline/system-context.md), [Index registry](indexes/README.md), [Authority/source map](indexes/authority-and-source-map.md)
 
-Canonical implementation: [Final complete implementation plan](topics/delivery/migration-sequence.md)
+## Supersession Notice
 
-Exact modular work: [Modular implementation work map](indexes/execution-slice-map.md)
+The user replaced this plan's Rust, two-frontend and fixed 50-module target with a new general AI Gateway implemented in a separate repository using Go plus one React/TypeScript/Tailwind Admin application. Kiro is now one complete provider module behind versioned contracts.
 
-Target technical authorities: [50-module ledger](indexes/target-module-ledger.md)
+No source implementation started under this plan. All target-specific implementation statements below are preserved as a historical snapshot and must not be executed. The [Greenfield AI Gateway plan](../greenfield-ai-gateway/README.md) wins target architecture, technology, module, frontend, work-order, acceptance and cutover conflicts.
 
-Complete source coverage: [Rewrite inventory](indexes/rewrite-inventory.md)
+Current-source evidence, verified findings and the replay/terminal/lease/shutdown invariants identified in the [supersession record](history/superseded-by-greenfield-ai-gateway-2026-07-13.md) remain reference inputs only.
 
-Implementation loop: [Entry and completion contract](topics/delivery/next-package-brief.md)
+Historical canonical implementation: [Final complete Rust implementation plan](topics/delivery/migration-sequence.md)
 
-Final validation/cutover: [Verification, final cutover and whole-system rollback](topics/delivery/verification-rollout-and-rollback.md)
+Historical modular work: [Rust modular implementation work map](indexes/execution-slice-map.md)
 
-Current readiness: [Final-plan readiness review](history/final-plan-readiness-review-2026-07-12.md)
+Historical target technical authorities: [50-module ledger](indexes/target-module-ledger.md)
+
+Historical complete source coverage: [Rewrite inventory](indexes/rewrite-inventory.md)
+
+Historical implementation loop: [Entry and completion contract](topics/delivery/next-package-brief.md)
+
+Historical validation/cutover: [Verification, final cutover and whole-system rollback](topics/delivery/verification-rollout-and-rollback.md)
+
+Historical readiness: [Final-plan readiness review](history/final-plan-readiness-review-2026-07-12.md)
 
 ## Purpose
 
@@ -120,7 +128,7 @@ This plan contains no project estimate, calendar, staffing, maintainer assignmen
 
 ## Readiness Semantics
 
-- **Target implementation ready:** final scope, technical decisions, exact work graph, conservative defaults, gates, deletion and final-cutover rules are fixed. This is the current plan-level state.
+- **Historical target implementation ready:** as of 2026-07-12, final Rust scope, technical decisions, exact work graph, conservative defaults, gates, deletion and final-cutover rules were fixed. This was the source plan's readiness state before supersession and is not current target readiness.
 - **Production implementation Not Started:** no modernization target source/evidence has landed under this plan.
 - **Production cutover Not Ready:** no complete candidate digest, migration rehearsal, load/recovery/client/browser/release evidence or rollback rehearsal exists.
 - **Complete:** only after target activation, full-system observation, compatibility-state contraction, legacy cleanup and final post-contract gates.

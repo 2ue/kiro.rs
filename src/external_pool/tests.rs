@@ -725,7 +725,7 @@ async fn external_pool_error_response_masks_raw_error_body_with_trace_id() {
     assert!(
         response
             .headers()
-            .get(HeaderName::from_static("x-kiro-rs-error-id"))
+            .get(HeaderName::from_static("x-error-id"))
             .and_then(|value| value.to_str().ok())
             .is_some_and(|error_id| error_id.starts_with("req_01"))
     );
@@ -811,7 +811,7 @@ async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
     assert!(
         response
             .headers()
-            .get(HeaderName::from_static("x-kiro-rs-error-id"))
+            .get(HeaderName::from_static("x-error-id"))
             .and_then(|value| value.to_str().ok())
             .is_some_and(|error_id| error_id.starts_with("req_01"))
     );

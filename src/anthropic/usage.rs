@@ -26,7 +26,6 @@ const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 const USAGE_WRITER_BATCH_MAX: usize = 64;
 const USAGE_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(25);
 const USAGE_WRITER_POSTGRES_TIMEOUT_SECS: u64 = 5;
-const USAGE_WRITER_ADMISSION_TIMEOUT: StdDuration = StdDuration::from_millis(100);
 const USAGE_REDIS_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_REDIS_WRITER_BATCH_MAX: usize = 64;
 const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(10);
@@ -254,6 +253,36 @@ pub struct UsageLatencyTrace {
     pub stop_reason_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspected_intent_preamble_end_turn: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_preamble_risk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspected_tool_context_leak_end_turn: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_context_leak_markers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_tail_intent_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_turn_anomaly_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_turn_anomaly_risk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_eof_without_completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upstream_event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upstream_events: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_upstream_assistant_response: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_upstream_tool_use: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saw_upstream_metadata: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_content_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filtered_trivial_text_blocks: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filtered_trivial_text_chars: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -303,6 +332,21 @@ impl UsageLatencyTrace {
             && self.saw_upstream_completed.is_none()
             && self.stop_reason_source.is_none()
             && self.suspected_intent_preamble_end_turn.is_none()
+            && self.intent_preamble_risk.is_none()
+            && self.suspected_tool_context_leak_end_turn.is_none()
+            && self.tool_context_leak_markers.is_none()
+            && self.assistant_tail_intent_hint.is_none()
+            && self.end_turn_anomaly_reason.is_none()
+            && self.end_turn_anomaly_risk.is_none()
+            && self.upstream_eof_without_completed.is_none()
+            && self.last_upstream_event_type.is_none()
+            && self.last_upstream_events.is_none()
+            && self.saw_upstream_assistant_response.is_none()
+            && self.saw_upstream_tool_use.is_none()
+            && self.saw_upstream_metadata.is_none()
+            && self.last_assistant_content_chars.is_none()
+            && self.filtered_trivial_text_blocks.is_none()
+            && self.filtered_trivial_text_chars.is_none()
     }
 }
 
@@ -1057,13 +1101,8 @@ struct UsageWriterControl {
 }
 
 enum UsageWriterEnqueueError {
-    AdmissionTimedOut(UsageRecord),
+    Full(UsageRecord),
     Closed(UsageRecord),
-}
-
-enum UsageWriterAdmissionError {
-    TimedOut,
-    Closed,
 }
 
 impl UsageWriterControl {
@@ -1092,31 +1131,7 @@ impl UsageWriterControl {
                 Err(UsageWriterEnqueueError::Closed(record))
             }
             Err(mpsc::error::TrySendError::Full(record)) => {
-                let admission = block_on_usage_runtime(async move {
-                    match tokio::time::timeout(
-                        USAGE_WRITER_ADMISSION_TIMEOUT,
-                        sender.reserve_owned(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(permit)) => Ok(permit),
-                        Ok(Err(_)) => Err(UsageWriterAdmissionError::Closed),
-                        Err(_) => Err(UsageWriterAdmissionError::TimedOut),
-                    }
-                });
-                match admission {
-                    Ok(Ok(permit)) => {
-                        permit.send(record);
-                        self.progress.mark_accepted();
-                        Ok(true)
-                    }
-                    Ok(Err(UsageWriterAdmissionError::TimedOut)) => {
-                        Err(UsageWriterEnqueueError::AdmissionTimedOut(record))
-                    }
-                    Ok(Err(UsageWriterAdmissionError::Closed)) | Err(_) => {
-                        Err(UsageWriterEnqueueError::Closed(record))
-                    }
-                }
+                Err(UsageWriterEnqueueError::Full(record))
             }
         }
     }
@@ -1509,32 +1524,45 @@ impl UsageRecorder {
                     self.backpressured_persist_records
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                Err(UsageWriterEnqueueError::AdmissionTimedOut(record)) => {
+                Err(UsageWriterEnqueueError::Full(_record)) => {
                     let count = self
                         .backpressured_persist_records
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
-                    tracing::warn!(
-                        count,
-                        timeout_ms = USAGE_WRITER_ADMISSION_TIMEOUT.as_millis() as u64,
-                        "PgSQL usage 队列容量等待超时，降级为有界直接持久化"
-                    );
-                    self.persist_usage_sync(record);
+                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_log_usage_counter(count) {
+                        tracing::warn!(
+                            count,
+                            dropped,
+                            "PgSQL usage 队列已满，已丢弃本条持久化记录以避免阻塞主请求"
+                        );
+                    }
                 }
-                Err(UsageWriterEnqueueError::Closed(record)) => {
-                    tracing::warn!("PgSQL usage writer 意外关闭，降级为直接持久化");
-                    self.persist_usage_sync(record);
+                Err(UsageWriterEnqueueError::Closed(_record)) => {
+                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_log_usage_counter(dropped) {
+                        tracing::warn!(
+                            dropped,
+                            "PgSQL usage writer 已关闭，已丢弃本条持久化记录以避免阻塞主请求"
+                        );
+                    }
                 }
             }
         } else {
-            self.persist_usage_sync(record);
+            let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_log_usage_counter(dropped) {
+                tracing::warn!(
+                    dropped,
+                    "PgSQL usage writer 不可用，已丢弃本条持久化记录以避免阻塞主请求"
+                );
+            }
         }
     }
 
     fn record_usage_redis(&self, record: UsageRecord) {
-        let Some(redis) = &self.redis_store else {
+        if self.redis_store.is_none() {
             return;
-        };
+        }
         if let Some(writer) = &self.redis_writer {
             match writer.enqueue(record) {
                 Ok(false) => {}
@@ -1542,27 +1570,40 @@ impl UsageRecorder {
                     self.backpressured_redis_records
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                Err(UsageWriterEnqueueError::AdmissionTimedOut(record)) => {
+                Err(UsageWriterEnqueueError::Full(_record)) => {
                     let count = self
                         .backpressured_redis_records
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
-                    tracing::warn!(
-                        count,
-                        timeout_ms = USAGE_WRITER_ADMISSION_TIMEOUT.as_millis() as u64,
-                        "Redis usage 队列容量等待超时，降级为有界直接持久化"
-                    );
-                    self.persist_usage_redis_sync(redis.clone(), record);
+                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_log_usage_counter(count) {
+                        tracing::warn!(
+                            count,
+                            dropped,
+                            "Redis usage 队列已满，已丢弃本条 summary 记录以避免阻塞主请求"
+                        );
+                    }
                 }
-                Err(UsageWriterEnqueueError::Closed(record)) => {
-                    tracing::warn!("Redis usage writer 意外关闭，降级为直接持久化");
-                    self.persist_usage_redis_sync(redis.clone(), record);
+                Err(UsageWriterEnqueueError::Closed(_record)) => {
+                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_log_usage_counter(dropped) {
+                        tracing::warn!(
+                            dropped,
+                            "Redis usage writer 已关闭，已丢弃本条 summary 记录以避免阻塞主请求"
+                        );
+                    }
                 }
             }
             return;
         }
 
-        self.persist_usage_redis_sync(redis.clone(), record);
+        let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_usage_counter(dropped) {
+            tracing::warn!(
+                dropped,
+                "Redis usage writer 不可用，已丢弃本条 summary 记录以避免阻塞主请求"
+            );
+        }
     }
 
     pub fn writer_stats(&self) -> UsageRecorderStats {
@@ -1616,47 +1657,6 @@ impl UsageRecorder {
                 .load(Ordering::Relaxed),
             dropped_persist_records: self.dropped_persist_records.load(Ordering::Relaxed),
             rejected_after_shutdown: self.rejected_after_shutdown.load(Ordering::Relaxed),
-        }
-    }
-
-    fn persist_usage_sync(&self, record: UsageRecord) {
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            if let Err(err) = block_on_usage_store(async move {
-                tokio::time::timeout(
-                    StdDuration::from_secs(USAGE_WRITER_POSTGRES_TIMEOUT_SECS),
-                    store.record(record),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "PgSQL usage 直接持久化超时（{}s）",
-                        USAGE_WRITER_POSTGRES_TIMEOUT_SECS
-                    )
-                })?
-            }) {
-                self.dropped_persist_records.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("写入 PgSQL usage record 失败: {}", err);
-            }
-        }
-    }
-
-    fn persist_usage_redis_sync(&self, redis: Arc<RedisStore>, record: UsageRecord) {
-        if let Err(err) = block_on_usage_store(async move {
-            tokio::time::timeout(
-                StdDuration::from_secs(USAGE_REDIS_WRITER_TIMEOUT_SECS),
-                redis.record_usage_summary(&record),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Redis usage 直接持久化超时（{}s）",
-                    USAGE_REDIS_WRITER_TIMEOUT_SECS
-                )
-            })?
-        }) {
-            self.dropped_redis_records.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("写入 Redis usage summary 失败: {}", err);
         }
     }
 
@@ -3103,7 +3103,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn writer_applies_bounded_backpressure_and_shutdown_drains() {
+    async fn writer_drops_when_full_and_shutdown_drains_accepted_records() {
         let (recorder, persisted, started, gate) = recorder_with_test_writer(1, true);
         assert_eq!(
             recorder.record(record("queued-1", 0, UsageSource::None)),
@@ -3116,29 +3116,25 @@ mod tests {
         );
 
         let third_recorder = recorder.clone();
-        let third =
-            tokio::spawn(
-                async move { third_recorder.record(record("queued-3", 0, UsageSource::None)) },
-            );
-        tokio::time::sleep(StdDuration::from_millis(25)).await;
+        let started_at = Instant::now();
+        assert_eq!(
+            third_recorder.record(record("queued-3", 0, UsageSource::None)),
+            UsageRecordOutcome::Accepted
+        );
         assert!(
-            !third.is_finished(),
-            "third record should wait for queue capacity"
+            started_at.elapsed() < StdDuration::from_millis(50),
+            "full usage writer should not block the request path"
         );
 
         gate.add_permits(1);
-        assert_eq!(third.await.unwrap(), UsageRecordOutcome::Accepted);
         let report = recorder.shutdown(StdDuration::from_secs(1)).await;
         assert!(report.drained);
         assert!(!report.timed_out);
-        assert_eq!(report.stats.writer_accepted, 3);
-        assert_eq!(report.stats.writer_finished, 3);
+        assert_eq!(report.stats.writer_accepted, 2);
+        assert_eq!(report.stats.writer_finished, 2);
         assert_eq!(report.stats.backpressured_persist_records, 1);
-        assert_eq!(report.stats.dropped_persist_records, 0);
-        assert_eq!(
-            persisted.lock().as_slice(),
-            &["queued-1", "queued-2", "queued-3"]
-        );
+        assert_eq!(report.stats.dropped_persist_records, 1);
+        assert_eq!(persisted.lock().as_slice(), &["queued-1", "queued-2"]);
 
         assert_eq!(
             recorder.record(record("late", 0, UsageSource::None)),
@@ -3177,7 +3173,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn saturated_writer_admission_and_fallback_are_bounded() {
+    async fn saturated_writer_drops_without_synchronous_fallback() {
         let (recorder, persisted, started, gate) = recorder_with_test_writer(1, true);
         recorder.record(record("busy", 0, UsageSource::None));
         started.notified().await;
@@ -3189,10 +3185,13 @@ mod tests {
             UsageRecordOutcome::Accepted
         );
         let elapsed = started_at.elapsed();
-        assert!(elapsed >= StdDuration::from_millis(80));
-        assert!(elapsed < StdDuration::from_millis(500));
+        assert!(
+            elapsed < StdDuration::from_millis(50),
+            "saturated usage writer should drop instead of synchronously persisting"
+        );
         assert_eq!(recorder.writer_stats().writer_accepted, 2);
         assert_eq!(recorder.writer_stats().backpressured_persist_records, 1);
+        assert_eq!(recorder.writer_stats().dropped_persist_records, 1);
 
         gate.add_permits(1);
         assert!(recorder.shutdown(StdDuration::from_secs(1)).await.drained);

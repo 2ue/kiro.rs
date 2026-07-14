@@ -939,7 +939,7 @@ export function CredentialCard({
             }} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || supportedModels.length === 0}>
               不限制
             </Button>
-            <Button variant="outline" size="sm" onClick={discoverSupportedModels} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || credential.authMethod === 'api_key'}>
+            <Button variant="outline" size="sm" onClick={discoverSupportedModels} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}>
               {discoverCredentialSupportedModels.isPending && <Spinner size="sm" />}拉取并生成官方写法
             </Button>
             <Button size="sm" onClick={saveSupportedModels} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}>

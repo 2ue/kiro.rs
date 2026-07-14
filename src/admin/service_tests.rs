@@ -52,6 +52,30 @@ fn missing_auth_method_with_external_idp_fields_is_inferred_as_external_idp() {
 }
 
 #[test]
+fn missing_auth_method_with_kiro_api_key_is_inferred_as_api_key() {
+    let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "kiroApiKey": "ksk_test_key|eu-central-1"
+    }))
+    .unwrap();
+
+    assert_eq!(resolve_add_credential_auth_method(&req), "api_key");
+}
+
+#[test]
+fn discovered_supported_models_preserve_non_claude_model_ids() {
+    let models = AdminService::normalize_discovered_supported_models(vec![
+        " QWEN3-CODER-NEXT ".to_string(),
+        "minimax-m2.5".to_string(),
+        "qwen3-coder-next".to_string(),
+    ]);
+
+    assert_eq!(
+        models,
+        vec!["qwen3-coder-next".to_string(), "minimax-m2.5".to_string()]
+    );
+}
+
+#[test]
 fn runtime_cooldown_validation_allows_base_values_above_max_cap() {
     validate_runtime_cooldown_settings(10, 2, &[30, 5, 10, 60])
         .expect("max cooldown is an upper cap applied at runtime");

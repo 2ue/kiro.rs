@@ -16,9 +16,9 @@ Refactor request/body processing so local credentials, external normalized pools
 
 ## Relationship And Authority
 
-This plan remains authoritative for the request/body capability boundaries, compatibility defaults, raw-versus-normalized behavior, and validation evidence landed in its scope. The [system architecture modernization plan](../system-architecture-modernization/README.md) owns later cross-system target architecture, request-pipeline orchestration, state ownership, and migration sequencing.
+This plan remains authoritative for the request/body capability boundaries, compatibility defaults, raw-versus-normalized behavior, and validation evidence landed in its scope. The [Greenfield AI Gateway plan](../greenfield-ai-gateway/README.md) owns later target architecture, request-pipeline orchestration and state ownership; the superseded Rust modernization plan is historical reference only.
 
-Future route-planner or plugin work must preserve this plan's non-negotiable behavior unless an accepted modernization decision explicitly supersedes a contract and defines compatibility, rollout, and rollback.
+Future route-planner or module work must preserve this plan's non-negotiable behavior unless an accepted greenfield decision explicitly supersedes a contract and defines compatibility, cutover and regression coverage.
 
 ## Reading Path
 

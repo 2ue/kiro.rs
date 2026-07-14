@@ -18,7 +18,7 @@ use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
     ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig, ThinkingTriggerMode,
+    PromptCacheSimulationMode, PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode,
     normalize_defined_cache_routes,
 };
 
@@ -115,6 +115,8 @@ pub struct AppState {
     pub image_processing: ImageProcessingConfig,
     /// 本地 Anthropic -> Kiro 转换能力配置
     pub body_conversion: BodyConversionConfig,
+    /// 统一提示词引导配置
+    pub prompt_steering: PromptSteeringConfig,
     /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略
     pub missing_max_tokens: MissingMaxTokensConfig,
     /// payload shaping 配置
@@ -178,6 +180,7 @@ impl AppState {
             kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
+            prompt_steering: PromptSteeringConfig::default(),
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: ExternalPoolsConfig::default(),
@@ -284,6 +287,7 @@ impl AppState {
         kiro_upstream_stream_idle_timeout_secs: u64,
         image_processing: ImageProcessingConfig,
         body_conversion: BodyConversionConfig,
+        prompt_steering: PromptSteeringConfig,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
@@ -298,6 +302,7 @@ impl AppState {
         self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
         self.image_processing = image_processing.normalized();
         self.body_conversion = body_conversion;
+        self.prompt_steering = prompt_steering.normalized();
         self.payload_shaping = payload_shaping;
         self
     }

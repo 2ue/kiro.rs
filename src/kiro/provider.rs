@@ -548,8 +548,46 @@ mod tests {
         );
         assert_eq!(
             KiroProvider::classify_bad_request_reason(r#"{"message":"unknown model"}"#),
-            "bad_request"
+            "model_invalid_bad_request"
         );
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"The requested model is not available for this endpoint. If this continues, contact the administrator with error ID: req_01example"}"#
+            ),
+            "model_unavailable_bad_request"
+        );
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#
+            ),
+            "model_invalid_bad_request"
+        );
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"Image data cannot be empty.","reason":"REQUEST_BODY_INVALID"}"#
+            ),
+            "tool_use_format_bad_request"
+        );
+    }
+
+    #[test]
+    fn model_unavailable_retry_requires_reason_and_model() {
+        assert!(KiroProvider::should_retry_model_unavailable_bad_request(
+            "model_unavailable_bad_request",
+            Some("claude-opus-4-8"),
+        ));
+        assert!(!KiroProvider::should_retry_model_unavailable_bad_request(
+            "bad_request",
+            Some("claude-opus-4-8"),
+        ));
+        assert!(!KiroProvider::should_retry_model_unavailable_bad_request(
+            "model_unavailable_bad_request",
+            None,
+        ));
+        assert!(!KiroProvider::should_retry_model_unavailable_bad_request(
+            "model_unavailable_bad_request",
+            Some("  "),
+        ));
     }
 
     #[test]
@@ -1655,6 +1693,21 @@ impl KiroProvider {
             "外部凭据".to_string(),
         )
         .await
+    }
+
+    /// 使用外部临时凭据同步可用模型列表。
+    ///
+    /// 该方法不把凭据写入调度池，适合 Admin 新增 / 导入 API Key 时先做能力发现，
+    /// 然后再把发现结果写回 supportedModels。
+    pub async fn list_available_models_for_external_credentials(
+        &self,
+        credentials: KiroCredentials,
+    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let ctx = self
+            .token_manager
+            .acquire_context_for_external_credentials(credentials)
+            .await?;
+        self.list_available_models_for_context(ctx).await
     }
 
     async fn call_api_with_single_context(
@@ -3215,7 +3268,7 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 Bad Request - 大多数是请求问题；模型/账号能力不匹配时允许换凭据重试。
             if status.as_u16() == 400 {
                 let bad_request_reason = Self::classify_bad_request_reason(&body);
                 let message = format!(
@@ -3226,6 +3279,68 @@ impl KiroProvider {
                     status,
                     body
                 );
+                if Self::should_retry_model_unavailable_bad_request(
+                    bad_request_reason,
+                    model.as_deref(),
+                ) && attempt + 1 < max_retries
+                    && self.token_manager.has_alternate_usable_credential_cached(
+                        model.as_deref(),
+                        &excluded_ids,
+                        ctx.id,
+                    )
+                {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        model = model.as_deref(),
+                        "API 请求失败（{}，当前账号不支持/不可用该模型，换未尝试账号重试，尝试 {}/{}）: {} {}",
+                        credential_context,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "model_unavailable_retry_next",
+                        Some(bad_request_reason),
+                        Some(message.clone()),
+                        attempt_started_at,
+                        model.as_deref(),
+                    );
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        model.as_deref(),
+                        TransientFailureKind::Protocol,
+                        retry_after,
+                        format!("model_unavailable_bad_request {} {}", status, body),
+                    ) {
+                        let final_message = format!(
+                            "{} API 请求失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
+                    }
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        self.token_manager
+                            .unbind_session_if_bound_to(session_id, ctx.id);
+                    }
+                    excluded_ids.insert(ctx.id);
+                    last_error = Some(anyhow::anyhow!(message));
+                    self.finish_attempt(&mut ctx);
+                    continue;
+                }
                 if bad_request_reason == "profile_arn_bad_request" {
                     tracing::warn!(
                         credential_id = ctx.id,
@@ -3848,6 +3963,12 @@ impl KiroProvider {
         {
             return "profile_arn_bad_request";
         }
+        if Self::bad_request_body_indicates_retryable_model_unavailable(&lower) {
+            return "model_unavailable_bad_request";
+        }
+        if Self::bad_request_body_indicates_invalid_model(&lower) {
+            return "model_invalid_bad_request";
+        }
         if lower.contains("invalid tool use format") || lower.contains("request_body_invalid") {
             return "tool_use_format_bad_request";
         }
@@ -3858,6 +3979,39 @@ impl KiroProvider {
             return "malformed_request";
         }
         "bad_request"
+    }
+
+    fn bad_request_body_indicates_retryable_model_unavailable(lower_body: &str) -> bool {
+        [
+            "requested model is not available",
+            "model is not available for this endpoint",
+            "not available for this endpoint",
+            "not available in this region",
+            "not supported in this region",
+            "not available for this account",
+            "not enabled for this account",
+        ]
+        .iter()
+        .any(|needle| lower_body.contains(needle))
+    }
+
+    fn bad_request_body_indicates_invalid_model(lower_body: &str) -> bool {
+        [
+            "invalid model",
+            "invalid_model_id",
+            "invalid_model",
+            "model not found",
+            "model_not_found",
+            "unsupported model",
+            "unknown model",
+        ]
+        .iter()
+        .any(|needle| lower_body.contains(needle))
+    }
+
+    fn should_retry_model_unavailable_bad_request(reason: &str, model: Option<&str>) -> bool {
+        reason == "model_unavailable_bad_request"
+            && model.map(str::trim).is_some_and(|value| !value.is_empty())
     }
 
     fn should_retry_prompt_logic_bad_request(
@@ -3888,6 +4042,7 @@ impl KiroProvider {
 
     fn bad_request_reason_label(reason: &str) -> &'static str {
         match reason {
+            "model_unavailable_bad_request" | "model_invalid_bad_request" => "模型不可用",
             "assistant_prefill_bad_request"
             | "profile_arn_bad_request"
             | "tool_use_format_bad_request"

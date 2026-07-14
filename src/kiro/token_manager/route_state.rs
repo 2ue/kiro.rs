@@ -17,6 +17,7 @@ pub enum LocalPoolRouteStateKind {
     ProxyBlocked,
     AllCoolingDown,
     CapacityFull,
+    SchedulerRedisDegraded,
 }
 
 impl LocalPoolRouteStateKind {

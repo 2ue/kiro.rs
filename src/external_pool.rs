@@ -682,6 +682,21 @@ impl ExternalLatencyTraceState {
             saw_upstream_completed: None,
             stop_reason_source: None,
             suspected_intent_preamble_end_turn: None,
+            intent_preamble_risk: None,
+            suspected_tool_context_leak_end_turn: None,
+            tool_context_leak_markers: None,
+            assistant_tail_intent_hint: None,
+            end_turn_anomaly_reason: None,
+            end_turn_anomaly_risk: None,
+            upstream_eof_without_completed: None,
+            last_upstream_event_type: None,
+            last_upstream_events: None,
+            saw_upstream_assistant_response: None,
+            saw_upstream_tool_use: None,
+            saw_upstream_metadata: None,
+            last_assistant_content_chars: None,
+            filtered_trivial_text_blocks: None,
+            filtered_trivial_text_chars: None,
         };
         (!trace.is_empty()).then_some(trace)
     }
@@ -779,7 +794,7 @@ impl ExternalPoolFinalError {
             public_error_type,
             message,
             request_id,
-            [("x-kiro-rs-error-id", self.error_id)],
+            [("x-error-id", self.error_id)],
         )
     }
 

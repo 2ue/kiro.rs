@@ -23,7 +23,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
 #[cfg(test)]
 use crate::kiro::model::requests::tool::ToolResult;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
+use crate::model::config::{CompatProfile, PromptCacheSimulationMode, PromptSteeringConfig};
 
 #[cfg(test)]
 use super::types::ContentBlock;
@@ -66,7 +66,7 @@ use tools::{
 };
 use tools::{collect_history_tool_names, convert_tools, create_placeholder_tool};
 
-const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool results provided.";
+const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Continue";
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 
 /// 转换结果
@@ -102,6 +102,7 @@ pub struct ConverterOptions {
     pub kiro_cache_point_tools_only: bool,
     pub kiro_cache_point_record_plan: bool,
     pub force_visible_thinking: bool,
+    pub prompt_steering: PromptSteeringConfig,
 }
 
 impl Default for ConverterOptions {
@@ -114,6 +115,7 @@ impl Default for ConverterOptions {
             kiro_cache_point_tools_only: true,
             kiro_cache_point_record_plan: true,
             force_visible_thinking: false,
+            prompt_steering: PromptSteeringConfig::default(),
         }
     }
 }
@@ -124,16 +126,44 @@ impl ConverterOptions {
     }
 
     fn inject_chunked_policy(&self) -> bool {
-        !self.is_strict() && self.conversion.chunked_tool_policy.is_enabled()
+        let prompt_steering = self.prompt_steering.clone().normalized();
+        !self.is_strict()
+            && prompt_steering.enabled
+            && prompt_steering.chunked_write.enabled
+            && prompt_steering.chunked_write.system_prompt_enabled
+            && self.conversion.chunked_tool_policy.is_enabled()
+    }
+
+    fn inject_chunked_tool_descriptions(&self) -> bool {
+        let prompt_steering = self.prompt_steering.clone().normalized();
+        !self.is_strict()
+            && prompt_steering.enabled
+            && prompt_steering.chunked_write.enabled
+            && prompt_steering.chunked_write.tool_description_enabled
+            && self.conversion.chunked_tool_policy.is_enabled()
     }
 
     fn inject_thinking_prefix(&self) -> bool {
+        let prompt_steering = self.prompt_steering.clone().normalized();
         self.conversion.thinking_prompt_controls.is_enabled()
+            && prompt_steering.enabled
+            && prompt_steering.thinking.enabled
             && (self.force_visible_thinking || !self.is_strict())
     }
 
     fn inject_tool_choice_prefix(&self) -> bool {
-        !self.is_strict() && self.conversion.tool_choice_steering.is_enabled()
+        let prompt_steering = self.prompt_steering.clone().normalized();
+        !self.is_strict()
+            && prompt_steering.enabled
+            && prompt_steering.tool_choice.enabled
+            && self.conversion.tool_choice_steering.is_enabled()
+    }
+
+    fn tool_choice_steering_enabled(&self) -> bool {
+        let prompt_steering = self.prompt_steering.clone().normalized();
+        prompt_steering.enabled
+            && prompt_steering.tool_choice.enabled
+            && self.conversion.tool_choice_steering.is_enabled()
     }
 }
 

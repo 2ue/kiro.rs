@@ -2,7 +2,7 @@
 //!
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -60,6 +60,165 @@ fn is_xml_tag_wrapper_char(buffer: &str, pos: usize) -> bool {
         .get(pos)
         .map(|c| XML_TAG_WRAPPER_CHARS.contains(c))
         .unwrap_or(false)
+}
+
+fn is_trivial_tool_preamble_text(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let mut chars = trimmed.chars();
+    let Some(ch) = chars.next() else {
+        return true;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    matches!(
+        ch,
+        '.' | '。'
+            | '·'
+            | '•'
+            | '…'
+            | '-'
+            | '—'
+            | '_'
+            | '*'
+            | '!'
+            | '?'
+            | '！'
+            | '？'
+            | ','
+            | '，'
+            | ';'
+            | '；'
+            | ':'
+            | '：'
+    )
+}
+
+const ASSISTANT_TEXT_TAIL_LIMIT_CHARS: usize = 4096;
+const TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS: usize = 128;
+
+const TOOL_CONTEXT_LEAK_MARKERS: &[(&str, &str)] = &[
+    ("tool_results_provided", "Tool results provided"),
+    ("tool_results_heading", "Tool results:"),
+    ("function_results_open", "<function_results>"),
+    ("function_results_close", "</function_results>"),
+    ("read_hash_result", "readHash"),
+    ("edit_hash_result", "editHash"),
+    ("write_hash_result", "writeHash"),
+    ("bash_hash_result", "bashHash"),
+];
+
+fn take_first_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn take_last_chars(value: &str, limit: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= limit {
+        return value.to_string();
+    }
+    value.chars().skip(char_count - limit).collect()
+}
+
+fn push_bounded_tail(tail: &mut String, content: &str, limit: usize) {
+    if content.is_empty() || limit == 0 {
+        return;
+    }
+
+    let content_chars = content.chars().count();
+    if content_chars >= limit {
+        *tail = take_last_chars(content, limit);
+        return;
+    }
+
+    tail.push_str(content);
+    let tail_chars = tail.chars().count();
+    if tail_chars > limit {
+        *tail = tail.chars().skip(tail_chars - limit).collect();
+    }
+}
+
+fn push_unique_marker(markers: &mut Vec<&'static str>, marker: &'static str) {
+    if !markers.contains(&marker) {
+        markers.push(marker);
+    }
+}
+
+fn looks_like_intent_preamble_text(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let action_hint = [
+        "inspect",
+        "check",
+        "look",
+        "read",
+        "edit",
+        "modify",
+        "create",
+        "write",
+        "run",
+        "execute",
+        "use the",
+        "call",
+        "tool",
+        "查看",
+        "检查",
+        "读取",
+        "读一下",
+        "修改",
+        "创建",
+        "写入",
+        "执行",
+        "运行",
+        "调用",
+        "搜索",
+        "分析",
+        "处理",
+        "打开",
+        "更新",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !action_hint {
+        return false;
+    }
+    [
+        "i will",
+        "i'll",
+        "i’m going to",
+        "i'm going to",
+        "let me",
+        "first",
+        "我会",
+        "我将",
+        "我先",
+        "先",
+        "先来",
+        "接下来",
+        "继续",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_like_tail_pending_tool_intent(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let tail_line = trimmed
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    looks_like_intent_preamble_text(tail_line)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -838,7 +997,10 @@ pub(crate) fn extract_invoke_content_blocks(
             .map(|(name, _)| known_tool_names.contains(name))
             .unwrap_or(false);
 
-        if invoke_looks_like_real_leak(stripped_before) && !fence_after_before && name_known {
+        let real_protocol_position =
+            invoke_looks_like_real_leak(stripped_before) && !fence_after_before;
+
+        if real_protocol_position && name_known {
             if !stripped_before.is_empty() {
                 advance_code_fence_state(&mut fence_open, &mut fence_partial, stripped_before);
                 pending_text.push_str(stripped_before);
@@ -858,6 +1020,11 @@ pub(crate) fn extract_invoke_content_blocks(
                 "name": name,
                 "input": input,
             }));
+        } else if real_protocol_position {
+            if !stripped_before.is_empty() {
+                advance_code_fence_state(&mut fence_open, &mut fence_partial, stripped_before);
+                pending_text.push_str(stripped_before);
+            }
         } else {
             let chunk = &rest[..end];
             advance_code_fence_state(&mut fence_open, &mut fence_partial, chunk);
@@ -1357,6 +1524,30 @@ pub struct StreamContext {
     upstream_message_status: Option<String>,
     /// 是否见过上游显式 `messageStatus: COMPLETED`。
     saw_upstream_completed: bool,
+    /// 最近若干上游事件类型，仅用于 EOF 诊断，不保存 payload。
+    upstream_event_tail: VecDeque<&'static str>,
+    /// 是否见过上游 assistantResponseEvent。
+    saw_upstream_assistant_response: bool,
+    /// 是否见过上游 toolUseEvent。
+    saw_upstream_tool_use: bool,
+    /// 是否见过上游 metadataEvent。
+    saw_upstream_metadata: bool,
+    /// 最近一次 assistant/code 内容片段的字符数。
+    last_assistant_content_chars: u32,
+    /// 最近 assistant/code 可见文本尾部窗口，仅用于低成本异常特征检测，不落库。
+    assistant_text_tail: String,
+    /// 已命中的工具上下文泄漏标记名，仅保存 marker 名，不保存正文。
+    tool_context_leak_markers: Vec<&'static str>,
+    /// 是否见过像“我先检查/我会执行/I will inspect”的执行前说明。
+    assistant_intent_preamble_hint: bool,
+    /// tool_use 前待判定的 trivial 文本片段。
+    pending_trivial_text: String,
+    /// 本轮被过滤的 trivial 文本块数量。
+    filtered_trivial_text_blocks: u32,
+    /// 本轮被过滤的 trivial 文本字符数。
+    filtered_trivial_text_chars: u32,
+    /// 已实际下发的可见文本字符数，用于避免误伤正文中的单个标点分片。
+    visible_text_chars_emitted: usize,
     /// stray token 复读熔断：最近一行。
     repeat_guard_last_line: String,
     /// stray token 复读熔断：连续次数。
@@ -1506,6 +1697,18 @@ impl StreamContext {
             kiro_metering_usage: None,
             upstream_message_status: None,
             saw_upstream_completed: false,
+            upstream_event_tail: VecDeque::with_capacity(Self::UPSTREAM_EVENT_TAIL_LIMIT),
+            saw_upstream_assistant_response: false,
+            saw_upstream_tool_use: false,
+            saw_upstream_metadata: false,
+            last_assistant_content_chars: 0,
+            assistant_text_tail: String::new(),
+            tool_context_leak_markers: Vec::new(),
+            assistant_intent_preamble_hint: false,
+            pending_trivial_text: String::new(),
+            filtered_trivial_text_blocks: 0,
+            filtered_trivial_text_chars: 0,
+            visible_text_chars_emitted: 0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -1522,6 +1725,56 @@ impl StreamContext {
 
     pub fn upstream_message_status(&self) -> Option<&str> {
         self.upstream_message_status.as_deref()
+    }
+
+    pub fn upstream_eof_without_completed(&self) -> bool {
+        !self.saw_upstream_completed
+    }
+
+    pub fn last_upstream_event_type(&self) -> Option<&'static str> {
+        self.upstream_event_tail.back().copied()
+    }
+
+    pub fn last_upstream_events(&self) -> Vec<String> {
+        self.upstream_event_tail
+            .iter()
+            .map(|event| (*event).to_string())
+            .collect()
+    }
+
+    pub fn saw_upstream_assistant_response(&self) -> bool {
+        self.saw_upstream_assistant_response
+    }
+
+    pub fn saw_upstream_tool_use(&self) -> bool {
+        self.saw_upstream_tool_use
+    }
+
+    pub fn saw_upstream_metadata(&self) -> bool {
+        self.saw_upstream_metadata
+    }
+
+    pub fn last_assistant_content_chars(&self) -> u32 {
+        self.last_assistant_content_chars
+    }
+
+    pub fn filtered_trivial_text_blocks(&self) -> u32 {
+        self.filtered_trivial_text_blocks
+    }
+
+    pub fn filtered_trivial_text_chars(&self) -> u32 {
+        self.filtered_trivial_text_chars
+    }
+
+    pub fn assistant_tail_intent_hint(&self) -> bool {
+        looks_like_tail_pending_tool_intent(&self.assistant_text_tail)
+    }
+
+    pub fn tool_context_leak_markers(&self) -> Vec<String> {
+        self.tool_context_leak_markers
+            .iter()
+            .map(|marker| (*marker).to_string())
+            .collect()
     }
 
     #[cfg(test)]
@@ -1558,6 +1811,51 @@ impl StreamContext {
             && self.output_tokens <= 96
     }
 
+    pub fn suspected_tool_context_leak_end_turn(&self, has_visible_text_output: bool) -> bool {
+        has_visible_text_output
+            && !self.state_manager.has_tool_use()
+            && self.state_manager.get_stop_reason() == "end_turn"
+            && !self.tool_context_leak_markers.is_empty()
+    }
+
+    pub fn end_turn_anomaly_reason(&self, has_visible_text_output: bool) -> Option<&'static str> {
+        if self.suspected_tool_context_leak_end_turn(has_visible_text_output) {
+            Some("tool_context_leak_text_only_end_turn")
+        } else if self.suspected_intent_preamble_end_turn(has_visible_text_output) {
+            Some("intent_preamble_text_only_end_turn")
+        } else {
+            None
+        }
+    }
+
+    pub fn end_turn_anomaly_risk(&self, has_visible_text_output: bool) -> Option<&'static str> {
+        if self.suspected_tool_context_leak_end_turn(has_visible_text_output) {
+            if !self.saw_upstream_completed {
+                Some("high")
+            } else {
+                Some("medium")
+            }
+        } else {
+            self.intent_preamble_risk(has_visible_text_output)
+        }
+    }
+
+    pub fn intent_preamble_risk(&self, has_visible_text_output: bool) -> Option<&'static str> {
+        if !self.suspected_intent_preamble_end_turn(has_visible_text_output) {
+            return None;
+        }
+        if !self.assistant_intent_preamble_hint {
+            return Some("low");
+        }
+        if !self.saw_upstream_completed && self.last_assistant_content_chars <= 320 {
+            Some("high")
+        } else if !self.saw_upstream_completed {
+            Some("medium")
+        } else {
+            Some("low")
+        }
+    }
+
     fn record_upstream_message_status(&mut self, status: Option<&str>) {
         let Some(status) = status.map(str::trim).filter(|status| !status.is_empty()) else {
             return;
@@ -1567,6 +1865,120 @@ impl StreamContext {
             self.saw_upstream_completed = true;
         }
         self.upstream_message_status = Some(status);
+    }
+
+    fn record_assistant_text_observability(&mut self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+
+        self.assistant_intent_preamble_hint |= looks_like_intent_preamble_text(content);
+        self.scan_tool_context_leak_markers(content);
+        push_bounded_tail(
+            &mut self.assistant_text_tail,
+            content,
+            ASSISTANT_TEXT_TAIL_LIMIT_CHARS,
+        );
+    }
+
+    fn scan_tool_context_leak_markers(&mut self, content: &str) {
+        if self.tool_context_leak_markers.len() >= TOOL_CONTEXT_LEAK_MARKERS.len() {
+            return;
+        }
+
+        let boundary_window = if self.assistant_text_tail.is_empty() {
+            String::new()
+        } else {
+            let mut window = take_last_chars(
+                &self.assistant_text_tail,
+                TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS,
+            );
+            window.push_str(&take_first_chars(
+                content,
+                TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS,
+            ));
+            window
+        };
+
+        for &(marker, needle) in TOOL_CONTEXT_LEAK_MARKERS {
+            if self.tool_context_leak_markers.contains(&marker) {
+                continue;
+            }
+            if content.contains(needle)
+                || (!boundary_window.is_empty() && boundary_window.contains(needle))
+            {
+                push_unique_marker(&mut self.tool_context_leak_markers, marker);
+            }
+        }
+    }
+
+    const UPSTREAM_EVENT_TAIL_LIMIT: usize = 12;
+
+    fn record_upstream_event(&mut self, event: &Event) {
+        let event_type = match event {
+            Event::AssistantResponse(resp) => {
+                self.saw_upstream_assistant_response = true;
+                self.last_assistant_content_chars = resp.content.chars().count() as u32;
+                self.record_assistant_text_observability(&resp.content);
+                "assistantResponseEvent"
+            }
+            Event::ToolUse(_) => {
+                self.saw_upstream_tool_use = true;
+                "toolUseEvent"
+            }
+            Event::ReasoningContent(_) => "reasoningContentEvent",
+            Event::Metadata(_) => {
+                self.saw_upstream_metadata = true;
+                "metadataEvent"
+            }
+            Event::Metering(_) => "meteringEvent",
+            Event::Code(code) => {
+                self.saw_upstream_assistant_response = true;
+                self.last_assistant_content_chars = code.content.chars().count() as u32;
+                self.record_assistant_text_observability(&code.content);
+                "codeEvent"
+            }
+            Event::ContextUsage(_) => "contextUsageEvent",
+            Event::MessageMetadata(_) => "messageMetadataEvent",
+            Event::InvalidState(_) => "invalidStateEvent",
+            Event::Unknown {} => "unknown",
+            Event::Error { .. } => "error",
+            Event::Exception { .. } => "exception",
+        };
+        if self.upstream_event_tail.len() >= Self::UPSTREAM_EVENT_TAIL_LIMIT {
+            self.upstream_event_tail.pop_front();
+        }
+        self.upstream_event_tail.push_back(event_type);
+    }
+
+    fn should_buffer_trivial_text(&self, content: &str) -> bool {
+        if self.known_tool_names.is_empty()
+            || self.state_manager.has_tool_use()
+            || self.visible_text_chars_emitted > 0
+            || !self.pending_trivial_text.is_empty()
+        {
+            return false;
+        }
+        is_trivial_tool_preamble_text(content)
+    }
+
+    fn flush_pending_trivial_text(&mut self) -> Vec<SseEvent> {
+        if self.pending_trivial_text.is_empty() {
+            return Vec::new();
+        }
+        let pending = std::mem::take(&mut self.pending_trivial_text);
+        self.emit_assistant_response_content(&pending)
+    }
+
+    fn drop_pending_trivial_text_before_tool_use(&mut self) {
+        if self.pending_trivial_text.is_empty() {
+            return;
+        }
+        self.filtered_trivial_text_blocks = self.filtered_trivial_text_blocks.saturating_add(1);
+        self.filtered_trivial_text_chars = self
+            .filtered_trivial_text_chars
+            .saturating_add(self.pending_trivial_text.chars().count() as u32);
+        self.pending_trivial_text.clear();
     }
 
     pub fn set_reported_cache_usage_policy(
@@ -1728,6 +2140,7 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        self.record_upstream_event(event);
         match event {
             Event::AssistantResponse(resp) => {
                 self.record_upstream_message_status(resp.message_status.as_deref());
@@ -1918,6 +2331,17 @@ impl StreamContext {
             return Vec::new();
         }
 
+        if self.should_buffer_trivial_text(content) {
+            self.pending_trivial_text.push_str(content);
+            return Vec::new();
+        }
+
+        let mut events = self.flush_pending_trivial_text();
+        events.extend(self.emit_assistant_response_content(content));
+        events
+    }
+
+    fn emit_assistant_response_content(&mut self, content: &str) -> Vec<SseEvent> {
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
@@ -2195,13 +2619,21 @@ impl StreamContext {
                             .map(|(name, _)| self.known_tool_names.contains(name))
                             .unwrap_or(false);
 
-                        if invoke_looks_like_real_leak(before) && !fence_after_before && name_known
-                        {
+                        let real_protocol_position =
+                            invoke_looks_like_real_leak(before) && !fence_after_before;
+
+                        if real_protocol_position && name_known {
                             if !before.is_empty() {
                                 events.extend(self.emit_text_delta_raw(before));
                             }
                             let (name, input_json) = parsed.expect("parsed is Some when known");
                             events.extend(self.queue_leaked_tool_use(name, input_json));
+                            let close_len = leading_function_calls_close_len(&buf[end..]);
+                            buf = buf[end + close_len..].to_string();
+                        } else if real_protocol_position {
+                            if !before.is_empty() {
+                                events.extend(self.emit_text_delta_raw(before));
+                            }
                             let close_len = leading_function_calls_close_len(&buf[end..]);
                             buf = buf[end + close_len..].to_string();
                         } else {
@@ -2228,6 +2660,13 @@ impl StreamContext {
                         }
                         let remainder = buf[start..].to_string();
                         if flush || remainder.len() > Self::MAX_INVOKE_HOLD_BYTES {
+                            // A line-start/non-fenced `<invoke>` tail is internal tool-call
+                            // protocol. If the stream ends before it becomes a valid tool_use,
+                            // do not leak the partial XML to Claude Code; keep only the visible
+                            // text that was emitted before the tail.
+                            if invoke_looks_like_real_leak(before) && !fence_after_before {
+                                break;
+                            }
                             events.extend(self.emit_text_delta_raw(&remainder));
                         } else {
                             self.invoke_sniff_buffer = remainder;
@@ -2237,7 +2676,12 @@ impl StreamContext {
                 },
                 None => {
                     if flush {
-                        if !buf.is_empty() {
+                        if let Some(tail_start) = find_trailing_function_calls_open(&buf) {
+                            let before = strip_trailing_tool_prefixes(&buf[..tail_start]);
+                            if !before.is_empty() {
+                                events.extend(self.emit_text_delta_raw(before));
+                            }
+                        } else if !buf.is_empty() {
                             events.extend(self.emit_text_delta_raw(&buf));
                         }
                     } else {
@@ -2438,6 +2882,9 @@ impl StreamContext {
             }),
         ) {
             events.push(delta_event);
+            self.visible_text_chars_emitted = self
+                .visible_text_chars_emitted
+                .saturating_add(text.chars().filter(|c| !c.is_whitespace()).count());
         }
 
         events
@@ -2536,6 +2983,7 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        self.drop_pending_trivial_text_before_tool_use();
         self.state_manager.set_has_tool_use(true);
 
         if self.native_reasoning_seen {
@@ -2727,6 +3175,8 @@ impl StreamContext {
         ) -> super::cache::CacheUsage,
     {
         let mut events = Vec::new();
+
+        events.extend(self.flush_pending_trivial_text());
 
         if self.native_reasoning_seen {
             events.extend(self.close_native_reasoning_block());
@@ -2975,8 +3425,243 @@ mod tests {
 
         assert_eq!(ctx.stop_reason_source(), "local_inferred_end_turn");
         assert!(ctx.suspected_intent_preamble_end_turn(true));
+        assert_eq!(ctx.intent_preamble_risk(true), Some("high"));
         assert!(!ctx.saw_upstream_completed());
         assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn end_turn_with_tool_context_leak_markers_sets_diagnostic_even_for_long_text() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string(), "Bash".to_string()]),
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                "好问题。让我完整梳理。\n\nuser Tool results pro",
+                None,
+            ))),
+        );
+        events.extend(
+            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                &format!(
+                    "vided.\n\nTool results:\n\n[readHash9b9a8d05] {}\n</function_results>\n\nLet me look at `_ensure_sso` next.",
+                    "x ".repeat(500)
+                ),
+                None,
+            ))),
+        );
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(ctx.stop_reason_source(), "local_inferred_end_turn");
+        assert!(
+            !ctx.suspected_intent_preamble_end_turn(true),
+            "long malformed text should not rely on the short-preamble heuristic"
+        );
+        assert!(ctx.suspected_tool_context_leak_end_turn(true));
+        assert_eq!(
+            ctx.end_turn_anomaly_reason(true),
+            Some("tool_context_leak_text_only_end_turn")
+        );
+        assert_eq!(ctx.end_turn_anomaly_risk(true), Some("high"));
+        assert!(ctx.assistant_tail_intent_hint());
+        let markers = ctx.tool_context_leak_markers();
+        assert!(markers.contains(&"tool_results_provided".to_string()));
+        assert!(markers.contains(&"tool_results_heading".to_string()));
+        assert!(markers.contains(&"function_results_close".to_string()));
+        assert!(markers.contains(&"read_hash_result".to_string()));
+        assert_eq!(
+            collect_text_content(&events),
+            format!(
+                "好问题。让我完整梳理。\n\nuser Tool results provided.\n\nTool results:\n\n[readHash9b9a8d05] {}\n</function_results>\n\nLet me look at `_ensure_sso` next.",
+                "x ".repeat(500)
+            )
+        );
+    }
+
+    #[test]
+    fn tool_context_leak_markers_do_not_flag_normal_tool_use_turn() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+            "Tool results provided.",
+            Some("IN_PROGRESS"),
+        )));
+        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "toolu_read".to_string(),
+            input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+            stop: true,
+        }));
+        let _ = ctx.generate_final_events();
+
+        assert_eq!(ctx.stop_reason_source(), "local_inferred_tool_use");
+        assert_eq!(
+            ctx.tool_context_leak_markers(),
+            vec!["tool_results_provided".to_string()]
+        );
+        assert!(!ctx.suspected_tool_context_leak_end_turn(true));
+        assert_eq!(ctx.end_turn_anomaly_reason(true), None);
+    }
+
+    #[test]
+    fn short_normal_answer_has_low_intent_preamble_risk() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                "正常", None,
+            ))),
+        );
+        events.extend(ctx.generate_final_events());
+
+        assert!(ctx.suspected_intent_preamble_end_turn(true));
+        assert_eq!(ctx.intent_preamble_risk(true), Some("low"));
+        assert_eq!(collect_text_content(&events), "正常");
+    }
+
+    #[test]
+    fn tool_use_drops_initial_trivial_text_preamble() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let mut all_events = ctx.generate_initial_events();
+
+        let trivial_events = ctx.process_kiro_event(&Event::AssistantResponse(
+            assistant_response_event(".", None),
+        ));
+        assert!(
+            collect_text_content(&trivial_events).is_empty(),
+            "trivial preamble should be buffered until the next event is known"
+        );
+        all_events.extend(trivial_events);
+
+        all_events.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "toolu_read".to_string(),
+            input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+            stop: true,
+        })));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all_events), "");
+        assert_eq!(ctx.filtered_trivial_text_blocks(), 1);
+        assert_eq!(ctx.filtered_trivial_text_chars(), 1);
+        assert_eq!(ctx.stop_reason_source(), "local_inferred_tool_use");
+    }
+
+    #[test]
+    fn end_turn_preserves_trivial_text_response() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let mut all_events = ctx.generate_initial_events();
+
+        let trivial_events = ctx.process_kiro_event(&Event::AssistantResponse(
+            assistant_response_event(".", None),
+        ));
+        assert!(collect_text_content(&trivial_events).is_empty());
+        all_events.extend(trivial_events);
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all_events), ".");
+        assert_eq!(ctx.filtered_trivial_text_blocks(), 0);
+        assert_eq!(ctx.filtered_trivial_text_chars(), 0);
+        assert_eq!(ctx.stop_reason_source(), "local_inferred_end_turn");
+    }
+
+    #[test]
+    fn normal_text_after_buffer_flushes_trivial_prefix() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+            assistant_response_event(".", None),
+        )));
+        all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+            assistant_response_event("14", None),
+        )));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all_events), ".14");
+        assert_eq!(ctx.filtered_trivial_text_blocks(), 0);
+        assert_eq!(ctx.filtered_trivial_text_chars(), 0);
+    }
+
+    #[test]
+    fn stream_context_records_last_upstream_events() {
+        use crate::kiro::model::events::{MetadataEvent, ToolUseEvent};
+
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+            "abc",
+            Some("IN_PROGRESS"),
+        )));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "toolu_read".to_string(),
+            input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+            stop: true,
+        }));
+
+        assert_eq!(ctx.upstream_message_status(), Some("IN_PROGRESS"));
+        assert!(ctx.upstream_eof_without_completed());
+        assert_eq!(ctx.last_upstream_event_type(), Some("toolUseEvent"));
+        assert_eq!(
+            ctx.last_upstream_events(),
+            vec![
+                "assistantResponseEvent".to_string(),
+                "metadataEvent".to_string(),
+                "toolUseEvent".to_string()
+            ]
+        );
+        assert!(ctx.saw_upstream_assistant_response());
+        assert!(ctx.saw_upstream_tool_use());
+        assert!(ctx.saw_upstream_metadata());
+        assert_eq!(ctx.last_assistant_content_chars(), 3);
     }
 
     #[test]
@@ -3946,7 +4631,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_flushes_held_invoke_sniff_text_before_error() {
+    fn stream_error_drops_held_protocol_tail_before_error() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -3959,8 +4644,12 @@ mod tests {
 
         let text = collect_text_content(&all_events);
         assert!(
-            text.contains("<function_calls>\n<inv"),
-            "held invoke sniff text should be flushed before the stream error: {text:?}"
+            text.contains("visible text before protocol tail"),
+            "visible text before the protocol tail should be preserved: {text:?}"
+        );
+        assert!(
+            !text.contains("<function_calls>") && !text.contains("<inv"),
+            "held internal tool protocol tail must not be rendered before the stream error: {text:?}"
         );
         assert!(
             all_events
@@ -3979,7 +4668,7 @@ mod tests {
                     && event.data["delta"]["type"] == "text_delta"
                     && event.data["delta"]["text"]
                         .as_str()
-                        .is_some_and(|text| text.contains("<function_calls>\n<inv"))
+                        .is_some_and(|text| text.contains("visible text before protocol tail"))
             })
             .expect("flushed text delta should be present");
         assert!(
@@ -5093,8 +5782,14 @@ mod tests {
             "fenced/unknown invoke must remain text: {tools:?}"
         );
         let text = collect_text_content(&all);
-        assert!(text.contains("<invoke name=\"exec_command\">"));
-        assert!(text.contains("unknown_tool"));
+        assert!(
+            text.contains("```\n<invoke name=\"exec_command\"><parameter name=\"cmd\">rm</parameter></invoke>\n```"),
+            "fenced example should stay visible as literal text: {text:?}"
+        );
+        assert!(
+            !text.contains("unknown_tool"),
+            "internal unknown invoke tail should not be rendered as visible text: {text:?}"
+        );
     }
 
     #[test]
@@ -5116,8 +5811,10 @@ mod tests {
 
         assert!(collect_tool_uses(&all).is_empty());
         let text = collect_text_content(&all);
-        assert!(text.contains("<invoke name=\"exec_command\">"));
-        assert!(text.contains("rm"));
+        assert!(
+            text.is_empty(),
+            "line-start internal invoke tail should be dropped when it never becomes a valid tool_use: {text:?}"
+        );
     }
 
     #[test]
@@ -5147,7 +5844,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_flushes_unclosed_line_start_invoke_as_text() {
+    fn test_stream_drops_unclosed_line_start_invoke_tail() {
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             1,
@@ -5165,8 +5862,10 @@ mod tests {
 
         assert!(collect_tool_uses(&all).is_empty());
         let text = collect_text_content(&all);
-        assert!(text.contains("<invoke name=\"exec_command\">"));
-        assert!(text.contains("ls"));
+        assert!(
+            text.is_empty(),
+            "unclosed line-start invoke tail should not leak to visible text: {text:?}"
+        );
     }
 
     #[test]

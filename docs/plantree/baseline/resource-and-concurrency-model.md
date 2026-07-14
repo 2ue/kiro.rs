@@ -212,7 +212,7 @@ This table explains coverage dimensions only. It does not assert that the curren
 
 ## 未实现要求
 
-The following required outcomes are not current baseline behavior. Detailed budgets, owners, measurements, and gates belong to the [System architecture modernization plan](../plans/system-architecture-modernization/README.md):
+The following required outcomes are not current baseline behavior. Detailed target budgets, authorities, measurements and gates belong to the [Greenfield AI Gateway plan](../plans/greenfield-ai-gateway/README.md):
 
 - define finite whole-request and process-wide budgets for remote-source count, downloaded bytes, materialized bytes, download concurrency, PDF work, and tokenizer work;
 - make PDF parsing and remote tokenization asynchronous or isolated behind explicitly bounded blocking workers, queues, cancellation, and time budgets;

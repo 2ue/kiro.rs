@@ -1,12 +1,16 @@
 # Roadmap
 
-Role: Authoritative state of the one complete modernization and its dependency work order
+Role: Historical state of the superseded Rust modernization and its dependency work order
 
-Status: Target implementation ready; implementation Not Started; production cutover Not Ready
+Status: Superseded on 2026-07-13; implementation never started; archive/reference only
 
-As of: 2026-07-12
+As of: 2026-07-13
 
-Related: [Plan root](README.md), [Final readiness review](history/final-plan-readiness-review-2026-07-12.md), [Decision 009](decisions/009-single-program-modular-build-and-final-cutover.md), [Work map](indexes/execution-slice-map.md), [Complete implementation plan](topics/delivery/migration-sequence.md), [Verification/final cutover](topics/delivery/verification-rollout-and-rollback.md)
+Related: [Greenfield AI Gateway](../greenfield-ai-gateway/README.md), [supersession record](history/superseded-by-greenfield-ai-gateway-2026-07-13.md), [Plan root](README.md), [Final readiness review](history/final-plan-readiness-review-2026-07-12.md), [Historical work map](indexes/execution-slice-map.md)
+
+## Supersession
+
+This roadmap is no longer an implementation queue. The greenfield plan replaces its Rust target, fixed 50-module topology, two-frontend scope, implementation order and cutover design. Retain the content below only for historical reasoning, source evidence and explicitly inherited semantic invariants.
 
 ## Done: Final Planning Specification
 
@@ -29,11 +33,11 @@ Related: [Plan root](README.md), [Final readiness review](history/final-plan-rea
 
 ## Current
 
-The final planning specification is implementation-ready. No production code implementation is in progress under this plan, so there is no active `implementation-status.md`.
+This plan is superseded. No production target code was implemented under it, and no `implementation-status.md` should be created for it.
 
-The [historical 2026-07-12 review](history/planning-readiness-review-2026-07-12.md) remains evidence of the earlier phased model and its conservative verdict. It is superseded for current readiness by the [final-plan review](history/final-plan-readiness-review-2026-07-12.md).
+The [2026-07-12 final-plan review](history/final-plan-readiness-review-2026-07-12.md) proves that the Rust specification was internally reviewed; it is not readiness evidence for the replacement Go system. Use the [supersession record](history/superseded-by-greenfield-ai-gateway-2026-07-13.md) for the authority mapping.
 
-## Implementation Order
+## Historical Implementation Order
 
 The following are dependency groups inside one implementation, not phased releases or separately approved scope. Exact rows live in the [modular work map](indexes/execution-slice-map.md).
 
@@ -78,9 +82,7 @@ There is no module-level production `Canary`, `Default On`, `Soaking`, rollback 
 
 ## Implementation Start
 
-The first implementation action is to create a concise active `implementation-status.md` and start exact `R0.4`/`R0.5`/`R0.6` harness/fitness foundations or another dependency-compatible work unit. The status tracks the one complete modernization with at most five active items.
-
-For every work unit, the first coding action pins the actual source revision and expands relevant legacy files into exact symbol/responsibility mappings. That output belongs to implementation and can change with the source revision; it is not a missing plan decision.
+Do not start implementation from this roadmap. Begin through the [Greenfield AI Gateway work graph](../greenfield-ai-gateway/roadmap.md) in a separate target repository. Current Rust source characterization remains valid only as a pinned behavioral-oracle task.
 
 ## Production Cutover Blockers
 

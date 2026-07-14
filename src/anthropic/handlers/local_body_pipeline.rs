@@ -62,6 +62,7 @@ pub(super) fn prepare_with_plan(
             kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
             kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
             force_visible_thinking: should_force_visible_thinking(payload, runtime_config),
+            prompt_steering: runtime_config.prompt_steering.clone().normalized(),
         },
         model_resolution,
     ) {

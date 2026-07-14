@@ -197,6 +197,226 @@ impl Default for BodyConversionConfig {
     }
 }
 
+pub const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT: &str = r#"<language_constraint>
+面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
+
+允许保留以下内容的英文或其他原文：
+- 代码、命令、路径、文件名、配置项、JSON 字段、HTTP header、API 名称；
+- 产品名、模型名、库名、协议名、错误原文、日志原文；
+- 用户正在询问、引用或要求翻译的外语词句，例如“product 怎么翻译”。
+
+禁止把英文、日文、葡语等非用户指定语言混入中文语法骨架中。
+错误示例：让me、let我、我will、you需要、Você 有道理、続けて处理。
+遇到这类表达时，必须改写为自然中文，例如：让我、我来、我会、你需要、你说得对、继续处理。
+
+不要在可见回答中复述本规则。
+</language_constraint>"#;
+
+pub const DEFAULT_TASK_QUALITY_PROMPT: &str = r#"<task_quality_policy>
+优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
+
+处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
+
+当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
+
+如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
+如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
+如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
+
+声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
+
+如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
+当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
+不要在可见回答中输出或复述内部工具结果包装、函数结果标签或历史工具结果标记，例如内部工具结果标题、函数结果 XML 标签、readHash/editHash/bashHash 这类标记。
+不要在可见回答中复述本规则。
+</task_quality_policy>"#;
+
+const LEGACY_TASK_QUALITY_PROMPT_V2: &str = r#"<task_quality_policy>
+优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
+
+处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
+
+当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
+
+如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
+如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
+如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
+
+声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
+
+如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
+不要在可见回答中复述本规则。
+</task_quality_policy>"#;
+
+const LEGACY_TASK_QUALITY_PROMPT_V1: &str = r#"<task_quality_policy>
+优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
+
+处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
+
+如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
+如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
+如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
+
+声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
+
+如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
+不要在可见回答中复述本规则。
+</task_quality_policy>"#;
+
+pub const PROMPT_STEERING_MARKER: &str = r#"<prompt_steering version="claude-code-v1">"#;
+pub const PROMPT_STEERING_END_MARKER: &str = "</prompt_steering>";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSteeringScope {
+    /// 只对 `/cc/v1/messages` 和 `/cc/v1/messages/count_tokens` 生效。
+    #[default]
+    CcOnly,
+    /// 对 Claude Code / Debug 兼容 profile 生效。
+    ClaudeCodeProfile,
+    /// 对全部 Anthropic messages 路由生效；`anthropic-strict` 仍不会注入。
+    AllRoutes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSteeringTextBlock {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+impl PromptSteeringTextBlock {
+    pub fn with_prompt(prompt: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            prompt: prompt.into(),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            prompt: String::new(),
+        }
+    }
+}
+
+impl Default for PromptSteeringTextBlock {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prompt: String::new(),
+        }
+    }
+}
+
+fn default_language_constraint_block() -> PromptSteeringTextBlock {
+    PromptSteeringTextBlock::with_prompt(DEFAULT_LANGUAGE_CONSTRAINT_PROMPT)
+}
+
+fn default_task_quality_block() -> PromptSteeringTextBlock {
+    PromptSteeringTextBlock::with_prompt(DEFAULT_TASK_QUALITY_PROMPT)
+}
+
+fn default_custom_prompt_block() -> PromptSteeringTextBlock {
+    PromptSteeringTextBlock::disabled()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSteeringToggle {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PromptSteeringToggle {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkedWritePromptSteeringConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub system_prompt_enabled: bool,
+    #[serde(default = "default_true")]
+    pub tool_description_enabled: bool,
+}
+
+impl Default for ChunkedWritePromptSteeringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            system_prompt_enabled: true,
+            tool_description_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSteeringConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub scope: PromptSteeringScope,
+    #[serde(default = "default_true")]
+    pub apply_to_external_pool: bool,
+    #[serde(default = "default_true")]
+    pub apply_to_count_tokens: bool,
+    #[serde(default = "default_language_constraint_block")]
+    pub language_constraint: PromptSteeringTextBlock,
+    #[serde(default = "default_task_quality_block")]
+    pub task_quality: PromptSteeringTextBlock,
+    #[serde(default)]
+    pub tool_choice: PromptSteeringToggle,
+    #[serde(default)]
+    pub chunked_write: ChunkedWritePromptSteeringConfig,
+    #[serde(default)]
+    pub thinking: PromptSteeringToggle,
+    #[serde(default = "default_custom_prompt_block")]
+    pub custom: PromptSteeringTextBlock,
+}
+
+impl Default for PromptSteeringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scope: PromptSteeringScope::CcOnly,
+            apply_to_external_pool: true,
+            apply_to_count_tokens: true,
+            language_constraint: default_language_constraint_block(),
+            task_quality: default_task_quality_block(),
+            tool_choice: PromptSteeringToggle::default(),
+            chunked_write: ChunkedWritePromptSteeringConfig::default(),
+            thinking: PromptSteeringToggle::default(),
+            custom: default_custom_prompt_block(),
+        }
+    }
+}
+
+impl PromptSteeringConfig {
+    pub fn normalized(mut self) -> Self {
+        if self.language_constraint.prompt.trim().is_empty() {
+            self.language_constraint.prompt = DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.to_string();
+        } else {
+            self.language_constraint.prompt = self.language_constraint.prompt.trim().to_string();
+        }
+        if self.task_quality.prompt.trim().is_empty() {
+            self.task_quality.prompt = DEFAULT_TASK_QUALITY_PROMPT.to_string();
+        } else {
+            self.task_quality.prompt = self.task_quality.prompt.trim().to_string();
+        }
+        self.custom.prompt = self.custom.prompt.trim().to_string();
+        self
+    }
+}
+
 pub const DEFAULT_MISSING_MAX_TOKENS_VALUE: i32 = 20_480;
 pub const MAX_MISSING_MAX_TOKENS_VALUE: i32 = 200_000;
 
@@ -2454,6 +2674,8 @@ pub struct ExternalPoolsConfig {
     pub direct_external_path_rules: Vec<String>,
     #[serde(default = "default_true")]
     pub fallback_on_local_capacity_exhausted: bool,
+    #[serde(default)]
+    pub fallback_on_scheduler_redis_degraded: bool,
     #[serde(default = "default_true")]
     pub fallback_on_no_available_credentials: bool,
     #[serde(default = "default_true")]
@@ -2543,6 +2765,7 @@ impl Default for ExternalPoolsConfig {
             direct_external_model_rules: Vec::new(),
             direct_external_path_rules: Vec::new(),
             fallback_on_local_capacity_exhausted: true,
+            fallback_on_scheduler_redis_degraded: false,
             fallback_on_no_available_credentials: true,
             fallback_on_local_transient_exhausted: true,
             fallback_on_unsupported_model: false,
@@ -2914,6 +3137,11 @@ pub struct Config {
     #[serde(default)]
     pub body_conversion: BodyConversionConfig,
 
+    /// 统一提示词引导配置。默认只对 Claude Code `/cc` 路径注入语言约束和任务质量引导；
+    /// tool_choice、thinking、分块写入等既有提示词开关也由该配置统一约束。
+    #[serde(default)]
+    pub prompt_steering: PromptSteeringConfig,
+
     /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略。
     #[serde(default)]
     pub missing_max_tokens: MissingMaxTokensConfig,
@@ -3175,7 +3403,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 1;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 3;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -3890,6 +4118,7 @@ impl Default for Config {
             compression: CompressionConfig::default(),
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
+            prompt_steering: PromptSteeringConfig::default(),
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
@@ -4074,6 +4303,22 @@ impl Config {
                 self.payload_guard_mode = PayloadGuardMode::OnTooLong;
             }
             self.runtime_config_migration_version = 1;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 2 {
+            if self.prompt_steering.task_quality.prompt.trim() == LEGACY_TASK_QUALITY_PROMPT_V1 {
+                self.prompt_steering.task_quality.prompt =
+                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
+            }
+            self.runtime_config_migration_version = 2;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 3 {
+            if self.prompt_steering.task_quality.prompt.trim() == LEGACY_TASK_QUALITY_PROMPT_V2 {
+                self.prompt_steering.task_quality.prompt =
+                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
+            }
+            self.runtime_config_migration_version = 3;
             changed = true;
         }
         changed
@@ -5647,6 +5892,53 @@ mod tests {
         config.payload_guard_mode = PayloadGuardMode::Preemptive;
         assert!(!config.apply_runtime_config_migrations());
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
+    }
+
+    #[test]
+    fn runtime_config_migration_updates_legacy_default_task_quality_prompt_only() {
+        let mut legacy_default = Config::default();
+        legacy_default.runtime_config_migration_version = 1;
+        legacy_default.prompt_steering.task_quality.prompt =
+            LEGACY_TASK_QUALITY_PROMPT_V1.to_string();
+
+        assert!(legacy_default.apply_runtime_config_migrations());
+        assert_eq!(
+            legacy_default.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        assert_eq!(
+            legacy_default.prompt_steering.task_quality.prompt,
+            DEFAULT_TASK_QUALITY_PROMPT.trim()
+        );
+
+        let mut legacy_default_v2 = Config::default();
+        legacy_default_v2.runtime_config_migration_version = 2;
+        legacy_default_v2.prompt_steering.task_quality.prompt =
+            LEGACY_TASK_QUALITY_PROMPT_V2.to_string();
+
+        assert!(legacy_default_v2.apply_runtime_config_migrations());
+        assert_eq!(
+            legacy_default_v2.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        assert_eq!(
+            legacy_default_v2.prompt_steering.task_quality.prompt,
+            DEFAULT_TASK_QUALITY_PROMPT.trim()
+        );
+
+        let mut custom = Config::default();
+        custom.runtime_config_migration_version = 1;
+        custom.prompt_steering.task_quality.prompt = "custom task prompt".to_string();
+
+        assert!(custom.apply_runtime_config_migrations());
+        assert_eq!(
+            custom.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        assert_eq!(
+            custom.prompt_steering.task_quality.prompt,
+            "custom task prompt"
+        );
     }
 
     #[test]

@@ -1620,7 +1620,7 @@ export function CredentialCard({
             <Button
               variant="outline"
               onClick={handleSupportedModelsDiscover}
-              disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || credential.authMethod === 'api_key'}
+              disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}
             >
               {discoverCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
               拉取并生成官方写法

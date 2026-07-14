@@ -278,6 +278,51 @@ export function UsageDetailModal({
                 {record.latencyTrace.suspectedIntentPreambleEndTurn && (
                   <MetricTile label="疑似开场白空转" value="是" tone="warning" />
                 )}
+                {record.latencyTrace.intentPreambleRisk && (
+                  <MetricTile label="开场白风险" value={record.latencyTrace.intentPreambleRisk} tone={record.latencyTrace.intentPreambleRisk === 'high' ? 'warning' : 'info'} />
+                )}
+                {record.latencyTrace.endTurnAnomalyReason && (
+                  <MetricTile label="EndTurn异常原因" value={record.latencyTrace.endTurnAnomalyReason} tone={record.latencyTrace.endTurnAnomalyRisk === 'high' ? 'warning' : 'info'} />
+                )}
+                {record.latencyTrace.endTurnAnomalyRisk && (
+                  <MetricTile label="EndTurn异常风险" value={record.latencyTrace.endTurnAnomalyRisk} tone={record.latencyTrace.endTurnAnomalyRisk === 'high' ? 'warning' : 'info'} />
+                )}
+                {record.latencyTrace.suspectedToolContextLeakEndTurn && (
+                  <MetricTile label="疑似工具上下文泄漏" value="是" tone="warning" />
+                )}
+                {record.latencyTrace.toolContextLeakMarkers?.length ? (
+                  <MetricTile label="工具泄漏标记" value={record.latencyTrace.toolContextLeakMarkers.join(' / ')} tone="warning" />
+                ) : null}
+                {record.latencyTrace.assistantTailIntentHint && (
+                  <MetricTile label="尾部意图提示" value="是" tone="info" />
+                )}
+                {typeof record.latencyTrace.upstreamEofWithoutCompleted === 'boolean' && (
+                  <MetricTile label="EOF无显式完成" value={record.latencyTrace.upstreamEofWithoutCompleted ? '是' : '否'} tone={record.latencyTrace.upstreamEofWithoutCompleted ? 'warning' : 'success'} />
+                )}
+                {record.latencyTrace.lastUpstreamEventType && (
+                  <MetricTile label="最后上游事件" value={record.latencyTrace.lastUpstreamEventType} />
+                )}
+                {record.latencyTrace.lastUpstreamEvents?.length ? (
+                  <MetricTile label="上游事件尾部" value={record.latencyTrace.lastUpstreamEvents.join(' → ')} />
+                ) : null}
+                {typeof record.latencyTrace.sawUpstreamAssistantResponse === 'boolean' && (
+                  <MetricTile label="见到Assistant事件" value={record.latencyTrace.sawUpstreamAssistantResponse ? '是' : '否'} />
+                )}
+                {typeof record.latencyTrace.sawUpstreamToolUse === 'boolean' && (
+                  <MetricTile label="见到ToolUse事件" value={record.latencyTrace.sawUpstreamToolUse ? '是' : '否'} />
+                )}
+                {typeof record.latencyTrace.sawUpstreamMetadata === 'boolean' && (
+                  <MetricTile label="见到Metadata事件" value={record.latencyTrace.sawUpstreamMetadata ? '是' : '否'} />
+                )}
+                {typeof record.latencyTrace.lastAssistantContentChars === 'number' && (
+                  <MetricTile label="最后Assistant字符" value={formatNumber(record.latencyTrace.lastAssistantContentChars)} />
+                )}
+                {typeof record.latencyTrace.filteredTrivialTextBlocks === 'number' && (
+                  <MetricTile label="过滤trivial文本块" value={formatNumber(record.latencyTrace.filteredTrivialTextBlocks)} tone="warning" />
+                )}
+                {typeof record.latencyTrace.filteredTrivialTextChars === 'number' && (
+                  <MetricTile label="过滤trivial字符" value={formatNumber(record.latencyTrace.filteredTrivialTextChars)} tone="warning" />
+                )}
               </>
             )}
           </div>

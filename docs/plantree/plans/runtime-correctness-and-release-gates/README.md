@@ -18,9 +18,9 @@ Fix the verified runtime, HA, lifecycle, CI, release, and maintainability findin
 
 ## Relationship And Authority
 
-This plan remains authoritative for the runtime fixes, lifecycle behavior, storage/Redis correctness, release-gate requirements, and dated evidence landed from the 2026-07-10 audit. The [system architecture modernization plan](../system-architecture-modernization/README.md) consumes those outcomes as constraints and owns later structural changes; it must not reclassify an incomplete gate as passed or reopen landed behavior without an explicit decision and new evidence.
+This plan remains authoritative for the runtime fixes, lifecycle behavior, storage/Redis correctness, release-gate requirements, and dated evidence landed from the 2026-07-10 audit. The [Greenfield AI Gateway plan](../greenfield-ai-gateway/README.md) consumes those outcomes as behavioral constraints and owns later target structural changes; it must not reclassify an incomplete gate as passed or reopen landed behavior without an explicit decision and new evidence.
 
-The deferred production container, TLS, Admin network-isolation, and database-secret hardening scope remains deferred here until a registered plan explicitly accepts ownership. Cross-replica requirements describe availability for one operator and do not introduce a multi-user or tenant boundary.
+The production container, TLS, Admin network-isolation and database-secret hardening scope remains deferred for the current Rust maintenance plan; the Greenfield AI Gateway accepts it for the separate target candidate. Cross-replica requirements describe availability for one operator and do not introduce a multi-user or tenant boundary.
 
 ## Reading Path
 

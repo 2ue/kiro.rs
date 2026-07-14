@@ -18,7 +18,7 @@ use crate::model::config::{
     CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
     KiroRsToolCachePolicy, MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig,
     ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptCacheStrategyType, ReportedUsageConfig,
+    PromptCacheSimulationMode, PromptCacheStrategyType, PromptSteeringConfig, ReportedUsageConfig,
     ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, ThinkingTriggerMode,
     normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
@@ -288,6 +288,21 @@ struct RequestLatencyTraceState {
     saw_upstream_completed: Arc<Mutex<Option<bool>>>,
     stop_reason_source: Arc<Mutex<Option<String>>>,
     suspected_intent_preamble_end_turn: Arc<Mutex<Option<bool>>>,
+    intent_preamble_risk: Arc<Mutex<Option<String>>>,
+    suspected_tool_context_leak_end_turn: Arc<Mutex<Option<bool>>>,
+    tool_context_leak_markers: Arc<Mutex<Option<Vec<String>>>>,
+    assistant_tail_intent_hint: Arc<Mutex<Option<bool>>>,
+    end_turn_anomaly_reason: Arc<Mutex<Option<String>>>,
+    end_turn_anomaly_risk: Arc<Mutex<Option<String>>>,
+    upstream_eof_without_completed: Arc<Mutex<Option<bool>>>,
+    last_upstream_event_type: Arc<Mutex<Option<String>>>,
+    last_upstream_events: Arc<Mutex<Option<Vec<String>>>>,
+    saw_upstream_assistant_response: Arc<Mutex<Option<bool>>>,
+    saw_upstream_tool_use: Arc<Mutex<Option<bool>>>,
+    saw_upstream_metadata: Arc<Mutex<Option<bool>>>,
+    last_assistant_content_chars: Arc<Mutex<Option<u32>>>,
+    filtered_trivial_text_blocks: Arc<Mutex<Option<u32>>>,
+    filtered_trivial_text_chars: Arc<Mutex<Option<u32>>>,
 }
 
 impl RequestLatencyTraceState {
@@ -320,6 +335,21 @@ impl RequestLatencyTraceState {
             saw_upstream_completed: Arc::new(Mutex::new(None)),
             stop_reason_source: Arc::new(Mutex::new(None)),
             suspected_intent_preamble_end_turn: Arc::new(Mutex::new(None)),
+            intent_preamble_risk: Arc::new(Mutex::new(None)),
+            suspected_tool_context_leak_end_turn: Arc::new(Mutex::new(None)),
+            tool_context_leak_markers: Arc::new(Mutex::new(None)),
+            assistant_tail_intent_hint: Arc::new(Mutex::new(None)),
+            end_turn_anomaly_reason: Arc::new(Mutex::new(None)),
+            end_turn_anomaly_risk: Arc::new(Mutex::new(None)),
+            upstream_eof_without_completed: Arc::new(Mutex::new(None)),
+            last_upstream_event_type: Arc::new(Mutex::new(None)),
+            last_upstream_events: Arc::new(Mutex::new(None)),
+            saw_upstream_assistant_response: Arc::new(Mutex::new(None)),
+            saw_upstream_tool_use: Arc::new(Mutex::new(None)),
+            saw_upstream_metadata: Arc::new(Mutex::new(None)),
+            last_assistant_content_chars: Arc::new(Mutex::new(None)),
+            filtered_trivial_text_blocks: Arc::new(Mutex::new(None)),
+            filtered_trivial_text_chars: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -704,6 +734,7 @@ struct RequestRuntimeConfig {
     kiro_upstream_stream_retry_on_status_error: bool,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
+    prompt_steering: PromptSteeringConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
@@ -747,6 +778,7 @@ impl RequestRuntimeConfig {
             kiro_upstream_stream_retry_on_status_error: true,
             image_processing: state.image_processing.normalized(),
             body_conversion: state.body_conversion.clone(),
+            prompt_steering: state.prompt_steering.clone().normalized(),
             missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
             external_pools: state.external_pools.clone(),
@@ -815,6 +847,7 @@ impl RequestRuntimeConfig {
                 .kiro_upstream_stream_retry_on_status_error,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
+            prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
@@ -1628,6 +1661,11 @@ fn local_pool_route_fallback_reason(
         LocalPoolRouteStateKind::CapacityFull if config.fallback_on_local_capacity_exhausted => {
             Some("local_capacity_full")
         }
+        LocalPoolRouteStateKind::SchedulerRedisDegraded
+            if config.fallback_on_scheduler_redis_degraded =>
+        {
+            Some("local_scheduler_redis_degraded")
+        }
         _ => None,
     }
 }
@@ -1643,6 +1681,11 @@ fn classify_local_error_for_external_fallback(
     }
     if is_request_error_that_must_not_fallback(&lower, attempts) {
         return None;
+    }
+    if lower.contains("redis 调度协调状态不可用") {
+        return config
+            .fallback_on_scheduler_redis_degraded
+            .then(|| "local_scheduler_redis_degraded".to_string());
     }
     if config.fallback_on_local_capacity_exhausted
         && (lower.contains("本地账号调度容量暂不可用")
@@ -1941,6 +1984,21 @@ impl RequestUsageContext {
         upstream_message_status: Option<&str>,
         stop_reason_source: impl Into<String>,
         suspected_intent_preamble_end_turn: bool,
+        intent_preamble_risk: Option<&str>,
+        suspected_tool_context_leak_end_turn: bool,
+        tool_context_leak_markers: Vec<String>,
+        assistant_tail_intent_hint: bool,
+        end_turn_anomaly_reason: Option<&str>,
+        end_turn_anomaly_risk: Option<&str>,
+        upstream_eof_without_completed: bool,
+        last_upstream_event_type: Option<&str>,
+        last_upstream_events: Vec<String>,
+        saw_upstream_assistant_response: bool,
+        saw_upstream_tool_use: bool,
+        saw_upstream_metadata: bool,
+        last_assistant_content_chars: u32,
+        filtered_trivial_text_blocks: u32,
+        filtered_trivial_text_chars: u32,
     ) {
         if let Some(status) = upstream_message_status
             .map(str::trim)
@@ -1955,6 +2013,43 @@ impl RequestUsageContext {
         *self.latency.stop_reason_source.lock() = Some(stop_reason_source.into());
         if suspected_intent_preamble_end_turn {
             *self.latency.suspected_intent_preamble_end_turn.lock() = Some(true);
+        }
+        if let Some(risk) = intent_preamble_risk {
+            *self.latency.intent_preamble_risk.lock() = Some(risk.to_string());
+        }
+        if suspected_tool_context_leak_end_turn {
+            *self.latency.suspected_tool_context_leak_end_turn.lock() = Some(true);
+        }
+        if !tool_context_leak_markers.is_empty() {
+            *self.latency.tool_context_leak_markers.lock() = Some(tool_context_leak_markers);
+        }
+        if assistant_tail_intent_hint {
+            *self.latency.assistant_tail_intent_hint.lock() = Some(true);
+        }
+        if let Some(reason) = end_turn_anomaly_reason {
+            *self.latency.end_turn_anomaly_reason.lock() = Some(reason.to_string());
+        }
+        if let Some(risk) = end_turn_anomaly_risk {
+            *self.latency.end_turn_anomaly_risk.lock() = Some(risk.to_string());
+        }
+        *self.latency.upstream_eof_without_completed.lock() = Some(upstream_eof_without_completed);
+        *self.latency.last_upstream_event_type.lock() =
+            last_upstream_event_type.map(str::to_string);
+        if !last_upstream_events.is_empty() {
+            *self.latency.last_upstream_events.lock() = Some(last_upstream_events);
+        }
+        *self.latency.saw_upstream_assistant_response.lock() =
+            Some(saw_upstream_assistant_response);
+        *self.latency.saw_upstream_tool_use.lock() = Some(saw_upstream_tool_use);
+        *self.latency.saw_upstream_metadata.lock() = Some(saw_upstream_metadata);
+        if last_assistant_content_chars > 0 {
+            *self.latency.last_assistant_content_chars.lock() = Some(last_assistant_content_chars);
+        }
+        if filtered_trivial_text_blocks > 0 {
+            *self.latency.filtered_trivial_text_blocks.lock() = Some(filtered_trivial_text_blocks);
+        }
+        if filtered_trivial_text_chars > 0 {
+            *self.latency.filtered_trivial_text_chars.lock() = Some(filtered_trivial_text_chars);
         }
     }
 
@@ -2114,6 +2209,24 @@ impl RequestUsageContext {
                 .latency
                 .suspected_intent_preamble_end_turn
                 .lock(),
+            intent_preamble_risk: self.latency.intent_preamble_risk.lock().clone(),
+            suspected_tool_context_leak_end_turn: *self
+                .latency
+                .suspected_tool_context_leak_end_turn
+                .lock(),
+            tool_context_leak_markers: self.latency.tool_context_leak_markers.lock().clone(),
+            assistant_tail_intent_hint: *self.latency.assistant_tail_intent_hint.lock(),
+            end_turn_anomaly_reason: self.latency.end_turn_anomaly_reason.lock().clone(),
+            end_turn_anomaly_risk: self.latency.end_turn_anomaly_risk.lock().clone(),
+            upstream_eof_without_completed: *self.latency.upstream_eof_without_completed.lock(),
+            last_upstream_event_type: self.latency.last_upstream_event_type.lock().clone(),
+            last_upstream_events: self.latency.last_upstream_events.lock().clone(),
+            saw_upstream_assistant_response: *self.latency.saw_upstream_assistant_response.lock(),
+            saw_upstream_tool_use: *self.latency.saw_upstream_tool_use.lock(),
+            saw_upstream_metadata: *self.latency.saw_upstream_metadata.lock(),
+            last_assistant_content_chars: *self.latency.last_assistant_content_chars.lock(),
+            filtered_trivial_text_blocks: *self.latency.filtered_trivial_text_blocks.lock(),
+            filtered_trivial_text_chars: *self.latency.filtered_trivial_text_chars.lock(),
         };
         (!trace.is_empty()).then_some(trace)
     }
@@ -2669,7 +2782,7 @@ fn public_error_response(
     };
     let mut headers = extra_headers.into_iter().collect::<Vec<_>>();
     if let Some(error_id) = error_id {
-        headers.push(("x-kiro-rs-error-id", error_id.to_string()));
+        headers.push(("x-error-id", error_id.to_string()));
     }
     envelope::error_response_with_id_and_headers(status, error_type, message, &request_id, headers)
 }
@@ -2849,6 +2962,21 @@ impl CredentialUsageContext {
             ctx.upstream_message_status(),
             ctx.stop_reason_source(),
             ctx.suspected_intent_preamble_end_turn(has_visible_text_output),
+            ctx.intent_preamble_risk(has_visible_text_output),
+            ctx.suspected_tool_context_leak_end_turn(has_visible_text_output),
+            ctx.tool_context_leak_markers(),
+            ctx.assistant_tail_intent_hint(),
+            ctx.end_turn_anomaly_reason(has_visible_text_output),
+            ctx.end_turn_anomaly_risk(has_visible_text_output),
+            ctx.upstream_eof_without_completed(),
+            ctx.last_upstream_event_type(),
+            ctx.last_upstream_events(),
+            ctx.saw_upstream_assistant_response(),
+            ctx.saw_upstream_tool_use(),
+            ctx.saw_upstream_metadata(),
+            ctx.last_assistant_content_chars(),
+            ctx.filtered_trivial_text_blocks(),
+            ctx.filtered_trivial_text_chars(),
         );
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage
@@ -3783,7 +3911,7 @@ fn map_provider_error(
     if is_upstream_invalid_model_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
-            "请求被拒绝：上游模型不支持（不应切换账号重试）",
+            "请求被拒绝：上游模型不可用（本地 provider 已在可重试场景尝试换号）",
             error_id,
         );
         let message = envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE;
@@ -3817,7 +3945,7 @@ fn map_provider_error(
             request_id,
             None,
             error_id
-                .map(|error_id| vec![("x-kiro-rs-error-id", error_id.to_string())])
+                .map(|error_id| vec![("x-error-id", error_id.to_string())])
                 .unwrap_or_default(),
         );
     }
@@ -3964,9 +4092,14 @@ fn is_upstream_invalid_model_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("invalid model")
         || lower.contains("invalid_model_id")
+        || lower.contains("invalid_model")
         || lower.contains("model not found")
         || lower.contains("model_not_found")
         || lower.contains("unsupported model")
+        || lower.contains("unknown model")
+        || lower.contains("requested model is not available")
+        || lower.contains("model is not available")
+        || lower.contains("not available for this endpoint")
 }
 
 fn is_upstream_too_long_error(value: &str) -> bool {
@@ -4509,6 +4642,32 @@ async fn post_messages_inner(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
+    let prompt_steering_applied = super::prompt_steering::apply_to_messages_request(
+        &endpoint,
+        runtime_config.compat_profile,
+        &runtime_config.prompt_steering,
+        &mut payload,
+    );
+    let raw_body = if prompt_steering_applied
+        && super::prompt_steering::should_apply_to_external_pool(
+            &endpoint,
+            runtime_config.compat_profile,
+            &runtime_config.prompt_steering,
+        ) {
+        match serde_json::to_vec(&payload) {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(err) => {
+                tracing::warn!("提示词引导后的请求体序列化失败: {}", err);
+                return envelope::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Failed to prepare request body.",
+                );
+            }
+        }
+    } else {
+        raw_body
+    };
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let mut external_fallback = build_external_fallback_context(
         &state,
@@ -7504,12 +7663,40 @@ fn should_force_visible_thinking(
 /// 计算消息的 token 数量
 pub async fn count_tokens(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+) -> Response {
+    count_tokens_for_endpoint(state, payload, "/v1/messages/count_tokens").await
+}
+
+/// POST /cc/v1/messages/count_tokens
+///
+/// Claude Code count_tokens must apply the same request-level prompt steering as `/cc/v1/messages`,
+/// otherwise the estimate under-counts the injected system guidance.
+pub async fn count_tokens_cc(
+    State(state): State<AppState>,
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+) -> Response {
+    count_tokens_for_endpoint(state, payload, "/cc/v1/messages/count_tokens").await
+}
+
+async fn count_tokens_for_endpoint(
+    state: AppState,
+    mut payload: CountTokensRequest,
+    endpoint: &str,
 ) -> Response {
     tracing::info!(
+        endpoint,
         model = %payload.model,
         message_count = %payload.messages.len(),
-        "Received POST /v1/messages/count_tokens request"
+        "Received POST messages/count_tokens request"
+    );
+
+    let runtime_config = RequestRuntimeConfig::from_app_state(&state);
+    super::prompt_steering::apply_to_count_tokens_request(
+        endpoint,
+        runtime_config.compat_profile,
+        &runtime_config.prompt_steering,
+        &mut payload,
     );
 
     let image_processing = request_image_processing_config(&state);
@@ -7542,35 +7729,14 @@ pub async fn count_tokens(
 pub async fn count_tokens_dfcache(
     State(state): State<AppState>,
     Path(route): Path<String>,
-    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> Response {
-    if let Err(response) = resolve_defined_cache_route(&state, &route) {
-        return response;
-    }
-    let image_processing = request_image_processing_config(&state);
-    if let Err(message) = body_processing::prepare_multimodal_message_sources(
-        &state.file_store,
-        &mut payload.messages,
-        None,
-        image_processing,
-    )
-    .await
-    {
-        tracing::warn!("dfcache count_tokens 多模态 source 处理失败: {}", message);
-        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
-    }
-
-    let total_tokens = token::count_all_tokens(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
-
-    Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
-    })
-    .into_response()
+    let prefix = match resolve_defined_cache_route(&state, &route) {
+        Ok(prefix) => prefix,
+        Err(response) => return response,
+    };
+    let endpoint = format!("{prefix}/v1/messages/count_tokens");
+    count_tokens_for_endpoint(state, payload, &endpoint).await
 }
 
 /// POST /cc/v1/messages

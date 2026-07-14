@@ -402,6 +402,7 @@ export function ExternalPoolsPanel() {
   const fallbackActive = externalEnabled && !directPolicyActive && (
     configDraft.localPoolPreflightEnabled
     || configDraft.fallbackOnLocalCapacityExhausted
+    || configDraft.fallbackOnSchedulerRedisDegraded
     || configDraft.fallbackOnNoAvailableCredentials
     || configDraft.fallbackOnLocalTransientExhausted
     || configDraft.fallbackOnUnsupportedModel
@@ -480,6 +481,7 @@ export function ExternalPoolsPanel() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Toggle disabled={!externalEnabled || directPolicyActive} label="本地容量预检" checked={configDraft.localPoolPreflightEnabled} onChange={(localPoolPreflightEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolPreflightEnabled }))} />
                   <Toggle disabled={!externalEnabled || directPolicyActive} label="容量不足 fallback" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(fallbackOnLocalCapacityExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalCapacityExhausted }))} />
+                  <Toggle disabled={!externalEnabled || directPolicyActive} label="调度 Redis 降级 fallback" checked={configDraft.fallbackOnSchedulerRedisDegraded} onChange={(fallbackOnSchedulerRedisDegraded) => setConfigDraft((prev) => ({ ...prev, fallbackOnSchedulerRedisDegraded }))} />
                   <Toggle disabled={!externalEnabled || directPolicyActive} label="无可用凭据 fallback" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(fallbackOnNoAvailableCredentials) => setConfigDraft((prev) => ({ ...prev, fallbackOnNoAvailableCredentials }))} />
                   <Toggle disabled={!externalEnabled || directPolicyActive} label="瞬态错误耗尽 fallback" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(fallbackOnLocalTransientExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalTransientExhausted }))} />
                   <Toggle disabled={!externalEnabled || directPolicyActive} label="模型不支持 fallback" checked={configDraft.fallbackOnUnsupportedModel} onChange={(fallbackOnUnsupportedModel) => setConfigDraft((prev) => ({ ...prev, fallbackOnUnsupportedModel }))} />

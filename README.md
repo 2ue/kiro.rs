@@ -136,6 +136,25 @@ Social 认证：
 }
 ```
 
+Kiro API Key / headless 认证：
+```json
+{
+   "authMethod": "api_key",
+   "kiroApiKey": "ksk_xxxxxxxx",
+   "region": "eu-central-1",
+   "authRegion": "eu-central-1",
+   "apiRegion": "eu-central-1",
+   "endpoint": "cli"
+}
+```
+
+也支持便捷纯文本格式，每行一组：
+```text
+ksk_xxxxxxxx|eu-central-1
+```
+
+API Key 凭据会直接作为 Kiro Bearer token 使用，不需要 `refreshToken`，默认走 `cli` endpoint。使用 `ksk_xxx|region` 形式导入时，服务会自动把 `region/authRegion/apiRegion` 补齐为同一个区域。
+
 IdC 认证：
 ```json
 {
@@ -372,6 +391,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
+| `kiroApiKey`   | string | Kiro API Key / headless 凭据，格式 `ksk_xxx`；也支持 `ksk_xxx|region` 便捷写法 |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
@@ -381,7 +401,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
-| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`）|
+| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`；API Key 凭据默认补为 `cli`）|
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
@@ -509,7 +529,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
-| `KIRO_API_KEY` | - | 自动导入一个最高优先级的 Kiro API Key 凭据并写入 PgSQL，可用于不准备 `credentials.json` 的场景 |
+| `KIRO_API_KEY` | - | 自动导入一个最高优先级的 Kiro API Key 凭据并写入 PgSQL，可用于不准备 `credentials.json` 的场景；支持 `ksk_xxx|region` |
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |

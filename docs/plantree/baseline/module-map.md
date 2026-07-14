@@ -172,4 +172,4 @@ File size alone is not a defect, but these files combine enough responsibilities
 | `src/model/config.rs` | 5,529 | All runtime configuration and patches |
 | `src/external_pool.rs` | 4,978 | Selection, transport, streaming, retry, usage, billing |
 
-The target module design is intentionally not defined here. See the registered system-architecture modernization plan for proposed ownership and dependency direction.
+The target module design is intentionally not defined here. See the registered [Greenfield AI Gateway plan](../plans/greenfield-ai-gateway/README.md) for target ownership and dependency direction; the Rust modernization plan is historical reference.

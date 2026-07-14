@@ -47,6 +47,7 @@ pub(crate) mod payload_guard_runtime;
 pub(crate) mod pricing;
 pub(crate) mod prompt_cache;
 pub(crate) mod prompt_cache_creation_control;
+pub(crate) mod prompt_steering;
 pub(crate) mod request_facts;
 mod router;
 mod stream;

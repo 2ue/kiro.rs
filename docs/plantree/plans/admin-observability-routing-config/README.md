@@ -25,9 +25,9 @@ This plan covers four related but separable surfaces:
 
 ## Relationship And Authority
 
-This plan remains authoritative for the exact request-id usage query, supported-model dispatch eligibility, bounded prompt/protocol retry, configuration grouping, and local verification landed in its scope. The [system architecture modernization plan](../system-architecture-modernization/README.md) owns later control-plane boundaries, generated frontend contracts, cross-replica invalidation, storage ports, and system-wide migration sequencing.
+This plan remains authoritative for the exact request-id usage query, supported-model dispatch eligibility, bounded prompt/protocol retry, configuration grouping, and local verification landed in its scope. The [Greenfield AI Gateway plan](../greenfield-ai-gateway/README.md) owns later control-plane boundaries, generated frontend contracts, cross-replica invalidation and target storage contracts.
 
-Modernization work must preserve the compatibility and dispatch semantics above unless an accepted decision explicitly supersedes them and provides migration and regression coverage.
+Greenfield work must preserve the compatibility and dispatch semantics above unless an accepted decision explicitly supersedes them and provides cutover and regression coverage.
 
 ## Reading Path
 

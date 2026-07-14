@@ -475,7 +475,8 @@ async fn execute_request(
     let request_id = header_string(&headers, "request-id")
         .or_else(|| header_string(&headers, "anthropic-request-id"))
         .or_else(|| header_string(&headers, "x-amzn-requestid"));
-    let error_id = header_string(&headers, "x-kiro-rs-error-id");
+    let error_id = header_string(&headers, "x-error-id")
+        .or_else(|| header_string(&headers, "x-kiro-rs-error-id"));
 
     if config.stream {
         let mut byte_stream = response.bytes_stream();
@@ -1906,7 +1907,7 @@ fn json_error(status: StatusCode, request_id: &str, error_type: &str, message: &
         [
             ("request-id", request_id),
             ("anthropic-request-id", request_id),
-            ("x-kiro-rs-error-id", request_id),
+            ("x-error-id", request_id),
         ],
         Json(json!({
             "type": "error",

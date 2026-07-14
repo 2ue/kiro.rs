@@ -6,9 +6,9 @@ Status: Current as of 2026-07-11
 
 Authority: Dated retrieval map for the implementation at `v0.0.102` / `e9479df`; source code, schema, configuration, and tests remain authoritative for exact current behavior
 
-Read when: Understanding the product or current system before opening a specific modernization topic
+Read when: Understanding the current Rust product or implementation before opening a target reconstruction topic
 
-Related: [Plan Tree](../README.md), [System architecture modernization](../plans/system-architecture-modernization/README.md)
+Related: [Plan Tree](../README.md), [Greenfield AI Gateway](../plans/greenfield-ai-gateway/README.md), [superseded Rust modernization](../plans/system-architecture-modernization/README.md)
 
 This baseline records project-wide facts that plans can reference without duplicating context. It describes the current system, not the proposed target architecture. Refresh the affected map from code before a large refactor and update its `As of` revision when current behavior changes materially.
 

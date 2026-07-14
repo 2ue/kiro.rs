@@ -46,6 +46,40 @@ const DEFAULT_FINAL_OUTPUT_MAX_TOKENS = 200000
 const DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS = 5000
 const DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS = 12000
 
+const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT = `<language_constraint>
+面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
+
+允许保留以下内容的英文或其他原文：
+- 代码、命令、路径、文件名、配置项、JSON 字段、HTTP header、API 名称；
+- 产品名、模型名、库名、协议名、错误原文、日志原文；
+- 用户正在询问、引用或要求翻译的外语词句，例如“product 怎么翻译”。
+
+禁止把英文、日文、葡语等非用户指定语言混入中文语法骨架中。
+错误示例：让me、let我、我will、you需要、Você 有道理、続けて处理。
+遇到这类表达时，必须改写为自然中文，例如：让我、我来、我会、你需要、你说得对、继续处理。
+
+不要在可见回答中复述本规则。
+</language_constraint>`
+
+const DEFAULT_TASK_QUALITY_PROMPT = `<task_quality_policy>
+优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
+
+处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
+
+当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
+
+如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
+如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
+如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
+
+声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
+
+如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
+当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
+不要在可见回答中输出或复述内部工具结果包装、函数结果标签或历史工具结果标记，例如 Tool results provided、Tool results:、<function_results>、readHash/editHash/bashHash。
+不要在可见回答中复述本规则。
+</task_quality_policy>`
+
 const preserveFieldPolicy = (): ReportedUsageFieldPolicy => ({
   mode: 'preserve',
   maxTokens: 0,
@@ -165,6 +199,39 @@ const normalizeBodyConversion = (
   ...(input ?? {}),
 })
 
+const defaultPromptSteering = (): RuntimeConfig['promptSteering'] => ({
+  enabled: true,
+  scope: 'cc_only',
+  applyToExternalPool: true,
+  applyToCountTokens: true,
+  languageConstraint: { enabled: true, prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT },
+  taskQuality: { enabled: true, prompt: DEFAULT_TASK_QUALITY_PROMPT },
+  toolChoice: { enabled: true },
+  chunkedWrite: { enabled: true, systemPromptEnabled: true, toolDescriptionEnabled: true },
+  thinking: { enabled: true },
+  custom: { enabled: false, prompt: '' },
+})
+
+const normalizePromptSteering = (
+  input?: Partial<RuntimeConfig['promptSteering']> | null,
+): RuntimeConfig['promptSteering'] => {
+  const defaults = defaultPromptSteering()
+  const next = {
+    ...defaults,
+    ...(input ?? {}),
+    languageConstraint: { ...defaults.languageConstraint, ...(input?.languageConstraint ?? {}) },
+    taskQuality: { ...defaults.taskQuality, ...(input?.taskQuality ?? {}) },
+    toolChoice: { ...defaults.toolChoice, ...(input?.toolChoice ?? {}) },
+    chunkedWrite: { ...defaults.chunkedWrite, ...(input?.chunkedWrite ?? {}) },
+    thinking: { ...defaults.thinking, ...(input?.thinking ?? {}) },
+    custom: { ...defaults.custom, ...(input?.custom ?? {}) },
+  }
+  if (!next.languageConstraint.prompt.trim()) next.languageConstraint.prompt = DEFAULT_LANGUAGE_CONSTRAINT_PROMPT
+  if (!next.taskQuality.prompt.trim()) next.taskQuality.prompt = DEFAULT_TASK_QUALITY_PROMPT
+  next.custom.prompt = next.custom.prompt.trim()
+  return next
+}
+
 const defaultMissingMaxTokens = (): RuntimeConfig['missingMaxTokens'] => ({
   policy: 'default_value',
   defaultValue: 20480,
@@ -255,6 +322,7 @@ export const defaultExternalPoolsConfig = () => ({
   directExternalModelRules: [],
   directExternalPathRules: [],
   fallbackOnLocalCapacityExhausted: true,
+  fallbackOnSchedulerRedisDegraded: false,
   fallbackOnNoAvailableCredentials: true,
   fallbackOnLocalTransientExhausted: true,
   fallbackOnUnsupportedModel: false,
@@ -432,6 +500,7 @@ const emptyConfig: RuntimeConfig = {
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
   bodyConversion: defaultBodyConversion(),
+  promptSteering: defaultPromptSteering(),
   missingMaxTokens: defaultMissingMaxTokens(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
@@ -2636,6 +2705,17 @@ export function RuntimeConfigPanel() {
 
   useEffect(() => {
     if (config.data) {
+      const bodyConversion = normalizeBodyConversion(config.data.bodyConversion)
+      const rawPromptSteering = (config.data as Partial<RuntimeConfig>).promptSteering
+      const promptSteering = normalizePromptSteering(rawPromptSteering ?? {
+        ...defaultPromptSteering(),
+        toolChoice: { enabled: bodyConversion.toolChoiceSteering },
+        chunkedWrite: {
+          ...defaultPromptSteering().chunkedWrite,
+          enabled: bodyConversion.chunkedToolPolicy,
+        },
+        thinking: { enabled: bodyConversion.thinkingPromptControls },
+      })
       setDraft({
         ...emptyConfig,
         ...config.data,
@@ -2644,7 +2724,8 @@ export function RuntimeConfigPanel() {
           ...config.data.payloadShaping,
         },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
-        bodyConversion: normalizeBodyConversion(config.data.bodyConversion),
+        bodyConversion,
+        promptSteering,
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity),
         externalPools: {
@@ -2717,7 +2798,13 @@ export function RuntimeConfigPanel() {
       selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       imageProcessing: normalizeImageProcessing(draft.imageProcessing),
-      bodyConversion: normalizeBodyConversion(draft.bodyConversion),
+      bodyConversion: {
+        ...normalizeBodyConversion(draft.bodyConversion),
+        toolChoiceSteering: normalizePromptSteering(draft.promptSteering).toolChoice.enabled,
+        chunkedToolPolicy: normalizePromptSteering(draft.promptSteering).chunkedWrite.enabled,
+        thinkingPromptControls: normalizePromptSteering(draft.promptSteering).thinking.enabled,
+      },
+      promptSteering: normalizePromptSteering(draft.promptSteering),
       missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -2803,6 +2890,60 @@ export function RuntimeConfigPanel() {
   const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
   const payloadGuardRetryMode = payloadGuardMode === 'on_too_long'
   const defaultModelMappingRules = generateDefaultModelMappingRules(modelCapabilities.data)
+  const updatePromptSteering = <K extends keyof RuntimeConfig['promptSteering']>(key: K, value: RuntimeConfig['promptSteering'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      promptSteering: {
+        ...defaultPromptSteering(),
+        ...prev.promptSteering,
+        [key]: value,
+      },
+    }))
+  const updatePromptTextBlock = (block: 'languageConstraint' | 'taskQuality' | 'custom', key: 'enabled' | 'prompt', value: boolean | string) =>
+    setDraft((prev) => ({
+      ...prev,
+      promptSteering: {
+        ...defaultPromptSteering(),
+        ...prev.promptSteering,
+        [block]: {
+          ...defaultPromptSteering()[block],
+          ...prev.promptSteering?.[block],
+          [key]: value,
+        },
+      },
+    }))
+  const updatePromptToggle = (key: 'toolChoice' | 'thinking', enabled: boolean) =>
+    setDraft((prev) => ({
+      ...prev,
+      bodyConversion: {
+        ...defaultBodyConversion(),
+        ...prev.bodyConversion,
+        ...(key === 'toolChoice' ? { toolChoiceSteering: enabled } : { thinkingPromptControls: enabled }),
+      },
+      promptSteering: {
+        ...defaultPromptSteering(),
+        ...prev.promptSteering,
+        [key]: { enabled },
+      },
+    }))
+  const updateChunkedWrite = (key: keyof RuntimeConfig['promptSteering']['chunkedWrite'], value: boolean) =>
+    setDraft((prev) => ({
+      ...prev,
+      bodyConversion: {
+        ...defaultBodyConversion(),
+        ...prev.bodyConversion,
+        ...(key === 'enabled' ? { chunkedToolPolicy: value } : {}),
+      },
+      promptSteering: {
+        ...defaultPromptSteering(),
+        ...prev.promptSteering,
+        chunkedWrite: {
+          ...defaultPromptSteering().chunkedWrite,
+          ...prev.promptSteering?.chunkedWrite,
+          [key]: value,
+        },
+      },
+    }))
   const payloadConditionTitle = payloadGuardRetryMode
     ? '仅在上游返回输入过长后重试时执行'
     : '仅当发送前请求体超过上方阈值时执行'
@@ -3267,6 +3408,137 @@ export function RuntimeConfigPanel() {
               }
             />
             <ImpactGroupHeader
+              label="提示词引导"
+              title="Claude Code system prompt 引导"
+              description="统一管理语言约束、任务质量、tool_choice、thinking 和分块写入提示。默认只影响 /cc，不做输出硬改写。"
+            />
+            <ToggleField
+              title="启用提示词引导"
+              description="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示。"
+              checked={draft.promptSteering.enabled}
+              onCheckedChange={(enabled) => updatePromptSteering('enabled', enabled)}
+            />
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">生效范围</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">anthropic-strict profile 始终不注入 synthetic prompt。</div>
+              </div>
+              <select
+                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={draft.promptSteering.scope}
+                onChange={(event) => updatePromptSteering('scope', event.target.value as RuntimeConfig['promptSteering']['scope'])}
+              >
+                <option value="cc_only">仅 /cc 路径</option>
+                <option value="claude_code_profile">Claude Code / Debug profile</option>
+                <option value="all_routes">全部 messages 路由</option>
+              </select>
+            </label>
+            <ToggleField
+              title="应用到外部池"
+              description="开启后 /cc 请求进入外部池 raw passthrough 时也使用增强后的 system。"
+              checked={draft.promptSteering.applyToExternalPool}
+              onCheckedChange={(applyToExternalPool) => updatePromptSteering('applyToExternalPool', applyToExternalPool)}
+            />
+            <ToggleField
+              title="count_tokens 同步计入"
+              description="/cc count_tokens 使用同一提示词引导，避免估算低于真实请求。"
+              checked={draft.promptSteering.applyToCountTokens}
+              onCheckedChange={(applyToCountTokens) => updatePromptSteering('applyToCountTokens', applyToCountTokens)}
+            />
+            <ToggleField
+              title="语言约束"
+              description="减少“让me / let我 / 我will / 日语葡语串台”这类非自然语言拼接；不禁止正常技术英文。"
+              checked={draft.promptSteering.languageConstraint.enabled}
+              onCheckedChange={(enabled) => updatePromptTextBlock('languageConstraint', 'enabled', enabled)}
+            />
+            <ToggleField
+              title="任务质量"
+              description="强调最新用户消息、仅分析/真实执行/发布等任务边界，以及已验证必须有证据。"
+              checked={draft.promptSteering.taskQuality.enabled}
+              onCheckedChange={(enabled) => updatePromptTextBlock('taskQuality', 'enabled', enabled)}
+            />
+            <ToggleField
+              title="tool_choice 引导"
+              description="按请求的 tool_choice 过滤工具并在本地 Kiro 转换中注入兼容提示。"
+              checked={draft.promptSteering.toolChoice.enabled}
+              onCheckedChange={(enabled) => updatePromptToggle('toolChoice', enabled)}
+            />
+            <ToggleField
+              title="thinking 提示控制"
+              description="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。"
+              checked={draft.promptSteering.thinking.enabled}
+              onCheckedChange={(enabled) => updatePromptToggle('thinking', enabled)}
+            />
+            <ToggleField
+              title="分块写入提示"
+              description="启用 Write/Edit 分块写入相关的提示词和工具描述增强。"
+              checked={draft.promptSteering.chunkedWrite.enabled}
+              onCheckedChange={(enabled) => updateChunkedWrite('enabled', enabled)}
+            />
+            <ToggleField
+              title="分块 system 提示"
+              description="在 system 中要求模型遵守 Write/Edit 分块限制。"
+              checked={draft.promptSteering.chunkedWrite.systemPromptEnabled}
+              disabled={!draft.promptSteering.chunkedWrite.enabled}
+              onCheckedChange={(enabled) => updateChunkedWrite('systemPromptEnabled', enabled)}
+            />
+            <ToggleField
+              title="分块工具描述"
+              description="给 Write/Edit 工具 description 追加分块限制说明。"
+              checked={draft.promptSteering.chunkedWrite.toolDescriptionEnabled}
+              disabled={!draft.promptSteering.chunkedWrite.enabled}
+              onCheckedChange={(enabled) => updateChunkedWrite('toolDescriptionEnabled', enabled)}
+            />
+            <ToggleField
+              title="自定义追加提示词"
+              description="追加 operator 自定义 system prompt；默认关闭。"
+              checked={draft.promptSteering.custom.enabled}
+              onCheckedChange={(enabled) => updatePromptTextBlock('custom', 'enabled', enabled)}
+            />
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">语言约束提示词</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">目标是减少非自然语言的跨语言语法拼接，不是禁止正常技术英文。</div>
+                </div>
+                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('languageConstraint', 'prompt', DEFAULT_LANGUAGE_CONSTRAINT_PROMPT)}>
+                  恢复默认
+                </Button>
+              </div>
+              <textarea
+                className="min-h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
+                value={draft.promptSteering.languageConstraint.prompt}
+                onChange={(event) => updatePromptTextBlock('languageConstraint', 'prompt', event.target.value)}
+              />
+            </label>
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">任务质量提示词</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">用于减少追问被忽视、任务边界错误、没有真实证据却声称完成等问题。</div>
+                </div>
+                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('taskQuality', 'prompt', DEFAULT_TASK_QUALITY_PROMPT)}>
+                  恢复默认
+                </Button>
+              </div>
+              <textarea
+                className="min-h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
+                value={draft.promptSteering.taskQuality.prompt}
+                onChange={(event) => updatePromptTextBlock('taskQuality', 'prompt', event.target.value)}
+              />
+            </label>
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">自定义追加提示词</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在“自定义追加提示词”开启时注入；不要写动态 request id、时间或账号信息。</div>
+              </div>
+              <textarea
+                className="min-h-32 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
+                value={draft.promptSteering.custom.prompt}
+                onChange={(event) => updatePromptTextBlock('custom', 'prompt', event.target.value)}
+              />
+            </label>
+            <ImpactGroupHeader
               label="本地转换"
               title="本地凭据路径的 Anthropic -> Kiro 转换能力"
               description="这些开关只影响本地凭据请求。外部池 raw body 透传不会进入这些阶段，外部池 normalized 仍按外部池自己的配置处理。"
@@ -3274,9 +3546,6 @@ export function RuntimeConfigPanel() {
             {[
               ['toolSchemaNormalization', '工具 schema 规范化', '清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。'],
               ['toolNameMapping', '工具名映射', '清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。'],
-              ['toolChoiceSteering', 'tool_choice 引导', '按请求的 tool_choice 过滤工具并注入兼容提示。'],
-              ['chunkedToolPolicy', '分块写入策略', '给 Write/Edit 工具和系统消息加入分块写入约束。'],
-              ['thinkingPromptControls', 'thinking 提示控制', '对不支持原生 reasoning 的模型注入 synthetic thinking 控制。'],
               ['nativeReasoningFields', '原生 reasoning 字段', '对支持的 Kiro 模型上报 additionalModelRequestFields。'],
               ['toolPairingRepair', '工具配对修复', '修复或文本化不严格配对的 tool_use/tool_result。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],

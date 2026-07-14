@@ -392,6 +392,7 @@ fn runtime_config_for_payload_guard(
         kiro_upstream_stream_retry_on_status_error: true,
         image_processing: ImageProcessingConfig::default(),
         body_conversion: BodyConversionConfig::default(),
+        prompt_steering: PromptSteeringConfig::default(),
         missing_max_tokens: MissingMaxTokensConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
         external_pools: ExternalPoolsConfig::default(),
@@ -2374,7 +2375,7 @@ async fn official_kiro_upstream_400_message_is_exposed_without_internal_prefix()
     assert_eq!(
         response
             .headers()
-            .get("x-kiro-rs-error-id")
+            .get("x-error-id")
             .and_then(|value| value.to_str().ok()),
         Some("req_01official")
     );
@@ -2494,6 +2495,37 @@ async fn official_kiro_high_load_message_is_exposed_when_safe() {
 }
 
 #[tokio::test]
+async fn official_kiro_upstream_message_with_kiro_term_is_masked() {
+    let response = map_provider_error(
+        anyhow::anyhow!(
+            "{}",
+            r#"流式 API 请求失败（账号 #7 secret-user）: 500 Internal Server Error {"message":"Kiro service rejected the request","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ),
+        Some("req_test_official_kiro_term"),
+        Some("req_01official_term"),
+        None,
+    );
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        value.pointer("/error/type").and_then(|v| v.as_str()),
+        Some("api_error")
+    );
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
+    assert!(message.contains("error ID: req_01official_term"));
+    assert_public_error_message_is_normalized(message);
+}
+
+#[tokio::test]
 async fn opaque_400_bad_request_maps_to_invalid_request_not_gateway() {
     let response = map_provider_error(
         anyhow::anyhow!(
@@ -2518,6 +2550,38 @@ async fn opaque_400_bad_request_maps_to_invalid_request_not_gateway() {
         value.pointer("/error/message").and_then(|v| v.as_str()),
         Some(UPSTREAM_INVALID_REQUEST_MESSAGE)
     );
+}
+
+#[tokio::test]
+async fn model_unavailable_400_maps_to_public_model_unavailable_message() {
+    let response = map_provider_error(
+        anyhow::anyhow!(
+            "{}",
+            r#"流式 API 请求失败（账号 #7 secret-user，模型不可用）: 400 Bad Request {"message":"The requested model is not available for this endpoint. If this continues, contact the administrator with error ID: req_01raw"}"#
+        ),
+        Some("req_test_model_unavailable"),
+        Some("req_01public_model_unavailable"),
+        None,
+    );
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        value.pointer("/error/type").and_then(|v| v.as_str()),
+        Some("invalid_request_error")
+    );
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .expect("error message");
+
+    assert!(message.contains(envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE));
+    assert!(message.contains("error ID: req_01public_model_unavailable"));
+    assert!(!message.contains("req_01raw"));
+    assert_public_error_message_is_normalized(message);
 }
 
 #[tokio::test]
@@ -2594,7 +2658,7 @@ async fn provider_error_response_exposes_matching_public_error_id() {
     assert_eq!(
         response
             .headers()
-            .get("x-kiro-rs-error-id")
+            .get("x-error-id")
             .and_then(|value| value.to_str().ok()),
         Some("req_01public_error_id")
     );
@@ -2619,6 +2683,7 @@ async fn provider_error_response_exposes_matching_public_error_id() {
 fn assert_public_error_message_is_normalized(message: &str) {
     let lower = message.to_ascii_lowercase();
     for forbidden in [
+        "kiro",
         "credential",
         "external pool",
         "external_pool",
@@ -3839,6 +3904,34 @@ fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
         ),
         None
     );
+    assert_eq!(
+        classify_local_error_for_external_fallback(
+            "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
+            &[],
+            &config,
+        ),
+        None
+    );
+
+    config = ExternalPoolsConfig::default();
+    assert_eq!(
+        classify_local_error_for_external_fallback(
+            "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
+            &[],
+            &config,
+        ),
+        None
+    );
+    config.fallback_on_scheduler_redis_degraded = true;
+    assert_eq!(
+        classify_local_error_for_external_fallback(
+            "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
+            &[],
+            &config,
+        )
+        .as_deref(),
+        Some("local_scheduler_redis_degraded")
+    );
 
     config = ExternalPoolsConfig::default();
     config.fallback_on_local_transient_exhausted = false;
@@ -3905,6 +3998,10 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
         Some("local_capacity_full")
     );
     assert_eq!(
+        local_pool_route_fallback_reason(LocalPoolRouteStateKind::SchedulerRedisDegraded, &config),
+        None
+    );
+    assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoModelCompatible, &config),
         None
     );
@@ -3936,6 +4033,13 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
     assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::CapacityFull, &config),
         None
+    );
+
+    config = ExternalPoolsConfig::default();
+    config.fallback_on_scheduler_redis_degraded = true;
+    assert_eq!(
+        local_pool_route_fallback_reason(LocalPoolRouteStateKind::SchedulerRedisDegraded, &config),
+        Some("local_scheduler_redis_degraded")
     );
 
     config = ExternalPoolsConfig::default();

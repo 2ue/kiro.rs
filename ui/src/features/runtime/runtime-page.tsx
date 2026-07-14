@@ -28,6 +28,7 @@ import {
   SelectValue,
   Spinner,
   Switch,
+  Textarea,
 } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -35,6 +36,7 @@ import {
   defaultBodyConversion,
   defaultExternalPoolsConfig,
   defaultMissingMaxTokens,
+  defaultPromptSteering,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
   defaultWeightedCapacity,
@@ -45,6 +47,7 @@ import {
   normalizeMissingMaxTokens,
   normalizeModelMapping,
   normalizePayloadShaping,
+  normalizePromptSteering,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   normalizeWeightedCapacity,
@@ -303,7 +306,13 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     highCacheThreshold: toWhole(draft.highCacheThreshold),
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     imageProcessing: normalizeImageProcessing(draft.imageProcessing),
-    bodyConversion: normalizeBodyConversion(draft.bodyConversion),
+    bodyConversion: {
+      ...normalizeBodyConversion(draft.bodyConversion),
+      toolChoiceSteering: normalizePromptSteering(draft.promptSteering).toolChoice.enabled,
+      chunkedToolPolicy: normalizePromptSteering(draft.promptSteering).chunkedWrite.enabled,
+      thinkingPromptControls: normalizePromptSteering(draft.promptSteering).thinking.enabled,
+    },
+    promptSteering: normalizePromptSteering(draft.promptSteering),
     missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
@@ -355,11 +364,23 @@ export function RuntimePage() {
 
   useEffect(() => {
     if (config.data) {
+      const bodyConversion = normalizeBodyConversion(config.data.bodyConversion ?? defaultBodyConversion())
+      const rawPromptSteering = (config.data as Partial<RuntimeConfig>).promptSteering
+      const promptSteering = normalizePromptSteering(rawPromptSteering ?? {
+        ...defaultPromptSteering(),
+        toolChoice: { enabled: bodyConversion.toolChoiceSteering },
+        chunkedWrite: {
+          ...defaultPromptSteering().chunkedWrite,
+          enabled: bodyConversion.chunkedToolPolicy,
+        },
+        thinking: { enabled: bodyConversion.thinkingPromptControls },
+      })
       setDraft({
         ...emptyRuntimeConfig,
         ...config.data,
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
-        bodyConversion: normalizeBodyConversion(config.data.bodyConversion ?? defaultBodyConversion()),
+        bodyConversion,
+        promptSteering,
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens ?? defaultMissingMaxTokens()),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         externalPools: {
@@ -408,6 +429,68 @@ export function RuntimePage() {
         [k]: v,
       },
     }))
+
+  const setPromptSteering = <K extends keyof RuntimeConfig['promptSteering']>(k: K) => (v: RuntimeConfig['promptSteering'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      promptSteering: {
+        ...defaultPromptSteering(),
+        ...prev.promptSteering,
+        [k]: v,
+      },
+    }))
+
+  const setPromptSteeringText =
+    (block: 'languageConstraint' | 'taskQuality' | 'custom', key: 'enabled' | 'prompt') =>
+    (v: boolean | string) =>
+      setDraft((prev) => ({
+        ...prev,
+        promptSteering: {
+          ...defaultPromptSteering(),
+          ...prev.promptSteering,
+          [block]: {
+            ...defaultPromptSteering()[block],
+            ...prev.promptSteering?.[block],
+            [key]: v,
+          },
+        },
+      }))
+
+  const setPromptSteeringToggle = (key: 'toolChoice' | 'thinking') => (enabled: boolean) =>
+    setDraft((prev) => ({
+      ...prev,
+      bodyConversion: {
+        ...defaultBodyConversion(),
+        ...prev.bodyConversion,
+        ...(key === 'toolChoice' ? { toolChoiceSteering: enabled } : { thinkingPromptControls: enabled }),
+      },
+      promptSteering: {
+        ...defaultPromptSteering(),
+        ...prev.promptSteering,
+        [key]: { enabled },
+      },
+    }))
+
+  const setChunkedWriteSteering =
+    (key: keyof RuntimeConfig['promptSteering']['chunkedWrite']) =>
+    (value: boolean) =>
+      setDraft((prev) => ({
+        ...prev,
+        bodyConversion: {
+          ...defaultBodyConversion(),
+          ...prev.bodyConversion,
+          ...(key === 'enabled' ? { chunkedToolPolicy: value } : {}),
+        },
+        promptSteering: {
+          ...defaultPromptSteering(),
+          ...prev.promptSteering,
+          chunkedWrite: {
+            ...defaultPromptSteering().chunkedWrite,
+            ...prev.promptSteering?.chunkedWrite,
+            [key]: value,
+          },
+        },
+      }))
 
   const setMissingMaxTokens = <K extends keyof RuntimeConfig['missingMaxTokens']>(k: K) => (v: RuntimeConfig['missingMaxTokens'][K]) =>
     setDraft((prev) => ({
@@ -785,6 +868,141 @@ export function RuntimePage() {
                 </div>
                 <div className="space-y-3">
                   <div>
+                    <div className="text-sm font-semibold">提示词引导</div>
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      统一管理 Claude Code 的 system prompt 引导。默认只影响 /cc，不做输出硬改写；语言约束允许保留代码、命令、路径、日志、错误原文和正常技术英文。
+                    </div>
+                  </div>
+                  <TwoCol>
+                    <TogField
+                      label="启用提示词引导"
+                      desc="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示。"
+                      checked={draft.promptSteering.enabled}
+                      onChange={setPromptSteering('enabled')}
+                    />
+                    <div className="space-y-1.5">
+                      <div className="text-sm font-semibold">生效范围</div>
+                      <Select value={draft.promptSteering.scope} onValueChange={(v) => setPromptSteering('scope')(v as RuntimeConfig['promptSteering']['scope'])}>
+                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="cc_only">仅 /cc 路径</SelectItem>
+                          <SelectItem value="claude_code_profile">Claude Code / Debug profile</SelectItem>
+                          <SelectItem value="all_routes">全部 messages 路由</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <div className="text-xs leading-5 text-muted-foreground">anthropic-strict profile 始终不注入 synthetic prompt。</div>
+                    </div>
+                    <TogField
+                      label="应用到外部池"
+                      desc="开启后 /cc 请求进入外部池 raw passthrough 时也使用增强后的 system。"
+                      checked={draft.promptSteering.applyToExternalPool}
+                      onChange={setPromptSteering('applyToExternalPool')}
+                    />
+                    <TogField
+                      label="count_tokens 同步计入"
+                      desc="/cc count_tokens 使用同一提示词引导，避免估算低于真实请求。"
+                      checked={draft.promptSteering.applyToCountTokens}
+                      onChange={setPromptSteering('applyToCountTokens')}
+                    />
+                    <TogField
+                      label="语言约束"
+                      desc="减少“让me / let我 / 我will / 日语葡语串台”这类非自然语言拼接；不禁止正常技术英文。"
+                      checked={draft.promptSteering.languageConstraint.enabled}
+                      onChange={setPromptSteeringText('languageConstraint', 'enabled')}
+                    />
+                    <TogField
+                      label="任务质量"
+                      desc="强调最新用户消息、仅分析/真实执行/发布等任务边界，以及已验证必须有证据。"
+                      checked={draft.promptSteering.taskQuality.enabled}
+                      onChange={setPromptSteeringText('taskQuality', 'enabled')}
+                    />
+                    <TogField
+                      label="tool_choice 引导"
+                      desc="按请求的 tool_choice 过滤工具并在本地 Kiro 转换中注入兼容提示。"
+                      checked={draft.promptSteering.toolChoice.enabled}
+                      onChange={setPromptSteeringToggle('toolChoice')}
+                    />
+                    <TogField
+                      label="thinking 提示控制"
+                      desc="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。"
+                      checked={draft.promptSteering.thinking.enabled}
+                      onChange={setPromptSteeringToggle('thinking')}
+                    />
+                    <TogField
+                      label="分块写入提示"
+                      desc="启用 Write/Edit 分块写入相关的提示词和工具描述增强。"
+                      checked={draft.promptSteering.chunkedWrite.enabled}
+                      onChange={setChunkedWriteSteering('enabled')}
+                    />
+                    <TogField
+                      label="分块 system 提示"
+                      desc="在 system 中要求模型遵守 Write/Edit 分块限制。"
+                      checked={draft.promptSteering.chunkedWrite.systemPromptEnabled}
+                      disabled={!draft.promptSteering.chunkedWrite.enabled}
+                      onChange={setChunkedWriteSteering('systemPromptEnabled')}
+                    />
+                    <TogField
+                      label="分块工具描述"
+                      desc="给 Write/Edit 工具 description 追加分块限制说明。"
+                      checked={draft.promptSteering.chunkedWrite.toolDescriptionEnabled}
+                      disabled={!draft.promptSteering.chunkedWrite.enabled}
+                      onChange={setChunkedWriteSteering('toolDescriptionEnabled')}
+                    />
+                    <TogField
+                      label="自定义追加提示词"
+                      desc="追加 operator 自定义 system prompt；默认关闭。"
+                      checked={draft.promptSteering.custom.enabled}
+                      onChange={setPromptSteeringText('custom', 'enabled')}
+                    />
+                  </TwoCol>
+                  <div className="grid gap-3">
+                    <div className="rounded-md border bg-background p-4">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">语言约束提示词</div>
+                          <div className="mt-1 text-xs leading-5 text-muted-foreground">目标是减少非自然语言的跨语言语法拼接，不是禁止正常技术英文。</div>
+                        </div>
+                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('languageConstraint', 'prompt')(defaultPromptSteering().languageConstraint.prompt)}>
+                          恢复默认
+                        </Button>
+                      </div>
+                      <Textarea
+                        className="min-h-48 font-mono text-xs"
+                        value={draft.promptSteering.languageConstraint.prompt}
+                        onChange={(event) => setPromptSteeringText('languageConstraint', 'prompt')(event.target.value)}
+                      />
+                    </div>
+                    <div className="rounded-md border bg-background p-4">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">任务质量提示词</div>
+                          <div className="mt-1 text-xs leading-5 text-muted-foreground">用于减少追问被忽视、任务边界错误、没有真实证据却声称完成等问题。</div>
+                        </div>
+                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('taskQuality', 'prompt')(defaultPromptSteering().taskQuality.prompt)}>
+                          恢复默认
+                        </Button>
+                      </div>
+                      <Textarea
+                        className="min-h-48 font-mono text-xs"
+                        value={draft.promptSteering.taskQuality.prompt}
+                        onChange={(event) => setPromptSteeringText('taskQuality', 'prompt')(event.target.value)}
+                      />
+                    </div>
+                    <div className="rounded-md border bg-background p-4">
+                      <div className="mb-3">
+                        <div className="text-sm font-medium">自定义追加提示词</div>
+                        <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在上方“自定义追加提示词”开启时注入；不要写动态 request id、时间或账号信息。</div>
+                      </div>
+                      <Textarea
+                        className="min-h-32 font-mono text-xs"
+                        value={draft.promptSteering.custom.prompt}
+                        onChange={(event) => setPromptSteeringText('custom', 'prompt')(event.target.value)}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  <div>
                     <div className="text-sm font-semibold">本地协议转换</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
                       这些开关会改变本地凭据路径最终发往 Kiro 的请求体；外部池 raw body 透传不会进入这些阶段。
@@ -818,9 +1036,6 @@ export function RuntimePage() {
                         onChange={(event) => setBodyConversion('toolSchemaKeyValidationRegex')(event.target.value)}
                       />
                     </div>
-                    <TogField label="tool_choice 引导" desc="按请求的 tool_choice 过滤工具并注入兼容提示。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
-                    <TogField label="分块写入策略" desc="给 Write/Edit 工具和系统消息加入分块写入约束。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
-                    <TogField label="thinking 提示控制" desc="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
                     <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
                     <TogField label="工具配对修复" desc="修复或文本化不严格配对的 tool_use/tool_result。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />

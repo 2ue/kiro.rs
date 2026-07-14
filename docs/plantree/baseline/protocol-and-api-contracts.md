@@ -284,7 +284,7 @@ The following distinctions are necessary when changing the protocol implementati
 
 ## 未实现要求
 
-The following outcomes are required but are not current baseline behavior. Their design, sequencing, acceptance criteria, rollout, and rollback belong to the [System architecture modernization plan](../plans/system-architecture-modernization/README.md):
+The following outcomes are required but are not current baseline behavior. Their target design, implementation graph, acceptance criteria, cutover and rollback belong to the [Greenfield AI Gateway plan](../plans/greenfield-ai-gateway/README.md):
 
 - make one immutable runtime/config snapshot authoritative for the complete request lifecycle;
 - restore the public `preservePath` behavior with route-specific compatibility tests for raw and normalized external bodies;

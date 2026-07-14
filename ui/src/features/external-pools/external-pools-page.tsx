@@ -250,6 +250,7 @@ export function ExternalPoolsPage() {
   const directPolicyActive = externalEnabled && configDraft.externalDirectPolicyEnabled
   const fallbackActive = externalEnabled && !directPolicyActive && (
     configDraft.localPoolPreflightEnabled || configDraft.fallbackOnLocalCapacityExhausted ||
+    configDraft.fallbackOnSchedulerRedisDegraded ||
     configDraft.fallbackOnNoAvailableCredentials || configDraft.fallbackOnLocalTransientExhausted ||
     configDraft.fallbackOnUnsupportedModel
   )
@@ -329,6 +330,7 @@ export function ExternalPoolsPage() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="本地容量预检" checked={configDraft.localPoolPreflightEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolPreflightEnabled: v }))} />
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="容量不足时使用外部账号" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnLocalCapacityExhausted: v }))} />
+                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="调度 Redis 降级时使用外部账号" checked={configDraft.fallbackOnSchedulerRedisDegraded} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnSchedulerRedisDegraded: v }))} />
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="没有可用账号时使用外部账号" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnNoAvailableCredentials: v }))} />
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="本地临时错误过多时使用外部账号" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnLocalTransientExhausted: v }))} />
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="模型不支持时使用外部账号" checked={configDraft.fallbackOnUnsupportedModel} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnUnsupportedModel: v }))} />

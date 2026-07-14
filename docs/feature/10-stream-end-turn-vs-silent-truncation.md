@@ -3,7 +3,9 @@
 > 本文可脱离原始排查会话独立阅读。目标：让读者仅凭本文即可理解问题现象、
 > 为什么现有数据无法自证、代码层面的根因线索、以及如何自行搭环境验证。
 
-- 状态：根因**未最终确认**；2026-07-13 已实现零行为变更观测字段，待真实长会话/CLI 复现判定 H1/H2/H3
+- 状态：观测盲区**已由代码与真实调用证实**；“静默截断”本身仍未被证实。2026-07-14
+  真实 `/cc`/Claude Code CLI 验证显示：成功流可落为 `sawUpstreamCompleted=false`、
+  `stopReasonSource=local_inferred_*`，说明仅凭 `success/end_turn/completed` 仍不能证明上游真完成。
 - 严重级别：中（潜在观测盲区 / 可能的误判，非已证实的线上故障）
 - 影响端点：全部 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1`、`/dfcache/*`（共用同一套流式处理逻辑）
 - 相关代码：`src/anthropic/stream.rs`、`src/anthropic/handlers.rs`、`src/kiro/model/events/assistant.rs`、`src/kiro/model/events/base.rs`
@@ -22,6 +24,18 @@ Claude Code CLI 在与本服务的多轮对话中，偶发「助手输出一句�
 
 2026-07-13 已补齐观测：代理会解析 `messageStatus`，并在 usage `latencyTrace` 写入
 `upstreamMessageStatus`、`sawUpstreamCompleted`、`stopReasonSource`。这不改变下游 SSE，仅用于后续判定。
+
+2026-07-14 用本地临时 release 服务 `127.0.0.1:19138` 跑真实 `/cc/v1/messages` 与真实
+Claude Code CLI 后，得到两个关键结论：
+
+- 文档核心问题成立：真实成功轮次存在 `status=success` / `downstreamStopReason=end_turn`
+  / `terminalReason=completed`，但 `sawUpstreamCompleted=false`、
+  `stopReasonSource=local_inferred_end_turn`。因此，`success/end_turn/completed` 仍然只是代理
+  自身推断的干净结束，不能自证上游发送过完成信号。
+- 用户观察到的日文/葡语等“串台”是另一个独立问题。已在本地 Claude Code JSONL 中找到
+  `続けて本体を追記する。`：该条有 `requestId`，`stop_reason=tool_use`，下一条就是
+  `Edit` 工具调用。它不是“end_turn 后无工具/无后续”的静默截断，而是模型在工具调用前输出了
+  非中文说明，CLI 如实展示。
 
 修复前 usage 记录中的 `end_turn` **无法区分**两种本质不同的情况：
 
@@ -46,16 +60,38 @@ Claude Code CLI 在与本服务的多轮对话中，偶发「助手输出一句�
 - 然后**这一轮就结束了**：没有执行任何工具调用（没有 tool_use），没有后续文本，也**没有任何报错**。
 - CLI 表现为「转了几秒就停住」（如 `✻ ... 5s`），像是任务被无声吞掉。
 
-### 1.2 关键旁证（来自 Claude Code 本地会话历史）
+### 1.2 关键旁证修正（来自 Claude Code 本地会话历史）
 
 Claude Code 会把会话落到本地 JSONL：
 `~/.claude/projects/<项目路径转义>/<sessionId>.jsonl`
 
-在断流轮次上观察到：
-- 该 assistant 消息**有文本内容，但没有 `requestId`，其后也没有跟随的 tool_use 记录**。
-- 对比正常轮：assistant 消息后紧跟一条 `[tool_use:Bash]` 之类的记录，工具真正发出。
+2026-07-14 复核本次会话 JSONL：
+
+- 会话文件：`~/.claude/projects/-Users-yuanfeijie-Desktop-procode-kiro-rs/4633d467-317c-4620-9545-a26f2d81eb66.jsonl`
+- assistant 记录数：327。
+- `requestId` 缺失数：0。
+- 含日文假名的 assistant 文本：4 条，其中用户贴出的 `続けて本体を追記する。` 在第 875 行。
+
+因此，先前“assistant 消息没有 `requestId`”这条旁证在当前复核中**不成立**，应视为早期排查
+脚本/字段理解误判，不能再作为证据使用。
+
+仍然成立的旁证是：
+
+- 会话中存在多条 `stop_reason=end_turn` 的纯文本轮次，其中一些是“我先去做 X / 先定位 Y”式
+  意图开场白。
+- 这些轮次是否是“模型主动把开场白作为一轮正常收尾”，还是“上游未显式完成就 EOF 被代理兜底
+  成 end_turn”，单靠旧 usage 与 Claude Code JSONL 仍无法区分。
+
+对比正常工具轮：
+
+- assistant 先输出一段说明；
+- 同一 `requestId` 下下一条 assistant 记录包含 `[tool_use:Bash]` / `[tool_use:Edit]` 等；
+- 随后 user 记录包含对应 `tool_result`。
 
 也就是说：断流轮里模型「说了要做」，但工具调用从未进入这一轮。
+
+这句话需要严格限定为“某些 `end_turn` 纯文本轮的表现”，不能套用到所有短开场白。用户贴出的
+日文例子就不是这种情况：它后面确实跟了 `Edit` 工具调用。
 
 ### 1.3 触发关联（未证实但高度相关）
 
@@ -284,6 +320,48 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 - 断流轮下游是否收到了完整的 `message_delta{stop_reason:end_turn}` + `message_stop`；
 - 用于验证「代理无论如何都补干净结束帧」这一行为（3.2），但**不能**区分 H1/H2。
 
+### 6.5 2026-07-14 本地真实验证结果
+
+验证环境：
+
+- 服务：临时 release 服务 `127.0.0.1:19138`，不触碰本地/现网主端口。
+- Claude Code CLI：`2.1.197 (Claude Code)`。
+- 入口：`ANTHROPIC_BASE_URL=http://127.0.0.1:19138/cc`。
+- 验证产物：`target/validation/direct-cc-lang-probe.json`、
+  `target/validation/claude-cli-lang-simple-now.jsonl`、
+  `target/validation/claude-cli-lang-tool-now.jsonl`、
+  `target/validation/claude-cli-lang-tool-repeat-summary.json`、
+  `target/validation/recent-usage-19138-after-cli.json`。
+
+真实调用结论：
+
+1. 直接 `/cc/v1/messages` 语言采样 6 次：
+   - 4 次成功，2 次 400（命中不支持模型的账号/路由问题）。
+   - 成功 4 次均为中文输出，未出现日文/韩文/俄文/阿语/泰文。
+   - 成功轮均为 `stop_reason=end_turn`。
+
+2. 真实 Claude Code CLI：
+   - 简单回答场景成功，输出 `正常`。
+   - 工具写文件场景成功，stream-json 中有真实 `tool_use`，输出中文。
+   - 重复工具场景 4 次：3 次成功，1 次在工具后的续轮遇到 400
+     `Invalid model ID`（命中不支持模型的账号）；成功 3 次均未出现日文/韩文/俄文/阿语/泰文。
+
+3. usage 观测字段：
+   - 多条真实成功 `end_turn` 记录为：
+     `terminalReason=completed`、`sawUpstreamCompleted=false`、
+     `stopReasonSource=local_inferred_end_turn`。
+   - 多条真实成功 `tool_use` 记录为：
+     `terminalReason=completed`、`sawUpstreamCompleted=false`、
+     `stopReasonSource=local_inferred_tool_use`。
+
+解释：
+
+- 这证明“代理仍可能在未观察到上游 `COMPLETED` 的情况下记录 success/completed”是真实存在的。
+- 这不能进一步证明“发生了静默截断”。如果当前 Kiro 上游本来就经常不发送 `messageStatus`，
+  那 `sawUpstreamCompleted=false` 只能说明 `messageStatus` 不是可依赖的完成信号，不能单独判 H2。
+- 需要补强的不是下游抓包，而是上游事件观测：记录最后若干上游事件类型、是否见到明确完成/收尾事件、
+  以及 EOF 前最后一次内容事件。
+
 ---
 
 ## 7. 修复 / 改进方向（按风险从低到高，均待验证后再定）
@@ -301,7 +379,22 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
    当 `None` EOF 分支满足「无 error + 无 COMPLETED + 有工具定义 + 无 tool_use + output 很小」时，
    记一个 `suspectedSilentTruncation` 标记/计数（沿用问题 09 的诊断框架），不改流行为。
 
-4. **是否对下游改变行为（高风险，需极谨慎，验证后再议）**
+4. **工具上下文泄漏型 end_turn 观测（低风险，观测类）** ✅ 2026-07-14 已实施
+   针对真实样本里出现的长文本异常（例如正文包含 `Tool results provided`、`Tool results:`、
+   `<function_results>`、`</function_results>`、`readHash/editHash/writeHash/bashHash`，但下游仍是
+   `text-only + end_turn + no tool_use`），新增独立 usage latencyTrace 字段：
+   `suspectedToolContextLeakEndTurn`、`toolContextLeakMarkers`、`assistantTailIntentHint`、
+   `endTurnAnomalyReason`、`endTurnAnomalyRisk`。
+
+   该分类不保存完整正文，只保存固定 marker 名和布尔/风险值；检测过程只扫描当前 assistant/code
+   内容和 4K 字符尾部窗口，不改变下游 SSE，不自动重试。
+
+5. **Claude Code 默认 prompt steering 补强（低风险，可配置）** ✅ 2026-07-14 已实施
+   在已有 `/cc` prompt steering 的任务质量提示中补充：需要读/搜/执行/编辑/调用工具时必须输出结构化
+   `tool_use`，不要把 “Let me look/我先检查” 作为最终回答结束；不要把内部工具结果包装、函数结果标签、
+   历史工具结果标记作为可见正文。该提示仍走原有 `promptSteering` 配置，用户自定义提示词不会被迁移覆盖。
+
+6. **是否对下游改变行为（高风险，需极谨慎，验证后再议）**
    若确认 H2 存在且影响大，才考虑：对「疑似截断」是否应发 SSE error 而非补 `message_stop`、
    或触发换号重试（仅在首字前安全）。此方向牵涉重试安全边界与 CLI 兼容，**不在本阶段实施**。
 
@@ -312,15 +405,21 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 
 ## 8. 回归 / 验收清单
 
-- [ ] 插桩后本地长会话采集到足量 `end_turn` 轮次样本（≥ 数十条）。
-- [ ] 统计 `saw_completed` 分布，明确 H1 / H2 / H3 哪个成立。
+- [x] 本地真实 `/cc`/Claude Code CLI 验证成功流会出现
+      `sawUpstreamCompleted=false` + `local_inferred_end_turn/tool_use`。
+- [ ] 继续采集足量长会话 `end_turn` 样本（≥ 数十条），但不要只看 `saw_completed`，还要记录
+      EOF 前最后若干上游事件类型，否则无法判断“上游不发 messageStatus”与“异常 EOF”的区别。
+- [ ] 统计 `saw_completed` 与 EOF 前事件分布，明确 H1 / H2 / H3 哪个成立。
 - [ ] 若 H1 为主：确认 `end_turn` 为真结束，问题归入 09（模型行为 + CLI 续轮），代理仅加记录。
 - [x] 记录 `messageStatus` + `stopReasonSource` 到 usage latencyTrace，使截断在记录层可辨识。
 - [ ] 若 H2 存在：再评估是否需要把“无 completed 的 EOF”从 success 改为可观测异常；当前不改行为。
 - [x] 单测：构造「有 COMPLETED 的 EOF」与「无 COMPLETED 的 EOF」两种上游流，断言
       `sawUpstreamCompleted` / `stopReasonSource` 取值正确。
 - [x] 单测确认观测插桩不改变现有下游 SSE stop_reason/message_stop。
-- [ ] 真实服务/Claude CLI 确认所有插桩与改动不改变现有下游 SSE 输出语义。
+- [x] 单测：构造「工具上下文 marker 泄漏 + 长文本 + end_turn + no tool_use」样本，断言新增
+      `tool_context_leak_text_only_end_turn` 诊断命中。
+- [x] 单测：构造「同样 marker + 正常 tool_use」样本，断言不误报为 end_turn 异常。
+- [x] 真实服务/Claude CLI 确认当前观测字段不改变现有下游 SSE 输出语义。
 
 ---
 
@@ -338,9 +437,16 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 
 ## 10. 结论（当前阶段，诚实陈述）
 
-- **已确证（代码事实）**：修复前代理无法区分「上游正常完成」与「上游静默 EOF」——因为它丢弃了
-  `messageStatus`，且 `end_turn` 是兜底默认值。旧 usage 记录的 `success + end_turn` **不能自证**没有截断。
+- **已确证（代码事实 + 真实调用）**：代理仍会在未观察到上游 `COMPLETED` 的情况下，把流记录为
+  `success + completed`，并根据本地状态推断 `end_turn` / `tool_use`。旧 usage 记录的
+  `success + end_turn` **不能自证**没有截断。
 - **已修复（观测层）**：2026-07-13 起，usage `latencyTrace` 会记录 `messageStatus` 与 stop reason 来源；这仍不改变下游 SSE 行为。
-- **未确证（需验证）**：本次会话那些 `end_turn` 轮**究竟**是 H1（真结束）还是 H2（静默截断）。
-  现有数据不足以断定，需按第 6 节插桩复现后才能下结论。
+- **已补强（观测层）**：2026-07-14 起，工具上下文/函数结果标签泄漏型长文本 `end_turn` 会单独记录
+  anomaly reason、risk 和 marker 分类；该补强不保存完整文本、不改变协议输出。
+- **未确证（需进一步上游事件观测）**：本次会话那些 `end_turn` 轮**究竟**是 H1（模型主动真结束）
+  还是 H2（静默截断）。`sawUpstreamCompleted=false` 是必要证据之一，但如果 Kiro 当前协议经常不发送
+  `messageStatus`，它不是充分证据。
+- **已拆分（语言串台）**：日文/葡语等偶发外语输出是真实存在的模型输出问题，但用户贴出的
+  `続けて本体を追記する。` 有 `requestId` 且后续正常 `tool_use=Edit`，不属于本问题的
+  “end_turn 后无工具/无后续”类别。
 - **此前的错误**：先前「现网全 success，已排除代理/上游断流」的说法**过强、不成立**，属循环论证，已在本文档纠正。

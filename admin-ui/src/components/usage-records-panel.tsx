@@ -448,6 +448,21 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="上游显式完成" value={typeof trace.sawUpstreamCompleted === 'boolean' ? (trace.sawUpstreamCompleted ? '是' : '否') : '-'} tone={trace.sawUpstreamCompleted ? 'success' : 'warning'} />
         <UsageMetric label="结束原因来源" value={trace.stopReasonSource || '-'} />
         <UsageMetric label="疑似开场白空转" value={trace.suspectedIntentPreambleEndTurn ? '是' : '-'} tone={trace.suspectedIntentPreambleEndTurn ? 'warning' : 'default'} />
+        <UsageMetric label="开场白风险" value={trace.intentPreambleRisk || '-'} tone={trace.intentPreambleRisk === 'high' ? 'warning' : 'info'} />
+        <UsageMetric label="EndTurn异常原因" value={trace.endTurnAnomalyReason || '-'} tone={trace.endTurnAnomalyRisk === 'high' ? 'warning' : 'info'} />
+        <UsageMetric label="EndTurn异常风险" value={trace.endTurnAnomalyRisk || '-'} tone={trace.endTurnAnomalyRisk === 'high' ? 'warning' : 'info'} />
+        <UsageMetric label="疑似工具上下文泄漏" value={trace.suspectedToolContextLeakEndTurn ? '是' : '-'} tone={trace.suspectedToolContextLeakEndTurn ? 'warning' : 'default'} />
+        <UsageMetric label="工具泄漏标记" value={trace.toolContextLeakMarkers?.length ? trace.toolContextLeakMarkers.join(' / ') : '-'} tone={trace.toolContextLeakMarkers?.length ? 'warning' : 'default'} />
+        <UsageMetric label="尾部意图提示" value={trace.assistantTailIntentHint ? '是' : '-'} tone={trace.assistantTailIntentHint ? 'info' : 'default'} />
+        <UsageMetric label="EOF无显式完成" value={typeof trace.upstreamEofWithoutCompleted === 'boolean' ? (trace.upstreamEofWithoutCompleted ? '是' : '否') : '-'} tone={trace.upstreamEofWithoutCompleted ? 'warning' : 'success'} />
+        <UsageMetric label="最后上游事件" value={trace.lastUpstreamEventType || '-'} />
+        <UsageMetric label="上游事件尾部" value={trace.lastUpstreamEvents?.length ? trace.lastUpstreamEvents.join(' → ') : '-'} />
+        <UsageMetric label="见到Assistant事件" value={typeof trace.sawUpstreamAssistantResponse === 'boolean' ? (trace.sawUpstreamAssistantResponse ? '是' : '否') : '-'} />
+        <UsageMetric label="见到ToolUse事件" value={typeof trace.sawUpstreamToolUse === 'boolean' ? (trace.sawUpstreamToolUse ? '是' : '否') : '-'} />
+        <UsageMetric label="见到Metadata事件" value={typeof trace.sawUpstreamMetadata === 'boolean' ? (trace.sawUpstreamMetadata ? '是' : '否') : '-'} />
+        <UsageMetric label="最后Assistant字符" value={typeof trace.lastAssistantContentChars === 'number' ? formatNumber(trace.lastAssistantContentChars) : '-'} />
+        <UsageMetric label="过滤trivial文本块" value={typeof trace.filteredTrivialTextBlocks === 'number' ? formatNumber(trace.filteredTrivialTextBlocks) : '-'} tone="warning" />
+        <UsageMetric label="过滤trivial字符" value={typeof trace.filteredTrivialTextChars === 'number' ? formatNumber(trace.filteredTrivialTextChars) : '-'} tone="warning" />
       </div>
     </div>
   )

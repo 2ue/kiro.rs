@@ -16,7 +16,8 @@ use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig,
     ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
+    PromptCacheSimulationMode, PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode,
+    ToolFormatDebugConfig,
 };
 
 use super::{
@@ -25,8 +26,9 @@ use super::{
         get_file_dfcache, list_files, upload_file,
     },
     handlers::{
-        count_tokens, count_tokens_dfcache, get_models, get_models_dfcache, post_messages,
-        post_messages_cc, post_messages_dfcache, post_messages_ha, post_messages_real_cache_usage,
+        count_tokens, count_tokens_cc, count_tokens_dfcache, get_models, get_models_dfcache,
+        post_messages, post_messages_cc, post_messages_dfcache, post_messages_ha,
+        post_messages_real_cache_usage,
     },
     middleware::{AppState, auth_middleware, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
@@ -81,6 +83,7 @@ pub struct AnthropicRouterConfig {
     kiro_upstream_stream_idle_timeout_secs: u64,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
+    prompt_steering: PromptSteeringConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
@@ -124,6 +127,7 @@ impl AnthropicRouterConfig {
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
+            prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
@@ -195,6 +199,7 @@ pub fn create_router_with_provider(
         kiro_upstream_stream_idle_timeout_secs,
         image_processing,
         body_conversion,
+        prompt_steering,
         missing_max_tokens,
         payload_shaping,
         external_pools,
@@ -240,6 +245,7 @@ pub fn create_router_with_provider(
         kiro_upstream_stream_idle_timeout_secs,
         image_processing,
         body_conversion,
+        prompt_steering,
         payload_shaping,
     )
     .with_missing_max_tokens(missing_max_tokens)
@@ -293,7 +299,7 @@ pub fn create_router_with_provider(
         .route("/files/{file_id}", get(get_file).delete(delete_file))
         .route("/files/{file_id}/content", get(get_file_content))
         .route("/messages", post(post_messages_cc))
-        .route("/messages/count_tokens", post(count_tokens))
+        .route("/messages/count_tokens", post(count_tokens_cc))
         .layer(middleware::from_fn_with_state(
             cc_v1_state.clone(),
             auth_middleware,

@@ -207,6 +207,15 @@ function optionalTrimmed(v: unknown): string | undefined {
   return t || undefined
 }
 
+function splitKiroApiKeyDraft(value: string): { key: string; region?: string } {
+  const trimmed = value.trim()
+  const [rawKey, rawRegion] = trimmed.split('|', 2)
+  return {
+    key: rawKey?.trim() || value,
+    region: rawRegion?.trim() || undefined,
+  }
+}
+
 function normalizedKamAuthMethod(
   value: unknown,
   clientId?: string,
@@ -388,6 +397,19 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           scopes: am === 'external_idp' ? prev.scopes : '',
         }
       }
+      if (key === 'kiroApiKey') {
+        const parsed = splitKiroApiKeyDraft(value)
+        if (parsed.region) {
+          return {
+            ...prev,
+            kiroApiKey: parsed.key,
+            region: prev.region.trim() ? prev.region : parsed.region,
+            authRegion: prev.authRegion.trim() ? prev.authRegion : parsed.region,
+            apiRegion: prev.apiRegion.trim() ? prev.apiRegion : parsed.region,
+            endpoint: prev.endpoint.trim() ? prev.endpoint : 'cli',
+          }
+        }
+      }
       if (key === 'region' && value.trim() && !prev.authRegion.trim()) return { ...prev, region: value, authRegion: value }
       if (key === 'proxyResourceId' && value && value !== '__none__') return { ...prev, proxyResourceId: value, proxyUrl: '', proxyUsername: '', proxyPassword: '' }
       if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && value.trim()) return { ...prev, [key]: value, proxyResourceId: '' }
@@ -490,7 +512,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
         <FieldGrid>
           {isApiKey ? (
             <Field label="Kiro API Key" className="col-span-2">
-              <SecretInput value={form.kiroApiKey} onChange={(v) => update('kiroApiKey', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} placeholder="sk-..." disabled={add.isPending} />
+              <SecretInput value={form.kiroApiKey} onChange={(v) => update('kiroApiKey', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} placeholder="ksk_... 或 ksk_...|eu-central-1" disabled={add.isPending} />
             </Field>
           ) : (
             <Field label="Refresh Token" className="col-span-2">

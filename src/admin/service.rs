@@ -1335,7 +1335,8 @@ impl AdminService {
         disabled: bool,
     ) -> Result<KiroCredentials, AdminServiceError> {
         if let Some(ref name) = req.endpoint {
-            if !self.known_endpoints.contains(name) {
+            let name = name.trim();
+            if !name.is_empty() && !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
                     self.known_endpoints.iter().map(|s| s.as_str()).collect();
                 known.sort();
@@ -1384,6 +1385,7 @@ impl AdminService {
         };
         credentials.canonicalize_auth_method();
         credentials.normalize_supported_models();
+        credentials.normalize_api_key_defaults();
         credentials.normalize_external_idp_defaults();
         if credentials.api_region.as_deref().is_none_or(str::is_empty) {
             if let Some(region) = credentials
@@ -1392,6 +1394,17 @@ impl AdminService {
                 .and_then(profile_arn_region)
             {
                 credentials.api_region = Some(region.to_string());
+            }
+        }
+        if let Some(ref name) = credentials.endpoint {
+            if !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
             }
         }
         Ok(credentials)
@@ -1972,17 +1985,39 @@ impl AdminService {
                     id, err
                 ))
             })?;
-        let kiro_model_ids = normalize_supported_models(
+        Ok(Self::normalize_discovered_supported_models(
             models
                 .into_iter()
                 .map(|model| model.model_id)
                 .collect::<Vec<_>>(),
-        );
+        ))
+    }
+
+    fn normalize_discovered_supported_models(model_ids: Vec<String>) -> Vec<String> {
+        let kiro_model_ids = normalize_supported_models(model_ids);
         let supported_models = expand_claude_supported_model_variants(kiro_model_ids.clone());
         if supported_models.is_empty() {
-            return Ok(kiro_model_ids);
+            kiro_model_ids
+        } else {
+            supported_models
         }
-        Ok(supported_models)
+    }
+
+    async fn discover_supported_models_for_external_credential(
+        &self,
+        credential: KiroCredentials,
+    ) -> anyhow::Result<Vec<String>> {
+        let models = self
+            .kiro_provider
+            .list_available_models_for_external_credentials(credential)
+            .await
+            .map_err(|err| anyhow::anyhow!("API Key 模型发现失败: {}", err))?;
+        Ok(Self::normalize_discovered_supported_models(
+            models
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect::<Vec<_>>(),
+        ))
     }
 
     pub fn set_credential_regions(
@@ -2639,7 +2674,35 @@ impl AdminService {
         let warmup_remaining = req.warmup_remaining;
         let enable_overage_after_import = req.enable_overage_after_import.unwrap_or(false);
         let disabled = req.disabled.unwrap_or(false);
-        let new_cred = self.credential_from_request(req, disabled)?;
+        let mut new_cred = self.credential_from_request(req, disabled)?;
+        let mut api_key_supported_models_autodiscovered = false;
+
+        if new_cred.is_api_key_credential() && new_cred.supported_models.is_empty() {
+            match self
+                .discover_supported_models_for_external_credential(new_cred.clone())
+                .await
+            {
+                Ok(supported_models) if !supported_models.is_empty() => {
+                    tracing::info!(
+                        supported_models_count = supported_models.len(),
+                        "API Key 凭据已自动发现支持模型"
+                    );
+                    new_cred.supported_models = supported_models;
+                    api_key_supported_models_autodiscovered = true;
+                }
+                Ok(_) => {
+                    tracing::warn!("API Key 凭据自动发现支持模型返回空列表，继续使用原始白名单");
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "API Key 凭据自动发现支持模型失败，继续使用原始白名单: {}",
+                        err
+                    );
+                }
+            }
+        }
+        let new_cred_is_api_key = new_cred.is_api_key_credential();
+        let new_cred_supported_models_count = new_cred.supported_models.len();
 
         let credential_id = self
             .token_manager
@@ -2653,6 +2716,16 @@ impl AdminService {
         }
 
         let mut warning = None;
+        if api_key_supported_models_autodiscovered {
+            tracing::info!(
+                credential_id = credential_id,
+                supported_models_count = new_cred_supported_models_count,
+                "API Key 凭据支持模型已自动写入"
+            );
+        } else if new_cred_is_api_key && new_cred_supported_models_count == 0 {
+            warning =
+                Some("API Key 凭据未自动发现支持模型，请在保存后手动同步支持模型".to_string());
+        }
         if enable_overage_after_import {
             if let Err(err) = self
                 .set_credential_overage(
@@ -2661,7 +2734,10 @@ impl AdminService {
                 )
                 .await
             {
-                warning = Some(format!("超额开启失败: {}", err));
+                warning = Some(match warning.take() {
+                    Some(existing) => format!("{}；超额开启失败: {}", existing, err),
+                    None => format!("超额开启失败: {}", err),
+                });
             }
         }
 
@@ -2727,6 +2803,52 @@ impl AdminService {
         self.token_manager
             .update_credential_auth(id, update, reset_runtime_state)
             .map_err(|e| self.classify_error(e, id))?;
+
+        if let Ok(ctx) = block_on_admin_store(self.token_manager.acquire_context_for_credential(id))
+        {
+            let current_credential = ctx.credentials;
+            if current_credential.is_api_key_credential()
+                && current_credential.supported_models.is_empty()
+            {
+                match block_on_admin_store(
+                    self.discover_supported_models_for_external_credential(current_credential),
+                ) {
+                    Ok(supported_models) if !supported_models.is_empty() => {
+                        if let Err(err) = self
+                            .token_manager
+                            .set_credential_supported_models(id, supported_models)
+                        {
+                            tracing::warn!(
+                                credential_id = id,
+                                "API Key 凭据自动写回支持模型失败: {}",
+                                err
+                            );
+                        } else {
+                            tracing::info!(credential_id = id, "API Key 凭据已自动写回支持模型");
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            credential_id = id,
+                            "API Key 凭据自动发现支持模型返回空列表，保留当前白名单"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            credential_id = id,
+                            "API Key 凭据自动发现支持模型失败，保留当前白名单: {}",
+                            err
+                        );
+                    }
+                }
+            }
+        } else {
+            tracing::warn!(
+                credential_id = id,
+                "更新后无法获取凭据上下文，跳过 API Key 支持模型自动发现"
+            );
+        }
+
         self.invalidate_balance_cache(id);
         self.audit(
             "update_credential_auth",
@@ -3884,6 +4006,7 @@ impl AdminService {
             whitespace_compression: config.compression.whitespace_compression,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
+            prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
@@ -4059,6 +4182,11 @@ impl AdminService {
             .body_conversion
             .clone()
             .unwrap_or_else(|| current_config.body_conversion.clone());
+        let prompt_steering = req
+            .prompt_steering
+            .clone()
+            .unwrap_or_else(|| current_config.prompt_steering.clone())
+            .normalized();
         let missing_max_tokens = req
             .missing_max_tokens
             .unwrap_or(current_config.missing_max_tokens)
@@ -4272,6 +4400,14 @@ impl AdminService {
         missing_max_tokens
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
+        let prompt_steering_chars = prompt_steering.language_constraint.prompt.chars().count()
+            + prompt_steering.task_quality.prompt.chars().count()
+            + prompt_steering.custom.prompt.chars().count();
+        if prompt_steering_chars > 20_000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptSteering 提示词总长度不能大于 20000 字符".to_string(),
+            ));
+        }
         if warmup_selection_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialWarmupSelectionPercent 不能大于 100".to_string(),
@@ -4446,6 +4582,7 @@ impl AdminService {
                 config.compression = compression.clone();
                 config.image_processing = image_processing;
                 config.body_conversion = body_conversion;
+                config.prompt_steering = prompt_steering;
                 config.missing_max_tokens = missing_max_tokens;
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;

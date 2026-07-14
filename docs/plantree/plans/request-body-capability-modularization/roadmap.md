@@ -20,7 +20,7 @@ None. The implemented scope is in compatibility maintenance.
 
 ## Next
 
-- Consider a route planner extraction through the [system architecture modernization plan](../system-architecture-modernization/README.md) if profiling shows that non-raw external targets still pay material unnecessary preprocessing cost.
+- Preserve the profiling scenario as a behavioral oracle for the [Greenfield AI Gateway plan](../greenfield-ai-gateway/README.md); any new route planner belongs to the separate target system rather than this implemented Rust maintenance plan.
 - Keep profiling the normalized long-context path if CPU/RSS pressure reappears under real upstream slow streams.
 
 ## Deferred

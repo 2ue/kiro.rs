@@ -33,8 +33,6 @@ const UPSTREAM_IMAGE_SOURCE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 const TOOL_FORMAT_DIAGNOSTIC_MAX_HISTORY_ENTRIES: usize = 512;
 const TOOL_FORMAT_DIAGNOSTIC_MAX_ITEMS: usize = 4096;
-const TOOL_RESULTS_TEXT_PREFIX: &str = "Tool results:";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadByteBreakdown {
@@ -4272,10 +4270,7 @@ fn dedupe_tool_results_keep_first(
         let keep = !result.tool_use_id.trim().is_empty() && seen.insert(result.tool_use_id.clone());
         if !keep && textify_duplicates {
             if let Some(text) = tool_result_to_text(result) {
-                duplicate_text.push(format!(
-                    "[duplicate tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
+                duplicate_text.push(format!("[duplicate output]\n{}", text));
             }
         }
         keep
@@ -4347,10 +4342,7 @@ fn repair_tool_results(
         let keep = valid_ids.contains(&result.tool_use_id);
         if !keep {
             if let Some(text) = tool_result_to_text(result) {
-                orphan_text.push(format!(
-                    "[trimmed tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
+                orphan_text.push(format!("[trimmed output]\n{}", text));
             }
         }
         keep
@@ -4490,22 +4482,16 @@ fn narrate_tool_results(
             .get(id)
             .cloned()
             .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| {
-                if id.is_empty() {
-                    "tool result".to_string()
-                } else {
-                    format!("tool result {}", id)
-                }
-            });
+            .unwrap_or_else(|| "output".to_string());
         let status = if result.is_error || result.status.as_deref() == Some("error") {
             " error"
         } else {
             ""
         };
-        parts.push(format!("[{}{}] {}", label, status, body));
+        parts.push(format!("{}{}: {}", label, status, body));
     }
 
-    (!parts.is_empty()).then(|| format!("{TOOL_RESULTS_TEXT_PREFIX}\n\n{}", parts.join("\n\n")))
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn previous_assistant_tool_use_ids(history: &[Message], idx: usize) -> HashSet<String> {
@@ -4826,7 +4812,7 @@ mod tests {
         assert!(
             user.user_input_message
                 .content
-                .contains("[readFile] valid result")
+                .contains("readFile: valid result")
         );
         assert!(user.user_input_message.content.contains("orphan result"));
     }
@@ -4970,9 +4956,8 @@ mod tests {
             }
         }
 
-        assert!(combined_history.contains("Tool results:"));
-        assert!(combined_history.contains("[exec_command] build ok"));
-        assert!(combined_history.contains("[exec_command] tests pass"));
+        assert!(combined_history.contains("exec_command: build ok"));
+        assert!(combined_history.contains("exec_command: tests pass"));
         assert!(
             request
                 .conversation_state
