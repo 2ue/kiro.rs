@@ -4329,9 +4329,10 @@ impl Config {
         let path = path.as_ref();
         if !path.exists() {
             // 配置文件不存在，返回默认配置
-            let mut config = Self::default();
-            config.config_path = Some(path.to_path_buf());
-            return Ok(config);
+            return Ok(Self {
+                config_path: Some(path.to_path_buf()),
+                ..Self::default()
+            });
         }
 
         let content = fs::read_to_string(path)?;
@@ -5427,46 +5428,51 @@ mod tests {
 
     #[test]
     fn cache_policy_keeps_legacy_reported_usage_path_override_after_template_refactor() {
-        let mut config = Config::default();
-        config.reported_usage = ReportedUsageConfig {
-            default: ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::raw(),
-                ..ReportedUsagePathPolicy::default()
-            },
-            path_overrides: [(
-                "/ha".to_string(),
-                ReportedUsagePathPolicy {
-                    input: ReportedUsageFieldPolicy::sample_input_max(500),
-                    cache_creation: ReportedUsageFieldPolicy::sample_target(150_000),
+        let current_high_cache_reported_usage = ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::raw(),
+            ..ReportedUsagePathPolicy::default()
+        };
+        let mut config = Config {
+            reported_usage: ReportedUsageConfig {
+                default: ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::raw(),
                     ..ReportedUsagePathPolicy::default()
                 },
-            )]
-            .into_iter()
-            .collect(),
-        };
-        config.cache_policy.default = CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-            reported_usage: Some(ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::raw(),
-                ..ReportedUsagePathPolicy::default()
-            }),
-            ..CacheRoutePolicyPatch::default()
-        };
-        config.cache_policy.current_high_cache = CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-            reported_usage: Some(ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::raw(),
-                ..ReportedUsagePathPolicy::default()
-            }),
-            ..CacheRoutePolicyPatch::default()
-        };
-        config.cache_policy.path_overrides.insert(
-            "/ha".to_string(),
-            CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
-                ..CacheRoutePolicyPatch::default()
+                path_overrides: [(
+                    "/ha".to_string(),
+                    ReportedUsagePathPolicy {
+                        input: ReportedUsageFieldPolicy::sample_input_max(500),
+                        cache_creation: ReportedUsageFieldPolicy::sample_target(150_000),
+                        ..ReportedUsagePathPolicy::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
             },
-        );
+            cache_policy: CachePolicyConfig {
+                default: CacheRoutePolicyPatch {
+                    cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                    reported_usage: Some(current_high_cache_reported_usage.clone()),
+                    ..CacheRoutePolicyPatch::default()
+                },
+                current_high_cache: CacheRoutePolicyPatch {
+                    cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                    reported_usage: Some(current_high_cache_reported_usage),
+                    ..CacheRoutePolicyPatch::default()
+                },
+                path_overrides: [(
+                    "/ha".to_string(),
+                    CacheRoutePolicyPatch {
+                        cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                        ..CacheRoutePolicyPatch::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..CachePolicyConfig::default()
+            },
+            ..Config::default()
+        };
 
         let ha = config.cache_policy_for_path("/ha/v1/messages");
         assert_eq!(
@@ -5684,17 +5690,19 @@ mod tests {
 
     #[test]
     fn cache_policy_resolves_path_creation_control_override() {
-        let mut config = Config::default();
-        config.prompt_cache_creation_control = PromptCacheCreationControlConfig {
-            enabled: true,
-            scope_mode: PromptCacheCreationControlScopeMode::ConversationModel,
-            min_successful_requests_between_creation: 7,
-            min_creation_interval_secs: 120,
-            min_creation_delta_tokens: 30000,
-            max_creation_tokens_per_event: 40000,
-            creation_budget_window_secs: 600,
-            max_creation_tokens_per_window: 200000,
-            expire_after_idle_secs: 7200,
+        let mut config = Config {
+            prompt_cache_creation_control: PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode: PromptCacheCreationControlScopeMode::ConversationModel,
+                min_successful_requests_between_creation: 7,
+                min_creation_interval_secs: 120,
+                min_creation_delta_tokens: 30000,
+                max_creation_tokens_per_event: 40000,
+                creation_budget_window_secs: 600,
+                max_creation_tokens_per_window: 200000,
+                expire_after_idle_secs: 7200,
+            },
+            ..Config::default()
         };
         config.cache_policy.path_overrides.insert(
             "/dfcache/team-a".to_string(),

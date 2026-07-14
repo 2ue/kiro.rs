@@ -1799,6 +1799,27 @@ impl CredentialErrorHint {
     }
 }
 
+struct StreamCompletionObservability<'a> {
+    upstream_message_status: Option<&'a str>,
+    stop_reason_source: &'static str,
+    suspected_intent_preamble_end_turn: bool,
+    intent_preamble_risk: Option<&'static str>,
+    suspected_tool_context_leak_end_turn: bool,
+    tool_context_leak_markers: Vec<String>,
+    assistant_tail_intent_hint: bool,
+    end_turn_anomaly_reason: Option<&'static str>,
+    end_turn_anomaly_risk: Option<&'static str>,
+    upstream_eof_without_completed: bool,
+    last_upstream_event_type: Option<&'static str>,
+    last_upstream_events: Vec<String>,
+    saw_upstream_assistant_response: bool,
+    saw_upstream_tool_use: bool,
+    saw_upstream_metadata: bool,
+    last_assistant_content_chars: u32,
+    filtered_trivial_text_blocks: u32,
+    filtered_trivial_text_chars: u32,
+}
+
 impl RequestUsageContext {
     fn elapsed_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis().max(1) as u64
@@ -1981,26 +2002,10 @@ impl RequestUsageContext {
 
     fn mark_stream_completion_observability(
         &self,
-        upstream_message_status: Option<&str>,
-        stop_reason_source: impl Into<String>,
-        suspected_intent_preamble_end_turn: bool,
-        intent_preamble_risk: Option<&str>,
-        suspected_tool_context_leak_end_turn: bool,
-        tool_context_leak_markers: Vec<String>,
-        assistant_tail_intent_hint: bool,
-        end_turn_anomaly_reason: Option<&str>,
-        end_turn_anomaly_risk: Option<&str>,
-        upstream_eof_without_completed: bool,
-        last_upstream_event_type: Option<&str>,
-        last_upstream_events: Vec<String>,
-        saw_upstream_assistant_response: bool,
-        saw_upstream_tool_use: bool,
-        saw_upstream_metadata: bool,
-        last_assistant_content_chars: u32,
-        filtered_trivial_text_blocks: u32,
-        filtered_trivial_text_chars: u32,
+        observability: StreamCompletionObservability<'_>,
     ) {
-        if let Some(status) = upstream_message_status
+        if let Some(status) = observability
+            .upstream_message_status
             .map(str::trim)
             .filter(|status| !status.is_empty())
         {
@@ -2010,46 +2015,52 @@ impl RequestUsageContext {
         } else {
             *self.latency.saw_upstream_completed.lock() = Some(false);
         }
-        *self.latency.stop_reason_source.lock() = Some(stop_reason_source.into());
-        if suspected_intent_preamble_end_turn {
+        *self.latency.stop_reason_source.lock() =
+            Some(observability.stop_reason_source.to_string());
+        if observability.suspected_intent_preamble_end_turn {
             *self.latency.suspected_intent_preamble_end_turn.lock() = Some(true);
         }
-        if let Some(risk) = intent_preamble_risk {
+        if let Some(risk) = observability.intent_preamble_risk {
             *self.latency.intent_preamble_risk.lock() = Some(risk.to_string());
         }
-        if suspected_tool_context_leak_end_turn {
+        if observability.suspected_tool_context_leak_end_turn {
             *self.latency.suspected_tool_context_leak_end_turn.lock() = Some(true);
         }
-        if !tool_context_leak_markers.is_empty() {
-            *self.latency.tool_context_leak_markers.lock() = Some(tool_context_leak_markers);
+        if !observability.tool_context_leak_markers.is_empty() {
+            *self.latency.tool_context_leak_markers.lock() =
+                Some(observability.tool_context_leak_markers);
         }
-        if assistant_tail_intent_hint {
+        if observability.assistant_tail_intent_hint {
             *self.latency.assistant_tail_intent_hint.lock() = Some(true);
         }
-        if let Some(reason) = end_turn_anomaly_reason {
+        if let Some(reason) = observability.end_turn_anomaly_reason {
             *self.latency.end_turn_anomaly_reason.lock() = Some(reason.to_string());
         }
-        if let Some(risk) = end_turn_anomaly_risk {
+        if let Some(risk) = observability.end_turn_anomaly_risk {
             *self.latency.end_turn_anomaly_risk.lock() = Some(risk.to_string());
         }
-        *self.latency.upstream_eof_without_completed.lock() = Some(upstream_eof_without_completed);
+        *self.latency.upstream_eof_without_completed.lock() =
+            Some(observability.upstream_eof_without_completed);
         *self.latency.last_upstream_event_type.lock() =
-            last_upstream_event_type.map(str::to_string);
-        if !last_upstream_events.is_empty() {
-            *self.latency.last_upstream_events.lock() = Some(last_upstream_events);
+            observability.last_upstream_event_type.map(str::to_string);
+        if !observability.last_upstream_events.is_empty() {
+            *self.latency.last_upstream_events.lock() = Some(observability.last_upstream_events);
         }
         *self.latency.saw_upstream_assistant_response.lock() =
-            Some(saw_upstream_assistant_response);
-        *self.latency.saw_upstream_tool_use.lock() = Some(saw_upstream_tool_use);
-        *self.latency.saw_upstream_metadata.lock() = Some(saw_upstream_metadata);
-        if last_assistant_content_chars > 0 {
-            *self.latency.last_assistant_content_chars.lock() = Some(last_assistant_content_chars);
+            Some(observability.saw_upstream_assistant_response);
+        *self.latency.saw_upstream_tool_use.lock() = Some(observability.saw_upstream_tool_use);
+        *self.latency.saw_upstream_metadata.lock() = Some(observability.saw_upstream_metadata);
+        if observability.last_assistant_content_chars > 0 {
+            *self.latency.last_assistant_content_chars.lock() =
+                Some(observability.last_assistant_content_chars);
         }
-        if filtered_trivial_text_blocks > 0 {
-            *self.latency.filtered_trivial_text_blocks.lock() = Some(filtered_trivial_text_blocks);
+        if observability.filtered_trivial_text_blocks > 0 {
+            *self.latency.filtered_trivial_text_blocks.lock() =
+                Some(observability.filtered_trivial_text_blocks);
         }
-        if filtered_trivial_text_chars > 0 {
-            *self.latency.filtered_trivial_text_chars.lock() = Some(filtered_trivial_text_chars);
+        if observability.filtered_trivial_text_chars > 0 {
+            *self.latency.filtered_trivial_text_chars.lock() =
+                Some(observability.filtered_trivial_text_chars);
         }
     }
 
@@ -2958,26 +2969,29 @@ impl CredentialUsageContext {
             .first_visible_text_delta_latency_ms
             .load(Ordering::Acquire)
             > 0;
-        self.request.mark_stream_completion_observability(
-            ctx.upstream_message_status(),
-            ctx.stop_reason_source(),
-            ctx.suspected_intent_preamble_end_turn(has_visible_text_output),
-            ctx.intent_preamble_risk(has_visible_text_output),
-            ctx.suspected_tool_context_leak_end_turn(has_visible_text_output),
-            ctx.tool_context_leak_markers(),
-            ctx.assistant_tail_intent_hint(),
-            ctx.end_turn_anomaly_reason(has_visible_text_output),
-            ctx.end_turn_anomaly_risk(has_visible_text_output),
-            ctx.upstream_eof_without_completed(),
-            ctx.last_upstream_event_type(),
-            ctx.last_upstream_events(),
-            ctx.saw_upstream_assistant_response(),
-            ctx.saw_upstream_tool_use(),
-            ctx.saw_upstream_metadata(),
-            ctx.last_assistant_content_chars(),
-            ctx.filtered_trivial_text_blocks(),
-            ctx.filtered_trivial_text_chars(),
-        );
+        self.request
+            .mark_stream_completion_observability(StreamCompletionObservability {
+                upstream_message_status: ctx.upstream_message_status(),
+                stop_reason_source: ctx.stop_reason_source(),
+                suspected_intent_preamble_end_turn: ctx
+                    .suspected_intent_preamble_end_turn(has_visible_text_output),
+                intent_preamble_risk: ctx.intent_preamble_risk(has_visible_text_output),
+                suspected_tool_context_leak_end_turn: ctx
+                    .suspected_tool_context_leak_end_turn(has_visible_text_output),
+                tool_context_leak_markers: ctx.tool_context_leak_markers(),
+                assistant_tail_intent_hint: ctx.assistant_tail_intent_hint(),
+                end_turn_anomaly_reason: ctx.end_turn_anomaly_reason(has_visible_text_output),
+                end_turn_anomaly_risk: ctx.end_turn_anomaly_risk(has_visible_text_output),
+                upstream_eof_without_completed: ctx.upstream_eof_without_completed(),
+                last_upstream_event_type: ctx.last_upstream_event_type(),
+                last_upstream_events: ctx.last_upstream_events(),
+                saw_upstream_assistant_response: ctx.saw_upstream_assistant_response(),
+                saw_upstream_tool_use: ctx.saw_upstream_tool_use(),
+                saw_upstream_metadata: ctx.saw_upstream_metadata(),
+                last_assistant_content_chars: ctx.last_assistant_content_chars(),
+                filtered_trivial_text_blocks: ctx.filtered_trivial_text_blocks(),
+                filtered_trivial_text_chars: ctx.filtered_trivial_text_chars(),
+            });
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage
             .is_none_or(|usage| !super::cache::metadata_usage_has_signal(usage))
