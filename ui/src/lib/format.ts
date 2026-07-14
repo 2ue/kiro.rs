@@ -41,6 +41,16 @@ export function formatUsdFixed2(value: number | undefined | null): string {
   }).format(value as number)
 }
 
+export function formatUsdDetailed(value: number | undefined | null): string {
+  if (!Number.isFinite(value ?? Number.NaN)) return '-'
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 8,
+    maximumFractionDigits: 8,
+  }).format(value as number)
+}
+
 export function formatQuota(value: number | undefined | null): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '-'
   const num = value as number

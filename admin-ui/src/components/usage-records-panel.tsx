@@ -189,6 +189,16 @@ function formatUsd(value: number): string {
   }).format(value)
 }
 
+function formatUsdDetailed(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 8,
+    maximumFractionDigits: 8,
+  }).format(value)
+}
+
 function ratio(part: number, total: number): number {
   if (!Number.isFinite(part) || !Number.isFinite(total) || total <= 0) {
     return Number.NaN
@@ -1035,10 +1045,10 @@ export function UsageRecordsPanel() {
                           onClick={() => setSelectedRecord(record)}
                           title="查看计费明细"
                         >
-                          {formatUsd(record.estimatedCostUsd || 0)}
+                          {formatUsdDetailed(record.estimatedCostUsd || 0)}
                         </button>
                         <div className="text-xs text-amber-600">
-                          原始 {formatUsd(record.originalCostUsd || 0)}
+                          原始 {formatUsdDetailed(record.originalCostUsd || 0)}
                         </div>
                         <div className="text-xs text-muted-foreground">
                           Kiro {formatMeteringUsage(record.kiroMeteringUsage || 0)}
@@ -1172,7 +1182,7 @@ export function UsageRecordsPanel() {
                 <div>
                   <div className="text-xs text-muted-foreground">估算费用</div>
                   <div>
-                    {formatUsd(selectedRecord.estimatedCostUsd || 0)}
+                    {formatUsdDetailed(selectedRecord.estimatedCostUsd || 0)}
                     <span className="ml-2 text-xs text-muted-foreground">
                       {selectedRecord.pricingAvailable
                         ? selectedRecord.pricingModel || 'priced'
@@ -1182,7 +1192,7 @@ export function UsageRecordsPanel() {
                 </div>
                 <div>
                   <div className="text-xs text-muted-foreground">原始计费</div>
-                  <div>{formatUsd(selectedRecord.originalCostUsd || 0)}</div>
+                  <div>{formatUsdDetailed(selectedRecord.originalCostUsd || 0)}</div>
                 </div>
                 <div>
                   <div className="text-xs text-muted-foreground">Kiro计量</div>
@@ -1269,28 +1279,28 @@ export function UsageRecordsPanel() {
                       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                         <div className="font-medium">外部池计费拆分</div>
                         <Badge variant={hasLoss ? 'destructive' : hasProfit ? 'warning' : 'success'}>
-                          {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
+                          {hasLoss ? `亏损 ${formatUsdDetailed(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsdDetailed(profit)}` : '持平'}
                         </Badge>
                       </div>
                       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                         <div>
                           <div className="text-xs text-muted-foreground">上游原始 usage 成本</div>
                           <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
-                          <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
+                          <div className="mt-1 font-medium">{formatUsdDetailed(billing.rawCostUsd || 0)}</div>
                           <div className="text-xs text-muted-foreground">按外部上游返回 usage 估算</div>
                         </div>
                         <div>
                           <div className="text-xs text-muted-foreground">整形后计费</div>
                           <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
-                          <div className="mt-1 font-medium">{formatUsd(shapedCost)}</div>
+                          <div className="mt-1 font-medium">{formatUsdDetailed(shapedCost)}</div>
                           <div className="text-xs text-muted-foreground">按当前路径缓存策略整形，未放大</div>
                         </div>
                         <div>
                           <div className="text-xs text-muted-foreground">整形后放大计费</div>
                           <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
-                          <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
+                          <div className="mt-1 font-medium">{formatUsdDetailed(upliftedCost)}</div>
                           <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
-                            盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+                            盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsdDetailed(profit)}
                           </div>
                         </div>
                         <div>

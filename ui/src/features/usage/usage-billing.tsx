@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { DollarSign } from 'lucide-react'
 import { Badge, Button } from '@/components/ui'
 import { SectionCard } from '@/components/patterns'
-import { formatCompact, formatMeteringUsage, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
+import { formatCompact, formatMeteringUsage, formatNumber, formatPercent, formatUsdDetailed, formatUsdFixed2 } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import type {
   ExternalPoolBilling,
@@ -101,13 +101,13 @@ export function UsageCostInline({
           onClick={onViewDetail}
           title="查看计费明细"
         >
-          {formatUsdFixed2(model.estimatedCostUsd)}
+          {formatUsdDetailed(model.estimatedCostUsd)}
         </Button>
       ) : (
-        <div className="font-semibold">{formatUsdFixed2(model.estimatedCostUsd)}</div>
+        <div className="font-semibold">{formatUsdDetailed(model.estimatedCostUsd)}</div>
       )}
       <div className="text-[0.62rem] text-warning">
-        原始 {formatUsdFixed2(model.originalCostUsd)}
+        原始 {formatUsdDetailed(model.originalCostUsd)}
       </div>
       <div className="text-[0.62rem] text-muted-foreground/60">{pricingLabel}</div>
       {typeof model.kiroMeteringUsage === 'number' && (
@@ -134,8 +134,8 @@ export function UsageCostTiles({
 
   return (
     <div className={cn('grid grid-cols-2 gap-2 sm:grid-cols-3', className)}>
-      <CostMetric label="估算费用" value={formatUsdFixed2(model.estimatedCostUsd)} tone={model.estimatedCostUsd > 0 ? 'warning' : 'default'} />
-      <CostMetric label="原始计费" value={formatUsdFixed2(model.originalCostUsd)} tone={model.originalCostUsd > 0 ? 'warning' : 'default'} />
+      <CostMetric label="估算费用" value={formatUsdDetailed(model.estimatedCostUsd)} tone={model.estimatedCostUsd > 0 ? 'warning' : 'default'} />
+      <CostMetric label="原始计费" value={formatUsdDetailed(model.originalCostUsd)} tone={model.originalCostUsd > 0 ? 'warning' : 'default'} />
       {showKiro && typeof model.kiroMeteringUsage === 'number' && (
         <CostMetric label="Kiro计量" value={formatMeteringUsage(model.kiroMeteringUsage)} />
       )}
@@ -164,26 +164,26 @@ export function UsageCostBreakdown({
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <CostMetric
             label="上游原始 usage 成本"
-            value={formatUsdFixed2(billing.rawCostUsd)}
+            value={formatUsdDetailed(billing.rawCostUsd)}
             detail={formatUsageSnapshot(billing.rawUsage)}
           />
           <CostMetric
             label="展示计费"
-            value={formatUsdFixed2(shapedCost)}
+            value={formatUsdDetailed(shapedCost)}
             detail={billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}
           />
           <CostMetric
             label="补偿后计费"
-            value={formatUsdFixed2(upliftedCost)}
+            value={formatUsdDetailed(upliftedCost)}
             detail={formatUsageSnapshot(billing.reportedUsage)}
           />
           <CostMetric
             label="上报费用 / 可计费"
-            value={`${formatUsdFixed2(billing.reportedCostUsd)} / ${formatUsdFixed2(billing.billableCostUsd)}`}
+            value={`${formatUsdDetailed(billing.reportedCostUsd)} / ${formatUsdDetailed(billing.billableCostUsd)}`}
           />
           <CostMetric
             label="计费差额"
-            value={`${delta >= 0 ? '+' : ''}${formatUsdFixed2(delta)}`}
+            value={`${delta >= 0 ? '+' : ''}${formatUsdDetailed(delta)}`}
             tone={deltaTone === 'loss' ? 'error' : deltaTone === 'profit' ? 'warning' : 'default'}
             detail="补偿后计费 - 上游原始成本"
           />
@@ -197,17 +197,17 @@ export function UsageCostBreakdown({
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <CostMetric
             label="原始计费"
-            value={formatUsdFixed2(model.originalCostUsd)}
+            value={formatUsdDetailed(model.originalCostUsd)}
             detail="按原始 usage 估算"
           />
           <CostMetric
             label="展示计费"
-            value={formatUsdFixed2(model.estimatedCostUsd)}
+            value={formatUsdDetailed(model.estimatedCostUsd)}
             detail="按下游展示 usage 估算"
           />
           <CostMetric
             label="计费差额"
-            value={`${delta >= 0 ? '+' : ''}${formatUsdFixed2(delta)}`}
+            value={`${delta >= 0 ? '+' : ''}${formatUsdDetailed(delta)}`}
             tone={deltaTone === 'loss' ? 'error' : deltaTone === 'profit' ? 'warning' : 'default'}
             detail="展示计费 - 原始计费"
           />
