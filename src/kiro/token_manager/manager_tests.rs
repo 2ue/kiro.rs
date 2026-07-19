@@ -7651,26 +7651,7 @@ async fn admin_runtime_snapshots_share_background_redis_refresh_and_report_real_
     assert_eq!(
         redis_store.scheduler_state_snapshot_count(),
         snapshot_count,
-        "Admin reads must enqueue one background refresh without blocking for it"
-    );
-
-    tokio::time::timeout(StdDuration::from_secs(1), async {
-        loop {
-            if redis_store.scheduler_state_snapshot_count() == snapshot_count + 1
-                && manager.scheduler_redis_runtime_fresh(Instant::now())
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the shared background Redis snapshot must complete");
-    assert!(manager.runtime_snapshot_for_ids(&ids).runtime_fresh);
-    assert_eq!(
-        redis_store.scheduler_state_snapshot_count(),
-        snapshot_count + 1,
-        "repeated Admin reads inside the one-second interval must reuse the same snapshot"
+        "Admin reads must not enqueue Redis refresh work"
     );
 }
 

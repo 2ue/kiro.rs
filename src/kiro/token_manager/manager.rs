@@ -463,7 +463,9 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 并发排队等待的周期性唤醒间隔，避免极端竞态下丢失通知后永久睡眠。
 const CONCURRENCY_WAIT_WAKEUP_SECS: u64 = 30;
-const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1);
+// Keep Admin runtime sampling from competing with admission on Redis while still
+// refreshing well within the 3-second runtime freshness window.
+const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(2);
 const SCHEDULER_REDIS_RUNTIME_FRESH_MAX_AGE: StdDuration = StdDuration::from_secs(3);
 const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 /// Redis scheduler reads may fall back to local cache after this soft budget.
@@ -4288,18 +4290,29 @@ impl MultiTokenManager {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
-            if let Some(deleted) = self.block_on_scheduler_redis_non_admission(
+            if let Some((deleted, authoritative)) = self.block_on_scheduler_redis_non_admission(
                 "按凭据删除 Redis 会话绑定",
                 async move {
-                    redis
+                    let deleted = redis
                         .delete_session_binding_if_bound_to(&session_id_owned, credential_id)
-                        .await
+                        .await?;
+                    let authoritative = if deleted {
+                        None
+                    } else {
+                        redis.get_session_binding(&session_id_owned).await?
+                    };
+                    Ok((deleted, authoritative))
                 },
             ) {
                 if !deleted {
-                    let _ = self.bound_credential_id(session_id);
+                    if let Some(binding) = authoritative {
+                        cache_sticky_redis_binding(
+                            &self.session_bindings,
+                            session_id,
+                            Some(binding),
+                        );
+                    }
                 }
-                return;
             }
         }
     }
@@ -4362,26 +4375,21 @@ impl MultiTokenManager {
 
     /// 清理绑定账号的软失败计数。
     pub fn clear_session_soft_failure(&self, session_id: &str, credential_id: u64) {
+        clear_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id);
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
-            if let Some(binding) = self.block_on_scheduler_redis_non_admission(
-                "原子清理 Redis 会话软失败",
-                async move {
-                    redis
-                        .clear_session_soft_failure_with_state(
-                            &session_id_owned,
-                            credential_id,
-                            SESSION_BINDING_TTL_SECS as usize,
-                        )
-                        .await
-                },
-            ) {
-                cache_sticky_redis_binding(&self.session_bindings, session_id, binding);
-                return;
-            }
+            spawn_best_effort_storage_task("后台清理 Redis 会话软失败", async move {
+                redis
+                    .clear_session_soft_failure_with_state(
+                        &session_id_owned,
+                        credential_id,
+                        SESSION_BINDING_TTL_SECS as usize,
+                    )
+                    .await?;
+                Ok(())
+            });
         }
-        clear_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id);
     }
 
     /// 获取 API 调用上下文
@@ -8454,8 +8462,6 @@ impl MultiTokenManager {
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         self.cleanup_expired_in_flight_leases_local_first();
-        self.refresh_stats_from_postgres();
-        self.refresh_scheduler_state_from_redis_best_effort();
         let config = self.config.lock().clone();
         let mut entries = self.entries.lock();
         if self.redis_store.is_none() {
@@ -8571,7 +8577,6 @@ impl MultiTokenManager {
     /// 该路径只读计数和全局容量，不构造每个凭据的运行态详情，供 Admin 顶部概览高频轮询使用。
     pub fn summary_snapshot(&self) -> ManagerSummarySnapshot {
         self.cleanup_expired_in_flight_leases_local_first();
-        self.refresh_scheduler_state_from_redis_best_effort();
         let config = self.config.lock().clone();
         let (current_id, total, available, local_global_in_flight) = {
             let entries = self.entries.lock();
@@ -8613,7 +8618,6 @@ impl MultiTokenManager {
     pub fn runtime_snapshot_for_ids(&self, ids: &[u64]) -> ManagerRuntimeSnapshot {
         self.cleanup_expired_in_flight_leases_local_first();
         let ids: HashSet<u64> = ids.iter().copied().collect();
-        self.refresh_scheduler_state_from_redis_best_effort();
         let runtime_fresh = self.scheduler_redis_runtime_fresh(Instant::now());
 
         let config = self.config.lock().clone();

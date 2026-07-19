@@ -102,7 +102,6 @@ fn schedule_uncertain_redis_admission_cleanup(
     if admitted {
         return;
     }
-    let synchronous_fallback_redis = fallback_redis.clone();
     let admitted = spawn_best_effort_storage_task(
         "关键队列饱和后清理结果不确定的 Redis 凭据准入",
         async move {
@@ -118,26 +117,11 @@ fn schedule_uncertain_redis_admission_cleanup(
         },
     );
     if !admitted {
-        // Both background lanes are bounded. Keep the final fallback on this stack so cleanup
-        // cannot be dropped or create an unbounded third task source under overload.
-        if let Err(err) = block_on_storage("Redis 准入清理队列均饱和后的同步回滚", async move {
-            release_redis_in_flight_lease_and_wakeup(
-                synchronous_fallback_redis,
-                credential_id,
-                lease_id,
-                true,
-                true,
-                2,
-            )
-            .await
-        }) {
-            tracing::error!(
-                credential_id,
-                lease_id,
-                "Redis 准入清理有界同步回滚仍失败，将由 tombstone 与分布式 lease 最大年龄兜底: {}",
-                err
-            );
-        }
+        tracing::warn!(
+            credential_id,
+            lease_id,
+            "Redis 准入清理队列已满，将由 tombstone 与 lease TTL 回收"
+        );
     }
 }
 
