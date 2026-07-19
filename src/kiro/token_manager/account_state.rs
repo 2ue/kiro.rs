@@ -104,6 +104,7 @@ pub(super) struct PendingRedisAdmission {
     pub(super) lease_id: u64,
     pub(super) rate_limit_available_at: Option<Instant>,
     pub(super) baseline_in_flight_requests: u32,
+    #[allow(dead_code)]
     pub(super) baseline_global_in_flight_requests: u32,
 }
 
