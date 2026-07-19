@@ -58,8 +58,11 @@ use super::concurrency::{
     DispatchQueueGuard, InFlightLeaseGuard, LocalRedisAdmissionReservationGuard,
     RedisAdmissionCleanupGuard, ReleasedInFlightLeaseTombstones,
     distributed_in_flight_lease_max_age, filter_released_in_flight_leases_from_scheduler_states,
-    record_released_in_flight_lease_tombstone, release_redis_dispatch_queue_lease_reliably,
-    release_redis_in_flight_lease_and_wakeup,
+    release_redis_dispatch_queue_lease_reliably,
+};
+#[cfg(test)]
+use super::concurrency::{
+    record_released_in_flight_lease_tombstone, release_redis_in_flight_lease_and_wakeup,
 };
 use super::cooldown::{entry_any_cooldown_remaining, entry_cooldown_remaining, model_state_key};
 use super::queue::{
@@ -4159,6 +4162,7 @@ impl MultiTokenManager {
         sticky_bound_credential_id(&self.session_bindings, session_id)
     }
 
+    #[allow(dead_code)]
     fn bound_credential_id(&self, session_id: &str) -> Option<u64> {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -7533,6 +7537,7 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn refresh_scheduler_state_from_redis_best_effort(&self) {
         if let Err(err) = self.refresh_scheduler_state_from_redis() {
             tracing::warn!("从 Redis 同步调度运行态失败: {}", err);
