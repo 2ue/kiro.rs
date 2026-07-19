@@ -566,3 +566,207 @@ fn extracts_model_ids_from_kiro_compatible_models_response() {
         ]
     );
 }
+
+#[test]
+fn external_pool_admin_cache_epoch_change_clears_external_shadow_atomically() {
+    let now = Instant::now();
+    let fresh_until = now + StdDuration::from_secs(2);
+    let stale_until = fresh_until + StdDuration::from_secs(30);
+    let shadow = Arc::new(Mutex::new(HashMap::from([
+        (
+            admin_external_pool_status_cache_key().to_string(),
+            AdminCacheEntry {
+                value: serde_json::json!({"stale": true}),
+                fresh_until,
+                stale_until,
+            },
+        ),
+        (
+            admin_external_pool_list_cache_key().to_string(),
+            AdminCacheEntry {
+                value: serde_json::json!([{"stale": true}]),
+                fresh_until,
+                stale_until,
+            },
+        ),
+        (
+            "admin_cache:usage:summary".to_string(),
+            AdminCacheEntry {
+                value: serde_json::json!({"requests": 1}),
+                fresh_until,
+                stale_until,
+            },
+        ),
+    ])));
+    let seen_epoch = AtomicU64::new(7);
+
+    let cached = read_external_pool_admin_cache_shadow(
+        &shadow,
+        &seen_epoch,
+        || 8,
+        admin_external_pool_status_cache_key(),
+        now,
+    );
+
+    assert!(cached.is_none());
+    assert_eq!(seen_epoch.load(Ordering::Acquire), 8);
+    let shadow = shadow.lock();
+    assert!(!shadow.contains_key(admin_external_pool_status_cache_key()));
+    assert!(!shadow.contains_key(admin_external_pool_list_cache_key()));
+    assert!(shadow.contains_key("admin_cache:usage:summary"));
+}
+
+#[test]
+fn external_pool_admin_cache_accepts_fresh_local_values_but_never_stale_values() {
+    let now = Instant::now();
+    let shadow = Arc::new(Mutex::new(HashMap::from([
+        (
+            admin_external_pool_status_cache_key().to_string(),
+            AdminCacheEntry {
+                value: serde_json::json!({"fresh": true}),
+                fresh_until: now + StdDuration::from_secs(2),
+                stale_until: now + StdDuration::from_secs(32),
+            },
+        ),
+        (
+            admin_external_pool_list_cache_key().to_string(),
+            AdminCacheEntry {
+                value: serde_json::json!([{"stale": true}]),
+                fresh_until: now
+                    .checked_sub(StdDuration::from_millis(1))
+                    .expect("test instant supports a one millisecond subtraction"),
+                stale_until: now + StdDuration::from_secs(30),
+            },
+        ),
+    ])));
+    let seen_epoch = AtomicU64::new(3);
+
+    assert_eq!(
+        read_external_pool_admin_cache_shadow(
+            &shadow,
+            &seen_epoch,
+            || 3,
+            admin_external_pool_status_cache_key(),
+            now,
+        ),
+        Some(serde_json::json!({"fresh": true}))
+    );
+    assert!(
+        read_external_pool_admin_cache_shadow(
+            &shadow,
+            &seen_epoch,
+            || 3,
+            admin_external_pool_list_cache_key(),
+            now,
+        )
+        .is_none()
+    );
+    assert!(
+        !shadow
+            .lock()
+            .contains_key(admin_external_pool_list_cache_key())
+    );
+}
+
+#[test]
+fn external_pool_admin_cache_rejects_late_write_from_an_old_epoch() {
+    let shadow = Arc::new(Mutex::new(HashMap::new()));
+    let seen_epoch = AtomicU64::new(8);
+
+    assert!(!write_external_pool_admin_cache_shadow(
+        &shadow,
+        &seen_epoch,
+        || 8,
+        7,
+        admin_external_pool_status_cache_key().to_string(),
+        serde_json::json!({"stale": true}),
+        2,
+    ));
+    assert!(
+        !shadow
+            .lock()
+            .contains_key(admin_external_pool_status_cache_key())
+    );
+
+    assert!(write_external_pool_admin_cache_shadow(
+        &shadow,
+        &seen_epoch,
+        || 8,
+        8,
+        admin_external_pool_status_cache_key().to_string(),
+        serde_json::json!({"fresh": true}),
+        2,
+    ));
+    assert_eq!(
+        read_external_pool_admin_cache_shadow(
+            &shadow,
+            &seen_epoch,
+            || 8,
+            admin_external_pool_status_cache_key(),
+            Instant::now(),
+        ),
+        Some(serde_json::json!({"fresh": true}))
+    );
+}
+
+#[test]
+fn only_external_pool_admin_cache_keys_use_the_local_only_path() {
+    assert!(is_external_pool_admin_cache_key(
+        admin_external_pool_status_cache_key()
+    ));
+    assert!(is_external_pool_admin_cache_key(
+        admin_external_pool_list_cache_key()
+    ));
+    assert!(!is_external_pool_admin_cache_key(
+        "admin_cache:usage:summary"
+    ));
+}
+
+#[test]
+fn usage_pg_admin_cache_uses_a_new_local_only_namespace() {
+    let summary_key = admin_usage_pg_summary_cache_key(10_000);
+    let dashboard_key = admin_usage_pg_dashboard_cache_key(Some("Asia/Beijing"), 10_000);
+
+    assert!(is_usage_pg_admin_cache_key(&summary_key));
+    assert!(is_usage_pg_admin_cache_key(&dashboard_key));
+    assert!(summary_key.starts_with("admin_cache:usage_pg:v2:"));
+    assert_eq!(
+        dashboard_key,
+        admin_usage_pg_dashboard_cache_key(Some("Asia/Shanghai"), 10_000)
+    );
+    assert!(!is_usage_pg_admin_cache_key(
+        "admin_cache:usage:summary:10000"
+    ));
+}
+
+#[test]
+fn usage_pg_admin_cache_never_serves_local_stale_values() {
+    let now = Instant::now();
+    let key = admin_usage_pg_summary_cache_key(500);
+    let shadow = Arc::new(Mutex::new(HashMap::from([(
+        key.clone(),
+        AdminCacheEntry {
+            value: serde_json::json!({"totalRequests": 99}),
+            fresh_until: now
+                .checked_sub(StdDuration::from_millis(1))
+                .expect("test instant supports a one millisecond subtraction"),
+            stale_until: now + StdDuration::from_secs(30),
+        },
+    )])));
+
+    assert!(read_fresh_admin_cache_shadow(&shadow, &key, now).is_none());
+    assert!(!shadow.lock().contains_key(&key));
+}
+
+#[test]
+fn usage_pg_dashboard_part_cache_normalizes_unknown_windows() {
+    assert_eq!(
+        admin_usage_pg_dashboard_part_cache_key(
+            "breakdown",
+            Some("UTC"),
+            Some("not-a-window"),
+            None,
+        ),
+        admin_usage_pg_dashboard_part_cache_key("breakdown", Some("Etc/UTC"), Some("today"), None,)
+    );
+}

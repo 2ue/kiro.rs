@@ -272,13 +272,13 @@ impl KiroStreamCompletion {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.in_flight_lease.lock().take();
         self.token_manager.report_success_for_session_with_latency(
             self.credential_id,
             self.model.as_deref(),
             self.session_id.as_deref(),
             Some(self.started_at.elapsed()),
         );
-        self.in_flight_lease.lock().take();
     }
 
     /// 上游流中断、idle timeout 或上游错误事件时调用。
@@ -717,6 +717,52 @@ mod tests {
 
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.entries[0].success_count, 1);
+    }
+
+    #[test]
+    fn stream_completion_releases_lease_before_success_persistence() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let lease = manager.acquire_in_flight_lease_for_test(1);
+        let completion = Arc::new(KiroStreamCompletion::new(
+            manager.clone(),
+            1,
+            lease,
+            Some("session".into()),
+            Some("claude-sonnet-4.5".into()),
+            false,
+            false,
+            Vec::new(),
+            Instant::now(),
+        ));
+
+        let config_guard = manager.lock_config_for_test();
+        let reporting = {
+            let completion = completion.clone();
+            std::thread::spawn(move || completion.report_success())
+        };
+        let deadline = Instant::now() + std::time::Duration::from_millis(250);
+        let released_before_persistence = loop {
+            if manager.in_flight_requests_for_test(1) == 0 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        drop(config_guard);
+        reporting.join().unwrap();
+
+        assert!(
+            released_before_persistence,
+            "stream completion must release capacity before terminal persistence can block"
+        );
+        assert_eq!(manager.snapshot().entries[0].success_count, 1);
     }
 
     #[test]
@@ -1221,6 +1267,7 @@ impl KiroProvider {
                 host,
             )?)
             .body("{}");
+        ctx.mark_upstream_dispatch_started();
         let response =
             send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
                 .await?;
@@ -1621,7 +1668,7 @@ impl KiroProvider {
         .await
     }
 
-    async fn call_api_with_context_with_request_id_and_mode(
+    pub(crate) async fn call_api_with_context_with_request_id_and_mode(
         &self,
         request_body: &str,
         request_id: Option<&str>,
@@ -1782,6 +1829,7 @@ impl KiroProvider {
             .header("Connection", "close");
         let request = endpoint.decorate_api(base, &rctx);
 
+        ctx.mark_upstream_dispatch_started();
         let response =
             send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
                 .await
@@ -1909,6 +1957,7 @@ impl KiroProvider {
                 request = request.body(serde_json::to_vec(&body)?);
             }
             let request = endpoint.decorate_models(request, &rctx);
+            ctx.mark_upstream_dispatch_started();
             let response = send_with_response_header_timeout(
                 request,
                 config.kiro_upstream_response_timeout_secs,
@@ -2091,7 +2140,7 @@ impl KiroProvider {
         .await
     }
 
-    async fn call_api_stream_with_request_id_and_mode(
+    pub(crate) async fn call_api_stream_with_request_id_and_mode(
         &self,
         request_body: &str,
         request_id: Option<&str>,
@@ -2218,6 +2267,7 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
 
+            ctx.mark_upstream_dispatch_started();
             let response = match send_with_response_header_timeout(
                 request,
                 config.kiro_upstream_response_timeout_secs,
@@ -2273,12 +2323,12 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                self.finish_attempt(&mut ctx);
                 self.token_manager.report_success_with_latency(
                     ctx.id,
                     None,
                     Some(attempt_started_at.elapsed()),
                 );
-                self.finish_attempt(&mut ctx);
                 return Ok(response);
             }
 
@@ -2806,6 +2856,7 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
+            ctx.mark_upstream_dispatch_started();
             let response = match send_with_response_header_timeout(
                 request,
                 config.kiro_upstream_response_timeout_secs,

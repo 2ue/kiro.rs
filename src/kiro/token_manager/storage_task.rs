@@ -84,6 +84,7 @@ pub struct StorageTaskShutdownReport {
 #[derive(Default)]
 struct StorageTaskProgress {
     accepted: AtomicU64,
+    outstanding: AtomicU64,
     succeeded: AtomicU64,
     failed: AtomicU64,
     timed_out: AtomicU64,
@@ -101,11 +102,22 @@ struct StorageTaskProgress {
 }
 
 impl StorageTaskProgress {
-    fn accept(&self, lane: StorageTaskLane) {
+    fn reserve(&self, lane: StorageTaskLane) {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
         self.accepted.fetch_add(1, Ordering::Release);
         if lane == StorageTaskLane::Critical {
             self.critical_accepted.fetch_add(1, Ordering::Release);
         }
+    }
+
+    fn cancel_reservation(&self, lane: StorageTaskLane) {
+        self.accepted.fetch_sub(1, Ordering::AcqRel);
+        if lane == StorageTaskLane::Critical {
+            self.critical_accepted.fetch_sub(1, Ordering::AcqRel);
+        }
+        let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "storage task reservation underflow");
+        self.changed.notify_waiters();
     }
 
     fn reject_full(&self, lane: StorageTaskLane) -> u64 {
@@ -151,6 +163,8 @@ impl StorageTaskProgress {
         if lane == StorageTaskLane::Critical {
             self.critical_finished.fetch_add(1, Ordering::Release);
         }
+        let previous = self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "storage task outstanding count underflow");
         self.changed.notify_waiters();
     }
 }
@@ -165,9 +179,18 @@ struct BestEffortStorageExecutorInner {
     shutdown_complete: AtomicBool,
     shutdown_timed_out: AtomicBool,
     shutdown_changed: Notify,
+    #[cfg(test)]
+    shutdown_wait_before_await_gate: Mutex<Option<StorageShutdownWaitTestGate>>,
     progress: Arc<StorageTaskProgress>,
     queue_capacity: usize,
     critical_queue_capacity: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StorageShutdownWaitTestGate {
+    reached: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
 }
 
 #[derive(Clone)]
@@ -243,6 +266,8 @@ impl BestEffortStorageExecutor {
                 shutdown_complete: AtomicBool::new(false),
                 shutdown_timed_out: AtomicBool::new(false),
                 shutdown_changed: Notify::new(),
+                #[cfg(test)]
+                shutdown_wait_before_await_gate: Mutex::new(None),
                 progress,
                 queue_capacity,
                 critical_queue_capacity,
@@ -290,12 +315,11 @@ impl BestEffortStorageExecutor {
             lane,
             future: Box::pin(future),
         };
+        self.inner.progress.reserve(lane);
         match sender.try_send(task) {
-            Ok(()) => {
-                self.inner.progress.accept(lane);
-                true
-            }
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(task)) => {
+                self.inner.progress.cancel_reservation(lane);
                 let rejected = self.inner.progress.reject_full(lane);
                 if should_log_counter(rejected) {
                     tracing::warn!(
@@ -309,6 +333,7 @@ impl BestEffortStorageExecutor {
                 false
             }
             Err(mpsc::error::TrySendError::Closed(task)) => {
+                self.inner.progress.cancel_reservation(lane);
                 self.reject_closed(lane, task.operation);
                 false
             }
@@ -367,26 +392,29 @@ impl BestEffortStorageExecutor {
     }
 
     async fn drain(&self, timeout: StdDuration) -> StorageTaskDrainReport {
-        let target = self.inner.progress.accepted.load(Ordering::Acquire);
         let wait = async {
             loop {
                 let changed = self.inner.progress.changed.notified();
-                let finished = self.inner.progress.finished.load(Ordering::Acquire);
-                if finished >= target {
-                    return finished;
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.inner.progress.outstanding.load(Ordering::Acquire) == 0 {
+                    return (
+                        self.inner.progress.accepted.load(Ordering::Acquire),
+                        self.inner.progress.finished.load(Ordering::Acquire),
+                    );
                 }
                 changed.await;
             }
         };
         match tokio::time::timeout(timeout, wait).await {
-            Ok(finished) => StorageTaskDrainReport {
+            Ok((target, finished)) => StorageTaskDrainReport {
                 target,
                 finished,
                 drained: true,
                 timed_out: false,
             },
             Err(_) => StorageTaskDrainReport {
-                target,
+                target: self.inner.progress.accepted.load(Ordering::Acquire),
                 finished: self.inner.progress.finished.load(Ordering::Acquire),
                 drained: false,
                 timed_out: true,
@@ -422,8 +450,17 @@ impl BestEffortStorageExecutor {
     async fn wait_for_shutdown(&self) {
         loop {
             let changed = self.inner.shutdown_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if self.inner.shutdown_complete.load(Ordering::Acquire) {
                 return;
+            }
+            #[cfg(test)]
+            let gate = self.inner.shutdown_wait_before_await_gate.lock().take();
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.reached.wait().await;
+                gate.resume.wait().await;
             }
             changed.await;
         }
@@ -908,6 +945,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_includes_tasks_submitted_by_an_accepted_task() {
+        let executor = test_executor(2, 2, StdDuration::from_secs(1));
+        let parent_started = Arc::new(Notify::new());
+        let release_parent = Arc::new(Notify::new());
+        let child_completed = Arc::new(AtomicBool::new(false));
+        let submitting_executor = executor.clone();
+        let started = parent_started.clone();
+        let release = release_parent.clone();
+        let completed = child_completed.clone();
+        assert!(executor.try_submit("parent", async move {
+            started.notify_one();
+            release.notified().await;
+            assert!(submitting_executor.try_submit("child", async move {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+                completed.store(true, Ordering::Release);
+                Ok(())
+            }));
+            Ok(())
+        }));
+        parent_started.notified().await;
+
+        let draining_executor = executor.clone();
+        let drain =
+            tokio::spawn(async move { draining_executor.drain(StdDuration::from_secs(1)).await });
+        tokio::task::yield_now().await;
+        release_parent.notify_one();
+
+        let report = drain.await.unwrap();
+        assert!(report.drained);
+        assert_eq!(report.target, 2);
+        assert!(report.finished >= report.target);
+        assert!(child_completed.load(Ordering::Acquire));
+        assert!(executor.shutdown(StdDuration::from_secs(1)).await.drained);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_timeout_aborts_remaining_workers_and_still_completes() {
         let executor = test_executor(1, 1, StdDuration::from_secs(5));
         let started = Arc::new(Notify::new());
@@ -940,6 +1013,54 @@ mod tests {
         let second = executor.shutdown(StdDuration::from_secs(1)).await;
         assert!(second.already_started);
         assert!(second.drained);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_wait_registers_notification_before_checking_completion() {
+        let executor = test_executor(1, 1, StdDuration::from_secs(1));
+        let reached = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *executor.inner.shutdown_wait_before_await_gate.lock() =
+            Some(StorageShutdownWaitTestGate {
+                reached: reached.clone(),
+                resume: resume.clone(),
+            });
+
+        let waiting_executor = executor.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiting_executor.wait_for_shutdown().await;
+        });
+        tokio::time::timeout(StdDuration::from_secs(5), reached.wait())
+            .await
+            .expect("shutdown waiter did not reach the pre-await gate");
+        executor
+            .inner
+            .shutdown_complete
+            .store(true, Ordering::Release);
+        executor.inner.shutdown_changed.notify_waiters();
+        tokio::time::timeout(StdDuration::from_secs(5), resume.wait())
+            .await
+            .expect("shutdown waiter did not resume after the completion notification");
+
+        let wait_completed =
+            match tokio::time::timeout(StdDuration::from_secs(1), &mut waiter).await {
+                Ok(join_result) => join_result.is_ok(),
+                Err(_) => {
+                    waiter.abort();
+                    let _ = waiter.await;
+                    false
+                }
+            };
+        executor
+            .inner
+            .shutdown_complete
+            .store(false, Ordering::Release);
+        let report = executor.shutdown(StdDuration::from_secs(1)).await;
+        assert!(report.drained);
+        assert!(
+            wait_completed,
+            "shutdown completion notification was lost between the flag check and await"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -51,7 +51,7 @@ use crate::anthropic::{
     prompt_cache_creation_control::PromptCacheCreationController,
     usage::{
         UsageDashboardResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
-        UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
+        UsageRecordsPageResult, UsageRecordsResult, UsageSummary, usage_dashboard_timezone,
     },
 };
 use crate::common::auth::RequestApiKeyStore;
@@ -100,6 +100,10 @@ const ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS: usize = 2;
 const ADMIN_CACHE_DEFAULT_LOCAL_TTL_SECS: usize = 2;
 const ADMIN_CACHE_REDIS_READ_TIMEOUT: StdDuration = StdDuration::from_millis(250);
 const ADMIN_CACHE_LOCAL_STALE_TTL_SECS: u64 = 30;
+const ADMIN_USAGE_PG_CACHE_PREFIX: &str = "admin_cache:usage_pg:v2:";
+const ADMIN_USAGE_PG_CACHE_PATTERN: &str = "admin_cache:usage_pg:v2:*";
+const ADMIN_EXTERNAL_POOL_CACHE_PREFIX: &str = "admin_cache:external_pools:";
+const ADMIN_EXTERNAL_POOL_CACHE_PATTERN: &str = "admin_cache:external_pools:*";
 const DEFAULT_PROXY_TEST_URL: &str = "https://api.ipify.org?format=json";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 12;
 const PROXY_TEST_PREVIEW_CHARS: usize = 300;
@@ -377,20 +381,59 @@ fn balance_cache_key(id: u64) -> String {
     format!("balance:{}", id)
 }
 
-fn admin_usage_summary_cache_key(high_cache_threshold: i32) -> String {
-    format!("admin_cache:usage:summary:{}", high_cache_threshold)
+fn admin_usage_pg_cache_timezone(timezone: Option<&str>) -> String {
+    usage_dashboard_timezone(timezone).0.replace(':', "_")
 }
 
-fn admin_usage_dashboard_cache_key(timezone: Option<&str>, high_cache_threshold: i32) -> String {
-    let timezone = timezone
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("default")
-        .replace(':', "_");
+fn admin_usage_pg_cache_window(window_key: Option<&str>) -> &'static str {
+    match window_key.map(str::trim) {
+        Some("last24h") => "last24h",
+        Some("yesterday") => "yesterday",
+        Some("last7d") => "last7d",
+        Some("last30d") => "last30d",
+        Some("thisMonth") => "thisMonth",
+        _ => "today",
+    }
+}
+
+fn admin_usage_pg_summary_cache_key(high_cache_threshold: i32) -> String {
     format!(
-        "admin_cache:usage:dashboard:{}:{}",
-        timezone, high_cache_threshold
+        "{}summary:{}",
+        ADMIN_USAGE_PG_CACHE_PREFIX, high_cache_threshold
     )
+}
+
+fn admin_usage_pg_dashboard_cache_key(timezone: Option<&str>, high_cache_threshold: i32) -> String {
+    format!(
+        "{}dashboard:{}:{}",
+        ADMIN_USAGE_PG_CACHE_PREFIX,
+        admin_usage_pg_cache_timezone(timezone),
+        high_cache_threshold
+    )
+}
+
+fn admin_usage_pg_dashboard_part_cache_key(
+    part: &str,
+    timezone: Option<&str>,
+    window_key: Option<&str>,
+    high_cache_threshold: Option<i32>,
+) -> String {
+    format!(
+        "{}dashboard:{}:{}:{}:{}",
+        ADMIN_USAGE_PG_CACHE_PREFIX,
+        part,
+        admin_usage_pg_cache_timezone(timezone),
+        window_key
+            .map(|value| admin_usage_pg_cache_window(Some(value)))
+            .unwrap_or("all"),
+        high_cache_threshold
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string())
+    )
+}
+
+fn is_usage_pg_admin_cache_key(key: &str) -> bool {
+    key.starts_with(ADMIN_USAGE_PG_CACHE_PREFIX)
 }
 
 fn admin_external_pool_status_cache_key() -> &'static str {
@@ -516,6 +559,7 @@ pub struct AdminService {
     external_pool_manager: Arc<ExternalPoolManager>,
     usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
     admin_cache_shadow: Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
+    external_admin_cache_epoch_seen: AtomicU64,
 }
 
 pub struct AdminServiceDependencies {
@@ -553,6 +597,82 @@ struct AdminCacheEntry {
     value: Value,
     fresh_until: Instant,
     stale_until: Instant,
+}
+
+fn is_external_pool_admin_cache_key(key: &str) -> bool {
+    key.starts_with(ADMIN_EXTERNAL_POOL_CACHE_PREFIX)
+}
+
+fn read_fresh_admin_cache_shadow(
+    admin_cache_shadow: &Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
+    key: &str,
+    now: Instant,
+) -> Option<Value> {
+    let mut shadow = admin_cache_shadow.lock();
+    match shadow.get(key) {
+        Some(entry) if entry.fresh_until > now => Some(entry.value.clone()),
+        Some(_) => {
+            shadow.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn read_external_pool_admin_cache_shadow(
+    admin_cache_shadow: &Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
+    external_admin_cache_epoch_seen: &AtomicU64,
+    current_epoch: impl FnOnce() -> u64,
+    key: &str,
+    now: Instant,
+) -> Option<Value> {
+    let mut shadow = admin_cache_shadow.lock();
+    let current_epoch = current_epoch();
+    if external_admin_cache_epoch_seen.load(Ordering::Acquire) != current_epoch {
+        shadow.retain(|cache_key, _| !is_external_pool_admin_cache_key(cache_key));
+        external_admin_cache_epoch_seen.store(current_epoch, Ordering::Release);
+        return None;
+    }
+
+    match shadow.get(key) {
+        Some(entry) if entry.fresh_until > now => Some(entry.value.clone()),
+        Some(_) => {
+            shadow.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn write_external_pool_admin_cache_shadow(
+    admin_cache_shadow: &Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
+    external_admin_cache_epoch_seen: &AtomicU64,
+    current_epoch: impl FnOnce() -> u64,
+    expected_epoch: u64,
+    key: String,
+    value: Value,
+    ttl_secs: usize,
+) -> bool {
+    let mut shadow = admin_cache_shadow.lock();
+    let current_epoch = current_epoch();
+    if current_epoch != expected_epoch {
+        return false;
+    }
+    if external_admin_cache_epoch_seen.load(Ordering::Acquire) != current_epoch {
+        shadow.retain(|cache_key, _| !is_external_pool_admin_cache_key(cache_key));
+        external_admin_cache_epoch_seen.store(current_epoch, Ordering::Release);
+    }
+    let now = Instant::now();
+    let fresh_ttl = StdDuration::from_secs(ttl_secs.max(1) as u64);
+    shadow.insert(
+        key,
+        AdminCacheEntry {
+            value,
+            fresh_until: now + fresh_ttl,
+            stale_until: now + fresh_ttl,
+        },
+    );
+    true
 }
 
 impl Default for UsageCleanupRuntime {
@@ -599,6 +719,7 @@ impl AdminService {
             request_api_key_store,
             external_pool_manager,
         } = dependencies;
+        let external_admin_cache_epoch_seen = external_pool_manager.external_admin_cache_epoch();
         Self {
             token_manager,
             postgres_store,
@@ -614,6 +735,7 @@ impl AdminService {
             external_pool_manager,
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
             admin_cache_shadow: Arc::new(Mutex::new(HashMap::new())),
+            external_admin_cache_epoch_seen: AtomicU64::new(external_admin_cache_epoch_seen),
         }
     }
 
@@ -627,6 +749,20 @@ impl AdminService {
     }
 
     fn read_admin_cache<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        if is_usage_pg_admin_cache_key(key) {
+            return read_fresh_admin_cache_shadow(&self.admin_cache_shadow, key, Instant::now())
+                .and_then(|value| deserialize_admin_cache_value(&value));
+        }
+        if is_external_pool_admin_cache_key(key) {
+            return read_external_pool_admin_cache_shadow(
+                &self.admin_cache_shadow,
+                &self.external_admin_cache_epoch_seen,
+                || self.external_pool_manager.external_admin_cache_epoch(),
+                key,
+                Instant::now(),
+            )
+            .and_then(|value| deserialize_admin_cache_value(&value));
+        }
         let now = Instant::now();
         let stale_value = {
             let mut shadow = self.admin_cache_shadow.lock();
@@ -681,13 +817,47 @@ impl AdminService {
                 return;
             }
         };
+        if is_external_pool_admin_cache_key(&key) {
+            tracing::warn!(key = %key, "忽略缺少 epoch fence 的外部池 Admin 缓存写入");
+            return;
+        }
         self.write_admin_cache_shadow(key.clone(), value.clone(), ttl_secs);
+        if is_usage_pg_admin_cache_key(&key) {
+            return;
+        }
         let redis = self.redis_store.clone();
         tokio::spawn(async move {
             if let Err(err) = redis.set_json(key, &value, ttl_secs).await {
                 tracing::warn!("写入 Redis Admin 缓存失败: {}", err);
             }
         });
+    }
+
+    fn write_external_pool_admin_cache<T>(
+        &self,
+        key: String,
+        value: T,
+        ttl_secs: usize,
+        expected_epoch: u64,
+    ) where
+        T: Serialize,
+    {
+        let value = match serde_json::to_value(&value) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("序列化外部池 Admin 缓存失败: {}", err);
+                return;
+            }
+        };
+        let _ = write_external_pool_admin_cache_shadow(
+            &self.admin_cache_shadow,
+            &self.external_admin_cache_epoch_seen,
+            || self.external_pool_manager.external_admin_cache_epoch(),
+            expected_epoch,
+            key,
+            value,
+            ttl_secs,
+        );
     }
 
     fn write_admin_cache_shadow(&self, key: String, value: Value, ttl_secs: usize) {
@@ -715,11 +885,13 @@ impl AdminService {
     }
 
     fn invalidate_usage_admin_cache(&self) {
+        invalidate_admin_cache_shadow(&self.admin_cache_shadow, ADMIN_USAGE_PG_CACHE_PATTERN);
         self.invalidate_admin_cache_pattern("admin_cache:usage:*");
     }
 
     fn invalidate_external_pool_admin_cache(&self) {
-        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        self.external_pool_manager.invalidate_routing_cache();
+        invalidate_admin_cache_shadow(&self.admin_cache_shadow, ADMIN_EXTERNAL_POOL_CACHE_PATTERN);
     }
 
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
@@ -857,6 +1029,7 @@ impl AdminService {
 
     pub fn list_external_pools(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
         let cache_key = admin_external_pool_list_cache_key();
+        let cache_epoch = self.external_pool_manager.external_admin_cache_epoch();
         if let Some(cached) = self.read_admin_cache::<Vec<ExternalPool>>(cache_key) {
             return Ok(cached);
         }
@@ -864,10 +1037,11 @@ impl AdminService {
         let store = self.postgres_store.clone();
         let pools = block_on_admin_store(async move { store.list_external_pools(true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-        self.write_admin_cache(
+        self.write_external_pool_admin_cache(
             cache_key.to_string(),
             pools.clone(),
             ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+            cache_epoch,
         );
         Ok(pools)
     }
@@ -1148,6 +1322,7 @@ impl AdminService {
         &self,
     ) -> Result<ExternalPoolsStatusResponse, AdminServiceError> {
         let cache_key = admin_external_pool_status_cache_key();
+        let cache_epoch = self.external_pool_manager.external_admin_cache_epoch();
         if let Some(cached) = self.read_admin_cache::<ExternalPoolsStatusResponse>(cache_key) {
             return Ok(cached);
         }
@@ -1157,10 +1332,11 @@ impl AdminService {
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let response = ExternalPoolsStatusResponse { pools };
-        self.write_admin_cache(
+        self.write_external_pool_admin_cache(
             cache_key.to_string(),
             response.clone(),
             ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+            cache_epoch,
         );
         Ok(response)
     }
@@ -3501,29 +3677,26 @@ impl AdminService {
     /// 获取 usage 汇总。
     pub fn get_usage_summary(&self) -> UsageSummary {
         let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
-        let cache_key = admin_usage_summary_cache_key(high_cache_threshold);
+        let cache_key = admin_usage_pg_summary_cache_key(high_cache_threshold);
         if let Some(cached) = self.read_admin_cache::<UsageSummary>(&cache_key) {
             return cached;
         }
-
         let summary = self.usage_recorder.summary(high_cache_threshold);
         self.write_admin_cache(cache_key, summary.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
         summary
     }
 
-    /// 获取 Redis-first 聚合的 usage 仪表盘数据。
-    ///
-    /// Redis 为空或未初始化时回退 PgSQL rollup，避免冷启动没有历史窗口数据。
+    /// 获取 PgSQL 权威 rollup 的 usage 仪表盘数据。
     pub fn get_usage_dashboard(
         &self,
         timezone: Option<String>,
     ) -> Result<UsageDashboardResponse, AdminServiceError> {
         let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
-        let cache_key = admin_usage_dashboard_cache_key(timezone.as_deref(), high_cache_threshold);
+        let cache_key =
+            admin_usage_pg_dashboard_cache_key(timezone.as_deref(), high_cache_threshold);
         if let Some(cached) = self.read_admin_cache::<UsageDashboardResponse>(&cache_key) {
             return Ok(cached);
         }
-
         let dashboard = self
             .usage_recorder
             .dashboard(timezone.as_deref(), high_cache_threshold)
@@ -3537,26 +3710,59 @@ impl AdminService {
         timezone: Option<String>,
     ) -> Result<crate::anthropic::usage::UsageDashboardWindowsResponse, AdminServiceError> {
         let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
-        self.usage_recorder
+        let cache_key = admin_usage_pg_dashboard_part_cache_key(
+            "windows",
+            timezone.as_deref(),
+            None,
+            Some(high_cache_threshold),
+        );
+        if let Some(cached) = self
+            .read_admin_cache::<crate::anthropic::usage::UsageDashboardWindowsResponse>(&cache_key)
+        {
+            return Ok(cached);
+        }
+        let response = self
+            .usage_recorder
             .dashboard_windows(timezone.as_deref(), high_cache_threshold)
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(cache_key, response.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        Ok(response)
     }
 
     pub fn get_usage_dashboard_series(
         &self,
         timezone: Option<String>,
     ) -> Result<crate::anthropic::usage::UsageDashboardSeriesResponse, AdminServiceError> {
-        self.usage_recorder
+        let cache_key =
+            admin_usage_pg_dashboard_part_cache_key("series", timezone.as_deref(), None, None);
+        if let Some(cached) = self
+            .read_admin_cache::<crate::anthropic::usage::UsageDashboardSeriesResponse>(&cache_key)
+        {
+            return Ok(cached);
+        }
+        let response = self
+            .usage_recorder
             .dashboard_series(timezone.as_deref())
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(cache_key, response.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        Ok(response)
     }
 
     pub fn get_usage_dashboard_top(
         &self,
     ) -> Result<crate::anthropic::usage::UsageDashboardTopResponse, AdminServiceError> {
-        self.usage_recorder
+        let cache_key = admin_usage_pg_dashboard_part_cache_key("top", None, None, None);
+        if let Some(cached) =
+            self.read_admin_cache::<crate::anthropic::usage::UsageDashboardTopResponse>(&cache_key)
+        {
+            return Ok(cached);
+        }
+        let response = self
+            .usage_recorder
             .dashboard_top()
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(cache_key, response.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        Ok(response)
     }
 
     pub fn get_usage_dashboard_breakdown(
@@ -3564,9 +3770,25 @@ impl AdminService {
         timezone: Option<String>,
         window_key: String,
     ) -> Result<crate::anthropic::usage::UsageDashboardBreakdownResponse, AdminServiceError> {
-        self.usage_recorder
+        let cache_key = admin_usage_pg_dashboard_part_cache_key(
+            "breakdown",
+            timezone.as_deref(),
+            Some(&window_key),
+            None,
+        );
+        if let Some(cached) = self
+            .read_admin_cache::<crate::anthropic::usage::UsageDashboardBreakdownResponse>(
+                &cache_key,
+            )
+        {
+            return Ok(cached);
+        }
+        let response = self
+            .usage_recorder
             .dashboard_breakdown(timezone.as_deref(), &window_key)
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(cache_key, response.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        Ok(response)
     }
 
     pub fn get_usage_dashboard_external_pool_billing(
@@ -3575,9 +3797,25 @@ impl AdminService {
         window_key: String,
     ) -> Result<crate::anthropic::usage::UsageDashboardExternalPoolBillingResponse, AdminServiceError>
     {
-        self.usage_recorder
+        let cache_key = admin_usage_pg_dashboard_part_cache_key(
+            "external_pool_billing",
+            timezone.as_deref(),
+            Some(&window_key),
+            None,
+        );
+        if let Some(cached) = self
+            .read_admin_cache::<crate::anthropic::usage::UsageDashboardExternalPoolBillingResponse>(
+                &cache_key,
+            )
+        {
+            return Ok(cached);
+        }
+        let response = self
+            .usage_recorder
             .dashboard_external_pool_billing(timezone.as_deref(), &window_key)
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(cache_key, response.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        Ok(response)
     }
 
     /// 获取 usage 持久化 writer 状态。该状态只用于观测，不参与调度。
@@ -6667,6 +6905,7 @@ async fn invalidate_usage_admin_cache_after_cleanup(
     redis: &RedisStore,
     admin_cache_shadow: &Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
 ) {
+    invalidate_admin_cache_shadow(admin_cache_shadow, ADMIN_USAGE_PG_CACHE_PATTERN);
     invalidate_admin_cache_shadow(admin_cache_shadow, "admin_cache:usage:*");
     if let Err(err) = redis.del_pattern("admin_cache:usage:*").await {
         tracing::warn!("清理 Redis Admin usage 缓存失败: {}", err);

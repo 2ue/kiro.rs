@@ -51,6 +51,7 @@ FROM credential_runtime_state
 
 const CREDENTIAL_ID_SEQUENCE_LOCK_ID: i64 = 4_950_531_234_002;
 const POSTGRES_MIGRATION_LOCK_ID: i64 = 4_950_531_234_001;
+const USAGE_RECORD_ADVISORY_LOCK_DOMAIN: &[u8] = b"kiro-rs:usage-record-advisory-lock:v1\0";
 const USAGE_INDEX_STARTUP_MAX_BYTES: i64 = 64 * 1024 * 1024;
 
 struct UsageIndexDefinition {
@@ -2480,7 +2481,12 @@ impl PostgresStore {
         operation_id: Uuid,
     ) -> anyhow::Result<CredentialRuntimeStateRow> {
         Ok(self
-            .record_credential_success_with_expected_generation(credential_id, operation_id, None)
+            .record_credential_success_with_expected_generation(
+                credential_id,
+                operation_id,
+                None,
+                1,
+            )
             .await?
             .state)
     }
@@ -2491,10 +2497,27 @@ impl PostgresStore {
         operation_id: Uuid,
         expected_generation: u64,
     ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        self.record_credential_successes_at_generation(
+            credential_id,
+            operation_id,
+            expected_generation,
+            1,
+        )
+        .await
+    }
+
+    pub async fn record_credential_successes_at_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: u64,
+        success_count: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
         self.record_credential_success_with_expected_generation(
             credential_id,
             operation_id,
             Some(expected_generation),
+            success_count,
         )
         .await
     }
@@ -2504,51 +2527,91 @@ impl PostgresStore {
         credential_id: u64,
         operation_id: Uuid,
         expected_generation: Option<u64>,
+        success_count: u32,
     ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
-        let mut tx = self.pool.begin().await?;
-        let (next_revision, credential_disabled) = match prepare_credential_runtime_mutation(
-            &mut tx,
+        let mut connection = self.pool.acquire().await?;
+        self.record_credential_success_with_connection(
+            &mut connection,
             credential_id,
             operation_id,
-            "success",
             expected_generation,
+            success_count,
         )
-        .await?
-        {
-            CredentialRuntimeMutationPreparation::Apply {
-                next_revision,
-                credential_disabled,
-                ..
-            } => (next_revision, credential_disabled),
-            CredentialRuntimeMutationPreparation::Duplicate {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
+        .await
+    }
+
+    async fn record_credential_success_with_connection(
+        &self,
+        connection: &mut sqlx::pool::PoolConnection<Postgres>,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: Option<u64>,
+        success_count: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        if success_count == 0 {
+            anyhow::bail!("凭据成功 mutation 的 success_count 必须大于 0");
+        }
+        let success_count = i32::try_from(success_count).map_err(|_| {
+            anyhow::anyhow!("凭据成功 mutation 的 success_count 超出 PgSQL INTEGER 范围")
+        })?;
+        let mut tx = connection.begin().await?;
+        let (next_revision, mut credential_disabled, auto_disabled_by_api_failures) =
+            match prepare_credential_runtime_mutation(
+                &mut tx,
+                credential_id,
+                operation_id,
+                "success",
+                expected_generation,
+            )
+            .await?
+            {
+                CredentialRuntimeMutationPreparation::Apply {
+                    next_revision,
+                    credential_disabled,
+                    auto_disabled_by_api_failures,
+                    ..
+                } => (
+                    next_revision,
+                    credential_disabled,
+                    auto_disabled_by_api_failures,
+                ),
+                CredentialRuntimeMutationPreparation::Duplicate {
                     state,
                     credential_disabled,
-                    applied: true,
-                });
-            }
-            CredentialRuntimeMutationPreparation::Stale {
-                state,
-                credential_disabled,
-            } => {
-                tx.commit().await?;
-                return Ok(CredentialRuntimeStateMutationResult {
+                } => {
+                    let credential_auto_reenabled =
+                        !credential_disabled && state.disabled_reason.is_none();
+                    tx.commit().await?;
+                    return Ok(CredentialRuntimeStateMutationResult {
+                        state,
+                        credential_disabled,
+                        applied: true,
+                        credential_auto_reenabled,
+                    });
+                }
+                CredentialRuntimeMutationPreparation::Stale {
                     state,
                     credential_disabled,
-                    applied: false,
-                });
-            }
-        };
+                } => {
+                    tx.commit().await?;
+                    return Ok(CredentialRuntimeStateMutationResult {
+                        state,
+                        credential_disabled,
+                        applied: false,
+                        credential_auto_reenabled: false,
+                    });
+                }
+            };
         let row = sqlx::query(
             r#"
             UPDATE credential_runtime_state
             SET failure_count = 0,
                 refresh_failure_count = 0,
-                warmup_remaining = GREATEST(credential_runtime_state.warmup_remaining - 1, 0),
+                disabled_reason = CASE
+                    WHEN credential_runtime_state.disabled_reason = 'TooManyFailures' THEN NULL
+                    ELSE credential_runtime_state.disabled_reason
+                END,
+                warmup_remaining = GREATEST(credential_runtime_state.warmup_remaining - $2, 0),
                 revision = credential_runtime_state.revision + 1,
                 updated_at = now()
             WHERE credential_id = $1
@@ -2557,15 +2620,21 @@ impl PostgresStore {
             "#,
         )
         .bind(credential_id as i64)
+        .bind(success_count)
         .fetch_one(&mut *tx)
         .await?;
         let state = runtime_state_from_row(&row)?;
         verify_runtime_mutation_revision(&state, next_revision)?;
+        if auto_disabled_by_api_failures {
+            persist_credential_disabled_flag_in_tx(&mut tx, credential_id, false).await?;
+            credential_disabled = false;
+        }
         tx.commit().await?;
         Ok(CredentialRuntimeStateMutationResult {
             state,
             credential_disabled,
             applied: true,
+            credential_auto_reenabled: auto_disabled_by_api_failures,
         })
     }
 
@@ -2639,6 +2708,7 @@ impl PostgresStore {
                     state,
                     credential_disabled,
                     applied: true,
+                    credential_auto_reenabled: false,
                 });
             }
             CredentialRuntimeMutationPreparation::Stale {
@@ -2650,6 +2720,7 @@ impl PostgresStore {
                     state,
                     credential_disabled,
                     applied: false,
+                    credential_auto_reenabled: false,
                 });
             }
         };
@@ -2685,6 +2756,7 @@ impl PostgresStore {
             state,
             credential_disabled,
             applied: true,
+            credential_auto_reenabled: false,
         })
     }
 
@@ -2758,6 +2830,7 @@ impl PostgresStore {
                     state,
                     credential_disabled,
                     applied: true,
+                    credential_auto_reenabled: false,
                 });
             }
             CredentialRuntimeMutationPreparation::Stale {
@@ -2769,6 +2842,7 @@ impl PostgresStore {
                     state,
                     credential_disabled,
                     applied: false,
+                    credential_auto_reenabled: false,
                 });
             }
         };
@@ -2804,6 +2878,7 @@ impl PostgresStore {
             state,
             credential_disabled,
             applied: true,
+            credential_auto_reenabled: false,
         })
     }
 
@@ -2919,6 +2994,7 @@ impl PostgresStore {
                     next_revision,
                     current_generation,
                     credential_disabled,
+                    ..
                 } => (next_revision, current_generation, credential_disabled),
                 CredentialRuntimeMutationPreparation::Duplicate {
                     state,
@@ -2928,6 +3004,7 @@ impl PostgresStore {
                         state,
                         credential_disabled,
                         applied: true,
+                        credential_auto_reenabled: false,
                     });
                 }
                 CredentialRuntimeMutationPreparation::Stale {
@@ -2938,6 +3015,7 @@ impl PostgresStore {
                         state,
                         credential_disabled,
                         applied: false,
+                        credential_auto_reenabled: false,
                     });
                 }
             };
@@ -2993,6 +3071,7 @@ impl PostgresStore {
             state,
             credential_disabled,
             applied: true,
+            credential_auto_reenabled: false,
         })
     }
 
@@ -4000,6 +4079,7 @@ pub struct CredentialRuntimeStateMutationResult {
     pub state: CredentialRuntimeStateRow,
     pub credential_disabled: bool,
     pub applied: bool,
+    pub credential_auto_reenabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4089,6 +4169,7 @@ impl PostgresUsageStore {
         let records: Vec<UsageRecord> = records_by_id.into_values().collect();
         let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
         let mut tx = self.store.pool().begin().await?;
+        lock_usage_record_ids_in_tx(&mut tx, &ids).await?;
         let old_rows = sqlx::query("SELECT id, data FROM usage_records WHERE id = ANY($1)")
             .bind(&ids)
             .fetch_all(&mut *tx)
@@ -5149,6 +5230,51 @@ impl PostgresUsageStore {
     }
 }
 
+fn usage_record_advisory_lock_id(request_id: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(USAGE_RECORD_ADVISORY_LOCK_DOMAIN);
+    hasher.update(request_id.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest always contains eight bytes"),
+    )
+}
+
+async fn lock_usage_record_ids_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    request_ids: &[String],
+) -> anyhow::Result<()> {
+    let mut lock_ids = request_ids
+        .iter()
+        .map(|request_id| usage_record_advisory_lock_id(request_id))
+        .collect::<Vec<_>>();
+    lock_ids.sort_unstable();
+    lock_ids.dedup();
+    if lock_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Materialization makes the sorted acquisition order explicit before any lock is taken.
+    sqlx::query(
+        r#"
+        WITH ordered_lock_ids AS MATERIALIZED (
+            SELECT lock_id
+            FROM UNNEST($1::BIGINT[]) AS request_locks(lock_id)
+            ORDER BY lock_id
+        )
+        SELECT pg_advisory_xact_lock(lock_id)
+        FROM ordered_lock_ids
+        ORDER BY lock_id
+        "#,
+    )
+    .bind(&lock_ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
     if record.original_cost_usd != 0.0 {
         return;
@@ -5479,6 +5605,16 @@ struct UsageRollupBatchDelta {
     credential_summaries: HashMap<u64, CredentialUsageSummaryDelta>,
 }
 
+fn sorted_usage_rollup_entries<K, V>(entries: HashMap<K, V>) -> Vec<(K, V)>
+where
+    K: Ord,
+{
+    // Concurrent batches must acquire every rollup table's row locks in one key order.
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    entries
+}
+
 impl UsageRollupBatchDelta {
     fn add_record(&mut self, record: &UsageRecord, direction: i64) {
         let direction = if direction < 0 { -1 } else { 1 };
@@ -5521,7 +5657,7 @@ impl UsageRollupBatchDelta {
     }
 
     async fn apply(self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
-        for ((dimension, key), aggregate) in self.totals {
+        for ((dimension, key), aggregate) in sorted_usage_rollup_entries(self.totals) {
             let dimension = UsageRollupDimension {
                 dimension,
                 key,
@@ -5530,7 +5666,9 @@ impl UsageRollupBatchDelta {
             };
             upsert_usage_rollup_total(tx, &dimension, aggregate.metrics).await?;
         }
-        for ((bucket_start, dimension, key), aggregate) in self.time_buckets {
+        for ((bucket_start, dimension, key), aggregate) in
+            sorted_usage_rollup_entries(self.time_buckets)
+        {
             let dimension = UsageRollupDimension {
                 dimension,
                 key,
@@ -5540,16 +5678,20 @@ impl UsageRollupBatchDelta {
             upsert_usage_rollup_time_bucket(tx, bucket_start, &dimension, aggregate.metrics)
                 .await?;
         }
-        for (cache_read, requests) in self.cache_read_totals {
+        for (cache_read, requests) in sorted_usage_rollup_entries(self.cache_read_totals) {
             upsert_usage_cache_read_total(tx, cache_read, requests).await?;
         }
-        for ((bucket_start, cache_read), requests) in self.cache_read_time_buckets {
+        for ((bucket_start, cache_read), requests) in
+            sorted_usage_rollup_entries(self.cache_read_time_buckets)
+        {
             upsert_usage_cache_read_time_bucket(tx, bucket_start, cache_read, requests).await?;
         }
-        for ((bucket_start, duration_ms), requests) in self.duration_time_buckets {
+        for ((bucket_start, duration_ms), requests) in
+            sorted_usage_rollup_entries(self.duration_time_buckets)
+        {
             upsert_usage_duration_time_bucket(tx, bucket_start, duration_ms, requests).await?;
         }
-        for (credential_id, delta) in self.credential_summaries {
+        for (credential_id, delta) in sorted_usage_rollup_entries(self.credential_summaries) {
             upsert_credential_usage_summary_delta(tx, credential_id, delta).await?;
         }
         Ok(())
@@ -6519,6 +6661,7 @@ enum CredentialRuntimeMutationPreparation {
         next_revision: u64,
         current_generation: u64,
         credential_disabled: bool,
+        auto_disabled_by_api_failures: bool,
     },
     Duplicate {
         state: CredentialRuntimeStateRow,
@@ -6650,6 +6793,8 @@ async fn prepare_credential_runtime_mutation(
             next_revision,
             current_generation: state.generation,
             credential_disabled,
+            auto_disabled_by_api_failures: state.disabled_reason.as_deref()
+                == Some("TooManyFailures"),
         });
     }
 
@@ -7754,6 +7899,434 @@ mod tests {
             payload_breakdown: None,
             payload_guard_report: None,
         }
+    }
+
+    async fn install_delayed_usage_insert_trigger(store: &PostgresStore) {
+        sqlx::query(
+            r#"
+            CREATE FUNCTION test_delay_usage_record_insert()
+            RETURNS TRIGGER
+            AS $function$
+            BEGIN
+                PERFORM pg_sleep(0.15);
+                RETURN NEW;
+            END;
+            $function$
+            LANGUAGE plpgsql
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER test_delay_usage_record_insert
+            BEFORE INSERT ON usage_records
+            FOR EACH ROW
+            EXECUTE FUNCTION test_delay_usage_record_insert()
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn install_delayed_usage_rollup_update_trigger(store: &PostgresStore) {
+        sqlx::query(
+            r#"
+            CREATE FUNCTION test_delay_usage_rollup_total_update()
+            RETURNS TRIGGER
+            AS $function$
+            BEGIN
+                PERFORM pg_sleep(0.03);
+                RETURN NEW;
+            END;
+            $function$
+            LANGUAGE plpgsql
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER test_delay_usage_rollup_total_update
+            BEFORE UPDATE ON usage_rollup_totals
+            FOR EACH ROW
+            EXECUTE FUNCTION test_delay_usage_rollup_total_update()
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn record_usage_batches_concurrently(
+        usage_store: PostgresUsageStore,
+        first: Vec<UsageRecord>,
+        second: Vec<UsageRecord>,
+    ) {
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let first_start = start.clone();
+        let first_store = usage_store.clone();
+        let mut first_task = tokio::spawn(async move {
+            first_start.wait().await;
+            first_store.record_batch(first).await
+        });
+        let second_start = start.clone();
+        let second_store = usage_store.clone();
+        let mut second_task = tokio::spawn(async move {
+            second_start.wait().await;
+            second_store.record_batch(second).await
+        });
+
+        start.wait().await;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(&mut first_task, &mut second_task)
+        })
+        .await;
+        let (first_result, second_result) = match joined {
+            Ok(results) => results,
+            Err(_) => {
+                first_task.abort();
+                second_task.abort();
+                panic!("concurrent usage batches did not finish before the deadlock timeout");
+            }
+        };
+        first_result
+            .expect("first usage batch task should finish")
+            .expect("first usage batch should persist");
+        second_result
+            .expect("second usage batch task should finish")
+            .expect("second usage batch should persist");
+    }
+
+    async fn assert_core_usage_rollups_match_records(
+        store: &PostgresStore,
+        records: &[UsageRecord],
+    ) {
+        assert!(!records.is_empty());
+        let expected_record_count = records.len() as i64;
+        let ids = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        let matching_records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM usage_records WHERE id = ANY($1) AND deleted_at IS NULL",
+        )
+        .bind(&ids)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(matching_records, expected_record_count);
+        let all_records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM usage_records WHERE deleted_at IS NULL",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(all_records, expected_record_count);
+
+        let mut total_dimensions: HashMap<(&'static str, String), i64> = HashMap::new();
+        let mut time_dimensions: HashMap<(DateTime<Utc>, &'static str, String), i64> =
+            HashMap::new();
+        let mut cache_read_totals: HashMap<i32, i64> = HashMap::new();
+        let mut cache_read_time_buckets: HashMap<(DateTime<Utc>, i32), i64> = HashMap::new();
+        let mut duration_time_buckets: HashMap<(DateTime<Utc>, i32), i64> = HashMap::new();
+        let mut credential_summaries: HashMap<u64, i64> = HashMap::new();
+        for record in records {
+            let bucket_start = usage_rollup_bucket_start(parse_usage_created_at(record));
+            let mut dimensions = vec![
+                ("global", "all".to_string()),
+                ("status", usage_status_value(record.status).to_string()),
+                ("model", non_empty_or_unknown(&record.model)),
+            ];
+            if let Some(credential_id) = record.credential_id {
+                dimensions.push(("credential", credential_id.to_string()));
+                *credential_summaries.entry(credential_id).or_default() += 1;
+            }
+            for (dimension, key) in dimensions {
+                *total_dimensions
+                    .entry((dimension, key.clone()))
+                    .or_default() += 1;
+                *time_dimensions
+                    .entry((bucket_start, dimension, key))
+                    .or_default() += 1;
+            }
+
+            let cache_read = record.cache_read_input_tokens.max(0);
+            *cache_read_totals.entry(cache_read).or_default() += 1;
+            *cache_read_time_buckets
+                .entry((bucket_start, cache_read))
+                .or_default() += 1;
+            let duration_ms = record.duration_ms.min(i32::MAX as u64) as i32;
+            *duration_time_buckets
+                .entry((bucket_start, duration_ms))
+                .or_default() += 1;
+        }
+
+        for ((dimension, key), expected_requests) in total_dimensions {
+            let requests: i64 = sqlx::query_scalar(
+                "SELECT requests FROM usage_rollup_totals WHERE dimension = $1 AND dimension_key = $2",
+            )
+            .bind(dimension)
+            .bind(&key)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                requests, expected_requests,
+                "unexpected total rollup count for {dimension}/{key}"
+            );
+        }
+        for ((bucket_start, dimension, key), expected_requests) in time_dimensions {
+            let requests: i64 = sqlx::query_scalar(
+                r#"
+                SELECT requests
+                FROM usage_rollup_time_buckets
+                WHERE bucket_start = $1 AND dimension = $2 AND dimension_key = $3
+                "#,
+            )
+            .bind(bucket_start)
+            .bind(dimension)
+            .bind(&key)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                requests, expected_requests,
+                "unexpected hourly rollup count for {dimension}/{key}"
+            );
+        }
+        for (cache_read, expected_requests) in cache_read_totals {
+            let requests: i64 = sqlx::query_scalar(
+                "SELECT requests FROM usage_cache_read_totals WHERE cache_read_input_tokens = $1",
+            )
+            .bind(cache_read)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(requests, expected_requests);
+        }
+        for ((bucket_start, cache_read), expected_requests) in cache_read_time_buckets {
+            let requests: i64 = sqlx::query_scalar(
+                r#"
+                SELECT requests
+                FROM usage_cache_read_rollup_time_buckets
+                WHERE bucket_start = $1 AND cache_read_input_tokens = $2
+                "#,
+            )
+            .bind(bucket_start)
+            .bind(cache_read)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(requests, expected_requests);
+        }
+        for ((bucket_start, duration_ms), expected_requests) in duration_time_buckets {
+            let requests: i64 = sqlx::query_scalar(
+                r#"
+                SELECT requests
+                FROM usage_duration_rollup_time_buckets
+                WHERE bucket_start = $1 AND duration_ms = $2
+                "#,
+            )
+            .bind(bucket_start)
+            .bind(duration_ms)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(requests, expected_requests);
+        }
+        for (credential_id, expected_requests) in credential_summaries {
+            let requests: i64 = sqlx::query_scalar(
+                "SELECT requests FROM usage_credential_cost_summary WHERE credential_id = $1",
+            )
+            .bind(credential_id as i64)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(requests, expected_requests);
+        }
+    }
+
+    #[test]
+    fn usage_record_advisory_lock_id_is_stable_and_request_scoped() {
+        let first = usage_record_advisory_lock_id("usage-lock-a");
+        assert_eq!(first, 6_405_790_651_652_074_526);
+        assert_eq!(first, usage_record_advisory_lock_id("usage-lock-a"));
+        assert_ne!(first, usage_record_advisory_lock_id("usage-lock-b"));
+    }
+
+    #[test]
+    fn usage_rollup_entries_follow_complete_primary_key_order() {
+        fn assert_order<K>(expected: Vec<K>)
+        where
+            K: Clone + std::fmt::Debug + std::hash::Hash + Ord,
+        {
+            let ordered = |keys: Vec<K>| {
+                sorted_usage_rollup_entries(keys.into_iter().map(|key| (key, ())).collect())
+                    .into_iter()
+                    .map(|(key, ())| key)
+                    .collect::<Vec<_>>()
+            };
+
+            assert_eq!(ordered(expected.clone()), expected);
+            assert_eq!(ordered(expected.iter().cloned().rev().collect()), expected);
+        }
+
+        let first_hour = DateTime::parse_from_rfc3339("2026-07-18T02:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let second_hour = DateTime::parse_from_rfc3339("2026-07-18T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_order(vec![
+            ("credential", "19".to_string()),
+            ("credential", "7".to_string()),
+            ("global", "all".to_string()),
+            ("model", "alpha".to_string()),
+            ("model", "beta".to_string()),
+        ]);
+        assert_order(vec![
+            (first_hour.clone(), "global", "all".to_string()),
+            (first_hour.clone(), "model", "alpha".to_string()),
+            (first_hour.clone(), "model", "beta".to_string()),
+            (second_hour.clone(), "global", "all".to_string()),
+        ]);
+        assert_order(vec![7_i32, 19_i32, 29_i32]);
+        assert_order(vec![
+            (first_hour.clone(), 7_i32),
+            (first_hour.clone(), 19_i32),
+            (second_hour.clone(), 7_i32),
+        ]);
+        assert_order(vec![
+            (first_hour.clone(), 31_i32),
+            (first_hour, 47_i32),
+            (second_hour, 31_i32),
+        ]);
+        assert_order(vec![7_u64, 19_u64, 29_u64]);
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_record_batch_serializes_concurrent_first_write_and_retry() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        install_delayed_usage_insert_trigger(&store).await;
+        let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
+        let mut record = usage_record("usage-concurrent-first-write", 17);
+        record.created_at = "2026-07-18T02:15:00Z".to_string();
+        record.duration_ms = 41;
+
+        record_usage_batches_concurrently(
+            usage_store.clone(),
+            vec![record.clone()],
+            vec![record.clone()],
+        )
+        .await;
+        usage_store
+            .record_batch(vec![record.clone()])
+            .await
+            .unwrap();
+
+        assert_core_usage_rollups_match_records(&store, &[record]).await;
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_record_batch_reverse_order_does_not_deadlock_or_double_count() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        install_delayed_usage_insert_trigger(&store).await;
+        let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
+        let mut first = usage_record("usage-lock-order-a", 19);
+        first.created_at = "2026-07-18T03:10:00Z".to_string();
+        first.duration_ms = 43;
+        let mut second = usage_record("usage-lock-order-b", 29);
+        second.created_at = "2026-07-18T03:20:00Z".to_string();
+        second.duration_ms = 47;
+
+        record_usage_batches_concurrently(
+            usage_store,
+            vec![first.clone(), second.clone()],
+            vec![second.clone(), first.clone()],
+        )
+        .await;
+
+        assert_core_usage_rollups_match_records(&store, &[first, second]).await;
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_rollups_for_distinct_ids_use_one_lock_order() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
+
+        let mut seed_alpha = usage_record("usage-rollup-seed-alpha", 11);
+        seed_alpha.created_at = "2026-07-18T04:10:00Z".to_string();
+        seed_alpha.model = "model-alpha".to_string();
+        seed_alpha.conversation_id = Some("conversation-alpha".to_string());
+        seed_alpha.credential_id = Some(7);
+        seed_alpha.duration_ms = 31;
+        let mut seed_beta = usage_record("usage-rollup-seed-beta", 17);
+        seed_beta.created_at = "2026-07-18T04:20:00Z".to_string();
+        seed_beta.model = "model-beta".to_string();
+        seed_beta.conversation_id = Some("conversation-beta".to_string());
+        seed_beta.credential_id = Some(19);
+        seed_beta.duration_ms = 47;
+
+        usage_store
+            .record_batch(vec![seed_alpha.clone(), seed_beta.clone()])
+            .await
+            .unwrap();
+        install_delayed_usage_rollup_update_trigger(&store).await;
+
+        let mut first_alpha = seed_alpha.clone();
+        first_alpha.id = "usage-rollup-first-alpha".to_string();
+        let mut first_beta = seed_beta.clone();
+        first_beta.id = "usage-rollup-first-beta".to_string();
+        let mut second_alpha = seed_alpha.clone();
+        second_alpha.id = "usage-rollup-second-alpha".to_string();
+        let mut second_beta = seed_beta.clone();
+        second_beta.id = "usage-rollup-second-beta".to_string();
+
+        record_usage_batches_concurrently(
+            usage_store,
+            vec![first_alpha.clone(), first_beta.clone()],
+            vec![second_beta.clone(), second_alpha.clone()],
+        )
+        .await;
+
+        assert_core_usage_rollups_match_records(
+            &store,
+            &[
+                seed_alpha,
+                seed_beta,
+                first_alpha,
+                first_beta,
+                second_alpha,
+                second_beta,
+            ],
+        )
+        .await;
+        store.drop_test_schema().await.unwrap();
     }
 
     #[test]

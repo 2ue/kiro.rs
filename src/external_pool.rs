@@ -1,8 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -14,14 +14,17 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, stream::FuturesUnordered};
 use parking_lot::Mutex as SyncMutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
 use tokio::time::{Instant, timeout};
+use tokio::{
+    sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc},
+    task::JoinHandle,
+};
 
 use crate::{
     anthropic::{
@@ -52,9 +55,7 @@ use crate::{
             UsageSource,
         },
     },
-    kiro::token_manager::storage_task::{
-        block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
-    },
+    kiro::token_manager::storage_task::spawn_best_effort_storage_task,
     model::config::{
         ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode,
         ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
@@ -92,9 +93,20 @@ const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
 const EXTERNAL_POOL_QUEUE_LEASE_TTL_SECS: u64 = 60;
 const EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
 const EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
-const EXTERNAL_POOL_QUEUE_REDIS_RETRY_DELAY: Duration = Duration::from_millis(50);
-const EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS: usize = 2;
+const EXTERNAL_POOL_RELEASE_SUPERVISOR_CAPACITY: usize = 65_536;
+const EXTERNAL_POOL_RELEASE_BATCH_SIZE: usize = 256;
+const EXTERNAL_POOL_RELEASE_MAX_IN_FLIGHT_TARGETS: usize = 16;
+const EXTERNAL_POOL_RELEASE_RETRY_MIN: Duration = Duration::from_millis(250);
+const EXTERNAL_POOL_RELEASE_RETRY_MAX: Duration = Duration::from_secs(5);
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
+const EXTERNAL_POOL_DEFINITIONS_CACHE_FRESH_TTL: Duration = Duration::from_secs(1);
+const EXTERNAL_POOL_DEFINITIONS_STALE_IF_ERROR_TTL: Duration = Duration::from_secs(30 * 60);
+const EXTERNAL_POOL_DEFINITIONS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+const EXTERNAL_POOL_DEFINITIONS_NEGATIVE_CACHE_TTL: Duration = Duration::from_millis(250);
+const EXTERNAL_POOL_DEFINITIONS_REFRESH_RETRY_MAX: Duration = Duration::from_secs(5);
+const EXTERNAL_POOL_INVALIDATION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
+const EXTERNAL_POOL_INVALIDATION_RETRY_MIN: Duration = Duration::from_millis(250);
+const EXTERNAL_POOL_INVALIDATION_RETRY_MAX: Duration = Duration::from_secs(5);
 const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
 const EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
 const EXTERNAL_POOL_AUTO_DISABLE_REASONS: &[&str] = &[
@@ -104,6 +116,13 @@ const EXTERNAL_POOL_AUTO_DISABLE_REASONS: &[&str] = &[
     "misconfigured_endpoint",
     "channel_disabled",
 ];
+
+fn external_pool_definitions_refresh_retry_delay(failure_streak: u32) -> Duration {
+    let shift = failure_streak.saturating_sub(1).min(5);
+    EXTERNAL_POOL_DEFINITIONS_NEGATIVE_CACHE_TTL
+        .saturating_mul(1_u32 << shift)
+        .min(EXTERNAL_POOL_DEFINITIONS_REFRESH_RETRY_MAX)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -952,13 +971,31 @@ pub struct ExternalPoolManager {
     redis: Arc<RedisStore>,
     client: reqwest::Client,
     capacity_notify: Arc<Notify>,
+    release_supervisor: ExternalPoolReleaseSupervisor,
     availability_cache: Arc<SyncMutex<Option<CachedPoolAvailabilitySnapshot>>>,
+    availability_refresh_lock: Arc<TokioMutex<()>>,
+    availability_cache_epoch: Arc<AtomicU64>,
+    definitions_cache: Arc<SyncMutex<Option<CachedExternalPoolDefinitions>>>,
+    definitions_refresh_lock: Arc<TokioMutex<()>>,
+    definitions_refresh_in_flight: Arc<AtomicBool>,
+    definitions_cache_epoch: Arc<AtomicU64>,
+    external_admin_cache_epoch: Arc<AtomicU64>,
+    invalidation_publish_dirty: Arc<AtomicBool>,
+    invalidation_publish_notify: Arc<Notify>,
+    event_origin_id: Arc<str>,
+    #[cfg(test)]
+    definitions_test_probe: Arc<ExternalPoolDefinitionsTestProbe>,
+    #[cfg(test)]
+    availability_test_probe: Arc<ExternalPoolAvailabilityTestProbe>,
+    #[cfg(test)]
+    release_test_probe: Arc<ExternalPoolReleaseTestProbe>,
 }
 
 struct ExternalPoolLease {
     manager: ExternalPoolManager,
     pool_id: u64,
     lease_id: u64,
+    _release_registration: ExternalPoolReleaseRegistration,
 }
 
 impl ExternalPoolLease {
@@ -972,157 +1009,762 @@ impl ExternalPoolLease {
     }
 }
 
-impl Drop for ExternalPoolLease {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExternalPoolReleaseShutdownReport {
+    pub already_started: bool,
+    pub drained: bool,
+    pub timed_out: bool,
+    pub worker_failed: bool,
+    pub accepting: bool,
+    pub active: u64,
+    pub pending: u64,
+    pub reserved: u64,
+    pub enqueued: u64,
+    pub succeeded: u64,
+    pub batches: u64,
+    pub retries: u64,
+    pub failed_attempts: u64,
+    pub reservation_rejected: u64,
+    pub fatal_rejected: u64,
+    pub abandoned: u64,
+}
+
+enum ExternalPoolReleaseCommand {
+    Pool {
+        pool_id: u64,
+        lease_id: u64,
+        _permit: OwnedSemaphorePermit,
+    },
+    Queue {
+        lease_id: String,
+        _permit: OwnedSemaphorePermit,
+    },
+}
+
+enum ExternalPoolReleaseKind {
+    Pool { pool_id: u64, lease_id: u64 },
+    Queue { lease_id: String },
+}
+
+#[derive(Default)]
+struct ExternalPoolReleaseProgress {
+    active: AtomicU64,
+    pending: AtomicU64,
+    reserved: AtomicU64,
+    enqueued: AtomicU64,
+    succeeded: AtomicU64,
+    batches: AtomicU64,
+    retries: AtomicU64,
+    failed_attempts: AtomicU64,
+    reservation_rejected: AtomicU64,
+    fatal_rejected: AtomicU64,
+    permanently_abandoned: AtomicU64,
+    worker_failed: AtomicBool,
+    changed: Notify,
+}
+
+struct ExternalPoolReleaseLifecycle {
+    accepting: bool,
+    sender: Option<mpsc::Sender<ExternalPoolReleaseCommand>>,
+}
+
+struct ExternalPoolReleaseSupervisorInner {
+    lifecycle: SyncMutex<ExternalPoolReleaseLifecycle>,
+    permits: Arc<Semaphore>,
+    progress: Arc<ExternalPoolReleaseProgress>,
+    worker: SyncMutex<Option<JoinHandle<()>>>,
+    shutdown_started: AtomicBool,
+    shutdown_complete: AtomicBool,
+    shutdown_timed_out: AtomicBool,
+    shutdown_changed: Notify,
+}
+
+impl Drop for ExternalPoolReleaseSupervisorInner {
     fn drop(&mut self) {
-        release_external_pool_lease_reliably(self.manager.clone(), self.pool_id, self.lease_id);
+        if let Some(worker) = self.worker.get_mut().take() {
+            worker.abort();
+        }
     }
 }
 
-async fn release_external_pool_lease_with_retry(
-    manager: ExternalPoolManager,
-    pool_id: u64,
-    lease_id: u64,
-    attempts: usize,
-) -> anyhow::Result<()> {
-    let attempts = attempts.max(1);
-    let mut last_error = None;
-    for attempt in 0..attempts {
-        match timeout(
-            EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
-            manager.release_pool(pool_id, lease_id),
-        )
-        .await
-        {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(err)) => last_error = Some(err),
+#[derive(Clone)]
+struct ExternalPoolReleaseSupervisor {
+    inner: Arc<ExternalPoolReleaseSupervisorInner>,
+}
+
+impl ExternalPoolReleaseSupervisor {
+    fn new(
+        redis: Arc<RedisStore>,
+        capacity_notify: Arc<Notify>,
+        capacity: usize,
+        #[cfg(test)] test_probe: Arc<ExternalPoolReleaseTestProbe>,
+    ) -> Self {
+        let capacity = capacity.max(1);
+        let (sender, receiver) = mpsc::channel(capacity);
+        let progress = Arc::new(ExternalPoolReleaseProgress::default());
+        let worker = tokio::spawn(external_pool_release_worker(
+            redis,
+            capacity_notify,
+            receiver,
+            progress.clone(),
+            #[cfg(test)]
+            test_probe,
+        ));
+        Self {
+            inner: Arc::new(ExternalPoolReleaseSupervisorInner {
+                lifecycle: SyncMutex::new(ExternalPoolReleaseLifecycle {
+                    accepting: true,
+                    sender: Some(sender),
+                }),
+                permits: Arc::new(Semaphore::new(capacity)),
+                progress,
+                worker: SyncMutex::new(Some(worker)),
+                shutdown_started: AtomicBool::new(false),
+                shutdown_complete: AtomicBool::new(false),
+                shutdown_timed_out: AtomicBool::new(false),
+                shutdown_changed: Notify::new(),
+            }),
+        }
+    }
+
+    fn try_reserve(
+        &self,
+        kind: ExternalPoolReleaseKind,
+    ) -> Result<ExternalPoolReleaseRegistration, &'static str> {
+        let lifecycle = self.inner.lifecycle.lock();
+        if !lifecycle.accepting {
+            self.inner
+                .progress
+                .reservation_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Err("release_supervisor_closed");
+        }
+        let permit = match self.inner.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
             Err(_) => {
-                last_error = Some(anyhow::anyhow!(
-                    "Redis external pool lease release timed out after {}ms",
-                    EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT.as_millis()
-                ));
+                self.inner
+                    .progress
+                    .reservation_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err("release_supervisor_capacity");
             }
-        }
-        if attempt + 1 < attempts {
-            tokio::time::sleep(EXTERNAL_POOL_QUEUE_REDIS_RETRY_DELAY).await;
-        }
+        };
+        self.inner.progress.active.fetch_add(1, Ordering::AcqRel);
+        self.inner.progress.reserved.fetch_add(1, Ordering::Relaxed);
+        Ok(ExternalPoolReleaseRegistration {
+            supervisor: self.clone(),
+            kind: Some(kind),
+            permit: Some(permit),
+        })
     }
-    Err(anyhow::anyhow!(
-        "external pool lease will be reclaimed by its TTL: {}",
-        last_error.expect("at least one external pool lease release attempt must run")
-    ))
-}
 
-fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u64, lease_id: u64) {
-    let fallback_manager = manager.clone();
-    let admitted = spawn_critical_storage_task("释放外部池 Redis 并发 lease", async move {
-        release_external_pool_lease_with_retry(
-            manager,
-            pool_id,
-            lease_id,
-            EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS,
-        )
-        .await
-    });
-    if admitted {
-        return;
-    }
-    if let Err(err) = block_on_storage(
-        "关键队列拒绝后同步释放外部池 Redis 并发 lease",
-        async move {
-            release_external_pool_lease_with_retry(
-                fallback_manager,
-                pool_id,
+    fn enqueue(&self, kind: ExternalPoolReleaseKind, permit: OwnedSemaphorePermit) {
+        let command = match kind {
+            ExternalPoolReleaseKind::Pool { pool_id, lease_id } => {
+                ExternalPoolReleaseCommand::Pool {
+                    pool_id,
+                    lease_id,
+                    _permit: permit,
+                }
+            }
+            ExternalPoolReleaseKind::Queue { lease_id } => ExternalPoolReleaseCommand::Queue {
                 lease_id,
-                EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS,
-            )
-            .await
-        },
-    ) {
-        tracing::error!(
-            pool_id,
-            lease_id,
-            "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
+                _permit: permit,
+            },
+        };
+        let lifecycle = self.inner.lifecycle.lock();
+        self.inner.progress.pending.fetch_add(1, Ordering::AcqRel);
+        let submitted = match lifecycle.sender.as_ref() {
+            Some(sender) => sender.try_send(command).map_err(|err| err.into_inner()),
+            None => Err(command),
+        };
+        match submitted {
+            Ok(()) => {
+                self.inner.progress.enqueued.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(command) => {
+                self.inner.progress.pending.fetch_sub(1, Ordering::AcqRel);
+                let fatal = self
+                    .inner
+                    .progress
+                    .fatal_rejected
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                self.inner
+                    .progress
+                    .permanently_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+                drop(command);
+                if fatal == 1 || fatal.is_power_of_two() {
+                    tracing::error!(
+                        fatal_rejected = fatal,
+                        "外部池 lease 释放监督器违反容量或关闭不变量，远端 lease 未确认释放"
+                    );
+                }
+            }
+        }
+        let previous = self.inner.progress.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "external release active reservation underflow"
         );
+        self.inner.progress.changed.notify_waiters();
     }
-}
 
-async fn release_external_pool_queue_lease_with_retry(
-    manager: ExternalPoolManager,
-    lease_id: String,
-    attempts: usize,
-) -> anyhow::Result<()> {
-    let attempts = attempts.max(1);
-    let mut last_error = None;
-    for attempt in 0..attempts {
-        match timeout(
-            EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
-            manager.redis.leave_external_pool_dispatch_queue(&lease_id),
-        )
-        .await
+    fn cancel_reservation(&self) {
+        let previous = self.inner.progress.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous > 0,
+            "external release active reservation underflow"
+        );
+        self.inner.progress.changed.notify_waiters();
+    }
+
+    async fn wait_for_progress(&self, require_pending_empty: bool) {
+        loop {
+            let changed = self.inner.progress.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let active = self.inner.progress.active.load(Ordering::Acquire);
+            let pending = self.inner.progress.pending.load(Ordering::Acquire);
+            if active == 0 && (!require_pending_empty || pending == 0) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_for_shutdown(&self) {
+        loop {
+            let changed = self.inner.shutdown_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.inner.shutdown_complete.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn drain(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.wait_for_progress(true))
+            .await
+            .is_ok()
+    }
+
+    async fn shutdown(&self, timeout: Duration) -> ExternalPoolReleaseShutdownReport {
+        let wait_deadline = Instant::now() + timeout;
+        let already_started = self
+            .inner
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err();
+        if !already_started {
+            {
+                let mut lifecycle = self.inner.lifecycle.lock();
+                lifecycle.accepting = false;
+            }
+            let shutdown_driver = self.clone();
+            tokio::spawn(async move {
+                shutdown_driver.drive_shutdown(wait_deadline).await;
+            });
+        }
+
+        let wait_timed_out = tokio::time::timeout_at(wait_deadline, self.wait_for_shutdown())
+            .await
+            .is_err();
+        self.shutdown_report(already_started, wait_timed_out)
+    }
+
+    async fn drive_shutdown(&self, deadline: Instant) {
+        let active_timed_out = tokio::time::timeout_at(deadline, self.wait_for_progress(false))
+            .await
+            .is_err();
         {
-            Ok(Ok(_)) => {
-                manager.capacity_notify.notify_waiters();
-                return Ok(());
-            }
-            Ok(Err(err)) => last_error = Some(err),
-            Err(_) => {
-                last_error = Some(anyhow::anyhow!(
-                    "Redis external pool queue release timed out after {}ms",
-                    EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT.as_millis()
-                ));
+            let mut lifecycle = self.inner.lifecycle.lock();
+            lifecycle.sender.take();
+        }
+
+        let mut worker_timed_out = false;
+        let worker = { self.inner.worker.lock().take() };
+        if let Some(mut worker) = worker {
+            if active_timed_out {
+                worker.abort();
+                let _ = worker.await;
+            } else {
+                match tokio::time::timeout_at(deadline, &mut worker).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if !err.is_cancelled() {
+                            self.inner
+                                .progress
+                                .worker_failed
+                                .store(true, Ordering::Release);
+                            tracing::error!("外部池 lease 释放 worker 异常退出: {}", err);
+                        }
+                    }
+                    Err(_) => {
+                        worker_timed_out = true;
+                        worker.abort();
+                        let _ = worker.await;
+                    }
+                }
             }
         }
-        if attempt + 1 < attempts {
-            tokio::time::sleep(EXTERNAL_POOL_QUEUE_REDIS_RETRY_DELAY).await;
+        let timed_out = active_timed_out || worker_timed_out;
+        self.inner
+            .shutdown_timed_out
+            .store(timed_out, Ordering::Release);
+        self.inner.shutdown_complete.store(true, Ordering::Release);
+        self.inner.shutdown_changed.notify_waiters();
+    }
+
+    fn shutdown_report(
+        &self,
+        already_started: bool,
+        wait_timed_out: bool,
+    ) -> ExternalPoolReleaseShutdownReport {
+        let progress = &self.inner.progress;
+        let active = progress.active.load(Ordering::Acquire);
+        let pending = progress.pending.load(Ordering::Acquire);
+        let fatal_rejected = progress.fatal_rejected.load(Ordering::Acquire);
+        let abandoned = progress
+            .permanently_abandoned
+            .load(Ordering::Acquire)
+            .saturating_add(active)
+            .saturating_add(pending);
+        let worker_failed = progress.worker_failed.load(Ordering::Acquire);
+        let timed_out = wait_timed_out || self.inner.shutdown_timed_out.load(Ordering::Acquire);
+        ExternalPoolReleaseShutdownReport {
+            already_started,
+            drained: self.inner.shutdown_complete.load(Ordering::Acquire)
+                && !timed_out
+                && !worker_failed
+                && fatal_rejected == 0
+                && abandoned == 0,
+            timed_out,
+            worker_failed,
+            accepting: self.inner.lifecycle.lock().accepting,
+            active,
+            pending,
+            reserved: progress.reserved.load(Ordering::Acquire),
+            enqueued: progress.enqueued.load(Ordering::Acquire),
+            succeeded: progress.succeeded.load(Ordering::Acquire),
+            batches: progress.batches.load(Ordering::Acquire),
+            retries: progress.retries.load(Ordering::Acquire),
+            failed_attempts: progress.failed_attempts.load(Ordering::Acquire),
+            reservation_rejected: progress.reservation_rejected.load(Ordering::Acquire),
+            fatal_rejected,
+            abandoned,
         }
     }
-    Err(last_error.expect("at least one external pool queue release attempt must run"))
 }
 
-fn release_external_pool_queue_lease_reliably(manager: ExternalPoolManager, lease_id: String) {
-    let fallback_manager = manager.clone();
-    let fallback_lease_id = lease_id.clone();
-    let admitted = spawn_critical_storage_task("释放外部池 Redis 调度排队 lease", async move {
-        release_external_pool_queue_lease_with_retry(manager, lease_id, 2).await
-    });
-    if admitted {
+struct ExternalPoolReleaseRegistration {
+    supervisor: ExternalPoolReleaseSupervisor,
+    kind: Option<ExternalPoolReleaseKind>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ExternalPoolReleaseRegistration {
+    fn disarm(mut self) {
+        if self.kind.take().is_some() {
+            self.supervisor.cancel_reservation();
+        }
+        drop(self.permit.take());
+    }
+}
+
+impl Drop for ExternalPoolReleaseRegistration {
+    fn drop(&mut self) {
+        let Some(kind) = self.kind.take() else {
+            return;
+        };
+        let permit = self
+            .permit
+            .take()
+            .expect("armed external release registration must own a permit");
+        self.supervisor.enqueue(kind, permit);
+    }
+}
+
+fn external_pool_release_retry_delay(retries: u32) -> Duration {
+    EXTERNAL_POOL_RELEASE_RETRY_MIN
+        .saturating_mul(1_u32 << retries.min(4))
+        .min(EXTERNAL_POOL_RELEASE_RETRY_MAX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ExternalPoolReleaseTarget {
+    Pool(u64),
+    Queue,
+}
+
+impl ExternalPoolReleaseCommand {
+    fn target(&self) -> ExternalPoolReleaseTarget {
+        match self {
+            Self::Pool { pool_id, .. } => ExternalPoolReleaseTarget::Pool(*pool_id),
+            Self::Queue { .. } => ExternalPoolReleaseTarget::Queue,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExternalPoolPendingReleaseState {
+    Ready,
+    WaitingForInFlight,
+    ScheduledRetry,
+}
+
+struct ExternalPoolPendingReleaseGroup {
+    commands: Vec<ExternalPoolReleaseCommand>,
+    retry_streak: u32,
+    state: ExternalPoolPendingReleaseState,
+}
+
+struct ExternalPoolReleaseAttemptResult {
+    target: ExternalPoolReleaseTarget,
+    commands: Vec<ExternalPoolReleaseCommand>,
+    retry_streak: u32,
+    succeeded: bool,
+}
+
+async fn external_pool_release_worker(
+    redis: Arc<RedisStore>,
+    capacity_notify: Arc<Notify>,
+    mut receiver: mpsc::Receiver<ExternalPoolReleaseCommand>,
+    progress: Arc<ExternalPoolReleaseProgress>,
+    #[cfg(test)] test_probe: Arc<ExternalPoolReleaseTestProbe>,
+) {
+    let mut receiver_open = true;
+    let mut pending = BTreeMap::<ExternalPoolReleaseTarget, ExternalPoolPendingReleaseGroup>::new();
+    let mut ready = VecDeque::<ExternalPoolReleaseTarget>::new();
+    let mut retry_schedule = BTreeMap::<(Instant, u64), ExternalPoolReleaseTarget>::new();
+    let mut next_retry_order = 0_u64;
+    let mut in_flight = HashSet::<ExternalPoolReleaseTarget>::new();
+    let mut attempts = FuturesUnordered::new();
+
+    loop {
+        let now = Instant::now();
+        for _ in 0..EXTERNAL_POOL_RELEASE_MAX_IN_FLIGHT_TARGETS {
+            let Some((retry_key, target)) = retry_schedule
+                .first_key_value()
+                .map(|(retry_key, target)| (*retry_key, *target))
+            else {
+                break;
+            };
+            if retry_key.0 > now {
+                break;
+            }
+            retry_schedule.remove(&retry_key);
+            let group = pending
+                .get_mut(&target)
+                .expect("scheduled external release target must remain pending");
+            debug_assert!(matches!(
+                group.state,
+                ExternalPoolPendingReleaseState::ScheduledRetry
+            ));
+            group.state = ExternalPoolPendingReleaseState::Ready;
+            ready.push_back(target);
+        }
+
+        while attempts.len() < EXTERNAL_POOL_RELEASE_MAX_IN_FLIGHT_TARGETS {
+            let Some(target) = ready.pop_front() else {
+                break;
+            };
+            let Some(mut group) = pending.remove(&target) else {
+                debug_assert!(false, "ready external release target must remain pending");
+                continue;
+            };
+            debug_assert!(matches!(
+                group.state,
+                ExternalPoolPendingReleaseState::Ready
+            ));
+
+            let remainder = if group.commands.len() > EXTERNAL_POOL_RELEASE_BATCH_SIZE {
+                Some(group.commands.split_off(EXTERNAL_POOL_RELEASE_BATCH_SIZE))
+            } else {
+                None
+            };
+            if let Some(commands) = remainder {
+                pending.insert(
+                    target,
+                    ExternalPoolPendingReleaseGroup {
+                        commands,
+                        retry_streak: group.retry_streak,
+                        state: ExternalPoolPendingReleaseState::WaitingForInFlight,
+                    },
+                );
+            }
+            let inserted = in_flight.insert(target);
+            debug_assert!(inserted, "external release target must be serialized");
+            progress.batches.fetch_add(1, Ordering::Relaxed);
+            attempts.push(release_external_pool_target_attempt(
+                redis.clone(),
+                target,
+                group.commands,
+                group.retry_streak,
+                #[cfg(test)]
+                test_probe.clone(),
+            ));
+        }
+
+        if !receiver_open && pending.is_empty() && attempts.is_empty() {
+            break;
+        }
+
+        let next_retry_at = (attempts.len() < EXTERNAL_POOL_RELEASE_MAX_IN_FLIGHT_TARGETS
+            && ready.is_empty())
+        .then(|| {
+            retry_schedule
+                .first_key_value()
+                .map(|((retry_at, _), _)| *retry_at)
+        })
+        .flatten();
+        tokio::select! {
+            result = attempts.next(), if !attempts.is_empty() => {
+                let result = result.expect("non-empty external release attempt set must yield");
+                let removed = in_flight.remove(&result.target);
+                debug_assert!(removed, "completed external release target must be in flight");
+                if result.succeeded {
+                    complete_external_pool_release_commands(&progress, result.commands);
+                    capacity_notify.notify_waiters();
+                    if let Some(group) = pending.get_mut(&result.target) {
+                        debug_assert!(matches!(
+                            group.state,
+                            ExternalPoolPendingReleaseState::WaitingForInFlight
+                        ));
+                        group.retry_streak = 0;
+                        group.state = ExternalPoolPendingReleaseState::Ready;
+                        ready.push_back(result.target);
+                    }
+                } else {
+                    progress.failed_attempts.fetch_add(1, Ordering::Relaxed);
+                    progress.retries.fetch_add(1, Ordering::Relaxed);
+                    let mut commands = result.commands;
+                    if let Some(mut waiting) = pending.remove(&result.target) {
+                        debug_assert!(matches!(
+                            waiting.state,
+                            ExternalPoolPendingReleaseState::WaitingForInFlight
+                        ));
+                        commands.append(&mut waiting.commands);
+                    }
+                    let retry_at = Instant::now()
+                        + external_pool_release_retry_delay(result.retry_streak);
+                    let retry_key = (retry_at, next_retry_order);
+                    next_retry_order = next_retry_order.wrapping_add(1);
+                    pending.insert(
+                        result.target,
+                        ExternalPoolPendingReleaseGroup {
+                            commands,
+                            retry_streak: result.retry_streak.saturating_add(1),
+                            state: ExternalPoolPendingReleaseState::ScheduledRetry,
+                        },
+                    );
+                    let replaced = retry_schedule.insert(retry_key, result.target);
+                    debug_assert!(replaced.is_none(), "external release retry key must be unique");
+                }
+            }
+            command = receiver.recv(), if receiver_open => {
+                match command {
+                    Some(command) => {
+                        tokio::task::yield_now().await;
+                        enqueue_external_pool_release_command(
+                            command,
+                            &mut pending,
+                            &mut ready,
+                            &in_flight,
+                        );
+                        for _ in 1..EXTERNAL_POOL_RELEASE_BATCH_SIZE {
+                            match receiver.try_recv() {
+                                Ok(command) => enqueue_external_pool_release_command(
+                                    command,
+                                    &mut pending,
+                                    &mut ready,
+                                    &in_flight,
+                                ),
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    receiver_open = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => receiver_open = false,
+                }
+            }
+            _ = wait_for_external_pool_release_retry(next_retry_at) => {}
+        }
+    }
+}
+
+fn enqueue_external_pool_release_command(
+    command: ExternalPoolReleaseCommand,
+    pending: &mut BTreeMap<ExternalPoolReleaseTarget, ExternalPoolPendingReleaseGroup>,
+    ready: &mut VecDeque<ExternalPoolReleaseTarget>,
+    in_flight: &HashSet<ExternalPoolReleaseTarget>,
+) {
+    let target = command.target();
+    if let Some(group) = pending.get_mut(&target) {
+        group.commands.push(command);
         return;
     }
-    if let Err(err) = block_on_storage(
-        "关键队列拒绝后同步释放外部池 Redis 调度排队 lease",
-        async move {
-            release_external_pool_queue_lease_with_retry(fallback_manager, fallback_lease_id, 2)
-                .await
+    let state = if in_flight.contains(&target) {
+        ExternalPoolPendingReleaseState::WaitingForInFlight
+    } else {
+        ready.push_back(target);
+        ExternalPoolPendingReleaseState::Ready
+    };
+    pending.insert(
+        target,
+        ExternalPoolPendingReleaseGroup {
+            commands: vec![command],
+            retry_streak: 0,
+            state,
         },
-    ) {
-        tracing::error!(
-            "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
-        );
+    );
+}
+
+async fn wait_for_external_pool_release_retry(next_retry_at: Option<Instant>) {
+    match next_retry_at {
+        Some(retry_at) => tokio::time::sleep_until(retry_at).await,
+        None => std::future::pending::<()>().await,
     }
+}
+
+async fn release_external_pool_target_attempt(
+    redis: Arc<RedisStore>,
+    target: ExternalPoolReleaseTarget,
+    commands: Vec<ExternalPoolReleaseCommand>,
+    retry_streak: u32,
+    #[cfg(test)] test_probe: Arc<ExternalPoolReleaseTestProbe>,
+) -> ExternalPoolReleaseAttemptResult {
+    #[cfg(test)]
+    let forced_failure = test_probe.before_release_attempt(target).await;
+    #[cfg(not(test))]
+    let forced_failure = false;
+
+    let succeeded = if forced_failure {
+        false
+    } else if let ExternalPoolReleaseTarget::Pool(pool_id) = target {
+        let lease_ids = commands
+            .iter()
+            .filter_map(|command| match command {
+                ExternalPoolReleaseCommand::Pool { lease_id, .. } => Some(*lease_id),
+                ExternalPoolReleaseCommand::Queue { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let result = timeout(
+            EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
+            redis.release_external_pool_leases(pool_id, &lease_ids),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    pool_id,
+                    count = commands.len(),
+                    "批量释放外部池 Redis 并发 lease 失败: {}",
+                    err
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pool_id,
+                    count = commands.len(),
+                    timeout_ms = EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT.as_millis() as u64,
+                    "批量释放外部池 Redis 并发 lease 超时"
+                );
+                false
+            }
+        }
+    } else {
+        let lease_ids = commands
+            .iter()
+            .filter_map(|command| match command {
+                ExternalPoolReleaseCommand::Queue { lease_id, .. } => Some(lease_id.as_str()),
+                ExternalPoolReleaseCommand::Pool { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let result = timeout(
+            EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
+            redis.leave_external_pool_dispatch_queue_leases(&lease_ids),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    count = commands.len(),
+                    "批量释放外部池 Redis 调度排队 lease 失败: {}",
+                    err
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    count = commands.len(),
+                    timeout_ms = EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT.as_millis() as u64,
+                    "批量释放外部池 Redis 调度排队 lease 超时"
+                );
+                false
+            }
+        }
+    };
+
+    ExternalPoolReleaseAttemptResult {
+        target,
+        commands,
+        retry_streak,
+        succeeded,
+    }
+}
+
+fn complete_external_pool_release_commands(
+    progress: &ExternalPoolReleaseProgress,
+    commands: Vec<ExternalPoolReleaseCommand>,
+) {
+    let completed = commands.len() as u64;
+    drop(commands);
+    progress.succeeded.fetch_add(completed, Ordering::Relaxed);
+    let previous = progress.pending.fetch_sub(completed, Ordering::AcqRel);
+    debug_assert!(
+        previous >= completed,
+        "external release pending count underflow"
+    );
+    progress.changed.notify_waiters();
 }
 
 struct ExternalPoolQueueGuard {
     manager: ExternalPoolManager,
     lease_id: String,
     next_renew_at: Instant,
-    released: bool,
+    release_registration: Option<ExternalPoolReleaseRegistration>,
 }
 
 impl ExternalPoolQueueGuard {
-    fn new(manager: ExternalPoolManager, lease_id: String) -> Self {
+    fn new(
+        manager: ExternalPoolManager,
+        lease_id: String,
+        release_registration: ExternalPoolReleaseRegistration,
+    ) -> Self {
         Self {
             manager,
             lease_id,
             next_renew_at: Instant::now()
                 + Duration::from_secs(EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_SECS),
-            released: false,
+            release_registration: Some(release_registration),
         }
     }
 
     fn disarm(mut self) {
-        self.released = true;
+        if let Some(registration) = self.release_registration.take() {
+            registration.disarm();
+        }
     }
 
     async fn renew_if_needed(&mut self) -> anyhow::Result<()> {
@@ -1152,11 +1794,7 @@ impl ExternalPoolQueueGuard {
     }
 
     fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        release_external_pool_queue_lease_reliably(self.manager.clone(), self.lease_id.clone());
+        drop(self.release_registration.take());
     }
 }
 
@@ -1266,11 +1904,122 @@ struct CachedPoolAvailabilitySnapshot {
     expires_at: Instant,
 }
 
-impl PoolAvailabilitySnapshot {
-    fn has_eligible_pool(&self) -> bool {
-        self.eligible_pools > 0
-    }
+#[derive(Debug, Clone)]
+struct CachedExternalPoolDefinitions {
+    pools: Vec<ExternalPool>,
+    fresh_until: Instant,
+    stale_if_error_until: Instant,
+    authoritative: bool,
+    refresh_failure_streak: u32,
+    refresh_retry_at: Option<Instant>,
+}
 
+#[cfg(test)]
+#[derive(Default)]
+struct ExternalPoolDefinitionsTestProbe {
+    query_attempts: AtomicU64,
+    fail_next_query: AtomicBool,
+    next_after_fetch_gate: SyncMutex<Option<ExternalPoolDefinitionsAfterFetchGate>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ExternalPoolDefinitionsAfterFetchGate {
+    fetched: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ExternalPoolAvailabilityTestProbe {
+    next_after_scan_gate: SyncMutex<Option<ExternalPoolAvailabilityAfterScanGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ExternalPoolReleaseTestProbe {
+    force_release_failure: AtomicBool,
+    force_pool_release_failures: SyncMutex<HashSet<u64>>,
+    force_queue_release_failure: AtomicBool,
+    release_attempts: AtomicU64,
+    pool_release_attempts: SyncMutex<BTreeMap<u64, u64>>,
+    queue_release_attempts: AtomicU64,
+    pool_release_attempt_gates: SyncMutex<BTreeMap<u64, ExternalPoolReleaseAttemptGate>>,
+    changed: Notify,
+    after_pool_acquire_gate: SyncMutex<Option<ExternalPoolReleaseAfterAcquireGate>>,
+}
+
+#[cfg(test)]
+impl ExternalPoolReleaseTestProbe {
+    async fn before_release_attempt(&self, target: ExternalPoolReleaseTarget) -> bool {
+        self.release_attempts.fetch_add(1, Ordering::Release);
+        let gate = match target {
+            ExternalPoolReleaseTarget::Pool(pool_id) => {
+                *self
+                    .pool_release_attempts
+                    .lock()
+                    .entry(pool_id)
+                    .or_default() += 1;
+                self.pool_release_attempt_gates
+                    .lock()
+                    .get(&pool_id)
+                    .cloned()
+            }
+            ExternalPoolReleaseTarget::Queue => {
+                self.queue_release_attempts.fetch_add(1, Ordering::Release);
+                None
+            }
+        };
+        self.changed.notify_waiters();
+        if let Some(gate) = gate {
+            gate.entered.wait().await;
+            gate.resume.wait().await;
+        }
+
+        self.force_release_failure.load(Ordering::Acquire)
+            || match target {
+                ExternalPoolReleaseTarget::Pool(pool_id) => {
+                    self.force_pool_release_failures.lock().contains(&pool_id)
+                }
+                ExternalPoolReleaseTarget::Queue => {
+                    self.force_queue_release_failure.load(Ordering::Acquire)
+                }
+            }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ExternalPoolReleaseAttemptGate {
+    entered: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ExternalPoolReleaseAfterAcquireGate {
+    acquired: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ExternalPoolAvailabilityAfterScanGate {
+    scanned: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+struct ExternalPoolDefinitionsRefreshGuard {
+    in_flight: Arc<AtomicBool>,
+}
+
+impl Drop for ExternalPoolDefinitionsRefreshGuard {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
+
+impl PoolAvailabilitySnapshot {
     fn has_temporary_unavailable_pool(&self) -> bool {
         self.temporary_unavailable_pools > 0
     }
@@ -1416,14 +2165,348 @@ fn direct_external_policy_static_reason(
 
 impl ExternalPoolManager {
     pub fn new(postgres: Arc<PostgresStore>, redis: Arc<RedisStore>) -> Self {
+        Self::new_with_release_capacity(postgres, redis, EXTERNAL_POOL_RELEASE_SUPERVISOR_CAPACITY)
+    }
+
+    #[cfg(test)]
+    fn new_with_test_release_capacity(
+        postgres: Arc<PostgresStore>,
+        redis: Arc<RedisStore>,
+        release_capacity: usize,
+    ) -> Self {
+        Self::new_with_release_capacity(postgres, redis, release_capacity)
+    }
+
+    fn new_with_release_capacity(
+        postgres: Arc<PostgresStore>,
+        redis: Arc<RedisStore>,
+        release_capacity: usize,
+    ) -> Self {
+        let capacity_notify = Arc::new(Notify::new());
+        #[cfg(test)]
+        let release_test_probe = Arc::new(ExternalPoolReleaseTestProbe::default());
+        let release_supervisor = ExternalPoolReleaseSupervisor::new(
+            redis.clone(),
+            capacity_notify.clone(),
+            release_capacity,
+            #[cfg(test)]
+            release_test_probe.clone(),
+        );
         Self {
             postgres,
             redis,
             client: reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
-            capacity_notify: Arc::new(Notify::new()),
+            capacity_notify,
+            release_supervisor,
             availability_cache: Arc::new(SyncMutex::new(None)),
+            availability_refresh_lock: Arc::new(TokioMutex::new(())),
+            availability_cache_epoch: Arc::new(AtomicU64::new(0)),
+            definitions_cache: Arc::new(SyncMutex::new(None)),
+            definitions_refresh_lock: Arc::new(TokioMutex::new(())),
+            definitions_refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            definitions_cache_epoch: Arc::new(AtomicU64::new(0)),
+            external_admin_cache_epoch: Arc::new(AtomicU64::new(0)),
+            invalidation_publish_dirty: Arc::new(AtomicBool::new(false)),
+            invalidation_publish_notify: Arc::new(Notify::new()),
+            event_origin_id: Arc::from(uuid::Uuid::new_v4().to_string()),
+            #[cfg(test)]
+            definitions_test_probe: Arc::new(ExternalPoolDefinitionsTestProbe::default()),
+            #[cfg(test)]
+            availability_test_probe: Arc::new(ExternalPoolAvailabilityTestProbe::default()),
+            #[cfg(test)]
+            release_test_probe,
+        }
+    }
+
+    pub async fn shutdown_release_supervisor(
+        &self,
+        timeout: Duration,
+    ) -> ExternalPoolReleaseShutdownReport {
+        self.release_supervisor.shutdown(timeout).await
+    }
+
+    fn invalidate_routing_cache_local(&self) {
+        self.definitions_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.availability_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.availability_cache.lock().take();
+        self.definitions_cache.lock().take();
+    }
+
+    pub fn invalidate_routing_cache_after_subscription(&self) {
+        self.invalidate_routing_cache_local();
+        self.external_admin_cache_epoch
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn invalidate_routing_cache(&self) {
+        self.invalidate_routing_cache_local();
+        self.external_admin_cache_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        self.invalidation_publish_dirty
+            .store(true, Ordering::Release);
+        self.invalidation_publish_notify.notify_one();
+    }
+
+    pub fn invalidate_routing_cache_from_event(&self, payload: &str) -> bool {
+        self.external_admin_cache_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        let is_self_event = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("origin")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|origin| origin == self.event_origin_id.as_ref());
+        if is_self_event {
+            return false;
+        }
+        self.invalidate_routing_cache_local();
+        true
+    }
+
+    pub fn external_admin_cache_epoch(&self) -> u64 {
+        self.external_admin_cache_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn spawn_invalidation_publisher(&self) -> tokio::task::JoinHandle<()> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            loop {
+                manager.wait_for_invalidation_publish().await;
+                let mut retry_delay = EXTERNAL_POOL_INVALIDATION_RETRY_MIN;
+                loop {
+                    let payload = json!({
+                        "kind": "external_pools_changed",
+                        "origin": manager.event_origin_id.as_ref(),
+                        "changedAt": Utc::now().to_rfc3339(),
+                    })
+                    .to_string();
+                    match timeout(
+                        EXTERNAL_POOL_INVALIDATION_PUBLISH_TIMEOUT,
+                        manager
+                            .redis
+                            .invalidate_external_pool_admin_cache_and_publish(payload),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => break,
+                        Ok(Err(err)) => tracing::warn!(
+                            retry_delay_ms = retry_delay.as_millis() as u64,
+                            "发布外部池缓存失效事件失败，将重试: {}",
+                            err
+                        ),
+                        Err(_) => tracing::warn!(
+                            timeout_ms =
+                                EXTERNAL_POOL_INVALIDATION_PUBLISH_TIMEOUT.as_millis() as u64,
+                            retry_delay_ms = retry_delay.as_millis() as u64,
+                            "发布外部池缓存失效事件超时，将重试"
+                        ),
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(EXTERNAL_POOL_INVALIDATION_RETRY_MAX);
+                }
+            }
+        })
+    }
+
+    async fn wait_for_invalidation_publish(&self) {
+        loop {
+            let notified = self.invalidation_publish_notify.notified();
+            if self
+                .invalidation_publish_dirty
+                .swap(false, Ordering::AcqRel)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn cache_external_pool_definitions(
+        &self,
+        pools: Vec<ExternalPool>,
+        expected_epoch: u64,
+    ) -> bool {
+        let now = Instant::now();
+        let mut cache = self.definitions_cache.lock();
+        if self.definitions_cache_epoch.load(Ordering::Acquire) != expected_epoch {
+            return false;
+        }
+        *cache = Some(CachedExternalPoolDefinitions {
+            pools,
+            fresh_until: now + EXTERNAL_POOL_DEFINITIONS_CACHE_FRESH_TTL,
+            stale_if_error_until: now + EXTERNAL_POOL_DEFINITIONS_STALE_IF_ERROR_TTL,
+            authoritative: true,
+            refresh_failure_streak: 0,
+            refresh_retry_at: None,
+        });
+        true
+    }
+
+    fn cache_external_pool_definitions_failure(&self, expected_epoch: u64) {
+        let now = Instant::now();
+        let mut cache = self.definitions_cache.lock();
+        if self.definitions_cache_epoch.load(Ordering::Acquire) != expected_epoch {
+            return;
+        }
+        if let Some(cached) = cache
+            .as_mut()
+            .filter(|cached| cached.authoritative && cached.stale_if_error_until > now)
+        {
+            cached.refresh_failure_streak = cached.refresh_failure_streak.saturating_add(1);
+            cached.refresh_retry_at = Some(
+                now + external_pool_definitions_refresh_retry_delay(cached.refresh_failure_streak),
+            );
+            return;
+        }
+        *cache = Some(CachedExternalPoolDefinitions {
+            pools: Vec::new(),
+            fresh_until: now + EXTERNAL_POOL_DEFINITIONS_NEGATIVE_CACHE_TTL,
+            stale_if_error_until: now,
+            authoritative: false,
+            refresh_failure_streak: 0,
+            refresh_retry_at: None,
+        });
+    }
+
+    async fn query_external_pool_definitions(&self) -> anyhow::Result<Vec<ExternalPool>> {
+        #[cfg(test)]
+        self.definitions_test_probe
+            .query_attempts
+            .fetch_add(1, Ordering::AcqRel);
+
+        #[cfg(test)]
+        if self
+            .definitions_test_probe
+            .fail_next_query
+            .swap(false, Ordering::AcqRel)
+        {
+            anyhow::bail!("测试注入的外部池路由定义 PgSQL 查询失败");
+        }
+
+        let pools = timeout(
+            EXTERNAL_POOL_DEFINITIONS_QUERY_TIMEOUT,
+            self.postgres.list_external_pools(false),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "外部池路由定义 PgSQL 查询超过 {}ms",
+                EXTERNAL_POOL_DEFINITIONS_QUERY_TIMEOUT.as_millis()
+            )
+        })??;
+
+        #[cfg(test)]
+        {
+            let gate = self
+                .definitions_test_probe
+                .next_after_fetch_gate
+                .lock()
+                .take();
+            if let Some(gate) = gate {
+                gate.fetched.wait().await;
+                gate.resume.wait().await;
+            }
+        }
+
+        Ok(pools)
+    }
+
+    fn external_pool_definitions_refresh_due(&self) -> bool {
+        let now = Instant::now();
+        self.definitions_cache
+            .lock()
+            .as_ref()
+            .is_some_and(|cached| {
+                cached.fresh_until <= now
+                    && cached.authoritative
+                    && cached.stale_if_error_until > now
+                    && cached
+                        .refresh_retry_at
+                        .is_none_or(|retry_at| retry_at <= now)
+            })
+    }
+
+    fn refresh_external_pool_definitions_in_background(&self) {
+        if !self.external_pool_definitions_refresh_due() {
+            return;
+        }
+        if self
+            .definitions_refresh_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if !self.external_pool_definitions_refresh_due() {
+            self.definitions_refresh_in_flight
+                .store(false, Ordering::Release);
+            return;
+        }
+        let manager = self.clone();
+        let expected_epoch = self.definitions_cache_epoch.load(Ordering::Acquire);
+        let guard = ExternalPoolDefinitionsRefreshGuard {
+            in_flight: self.definitions_refresh_in_flight.clone(),
+        };
+        spawn_best_effort_storage_task("刷新外部池路由定义缓存", async move {
+            let _guard = guard;
+            match manager.query_external_pool_definitions().await {
+                Ok(pools) => {
+                    manager.cache_external_pool_definitions(pools, expected_epoch);
+                    Ok(())
+                }
+                Err(err) => {
+                    manager.cache_external_pool_definitions_failure(expected_epoch);
+                    Err(err)
+                }
+            }
+        });
+    }
+
+    async fn external_pool_definitions_for_routing(&self) -> anyhow::Result<Vec<ExternalPool>> {
+        let now = Instant::now();
+        let cached = self.definitions_cache.lock().clone();
+        if let Some(cached) = cached.as_ref().filter(|cached| cached.fresh_until > now) {
+            return Ok(cached.pools.clone());
+        }
+        if let Some(cached) =
+            cached.filter(|cached| cached.authoritative && cached.stale_if_error_until > now)
+        {
+            self.refresh_external_pool_definitions_in_background();
+            return Ok(cached.pools);
+        }
+
+        let _refresh_guard = self.definitions_refresh_lock.lock().await;
+        let now = Instant::now();
+        let cached_after_lock = self.definitions_cache.lock().clone();
+        if let Some(cached) = cached_after_lock {
+            if cached.fresh_until > now {
+                return Ok(cached.pools);
+            }
+            if cached.authoritative && cached.stale_if_error_until > now {
+                self.refresh_external_pool_definitions_in_background();
+                return Ok(cached.pools);
+            }
+        }
+
+        let expected_epoch = self.definitions_cache_epoch.load(Ordering::Acquire);
+        let pools = match self.query_external_pool_definitions().await {
+            Ok(pools) => pools,
+            Err(err) => {
+                self.cache_external_pool_definitions_failure(expected_epoch);
+                return Err(err);
+            }
+        };
+        if self.cache_external_pool_definitions(pools.clone(), expected_epoch) {
+            Ok(pools)
+        } else {
+            anyhow::bail!("外部池路由定义在 PgSQL 查询期间已失效，请求重新预检")
         }
     }
 
@@ -1463,9 +2546,16 @@ impl ExternalPoolManager {
     }
 
     pub async fn has_eligible_pool(&self, config: &ExternalPoolsConfig) -> bool {
-        self.pool_availability_snapshot(&HashSet::new(), config)
+        if !config.external_pools_enabled {
+            return false;
+        }
+        self.external_pool_definitions_for_routing()
             .await
-            .has_eligible_pool()
+            .is_ok_and(|pools| {
+                pools
+                    .into_iter()
+                    .any(|pool| pool.enabled && !pool.is_auto_disabled_now())
+            })
     }
 
     pub async fn has_eligible_pool_for_body_mode(
@@ -1473,36 +2563,18 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         body_mode: ExternalPoolRequestBodyMode,
     ) -> bool {
-        self.scan_pool_availability_uncached(
-            &HashSet::new(),
-            config,
-            false,
-            Some(body_mode),
-            None,
-            None,
-        )
-        .await
-        .availability
-        .has_eligible_pool()
-    }
-
-    pub async fn has_available_pool_for_body_mode(
-        &self,
-        config: &ExternalPoolsConfig,
-        body_mode: ExternalPoolRequestBodyMode,
-    ) -> bool {
-        self.scan_pool_availability_uncached(
-            &HashSet::new(),
-            config,
-            false,
-            Some(body_mode),
-            None,
-            None,
-        )
-        .await
-        .availability
-        .available_pools
-            > 0
+        if !config.external_pools_enabled {
+            return false;
+        }
+        self.external_pool_definitions_for_routing()
+            .await
+            .is_ok_and(|pools| {
+                pools.into_iter().any(|pool| {
+                    pool.enabled
+                        && !pool.is_auto_disabled_now()
+                        && external_pool_matches_body_mode_filter(&pool, Some(body_mode))
+                })
+            })
     }
 
     pub async fn record_local_pool_failure(
@@ -2364,8 +3436,15 @@ impl ExternalPoolManager {
         if !config.external_pools_enabled {
             return PoolSelectionSnapshot::default();
         }
-        let Ok(pools) = self.postgres.list_external_pools(false).await else {
-            return PoolSelectionSnapshot::default();
+        let pools = match self.external_pool_definitions_for_routing().await {
+            Ok(pools) => pools,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "读取外部池路由定义失败，当前请求不执行外部池准入"
+                );
+                return PoolSelectionSnapshot::default();
+            }
         };
         let mut candidates = include_selection.then(Vec::new);
         let mut availability = PoolAvailabilitySnapshot::default();
@@ -2503,15 +3582,52 @@ impl ExternalPoolManager {
             return snapshot;
         }
 
+        let _refresh_guard = if cacheable {
+            Some(self.availability_refresh_lock.lock().await)
+        } else {
+            None
+        };
+        if cacheable {
+            let now = Instant::now();
+            if let Some(snapshot) = self
+                .availability_cache
+                .lock()
+                .as_ref()
+                .filter(|cached| cached.expires_at > now)
+                .map(|cached| cached.snapshot.clone())
+            {
+                return snapshot;
+            }
+        }
+
+        let expected_epoch =
+            cacheable.then(|| self.availability_cache_epoch.load(Ordering::Acquire));
         let snapshot = self
             .scan_pool_availability_uncached(excluded, config, false, None, None, None)
             .await
             .availability;
+
+        #[cfg(test)]
         if cacheable {
-            *self.availability_cache.lock() = Some(CachedPoolAvailabilitySnapshot {
-                snapshot: snapshot.clone(),
-                expires_at: Instant::now() + EXTERNAL_POOL_AVAILABILITY_CACHE_TTL,
-            });
+            let gate = self
+                .availability_test_probe
+                .next_after_scan_gate
+                .lock()
+                .take();
+            if let Some(gate) = gate {
+                gate.scanned.wait().await;
+                gate.resume.wait().await;
+            }
+        }
+
+        if let Some(expected_epoch) = expected_epoch {
+            let mut cache = self.availability_cache.lock();
+            if self.availability_cache_epoch.load(Ordering::Acquire) == expected_epoch {
+                *cache = Some(CachedPoolAvailabilitySnapshot {
+                    snapshot: snapshot.clone(),
+                    expires_at: Instant::now() + EXTERNAL_POOL_AVAILABILITY_CACHE_TTL,
+                });
+            }
         }
         snapshot
     }
@@ -2784,6 +3900,28 @@ impl ExternalPoolManager {
                 });
             }
         };
+        let release_registration =
+            match self
+                .release_supervisor
+                .try_reserve(ExternalPoolReleaseKind::Pool {
+                    pool_id: pool.id,
+                    lease_id,
+                }) {
+                Ok(registration) => registration,
+                Err(detail) => {
+                    tracing::warn!(
+                        pool_id = pool.id,
+                        detail,
+                        "外部池 lease 释放监督器无可用登记容量，拒绝占用 Redis 并发槽"
+                    );
+                    return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                        reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                        wait_for: None,
+                        exclude_pool_for_reselect: false,
+                        detail,
+                    });
+                }
+            };
         let max_age = Some(Duration::from_secs(
             DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS.saturating_mul(2),
         ));
@@ -2798,12 +3936,29 @@ impl ExternalPoolManager {
             )
             .await
         {
-            Ok(Some(_)) => PoolAcquireResult::Acquired(ExternalPoolLease {
-                manager: self.clone(),
-                pool_id: pool.id,
-                lease_id,
-            }),
+            Ok(Some(_)) => {
+                #[cfg(test)]
+                {
+                    let gate = {
+                        self.release_test_probe
+                            .after_pool_acquire_gate
+                            .lock()
+                            .take()
+                    };
+                    if let Some(gate) = gate {
+                        gate.acquired.wait().await;
+                        gate.resume.wait().await;
+                    }
+                }
+                PoolAcquireResult::Acquired(ExternalPoolLease {
+                    manager: self.clone(),
+                    pool_id: pool.id,
+                    lease_id,
+                    _release_registration: release_registration,
+                })
+            }
             Ok(None) => {
+                release_registration.disarm();
                 let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
                     match self.pool_runtime_snapshot(pool.id).await {
                         Ok(snapshot) => snapshot,
@@ -2873,8 +4028,20 @@ impl ExternalPoolManager {
         max_queued: u32,
     ) -> anyhow::Result<Option<ExternalPoolQueueGuard>> {
         let lease_id = uuid::Uuid::new_v4().to_string();
+        let release_registration = self
+            .release_supervisor
+            .try_reserve(ExternalPoolReleaseKind::Queue {
+                lease_id: lease_id.clone(),
+            })
+            .map_err(|detail| {
+                anyhow::anyhow!(
+                    "external pool queue release supervisor unavailable: {}",
+                    detail
+                )
+            })?;
         // Arm cleanup before awaiting Redis so cancellation and commit-unknown both remove this ID.
-        let guard = ExternalPoolQueueGuard::new(self.clone(), lease_id.clone());
+        let guard =
+            ExternalPoolQueueGuard::new(self.clone(), lease_id.clone(), release_registration);
         let admitted = timeout(
             EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
             self.redis.try_enter_external_pool_dispatch_queue(
@@ -2896,24 +4063,6 @@ impl ExternalPoolManager {
             guard.disarm();
             Ok(None)
         }
-    }
-
-    async fn release_pool(&self, pool_id: u64, lease_id: u64) -> anyhow::Result<()> {
-        match self
-            .redis
-            .release_external_pool_lease(pool_id, lease_id)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::debug!(
-                pool_id,
-                lease_id,
-                "外部池 Redis 并发 lease 已不存在或已释放"
-            ),
-            Err(err) => return Err(err),
-        }
-        self.capacity_notify.notify_waiters();
-        Ok(())
     }
 
     async fn touch_pool(&self, pool_id: u64, lease_id: u64) -> anyhow::Result<()> {
@@ -3104,6 +4253,8 @@ impl ExternalPoolManager {
             .await
         {
             tracing::warn!(pool_id = pool.id, "自动禁用外部池失败: {}", err);
+        } else {
+            self.invalidate_routing_cache();
         }
     }
 

@@ -116,18 +116,61 @@ impl CallContext {
             lease.set_kind(kind);
         }
     }
+
+    pub(crate) fn mark_upstream_dispatch_started(&self) {
+        if let Some(lease) = &self.in_flight_lease {
+            lease.mark_upstream_dispatch_started();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireMode {
     WaitForCapacity,
+    /// Legacy all-cause fail-fast mode retained for existing provider helpers.
     FailFastOnCapacity,
+    SelectiveFailFast {
+        rate_limit: bool,
+        concurrency: bool,
+    },
     WaitForCapacityMax(StdDuration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DispatchBlockKind {
+    RateLimit,
+    Concurrency,
 }
 
 impl AcquireMode {
     pub(super) fn is_fail_fast(self) -> bool {
-        matches!(self, Self::FailFastOnCapacity)
+        match self {
+            Self::FailFastOnCapacity => true,
+            Self::SelectiveFailFast {
+                rate_limit,
+                concurrency,
+            } => rate_limit || concurrency,
+            _ => false,
+        }
+    }
+
+    pub(super) fn should_fail_fast_for(self, kind: DispatchBlockKind) -> bool {
+        match (self, kind) {
+            (Self::FailFastOnCapacity, _) => true,
+            (
+                Self::SelectiveFailFast {
+                    rate_limit: true, ..
+                },
+                DispatchBlockKind::RateLimit,
+            ) => true,
+            (
+                Self::SelectiveFailFast {
+                    concurrency: true, ..
+                },
+                DispatchBlockKind::Concurrency,
+            ) => true,
+            _ => false,
+        }
     }
 
     pub(super) fn max_wait_override(self) -> Option<StdDuration> {

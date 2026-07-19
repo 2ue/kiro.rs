@@ -1,4 +1,5 @@
 use super::*;
+use futures::StreamExt;
 use std::sync::Arc;
 
 const SONNET_MODEL: &str = "claude-sonnet-4.5";
@@ -180,6 +181,46 @@ async fn test_redis_store() -> Option<Arc<RedisStore>> {
     config.redis.url = Some(url);
     config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
     Some(Arc::new(RedisStore::connect(&config).await.unwrap()))
+}
+
+async fn occupy_redis_dispatch_slots(
+    redis: &RedisStore,
+    credential_ids: &[u64],
+    credential_max: u32,
+    global_max: u32,
+    lease_base: u64,
+) -> Vec<(u64, u64)> {
+    let mut leases = Vec::with_capacity(credential_ids.len());
+    for (offset, credential_id) in credential_ids.iter().copied().enumerate() {
+        let lease_id = lease_base + offset as u64;
+        let acquired = redis
+            .acquire_dispatch_lease(
+                credential_id,
+                lease_id,
+                credential_max,
+                global_max,
+                1,
+                Some(StdDuration::from_secs(60)),
+                InFlightKind::Api.as_str(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            acquired.is_some(),
+            "failed to prefill credential {credential_id}"
+        );
+        leases.push((credential_id, lease_id));
+    }
+    leases
+}
+
+async fn release_redis_dispatch_slots(redis: &RedisStore, leases: &[(u64, u64)]) {
+    for (credential_id, lease_id) in leases.iter().copied() {
+        redis
+            .release_in_flight_lease(credential_id, lease_id)
+            .await
+            .unwrap();
+    }
 }
 
 async fn acquire_test_refresh_lock_until(
@@ -467,6 +508,265 @@ async fn postgres_failed_stats_batch_retry_keeps_frozen_payload_and_new_accumula
     assert!(manager.refresh_stats_dirty_from_pending());
 }
 
+#[test]
+fn pending_success_replay_coalesces_without_quarantining_dispatch() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential("pending-success", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let first_operation_id = uuid::Uuid::new_v4();
+    let second_operation_id = uuid::Uuid::new_v4();
+    let latest_operation_id = uuid::Uuid::new_v4();
+
+    for operation_id in [first_operation_id, second_operation_id, latest_operation_id] {
+        assert!(manager.enqueue_pending_runtime_mutation(
+            1,
+            PendingCredentialRuntimeMutation::Success {
+                operation_id,
+                expected_generation: 0,
+                count: 1,
+            },
+        ));
+    }
+
+    {
+        let pending = manager.pending_runtime_mutations.lock();
+        let queue = pending.get(&1).expect("success replay queue");
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.front().unwrap().operation_id(), first_operation_id);
+        match queue.back().unwrap() {
+            PendingCredentialRuntimeMutation::Success {
+                operation_id,
+                expected_generation,
+                count,
+            } => {
+                assert_eq!(*operation_id, latest_operation_id);
+                assert_eq!(*expected_generation, 0);
+                assert_eq!(*count, 2);
+            }
+            mutation => panic!("unexpected tail mutation: {mutation:?}"),
+        }
+    }
+    {
+        let entries = manager.entries.lock();
+        assert!(!entries[0].runtime_persistence_degraded);
+        assert!(!entries[0].disabled);
+    }
+
+    assert!(manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::ApiFailure {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            last_used_at: Utc::now().to_rfc3339(),
+        },
+    ));
+    let entries = manager.entries.lock();
+    assert!(entries[0].runtime_persistence_degraded);
+    assert!(entries[0].disabled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_success_pool_saturation_stays_bounded_and_does_not_disable_credential() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+    let mut credential = api_key_credential("success-pool-saturation");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+    manager.set_warmup_remaining(1, 5).unwrap();
+
+    let first_connection = store.pool().acquire().await.unwrap();
+    let second_connection = store.pool().acquire().await.unwrap();
+    let started_at = Instant::now();
+    for _ in 0..3 {
+        manager.report_success(1);
+    }
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        elapsed < StdDuration::from_millis(250),
+        "success completion must not wait for a saturated PgSQL pool, elapsed={elapsed:?}"
+    );
+    assert_eq!(manager.runtime_mutation_backlog().0, 2);
+    {
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].warmup_remaining, 2);
+        assert!(!entries[0].runtime_persistence_degraded);
+        assert!(!entries[0].disabled);
+    }
+
+    drop(first_connection);
+    drop(second_connection);
+    manager.flush_pending_runtime_mutations_with_budget(StdDuration::from_secs(2));
+
+    assert_eq!(manager.runtime_mutation_backlog(), (0, 0));
+    let runtime = store.load_credential_runtime_state().await.unwrap();
+    assert_eq!(runtime[&1].warmup_remaining, 2);
+    assert_eq!(runtime[&1].revision, 3);
+    assert!(runtime[&1].disabled_reason.is_none());
+
+    store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_success_pool_saturation_keeps_40_credentials_dispatchable() {
+    const CREDENTIAL_COUNT: u64 = 40;
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+    let credentials: Vec<_> = (1..=CREDENTIAL_COUNT)
+        .map(|id| {
+            let mut credential = api_key_credential(&format!("saturated-success-{id}"));
+            credential.id = Some(id);
+            credential
+        })
+        .collect();
+    store.save_credentials(&credentials).await.unwrap();
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            credentials,
+            None,
+            None,
+            false,
+            Some(store.clone()),
+            None,
+        )
+        .unwrap(),
+    );
+
+    let first_connection = store.pool().acquire().await.unwrap();
+    let second_connection = store.pool().acquire().await.unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(CREDENTIAL_COUNT as usize + 1));
+    let mut workers = Vec::with_capacity(CREDENTIAL_COUNT as usize);
+    for id in 1..=CREDENTIAL_COUNT {
+        let manager = manager.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            manager.report_success(id);
+        }));
+    }
+
+    let started_at = Instant::now();
+    barrier.wait();
+    for worker in workers {
+        worker.join().expect("concurrent success reporter panicked");
+    }
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        elapsed < StdDuration::from_millis(500),
+        "40 success completions must bypass a saturated PgSQL pool, elapsed={elapsed:?}"
+    );
+    assert_eq!(manager.runtime_mutation_backlog(), (40, 0));
+    assert_eq!(manager.available_count(), CREDENTIAL_COUNT as usize);
+    let route_state = manager.local_pool_route_state(None);
+    assert_eq!(route_state.kind, LocalPoolRouteStateKind::Ready);
+    assert_eq!(route_state.total, CREDENTIAL_COUNT as usize);
+    assert_eq!(route_state.available, CREDENTIAL_COUNT as usize);
+    assert!(manager.entries.lock().iter().all(|entry| {
+        !entry.disabled && !entry.runtime_persistence_degraded && entry.success_count == 1
+    }));
+
+    drop(first_connection);
+    drop(second_connection);
+    manager.flush_pending_runtime_mutations_with_budget(StdDuration::from_secs(5));
+
+    assert_eq!(manager.runtime_mutation_backlog(), (0, 0));
+    let runtime = store.load_credential_runtime_state().await.unwrap();
+    assert_eq!(runtime.len(), CREDENTIAL_COUNT as usize);
+    assert!(runtime.values().all(|state| {
+        state.revision == 1 && state.disabled_reason.is_none() && state.warmup_remaining == 0
+    }));
+
+    store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_success_replay_applies_authoritative_disable_without_cancelling_in_flight() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+    let mut credential = api_key_credential("pending-success-authoritative-disable");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+    let lease = manager
+        .acquire_in_flight_lease_for_test(1)
+        .expect("test credential should have capacity");
+
+    store
+        .mark_credential_disabled_at_generation(
+            1,
+            uuid::Uuid::new_v4(),
+            0,
+            DisabledReason::Manual.as_str(),
+            CredentialRuntimeFailureCounts::default(),
+            &Utc::now().to_rfc3339(),
+        )
+        .await
+        .unwrap();
+    let first_connection = store.pool().acquire().await.unwrap();
+    let second_connection = store.pool().acquire().await.unwrap();
+
+    manager.report_success(1);
+    assert_eq!(manager.runtime_mutation_backlog().0, 1);
+    assert_eq!(manager.in_flight_requests_for_test(1), 1);
+
+    drop(first_connection);
+    drop(second_connection);
+    manager.flush_pending_runtime_mutations_with_budget(StdDuration::from_secs(2));
+
+    assert_eq!(manager.runtime_mutation_backlog(), (0, 0));
+    assert_eq!(
+        manager.in_flight_requests_for_test(1),
+        1,
+        "authoritative disable must let an already-started request drain naturally"
+    );
+    let entry = &manager.snapshot().entries[0];
+    assert!(entry.disabled);
+    assert_eq!(
+        entry.disabled_reason.as_deref(),
+        Some(DisabledReason::Manual.as_str())
+    );
+    let acquire = tokio::time::timeout(StdDuration::from_secs(1), manager.acquire_context(None))
+        .await
+        .expect("disabled credential acquisition must not wait");
+    assert!(acquire.is_err(), "disabled credential accepted new work");
+    drop(lease);
+    assert_eq!(manager.in_flight_requests_for_test(1), 0);
+
+    store.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds() {
     let Some(store) = test_postgres_store().await else {
@@ -517,6 +817,7 @@ async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds
             PendingCredentialRuntimeMutation::Success {
                 operation_id: uuid::Uuid::new_v4(),
                 expected_generation: 0,
+                count: 1,
             },
         ));
     }
@@ -582,6 +883,7 @@ async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
                 PendingCredentialRuntimeMutation::Success {
                     operation_id: uuid::Uuid::new_v4(),
                     expected_generation: 0,
+                    count: 1,
                 },
             ));
         }
@@ -601,8 +903,8 @@ async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
     {
         let entries = manager.entries.lock();
         let failed = entries.iter().find(|entry| entry.id == 1).unwrap();
-        assert!(failed.runtime_persistence_degraded);
-        assert!(failed.disabled);
+        assert!(!failed.runtime_persistence_degraded);
+        assert!(!failed.disabled);
         for id in [2, 3] {
             let healthy = entries.iter().find(|entry| entry.id == id).unwrap();
             assert_eq!(healthy.runtime_revision, 2);
@@ -724,6 +1026,7 @@ async fn postgres_admin_runtime_patches_advance_revision_once_and_ignore_old_res
             state: disabled_state,
             credential_disabled: true,
             applied: true,
+            credential_auto_reenabled: false,
         },
     );
     manager.apply_runtime_mutation_result(
@@ -739,6 +1042,7 @@ async fn postgres_admin_runtime_patches_advance_revision_once_and_ignore_old_res
             },
             credential_disabled: false,
             applied: true,
+            credential_auto_reenabled: false,
         },
     );
     {
@@ -775,6 +1079,7 @@ fn delete_credential_clears_pending_persistence_for_that_id() {
         PendingCredentialRuntimeMutation::Success {
             operation_id: uuid::Uuid::new_v4(),
             expected_generation: 0,
+            count: 1,
         },
     ));
     manager.mark_stats_dirty();
@@ -877,6 +1182,7 @@ async fn reload_remote_delete_clears_pending_persistence_for_removed_id() {
         PendingCredentialRuntimeMutation::Success {
             operation_id: uuid::Uuid::new_v4(),
             expected_generation: 0,
+            count: 1,
         },
     ));
     manager.mark_stats_dirty();
@@ -1171,6 +1477,7 @@ async fn runtime_mutation_flush_respects_global_wall_clock_budget() {
             PendingCredentialRuntimeMutation::Success {
                 operation_id: uuid::Uuid::new_v4(),
                 expected_generation: 0,
+                count: 1,
             },
         ));
     }
@@ -1523,25 +1830,39 @@ async fn force_refresh_runtime_reset_cannot_overrun_total_deadline() {
         None,
     )
     .unwrap();
+    sqlx::query(
+        "INSERT INTO credential_runtime_state (credential_id) VALUES ($1) ON CONFLICT DO NOTHING",
+    )
+    .bind(1_i64)
+    .execute(store.pool())
+    .await
+    .unwrap();
     let mut transaction = store.pool().begin().await.unwrap();
-    sqlx::query("LOCK TABLE credential_runtime_state IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+    let locked_credential_id: i64 = sqlx::query_scalar(
+        "SELECT credential_id FROM credential_runtime_state WHERE credential_id = $1 FOR UPDATE",
+    )
+    .bind(1_i64)
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(locked_credential_id, 1);
 
     let started_at = Instant::now();
-    manager
-        .force_refresh_token_for_with_budgets(
+    tokio::time::timeout(
+        StdDuration::from_secs(2),
+        manager.force_refresh_token_for_with_budgets(
             1,
             TokenRefreshBudgets {
-                workflow: StdDuration::from_millis(300),
-                coordination: StdDuration::from_millis(50),
-                reconciliation: StdDuration::from_millis(80),
+                workflow: StdDuration::from_secs(1),
+                coordination: StdDuration::from_millis(100),
+                reconciliation: StdDuration::from_millis(200),
             },
-        )
-        .await
-        .unwrap();
-    assert!(started_at.elapsed() < StdDuration::from_millis(600));
+        ),
+    )
+    .await
+    .expect("被锁定的 runtime 写回不得拖住强制刷新工作流")
+    .unwrap();
+    assert!(started_at.elapsed() < StdDuration::from_secs(2));
     assert_eq!(manager.runtime_mutation_backlog().0, 1);
 
     transaction.commit().await.unwrap();
@@ -2023,7 +2344,7 @@ fn test_scheduler_state_apply_drops_remote_lease_missing_from_next_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
+async fn scheduler_non_admission_timeout_does_not_degrade_admission() {
     let manager = MultiTokenManager::new(
         Config::default(),
         vec![test_access_token_credential("token-1", "Pro")],
@@ -2034,12 +2355,462 @@ async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
     .unwrap();
 
     let result = manager
-        .block_on_scheduler_redis_state_sync("测试 Redis 调度状态同步", async move {
+        .block_on_scheduler_redis_non_admission("测试 Redis 非准入操作", async move {
             std::future::pending::<anyhow::Result<()>>().await
         });
 
     assert!(result.is_none());
     assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_degraded_streak
+            .load(Ordering::Acquire),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_non_admission_success_does_not_reset_admission_streak() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager
+        .scheduler_redis_degraded_streak
+        .store(3, Ordering::Release);
+
+    let result = manager
+        .block_on_scheduler_redis_non_admission("测试 Redis 非准入成功", async move {
+            Ok::<_, anyhow::Error>(7_u32)
+        });
+
+    assert_eq!(result, Some(7));
+    assert_eq!(
+        manager
+            .scheduler_redis_degraded_streak
+            .load(Ordering::Acquire),
+        3
+    );
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+}
+
+#[test]
+fn recent_confirmed_admission_success_prevents_failure_cluster_from_opening_breaker() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager.mark_scheduler_redis_admission_healthy();
+
+    let err = anyhow::anyhow!("redis connection closed");
+    for index in 0..SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD + 2 {
+        if index % 2 == 0 {
+            manager.record_scheduler_redis_admission_timeout("测试并发 Redis 准入硬超时");
+        } else {
+            manager.record_scheduler_redis_admission_failure(
+                "测试并发 Redis 准入错误",
+                "error",
+                &err,
+            );
+        }
+    }
+    assert!(
+        manager.scheduler_redis_degraded_until.lock().is_none(),
+        "failures interleaved with a recent authoritative success must not fan out into a whole-pool breaker"
+    );
+
+    *manager.last_scheduler_redis_admission_success_at.lock() = Some(
+        Instant::now() - SCHEDULER_REDIS_ADMISSION_NO_SUCCESS_WINDOW - StdDuration::from_millis(1),
+    );
+    manager.record_scheduler_redis_admission_failure("测试持续 Redis 准入错误", "error", &err);
+    assert!(manager.scheduler_redis_degraded_until.lock().is_some());
+}
+
+#[test]
+fn admission_failures_completed_before_newer_success_are_ignored() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let failure_completed_at = Instant::now();
+    manager.mark_scheduler_redis_admission_healthy();
+    let err = anyhow::anyhow!("redis connection closed");
+
+    for _ in 0..SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD + 2 {
+        manager.record_scheduler_redis_admission_failure_at(
+            "测试晚提交的旧 Redis 准入失败",
+            "error",
+            &err,
+            failure_completed_at,
+        );
+    }
+
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0
+    );
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+}
+
+#[test]
+fn redis_failure_message_uses_owner_time_when_caller_resumes_after_newer_success() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let completed_at = Instant::now() - StdDuration::from_millis(10);
+    let started_at = completed_at - StdDuration::from_millis(10);
+    let delayed_failure = RedisAdmissionTaskMessage::RedisFailed {
+        err: anyhow::anyhow!("redis connection closed"),
+        started_at,
+        completed_at,
+    };
+
+    manager.mark_scheduler_redis_admission_healthy();
+    let outcome = manager.record_redis_dispatch_admission_failure_message(
+        "测试 caller 延迟处理旧 Redis 失败消息",
+        delayed_failure,
+    );
+
+    assert!(matches!(outcome, SchedulerRedisHotOutcome::Failed));
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0,
+        "an old owner failure processed after a newer success must not resurrect the streak"
+    );
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+}
+
+#[test]
+fn concurrent_admission_failure_wave_advances_breaker_once() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    *manager.last_scheduler_redis_admission_success_at.lock() = Some(
+        Instant::now() - SCHEDULER_REDIS_ADMISSION_NO_SUCCESS_WINDOW - StdDuration::from_secs(1),
+    );
+    let wave_started_at = Instant::now();
+    let err = anyhow::anyhow!("redis connection closed");
+
+    for offset_ms in 1..=64 {
+        manager.record_scheduler_redis_admission_failure_during(
+            "测试并发 Redis 准入失败波次",
+            "error",
+            &err,
+            wave_started_at,
+            wave_started_at + StdDuration::from_millis(offset_ms),
+        );
+    }
+
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        1,
+        "one overlapping caller wave must advance the breaker only once"
+    );
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+}
+
+#[tokio::test]
+async fn expired_scheduler_breaker_allows_only_one_half_open_probe() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
+    *manager.scheduler_redis_degraded_until.lock() =
+        Some(Instant::now() - StdDuration::from_millis(1));
+
+    let probe = manager
+        .scheduler_redis_admission_permit(true)
+        .expect("expired breaker must allow one probe");
+    assert!(
+        manager.scheduler_redis_admission_permit(true).is_none(),
+        "a second caller must not join an in-flight half-open probe"
+    );
+    drop(probe);
+
+    let recovered = manager
+        .await_scheduler_redis_admission_outcome("测试 Redis half-open 恢复", true, async {
+            Ok::<_, anyhow::Error>(7_u32)
+        })
+        .await;
+    assert!(matches!(recovered, SchedulerRedisHotOutcome::Completed(7)));
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0
+    );
+}
+
+#[tokio::test]
+async fn queue_coordination_success_does_not_mask_dispatch_admission_timeouts() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
+    let old_success =
+        Instant::now() - SCHEDULER_REDIS_ADMISSION_NO_SUCCESS_WINDOW - StdDuration::from_millis(1);
+    *manager.last_scheduler_redis_admission_success_at.lock() = Some(old_success);
+    manager.scheduler_redis_admission_failure_streak.store(
+        SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD - 1,
+        Ordering::Release,
+    );
+
+    let result = manager
+        .await_scheduler_redis_admission_outcome("测试 Redis 队列协调成功", false, async move {
+            Ok::<_, anyhow::Error>(true)
+        })
+        .await;
+    assert!(matches!(result, SchedulerRedisHotOutcome::Completed(true)));
+    assert_eq!(
+        *manager.last_scheduler_redis_admission_success_at.lock(),
+        Some(old_success)
+    );
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD - 1
+    );
+    for _ in 0..SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD {
+        let queue_timeout = manager
+            .await_scheduler_redis_admission_outcome("测试 Redis 队列协调超时", false, async move {
+                std::future::pending::<anyhow::Result<bool>>().await
+            })
+            .await;
+        assert!(matches!(queue_timeout, SchedulerRedisHotOutcome::Failed));
+    }
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD - 1
+    );
+
+    manager.record_scheduler_redis_admission_timeout("测试持续 Redis dispatch 准入超时");
+    assert!(manager.scheduler_redis_degraded_until.lock().is_some());
+}
+
+#[tokio::test]
+async fn scheduler_admission_soft_budget_overrun_keeps_admission_healthy() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+
+    let result = manager
+        .await_scheduler_redis_admission_outcome("测试 Redis 准入软延迟", true, async move {
+            tokio::time::sleep(SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(25)).await;
+            Ok::<_, anyhow::Error>(7_u32)
+        })
+        .await;
+
+    assert!(matches!(result, SchedulerRedisHotOutcome::Completed(7)));
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_degraded_streak
+            .load(Ordering::Acquire),
+        0
+    );
+}
+
+#[tokio::test]
+async fn scheduler_admission_requires_three_consecutive_hard_timeouts_to_open_breaker() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
+
+    for expected_streak in 1..SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD {
+        let result = manager
+            .await_scheduler_redis_admission_outcome("测试 Redis 准入硬超时", true, async move {
+                std::future::pending::<anyhow::Result<()>>().await
+            })
+            .await;
+        assert!(matches!(result, SchedulerRedisHotOutcome::Failed));
+        assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+        assert_eq!(
+            manager
+                .scheduler_redis_admission_failure_streak
+                .load(Ordering::Acquire),
+            expected_streak
+        );
+    }
+    let result = manager
+        .await_scheduler_redis_admission_outcome("测试 Redis 准入硬超时", true, async move {
+            std::future::pending::<anyhow::Result<()>>().await
+        })
+        .await;
+    assert!(matches!(result, SchedulerRedisHotOutcome::Failed));
+    assert!(manager.scheduler_redis_degraded_until.lock().is_some());
+}
+
+#[tokio::test]
+async fn scheduler_admission_requires_three_consecutive_errors_to_open_breaker() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![test_access_token_credential("token-1", "Pro")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
+
+    for expected_streak in 1..SCHEDULER_REDIS_ADMISSION_FAILURE_THRESHOLD {
+        let result = manager
+            .await_scheduler_redis_admission_outcome("测试 Redis 准入错误", true, async move {
+                Err::<(), _>(anyhow::anyhow!("redis connection closed"))
+            })
+            .await;
+        assert!(matches!(result, SchedulerRedisHotOutcome::Failed));
+        assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+        assert_eq!(
+            manager
+                .scheduler_redis_admission_failure_streak
+                .load(Ordering::Acquire),
+            expected_streak
+        );
+    }
+    let result = manager
+        .await_scheduler_redis_admission_outcome("测试 Redis 准入错误", true, async move {
+            Err::<(), _>(anyhow::anyhow!("redis connection closed"))
+        })
+        .await;
+    assert!(matches!(result, SchedulerRedisHotOutcome::Failed));
+    assert!(manager.scheduler_redis_degraded_until.lock().is_some());
+}
+
+#[tokio::test]
+async fn confirmed_concurrent_admission_success_clears_error_streak() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store),
+        )
+        .unwrap(),
+    );
+    let slow_manager = manager.clone();
+    let slow_success = tokio::spawn(async move {
+        slow_manager
+            .await_scheduler_redis_admission_outcome("并发 Redis 准入成功", true, async move {
+                tokio::time::sleep(SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(25))
+                    .await;
+                Ok::<_, anyhow::Error>(11_u32)
+            })
+            .await
+    });
+    tokio::time::sleep(StdDuration::from_millis(10)).await;
+
+    let failed = manager
+        .await_scheduler_redis_admission_outcome("Redis 准入明确错误", true, async move {
+            Err::<u32, _>(anyhow::anyhow!("redis connection closed"))
+        })
+        .await;
+    assert!(matches!(failed, SchedulerRedisHotOutcome::Failed));
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        1
+    );
+
+    assert!(matches!(
+        slow_success.await.unwrap(),
+        SchedulerRedisHotOutcome::Completed(11)
+    ));
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0
+    );
 }
 
 #[test]
@@ -2054,14 +2825,14 @@ fn test_scheduler_redis_degraded_backoff_grows_on_repeated_failures() {
     .unwrap();
     let err = anyhow::anyhow!("redis timeout");
 
-    manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
+    manager.mark_scheduler_redis_admission_degraded("测试 Redis 准入热路径", &err);
     let first_deadline = *manager.scheduler_redis_degraded_until.lock();
     let first_remaining = first_deadline
         .expect("degraded deadline")
         .saturating_duration_since(Instant::now());
 
     *manager.scheduler_redis_degraded_until.lock() = None;
-    manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
+    manager.mark_scheduler_redis_admission_degraded("测试 Redis 准入热路径", &err);
     let second_deadline = *manager.scheduler_redis_degraded_until.lock();
     let second_remaining = second_deadline
         .expect("degraded deadline")
@@ -2395,6 +3166,77 @@ async fn postgres_success_reset_is_ordered_before_next_cross_manager_failure() {
     store.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_success_auto_reenables_cross_manager_failure_disable_after_postgres_recovers() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credential = api_key_credential("ksk_queued_success_auto_reenable");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager_a = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential.clone()],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+
+    assert!(manager_a.report_failure(1));
+    assert!(manager_a.report_failure(1));
+    let first_connection = store.pool().acquire().await.unwrap();
+    let second_connection = store.pool().acquire().await.unwrap();
+    manager_b.report_success(1);
+    assert_eq!(manager_b.runtime_mutation_backlog().0, 1);
+
+    drop(first_connection);
+    drop(second_connection);
+    assert!(!manager_a.report_failure(1));
+    assert!(
+        store
+            .load_credentials()
+            .await
+            .unwrap()
+            .iter()
+            .any(|credential| credential.id == Some(1) && credential.disabled)
+    );
+
+    manager_b.flush_pending_runtime_mutations_with_budget(StdDuration::from_secs(2));
+    assert_eq!(manager_b.runtime_mutation_backlog(), (0, 0));
+    let runtime = store.load_credential_runtime_state().await.unwrap();
+    assert_eq!(runtime[&1].failure_count, 0);
+    assert!(runtime[&1].disabled_reason.is_none());
+    assert!(
+        store
+            .load_credentials()
+            .await
+            .unwrap()
+            .iter()
+            .any(|credential| credential.id == Some(1) && !credential.disabled)
+    );
+    assert!(manager_a.reload_credentials_from_postgres().unwrap());
+    let reloaded = &manager_a.snapshot().entries[0];
+    assert!(!reloaded.disabled);
+    assert!(reloaded.disabled_reason.is_none());
+
+    store.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_refresh_failure_counts_are_atomic_across_managers() {
     let Some(store) = test_postgres_store().await else {
@@ -2548,6 +3390,7 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
         PendingCredentialRuntimeMutation::Success {
             operation_id: uuid::Uuid::new_v4(),
             expected_generation: 0,
+            count: 1,
         },
     ));
     {
@@ -2572,6 +3415,19 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
         assert_eq!(entries[0].runtime_revision, 1);
     }
     assert_eq!(manager.runtime_mutation_backlog().0, 2);
+
+    let mut failed_ids = HashSet::new();
+    assert!(manager.flush_pending_runtime_mutations_until(
+        Instant::now() + StdDuration::from_secs(2),
+        1,
+        &mut failed_ids,
+    ));
+    assert_eq!(manager.runtime_mutation_backlog().0, 1);
+    {
+        let entries = manager.entries.lock();
+        assert!(entries[0].runtime_persistence_degraded);
+        assert!(entries[0].disabled);
+    }
 
     manager.flush_pending_runtime_mutations();
 
@@ -3047,7 +3903,7 @@ async fn test_all_bad_refresh_tokens_are_bounded_by_auth_cooldown() {
         snapshot
             .entries
             .iter()
-            .all(|entry| entry.refresh_failure_count == 1)
+            .all(|entry| entry.refresh_failure_count == 0)
     );
     assert!(snapshot.entries.iter().all(|entry| entry.cooled_down));
 }
@@ -3724,6 +4580,10 @@ fn test_health_balanced_score_parameters_are_effective() {
         cooldown_reason: None,
         model_cooldowns: HashMap::new(),
         rate_limit_available_at: None,
+        rate_limit_rpm: None,
+        rate_limit_owner_lease_id: None,
+        rate_limit_redis_deadline_ms: None,
+        pending_redis_admission: None,
         in_flight_requests: 1,
         in_flight_leases: Vec::new(),
         warmup_remaining: 0,
@@ -3753,6 +4613,10 @@ fn test_health_balanced_score_parameters_are_effective() {
         cooldown_reason: None,
         model_cooldowns: HashMap::new(),
         rate_limit_available_at: None,
+        rate_limit_rpm: None,
+        rate_limit_owner_lease_id: None,
+        rate_limit_redis_deadline_ms: None,
+        pending_redis_admission: None,
         in_flight_requests: 0,
         in_flight_leases: Vec::new(),
         warmup_remaining: 0,
@@ -4248,6 +5112,7 @@ async fn test_rate_limiter_blocks_after_window_capacity_is_full() {
 
     let manager = Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
     let mut first = manager.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
     first.release_in_flight();
 
     let state = manager.local_pool_route_state(None);
@@ -4257,9 +5122,37 @@ async fn test_rate_limiter_blocks_after_window_capacity_is_full() {
 }
 
 #[tokio::test]
-async fn test_rate_limiter_allows_idle_burst_up_to_rpm_capacity() {
+async fn test_rate_limiter_rolls_back_context_released_before_upstream_dispatch() {
     let mut config = Config::default();
-    config.credential_rpm = Some(50);
+    config.credential_rpm = Some(1);
+
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("t1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    let mut cancelled = manager.acquire_context(None).await.unwrap();
+    let credential_id = cancelled.id;
+    cancelled.release_in_flight();
+
+    assert!(!manager.snapshot().entries[0].rate_limited);
+    let mut next =
+        tokio::time::timeout(StdDuration::from_millis(100), manager.acquire_context(None))
+            .await
+            .expect("pre-dispatch cancellation must not retain the RPM reservation")
+            .unwrap();
+    assert_eq!(next.id, credential_id);
+    next.release_in_flight();
+}
+
+#[tokio::test]
+async fn test_rate_limiter_paces_idle_requests_instead_of_bursting() {
+    let mut config = Config::default();
+    config.credential_rpm = Some(6_000);
     config.credential_max_concurrent_requests = 50;
     config.dispatch_global_max_concurrent_requests = 80;
 
@@ -4272,18 +5165,21 @@ async fn test_rate_limiter_allows_idle_burst_up_to_rpm_capacity() {
     )
     .unwrap();
 
-    let mut leases = Vec::new();
-    for _ in 0..50 {
-        leases.push(manager.acquire_context(None).await.unwrap());
-    }
+    let mut first = manager.acquire_context(None).await.unwrap();
+    let started = Instant::now();
+    let mut second =
+        tokio::time::timeout(StdDuration::from_millis(500), manager.acquire_context(None))
+            .await
+            .expect("pacing interval should expire within the test deadline")
+            .unwrap();
 
     let snapshot = manager.snapshot();
-    assert_eq!(snapshot.global_in_flight_requests, 50);
+    assert!(started.elapsed() >= StdDuration::from_millis(8));
+    assert_eq!(snapshot.global_in_flight_requests, 2);
     assert!(snapshot.entries[0].rate_limited);
 
-    for lease in &mut leases {
-        lease.release_in_flight();
-    }
+    first.release_in_flight();
+    second.release_in_flight();
 }
 
 #[tokio::test]
@@ -4301,6 +5197,7 @@ async fn test_runtime_config_disabling_credential_rpm_clears_rate_limit_state() 
     .unwrap();
 
     let mut first = manager.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
     first.release_in_flight();
     assert!(manager.snapshot().entries[0].rate_limited);
 
@@ -4320,6 +5217,69 @@ async fn test_runtime_config_disabling_credential_rpm_clears_rate_limit_state() 
 }
 
 #[tokio::test]
+async fn test_runtime_config_nonzero_rpm_change_drops_old_pacing_deadline() {
+    let mut config = Config::default();
+    config.credential_rpm = Some(1);
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("t1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    let mut first = manager.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
+    first.release_in_flight();
+    assert!(manager.snapshot().entries[0].rate_limited);
+
+    manager
+        .update_runtime_config(|config| config.credential_rpm = Some(6_000))
+        .unwrap();
+    let mut second =
+        tokio::time::timeout(StdDuration::from_millis(100), manager.acquire_context(None))
+            .await
+            .expect("the old one-RPM deadline must not survive a nonzero RPM change")
+            .unwrap();
+    second.mark_upstream_dispatch_started();
+    second.release_in_flight();
+}
+
+#[test]
+fn test_redis_rate_limit_results_merge_by_deadline_and_reject_old_rpm() {
+    let mut config = Config::default();
+    config.credential_rpm = Some(6_000);
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("t1", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    manager.apply_redis_rate_limit_available_at(1, 6_000, 20_000, 50, Some(2));
+    manager.apply_redis_rate_limit_available_at(1, 6_000, 10_000, 5_000, Some(1));
+    manager.apply_redis_rate_limit_available_at(1, 6_000, 20_000, 500, None);
+    {
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].rate_limit_redis_deadline_ms, Some(20_000));
+        assert_eq!(entries[0].rate_limit_owner_lease_id, Some(2));
+    }
+
+    manager
+        .update_runtime_config(|config| config.credential_rpm = None)
+        .unwrap();
+    manager.apply_redis_rate_limit_available_at(1, 6_000, 30_000, 60_000, Some(3));
+    let entries = manager.entries.lock();
+    assert!(entries[0].rate_limit_available_at.is_none());
+    assert!(entries[0].rate_limit_rpm.is_none());
+    assert!(entries[0].rate_limit_owner_lease_id.is_none());
+    assert!(entries[0].rate_limit_redis_deadline_ms.is_none());
+}
+
+#[tokio::test]
 async fn test_credential_rpm_override_limits_when_global_unlimited() {
     let mut config = Config::default();
     config.credential_rpm = None;
@@ -4329,6 +5289,7 @@ async fn test_credential_rpm_override_limits_when_global_unlimited() {
 
     let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
     let mut first = manager.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
     first.release_in_flight();
 
     let snapshot = manager.snapshot();
@@ -4547,6 +5508,291 @@ async fn test_fail_fast_global_capacity_full_returns_without_queueing() {
 }
 
 #[tokio::test]
+async fn selective_rate_limit_fail_fast_does_not_queue() {
+    let mut credential = api_key_credential("selective-rate-limit");
+    credential.rpm = Some(60);
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    let mut first = manager.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
+    first.release_in_flight();
+
+    let started_at = Instant::now();
+    let err = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::SelectiveFailFast {
+                rate_limit: true,
+                concurrency: false,
+            },
+            1,
+        )
+        .await
+        .err()
+        .expect("rate-limited selective fail-fast request must return an error");
+
+    assert!(started_at.elapsed() < StdDuration::from_millis(250));
+    assert_eq!(manager.snapshot().queued_requests, 0);
+    let summary = manager.selection_failure_summary(
+        "selective-rate-limit",
+        "local_account",
+        None,
+        &err.to_string(),
+    );
+    assert_eq!(summary.primary_reason, AccountRejectReason::RpmLimited);
+}
+
+#[tokio::test]
+async fn selective_rate_limit_fail_fast_still_waits_for_concurrency() {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    let manager = Arc::new(
+        MultiTokenManager::new(
+            config,
+            vec![api_key_credential("selective-concurrency-wait")],
+            None,
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let mut first = manager.acquire_context(None).await.unwrap();
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::SelectiveFailFast {
+                    rate_limit: true,
+                    concurrency: false,
+                },
+                1,
+            )
+            .await
+    });
+
+    tokio::time::sleep(StdDuration::from_millis(40)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(manager.snapshot().queued_requests, 1);
+    first.release_in_flight();
+
+    let mut second = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+        .await
+        .expect("rate-only fail-fast request must resume after concurrency is released")
+        .unwrap()
+        .unwrap();
+    assert_eq!(manager.snapshot().queued_requests, 0);
+    second.release_in_flight();
+}
+
+#[tokio::test]
+async fn selective_mixed_pressure_waits_for_concurrency_before_rate_fallback() {
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    let mut credential = api_key_credential("selective-mixed-pressure");
+    credential.rpm = Some(60);
+    let manager =
+        Arc::new(MultiTokenManager::new(config, vec![credential], None, None, false).unwrap());
+    let mut first = manager.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
+    let mixed_state = manager.compute_local_pool_route_state(None);
+    assert_eq!(mixed_state.kind, LocalPoolRouteStateKind::CapacityFull);
+    assert_eq!(mixed_state.rate_limit_blocked, 1);
+    assert_eq!(mixed_state.concurrency_blocked, 1);
+
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::SelectiveFailFast {
+                    rate_limit: true,
+                    concurrency: false,
+                },
+                1,
+            )
+            .await
+    });
+    tokio::time::sleep(StdDuration::from_millis(40)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(manager.snapshot().queued_requests, 1);
+
+    first.release_in_flight();
+    let result = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+        .await
+        .expect("request must be reclassified promptly after concurrency clears")
+        .unwrap();
+    let error = match result {
+        Ok(mut context) => {
+            context.release_in_flight();
+            panic!("remaining RPM pressure should become the external fallback signal");
+        }
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("RPM 调度暂不可用"));
+    assert_eq!(manager.snapshot().queued_requests, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_capacity_admission_is_not_reclassified_as_rate_limit() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    let mut credential = api_key_credential("redis-mixed-pressure");
+    credential.id = Some(1);
+    credential.rpm = Some(60);
+    let manager_a = MultiTokenManager::new_with_stores(
+        config.clone(),
+        vec![credential.clone()],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+
+    let mut first = manager_a.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
+    *manager_b.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    let waiting_manager = manager_b.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::SelectiveFailFast {
+                    rate_limit: true,
+                    concurrency: false,
+                },
+                1,
+            )
+            .await
+    });
+
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    assert!(
+        !waiting.is_finished(),
+        "Redis Lua CapacityFull 必须按并发压力等待，不能被本地 RPM 镜像误判后 fail-fast"
+    );
+    first.release_in_flight();
+    let result = tokio::time::timeout(StdDuration::from_secs(2), waiting)
+        .await
+        .expect("request should be reclassified after distributed concurrency clears")
+        .unwrap();
+    match result {
+        Ok(mut context) => {
+            context.release_in_flight();
+        }
+        Err(error) => assert!(error.to_string().contains("RPM 调度暂不可用")),
+    }
+    redis_store.clear_rate_limit(1).await.unwrap();
+    redis_store.clear_in_flight_leases(1, None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slot_race_exclusion_is_restored_before_waiting_on_another_credential() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    let mut paced = api_key_credential("paced");
+    paced.id = Some(1);
+    paced.rpm = Some(60);
+    paced.priority = 1;
+    let mut busy = api_key_credential("busy");
+    busy.id = Some(2);
+    busy.rpm = Some(0);
+    busy.priority = 2;
+    let mut caller_excluded = api_key_credential("caller-excluded");
+    caller_excluded.id = Some(3);
+    caller_excluded.rpm = Some(0);
+    caller_excluded.priority = 0;
+
+    let pacing_manager = MultiTokenManager::new_with_stores(
+        config.clone(),
+        vec![paced.clone()],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            vec![paced, busy, caller_excluded],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+
+    let mut paced_context = pacing_manager.acquire_context(None).await.unwrap();
+    paced_context.mark_upstream_dispatch_started();
+    paced_context.release_in_flight();
+    let busy_lease = manager
+        .acquire_in_flight_lease_for_test(2)
+        .expect("second credential should be held at local concurrency capacity");
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move {
+        let caller_excluded_ids = HashSet::from([3]);
+        waiting_manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &caller_excluded_ids,
+                AcquireMode::SelectiveFailFast {
+                    rate_limit: true,
+                    concurrency: false,
+                },
+                1,
+            )
+            .await
+    });
+    let mut context = tokio::time::timeout(StdDuration::from_secs(2), waiting)
+        .await
+        .expect("paced credential must be reconsidered after its Redis deadline expires")
+        .unwrap()
+        .unwrap();
+    assert_eq!(context.id, 1);
+    context.release_in_flight();
+    drop(busy_lease);
+    redis_store.clear_rate_limit(1).await.unwrap();
+    redis_store.clear_in_flight_leases(1, None).await.unwrap();
+}
+
+#[tokio::test]
 async fn test_weighted_local_capacity_consumes_single_credential_slots() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 4;
@@ -4674,6 +5920,7 @@ async fn test_weighted_selection_pressure_counts_capacity_units_not_total_reques
         )
         .await
         .unwrap();
+    ctx.mark_upstream_dispatch_started();
     ctx.release_in_flight();
 
     let snapshot = manager.snapshot();
@@ -4708,6 +5955,7 @@ async fn test_weighted_rpm_consumes_capacity_units() {
         )
         .await
         .unwrap();
+    ctx.mark_upstream_dispatch_started();
     ctx.release_in_flight();
 
     let state = manager.local_pool_route_state(None);
@@ -4809,7 +6057,7 @@ async fn selection_failure_summary_records_concurrency_full_accounts() {
 #[tokio::test]
 async fn selection_failure_summary_records_rpm_limited_accounts() {
     let mut config = Config::default();
-    config.credential_rpm = Some(60);
+    config.credential_rpm = Some(1);
     let manager = MultiTokenManager::new(
         config,
         vec![test_access_token_credential("first", "Pro")],
@@ -4819,10 +6067,9 @@ async fn selection_failure_summary_records_rpm_limited_accounts() {
     )
     .unwrap();
 
-    for _ in 0..60 {
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        ctx.release_in_flight();
-    }
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    ctx.mark_upstream_dispatch_started();
+    ctx.release_in_flight();
     let summary = manager.selection_failure_summary(
         "req_rpm",
         "/cc/v1/messages",
@@ -4977,6 +6224,31 @@ async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
     assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
     assert_eq!(ready.model_usable, 1);
     assert_eq!(ready.dispatchable, 1);
+}
+
+#[tokio::test]
+async fn local_pool_route_state_cache_expires_at_rate_limit_deadline() {
+    let mut credential = api_key_credential("route-state-paced");
+    credential.rpm = Some(60);
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+    {
+        let mut entries = manager.entries.lock();
+        entries[0].rate_limit_available_at = Some(Instant::now() + StdDuration::from_millis(80));
+        entries[0].rate_limit_rpm = Some(60);
+    }
+
+    let blocked = manager.local_pool_route_state(None);
+    assert_eq!(blocked.kind, LocalPoolRouteStateKind::AllCoolingDown);
+    assert_eq!(blocked.rate_limit_blocked, 1);
+
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    let ready = manager.local_pool_route_state(None);
+    assert_eq!(
+        ready.kind,
+        LocalPoolRouteStateKind::Ready,
+        "time-driven pacing expiry must not remain hidden behind the 250ms route-state cache"
+    );
 }
 
 #[test]
@@ -5685,11 +6957,14 @@ async fn redis_backed_in_flight_limit_is_shared_between_managers() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
     config.credential_dispatch_max_wait_secs = 2;
+    let credential_id = 98_640;
+    let mut credential = api_key_credential("shared-manager-in-flight");
+    credential.id = Some(credential_id);
 
     let manager_a = Arc::new(
         MultiTokenManager::new_with_stores(
             config.clone(),
-            vec![api_key_credential("a")],
+            vec![credential.clone()],
             None,
             None,
             false,
@@ -5701,12 +6976,12 @@ async fn redis_backed_in_flight_limit_is_shared_between_managers() {
     let manager_b = Arc::new(
         MultiTokenManager::new_with_stores(
             config,
-            vec![api_key_credential("a")],
+            vec![credential],
             None,
             None,
             false,
             None,
-            Some(redis_store),
+            Some(redis_store.clone()),
         )
         .unwrap(),
     );
@@ -5727,6 +7002,1406 @@ async fn redis_backed_in_flight_limit_is_shared_between_managers() {
         .expect("等待任务不应 panic")
         .expect("等待请求应成功");
     second.release_in_flight();
+    redis_store
+        .clear_in_flight_leases(credential_id, None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credential_rpm_reload_replaces_old_redis_pacing_across_managers() {
+    let Some(postgres_store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        postgres_store.drop_test_schema().await.unwrap();
+        return;
+    };
+
+    let mut credential = api_key_credential("rpm-reload");
+    credential.id = Some(1);
+    credential.rpm = Some(1);
+    postgres_store
+        .save_credentials(&[credential.clone()])
+        .await
+        .unwrap();
+    let manager_a = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential.clone()],
+        None,
+        None,
+        false,
+        Some(postgres_store.clone()),
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(postgres_store.clone()),
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+
+    let mut first = manager_a.acquire_context(None).await.unwrap();
+    first.mark_upstream_dispatch_started();
+    first.release_in_flight();
+    assert!(manager_a.snapshot().entries[0].rate_limited);
+
+    manager_a.set_credential_rpm(1, Some(6_000)).unwrap();
+    assert!(manager_b.reload_credentials_from_postgres().unwrap());
+    let mut second = tokio::time::timeout(
+        StdDuration::from_millis(500),
+        manager_b.acquire_context(None),
+    )
+    .await
+    .expect("the reloaded 6000 RPM override must replace the old Redis one-RPM deadline")
+    .unwrap();
+    assert_eq!(second.id, 1);
+    second.mark_upstream_dispatch_started();
+    second.release_in_flight();
+
+    redis_store.clear_rate_limit(1).await.unwrap();
+    redis_store.clear_in_flight_leases(1, None).await.unwrap();
+    postgres_store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn redis_admission_local_commit_failure_rolls_back_unissued_pacing_slot() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut credential = api_key_credential("local-commit-rollback");
+    credential.id = Some(1);
+    credential.rpm = Some(60);
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let lease_id = redis_store.next_in_flight_lease_id().await.unwrap();
+    let admission = redis_store
+        .acquire_dispatch_lease_with_rate_limit(
+            1,
+            lease_id,
+            1,
+            1,
+            1,
+            60,
+            Some(StdDuration::from_secs(60)),
+            InFlightKind::Api.as_str(),
+        )
+        .await
+        .unwrap();
+    let reservation = match admission {
+        SchedulerDispatchAdmission::Acquired {
+            rate_limit_available_at_ms: Some(redis_deadline_ms),
+            rate_limit_remaining_ms: Some(remaining_ms),
+            rate_limit_rpm: Some(rpm),
+            rate_limit_owner_lease_id: Some(owner_lease_id),
+            ..
+        } => RateLimitReservation {
+            available_at: Instant::now() + StdDuration::from_millis(remaining_ms),
+            rpm,
+            owner_lease_id: Some(owner_lease_id),
+            redis_deadline_ms: Some(redis_deadline_ms),
+        },
+        other => panic!("Redis admission should succeed, got {other:?}"),
+    };
+
+    {
+        let mut entries = manager.entries.lock();
+        entries[0].in_flight_requests = 1;
+    }
+    assert!(matches!(
+        manager.acquire_local_in_flight_slot_with_id(
+            1,
+            lease_id,
+            Instant::now(),
+            1,
+            1,
+            1,
+            0,
+            Some(reservation),
+            false,
+        ),
+        LocalInFlightSlotOutcome::ConcurrencyFull
+    ));
+    release_redis_in_flight_lease_and_wakeup(redis_store.clone(), 1, lease_id, false, true, 2)
+        .await
+        .unwrap();
+    manager.entries.lock()[0].in_flight_requests = 0;
+
+    let state = redis_store
+        .scheduler_state_for_credentials(&[1])
+        .await
+        .unwrap()
+        .remove(&1)
+        .unwrap();
+    assert!(state.rate_limit_available_at_ms.is_none());
+    assert!(state.in_flight_leases.is_empty());
+}
+
+#[tokio::test]
+async fn redis_admission_pre_eval_delay_does_not_expire_local_pacing_early() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut credential = api_key_credential("admission-pre-eval-delay");
+    credential.id = Some(1);
+    credential.rpm = Some(60);
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    redis_store.delay_next_scheduler_admission_before_eval(StdDuration::from_millis(125));
+
+    let started_at = Instant::now();
+    let mut context = manager.acquire_context(None).await.unwrap();
+    let admission_elapsed = started_at.elapsed();
+    let local_remaining = manager.entries.lock()[0]
+        .rate_limit_available_at
+        .expect("successful paced admission must install a local deadline")
+        .saturating_duration_since(Instant::now());
+
+    assert!(admission_elapsed >= StdDuration::from_millis(100));
+    assert!(
+        local_remaining >= StdDuration::from_millis(900),
+        "delay before Redis executes the Lua script must not be deducted from its deadline: elapsed={admission_elapsed:?}, remaining={local_remaining:?}"
+    );
+
+    context.mark_upstream_dispatch_started();
+    context.release_in_flight();
+    redis_store.clear_rate_limit(1).await.unwrap();
+    redis_store.clear_in_flight_leases(1, None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_request_cannot_leave_committed_redis_admission() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut credential = api_key_credential("cancelled-admission-cleanup");
+    credential.id = Some(1);
+    credential.rpm = Some(60);
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    redis_store.delay_next_scheduler_admission_after_eval(StdDuration::from_millis(500));
+    let acquiring_manager = manager.clone();
+    let acquiring = tokio::spawn(async move { acquiring_manager.acquire_context(None).await });
+
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+            if !state.in_flight_leases.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("test admission never committed in Redis");
+
+    acquiring.abort();
+    let _ = acquiring.await;
+    {
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].in_flight_requests, 0);
+        assert!(entries[0].pending_redis_admission.is_none());
+    }
+
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+            if state.in_flight_leases.is_empty() && state.rate_limit_available_at_ms.is_none() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled admission was not reconciled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_admission_gate_saturation_is_fail_fast_capacity_not_redis_failure() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_id = 98_701;
+    redis_store.clear_rate_limit(credential_id).await.unwrap();
+    redis_store
+        .clear_in_flight_leases(credential_id, None)
+        .await
+        .unwrap();
+    let mut credential = api_key_credential("admission-gate-saturation");
+    credential.id = Some(credential_id);
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let gate = manager.scheduler_redis_admission_gate.clone();
+    let mut held_permits = Vec::with_capacity(SCHEDULER_REDIS_ADMISSION_MAX_IN_FLIGHT);
+    for _ in 0..SCHEDULER_REDIS_ADMISSION_MAX_IN_FLIGHT {
+        held_permits.push(
+            gate.clone()
+                .try_acquire_owned()
+                .expect("test must fill every admission execution slot"),
+        );
+    }
+    assert_eq!(gate.available_permits(), 0);
+    let eval_count = redis_store.scheduler_admission_eval_count();
+    let excluded = HashSet::new();
+
+    let delayed_release_permit = held_permits.pop().unwrap();
+    let delayed_release = tokio::spawn(async move {
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        drop(delayed_release_permit);
+    });
+    let mut context = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &excluded,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .expect("a gate permit released within 10ms must be consumed by real Redis admission");
+    delayed_release.await.unwrap();
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 1,
+        "the bounded gate wait must absorb a short healthy wave and execute EVAL"
+    );
+    context.mark_upstream_dispatch_started();
+    context.release_in_flight();
+
+    held_permits.push(
+        gate.clone()
+            .try_acquire_owned()
+            .expect("the successful EVAL must release its gate permit"),
+    );
+    assert_eq!(gate.available_permits(), 0);
+    let saturated_eval_count = redis_store.scheduler_admission_eval_count();
+    let started_at = Instant::now();
+    let error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &excluded,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .err()
+        .expect("a saturated admission gate must fail fast as capacity");
+
+    assert!(
+        started_at.elapsed()
+            <= SCHEDULER_REDIS_ADMISSION_GATE_WAIT_MAX + StdDuration::from_millis(25),
+        "sustained gate pressure must route as capacity within 75ms"
+    );
+    assert!(error.to_string().contains("调度容量暂不可用"));
+    assert!(!error.to_string().contains("Redis 调度协调状态不可用"));
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        saturated_eval_count
+    );
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0,
+        "execution-slot pressure must not count as a Redis health failure"
+    );
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    drop(held_permits);
+    redis_store.clear_rate_limit(credential_id).await.unwrap();
+    redis_store
+        .clear_in_flight_leases(credential_id, None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provisional_redis_admission_prevents_forty_account_reselection_wave() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credentials = (0..40)
+        .map(|offset| {
+            let mut credential = api_key_credential(&format!("provisional-wave-{offset}"));
+            credential.id = Some(99_100 + offset);
+            credential.rpm = Some(60);
+            credential
+        })
+        .collect();
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            credentials,
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    manager.delay_each_redis_admission_owner_before_submit(StdDuration::from_millis(70));
+    let eval_count = redis_store.scheduler_admission_eval_count();
+    let barrier = Arc::new(tokio::sync::Barrier::new(41));
+    let mut tasks = Vec::new();
+    for _ in 0..40 {
+        let task_manager = manager.clone();
+        let task_barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            task_barrier.wait().await;
+            task_manager
+                .acquire_context_for_session_with_mode(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    AcquireMode::SelectiveFailFast {
+                        rate_limit: true,
+                        concurrency: true,
+                    },
+                    1,
+                )
+                .await
+        }));
+    }
+    barrier.wait().await;
+
+    let mut contexts = Vec::new();
+    for result in futures::future::join_all(tasks).await {
+        contexts.push(
+            result
+                .expect("provisional admission task must not panic")
+                .expect("40 credentials must admit the 40-request wave"),
+        );
+    }
+    let selected_ids = contexts
+        .iter()
+        .map(|context| context.id)
+        .collect::<HashSet<_>>();
+    assert_eq!(selected_ids.len(), 40);
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 40,
+        "each request must submit exactly one admission EVAL"
+    );
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0
+    );
+    assert!(
+        manager
+            .entries
+            .lock()
+            .iter()
+            .all(|entry| entry.pending_redis_admission.is_none())
+    );
+    for context in &mut contexts {
+        context.mark_upstream_dispatch_started();
+        context.release_in_flight();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provisional_redis_admission_preserves_no_rpm_concurrency() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_id = 99_149;
+    let mut credential = api_key_credential("provisional-no-rpm");
+    credential.id = Some(credential_id);
+    credential.rpm = Some(0);
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 20;
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    manager.delay_each_redis_admission_owner_before_submit(StdDuration::from_millis(70));
+    let eval_count = redis_store.scheduler_admission_eval_count();
+    let barrier = Arc::new(tokio::sync::Barrier::new(21));
+    let mut tasks = Vec::new();
+    for _ in 0..20 {
+        let task_manager = manager.clone();
+        let task_barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            task_barrier.wait().await;
+            task_manager
+                .acquire_context_for_session_with_mode(
+                    None,
+                    None,
+                    &HashSet::new(),
+                    AcquireMode::SelectiveFailFast {
+                        rate_limit: true,
+                        concurrency: true,
+                    },
+                    1,
+                )
+                .await
+        }));
+    }
+    barrier.wait().await;
+
+    let mut contexts = Vec::new();
+    for result in futures::future::join_all(tasks).await {
+        contexts.push(
+            result
+                .expect("no-RPM admission task must not panic")
+                .expect("one credential must fill all 20 configured concurrency slots"),
+        );
+    }
+    assert_eq!(manager.entries.lock()[0].in_flight_requests, 20);
+    assert!(manager.entries.lock()[0].pending_redis_admission.is_none());
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 20
+    );
+    for context in &mut contexts {
+        context.mark_upstream_dispatch_started();
+        context.release_in_flight();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_redis_pacing_survives_snapshot_and_rejects_second_eval_immediately() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_id = 99_150;
+    let mut credential = api_key_credential("pending-pacing-single");
+    credential.id = Some(credential_id);
+    credential.rpm = Some(60);
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    manager.delay_next_redis_admission_owner_before_submit(StdDuration::from_millis(100));
+    let eval_count = redis_store.scheduler_admission_eval_count();
+    let first_manager = manager.clone();
+    let first = tokio::spawn(async move { first_manager.acquire_context(None).await });
+
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        loop {
+            if manager.entries.lock()[0].pending_redis_admission.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first request must install provisional pacing before awaiting Redis");
+
+    manager.apply_scheduler_states(HashMap::from([(
+        credential_id,
+        SchedulerCredentialState::default(),
+    )]));
+    {
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].in_flight_requests, 1);
+        assert!(entries[0].pending_redis_admission.is_some());
+    }
+
+    let before_second_eval = redis_store.scheduler_admission_eval_count();
+    let started_at = Instant::now();
+    let error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::SelectiveFailFast {
+                rate_limit: true,
+                concurrency: true,
+            },
+            1,
+        )
+        .await
+        .err()
+        .expect("a second request must use the external RPM fallback signal");
+    assert!(started_at.elapsed() < StdDuration::from_millis(75));
+    assert!(error.to_string().contains("RPM 调度暂不可用"));
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        before_second_eval,
+        "pending local pacing must suppress a duplicate Redis EVAL"
+    );
+
+    let mut first_context = tokio::time::timeout(StdDuration::from_secs(1), first)
+        .await
+        .expect("first admission must finish")
+        .expect("first admission task must not panic")
+        .expect("first admission must succeed");
+    assert_eq!(redis_store.scheduler_admission_eval_count(), eval_count + 1);
+    assert!(manager.entries.lock()[0].pending_redis_admission.is_none());
+    first_context.mark_upstream_dispatch_started();
+    first_context.release_in_flight();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_runtime_snapshots_share_background_redis_refresh_and_report_real_freshness() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credentials = (0..40)
+        .map(|offset| {
+            let mut credential = api_key_credential(&format!("runtime-singleflight-{offset}"));
+            credential.id = Some(99_200 + offset);
+            credential
+        })
+        .collect();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let ids = (0..40).map(|offset| 99_200 + offset).collect::<Vec<_>>();
+    let old_success = Instant::now()
+        .checked_sub(SCHEDULER_REDIS_RUNTIME_FRESH_MAX_AGE + StdDuration::from_secs(1))
+        .unwrap();
+    *manager.last_scheduler_redis_sync_success_at.lock() = Some(old_success);
+    *manager.last_scheduler_redis_sync_at.lock() = None;
+    let snapshot_count = redis_store.scheduler_state_snapshot_count();
+
+    for _ in 0..10 {
+        let snapshot = manager.runtime_snapshot_for_ids(&ids);
+        assert!(!snapshot.runtime_fresh);
+    }
+    assert_eq!(
+        redis_store.scheduler_state_snapshot_count(),
+        snapshot_count,
+        "Admin reads must enqueue one background refresh without blocking for it"
+    );
+
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        loop {
+            if redis_store.scheduler_state_snapshot_count() == snapshot_count + 1
+                && manager.scheduler_redis_runtime_fresh(Instant::now())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the shared background Redis snapshot must complete");
+    assert!(manager.runtime_snapshot_for_ids(&ids).runtime_fresh);
+    assert_eq!(
+        redis_store.scheduler_state_snapshot_count(),
+        snapshot_count + 1,
+        "repeated Admin reads inside the one-second interval must reuse the same snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_admission_gate_busy_is_pool_scoped_across_forty_credentials() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credentials = (0..40)
+        .map(|offset| {
+            let mut credential = api_key_credential(&format!("gate-busy-{offset}"));
+            credential.id = Some(98_710 + offset);
+            credential
+        })
+        .collect();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let gate = manager.scheduler_redis_admission_gate.clone();
+    let held_permits = (0..SCHEDULER_REDIS_ADMISSION_MAX_IN_FLIGHT)
+        .map(|_| {
+            gate.clone()
+                .try_acquire_owned()
+                .expect("test must fill every admission execution slot")
+        })
+        .collect::<Vec<_>>();
+    let eval_count = redis_store.scheduler_admission_eval_count();
+
+    let started_at = Instant::now();
+    let error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::SelectiveFailFast {
+                rate_limit: true,
+                concurrency: true,
+            },
+            1,
+        )
+        .await
+        .err()
+        .expect("a pool-scoped busy gate must fail external preflight");
+
+    assert!(
+        started_at.elapsed()
+            <= SCHEDULER_REDIS_ADMISSION_GATE_WAIT_MAX + StdDuration::from_millis(25),
+        "gate busy must be paid once for the pool, not once per credential"
+    );
+    assert!(error.to_string().contains("调度容量暂不可用"));
+    assert!(!error.to_string().contains("Redis 调度协调状态不可用"));
+    assert_eq!(redis_store.scheduler_admission_eval_count(), eval_count);
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0
+    );
+    drop(held_permits);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_global_capacity_full_is_pool_scoped_without_account_reselection() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_ids = (0..40).map(|offset| 98_800 + offset).collect::<Vec<_>>();
+    let credentials = credential_ids
+        .iter()
+        .copied()
+        .map(|id| {
+            let mut credential = api_key_credential(&format!("global-full-{id}"));
+            credential.id = Some(id);
+            credential
+        })
+        .collect();
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 15;
+    config.dispatch_global_max_concurrent_requests = 1;
+    let manager = MultiTokenManager::new_with_stores(
+        config,
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    let occupied =
+        occupy_redis_dispatch_slots(&redis_store, &credential_ids[..1], 15, 1, 9_880_000).await;
+    let eval_count = redis_store.scheduler_admission_eval_count();
+
+    let error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::SelectiveFailFast {
+                rate_limit: false,
+                concurrency: true,
+            },
+            1,
+        )
+        .await
+        .err()
+        .expect("global capacity must fail external preflight");
+
+    assert!(error.to_string().contains("调度容量暂不可用"));
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 1,
+        "authoritative global capacity rejection must not walk every credential"
+    );
+    release_redis_dispatch_slots(&redis_store, &occupied).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_mode_global_redis_capacity_full_queues_after_one_rejection_eval() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_ids = (0..40).map(|offset| 98_850 + offset).collect::<Vec<_>>();
+    let credentials = credential_ids
+        .iter()
+        .copied()
+        .map(|id| {
+            let mut credential = api_key_credential(&format!("wait-global-full-{id}"));
+            credential.id = Some(id);
+            credential
+        })
+        .collect();
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 15;
+    config.dispatch_global_max_concurrent_requests = 1;
+    config.dispatch_max_queued_requests = 10;
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            credentials,
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    let occupied =
+        occupy_redis_dispatch_slots(&redis_store, &credential_ids[..1], 15, 1, 9_885_000).await;
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    let eval_count = redis_store.scheduler_admission_eval_count();
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::WaitForCapacityMax(StdDuration::from_secs(2)),
+                1,
+            )
+            .await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        loop {
+            if manager.snapshot().queued_requests == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("global Redis capacity rejection must enter the wait queue");
+    assert!(!waiting.is_finished());
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 1,
+        "global capacity code 4 must queue after one pool-scoped EVAL instead of walking accounts"
+    );
+
+    release_redis_dispatch_slots(&redis_store, &occupied).await;
+    manager.in_flight_notify.notify_one();
+    let mut context = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+        .await
+        .expect("global capacity waiter must resume after the Redis lease is released")
+        .expect("global capacity waiter task must not panic")
+        .expect("global capacity waiter must acquire after capacity returns");
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 2,
+        "capacity recovery should need only the original rejection and one successful EVAL"
+    );
+    assert_eq!(manager.snapshot().queued_requests, 0);
+    context.mark_upstream_dispatch_started();
+    context.release_in_flight();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credential_scoped_redis_capacity_can_reselect_a_later_free_credential() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_ids = (0..40).map(|offset| 98_900 + offset).collect::<Vec<_>>();
+    let credentials = credential_ids
+        .iter()
+        .copied()
+        .map(|id| {
+            let mut credential = api_key_credential(&format!("credential-full-{id}"));
+            credential.id = Some(id);
+            credential
+        })
+        .collect();
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.dispatch_global_max_concurrent_requests = 0;
+    let manager = MultiTokenManager::new_with_stores(
+        config,
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    let occupied =
+        occupy_redis_dispatch_slots(&redis_store, &credential_ids[..39], 1, 0, 9_890_000).await;
+
+    let mut context = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::SelectiveFailFast {
+                rate_limit: false,
+                concurrency: true,
+            },
+            1,
+        )
+        .await
+        .expect("credential-scoped capacity rejection must preserve account reselection");
+
+    assert_eq!(context.id, credential_ids[39]);
+    context.mark_upstream_dispatch_started();
+    context.release_in_flight();
+    release_redis_dispatch_slots(&redis_store, &occupied).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_mode_reselects_a_free_lower_priority_credential_without_queueing() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_ids = [98_950, 98_951];
+    let mut preferred = api_key_credential("wait-preferred-redis-full");
+    preferred.id = Some(credential_ids[0]);
+    preferred.priority = 0;
+    let mut fallback = api_key_credential("wait-fallback-redis-free");
+    fallback.id = Some(credential_ids[1]);
+    fallback.priority = 1;
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.dispatch_max_queued_requests = 10;
+    let manager = MultiTokenManager::new_with_stores(
+        config,
+        vec![preferred, fallback],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let occupied =
+        occupy_redis_dispatch_slots(&redis_store, &credential_ids[..1], 1, 0, 9_895_000).await;
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    let eval_count = redis_store.scheduler_admission_eval_count();
+
+    let started_at = Instant::now();
+    let mut context = tokio::time::timeout(
+        StdDuration::from_secs(1),
+        manager.acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::WaitForCapacityMax(StdDuration::from_secs(1)),
+            1,
+        ),
+    )
+    .await
+    .expect("Wait mode must not queue behind a Redis-full preferred credential")
+    .expect("Wait mode must immediately reselect the free credential");
+
+    assert_eq!(context.id, credential_ids[1]);
+    assert!(
+        started_at.elapsed() <= SCHEDULER_REDIS_RESELECTION_BUDGET + StdDuration::from_millis(75),
+        "account-scoped Redis capacity rejection must stay inside one reselection wave"
+    );
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 2,
+        "Wait mode should evaluate the full preferred account once and the free fallback once"
+    );
+    assert_eq!(manager.snapshot().queued_requests, 0);
+    context.mark_upstream_dispatch_started();
+    context.release_in_flight();
+    release_redis_dispatch_slots(&redis_store, &occupied).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_mode_restores_redis_capacity_exclusions_before_queueing() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_ids = [98_960, 98_961];
+    let credentials = credential_ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(priority, id)| {
+            let mut credential = api_key_credential(&format!("wait-restore-full-{id}"));
+            credential.id = Some(id);
+            credential.priority = priority as u32;
+            credential
+        })
+        .collect();
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.dispatch_max_queued_requests = 10;
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            credentials,
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    let occupied =
+        occupy_redis_dispatch_slots(&redis_store, &credential_ids, 1, 0, 9_896_000).await;
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    let eval_count = redis_store.scheduler_admission_eval_count();
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::WaitForCapacityMax(StdDuration::from_secs(2)),
+                1,
+            )
+            .await
+    });
+
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        loop {
+            if manager.snapshot().queued_requests == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exhausting account-scoped Redis candidates must wait instead of returning an exclusion error");
+    assert!(!waiting.is_finished());
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count + 2,
+        "one reselection wave should inspect each account once before waiting"
+    );
+
+    release_redis_dispatch_slots(&redis_store, &occupied[1..]).await;
+    manager.in_flight_notify.notify_one();
+    let mut context = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+        .await
+        .expect("account capacity waiter must resume after one Redis lease is released")
+        .expect("account capacity waiter task must not panic")
+        .expect("restored candidates must be eligible after real waiting");
+    assert_eq!(context.id, credential_ids[1]);
+    assert_eq!(manager.snapshot().queued_requests, 0);
+    context.mark_upstream_dispatch_started();
+    context.release_in_flight();
+    release_redis_dispatch_slots(&redis_store, &occupied[..1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_credential_rejections_share_one_fail_fast_reselection_deadline() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let credential_ids = (0..40).map(|offset| 99_000 + offset).collect::<Vec<_>>();
+    let credentials = credential_ids
+        .iter()
+        .copied()
+        .map(|id| {
+            let mut credential = api_key_credential(&format!("slow-capacity-{id}"));
+            credential.id = Some(id);
+            credential
+        })
+        .collect();
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.dispatch_global_max_concurrent_requests = 0;
+    let manager = MultiTokenManager::new_with_stores(
+        config,
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    *manager.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+    let occupied =
+        occupy_redis_dispatch_slots(&redis_store, &credential_ids, 1, 0, 9_900_000).await;
+    manager.delay_each_redis_admission_owner_before_submit(StdDuration::from_millis(70));
+    let eval_count = redis_store.scheduler_admission_eval_count();
+
+    let started_at = Instant::now();
+    let error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::SelectiveFailFast {
+                rate_limit: false,
+                concurrency: true,
+            },
+            1,
+        )
+        .await
+        .err()
+        .expect("all credential capacity rejections must fail external preflight");
+    let elapsed = started_at.elapsed();
+    let eval_delta = redis_store.scheduler_admission_eval_count() - eval_count;
+
+    assert!(
+        elapsed <= SCHEDULER_REDIS_RESELECTION_BUDGET + StdDuration::from_millis(75),
+        "40 account delays must share one deadline, elapsed={elapsed:?}"
+    );
+    assert!(
+        eval_delta <= 4,
+        "the shared deadline must stop account walking, eval_delta={eval_delta}"
+    );
+    assert!(error.to_string().contains("调度容量暂不可用"));
+    assert!(!error.to_string().contains("Redis 调度协调状态不可用"));
+    release_redis_dispatch_slots(&redis_store, &occupied).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_admission_owner_past_deadline_never_submits_eval() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut credential = api_key_credential("admission-owner-deadline");
+    credential.id = Some(98_702);
+    credential.rpm = Some(60);
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    manager.delay_next_redis_admission_owner_before_submit(
+        SCHEDULER_REDIS_ADMISSION_OP_TIMEOUT + StdDuration::from_millis(100),
+    );
+    let eval_count = redis_store.scheduler_admission_eval_count();
+    let excluded = HashSet::new();
+
+    let error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &excluded,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .err()
+        .expect("an owner that misses the absolute deadline must fail closed");
+    tokio::time::sleep(StdDuration::from_millis(150)).await;
+
+    assert!(error.to_string().contains("调度容量暂不可用"));
+    assert!(!error.to_string().contains("Redis 调度协调状态不可用"));
+    assert_eq!(
+        redis_store.scheduler_admission_eval_count(),
+        eval_count,
+        "a late detached owner must observe cancellation and never submit EVAL"
+    );
+    assert_eq!(
+        manager
+            .scheduler_redis_admission_failure_streak
+            .load(Ordering::Acquire),
+        0,
+        "an admission that never reached Redis must not advance the breaker"
+    );
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    {
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].in_flight_requests, 0);
+        assert!(entries[0].pending_redis_admission.is_none());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_admission_hard_timeout_returns_before_async_cleanup_finishes() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    redis_store.clear_rate_limit(1).await.unwrap();
+    redis_store.clear_in_flight_leases(1, None).await.unwrap();
+    let mut credential = api_key_credential("admission-hard-timeout");
+    credential.id = Some(1);
+    credential.rpm = Some(60);
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    redis_store.delay_next_scheduler_admission_after_eval(StdDuration::from_millis(500));
+
+    let started_at = Instant::now();
+    let error = manager
+        .acquire_context(None)
+        .await
+        .err()
+        .expect("250ms Redis admission deadline must fail closed");
+    assert!(error.to_string().contains("Redis 调度协调状态不可用"));
+    assert!(
+        started_at.elapsed() < StdDuration::from_secs(1),
+        "request path must return independently of detached cleanup"
+    );
+
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+            if state.in_flight_leases.is_empty() && state.rate_limit_available_at_ms.is_none() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("timed-out admission was not reconciled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_caller_during_admission_commit_ack_rolls_back_redis() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    redis_store.clear_rate_limit(1).await.unwrap();
+    redis_store.clear_in_flight_leases(1, None).await.unwrap();
+    let mut credential = api_key_credential("admission-commit-ack-cancel");
+    credential.id = Some(1);
+    credential.rpm = Some(60);
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    manager.delay_next_redis_admission_before_local_commit(StdDuration::from_secs(5));
+    let acquiring_manager = manager.clone();
+    let acquiring = tokio::spawn(async move { acquiring_manager.acquire_context(None).await });
+
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+            if !state.in_flight_leases.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("admission never reached commit-ack handoff");
+    acquiring.abort();
+    let _ = acquiring.await;
+
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+            if state.in_flight_leases.is_empty() && state.rate_limit_available_at_ms.is_none() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled commit-ack handoff was not reconciled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_commit_race_nacks_redis_admission_without_blocking_caller() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    redis_store.clear_rate_limit(1).await.unwrap();
+    redis_store.clear_in_flight_leases(1, None).await.unwrap();
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    let mut credential = api_key_credential("admission-local-commit-race");
+    credential.id = Some(1);
+    credential.rpm = Some(60);
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    manager.delay_next_redis_admission_before_local_commit(StdDuration::from_millis(200));
+    let acquiring_manager = manager.clone();
+    let acquiring =
+        tokio::spawn(async move { acquiring_manager.acquire_in_flight_slot(1, 1).await });
+
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+            if !state.in_flight_leases.is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("admission never reached local commit handoff");
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while manager.in_flight_requests_for_test(1) < 1 {
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("local provisional reservation was not established");
+    {
+        let mut entries = manager.entries.lock();
+        entries[0].in_flight_requests = entries[0].in_flight_requests.saturating_add(1);
+    }
+
+    let outcome = tokio::time::timeout(StdDuration::from_secs(1), acquiring)
+        .await
+        .expect("local commit race must return before async Redis cleanup")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome, InFlightSlotOutcome::ConcurrencyFull));
+    manager.entries.lock()[0].in_flight_requests = 0;
+
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap()
+                .remove(&1)
+                .unwrap();
+            if state.in_flight_leases.is_empty() && state.rate_limit_available_at_ms.is_none() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("local commit NACK was not reconciled");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5784,7 +8459,10 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_under_concurrency() {
         leases.push(task.await.expect("并发 lease 任务不应 panic"));
     }
     assert_eq!(
-        leases.iter().filter(|lease| lease.is_some()).count(),
+        leases
+            .iter()
+            .filter(|lease| matches!(lease, InFlightSlotOutcome::Acquired(_)))
+            .count(),
         1,
         "健康 Redis 下超过两个并发请求也必须严格执行跨 manager 的单槽限制"
     );
@@ -5811,13 +8489,37 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
     )
     .unwrap();
     *manager.scheduler_redis_degraded_until.lock() =
-        Some(Instant::now() + StdDuration::from_secs(1));
+        Some(Instant::now() + StdDuration::from_secs(5));
+    manager.entries.lock()[0].cooldown_until = Some(Instant::now() + StdDuration::from_secs(60));
     let route_state = manager.local_pool_route_state(None);
     assert_eq!(
         route_state.kind,
         LocalPoolRouteStateKind::SchedulerRedisDegraded
     );
-    assert!(route_state.retry_after_secs.is_some());
+    assert!(
+        route_state.retry_after_secs.is_some_and(|secs| secs <= 5),
+        "Redis degradation must report its own backoff instead of an unrelated credential cooldown: {route_state:?}"
+    );
+    manager.entries.lock()[0].disabled = true;
+    let disabled_route_state = manager.compute_local_pool_route_state(None);
+    assert_eq!(
+        disabled_route_state.kind,
+        LocalPoolRouteStateKind::AllDisabled,
+        "authoritatively disabled credentials should keep their independent fallback policy"
+    );
+    manager.entries.lock()[0].runtime_persistence_degraded = true;
+    let quarantined_route_state = manager.compute_local_pool_route_state(None);
+    assert_eq!(
+        quarantined_route_state.kind,
+        LocalPoolRouteStateKind::SchedulerRedisDegraded,
+        "Redis admission degradation must not be masked as local_all_disabled"
+    );
+    {
+        let mut entries = manager.entries.lock();
+        entries[0].runtime_persistence_degraded = false;
+        entries[0].disabled = false;
+        entries[0].cooldown_until = None;
+    }
 
     let queue_error = manager
         .acquire_context(None)
@@ -6049,7 +8751,7 @@ async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers()
         None,
         false,
         None,
-        Some(redis_store),
+        Some(redis_store.clone()),
     )
     .unwrap();
     let empty = HashSet::new();
@@ -6060,6 +8762,22 @@ async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers()
         .unwrap();
     let first_id = first.id;
     first.release_in_flight();
+
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            if redis_store
+                .get_session_binding("shared-session")
+                .await
+                .unwrap()
+                .is_some_and(|binding| binding.credential_id == first_id)
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background session binding should propagate between managers");
 
     let mut rebound = manager_b
         .acquire_context_for_session(None, Some("shared-session"), &empty)
@@ -6090,6 +8808,273 @@ async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers()
     let mut after_cooldown = manager_b.acquire_context(None).await.unwrap();
     assert_ne!(after_cooldown.id, first_id);
     after_cooldown.release_in_flight();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unique_session_uses_one_redis_binding_read_and_background_write() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![api_key_credential("unique-session-background-binding")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let session_id = format!("unique-session-{}", uuid::Uuid::new_v4());
+    let reads_before = manager.session_binding_redis_reads.load(Ordering::Acquire);
+    let writes_before = manager
+        .session_binding_redis_writes_enqueued
+        .load(Ordering::Acquire);
+
+    let mut context = manager
+        .acquire_context_for_session(None, Some(&session_id), &HashSet::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        manager.session_binding_redis_reads.load(Ordering::Acquire) - reads_before,
+        1,
+        "one acquire must perform exactly one Redis session-binding lookup"
+    );
+    assert_eq!(
+        manager
+            .session_binding_redis_writes_enqueued
+            .load(Ordering::Acquire)
+            - writes_before,
+        1,
+        "new binding must be submitted to the bounded background executor"
+    );
+    assert_eq!(
+        sticky_bound_credential_id(&manager.session_bindings, &session_id),
+        Some(context.id),
+        "local sticky state must be visible before background Redis persistence completes"
+    );
+
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            if redis_store
+                .get_session_binding(&session_id)
+                .await
+                .unwrap()
+                .is_some_and(|binding| binding.credential_id == context.id)
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background Redis session binding should become visible to other instances");
+
+    context.release_in_flight();
+    redis_store
+        .delete_session_binding(&session_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_unbind_fences_a_queued_session_binding_write() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![
+            api_key_credential("queued-binding-a"),
+            api_key_credential("queued-binding-b"),
+        ],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+
+    let absent_session = format!("queued-binding-absent-{}", uuid::Uuid::new_v4());
+    let absent_write_lock = manager.session_binding_write_lock(&absent_session);
+    let absent_write_guard = absent_write_lock.lock().await;
+    manager.bind_session_to_credential(&absent_session, 1);
+    assert_eq!(
+        sticky_bound_credential_id(&manager.session_bindings, &absent_session),
+        Some(1)
+    );
+    assert!(
+        redis_store
+            .get_session_binding(&absent_session)
+            .await
+            .unwrap()
+            .is_none(),
+        "holding the shard lock must keep the accepted background SET out of Redis"
+    );
+
+    manager.unbind_session_if_bound_to(&absent_session, 1);
+    assert_eq!(
+        sticky_bound_credential_id(&manager.session_bindings, &absent_session),
+        None,
+        "conditional unbind must clear local-first state before Redis reconciliation"
+    );
+    drop(absent_write_guard);
+    let drain =
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(6))
+            .await;
+    assert!(
+        drain.drained,
+        "queued session write did not drain: {drain:?}"
+    );
+    assert!(
+        redis_store
+            .get_session_binding(&absent_session)
+            .await
+            .unwrap()
+            .is_none(),
+        "the queued SET must not resurrect an absent conditionally deleted binding"
+    );
+
+    let mismatch_session = format!("queued-binding-mismatch-{}", uuid::Uuid::new_v4());
+    let mismatch_write_lock = manager.session_binding_write_lock(&mismatch_session);
+    let mismatch_write_guard = mismatch_write_lock.lock().await;
+    manager.bind_session_to_credential(&mismatch_session, 1);
+    let authoritative = SchedulerSessionBinding {
+        credential_id: 2,
+        last_used_at: Utc::now(),
+        soft_failure_count: 0,
+    };
+    redis_store
+        .set_session_binding(
+            &mismatch_session,
+            &authoritative,
+            SESSION_BINDING_TTL_SECS as usize,
+        )
+        .await
+        .unwrap();
+
+    manager.unbind_session_if_bound_to(&mismatch_session, 1);
+    assert_eq!(
+        sticky_bound_credential_id(&manager.session_bindings, &mismatch_session),
+        Some(2),
+        "a different authoritative Redis binding must replace the removed local target"
+    );
+    drop(mismatch_write_guard);
+    let drain =
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(6))
+            .await;
+    assert!(
+        drain.drained,
+        "mismatched session write did not drain: {drain:?}"
+    );
+    assert_eq!(
+        redis_store
+            .get_session_binding(&mismatch_session)
+            .await
+            .unwrap(),
+        Some(authoritative),
+        "the older queued local SET must not overwrite the authoritative Redis binding"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_bulk_session_cleanup_is_background_and_does_not_touch_admission_breaker() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![api_key_credential("bulk-session-cleanup")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let binding = SchedulerSessionBinding {
+        credential_id: 1,
+        last_used_at: Utc::now(),
+        soft_failure_count: 0,
+    };
+    const SESSION_COUNT: usize = 10_000;
+    futures::stream::iter(0..SESSION_COUNT)
+        .for_each_concurrent(Some(64), |index| {
+            let redis_store = redis_store.clone();
+            let binding = binding.clone();
+            async move {
+                redis_store
+                    .set_session_binding(
+                        &format!("bulk-session-{index}"),
+                        &binding,
+                        SESSION_BINDING_TTL_SECS as usize,
+                    )
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+    manager
+        .scheduler_redis_degraded_streak
+        .store(3, Ordering::Release);
+
+    let started_at = Instant::now();
+    manager.unbind_sessions_for_credential(1);
+    let return_latency = started_at.elapsed();
+
+    assert!(
+        return_latency < SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+        "bulk sticky cleanup must leave the request path, elapsed={return_latency:?}"
+    );
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_degraded_streak
+            .load(Ordering::Acquire),
+        3
+    );
+
+    for _ in 0..64 {
+        let mut context =
+            tokio::time::timeout(StdDuration::from_secs(1), manager.acquire_context(None))
+                .await
+                .expect("high-cardinality cleanup must not starve Redis admission")
+                .expect("Redis admission must remain healthy during background cleanup");
+        context.release_in_flight();
+    }
+
+    let drain =
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(12))
+            .await;
+    assert!(drain.drained, "background cleanup did not drain: {drain:?}");
+    assert_eq!(
+        redis_store.delete_sessions_for_credential(1).await.unwrap(),
+        0,
+        "background cleanup left credential session bindings behind"
+    );
+    for index in [0, SESSION_COUNT / 2, SESSION_COUNT - 1] {
+        assert!(
+            redis_store
+                .get_session_binding(&format!("bulk-session-{index}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "background cleanup left bulk-session-{index} bound"
+        );
+    }
+    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert_eq!(
+        manager
+            .scheduler_redis_degraded_streak
+            .load(Ordering::Acquire),
+        0,
+        "successful admission probes should reset the old failure streak"
+    );
 }
 
 #[tokio::test]
@@ -6423,6 +9408,83 @@ async fn test_unbind_session_if_bound_to_does_not_clear_original_binding() {
         .await
         .unwrap();
     assert_eq!(bound.id, rebound.id);
+}
+
+#[test]
+fn pending_local_session_binding_rejects_stale_redis_reconciliation() {
+    let bindings = Mutex::new(HashMap::new());
+    let first = bind_sticky_session_to_credential(&bindings, "pending-session", 1, true);
+
+    cache_sticky_redis_binding(&bindings, "pending-session", None);
+    assert_eq!(
+        sticky_bound_credential_id(&bindings, "pending-session"),
+        Some(1),
+        "a Redis miss must not erase a local-first binding before its queued write finishes"
+    );
+
+    let second = bind_sticky_session_to_credential(&bindings, "pending-session", 2, true);
+    assert!(!cache_sticky_redis_binding_if_current(
+        &bindings,
+        "pending-session",
+        &first,
+        Some(SchedulerSessionBinding {
+            credential_id: 1,
+            last_used_at: first.last_used_at,
+            soft_failure_count: 0,
+        }),
+    ));
+    assert_eq!(
+        sticky_bound_credential_id(&bindings, "pending-session"),
+        Some(2),
+        "an older background completion must not overwrite a newer local binding"
+    );
+
+    assert!(clear_sticky_redis_persist_pending_if_current(
+        &bindings,
+        "pending-session",
+        &second,
+    ));
+    cache_sticky_redis_binding(&bindings, "pending-session", None);
+    assert_eq!(
+        sticky_bound_credential_id(&bindings, "pending-session"),
+        None
+    );
+}
+
+#[test]
+fn unpolled_session_binding_write_clears_pending_state_on_cancellation() {
+    let bindings = Arc::new(Mutex::new(HashMap::new()));
+    let expected = bind_sticky_session_to_credential(&bindings, "cancelled-session", 1, true);
+    let guard = Arc::new(SessionBindingPersistGuard {
+        session_bindings: bindings.clone(),
+        session_id: "cancelled-session".to_string(),
+        expected: expected.clone(),
+        armed: AtomicBool::new(true),
+    });
+    let future = {
+        let guard = guard.clone();
+        async move {
+            std::future::pending::<()>().await;
+            drop(guard);
+        }
+    };
+    drop(guard);
+    assert!(sticky_redis_binding_matches_local(
+        &bindings,
+        "cancelled-session",
+        &expected,
+    ));
+
+    drop(future);
+    assert!(
+        !sticky_redis_binding_matches_local(&bindings, "cancelled-session", &expected),
+        "dropping an accepted-but-unpolled write future must clear its pending marker"
+    );
+    assert_eq!(
+        sticky_bound_credential_id(&bindings, "cancelled-session"),
+        Some(1),
+        "cancelling Redis persistence must not discard the local-first binding"
+    );
 }
 
 #[tokio::test]

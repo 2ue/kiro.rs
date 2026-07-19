@@ -20,6 +20,13 @@ fn test_redis_config() -> Option<Config> {
 }
 
 async fn test_external_pool_manager() -> Option<(ExternalPoolManager, Arc<PostgresStore>)> {
+    test_external_pool_manager_with_release_capacity(EXTERNAL_POOL_RELEASE_SUPERVISOR_CAPACITY)
+        .await
+}
+
+async fn test_external_pool_manager_with_release_capacity(
+    release_capacity: usize,
+) -> Option<(ExternalPoolManager, Arc<PostgresStore>)> {
     let Some(postgres_config) = test_postgres_config() else {
         eprintln!("跳过外部备用池集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
         return None;
@@ -30,7 +37,14 @@ async fn test_external_pool_manager() -> Option<(ExternalPoolManager, Arc<Postgr
     };
     let postgres = Arc::new(PostgresStore::connect_test(&postgres_config).await.unwrap());
     let redis = Arc::new(RedisStore::connect(&redis_config).await.unwrap());
-    Some((ExternalPoolManager::new(postgres.clone(), redis), postgres))
+    Some((
+        ExternalPoolManager::new_with_test_release_capacity(
+            postgres.clone(),
+            redis,
+            release_capacity,
+        ),
+        postgres,
+    ))
 }
 
 fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExternalPoolRequest {
@@ -97,6 +111,38 @@ fn pool_auto_disable_policy_can_override_global_switch() {
         ExternalPoolAutoDisablePolicy::Inherit,
         &config
     ));
+}
+
+#[test]
+fn external_pool_definition_refresh_backoff_is_exponential_and_bounded() {
+    assert_eq!(
+        external_pool_definitions_refresh_retry_delay(1),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        external_pool_definitions_refresh_retry_delay(2),
+        Duration::from_millis(500)
+    );
+    assert_eq!(
+        external_pool_definitions_refresh_retry_delay(3),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        external_pool_definitions_refresh_retry_delay(4),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        external_pool_definitions_refresh_retry_delay(5),
+        Duration::from_secs(4)
+    );
+    assert_eq!(
+        external_pool_definitions_refresh_retry_delay(6),
+        EXTERNAL_POOL_DEFINITIONS_REFRESH_RETRY_MAX
+    );
+    assert_eq!(
+        external_pool_definitions_refresh_retry_delay(u32::MAX),
+        EXTERNAL_POOL_DEFINITIONS_REFRESH_RETRY_MAX
+    );
 }
 
 #[test]
@@ -395,6 +441,662 @@ async fn external_pool_manager_uncached_snapshot_detects_full_pool_after_availab
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_selection_uses_last_known_good_definitions_while_postgres_is_blocked() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-definition-cache", 1, true))
+        .await
+        .unwrap();
+
+    let warmed = manager
+        .select_pool(&HashSet::new(), &config)
+        .await
+        .expect("initial selection should warm the definition cache");
+    assert_eq!(warmed.id, pool.id);
+    {
+        let mut cache = manager.definitions_cache.lock();
+        let cached = cache.as_mut().expect("definition cache should be warm");
+        cached.fresh_until = Instant::now() - Duration::from_secs(60);
+        assert!(cached.authoritative);
+    }
+
+    let first_connection = postgres.pool().acquire().await.unwrap();
+    let second_connection = postgres.pool().acquire().await.unwrap();
+    let selection = tokio::time::timeout(
+        Duration::from_millis(250),
+        manager.select_pool(&HashSet::new(), &config),
+    )
+    .await
+    .expect("last-known-good definitions must keep routing off the saturated PgSQL pool")
+    .expect("cached external pool should remain selectable");
+    assert_eq!(selection.id, pool.id);
+
+    drop(first_connection);
+    drop(second_connection);
+    for _ in 0..100 {
+        if !manager
+            .definitions_refresh_in_flight
+            .load(Ordering::Acquire)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !manager
+            .definitions_refresh_in_flight
+            .load(Ordering::Acquire),
+        "background definition refresh did not drain after PgSQL recovered"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_last_known_good_refresh_failure_is_backed_off_without_losing_pools() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-refresh-backoff", 1, true))
+        .await
+        .unwrap();
+
+    let warmed = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(warmed.iter().any(|candidate| candidate.id == pool.id));
+    let (fresh_until, stale_if_error_until) = {
+        let mut cache = manager.definitions_cache.lock();
+        let cached = cache.as_mut().expect("definition cache should be warm");
+        cached.fresh_until = Instant::now() - Duration::from_secs(60);
+        assert!(cached.authoritative);
+        (cached.fresh_until, cached.stale_if_error_until)
+    };
+
+    let attempts_before = manager
+        .definitions_test_probe
+        .query_attempts
+        .load(Ordering::Acquire);
+    manager
+        .definitions_test_probe
+        .fail_next_query
+        .store(true, Ordering::Release);
+
+    let failed_refresh_started_at = Instant::now();
+    let stale = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(stale.iter().any(|candidate| candidate.id == pool.id));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager
+                .definitions_test_probe
+                .query_attempts
+                .load(Ordering::Acquire)
+                >= attempts_before + 1
+                && !manager
+                    .definitions_refresh_in_flight
+                    .load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("failed background definition refresh did not drain");
+
+    let retry_at = {
+        let cache = manager.definitions_cache.lock();
+        let cached = cache
+            .as_ref()
+            .expect("failed refresh must preserve the stale cache entry");
+        assert_eq!(cached.fresh_until, fresh_until);
+        assert_eq!(cached.stale_if_error_until, stale_if_error_until);
+        assert!(cached.authoritative);
+        assert_eq!(cached.refresh_failure_streak, 1);
+        assert!(cached.pools.iter().any(|candidate| candidate.id == pool.id));
+        cached
+            .refresh_retry_at
+            .expect("failed refresh should install a retry deadline")
+    };
+    assert!(
+        retry_at >= failed_refresh_started_at + EXTERNAL_POOL_DEFINITIONS_NEGATIVE_CACHE_TTL,
+        "failed refresh should back off for the configured retry duration"
+    );
+    {
+        let mut cache = manager.definitions_cache.lock();
+        cache
+            .as_mut()
+            .expect("stale cache should still exist")
+            .refresh_retry_at = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    for _ in 0..32 {
+        let pools = manager
+            .external_pool_definitions_for_routing()
+            .await
+            .unwrap();
+        assert!(pools.iter().any(|candidate| candidate.id == pool.id));
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(
+        manager
+            .definitions_test_probe
+            .query_attempts
+            .load(Ordering::Acquire),
+        attempts_before + 1,
+        "stale-cache traffic during retry backoff must not query PostgreSQL again"
+    );
+
+    {
+        let mut cache = manager.definitions_cache.lock();
+        cache
+            .as_mut()
+            .expect("stale cache should still exist")
+            .refresh_retry_at = Some(Instant::now() - Duration::from_millis(1));
+    }
+    let stale = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(stale.iter().any(|candidate| candidate.id == pool.id));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let query_finished = manager
+                .definitions_test_probe
+                .query_attempts
+                .load(Ordering::Acquire)
+                >= attempts_before + 2
+                && !manager
+                    .definitions_refresh_in_flight
+                    .load(Ordering::Acquire);
+            let cache_refreshed = manager
+                .definitions_cache
+                .lock()
+                .as_ref()
+                .is_some_and(|cached| {
+                    cached.fresh_until > Instant::now()
+                        && cached.refresh_failure_streak == 0
+                        && cached.refresh_retry_at.is_none()
+                });
+            if query_finished && cache_refreshed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("definition cache did not recover after retry backoff elapsed");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_last_known_good_hard_expiry_requires_postgres_confirmation() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-hard-expiry", 1, true))
+        .await
+        .unwrap();
+    let warmed = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(warmed.iter().any(|candidate| candidate.id == pool.id));
+    {
+        let mut cache = manager.definitions_cache.lock();
+        let cached = cache.as_mut().expect("definition cache should be warm");
+        cached.fresh_until = Instant::now() - Duration::from_secs(1);
+        cached.stale_if_error_until = Instant::now() - Duration::from_millis(1);
+    }
+
+    let first_connection = postgres.pool().acquire().await.unwrap();
+    let second_connection = postgres.pool().acquire().await.unwrap();
+    let started_at = Instant::now();
+    let result = manager.external_pool_definitions_for_routing().await;
+    assert!(result.is_err());
+    assert!(started_at.elapsed() >= EXTERNAL_POOL_DEFINITIONS_QUERY_TIMEOUT);
+    assert!(
+        manager
+            .definitions_cache
+            .lock()
+            .as_ref()
+            .is_some_and(|cached| !cached.authoritative && cached.pools.is_empty())
+    );
+
+    drop(first_connection);
+    drop(second_connection);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_definition_epoch_rejects_stale_background_write_after_admin_invalidation() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-epoch-fence", 1, true))
+        .await
+        .unwrap();
+
+    let warmed = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(
+        warmed
+            .iter()
+            .any(|candidate| candidate.id == pool.id && candidate.enabled)
+    );
+    {
+        let mut cache = manager.definitions_cache.lock();
+        let cached = cache.as_mut().expect("definition cache should be warm");
+        cached.fresh_until = Instant::now() - Duration::from_millis(1);
+        assert!(cached.authoritative);
+    }
+
+    let fetched = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    *manager.definitions_test_probe.next_after_fetch_gate.lock() =
+        Some(ExternalPoolDefinitionsAfterFetchGate {
+            fetched: fetched.clone(),
+            resume: resume.clone(),
+        });
+
+    let stale = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(
+        stale
+            .iter()
+            .any(|candidate| candidate.id == pool.id && candidate.enabled)
+    );
+    tokio::time::timeout(Duration::from_secs(5), fetched.wait())
+        .await
+        .expect("background definition refresh did not reach the post-fetch fence");
+
+    let disabled = postgres
+        .set_external_pool_enabled(pool.id, false)
+        .await
+        .unwrap()
+        .expect("pool should still exist");
+    assert!(!disabled.enabled);
+    let epoch_before_invalidation = manager.definitions_cache_epoch.load(Ordering::Acquire);
+    manager.invalidate_routing_cache();
+    assert!(manager.definitions_cache_epoch.load(Ordering::Acquire) > epoch_before_invalidation);
+    assert!(manager.definitions_cache.lock().is_none());
+    assert!(manager.availability_cache.lock().is_none());
+
+    resume.wait().await;
+    for _ in 0..200 {
+        if !manager
+            .definitions_refresh_in_flight
+            .load(Ordering::Acquire)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !manager
+            .definitions_refresh_in_flight
+            .load(Ordering::Acquire),
+        "background definition refresh did not drain"
+    );
+    assert!(
+        manager.definitions_cache.lock().is_none(),
+        "a pre-invalidation SELECT must not repopulate the definition cache"
+    );
+
+    let reloaded = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(
+        reloaded
+            .iter()
+            .any(|candidate| candidate.id == pool.id && !candidate.enabled)
+    );
+    assert!(
+        manager
+            .select_pool(&HashSet::new(), &config)
+            .await
+            .is_none()
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_availability_epoch_rejects_in_flight_scan_after_invalidation() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-availability-epoch", 1, true))
+        .await
+        .unwrap();
+    assert!(manager.availability_cache.lock().is_none());
+
+    let scanned = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    *manager.availability_test_probe.next_after_scan_gate.lock() =
+        Some(ExternalPoolAvailabilityAfterScanGate {
+            scanned: scanned.clone(),
+            resume: resume.clone(),
+        });
+
+    let scan_manager = manager.clone();
+    let scan_config = config.clone();
+    let in_flight_scan = tokio::spawn(async move {
+        scan_manager
+            .pool_availability_snapshot(&HashSet::new(), &scan_config)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), scanned.wait())
+        .await
+        .expect("availability scan did not reach the pre-cache fence");
+
+    let disabled = postgres
+        .set_external_pool_enabled(pool.id, false)
+        .await
+        .unwrap()
+        .expect("pool should still exist");
+    assert!(!disabled.enabled);
+    let epoch_before_invalidation = manager.availability_cache_epoch.load(Ordering::Acquire);
+    manager.invalidate_routing_cache();
+    assert!(manager.availability_cache_epoch.load(Ordering::Acquire) > epoch_before_invalidation);
+    assert!(manager.availability_cache.lock().is_none());
+
+    resume.wait().await;
+    let stale_snapshot = tokio::time::timeout(Duration::from_secs(5), in_flight_scan)
+        .await
+        .expect("in-flight availability scan did not resume")
+        .unwrap();
+    assert_eq!(stale_snapshot.eligible_pools, 1);
+    assert_eq!(stale_snapshot.available_pools, 1);
+    assert!(
+        manager.availability_cache.lock().is_none(),
+        "a pre-invalidation scan must not repopulate the availability cache"
+    );
+
+    let reloaded = manager
+        .pool_availability_snapshot(&HashSet::new(), &config)
+        .await;
+    assert_eq!(reloaded.eligible_pools, 0);
+    assert_eq!(reloaded.available_pools, 0);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_routing_invalidation_ignores_self_echo_but_accepts_remote_event() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let initial_definitions_epoch = manager.definitions_cache_epoch.load(Ordering::Acquire);
+    let initial_availability_epoch = manager.availability_cache_epoch.load(Ordering::Acquire);
+    let initial_admin_epoch = manager.external_admin_cache_epoch();
+    let self_payload = json!({
+        "kind": "external_pools_changed",
+        "origin": manager.event_origin_id.as_ref(),
+    })
+    .to_string();
+
+    assert!(!manager.invalidate_routing_cache_from_event(&self_payload));
+    assert_eq!(
+        manager.definitions_cache_epoch.load(Ordering::Acquire),
+        initial_definitions_epoch
+    );
+    assert_eq!(
+        manager.availability_cache_epoch.load(Ordering::Acquire),
+        initial_availability_epoch
+    );
+    assert_eq!(
+        manager.external_admin_cache_epoch(),
+        initial_admin_epoch + 1,
+        "self echo must still invalidate the Admin shadow after Redis keys were deleted"
+    );
+
+    let remote_payload = json!({
+        "kind": "external_pools_changed",
+        "origin": "another-kiro-rs-instance",
+    })
+    .to_string();
+    assert!(manager.invalidate_routing_cache_from_event(&remote_payload));
+    assert_eq!(
+        manager.definitions_cache_epoch.load(Ordering::Acquire),
+        initial_definitions_epoch + 1
+    );
+    assert_eq!(
+        manager.availability_cache_epoch.load(Ordering::Acquire),
+        initial_availability_epoch + 1
+    );
+    assert_eq!(
+        manager.external_admin_cache_epoch(),
+        initial_admin_epoch + 2
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_invalidation_dirty_set_during_publish_is_preserved() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+
+    manager.invalidate_routing_cache();
+    // The publisher consumes dirty immediately before issuing the Redis command.
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        manager.wait_for_invalidation_publish(),
+    )
+    .await
+    .expect("the initial invalidation must enter the simulated publish attempt");
+    assert!(!manager.invalidation_publish_dirty.load(Ordering::Acquire));
+
+    manager.invalidate_routing_cache();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        manager.wait_for_invalidation_publish(),
+    )
+    .await
+    .expect("an invalidation raised during publish must remain pending for the next attempt");
+    assert!(!manager.invalidation_publish_dirty.load(Ordering::Acquire));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            manager.wait_for_invalidation_publish(),
+        )
+        .await
+        .is_err(),
+        "the second dirty state must be consumed exactly once"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_invalidation_deletes_admin_cache_before_publishing() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    manager
+        .redis
+        .set_json(
+            "admin_cache:external_pools:status",
+            &json!({"stale": true}),
+            60,
+        )
+        .await
+        .unwrap();
+    manager
+        .redis
+        .set_json(
+            "admin_cache:external_pools:list",
+            &json!([{"stale": true}]),
+            60,
+        )
+        .await
+        .unwrap();
+    let mut pubsub = manager.redis.subscribe_runtime_events().await.unwrap();
+    let expected_channel = manager.redis.external_pools_changed_channel();
+    let mut stream = pubsub.on_message();
+    let publisher = manager.spawn_invalidation_publisher();
+
+    manager.invalidate_routing_cache();
+    let message = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("external pool invalidation event was not published")
+        .expect("Redis Pub/Sub stream ended");
+    assert_eq!(message.get_channel_name(), expected_channel);
+    assert!(
+        manager
+            .redis
+            .get_json::<serde_json::Value>("admin_cache:external_pools:status")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        manager
+            .redis
+            .get_json::<serde_json::Value>("admin_cache:external_pools:list")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    publisher.abort();
+    let _ = publisher.await;
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_definition_cold_miss_is_singleflight_and_negative_cached() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-cold-singleflight", 1, true))
+        .await
+        .unwrap();
+    assert!(manager.definitions_cache.lock().is_none());
+
+    let first_connection = postgres.pool().acquire().await.unwrap();
+    let second_connection = postgres.pool().acquire().await.unwrap();
+    assert_eq!(postgres.pool().size(), 2);
+    assert_eq!(postgres.pool().num_idle(), 0);
+    assert!(postgres.pool().try_acquire().is_none());
+
+    const CALLERS: usize = 16;
+    let query_attempts_before = manager
+        .definitions_test_probe
+        .query_attempts
+        .load(Ordering::Acquire);
+    let start = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+    let mut callers = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        let manager = manager.clone();
+        let start = start.clone();
+        callers.push(tokio::spawn(async move {
+            start.wait().await;
+            manager.external_pool_definitions_for_routing().await
+        }));
+    }
+    start.wait().await;
+    let started_at = Instant::now();
+    let results = tokio::time::timeout(Duration::from_secs(2), async move {
+        let mut results = Vec::with_capacity(CALLERS);
+        for caller in callers {
+            results.push(caller.await.unwrap());
+        }
+        results
+    })
+    .await
+    .expect("cold definition callers should share one bounded PgSQL query");
+    assert!(started_at.elapsed() >= EXTERNAL_POOL_DEFINITIONS_QUERY_TIMEOUT);
+    assert_eq!(
+        manager
+            .definitions_test_probe
+            .query_attempts
+            .load(Ordering::Acquire)
+            - query_attempts_before,
+        1,
+        "a cold miss burst must execute one PgSQL definition query"
+    );
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Ok(pools) if pools.is_empty()))
+            .count(),
+        CALLERS - 1
+    );
+    assert!(
+        manager
+            .definitions_cache
+            .lock()
+            .as_ref()
+            .is_some_and(|cached| {
+                cached.pools.is_empty()
+                    && !cached.authoritative
+                    && cached.fresh_until > Instant::now()
+            })
+    );
+
+    let cached = tokio::time::timeout(
+        Duration::from_millis(100),
+        manager.external_pool_definitions_for_routing(),
+    )
+    .await
+    .expect("negative definition cache should avoid another saturated-pool wait")
+    .unwrap();
+    assert!(cached.is_empty());
+    assert_eq!(
+        manager
+            .definitions_test_probe
+            .query_attempts
+            .load(Ordering::Acquire)
+            - query_attempts_before,
+        1
+    );
+
+    drop(first_connection);
+    drop(second_connection);
+    manager.invalidate_routing_cache();
+    let recovered = manager
+        .external_pool_definitions_for_routing()
+        .await
+        .unwrap();
+    assert!(recovered.iter().any(|candidate| candidate.id == pool.id));
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_lease_touch_and_drop_release_are_accepted_and_drained() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -436,21 +1138,14 @@ async fn external_pool_lease_touch_and_drop_release_are_accepted_and_drained() {
     assert_eq!(pool_in_flight, 1);
     assert_eq!(global_in_flight, 1);
 
-    let before_drop = crate::kiro::token_manager::storage_task::best_effort_storage_task_stats();
     drop(lease);
-    let after_drop_submission =
-        crate::kiro::token_manager::storage_task::best_effort_storage_task_stats();
     assert!(
-        after_drop_submission.critical_accepted >= before_drop.critical_accepted.saturating_add(1),
-        "lease drop must add a task to the critical lane"
+        manager
+            .release_supervisor
+            .drain(Duration::from_secs(5))
+            .await,
+        "accepted release command should drain"
     );
-    let release_drain = crate::kiro::token_manager::storage_task::drain_best_effort_storage_tasks(
-        Duration::from_secs(5),
-    )
-    .await;
-    assert!(release_drain.drained, "accepted release task should drain");
-    assert!(release_drain.target >= after_drop_submission.accepted);
-    assert!(release_drain.finished >= release_drain.target);
     let (pool_in_flight, global_in_flight, _, _) =
         manager.pool_runtime_snapshot(pool.id).await.unwrap();
     assert_eq!(
@@ -461,6 +1156,623 @@ async fn external_pool_lease_touch_and_drop_release_are_accepted_and_drained() {
         global_in_flight, 0,
         "global release must not wait for lease TTL"
     );
+
+    manager
+        .redis
+        .del("external_pool:inflight:lease_sequence")
+        .await
+        .unwrap();
+    let shutdown = manager
+        .shutdown_release_supervisor(Duration::from_secs(5))
+        .await;
+    assert!(
+        shutdown.drained,
+        "release supervisor should drain: {shutdown:?}"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_release_supervisor_is_bounded_and_retries_without_blocking_drop() {
+    const RELEASE_COUNT: usize = 4;
+    const DROP_LATENCY_LIMIT: Duration = Duration::from_millis(100);
+
+    let Some((manager, postgres)) =
+        test_external_pool_manager_with_release_capacity(RELEASE_COUNT).await
+    else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: RELEASE_COUNT as u32 + 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut request = create_pool_request("external-release-overflow", 1, true);
+    request.max_concurrent_requests = RELEASE_COUNT as u32 + 1;
+    let pool = postgres.create_external_pool(request).await.unwrap();
+    let acquisitions =
+        futures::future::join_all((0..RELEASE_COUNT).map(|_| manager.acquire_pool(&pool, &config)))
+            .await;
+    let leases = acquisitions
+        .into_iter()
+        .map(|result| match result {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(unavailable) => panic!(
+                "all external release test leases should be acquired: {}",
+                unavailable.detail
+            ),
+        })
+        .collect::<Vec<_>>();
+    let (pool_in_flight, global_in_flight, _, _) =
+        manager.pool_runtime_snapshot(pool.id).await.unwrap();
+    assert_eq!(pool_in_flight, RELEASE_COUNT as u32);
+    assert_eq!(global_in_flight, RELEASE_COUNT as u32);
+
+    let unavailable = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(_) => panic!("release supervisor capacity must be bounded"),
+        PoolAcquireResult::Unavailable(unavailable) => unavailable,
+    };
+    assert_eq!(unavailable.detail, "release_supervisor_capacity");
+
+    manager
+        .release_test_probe
+        .force_release_failure
+        .store(true, Ordering::Release);
+
+    let drop_started_at = Instant::now();
+    drop(leases);
+    let drop_elapsed = drop_started_at.elapsed();
+    assert!(
+        drop_elapsed < DROP_LATENCY_LIMIT,
+        "dropping {RELEASE_COUNT} leases took {drop_elapsed:?}; Drop must only perform bounded nonblocking admission"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let changed = manager.release_test_probe.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if manager
+                .release_test_probe
+                .release_attempts
+                .load(Ordering::Acquire)
+                > 0
+            {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await
+    .expect("forced Redis release failure was not observed");
+    assert_eq!(
+        manager
+            .release_supervisor
+            .inner
+            .progress
+            .pending
+            .load(Ordering::Acquire),
+        RELEASE_COUNT as u64,
+        "failed releases must retain their commands and permits"
+    );
+
+    manager
+        .release_test_probe
+        .force_release_failure
+        .store(false, Ordering::Release);
+    assert!(
+        manager
+            .release_supervisor
+            .drain(Duration::from_secs(5))
+            .await,
+        "retained releases should retry after Redis recovery"
+    );
+    let (pool_in_flight, global_in_flight, _, _) =
+        manager.pool_runtime_snapshot(pool.id).await.unwrap();
+    assert_eq!(pool_in_flight, 0, "all pool leases must be released");
+    assert_eq!(global_in_flight, 0, "all global leases must be released");
+    assert_eq!(
+        manager
+            .release_supervisor
+            .inner
+            .progress
+            .succeeded
+            .load(Ordering::Acquire),
+        RELEASE_COUNT as u64
+    );
+
+    manager
+        .redis
+        .del("external_pool:inflight:lease_sequence")
+        .await
+        .unwrap();
+    let shutdown = manager
+        .shutdown_release_supervisor(Duration::from_secs(5))
+        .await;
+    assert!(
+        shutdown.drained,
+        "release supervisor should drain: {shutdown:?}"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_release_poison_target_does_not_block_healthy_pool_or_queue() {
+    const RELEASE_CAPACITY: usize = 3;
+
+    let Some((manager, postgres)) =
+        test_external_pool_manager_with_release_capacity(RELEASE_CAPACITY).await
+    else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 2,
+        ..ExternalPoolsConfig::default()
+    };
+    let poison_pool = postgres
+        .create_external_pool(create_pool_request("external-release-poison", 1, true))
+        .await
+        .unwrap();
+    let healthy_pool = postgres
+        .create_external_pool(create_pool_request("external-release-healthy", 2, true))
+        .await
+        .unwrap();
+    let poison_lease = match manager.acquire_pool(&poison_pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "poison pool lease should be acquired: {}",
+                unavailable.detail
+            )
+        }
+    };
+    let healthy_lease = match manager.acquire_pool(&healthy_pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "healthy pool lease should be acquired: {}",
+                unavailable.detail
+            )
+        }
+    };
+    let queue_guard = manager
+        .enter_external_pool_queue(1)
+        .await
+        .unwrap()
+        .expect("queue lease should be admitted");
+    assert_eq!(
+        manager
+            .redis
+            .external_pool_dispatch_queue_size()
+            .await
+            .unwrap(),
+        1
+    );
+
+    manager
+        .release_test_probe
+        .force_pool_release_failures
+        .lock()
+        .insert(poison_pool.id);
+    drop(poison_lease);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manager
+            .release_supervisor
+            .inner
+            .progress
+            .failed_attempts
+            .load(Ordering::Acquire)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("poison pool should enter target-scoped retry backoff");
+    drop(healthy_lease);
+    drop(queue_guard);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let poison_attempted = manager
+                .release_test_probe
+                .pool_release_attempts
+                .lock()
+                .get(&poison_pool.id)
+                .copied()
+                .unwrap_or_default()
+                > 0;
+            let (healthy_in_flight, healthy_global_in_flight, _, _) = manager
+                .pool_runtime_snapshot(healthy_pool.id)
+                .await
+                .unwrap();
+            let queue_size = manager
+                .redis
+                .external_pool_dispatch_queue_size()
+                .await
+                .unwrap();
+            if poison_attempted
+                && healthy_in_flight == 0
+                && healthy_global_in_flight == 1
+                && queue_size == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("poison pool must not block healthy pool and queue releases");
+    let (poison_in_flight, global_in_flight, _, _) =
+        manager.pool_runtime_snapshot(poison_pool.id).await.unwrap();
+    assert_eq!(poison_in_flight, 1, "poison lease must remain retained");
+    assert_eq!(global_in_flight, 1, "only the poison lease should remain");
+    assert_eq!(
+        manager
+            .release_supervisor
+            .inner
+            .progress
+            .pending
+            .load(Ordering::Acquire),
+        1,
+        "failed poison command must remain pending"
+    );
+    assert_eq!(
+        manager.release_supervisor.inner.permits.available_permits(),
+        RELEASE_CAPACITY - 1,
+        "poison command must retain its release permit"
+    );
+
+    manager
+        .release_test_probe
+        .force_pool_release_failures
+        .lock()
+        .remove(&poison_pool.id);
+    assert!(
+        manager
+            .release_supervisor
+            .drain(Duration::from_secs(5))
+            .await,
+        "poison command should drain after its target recovers"
+    );
+    let (poison_in_flight, global_in_flight, _, _) =
+        manager.pool_runtime_snapshot(poison_pool.id).await.unwrap();
+    assert_eq!(poison_in_flight, 0);
+    assert_eq!(global_in_flight, 0);
+    assert_eq!(
+        manager.release_supervisor.inner.permits.available_permits(),
+        RELEASE_CAPACITY
+    );
+
+    manager
+        .redis
+        .del("external_pool:inflight:lease_sequence")
+        .await
+        .unwrap();
+    let shutdown = manager
+        .shutdown_release_supervisor(Duration::from_secs(5))
+        .await;
+    assert!(
+        shutdown.drained,
+        "release supervisor should drain: {shutdown:?}"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_release_blocked_target_does_not_serialize_later_pools() {
+    const RELEASE_CAPACITY: usize = 3;
+
+    let Some((manager, postgres)) =
+        test_external_pool_manager_with_release_capacity(RELEASE_CAPACITY).await
+    else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: RELEASE_CAPACITY as u32,
+        ..ExternalPoolsConfig::default()
+    };
+    let blocked_pool = postgres
+        .create_external_pool(create_pool_request("external-release-blocked", 1, true))
+        .await
+        .unwrap();
+    let healthy_pool_a = postgres
+        .create_external_pool(create_pool_request("external-release-later-a", 2, true))
+        .await
+        .unwrap();
+    let healthy_pool_b = postgres
+        .create_external_pool(create_pool_request("external-release-later-b", 3, true))
+        .await
+        .unwrap();
+    let blocked_lease = match manager.acquire_pool(&blocked_pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "blocked pool lease should be acquired: {}",
+                unavailable.detail
+            )
+        }
+    };
+    let healthy_lease_a = match manager.acquire_pool(&healthy_pool_a, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "healthy pool A lease should be acquired: {}",
+                unavailable.detail
+            )
+        }
+    };
+    let healthy_lease_b = match manager.acquire_pool(&healthy_pool_b, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "healthy pool B lease should be acquired: {}",
+                unavailable.detail
+            )
+        }
+    };
+    let gate = ExternalPoolReleaseAttemptGate {
+        entered: Arc::new(tokio::sync::Barrier::new(2)),
+        resume: Arc::new(tokio::sync::Barrier::new(2)),
+    };
+    manager
+        .release_test_probe
+        .pool_release_attempt_gates
+        .lock()
+        .insert(blocked_pool.id, gate.clone());
+
+    drop(blocked_lease);
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.wait())
+        .await
+        .expect("blocked pool release attempt should enter its Redis gate");
+    drop(healthy_lease_a);
+    drop(healthy_lease_b);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (pool_a_in_flight, _, _, _) = manager
+                .pool_runtime_snapshot(healthy_pool_a.id)
+                .await
+                .unwrap();
+            let (pool_b_in_flight, _, _, _) = manager
+                .pool_runtime_snapshot(healthy_pool_b.id)
+                .await
+                .unwrap();
+            if pool_a_in_flight == 0 && pool_b_in_flight == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("later pools must release before the first target's Redis attempt returns");
+    let (blocked_in_flight, global_in_flight, _, _) = manager
+        .pool_runtime_snapshot(blocked_pool.id)
+        .await
+        .unwrap();
+    assert_eq!(blocked_in_flight, 1);
+    assert_eq!(global_in_flight, 1);
+    assert_eq!(
+        manager.release_supervisor.inner.permits.available_permits(),
+        RELEASE_CAPACITY - 1,
+        "the blocked command must retain its permit while other targets complete"
+    );
+
+    manager
+        .release_test_probe
+        .pool_release_attempt_gates
+        .lock()
+        .remove(&blocked_pool.id);
+    gate.resume.wait().await;
+    assert!(
+        manager
+            .release_supervisor
+            .drain(Duration::from_secs(5))
+            .await,
+        "blocked target should drain after its Redis attempt resumes"
+    );
+    let (blocked_in_flight, global_in_flight, _, _) = manager
+        .pool_runtime_snapshot(blocked_pool.id)
+        .await
+        .unwrap();
+    assert_eq!(blocked_in_flight, 0);
+    assert_eq!(global_in_flight, 0);
+
+    manager
+        .redis
+        .del("external_pool:inflight:lease_sequence")
+        .await
+        .unwrap();
+    let shutdown = manager
+        .shutdown_release_supervisor(Duration::from_secs(5))
+        .await;
+    assert!(
+        shutdown.drained,
+        "release supervisor should drain: {shutdown:?}"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_cancelled_commit_unknown_acquire_is_supervised_to_zero() {
+    let Some((manager, postgres)) = test_external_pool_manager_with_release_capacity(1).await
+    else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-release-cancel", 1, true))
+        .await
+        .unwrap();
+    let gate = ExternalPoolReleaseAfterAcquireGate {
+        acquired: Arc::new(tokio::sync::Barrier::new(2)),
+        resume: Arc::new(tokio::sync::Barrier::new(2)),
+    };
+    *manager.release_test_probe.after_pool_acquire_gate.lock() = Some(gate.clone());
+    let acquire_manager = manager.clone();
+    let acquire_pool = pool.clone();
+    let acquire =
+        tokio::spawn(async move { acquire_manager.acquire_pool(&acquire_pool, &config).await });
+    gate.acquired.wait().await;
+    acquire.abort();
+    let error = match acquire.await {
+        Err(error) => error,
+        Ok(_) => panic!("acquire should be cancelled after Redis commit"),
+    };
+    assert!(error.is_cancelled());
+    assert!(
+        manager
+            .release_supervisor
+            .drain(Duration::from_secs(5))
+            .await,
+        "commit-unknown cancellation release should drain"
+    );
+    let (pool_in_flight, global_in_flight, _, _) =
+        manager.pool_runtime_snapshot(pool.id).await.unwrap();
+    assert_eq!(pool_in_flight, 0);
+    assert_eq!(global_in_flight, 0);
+
+    manager
+        .redis
+        .del("external_pool:inflight:lease_sequence")
+        .await
+        .unwrap();
+    let shutdown = manager
+        .shutdown_release_supervisor(Duration::from_secs(5))
+        .await;
+    assert!(
+        shutdown.drained,
+        "release supervisor should drain: {shutdown:?}"
+    );
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_release_supervisor_shutdown_waits_for_last_live_lease() {
+    let Some((manager, postgres)) = test_external_pool_manager_with_release_capacity(1).await
+    else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-release-shutdown", 1, true))
+        .await
+        .unwrap();
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "external pool lease should be acquired: {}",
+                unavailable.detail
+            )
+        }
+    };
+
+    let shutdown_manager = manager.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_manager
+            .shutdown_release_supervisor(Duration::from_secs(5))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.release_supervisor.inner.lifecycle.lock().accepting {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown should close release reservation admission");
+    drop(lease);
+    let report = shutdown.await.unwrap();
+    assert!(
+        report.drained,
+        "shutdown should drain the final release: {report:?}"
+    );
+    assert_eq!(report.active, 0);
+    assert_eq!(report.pending, 0);
+    assert_eq!(report.abandoned, 0);
+    assert_eq!(report.fatal_rejected, 0);
+
+    manager
+        .redis
+        .del("external_pool:inflight:lease_sequence")
+        .await
+        .unwrap();
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_release_supervisor_cancelled_shutdown_owner_still_drains() {
+    let Some((manager, postgres)) = test_external_pool_manager_with_release_capacity(1).await
+    else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request(
+            "external-release-cancelled-shutdown",
+            1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "external pool lease should be acquired: {}",
+                unavailable.detail
+            )
+        }
+    };
+
+    let shutdown_manager = manager.clone();
+    let first_shutdown = tokio::spawn(async move {
+        shutdown_manager
+            .shutdown_release_supervisor(Duration::from_secs(5))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.release_supervisor.inner.lifecycle.lock().accepting {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown should close release reservation admission");
+    first_shutdown.abort();
+    let first_error = first_shutdown
+        .await
+        .expect_err("the first shutdown caller should be cancelled");
+    assert!(first_error.is_cancelled());
+
+    drop(lease);
+    let report = manager
+        .shutdown_release_supervisor(Duration::from_secs(5))
+        .await;
+    assert!(report.already_started);
+    assert!(
+        report.drained,
+        "cancelled shutdown owner must not cancel the shared shutdown driver: {report:?}"
+    );
+    assert!(!report.timed_out);
+    assert!(!report.worker_failed);
+    assert!(!report.accepting);
+    assert_eq!(report.active, 0);
+    assert_eq!(report.pending, 0);
+    assert_eq!(report.fatal_rejected, 0);
+    assert_eq!(report.abandoned, 0);
 
     manager
         .redis
@@ -519,12 +1831,42 @@ async fn external_pool_cancelled_waiter_releases_redis_queue_lease() {
     .await
     .expect("external waiter should acquire a Redis queue lease");
 
+    let release_attempts_before = manager
+        .release_test_probe
+        .release_attempts
+        .load(Ordering::Acquire);
+    manager
+        .release_test_probe
+        .force_release_failure
+        .store(true, Ordering::Release);
     waiting.abort();
     let join_error = match waiting.await {
         Err(error) => error,
         Ok(_) => panic!("aborted external queue waiter should not finish normally"),
     };
     assert!(join_error.is_cancelled());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let changed = manager.release_test_probe.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if manager
+                .release_test_probe
+                .release_attempts
+                .load(Ordering::Acquire)
+                > release_attempts_before
+            {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await
+    .expect("cancelled queue waiter release should enter the supervised retry loop");
+    manager
+        .release_test_probe
+        .force_release_failure
+        .store(false, Ordering::Release);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if manager
@@ -540,9 +1882,28 @@ async fn external_pool_cancelled_waiter_releases_redis_queue_lease() {
         }
     })
     .await
-    .expect("cancelled external waiter should release its queue lease before TTL");
-
+    .expect("cancelled external waiter should release its queue lease without TTL recovery");
     drop(held_lease);
+    assert!(
+        manager
+            .release_supervisor
+            .drain(Duration::from_secs(5))
+            .await,
+        "the queue and held concurrency releases must fully drain"
+    );
+
+    manager
+        .redis
+        .del("external_pool:inflight:lease_sequence")
+        .await
+        .unwrap();
+    let shutdown = manager
+        .shutdown_release_supervisor(Duration::from_secs(5))
+        .await;
+    assert!(
+        shutdown.drained,
+        "release supervisor should drain: {shutdown:?}"
+    );
     postgres.drop_test_schema().await.unwrap();
 }
 

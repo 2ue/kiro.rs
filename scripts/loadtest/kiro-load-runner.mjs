@@ -5,6 +5,7 @@ import https from "node:https";
 import { URL } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createHash, randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
 
 const args = parseArgs(process.argv.slice(2));
 const baseUrl = new URL(args.baseUrl || process.env.KIRO_BASE_URL || "http://127.0.0.1:9022");
@@ -17,6 +18,8 @@ const scenario = args.scenario || process.env.KIRO_MOCK_SCENARIO || "success";
 const apiKey = args.apiKey || process.env.KIRO_API_KEY || "sk-kiro-rs-local-debug";
 const noSummary = parseBool(args.noSummary ?? process.env.NO_SUMMARY ?? "false");
 const conversationMode = args.conversationMode || process.env.CONVERSATION_MODE || "derived";
+const reportPath = args.report || process.env.REPORT || null;
+const requestTimeoutMs = parseDuration(args.requestTimeout || process.env.REQUEST_TIMEOUT || "120s");
 
 const agent = baseUrl.protocol === "https:" ? new https.Agent({ keepAlive: true, maxSockets: concurrency * 2 }) : new http.Agent({ keepAlive: true, maxSockets: concurrency * 2 });
 
@@ -40,7 +43,10 @@ const state = {
   duplicateChunks: 0,
   responseDigests: new Map(),
   inFlight: 0,
+  peakInFlight: 0,
   firstByteLatencies: [],
+  stoppedSendingAt: null,
+  completedAt: null,
 };
 
 function parseArgs(argv) {
@@ -205,6 +211,18 @@ function requestOnce(pathname, sequence) {
     let eventCount = 0;
     let duplicateChunkCount = 0;
     let previousAssistant = null;
+    let settled = false;
+    let timeoutHandle = null;
+    const finishError = (error) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      const latencyMs = performance.now() - startedAt;
+      state.failed += 1;
+      inc(state.errors, error.code || error.message);
+      state.latencies.push(latencyMs);
+      resolve({ error, latencyMs });
+    };
     const req = client.request(
       url,
       { method: "POST", headers, agent },
@@ -235,6 +253,9 @@ function requestOnce(pathname, sequence) {
           }
         });
         res.on("end", () => {
+          if (settled) return;
+          settled = true;
+          if (timeoutHandle) clearTimeout(timeoutHandle);
           const latencyMs = performance.now() - startedAt;
           const firstByteMs = firstByteAt == null ? null : firstByteAt - startedAt;
           collectRequestSummary(res.statusCode || 0, bodyText, eventCount, duplicateChunkCount, latencyMs, firstByteMs);
@@ -247,15 +268,25 @@ function requestOnce(pathname, sequence) {
             duplicateChunkCount,
           });
         });
+        res.on("aborted", () => {
+          finishError(Object.assign(new Error("response aborted before completion"), { code: "RESPONSE_ABORTED" }));
+        });
+        res.on("error", finishError);
+        res.on("close", () => {
+          if (!res.complete) {
+            finishError(Object.assign(new Error("response closed before completion"), { code: "RESPONSE_CLOSED" }));
+          }
+        });
       }
     );
-    req.on("error", (error) => {
-      const latencyMs = performance.now() - startedAt;
-      state.failed += 1;
-      inc(state.errors, error.code || error.message);
-      state.latencies.push(latencyMs);
-      resolve({ error, latencyMs });
-    });
+    timeoutHandle = setTimeout(() => {
+      req.destroy(
+        Object.assign(new Error(`request timed out after ${requestTimeoutMs}ms`), {
+          code: "REQUEST_TIMEOUT",
+        })
+      );
+    }, requestTimeoutMs);
+    req.on("error", finishError);
     if (payload) req.write(payload);
     req.end();
   });
@@ -270,6 +301,7 @@ async function scheduler() {
     while (state.inFlight < concurrency && Date.now() >= nextAt && Date.now() < deadline) {
       state.sent += 1;
       state.inFlight += 1;
+      state.peakInFlight = Math.max(state.peakInFlight, state.inFlight);
       const sequence = state.sent;
       const current = requestOnce(path, sequence)
         .catch((error) => {
@@ -286,13 +318,17 @@ async function scheduler() {
     const waitMs = Math.max(1, Math.min(intervalMs, nextAt - Date.now(), 25));
     await sleep(waitMs);
   }
+  state.stoppedSendingAt = Date.now();
   while (workers.size > 0) {
     await Promise.race([...workers]);
   }
+  state.completedAt = Date.now();
 }
 
-function printSummary() {
+async function printSummary() {
   const total = state.ok + state.failed;
+  const sendingElapsedMs = (state.stoppedSendingAt || Date.now()) - state.startedAt;
+  const wallElapsedMs = (state.completedAt || Date.now()) - state.startedAt;
   const summary = {
     baseUrl: baseUrl.toString(),
     path,
@@ -302,10 +338,19 @@ function printSummary() {
     durationMs,
     concurrency,
     targetRpm,
+    requestTimeoutMs,
     sent: state.sent,
     completed: total,
     ok: state.ok,
     failed: state.failed,
+    observed: {
+      peakInFlight: state.peakInFlight,
+      sendingElapsedMs,
+      drainElapsedMs: Math.max(0, wallElapsedMs - sendingElapsedMs),
+      wallElapsedMs,
+      sentRpm: round((state.sent * 60_000) / Math.max(1, sendingElapsedMs)),
+      completedRpmOverWallTime: round((total * 60_000) / Math.max(1, wallElapsedMs)),
+    },
     statusCodes: Object.fromEntries([...state.statuses.entries()].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))),
     errors: Object.fromEntries([...state.errors.entries()].sort(([a], [b]) => a.localeCompare(b))),
     latencyMs: {
@@ -327,6 +372,13 @@ function printSummary() {
     },
   };
 
+  if (reportPath) {
+    await writeFile(reportPath, `${JSON.stringify(summary, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+  }
+
   if (!noSummary) {
     console.log(JSON.stringify(summary, null, 2));
   } else {
@@ -339,4 +391,4 @@ function round(value) {
 }
 
 await scheduler();
-printSummary();
+await printSummary();

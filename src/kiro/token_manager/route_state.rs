@@ -47,6 +47,8 @@ pub struct LocalPoolRouteState {
     pub max_queued_requests: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u64>,
+    #[serde(skip)]
+    pub(super) cache_expires_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +83,10 @@ pub(super) fn store_local_pool_route_state_cache(
     state: LocalPoolRouteState,
     now: Instant,
 ) {
+    let expires_at = state
+        .cache_expires_at
+        .map(|deadline| deadline.min(now + LOCAL_POOL_ROUTE_STATE_CACHE_TTL))
+        .unwrap_or(now + LOCAL_POOL_ROUTE_STATE_CACHE_TTL);
     let mut cache = cache.lock();
     if cache.len() >= LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS && !cache.contains_key(&key) {
         cache.retain(|_, cached| cached.expires_at > now);
@@ -88,13 +94,7 @@ pub(super) fn store_local_pool_route_state_cache(
             cache.clear();
         }
     }
-    cache.insert(
-        key,
-        CachedLocalPoolRouteState {
-            state,
-            expires_at: now + LOCAL_POOL_ROUTE_STATE_CACHE_TTL,
-        },
-    );
+    cache.insert(key, CachedLocalPoolRouteState { state, expires_at });
 }
 
 pub(super) fn invalidate_local_pool_route_state_cache(

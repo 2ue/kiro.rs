@@ -41,9 +41,9 @@ pub(super) fn concurrency_blocked_count(
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
     model: Option<&str>,
     excluded_ids: &HashSet<u64>,
-    now: Instant,
+    _now: Instant,
     max_concurrent_requests: u32,
-    global_rpm: u32,
+    _global_rpm: u32,
     global_has_capacity: bool,
     request_weight_units: u32,
 ) -> usize {
@@ -51,8 +51,6 @@ pub(super) fn concurrency_blocked_count(
         .iter()
         .filter(|entry| {
             credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
-                && entry_cooldown_remaining(entry, model, now).is_none()
-                && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
                 && (!global_has_capacity
                     || !entry_has_concurrency_capacity(
                         entry,

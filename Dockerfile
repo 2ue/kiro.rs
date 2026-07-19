@@ -17,12 +17,15 @@ RUN pnpm build
 
 FROM rust:1.92.0-alpine3.23 AS builder
 
+ARG CARGO_BUILD_JOBS=1
+
 RUN apk add --no-cache musl-dev perl make
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 
-ENV CARGO_PROFILE_RELEASE_LTO=false \
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
+    CARGO_PROFILE_RELEASE_LTO=false \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     CARGO_HTTP_TIMEOUT=600 \
     CARGO_HTTP_LOW_SPEED_LIMIT=1 \

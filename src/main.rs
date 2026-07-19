@@ -14,7 +14,7 @@ use std::{
     future::{Future, IntoFuture},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -48,6 +48,12 @@ const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+const RUNTIME_RELOAD_INTERVAL: StdDuration = StdDuration::from_secs(60);
+const RUNTIME_RELOAD_RETRY_MIN: StdDuration = StdDuration::from_millis(250);
+const RUNTIME_RELOAD_RETRY_MAX: StdDuration = StdDuration::from_secs(5);
+const RUNTIME_RELOAD_CONFIG: u8 = 1 << 0;
+const RUNTIME_RELOAD_CREDENTIALS: u8 = 1 << 1;
+const RUNTIME_RELOAD_ALL: u8 = RUNTIME_RELOAD_CONFIG | RUNTIME_RELOAD_CREDENTIALS;
 
 #[tokio::main]
 async fn main() {
@@ -330,10 +336,16 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
+    let external_pool_manager = Arc::new(ExternalPoolManager::new(
+        postgres_store.clone(),
+        redis_store.clone(),
+    ));
+    let external_pool_event_publisher = external_pool_manager.spawn_invalidation_publisher();
     let runtime_event_health = Arc::new(RuntimeEventHealth::default());
-    let runtime_event_listener = spawn_redis_runtime_event_listener(
+    let runtime_event_tasks = spawn_redis_runtime_event_listener(
         redis_store.clone(),
         token_manager.clone(),
+        external_pool_manager.clone(),
         request_api_key_store.clone(),
         runtime_event_health.clone(),
     );
@@ -344,10 +356,6 @@ async fn main() {
         config.default_endpoint.clone(),
     );
     let kiro_provider = Arc::new(kiro_provider);
-    let external_pool_manager = Arc::new(ExternalPoolManager::new(
-        postgres_store.clone(),
-        redis_store.clone(),
-    ));
     let startup_catalog_sync_task = {
         let model_capabilities = model_capabilities.clone();
         let postgres_store = postgres_store.clone();
@@ -529,9 +537,46 @@ async fn main() {
     let shutdown_deadline = shutdown_started_at + BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT;
     runtime_event_health.mark_disconnected();
     tokio::join!(
-        abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
+        runtime_event_tasks.shutdown(),
+        abort_task_with_timeout(
+            "external pool invalidation publisher",
+            external_pool_event_publisher,
+        ),
         abort_task_with_timeout("startup catalog sync", startup_catalog_sync_task),
     );
+
+    let external_release_report = external_pool_manager
+        .shutdown_release_supervisor(remaining_shutdown_budget(
+            shutdown_deadline,
+            BACKGROUND_SHUTDOWN_TIMEOUT,
+        ))
+        .await;
+    tracing::info!(
+        already_started = external_release_report.already_started,
+        drained = external_release_report.drained,
+        timed_out = external_release_report.timed_out,
+        worker_failed = external_release_report.worker_failed,
+        accepting = external_release_report.accepting,
+        active = external_release_report.active,
+        pending = external_release_report.pending,
+        reserved = external_release_report.reserved,
+        enqueued = external_release_report.enqueued,
+        succeeded = external_release_report.succeeded,
+        batches = external_release_report.batches,
+        retries = external_release_report.retries,
+        failed_attempts = external_release_report.failed_attempts,
+        reservation_rejected = external_release_report.reservation_rejected,
+        fatal_rejected = external_release_report.fatal_rejected,
+        abandoned = external_release_report.abandoned,
+        "外部池 Redis lease 释放监督器已停止"
+    );
+    let external_release_shutdown_failed = !external_release_report.drained
+        || external_release_report.timed_out
+        || external_release_report.worker_failed
+        || external_release_report.active > 0
+        || external_release_report.pending > 0
+        || external_release_report.fatal_rejected > 0
+        || external_release_report.abandoned > 0;
 
     let stats_report = stats_flush_worker
         .shutdown(remaining_shutdown_budget(
@@ -630,6 +675,17 @@ async fn main() {
             stats_report.pending_stats_batches,
             stats_report.pending_stats_deltas,
             stats_report.pending_runtime_mutations,
+        );
+    }
+    if external_release_shutdown_failed {
+        panic!(
+            "外部池 Redis lease 释放监督器关闭未完整排空: timed_out={}, worker_failed={}, active={}, pending={}, fatal_rejected={}, abandoned={}",
+            external_release_report.timed_out,
+            external_release_report.worker_failed,
+            external_release_report.active,
+            external_release_report.pending,
+            external_release_report.fatal_rejected,
+            external_release_report.abandoned,
         );
     }
     if let Err(err) = server_result {
@@ -891,13 +947,21 @@ async fn new_ui_index_redirect() -> Redirect {
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
+    external_pool_manager: Arc<ExternalPoolManager>,
     request_api_key_store: Arc<RequestApiKeyStore>,
     health: Arc<RuntimeEventHealth>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> RuntimeEventTasks {
+    let reload_signal = Arc::new(RuntimeReloadSignal::default());
+    let reload_worker = spawn_runtime_reload_worker(
+        reload_signal.clone(),
+        token_manager.clone(),
+        request_api_key_store,
+    );
+    let listener = tokio::spawn(async move {
         loop {
             let config_channel = redis_store.runtime_config_changed_channel();
             let credentials_channel = redis_store.credentials_changed_channel();
+            let external_pools_channel = redis_store.external_pools_changed_channel();
             let wakeup_channel = redis_store.dispatch_wakeup_channel();
             let mut pubsub = match redis_store.subscribe_runtime_events().await {
                 Ok(pubsub) => pubsub,
@@ -908,10 +972,12 @@ fn spawn_redis_runtime_event_listener(
                     continue;
                 }
             };
+            external_pool_manager.invalidate_routing_cache_after_subscription();
+            token_manager.notify_dispatch_state_changed();
+            reload_signal.request(RUNTIME_RELOAD_ALL);
             health.mark_connected();
             tracing::info!("已订阅 Redis 运行时事件");
             let mut stream = pubsub.on_message();
-            let mut periodic_reload = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tokio::select! {
                     message = stream.next() => {
@@ -924,33 +990,19 @@ fn spawn_redis_runtime_event_listener(
                             .unwrap_or_else(|_| String::new());
                         health.mark_event();
                         if channel == config_channel {
-                            match token_manager.reload_runtime_config_from_postgres() {
-                                Ok(true) => {
-                                    request_api_key_store.replace_keys(token_manager.runtime_config().request_api_keys());
-                                    tracing::info!(payload, "已根据 Redis 通知热加载运行配置");
-                                }
-                                Ok(false) => tracing::debug!(payload, "收到运行配置通知，但未执行热加载"),
-                                Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
-                            }
+                            reload_signal.request(RUNTIME_RELOAD_CONFIG);
+                            tracing::debug!(payload, "已合并 Redis 运行配置热加载通知");
                         } else if channel == credentials_channel {
-                            match token_manager.reload_credentials_from_postgres() {
-                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知同步凭据快照"),
-                                Ok(false) => tracing::debug!(payload, "收到凭据通知，但凭据快照无变化"),
-                                Err(err) => tracing::warn!(payload, "同步凭据快照失败: {}", err),
+                            reload_signal.request(RUNTIME_RELOAD_CREDENTIALS);
+                            tracing::debug!(payload, "已合并 Redis 凭据快照同步通知");
+                        } else if channel == external_pools_channel {
+                            if external_pool_manager.invalidate_routing_cache_from_event(&payload) {
+                                tracing::info!(payload, "已根据 Redis 通知清理外部池路由缓存");
+                            } else {
+                                tracing::debug!("忽略本实例发布的外部池路由缓存通知");
                             }
-                            token_manager.notify_dispatch_state_changed();
                         } else if channel == wakeup_channel {
                             token_manager.notify_dispatch_state_changed();
-                        }
-                    }
-                    _ = periodic_reload.tick() => {
-                        match token_manager.reload_runtime_config_from_postgres() {
-                            Ok(true) => request_api_key_store.replace_keys(token_manager.runtime_config().request_api_keys()),
-                            Ok(false) => {}
-                            Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),
-                        }
-                        if let Err(err) = token_manager.reload_credentials_from_postgres() {
-                            tracing::warn!("定时同步凭据快照失败: {}", err);
                         }
                     }
                 }
@@ -958,6 +1010,117 @@ fn spawn_redis_runtime_event_listener(
             health.mark_disconnected();
             tracing::warn!("Redis 运行时事件订阅已断开，准备重新订阅");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    RuntimeEventTasks {
+        listener,
+        reload_worker,
+    }
+}
+
+struct RuntimeEventTasks {
+    listener: tokio::task::JoinHandle<()>,
+    reload_worker: tokio::task::JoinHandle<()>,
+}
+
+impl RuntimeEventTasks {
+    async fn shutdown(self) {
+        self.listener.abort();
+        self.reload_worker.abort();
+        let (listener_result, reload_result) = tokio::join!(self.listener, self.reload_worker);
+        for (task_name, result) in [
+            ("Redis runtime event listener", listener_result),
+            ("Redis runtime reload worker", reload_result),
+        ] {
+            if let Err(err) = result {
+                if !err.is_cancelled() {
+                    tracing::warn!(task_name, "后台任务关闭异常: {}", err);
+                }
+            }
+        }
+    }
+}
+
+fn runtime_reload_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + RUNTIME_RELOAD_INTERVAL,
+        RUNTIME_RELOAD_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+#[derive(Default)]
+struct RuntimeReloadSignal {
+    pending: AtomicU8,
+    notify: tokio::sync::Notify,
+}
+
+impl RuntimeReloadSignal {
+    fn request(&self, bits: u8) {
+        self.pending.fetch_or(bits, Ordering::AcqRel);
+        self.notify.notify_one();
+    }
+
+    async fn next(&self) -> u8 {
+        loop {
+            let notified = self.notify.notified();
+            let pending = self.pending.swap(0, Ordering::AcqRel);
+            if pending != 0 {
+                return pending;
+            }
+            notified.await;
+        }
+    }
+}
+
+fn spawn_runtime_reload_worker(
+    signal: Arc<RuntimeReloadSignal>,
+    token_manager: Arc<MultiTokenManager>,
+    request_api_key_store: Arc<RequestApiKeyStore>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut retry_delay = RUNTIME_RELOAD_RETRY_MIN;
+        let mut periodic_reload = runtime_reload_interval();
+        loop {
+            let pending = tokio::select! {
+                pending = signal.next() => pending,
+                _ = periodic_reload.tick() => RUNTIME_RELOAD_ALL,
+            };
+            let mut failed = 0u8;
+            if pending & RUNTIME_RELOAD_CONFIG != 0 {
+                match token_manager.reload_runtime_config_from_postgres() {
+                    Ok(true) => {
+                        request_api_key_store
+                            .replace_keys(token_manager.runtime_config().request_api_keys());
+                        tracing::info!("已从 PgSQL 热加载运行配置");
+                    }
+                    Ok(false) => tracing::debug!("运行配置热加载无变化"),
+                    Err(err) => {
+                        failed |= RUNTIME_RELOAD_CONFIG;
+                        tracing::warn!("从 PgSQL 热加载运行配置失败: {}", err);
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+            if pending & RUNTIME_RELOAD_CREDENTIALS != 0 {
+                match token_manager.reload_credentials_from_postgres() {
+                    Ok(true) => tracing::info!("已从 PgSQL 同步凭据快照"),
+                    Ok(false) => tracing::debug!("PgSQL 凭据快照无变化"),
+                    Err(err) => {
+                        failed |= RUNTIME_RELOAD_CREDENTIALS;
+                        tracing::warn!("从 PgSQL 同步凭据快照失败: {}", err);
+                    }
+                }
+                token_manager.notify_dispatch_state_changed();
+            }
+            if failed == 0 {
+                retry_delay = RUNTIME_RELOAD_RETRY_MIN;
+                continue;
+            }
+            tokio::time::sleep(retry_delay).await;
+            signal.request(failed);
+            retry_delay = retry_delay.saturating_mul(2).min(RUNTIME_RELOAD_RETRY_MAX);
         }
     })
 }
@@ -1101,6 +1264,14 @@ fn handle_credentials_command(
 mod lifecycle_tests {
     use super::*;
 
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     #[test]
     fn remaining_shutdown_budget_caps_each_stage_and_expires() {
         let future_deadline = Instant::now() + StdDuration::from_secs(1);
@@ -1116,5 +1287,69 @@ mod lifecycle_tests {
             remaining_shutdown_budget(expired_deadline, StdDuration::from_secs(1)),
             StdDuration::ZERO
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_signal_coalesces_config_and_credential_bits() {
+        let signal = RuntimeReloadSignal::default();
+        signal.request(RUNTIME_RELOAD_CONFIG);
+        signal.request(RUNTIME_RELOAD_CONFIG);
+        signal.request(RUNTIME_RELOAD_CREDENTIALS);
+
+        assert_eq!(signal.next().await, RUNTIME_RELOAD_ALL);
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(10), signal.next())
+                .await
+                .is_err(),
+            "coalesced bits must be consumed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_interval_does_not_tick_immediately() {
+        let mut interval = runtime_reload_interval();
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(10), interval.tick())
+                .await
+                .is_err(),
+            "periodic PgSQL reload must not run immediately after Redis subscription"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_event_tasks_shutdown_joins_both_tasks() {
+        let listener_dropped = Arc::new(AtomicBool::new(false));
+        let reload_dropped = Arc::new(AtomicBool::new(false));
+        let listener_flag = listener_dropped.clone();
+        let reload_flag = reload_dropped.clone();
+        let (listener_started_tx, listener_started_rx) = tokio::sync::oneshot::channel();
+        let (reload_started_tx, reload_started_rx) = tokio::sync::oneshot::channel();
+        let tasks = RuntimeEventTasks {
+            listener: tokio::spawn(async move {
+                let _drop_flag = DropFlag(listener_flag);
+                let _ = listener_started_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+            reload_worker: tokio::spawn(async move {
+                let _drop_flag = DropFlag(reload_flag);
+                let _ = reload_started_tx.send(());
+                std::future::pending::<()>().await;
+            }),
+        };
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            listener_started_rx
+                .await
+                .expect("listener task must report that it started");
+            reload_started_rx
+                .await
+                .expect("reload worker must report that it started");
+        })
+        .await
+        .expect("runtime event tasks did not start in time");
+
+        tasks.shutdown().await;
+
+        assert!(listener_dropped.load(Ordering::Acquire));
+        assert!(reload_dropped.load(Ordering::Acquire));
     }
 }

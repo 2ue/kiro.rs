@@ -2,7 +2,7 @@
 
 Role: Durable planning registry and authority entrypoint
 
-Status: Current as of 2026-07-13
+Status: Current as of 2026-07-18
 
 Authority: Defines how project-wide facts, accepted decisions, plan state, and historical evidence are retrieved
 
@@ -39,7 +39,7 @@ Current-state facts and target-state decisions answer different questions and mu
 | [Greenfield AI Gateway](plans/greenfield-ai-gateway/README.md) | Architecture Plan Ready For Review | New-repository Go/React target, module contracts, Kiro V1 scope, technology stack, references, complete work graph and acceptance gates documented; implementation Not Started | 2026-07-13: [complete reconstruction plan](plans/greenfield-ai-gateway/topics/complete-reconstruction-plan.md), [reference review](plans/greenfield-ai-gateway/topics/reference-projects-and-template-selection.md) and [decision 001](plans/greenfield-ai-gateway/decisions/001-greenfield-go-modular-ai-gateway.md) created | Accept the plan, choose the new repository name/location and create the target repository |
 | [System architecture modernization](plans/system-architecture-modernization/README.md) | Superseded / Historical Reference | Rust target implementation never started; findings and selected invariants remain reference inputs for the greenfield plan | 2026-07-13: [supersession record](plans/system-architecture-modernization/history/superseded-by-greenfield-ai-gateway-2026-07-13.md) maps retained evidence and rejected target topology | No target implementation; preserve until a link-safe archive pass |
 | [Runtime correctness and release gates](plans/runtime-correctness-and-release-gates/README.md) | In Progress | Runtime usage/error correctness follow-up before v0.0.103 release validation | 2026-07-13: [feature follow-up status](../feature/runtime-usage-error-followup-2026-07-13.md) records current fixes, `/ha` usage explanation, and remaining real-service gates; earlier static/storage/protocol/load/shutdown evidence remains indexed | Finish C0 + temporary local-service real-call validation, then complete the end-to-end Docker gate after the crates.io fetch timeout |
-| [Request body capability modularization](plans/request-body-capability-modularization/README.md) | Implemented And Validated | Maintenance | 2026-07-06: capability plans, converter split, configuration, UI, and fake-upstream regression landed | No active implementation; preserve behavior as an oracle and route future target-system work through the Greenfield AI Gateway plan |
+| [Request body capability modularization](plans/request-body-capability-modularization/README.md) | Implemented Base; Reasoning Fidelity Plan Ready | Current Rust protocol-correctness maintenance; implementation not started | 2026-07-06: capability plans, converter split, configuration, UI, and fake-upstream regression landed | Implement schema-driven per-attempt reasoning materialization, exact effort/thinking fidelity, operator injection/force controls, and full IDE/CLI validation |
 | [Admin observability, routing model support, and config IA](plans/admin-observability-routing-config/README.md) | Implemented And Locally Verified | Maintenance | 2026-07-07: exact usage search, supported-model routing, bounded prompt retry, and UI grouping landed | Optional low-volume real-upstream smoke only when explicitly requested |
 
 ## Baseline

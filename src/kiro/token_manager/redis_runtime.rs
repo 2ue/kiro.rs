@@ -10,6 +10,7 @@ use crate::storage::postgres::PostgresStore;
 use crate::storage::redis_cache::{RedisStore, SchedulerCredentialState, SchedulerHealthState};
 
 use super::account_state::{CredentialEntry, CredentialModelCooldown, InFlightLease};
+use super::concurrency::distributed_in_flight_lease_max_age;
 use super::cooldown::model_state_key;
 use super::rpm::{effective_rpm, rate_limit_interval_for_rpm};
 use super::storage_task::spawn_best_effort_storage_task;
@@ -31,14 +32,7 @@ fn instant_from_elapsed_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> I
     }
 }
 
-fn redis_in_flight_lease_is_fresh(
-    last_seen_at_ms: i64,
-    now_ms: i64,
-    max_age: Option<StdDuration>,
-) -> bool {
-    let Some(max_age) = max_age else {
-        return true;
-    };
+fn redis_in_flight_lease_is_fresh(last_seen_at_ms: i64, now_ms: i64, max_age: StdDuration) -> bool {
     if last_seen_at_ms >= now_ms {
         return true;
     }
@@ -104,7 +98,7 @@ fn apply_scheduler_state_to_entry(
     entry: &mut CredentialEntry,
     state: SchedulerCredentialState,
     global_rpm: u32,
-    in_flight_max_age: Option<StdDuration>,
+    in_flight_max_age: StdDuration,
     now_ms: i64,
     now: Instant,
 ) {
@@ -131,19 +125,47 @@ fn apply_scheduler_state_to_entry(
         }
         entry.model_health.insert(key, model_state.health);
     }
-    entry.rate_limit_available_at =
-        if rate_limit_interval_for_rpm(effective_rpm(entry, global_rpm)).is_some() {
-            let redis_available_at = state
-                .rate_limit_available_at_ms
-                .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));
-            match (entry.rate_limit_available_at, redis_available_at) {
-                (Some(local), Some(redis)) => Some(local.max(redis)),
-                (Some(local), None) if local > now => Some(local),
-                (_, redis) => redis,
-            }
-        } else {
-            None
-        };
+    let current_rpm = effective_rpm(entry, global_rpm);
+    let redis_reservation = (rate_limit_interval_for_rpm(current_rpm).is_some()
+        && state.rate_limit_rpm == Some(current_rpm))
+    .then(|| {
+        state
+            .rate_limit_available_at_ms
+            .zip(state.rate_limit_remaining_ms)
+            .map(|(redis_deadline_ms, remaining_ms)| {
+                (
+                    now + StdDuration::from_millis(remaining_ms.max(1)),
+                    state.rate_limit_owner_lease_id,
+                    redis_deadline_ms,
+                )
+            })
+    })
+    .flatten();
+    let local_reservation = (entry.rate_limit_rpm == Some(current_rpm))
+        .then_some(entry.rate_limit_available_at)
+        .flatten()
+        .filter(|available_at| *available_at > now)
+        .zip(entry.rate_limit_redis_deadline_ms)
+        .map(|(available_at, redis_deadline_ms)| {
+            (
+                available_at,
+                entry.rate_limit_owner_lease_id,
+                redis_deadline_ms,
+            )
+        });
+    let reservation = match (local_reservation, redis_reservation) {
+        (Some(local), Some(redis)) if local.2 > redis.2 => Some(local),
+        (Some(local), Some(redis)) if local.2 == redis.2 => {
+            Some((local.0.max(redis.0), local.1.or(redis.1), redis.2))
+        }
+        (Some(local), None) => Some(local),
+        (_, redis) => redis,
+    };
+    entry.rate_limit_available_at = reservation.map(|(available_at, _, _)| available_at);
+    entry.rate_limit_rpm = reservation.map(|_| current_rpm);
+    entry.rate_limit_owner_lease_id = reservation.and_then(|(_, owner, _)| owner);
+    entry.rate_limit_redis_deadline_ms =
+        reservation.map(|(_, _, redis_deadline_ms)| redis_deadline_ms);
     let previous_local_leases = std::mem::take(&mut entry.in_flight_leases);
     let mut seen_lease_ids = HashSet::new();
     let mut merged_in_flight_leases: Vec<InFlightLease> = state
@@ -183,21 +205,21 @@ pub(super) fn apply_scheduler_states(
     config: &Mutex<Config>,
     states: HashMap<u64, SchedulerCredentialState>,
 ) {
-    let (global_rpm, in_flight_max_age) = {
+    let (global_rpm, configured_in_flight_max_age_secs) = {
         let config = config.lock();
         (
             config.credential_rpm.unwrap_or(0),
-            (config.credential_in_flight_lease_max_secs > 0)
-                .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
+            config.credential_in_flight_lease_max_secs,
         )
     };
+    let in_flight_max_age = distributed_in_flight_lease_max_age(configured_in_flight_max_age_secs);
     apply_scheduler_states_with_global_rpm(entries, global_rpm, in_flight_max_age, states);
 }
 
 pub(super) fn apply_scheduler_states_with_global_rpm(
     entries: &Mutex<Vec<CredentialEntry>>,
     global_rpm: u32,
-    in_flight_max_age: Option<StdDuration>,
+    in_flight_max_age: StdDuration,
     states: HashMap<u64, SchedulerCredentialState>,
 ) {
     let now_ms = Utc::now().timestamp_millis();
@@ -219,14 +241,14 @@ pub(super) fn apply_scheduler_states_for_ids(
     }
     let now_ms = Utc::now().timestamp_millis();
     let now = Instant::now();
-    let (global_rpm, in_flight_max_age) = {
+    let (global_rpm, configured_in_flight_max_age_secs) = {
         let config = config.lock();
         (
             config.credential_rpm.unwrap_or(0),
-            (config.credential_in_flight_lease_max_secs > 0)
-                .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
+            config.credential_in_flight_lease_max_secs,
         )
     };
+    let in_flight_max_age = distributed_in_flight_lease_max_age(configured_in_flight_max_age_secs);
     let mut entries = entries.lock();
     for entry in entries.iter_mut() {
         if let Some(state) = states.get(&entry.id).cloned() {
@@ -253,6 +275,9 @@ pub(super) fn clear_scheduler_state_for_credential_local(
         entry.cooldown_reason = None;
         entry.model_cooldowns.clear();
         entry.rate_limit_available_at = None;
+        entry.rate_limit_rpm = None;
+        entry.rate_limit_owner_lease_id = None;
+        entry.rate_limit_redis_deadline_ms = None;
         entry.health = SchedulerHealthState::default();
         entry.model_health.clear();
         if clear_in_flight {
@@ -275,10 +300,30 @@ pub(super) fn clear_scheduler_state_for_credential_redis(
         redis.clear_scheduler_cooldown(id).await?;
         redis.clear_scheduler_health(id).await?;
         redis.clear_rate_limit(id).await?;
-        redis.delete_sessions_for_credential(id).await?;
         if clear_in_flight {
             redis.clear_in_flight_leases(id, None).await?;
         }
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_config_snapshot_age_expires_old_distributed_lease() {
+        let max_age = distributed_in_flight_lease_max_age(0);
+        let now_ms = 1_000_000i64;
+        assert!(redis_in_flight_lease_is_fresh(
+            now_ms - max_age.as_millis() as i64,
+            now_ms,
+            max_age,
+        ));
+        assert!(!redis_in_flight_lease_is_fresh(
+            now_ms - max_age.as_millis() as i64 - 1,
+            now_ms,
+            max_age,
+        ));
+    }
 }

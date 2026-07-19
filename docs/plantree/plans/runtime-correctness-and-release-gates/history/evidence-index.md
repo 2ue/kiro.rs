@@ -1,10 +1,10 @@
 # Evidence Index
 
-Date: 2026-07-12
+Date: 2026-07-17
 
 Role: Durable verification summary for the runtime-correctness and release-gates plan.
 
-Status: Current through the dirty-tree schema-key compatibility and local release-build evidence on 2026-07-12. Every listed gate passed except the explicitly incomplete end-to-end Docker image build.
+Status: Current through the uncommitted scheduler persistence/admission isolation evidence on 2026-07-17. Every listed historical gate passed except the explicitly incomplete end-to-end Docker image build; the scheduler branch has not been deployed or tested against a real upstream.
 
 Source revision note: This historical index did not record the exact Git commit/tree of the validated worktree. Results and binary hashes below must not be attributed to the later `v0.0.102` version-only release commit without separate evidence.
 
@@ -15,6 +15,34 @@ Source revision note: This historical index did not record the exact Git commit/
 - Raw runtime reports remain under `target/loadtest/runtime-correctness-20260710204231-19707/`; this index records only non-secret outcomes and artifact identifiers.
 
 The later `v0.0.102` release action is a separate event and does not change the evidence boundary above. See [the version-specific release exception](release-exception-v0.0.102.md). The 2026-07-12 schema-key evidence below was produced from a dirty working tree and proves the current local implementation only; it is not an attestation for the already published `v0.0.102` artifact.
+
+## 2026-07-17 Scheduler Persistence And Redis Admission Isolation
+
+- Branch: `fix/scheduler-redis-degradation-isolation`, based on `main` / `v0.0.109` / `401473c`. No commit, tag, push, deployment, production mutation, or real-upstream call is part of this evidence.
+- The initial incident conclusion was incomplete. No persistent credential disable was found, but PgSQL success-persistence timeouts did set `runtime_persistence_degraded=true` and `entry.disabled=true` in each affected process. Success handling then synchronously removed sticky bindings, and the old `SMEMBERS + N serial EVAL` cleanup could exceed 75 ms and open the shared Redis admission breaker.
+- Success persistence now has a 100 ms request-path budget. Pending success mutations remain dispatchable and coalesce only in an unattempted FIFO tail; API/refresh failure, disable, and patch mutations still quarantine and fail closed. PgSQL applies aggregated success count, warmup decrement, revision update, and operation-id idempotency in one transaction.
+- Successful stream and non-stream completion releases its in-flight lease before terminal success persistence. Soft/upstream failure still records cooldown or sticky failure before releasing the lease.
+- Only capacity acquire, queue admission, and queue renewal affect Redis admission degradation. Sticky binding, soft-failure, and scheduler snapshot operations use a bounded non-admission path that neither opens nor resets the breaker.
+- Credential-wide sticky cleanup leaves the request path immediately and uses atomic batches of 64 (`SPOP`, current binding credential check, conditional `DEL`) with a yield between batches. It preserves concurrently rebound sessions and safely handles malformed scalar JSON.
+- Local route classification preserves authoritative `AllDisabled`, reports process quarantine plus Redis failure as `SchedulerRedisDegraded`, and uses the Redis backoff rather than an unrelated credential cooldown for `retry_after_secs`.
+- Normal local requests no longer scan external pools before establishing a valid local fallback reason. Raw direct/preflight paths short-circuit disabled feature switches, parsed preflight requires an actually available pool, and cache misses use an async singleflight refresh with a lock-after-wait cache check.
+
+Verification:
+
+- Static: `cargo fmt --all -- --check`, `git diff --check`, and `cargo check --tests --locked` passed.
+- Full real-storage suite: `KIRO_RS_TEST_POSTGRES_URL=... KIRO_RS_TEST_REDIS_URL=... cargo test --locked --bin kiro-rs -- --test-threads=4` passed `1169/1169`; the isolated dependency URLs were supplied, so the PgSQL/Redis tests did not skip.
+- Loadtest unit suite: `cargo test --locked --bin kiro_loadtest` passed `26/26`.
+- Real PgSQL: while both connections in a two-connection pool were held, 40 credentials reported success concurrently. The request-path phase stayed bounded, route state remained `Ready`, `available=40`, `disabled=0`, and all 40 queued mutations replayed after releasing the pool.
+- Real Redis: 10,000 sticky bindings were populated, cleanup returned off-path within the 75 ms admission budget, 64 admission probes succeeded during cleanup, the breaker deadline remained empty, and final binding backlog was zero.
+- Fail-closed evidence: Redis in-flight admission rejected without a local lease during degradation, an already queued waiter failed closed and released its Redis queue lease, and authoritative disable remained distinct from process quarantine.
+- L1 fake-upstream reports are in `target/loadtest/scheduler-redis-fix-20260717/`: stream `40/40` with TTFB p95 `2 ms`; non-stream `40/40` with p95 `3 ms`; injected 1500 ms slow-first-byte `24/24` with p95 `1507 ms` and no additional queueing; slow-thinking `20/20`; burst recovery produced the expected first 9 HTTP 500 responses followed by 21 consecutive HTTP 200 responses.
+- The fake-upstream run used temporary ports `39180-39184`, which were released afterward. It validates the load generator, stream parsing, latency measurement, and recovery sequencing, not a complete proxy/PgSQL/Redis path.
+
+Residual boundary:
+
+- The generic best-effort storage executor can reject or cancel sticky cleanup after five seconds; stale bindings then age out through the six-hour TTL. Queue rejection is visible in logs, and the tested 10,000-binding cleanup completed, but there is no durable retry worker.
+- Pending success mutations are in-memory and are not a crash-durable journal. Normal retries are operation-id idempotent and generation-fenced; a hard kill during a prolonged PgSQL outage can lose unapplied warmup decrements.
+- A production-like full-proxy canary with 40 fake accounts and an external fallback sentinel remains a pre-deployment recommendation. No production or real Kiro upstream claim is made.
 
 ## 2026-07-12 Tool Schema Key Compatibility
 

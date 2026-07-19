@@ -53,7 +53,8 @@ pub(super) struct CredentialEntry {
     pub(super) runtime_revision: u64,
     /// Reset generation used to fence runtime mutations created before an Admin reset/update.
     pub(super) runtime_generation: u64,
-    /// A PgSQL mutation is waiting to be replayed. Quarantined credentials are not dispatched.
+    /// A correctness-critical PgSQL mutation is waiting to be replayed. A pending success reset
+    /// alone is safe to replay without quarantining the credential.
     pub(super) runtime_persistence_degraded: bool,
     /// 是否已禁用
     pub(super) disabled: bool,
@@ -73,6 +74,17 @@ pub(super) struct CredentialEntry {
     pub(super) model_cooldowns: HashMap<String, CredentialModelCooldown>,
     /// 下一次本地限流允许发送请求的时间，不持久化。
     pub(super) rate_limit_available_at: Option<Instant>,
+    /// 生成当前限流时间的 effective RPM；配置变化时用于拒绝旧状态。
+    pub(super) rate_limit_rpm: Option<u32>,
+    /// 生成当前限流时间的调度 lease；仅 owner 可回滚未实际发出的请求。
+    pub(super) rate_limit_owner_lease_id: Option<u64>,
+    /// Redis pacing deadline，作为跨连接乱序响应的单调 reservation 身份。
+    pub(super) rate_limit_redis_deadline_ms: Option<i64>,
+    /// 本进程已选中该凭据、但 Redis admission 尚未确认的临时 pacing 占位。
+    ///
+    /// 该状态必须与 Redis 权威 pacing 分离，否则后台 Redis 快照可能在 EVAL 返回前
+    /// 清掉本地占位，使同一进程的请求再次选中相同凭据并形成重选风暴。
+    pub(super) pending_redis_admission: Option<PendingRedisAdmission>,
     /// 当前正在使用该凭据的请求数，不持久化。
     pub(super) in_flight_requests: u32,
     /// 当前正在使用该凭据的请求 lease，不持久化。
@@ -85,6 +97,14 @@ pub(super) struct CredentialEntry {
     pub(super) model_health: HashMap<String, SchedulerHealthState>,
     /// 本进程内的近期调度选中事件；无 Redis 时用于计算短窗口调度压力。
     pub(super) selection_events: VecDeque<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PendingRedisAdmission {
+    pub(super) lease_id: u64,
+    pub(super) rate_limit_available_at: Option<Instant>,
+    pub(super) baseline_in_flight_requests: u32,
+    pub(super) baseline_global_in_flight_requests: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -108,10 +128,13 @@ pub(super) struct InFlightLease {
 }
 
 /// 会话到凭据的粘性绑定。
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct SessionBinding {
     pub(super) credential_id: u64,
     pub(super) last_used_at: DateTime<Utc>,
     pub(super) soft_failure_count: u32,
+    /// A local-first binding is authoritative until its queued Redis write finishes.
+    pub(super) redis_persist_pending: bool,
 }
 
 /// 禁用原因

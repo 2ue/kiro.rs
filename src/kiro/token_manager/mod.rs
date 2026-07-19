@@ -37,8 +37,8 @@ pub use types::{
 
 #[allow(unused_imports)]
 pub(crate) use refresh::{
-    RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
-    is_token_expiring_within, refresh_token, validate_refresh_token,
+    RefreshCredentialRejectedError, RefreshTokenInvalidError, get_usage_limits, is_token_expired,
+    is_token_expiring_soon, is_token_expiring_within, refresh_token, validate_refresh_token,
 };
 #[allow(unused_imports)]
 pub(crate) use types::InFlightKind;

@@ -76,6 +76,24 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+/// The refresh service definitively rejected the client credentials.
+///
+/// Only this typed error contributes to the bounded permanent refresh-failure
+/// counter. Transport, coordination, storage and unknown protocol failures stay
+/// transient so infrastructure pressure cannot disable a healthy credential.
+#[derive(Debug)]
+pub(crate) struct RefreshCredentialRejectedError {
+    pub message: String,
+}
+
+impl fmt::Display for RefreshCredentialRejectedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RefreshCredentialRejectedError {}
+
 pub(super) fn is_invalid_grant_response(status: reqwest::StatusCode, body_text: &str) -> bool {
     if status.as_u16() != 400 {
         return false;
@@ -88,6 +106,37 @@ pub(super) fn is_invalid_grant_response(status: reqwest::StatusCode, body_text: 
     }
 
     body_text.contains("\"invalid_grant\"")
+}
+
+pub(super) fn is_refresh_credential_rejected_response(
+    status: reqwest::StatusCode,
+    body_text: &str,
+) -> bool {
+    if !matches!(status.as_u16(), 400 | 401 | 403) {
+        return false;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body_text) else {
+        return false;
+    };
+    ["error", "errorCode", "code", "__type"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .map(|raw| {
+            raw.rsplit(['#', ':'])
+                .next()
+                .unwrap_or(raw)
+                .to_ascii_lowercase()
+        })
+        .any(|code| {
+            matches!(
+                code.as_str(),
+                "invalid_client"
+                    | "unauthorized_client"
+                    | "invalidclientexception"
+                    | "unauthorizedclientexception"
+            )
+        })
 }
 
 /// 刷新 Token
@@ -187,6 +236,12 @@ async fn refresh_social_token(
             500..=599 => "服务器错误，AWS OAuth 服务暂时不可用",
             _ => "Token 刷新失败",
         };
+        if is_refresh_credential_rejected_response(status, &body_text) {
+            return Err(RefreshCredentialRejectedError {
+                message: format!("{}: {} {}", error_msg, status, body_text),
+            }
+            .into());
+        }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -274,6 +329,12 @@ async fn refresh_external_idp_token(
             500..=599 => "External IdP 服务暂时不可用",
             _ => "External IdP Token 刷新失败",
         };
+        if is_refresh_credential_rejected_response(status, &body_text) {
+            return Err(RefreshCredentialRejectedError {
+                message: format!("{}: {} {}", error_msg, status, body_text),
+            }
+            .into());
+        }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -368,6 +429,12 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
+        if is_refresh_credential_rejected_response(status, &body_text) {
+            return Err(RefreshCredentialRejectedError {
+                message: format!("{}: {} {}", error_msg, status, body_text),
+            }
+            .into());
+        }
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
@@ -550,17 +617,64 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::extract::{Form, State};
+    use axum::http::StatusCode;
     use axum::routing::post;
     use axum::{Json, Router};
     use serde_json::json;
 
-    use super::refresh_token;
+    use super::{is_refresh_credential_rejected_response, refresh_token};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
 
     #[derive(Clone)]
     struct TokenEndpointState {
         captured_form: Arc<Mutex<Option<HashMap<String, String>>>>,
+    }
+
+    #[derive(Clone)]
+    struct TokenErrorEndpointState {
+        status: StatusCode,
+        body: serde_json::Value,
+    }
+
+    #[test]
+    fn refresh_rejection_classifier_uses_a_structured_allowlist() {
+        assert!(!is_refresh_credential_rejected_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "not-json"
+        ));
+        assert!(!is_refresh_credential_rejected_response(
+            reqwest::StatusCode::FORBIDDEN,
+            "{}"
+        ));
+        assert!(is_refresh_credential_rejected_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid_client"}"#
+        ));
+        assert!(is_refresh_credential_rejected_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"code":"UnauthorizedClientException"}"#
+        ));
+        assert!(is_refresh_credential_rejected_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_client"}"#
+        ));
+        assert!(is_refresh_credential_rejected_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"__type":"aws.protocol#UnauthorizedClientException"}"#
+        ));
+        assert!(!is_refresh_credential_rejected_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"slow_down"}"#
+        ));
+        assert!(!is_refresh_credential_rejected_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"invalid_client"}"#
+        ));
+        assert!(!is_refresh_credential_rejected_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "{}"
+        ));
     }
 
     async fn mock_external_idp_token_endpoint(
@@ -574,6 +688,91 @@ mod tests {
             "expires_in": 3600,
             "scope": "offline_access codewhisperer:conversations"
         }))
+    }
+
+    async fn mock_external_idp_error_endpoint(
+        State(state): State<TokenErrorEndpointState>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        (state.status, Json(state.body))
+    }
+
+    async fn external_idp_refresh_error(
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> anyhow::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/token", post(mock_external_idp_error_endpoint))
+            .with_state(TokenErrorEndpointState { status, body });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            client_id: Some("client-123".to_string()),
+            token_endpoint: Some(format!("http://{addr}/token")),
+            ..Default::default()
+        };
+
+        let error = refresh_token(&credentials, &Config::default(), None)
+            .await
+            .unwrap_err();
+        server.abort();
+        error
+    }
+
+    #[tokio::test]
+    async fn external_idp_refresh_errors_preserve_permanence_classification() {
+        let rejected = external_idp_refresh_error(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "invalid_client"}),
+        )
+        .await;
+        assert!(
+            rejected
+                .downcast_ref::<super::RefreshCredentialRejectedError>()
+                .is_some()
+        );
+
+        let unstructured_unauthorized =
+            external_idp_refresh_error(StatusCode::UNAUTHORIZED, json!({})).await;
+        assert!(
+            unstructured_unauthorized
+                .downcast_ref::<super::RefreshCredentialRejectedError>()
+                .is_none()
+        );
+        assert!(
+            unstructured_unauthorized
+                .downcast_ref::<super::RefreshTokenInvalidError>()
+                .is_none()
+        );
+
+        let rate_limited = external_idp_refresh_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "invalid_client"}),
+        )
+        .await;
+        assert!(
+            rate_limited
+                .downcast_ref::<super::RefreshCredentialRejectedError>()
+                .is_none()
+        );
+        assert!(
+            rate_limited
+                .downcast_ref::<super::RefreshTokenInvalidError>()
+                .is_none()
+        );
+
+        let invalid_grant =
+            external_idp_refresh_error(StatusCode::BAD_REQUEST, json!({"error": "invalid_grant"}))
+                .await;
+        assert!(
+            invalid_grant
+                .downcast_ref::<super::RefreshTokenInvalidError>()
+                .is_some()
+        );
     }
 
     #[tokio::test]

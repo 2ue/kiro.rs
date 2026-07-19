@@ -6,7 +6,6 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc,
 };
-use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -22,16 +21,17 @@ const DEFAULT_QUERY_LIMIT: usize = 100;
 const DEFAULT_PAGE_QUERY_LIMIT: usize = 20;
 const MAX_QUERY_LIMIT: usize = 1000;
 const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
-const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 const USAGE_WRITER_BATCH_MAX: usize = 64;
 const USAGE_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(25);
 const USAGE_WRITER_POSTGRES_TIMEOUT_SECS: u64 = 5;
+const USAGE_WRITER_POSTGRES_TOTAL_DEADLINE_SECS: u64 = 120;
+const USAGE_WRITER_POSTGRES_INITIAL_BACKOFF_MS: u64 = 100;
+const USAGE_WRITER_POSTGRES_MAX_BACKOFF_MS: u64 = 2_000;
 const USAGE_REDIS_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_REDIS_WRITER_BATCH_MAX: usize = 64;
 const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(10);
 const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
 const USAGE_WRITER_ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_millis(100);
-const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
 const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
 const ERROR_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 8192;
@@ -1062,6 +1062,15 @@ struct UsageWriterProgress {
     accepted: AtomicU64,
     finished: AtomicU64,
     changed: Notify,
+    #[cfg(test)]
+    wait_before_await_gate: Mutex<Option<UsageWaitTestGate>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct UsageWaitTestGate {
+    reached: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
 }
 
 impl UsageWriterProgress {
@@ -1085,9 +1094,18 @@ impl UsageWriterProgress {
     async fn wait_until(&self, target: u64) -> u64 {
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let finished = self.finished();
             if finished >= target {
                 return finished;
+            }
+            #[cfg(test)]
+            let gate = self.wait_before_await_gate.lock().take();
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.reached.wait().await;
+                gate.resume.wait().await;
             }
             changed.await;
         }
@@ -1159,6 +1177,8 @@ struct UsageShutdownState {
     complete: AtomicBool,
     timed_out: AtomicBool,
     changed: Notify,
+    #[cfg(test)]
+    wait_before_await_gate: Mutex<Option<UsageWaitTestGate>>,
 }
 
 pub struct UsageRecorder {
@@ -1176,12 +1196,6 @@ pub struct UsageRecorder {
     backpressured_redis_records: AtomicU64,
     dropped_persist_records: Arc<AtomicU64>,
     dropped_redis_records: Arc<AtomicU64>,
-}
-
-enum UsageDashboardCacheRead {
-    Hit(UsageDashboardResponse),
-    Empty,
-    Timeout,
 }
 
 fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
@@ -1465,7 +1479,7 @@ impl UsageRecorder {
                 Some(Arc::new(UsageWriterControl::new(tx, task, progress)))
             } else {
                 tracing::warn!(
-                    "创建 UsageRecorder 时没有运行中的 Tokio runtime，将同步写入 Redis usage summary"
+                    "创建 UsageRecorder 时没有运行中的 Tokio runtime，Redis usage snapshot writer 不可用"
                 );
                 None
             }
@@ -1580,7 +1594,7 @@ impl UsageRecorder {
                         tracing::warn!(
                             count,
                             dropped,
-                            "Redis usage 队列已满，已丢弃本条 summary 记录以避免阻塞主请求"
+                            "Redis usage 队列已满，已丢弃本条 snapshot 记录以避免阻塞主请求"
                         );
                     }
                 }
@@ -1589,7 +1603,7 @@ impl UsageRecorder {
                     if should_log_usage_counter(dropped) {
                         tracing::warn!(
                             dropped,
-                            "Redis usage writer 已关闭，已丢弃本条 summary 记录以避免阻塞主请求"
+                            "Redis usage writer 已关闭，已丢弃本条 snapshot 记录以避免阻塞主请求"
                         );
                     }
                 }
@@ -1601,7 +1615,7 @@ impl UsageRecorder {
         if should_log_usage_counter(dropped) {
             tracing::warn!(
                 dropped,
-                "Redis usage writer 不可用，已丢弃本条 summary 记录以避免阻塞主请求"
+                "Redis usage writer 不可用，已丢弃本条 snapshot 记录以避免阻塞主请求"
             );
         }
     }
@@ -1717,8 +1731,17 @@ impl UsageRecorder {
     async fn wait_for_shutdown(&self) {
         loop {
             let changed = self.shutdown.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if self.shutdown.complete.load(Ordering::Acquire) {
                 return;
+            }
+            #[cfg(test)]
+            let gate = self.shutdown.wait_before_await_gate.lock().take();
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.reached.wait().await;
+                gate.resume.wait().await;
             }
             changed.await;
         }
@@ -1857,16 +1880,6 @@ impl UsageRecorder {
     }
 
     pub fn summary(&self, high_cache_threshold: i32) -> UsageSummary {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            match block_on_usage_store(
-                async move { redis.usage_summary(high_cache_threshold).await },
-            ) {
-                Ok(Some(summary)) => return summary,
-                Ok(None) => {}
-                Err(err) => tracing::warn!("读取 Redis usage summary 失败，回退 PgSQL: {}", err),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             return block_on_usage_store(async move { store.summary(high_cache_threshold).await })
@@ -1883,36 +1896,6 @@ impl UsageRecorder {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            match block_on_usage_store(async move {
-                match tokio::time::timeout(
-                    StdDuration::from_secs(USAGE_DASHBOARD_REDIS_TIMEOUT_SECS),
-                    redis.usage_dashboard(timezone.as_deref(), high_cache_threshold),
-                )
-                .await
-                {
-                    Ok(Ok(Some(dashboard))) => Ok(UsageDashboardCacheRead::Hit(dashboard)),
-                    Ok(Ok(None)) => Ok(UsageDashboardCacheRead::Empty),
-                    Ok(Err(err)) => Err(err),
-                    Err(_) => Ok(UsageDashboardCacheRead::Timeout),
-                }
-            }) {
-                Ok(UsageDashboardCacheRead::Hit(dashboard)) => return Ok(dashboard),
-                Ok(UsageDashboardCacheRead::Empty) => {}
-                Ok(UsageDashboardCacheRead::Timeout) => {
-                    tracing::warn!(
-                        timeout_secs = USAGE_DASHBOARD_REDIS_TIMEOUT_SECS,
-                        "读取 Redis usage dashboard 超时，回退 PgSQL"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!("读取 Redis usage dashboard 失败，回退 PgSQL: {}", err)
-                }
-            }
-        }
-
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
@@ -1932,7 +1915,7 @@ impl UsageRecorder {
             });
         }
 
-        anyhow::bail!("usage dashboard 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard 需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_windows(
@@ -1940,28 +1923,6 @@ impl UsageRecorder {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardWindowsResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            match block_on_usage_store(async move {
-                redis
-                    .usage_dashboard_windows_only(timezone.as_deref(), high_cache_threshold)
-                    .await
-            }) {
-                Ok(Some((generated_at, timezone, windows))) => {
-                    return Ok(UsageDashboardWindowsResponse {
-                        generated_at,
-                        timezone,
-                        windows,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    "读取 Redis usage dashboard windows 失败，回退 PgSQL: {}",
-                    err
-                ),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
@@ -1976,33 +1937,13 @@ impl UsageRecorder {
                 windows,
             });
         }
-        anyhow::bail!("usage dashboard windows 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard windows 需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_series(
         &self,
         timezone: Option<&str>,
     ) -> anyhow::Result<UsageDashboardSeriesResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            match block_on_usage_store(async move {
-                redis.usage_dashboard_series_only(timezone.as_deref()).await
-            }) {
-                Ok(Some((generated_at, timezone, series))) => {
-                    return Ok(UsageDashboardSeriesResponse {
-                        generated_at,
-                        timezone,
-                        series,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    "读取 Redis usage dashboard series 失败，回退 PgSQL: {}",
-                    err
-                ),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
@@ -2015,29 +1956,17 @@ impl UsageRecorder {
                 series,
             });
         }
-        anyhow::bail!("usage dashboard series 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard series 需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_top(&self) -> anyhow::Result<UsageDashboardTopResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            match block_on_usage_store(async move { redis.usage_dashboard_top_only().await }) {
-                Ok(Some((generated_at, top))) => {
-                    return Ok(UsageDashboardTopResponse { generated_at, top });
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!("读取 Redis usage dashboard top 失败，回退 PgSQL: {}", err)
-                }
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let (generated_at, top) =
                 block_on_usage_store(async move { store.dashboard_top_only().await })?;
             return Ok(UsageDashboardTopResponse { generated_at, top });
         }
-        anyhow::bail!("usage dashboard top 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard top 需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_breakdown(
@@ -2045,37 +1974,6 @@ impl UsageRecorder {
         timezone: Option<&str>,
         window_key: &str,
     ) -> anyhow::Result<UsageDashboardBreakdownResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            let window_key = window_key.to_string();
-            match block_on_usage_store(async move {
-                redis
-                    .usage_dashboard_breakdown_only(timezone.as_deref(), &window_key)
-                    .await
-            }) {
-                Ok(Some((
-                    generated_at,
-                    timezone,
-                    window_key,
-                    status_breakdown,
-                    usage_source_breakdown,
-                ))) => {
-                    return Ok(UsageDashboardBreakdownResponse {
-                        generated_at,
-                        timezone,
-                        window_key,
-                        status_breakdown,
-                        usage_source_breakdown,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    "读取 Redis usage dashboard breakdown 失败，回退 PgSQL: {}",
-                    err
-                ),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
@@ -2094,7 +1992,7 @@ impl UsageRecorder {
                 usage_source_breakdown,
             });
         }
-        anyhow::bail!("usage dashboard breakdown 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard breakdown 需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_external_pool_billing(
@@ -2102,30 +2000,6 @@ impl UsageRecorder {
         timezone: Option<&str>,
         window_key: &str,
     ) -> anyhow::Result<UsageDashboardExternalPoolBillingResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            let window_key = window_key.to_string();
-            match block_on_usage_store(async move {
-                redis
-                    .usage_dashboard_external_pool_billing_only(timezone.as_deref(), &window_key)
-                    .await
-            }) {
-                Ok(Some((generated_at, timezone, window_key, external_pool_billing_by_pool))) => {
-                    return Ok(UsageDashboardExternalPoolBillingResponse {
-                        generated_at,
-                        timezone,
-                        window_key,
-                        external_pool_billing_by_pool,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    "读取 Redis usage dashboard external pool billing 失败，回退 PgSQL: {}",
-                    err
-                ),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
@@ -2143,7 +2017,7 @@ impl UsageRecorder {
                 external_pool_billing_by_pool,
             });
         }
-        anyhow::bail!("usage dashboard external pool billing 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard external pool billing 需要 PgSQL 聚合存储")
     }
 
     fn summary_memory(&self, high_cache_threshold: i32) -> UsageSummary {
@@ -2538,66 +2412,110 @@ async fn persist_usage_batch_with_retry(
         .unwrap_or_default()
         .to_string();
     let record_count = records.len();
-    let mut attempt = 1;
+    let store = store.clone();
+    persist_usage_batch_operation_with_retry(
+        &first_request_id,
+        record_count,
+        dropped_records,
+        UsagePersistRetryPolicy::production(),
+        move || {
+            let store = store.clone();
+            // record_batch replaces rows by request id and adjusts rollups in one transaction.
+            // Retrying the same immutable batch therefore cannot double-count committed records.
+            let records = records.clone();
+            async move { store.record_batch(records).await }
+        },
+    )
+    .await;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsagePersistRetryPolicy {
+    total_deadline: StdDuration,
+    attempt_timeout: StdDuration,
+    initial_backoff: StdDuration,
+    max_backoff: StdDuration,
+}
+
+impl UsagePersistRetryPolicy {
+    fn production() -> Self {
+        Self {
+            total_deadline: StdDuration::from_secs(USAGE_WRITER_POSTGRES_TOTAL_DEADLINE_SECS),
+            attempt_timeout: StdDuration::from_secs(USAGE_WRITER_POSTGRES_TIMEOUT_SECS),
+            initial_backoff: StdDuration::from_millis(USAGE_WRITER_POSTGRES_INITIAL_BACKOFF_MS),
+            max_backoff: StdDuration::from_millis(USAGE_WRITER_POSTGRES_MAX_BACKOFF_MS),
+        }
+    }
+}
+
+async fn persist_usage_batch_operation_with_retry<F, Fut>(
+    first_request_id: &str,
+    record_count: usize,
+    dropped_records: &AtomicU64,
+    policy: UsagePersistRetryPolicy,
+    mut persist: F,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + policy.total_deadline;
+    let mut attempt = 1u32;
+    let mut backoff = policy.initial_backoff.min(policy.max_backoff);
+    let mut last_failure = "retry deadline elapsed before the first attempt".to_string();
+
     loop {
-        let result = tokio::time::timeout(
-            StdDuration::from_secs(USAGE_WRITER_POSTGRES_TIMEOUT_SECS),
-            store.record_batch(records.clone()),
-        )
-        .await;
-        match result {
-            Ok(Ok(())) => break,
-            Err(_) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
-                let delay_ms = 100u64.saturating_mul(2u64.saturating_pow(attempt - 1));
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let dropped = dropped_records.fetch_add(record_count as u64, Ordering::Relaxed)
+                + record_count as u64;
+            tracing::warn!(
+                request_id = %first_request_id,
+                record_count,
+                attempt_count = attempt.saturating_sub(1),
+                total_deadline_secs = policy.total_deadline.as_secs(),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                dropped,
+                last_failure = %last_failure,
+                "批量写入 PgSQL usage record 超过总重试期限，已放弃本批持久化"
+            );
+            return false;
+        }
+
+        let attempt_timeout = policy.attempt_timeout.min(remaining);
+        match tokio::time::timeout(attempt_timeout, persist()).await {
+            Ok(Ok(())) => return true,
+            Err(_) => {
+                last_failure = format!("attempt timed out after {}ms", attempt_timeout.as_millis());
                 tracing::warn!(
                     request_id = %first_request_id,
                     record_count,
                     attempt,
-                    timeout_secs = USAGE_WRITER_POSTGRES_TIMEOUT_SECS,
+                    attempt_timeout_ms = attempt_timeout.as_millis() as u64,
+                    total_deadline_secs = policy.total_deadline.as_secs(),
                     "批量写入 PgSQL usage record 超时，准备重试"
                 );
-                tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
-                attempt += 1;
-            }
-            Err(_) => {
-                let dropped = dropped_records.fetch_add(record_count as u64, Ordering::Relaxed)
-                    + record_count as u64;
-                tracing::warn!(
-                    request_id = %first_request_id,
-                    record_count,
-                    attempt,
-                    timeout_secs = USAGE_WRITER_POSTGRES_TIMEOUT_SECS,
-                    dropped,
-                    "批量写入 PgSQL usage record 最终超时，已放弃本批持久化"
-                );
-                break;
-            }
-            Ok(Err(err)) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
-                let delay_ms = 100u64.saturating_mul(2u64.saturating_pow(attempt - 1));
-                tracing::warn!(
-                    request_id = %first_request_id,
-                    record_count,
-                    attempt,
-                    "批量写入 PgSQL usage record 失败，准备重试: {}",
-                    err
-                );
-                tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
-                attempt += 1;
             }
             Ok(Err(err)) => {
-                let dropped = dropped_records.fetch_add(record_count as u64, Ordering::Relaxed)
-                    + record_count as u64;
+                last_failure = err.to_string();
                 tracing::warn!(
                     request_id = %first_request_id,
                     record_count,
                     attempt,
-                    dropped,
-                    "批量写入 PgSQL usage record 最终失败，已放弃本批持久化: {}",
-                    err
+                    total_deadline_secs = policy.total_deadline.as_secs(),
+                    error = %last_failure,
+                    "批量写入 PgSQL usage record 失败，准备重试"
                 );
-                break;
             }
         }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !remaining.is_zero() {
+            tokio::time::sleep(backoff.min(remaining)).await;
+        }
+        backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -2651,10 +2569,10 @@ async fn persist_usage_redis_batch_with_timeout(
         .unwrap_or_default()
         .to_string();
     let started_at = Instant::now();
-    let results = run_bounded_usage_batch(
+    let results = run_serial_usage_batch(
         records,
         StdDuration::from_secs(USAGE_REDIS_WRITER_TIMEOUT_SECS),
-        |record| async move { redis.record_usage_summary(&record).await },
+        |record| async move { redis.record_usage_record_snapshot(&record).await },
     )
     .await;
     let mut failed = 0u64;
@@ -2675,7 +2593,7 @@ async fn persist_usage_redis_batch_with_timeout(
             timeout_secs = USAGE_REDIS_WRITER_TIMEOUT_SECS,
             elapsed_ms = started_at.elapsed().as_millis() as u64,
             error = ?last_error,
-            "写入 Redis usage summary 失败，已丢弃部分观测记录"
+            "写入 Redis usage snapshot 失败，已丢弃部分观测记录"
         );
     } else {
         let elapsed = started_at.elapsed();
@@ -2684,35 +2602,47 @@ async fn persist_usage_redis_batch_with_timeout(
                 request_id = %first_request_id,
                 record_count,
                 elapsed_ms = elapsed.as_millis() as u64,
-                "Redis usage summary 批量写入耗时较长"
+                "Redis usage snapshot 批量写入耗时较长"
             );
         }
     }
 }
 
-async fn run_bounded_usage_batch<T, F, Fut>(
+async fn run_serial_usage_batch<T, F, Fut>(
     items: Vec<T>,
-    operation_timeout: StdDuration,
+    batch_timeout: StdDuration,
     write: F,
 ) -> Vec<anyhow::Result<()>>
 where
     F: Fn(T) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    join_all(items.into_iter().map(|item| {
-        let write = write(item);
-        async move {
-            tokio::time::timeout(operation_timeout, write)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "usage batch operation timed out after {}ms",
-                        operation_timeout.as_millis()
-                    )
-                })?
+    let deadline = tokio::time::Instant::now() + batch_timeout;
+    let mut results = Vec::with_capacity(items.len());
+    let mut items = items.into_iter();
+    while let Some(item) = items.next() {
+        if deadline <= tokio::time::Instant::now() {
+            results.push(usage_batch_timeout_error(batch_timeout));
+            results.extend(items.map(|_| usage_batch_timeout_error(batch_timeout)));
+            break;
         }
-    }))
-    .await
+        match tokio::time::timeout_at(deadline, write(item)).await {
+            Ok(result) => results.push(result),
+            Err(_) => {
+                results.push(usage_batch_timeout_error(batch_timeout));
+                results.extend(items.map(|_| usage_batch_timeout_error(batch_timeout)));
+                break;
+            }
+        }
+    }
+    results
+}
+
+fn usage_batch_timeout_error(batch_timeout: StdDuration) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "usage batch operation timed out after {}ms",
+        batch_timeout.as_millis()
+    ))
 }
 
 fn block_on_usage_store<T: Send>(
@@ -2965,7 +2895,7 @@ fn top_aggregates(map: HashMap<String, UsageAggregate>) -> Vec<UsageAggregate> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::{Barrier, Notify, Semaphore};
 
     fn record_with_time(
         id: &str,
@@ -3100,6 +3030,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_progress_wait_registers_notification_before_checking_finished() {
+        let progress = Arc::new(UsageWriterProgress::default());
+        let reached = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *progress.wait_before_await_gate.lock() = Some(UsageWaitTestGate {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let waiting_progress = progress.clone();
+        let mut waiter = tokio::spawn(async move { waiting_progress.wait_until(1).await });
+        tokio::time::timeout(StdDuration::from_secs(5), reached.wait())
+            .await
+            .expect("usage progress waiter did not reach the pre-await gate");
+        progress.mark_finished(1);
+        tokio::time::timeout(StdDuration::from_secs(5), resume.wait())
+            .await
+            .expect("usage progress waiter did not resume after the completion notification");
+
+        let finished = match tokio::time::timeout(StdDuration::from_secs(1), &mut waiter).await {
+            Ok(join_result) => join_result.expect("usage progress waiter task failed"),
+            Err(_) => {
+                waiter.abort();
+                let _ = waiter.await;
+                panic!("usage progress notification was lost between the check and await");
+            }
+        };
+        assert_eq!(finished, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_shutdown_wait_registers_notification_before_checking_completion() {
+        let recorder = Arc::new(UsageRecorder::new(1));
+        let reached = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *recorder.shutdown.wait_before_await_gate.lock() = Some(UsageWaitTestGate {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+
+        let waiting_recorder = recorder.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiting_recorder.wait_for_shutdown().await;
+        });
+        tokio::time::timeout(StdDuration::from_secs(5), reached.wait())
+            .await
+            .expect("usage shutdown waiter did not reach the pre-await gate");
+        recorder.shutdown.complete.store(true, Ordering::Release);
+        recorder.shutdown.changed.notify_waiters();
+        tokio::time::timeout(StdDuration::from_secs(5), resume.wait())
+            .await
+            .expect("usage shutdown waiter did not resume after the completion notification");
+
+        match tokio::time::timeout(StdDuration::from_secs(1), &mut waiter).await {
+            Ok(join_result) => join_result.expect("usage shutdown waiter task failed"),
+            Err(_) => {
+                waiter.abort();
+                let _ = waiter.await;
+                panic!("usage shutdown notification was lost between the check and await");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3244,27 +3238,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_usage_batch_runs_operations_concurrently() {
+    async fn postgres_usage_batch_survives_more_than_three_attempt_timeouts() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let dropped = AtomicU64::new(0);
+        let persisted = persist_usage_batch_operation_with_retry(
+            "pool-starved-batch",
+            52,
+            &dropped,
+            UsagePersistRetryPolicy {
+                total_deadline: StdDuration::from_millis(250),
+                attempt_timeout: StdDuration::from_millis(5),
+                initial_backoff: StdDuration::from_millis(1),
+                max_backoff: StdDuration::from_millis(2),
+            },
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                    async move {
+                        if attempt <= 4 {
+                            tokio::time::sleep(StdDuration::from_millis(25)).await;
+                        }
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(persisted);
+        assert_eq!(attempts.load(Ordering::Relaxed), 5);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_batch_total_deadline_drops_each_record_once() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let dropped = AtomicU64::new(0);
         let started_at = Instant::now();
-        let results = run_bounded_usage_batch(
-            (0..8).collect::<Vec<_>>(),
-            StdDuration::from_millis(500),
-            |_| async {
-                tokio::time::sleep(StdDuration::from_millis(40)).await;
+        let persisted = persist_usage_batch_operation_with_retry(
+            "deadline-batch",
+            52,
+            &dropped,
+            UsagePersistRetryPolicy {
+                total_deadline: StdDuration::from_millis(25),
+                attempt_timeout: StdDuration::from_millis(5),
+                initial_backoff: StdDuration::from_millis(1),
+                max_backoff: StdDuration::from_millis(2),
+            },
+            {
+                let attempts = attempts.clone();
+                move || {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    std::future::pending::<anyhow::Result<()>>()
+                }
+            },
+        )
+        .await;
+
+        assert!(!persisted);
+        assert!(attempts.load(Ordering::Relaxed) > 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 52);
+        assert!(started_at.elapsed() < StdDuration::from_millis(250));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redis_snapshot_batch_never_runs_more_than_one_write_concurrently() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let peak_in_flight = Arc::new(AtomicU64::new(0));
+        let results =
+            run_serial_usage_batch((0..24).collect::<Vec<_>>(), StdDuration::from_secs(1), {
+                let calls = calls.clone();
+                let in_flight = in_flight.clone();
+                let peak_in_flight = peak_in_flight.clone();
+                move |_| {
+                    let calls = calls.clone();
+                    let in_flight = in_flight.clone();
+                    let peak_in_flight = peak_in_flight.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        let current = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                        peak_in_flight.fetch_max(current, Ordering::AcqRel);
+                        tokio::time::sleep(StdDuration::from_millis(10)).await;
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        assert_eq!(results.len(), 24);
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(calls.load(Ordering::Relaxed), 24);
+        assert_eq!(peak_in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn serial_usage_batch_preserves_per_record_failures() {
+        let results = run_serial_usage_batch(
+            (0..12).collect::<Vec<_>>(),
+            StdDuration::from_secs(1),
+            |item| async move {
+                if matches!(item, 2 | 9) {
+                    anyhow::bail!("failed item {item}");
+                }
                 Ok(())
             },
         )
         .await;
-        assert!(results.iter().all(Result::is_ok));
-        assert!(started_at.elapsed() < StdDuration::from_millis(200));
+        let errors = results
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            vec!["failed item 2".to_string(), "failed item 9".to_string()]
+        );
+    }
 
-        let started_at = Instant::now();
-        let results = run_bounded_usage_batch(vec![1, 2, 3], StdDuration::from_millis(20), |_| {
-            std::future::pending::<anyhow::Result<()>>()
+    #[tokio::test]
+    async fn serial_usage_batch_uses_one_deadline_for_started_and_remaining_items() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let results = run_serial_usage_batch((0..17).collect(), StdDuration::from_millis(20), {
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                std::future::pending::<anyhow::Result<()>>()
+            }
         })
         .await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(results.len(), 17);
         assert!(results.iter().all(Result::is_err));
-        assert!(started_at.elapsed() < StdDuration::from_millis(200));
+        assert!(results.into_iter().all(|result| {
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("timed out after 20ms")
+        }));
     }
 
     #[test]

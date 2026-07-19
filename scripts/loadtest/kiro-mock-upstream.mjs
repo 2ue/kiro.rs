@@ -8,6 +8,14 @@ const DEFAULT_PORT = Number.parseInt(process.env.PORT || process.env.KIRO_MOCK_P
 const DEFAULT_HOST = process.env.HOST || "127.0.0.1";
 const DEFAULT_SCENARIO = process.env.KIRO_MOCK_SCENARIO || "success";
 const LOG_REQUESTS = process.env.KIRO_MOCK_LOG_REQUESTS === "1";
+const FIRST_BYTE_DELAY_MS = parseOptionalNonNegativeInt(
+  process.env.KIRO_MOCK_FIRST_BYTE_DELAY_MS,
+  "KIRO_MOCK_FIRST_BYTE_DELAY_MS",
+);
+const STREAM_TOTAL_MS = parseOptionalNonNegativeInt(
+  process.env.KIRO_MOCK_STREAM_TOTAL_MS,
+  "KIRO_MOCK_STREAM_TOTAL_MS",
+);
 
 const models = [
   { id: "sonnet", displayName: "Sonnet", maxInputTokens: 200000 },
@@ -17,6 +25,15 @@ const models = [
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function parseOptionalNonNegativeInt(value, name) {
+  if (value == null || value === "") return null;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0 || String(parsed) !== String(value).trim()) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return parsed;
 }
 
 function pickScenario(url) {
@@ -276,6 +293,36 @@ function writeStream(req, res, frames, endDelayMs = 0) {
   writeNext();
 }
 
+function applyConfiguredStreamTiming(frames) {
+  if (FIRST_BYTE_DELAY_MS == null && STREAM_TOTAL_MS == null) {
+    return { frames, endDelayMs: 0 };
+  }
+  if (frames.length === 0) {
+    return { frames, endDelayMs: STREAM_TOTAL_MS || FIRST_BYTE_DELAY_MS || 0 };
+  }
+
+  const firstByteDelayMs = FIRST_BYTE_DELAY_MS || 0;
+  const totalMs = Math.max(STREAM_TOTAL_MS || firstByteDelayMs, firstByteDelayMs);
+  const timedFrames = frames.map((item) => ({ ...item, delayMs: 0 }));
+  timedFrames[0].delayMs = firstByteDelayMs;
+  const remainingMs = totalMs - firstByteDelayMs;
+  if (timedFrames.length === 1) {
+    return { frames: timedFrames, endDelayMs: remainingMs };
+  }
+
+  const intervals = timedFrames.length - 1;
+  const intervalMs = Math.floor(remainingMs / intervals);
+  let remainderMs = remainingMs - intervalMs * intervals;
+  for (let index = 1; index < timedFrames.length; index += 1) {
+    timedFrames[index].delayMs = intervalMs;
+    if (remainderMs > 0) {
+      timedFrames[index].delayMs += 1;
+      remainderMs -= 1;
+    }
+  }
+  return { frames: timedFrames, endDelayMs: 0 };
+}
+
 function handleListModels(req, res, url, scenario) {
   if (scenario === "429") {
     json(res, 429, { message: "rate limited", reason: "THROTTLED" }, { "retry-after": "1" });
@@ -313,7 +360,8 @@ function handleGenerateAssistantResponse(req, res, url, scenario, body) {
     json(res, 500, { message: "internal error from mock upstream", requestId: "mock-error" });
     return;
   }
-  writeStream(req, res, buildStreamFrames({ body, scenario }));
+  const timing = applyConfiguredStreamTiming(buildStreamFrames({ body, scenario }));
+  writeStream(req, res, timing.frames, timing.endDelayMs);
 }
 
 function handleMcp(req, res, url, scenario, body) {

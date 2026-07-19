@@ -83,9 +83,9 @@ use crate::external_pool::{
     ExternalPoolRequestBodyMode, ExternalRouteRequest,
 };
 use crate::http_client::response_bytes_with_body_timeout;
-use crate::kiro::call_trace::KiroCredentialAttempt;
+use crate::kiro::call_trace::{AccountRejectReason, KiroCredentialAttempt};
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
-use crate::kiro::token_manager::LocalPoolRouteStateKind;
+use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteStateKind};
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
@@ -1142,10 +1142,7 @@ async fn maybe_raw_external_direct_response(
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
-    if !manager
-        .has_eligible_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
-        .await
-    {
+    if !config.external_pools_enabled || !config.external_direct_policy_enabled {
         return None;
     }
 
@@ -1153,6 +1150,13 @@ async fn maybe_raw_external_direct_response(
     let reason = manager
         .direct_policy_reason(&config, endpoint, model_hint.as_deref().unwrap_or(""))
         .await?;
+    if !manager
+        .has_eligible_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
+        .await
+    {
+        return None;
+    }
+
     let request_id = envelope::request_id();
     let route = raw_external_route_request(
         state,
@@ -1182,16 +1186,9 @@ async fn maybe_raw_external_preflight_response(
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
-    if !config.local_pool_preflight_enabled {
+    if !config.external_pools_enabled || !config.local_pool_preflight_enabled {
         return None;
     }
-    if !manager
-        .has_available_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
-        .await
-    {
-        return None;
-    }
-
     let local_state = provider.local_pool_route_state(None);
     if !local_state.kind.should_route_external() {
         return None;
@@ -1199,6 +1196,12 @@ async fn maybe_raw_external_preflight_response(
     let Some(reason) = local_pool_route_fallback_reason(local_state.kind, &config) else {
         return None;
     };
+    if !manager
+        .has_eligible_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
+        .await
+    {
+        return None;
+    }
 
     let reason = reason.to_string();
     let request_id = envelope::request_id();
@@ -1362,11 +1365,16 @@ impl ExternalFallbackContext {
         ) as i32;
     }
 
-    async fn should_fail_fast_local(&self) -> bool {
-        if !local_pool_capacity_fail_fast_enabled(&self.config) {
-            return false;
+    async fn local_acquire_mode(&self) -> AcquireMode {
+        if !self.config.local_pool_preflight_enabled
+            || !self.manager.has_eligible_pool(&self.config).await
+        {
+            return AcquireMode::WaitForCapacity;
         }
-        self.manager.has_available_pool(&self.config).await
+        AcquireMode::SelectiveFailFast {
+            rate_limit: self.config.fallback_on_local_transient_exhausted,
+            concurrency: local_pool_capacity_fail_fast_enabled(&self.config),
+        }
     }
 
     async fn direct_policy_response(&self, request_id: &str) -> Option<Response> {
@@ -1399,7 +1407,7 @@ impl ExternalFallbackContext {
         request_id: &str,
         model: Option<&str>,
     ) -> Option<ExternalPoolForwardOutcome> {
-        if !self.config.local_pool_preflight_enabled {
+        if !self.config.external_pools_enabled || !self.config.local_pool_preflight_enabled {
             return None;
         }
         let state = provider.local_pool_route_state(model);
@@ -1455,9 +1463,15 @@ impl ExternalFallbackContext {
         request_id: &str,
         error_message: &str,
         local_attempts: Vec<KiroCredentialAttempt>,
+        selection_failure_reason: Option<AccountRejectReason>,
     ) -> Option<Response> {
         match self
-            .fallback_after_local_error_outcome(request_id, error_message, local_attempts)
+            .fallback_after_local_error_outcome(
+                request_id,
+                error_message,
+                local_attempts,
+                selection_failure_reason,
+            )
             .await?
         {
             ExternalPoolForwardOutcome::Response(response) => Some(response),
@@ -1470,6 +1484,7 @@ impl ExternalFallbackContext {
         request_id: &str,
         error_message: &str,
         local_attempts: Vec<KiroCredentialAttempt>,
+        selection_failure_reason: Option<AccountRejectReason>,
     ) -> Option<ExternalPoolForwardOutcome> {
         let classification_attempts = local_attempts.clone();
         self.fallback_after_local_error_outcome_with_diagnostics(
@@ -1477,6 +1492,7 @@ impl ExternalFallbackContext {
             error_message,
             classification_attempts,
             local_attempts,
+            selection_failure_reason,
         )
         .await
     }
@@ -1487,10 +1503,12 @@ impl ExternalFallbackContext {
         error_message: &str,
         classification_attempts: Vec<KiroCredentialAttempt>,
         diagnostic_attempts: Vec<KiroCredentialAttempt>,
+        selection_failure_reason: Option<AccountRejectReason>,
     ) -> Option<ExternalPoolForwardOutcome> {
-        let reason = classify_local_error_for_external_fallback(
+        let reason = classify_local_error_for_external_fallback_with_reason(
             error_message,
             &classification_attempts,
+            selection_failure_reason,
             &self.config,
         )?;
         if self.config.local_pool_circuit_enabled {
@@ -1530,12 +1548,13 @@ impl ExternalFallbackContext {
         } else {
             UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
         };
+        let local_attempted = !diagnostic_attempts.is_empty();
         let route = match self.route_request(
             request_id.to_string(),
             route_subtype,
             Some(reason),
             None,
-            true,
+            local_attempted,
             local_preflight,
             diagnostic_attempts,
         ) {
@@ -1675,6 +1694,48 @@ fn classify_local_error_for_external_fallback(
     attempts: &[KiroCredentialAttempt],
     config: &ExternalPoolsConfig,
 ) -> Option<String> {
+    classify_local_error_for_external_fallback_with_reason(message, attempts, None, config)
+}
+
+fn classify_local_error_for_external_fallback_with_reason(
+    message: &str,
+    attempts: &[KiroCredentialAttempt],
+    selection_failure_reason: Option<AccountRejectReason>,
+    config: &ExternalPoolsConfig,
+) -> Option<String> {
+    if let Some(reason) = selection_failure_reason {
+        match reason {
+            AccountRejectReason::RpmLimited | AccountRejectReason::CooldownActive => {
+                return config
+                    .fallback_on_local_transient_exhausted
+                    .then(|| "local_transient_exhausted".to_string());
+            }
+            AccountRejectReason::AccountConcurrencyFull
+            | AccountRejectReason::GlobalConcurrencyFull => {
+                return config
+                    .fallback_on_local_capacity_exhausted
+                    .then(|| "local_capacity_exhausted".to_string());
+            }
+            AccountRejectReason::ModelNotSupported => {
+                return config
+                    .fallback_on_unsupported_model
+                    .then(|| "unsupported_model".to_string());
+            }
+            AccountRejectReason::NoAccounts
+            | AccountRejectReason::Disabled
+            | AccountRejectReason::MissingAuth
+            | AccountRejectReason::RouteNotAllowed
+            | AccountRejectReason::ProxyUnavailable
+            | AccountRejectReason::HealthBlocked
+            | AccountRejectReason::StickyTargetUnavailable
+            | AccountRejectReason::RefreshFailed => {
+                return config
+                    .fallback_on_no_available_credentials
+                    .then(|| "no_available_credentials".to_string());
+            }
+            AccountRejectReason::RefreshInProgress | AccountRejectReason::Unknown => {}
+        }
+    }
     let lower = message.to_ascii_lowercase();
     if config.fallback_on_unsupported_model && is_unsupported_model_error(&lower, attempts) {
         return Some("unsupported_model".to_string());
@@ -3427,6 +3488,10 @@ fn provider_error_metadata(err: &Error) -> Option<serde_json::Value> {
     .ok()
 }
 
+fn provider_selection_failure_reason(err: &Error) -> Option<AccountRejectReason> {
+    KiroProvider::selection_failure_from_error(err).map(|summary| summary.primary_reason)
+}
+
 fn should_persist_payload_diagnostics(
     status: UsageRecordStatus,
     report: Option<&PayloadGuardReport>,
@@ -4727,6 +4792,7 @@ async fn post_messages_inner(
                 &envelope::request_id(),
                 &format!("模型不支持: {}", payload.model),
                 Vec::new(),
+                None,
             )
             .await
             {
@@ -4882,22 +4948,15 @@ async fn call_api_stream_maybe_fail_fast(
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
-    if let Some(external) = external_fallback {
-        if external.should_fail_fast_local().await {
-            return provider
-                .call_api_stream_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
-                    request_body,
-                    request_id,
-                    capacity_weight_units,
-                    dispatch_model_filter,
-                )
-                .await;
-        }
-    }
+    let acquire_mode = match external_fallback {
+        Some(external) => external.local_acquire_mode().await,
+        None => AcquireMode::WaitForCapacity,
+    };
     provider
-        .call_api_stream_with_request_id_and_capacity_weight_and_model_filter(
+        .call_api_stream_with_request_id_and_mode(
             request_body,
             request_id,
+            acquire_mode,
             capacity_weight_units,
             dispatch_model_filter,
         )
@@ -4912,22 +4971,15 @@ async fn call_api_maybe_fail_fast(
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
-    if let Some(external) = external_fallback {
-        if external.should_fail_fast_local().await {
-            return provider
-                .call_api_with_context_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
-                    request_body,
-                    request_id,
-                    capacity_weight_units,
-                    dispatch_model_filter,
-                )
-                .await;
-        }
-    }
+    let acquire_mode = match external_fallback {
+        Some(external) => external.local_acquire_mode().await,
+        None => AcquireMode::WaitForCapacity,
+    };
     provider
-        .call_api_with_context_with_request_id_and_capacity_weight_and_model_filter(
+        .call_api_with_context_with_request_id_and_mode(
             request_body,
             request_id,
+            acquire_mode,
             capacity_weight_units,
             dispatch_model_filter,
         )
@@ -4939,9 +4991,10 @@ async fn maybe_forward_external_after_local_error(
     request_id: &str,
     message: &str,
     attempts: Vec<KiroCredentialAttempt>,
+    selection_failure_reason: Option<AccountRejectReason>,
 ) -> Option<Response> {
     external_fallback?
-        .fallback_after_local_error(request_id, message, attempts)
+        .fallback_after_local_error(request_id, message, attempts, selection_failure_reason)
         .await
 }
 
@@ -4950,9 +5003,10 @@ async fn maybe_external_fallback_after_local_error_outcome(
     request_id: &str,
     message: &str,
     attempts: Vec<KiroCredentialAttempt>,
+    selection_failure_reason: Option<AccountRejectReason>,
 ) -> Option<ExternalPoolForwardOutcome> {
     external_fallback?
-        .fallback_after_local_error_outcome(request_id, message, attempts)
+        .fallback_after_local_error_outcome(request_id, message, attempts, selection_failure_reason)
         .await
 }
 
@@ -4962,6 +5016,7 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
     message: &str,
     classification_attempts: Vec<KiroCredentialAttempt>,
     diagnostic_attempts: Vec<KiroCredentialAttempt>,
+    selection_failure_reason: Option<AccountRejectReason>,
 ) -> Option<ExternalPoolForwardOutcome> {
     external_fallback?
         .fallback_after_local_error_outcome_with_diagnostics(
@@ -4969,6 +5024,7 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
             message,
             classification_attempts,
             diagnostic_attempts,
+            selection_failure_reason,
         )
         .await
 }
@@ -5356,6 +5412,7 @@ async fn handle_stream_request(
                                 &retry_message,
                                 classification_attempts,
                                 all_attempts.clone(),
+                                provider_selection_failure_reason(&retry_error),
                             )
                             .await
                         {
@@ -5449,6 +5506,7 @@ async fn handle_stream_request(
                                 &retry_message,
                                 classification_attempts.clone(),
                                 all_attempts.clone(),
+                                provider_selection_failure_reason(&retry_error),
                             )
                             .await
                         {
@@ -5457,9 +5515,10 @@ async fn handle_stream_request(
                                 ExternalPoolForwardOutcome::FinalError(err) => {
                                     if let Some(external) = external_fallback.as_ref() {
                                         let local_fallback_reason =
-                                            classify_local_error_for_external_fallback(
+                                            classify_local_error_for_external_fallback_with_reason(
                                                 &retry_message,
                                                 &classification_attempts,
+                                                provider_selection_failure_reason(&retry_error),
                                                 &external.config,
                                             );
                                         if let Some(reason) =
@@ -5568,6 +5627,7 @@ async fn handle_stream_request(
                     &request_id,
                     &message,
                     attempts.clone(),
+                    provider_selection_failure_reason(&e),
                 )
                 .await
                 {
@@ -5576,9 +5636,10 @@ async fn handle_stream_request(
                         ExternalPoolForwardOutcome::FinalError(err) => {
                             if let Some(external) = external_fallback.as_ref() {
                                 let local_fallback_reason =
-                                    classify_local_error_for_external_fallback(
+                                    classify_local_error_for_external_fallback_with_reason(
                                         &message,
                                         &attempts,
+                                        provider_selection_failure_reason(&e),
                                         &external.config,
                                     );
                                 if let Some(reason) = local_rescue_reason_after_external_error(
@@ -6720,6 +6781,7 @@ async fn handle_non_stream_request(
                                 &retry_message,
                                 classification_attempts,
                                 all_attempts.clone(),
+                                provider_selection_failure_reason(&retry_error),
                             )
                             .await
                         {
@@ -6813,6 +6875,7 @@ async fn handle_non_stream_request(
                                 &retry_message,
                                 classification_attempts.clone(),
                                 all_attempts.clone(),
+                                provider_selection_failure_reason(&retry_error),
                             )
                             .await
                         {
@@ -6821,9 +6884,10 @@ async fn handle_non_stream_request(
                                 ExternalPoolForwardOutcome::FinalError(err) => {
                                     if let Some(external) = external_fallback.as_ref() {
                                         let local_fallback_reason =
-                                            classify_local_error_for_external_fallback(
+                                            classify_local_error_for_external_fallback_with_reason(
                                                 &retry_message,
                                                 &classification_attempts,
+                                                provider_selection_failure_reason(&retry_error),
                                                 &external.config,
                                             );
                                         if let Some(reason) =
@@ -6932,6 +6996,7 @@ async fn handle_non_stream_request(
                     &request_id,
                     &message,
                     attempts.clone(),
+                    provider_selection_failure_reason(&e),
                 )
                 .await
                 {
@@ -6940,9 +7005,10 @@ async fn handle_non_stream_request(
                         ExternalPoolForwardOutcome::FinalError(err) => {
                             if let Some(external) = external_fallback.as_ref() {
                                 let local_fallback_reason =
-                                    classify_local_error_for_external_fallback(
+                                    classify_local_error_for_external_fallback_with_reason(
                                         &message,
                                         &attempts,
+                                        provider_selection_failure_reason(&e),
                                         &external.config,
                                     );
                                 if let Some(reason) = local_rescue_reason_after_external_error(

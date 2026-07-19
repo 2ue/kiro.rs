@@ -3835,6 +3835,59 @@ fn external_fallback_classifier_allows_capacity_and_transient_errors() {
 }
 
 #[test]
+fn external_fallback_classifier_uses_typed_scheduler_reason_authoritatively() {
+    let mut config = ExternalPoolsConfig {
+        fallback_on_local_capacity_exhausted: false,
+        fallback_on_local_transient_exhausted: true,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        classify_local_error_for_external_fallback_with_reason(
+            "misleading rate limit text",
+            &[],
+            Some(AccountRejectReason::AccountConcurrencyFull),
+            &config,
+        ),
+        None,
+        "typed concurrency must not fall through to transient string matching"
+    );
+    assert_eq!(
+        classify_local_error_for_external_fallback_with_reason(
+            "misleading max_concurrent_requests text",
+            &[],
+            Some(AccountRejectReason::RpmLimited),
+            &config,
+        )
+        .as_deref(),
+        Some("local_transient_exhausted")
+    );
+
+    config.fallback_on_local_capacity_exhausted = true;
+    config.fallback_on_local_transient_exhausted = false;
+    assert_eq!(
+        classify_local_error_for_external_fallback_with_reason(
+            "misleading rate limit text",
+            &[],
+            Some(AccountRejectReason::GlobalConcurrencyFull),
+            &config,
+        )
+        .as_deref(),
+        Some("local_capacity_exhausted")
+    );
+    assert_eq!(
+        classify_local_error_for_external_fallback_with_reason(
+            "misleading max_concurrent_requests text",
+            &[],
+            Some(AccountRejectReason::RpmLimited),
+            &config,
+        ),
+        None,
+        "typed RPM must not fall through to capacity string matching"
+    );
+}
+
+#[test]
 fn external_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard_retry() {
     let config = ExternalPoolsConfig::default();
     let prior_too_long_attempt = KiroCredentialAttempt::new(
