@@ -463,7 +463,7 @@ async fn external_pool_fake_upstream_non_stream_json_with_sse_header_records_bil
     let records = recorder.records_snapshot();
     let record = records.last().expect("usage record");
     assert_eq!(record.status, UsageRecordStatus::Success);
-    assert_eq!(record.stream, false);
+    assert!(!record.stream);
     assert_eq!(record.external_pool_id, Some(pool.id));
     assert!(record.raw_usage.is_some());
     let billing = record

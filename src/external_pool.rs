@@ -4414,10 +4414,10 @@ impl ExternalPoolManager {
                         ))
                     }
                     None => {
-                        if let Some(mut guard) = guard.take() {
-                            if let Some(synthetic_usage) = guard.record_success() {
-                                return Some((Ok(synthetic_usage), (data_stream, None)));
-                            }
+                        if let Some(mut guard) = guard.take()
+                            && let Some(synthetic_usage) = guard.record_success()
+                        {
+                            return Some((Ok(synthetic_usage), (data_stream, None)));
                         }
                         None
                     }
@@ -5795,6 +5795,7 @@ struct ProjectedNonStreamBody {
     usage_capture: ExternalUsageCapture,
 }
 
+#[cfg(test)]
 fn maybe_project_non_stream_usage(
     bytes: Bytes,
     projection: Option<&ExternalUsageProjectionContext>,
@@ -5845,13 +5846,13 @@ fn process_non_stream_response_usage(
             }
         }
 
-        if pointer != "/usage" {
-            if let Some(reported) = usage_capture.reported.or(usage_capture.raw) {
-                changed |= set_top_level_usage_value(
-                    &mut value,
-                    anthropic_usage_value_for_body(reported, usage_capture.projected),
-                );
-            }
+        if pointer != "/usage"
+            && let Some(reported) = usage_capture.reported.or(usage_capture.raw)
+        {
+            changed |= set_top_level_usage_value(
+                &mut value,
+                anthropic_usage_value_for_body(reported, usage_capture.projected),
+            );
         }
 
         let body = if changed {
@@ -5867,28 +5868,28 @@ fn process_non_stream_response_usage(
         };
     }
 
-    if route.is_some() && normal_non_stream_model_response(&value) {
-        if let Some(estimated) = estimate_non_stream_response_usage(route, projection, &value) {
-            usage_capture.raw = Some(estimated.raw);
-            usage_capture.shaped = Some(estimated.shaped);
-            usage_capture.reported = Some(estimated.reported);
-            usage_capture.projected = estimated.projected;
-            usage_capture.usage_estimated = true;
-            usage_capture.usage_estimate_reason = Some("missing_upstream_usage".to_string());
-            usage_capture.request_input_tokens = Some(estimated.request_input_tokens);
+    if normal_non_stream_model_response(&value)
+        && let Some(estimated) = estimate_non_stream_response_usage(route, projection, &value)
+    {
+        usage_capture.raw = Some(estimated.raw);
+        usage_capture.shaped = Some(estimated.shaped);
+        usage_capture.reported = Some(estimated.reported);
+        usage_capture.projected = estimated.projected;
+        usage_capture.usage_estimated = true;
+        usage_capture.usage_estimate_reason = Some("missing_upstream_usage".to_string());
+        usage_capture.request_input_tokens = Some(estimated.request_input_tokens);
 
-            set_top_level_usage_value(
-                &mut value,
-                anthropic_usage_value_for_body(estimated.reported, estimated.projected),
-            );
-            let body = serde_json::to_vec(&value)
-                .map(Bytes::from)
-                .unwrap_or_else(|_| bytes.clone());
-            return ProjectedNonStreamBody {
-                body,
-                usage_capture,
-            };
-        }
+        set_top_level_usage_value(
+            &mut value,
+            anthropic_usage_value_for_body(estimated.reported, estimated.projected),
+        );
+        let body = serde_json::to_vec(&value)
+            .map(Bytes::from)
+            .unwrap_or_else(|_| bytes.clone());
+        return ProjectedNonStreamBody {
+            body,
+            usage_capture,
+        };
     }
 
     ProjectedNonStreamBody {
@@ -6002,10 +6003,8 @@ fn anthropic_usage_value_for_body(
     include_cache_creation_breakdown: bool,
 ) -> serde_json::Value {
     let mut value = usage.to_anthropic_usage_json();
-    if include_cache_creation_breakdown {
-        if let Some(obj) = value.as_object_mut() {
-            apply_projected_cache_creation_breakdown(obj, usage);
-        }
+    if include_cache_creation_breakdown && let Some(obj) = value.as_object_mut() {
+        apply_projected_cache_creation_breakdown(obj, usage);
     }
     value
 }
@@ -6074,11 +6073,12 @@ fn estimate_non_stream_output_tokens(value: &serde_json::Value) -> Option<i32> {
                 return Some(0);
             }
             serde_json::Value::String(text) => {
-                return Some(
-                    (!text.trim().is_empty())
-                        .then(|| (token::count_tokens(text) as i32).max(1))
-                        .unwrap_or(0),
-                );
+                let output_tokens = if text.trim().is_empty() {
+                    0
+                } else {
+                    (token::count_tokens(text) as i32).max(1)
+                };
+                return Some(output_tokens);
             }
             _ => {}
         }
