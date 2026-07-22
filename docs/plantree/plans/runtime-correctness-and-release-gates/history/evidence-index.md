@@ -44,6 +44,15 @@ the historical 2026-07-12 release artifact below.
   `targets=0 reservations=0 target_processes=0 blockers=0`.
 - Detailed evidence lives in
   [feature/evidence/final-release-gate-20260723.md](../../../../../feature/evidence/final-release-gate-20260723.md).
+- Release publication then used Rust crate mode:
+  - work commit `b528ead` (`fix: harden runtime protocol and scheduler gates`);
+  - release bump commit `beb9b3420b20776db489461d65392b5b1d6e5d92`
+    (`chore(release): 0.0.114`);
+  - latest remote semver tag base `v0.0.113`;
+  - annotated tag `v0.0.114`, tag object
+    `071ccb3975fb1ae2bf6cd27f9875f9dd4b9a24e8`, peeled commit
+    `beb9b3420b20776db489461d65392b5b1d6e5d92`;
+  - branch push succeeded before tag push, and tag push succeeded.
 
 Docker dynamic execution is explicitly waived by the user for this phase and is not counted
 as pass. Existing `127.0.0.1:9022` production/development service was not modified.

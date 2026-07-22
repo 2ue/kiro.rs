@@ -2,7 +2,7 @@
 
 Role: 保存最终发布门禁、版本决策、提交、tag、推送、回滚点和发布后观察结果
 
-Status: 当前候选 release gate 已通过；版本 bump/tag/push 执行中
+Status: `v0.0.114` 已发布；post-release documentation update in progress
 
 在所有适用门禁通过前，本目录不会记录“可发布”。发布时必须先同步远端分支与 tag，使用项目版本权威计算新版本，工作修复提交与版本提交分开，先推分支再推 tag，不修改依赖要求版本，不 force push。
 
@@ -23,10 +23,29 @@ Status: 当前候选 release gate 已通过；版本 bump/tag/push 执行中
 - Build inventory: 删除可再生 repo `target/` 后最终 `targets=0 reservations=0 target_processes=0 blockers=0`。
 - Docker 动态验证按用户要求豁免，不记为 pass；既有 `127.0.0.1:9022` 未停止、重启或压测。
 
-发布步骤：
+发布步骤与结果：
 
 1. 将根 `Cargo.toml` 和 `Cargo.lock` 当前 crate 版本更新到 `0.0.114`。
-2. 提交 release bump：`chore(release): 0.0.114`。
+2. 提交 release bump：`beb9b3420b20776db489461d65392b5b1d6e5d92` (`chore(release): 0.0.114`)。
 3. 二次 fetch 远端 tags，确认 `v0.0.114` 不存在且远端最新仍是 `v0.0.113`。
 4. 创建 annotated tag `v0.0.114`。
-5. 先推 `main`，再推 `v0.0.114`。
+   - tag object: `071ccb3975fb1ae2bf6cd27f9875f9dd4b9a24e8`
+   - peeled commit: `beb9b3420b20776db489461d65392b5b1d6e5d92`
+5. 先推 `main`：`401473c..beb9b34  HEAD -> main`。
+6. 再推 `v0.0.114`：`[new tag] v0.0.114 -> v0.0.114`。
+
+发布模型：`rust-crate`。
+
+版本权威：根 `Cargo.toml [package].version = "0.0.114"`，与 tag `v0.0.114` 的数字部分一致。
+
+远端验证：
+
+```text
+git ls-remote --tags --refs origin v0.0.114
+071ccb3975fb1ae2bf6cd27f9875f9dd4b9a24e8 refs/tags/v0.0.114
+
+git rev-parse v0.0.114^{}
+beb9b3420b20776db489461d65392b5b1d6e5d92
+```
+
+Post-release note: 本段是在 tag 推送成功后补写的文档记录；不会移动已发布 tag，也不会修改 `v0.0.114` 指向的 release commit。

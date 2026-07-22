@@ -4,7 +4,7 @@ Date: 2026-07-23
 
 ## Current Phase
 
-`final validation complete / release gate pass / publish pending`：当前候选已完成 2026-07-22 真实 Claude CLI、thinking wire、body/reasoning、runtime quarantine、scheduler Redis chaos、业务/观测 Redis fault-domain 与 SchedulerRedisDegraded external takeover 正/负向动态复测；2026-07-23 又完成最终统一候选 Rust C0/release build、Node 合同、文档、diff 与 build artifact inventory。既有 `127.0.0.1:9022` 服务未被停止、重启、迁移或压测；Docker 动态验证按用户要求豁免且不记为 pass。当前剩余工作是 Git 发布。
+`released / v0.0.114`：当前候选已完成 2026-07-22 真实 Claude CLI、thinking wire、body/reasoning、runtime quarantine、scheduler Redis chaos、业务/观测 Redis fault-domain 与 SchedulerRedisDegraded external takeover 正/负向动态复测；2026-07-23 又完成最终统一候选 Rust C0/release build、Node 合同、文档、diff 与 build artifact inventory。既有 `127.0.0.1:9022` 服务未被停止、重启、迁移或压测；Docker 动态验证按用户要求豁免且不记为 pass。Git 发布已完成：`v0.0.114` 已推送。
 
 ## 2026-07-23 Final Release Gate Checkpoint
 
@@ -43,9 +43,9 @@ Date: 2026-07-23
 
 ## Active TODO
 
-1. 读取 `publish-new-version` skill，按发版流程提交工作、计算远端最新 patch tag、必要时更新版本、创建 tag 并推送。
-2. 发布后更新 [feature/releases/README.md](releases/README.md)、本状态文件和 final report 的 tag/commit 结果。
-3. Docker 动态验证按用户当前要求豁免；Docker/依赖验证程序仍必须保留可执行合同，不能记为 pass。
+1. 推送 post-release documentation commit，记录 `v0.0.114` 已发布事实，不移动 tag。
+2. Docker 动态验证按用户当前要求豁免；Docker/依赖验证程序仍必须保留可执行合同，不能记为 pass。
+3. 发布后观察生产 recurrence/usage/scheduler 指标，若出现新真实样本，按 `kiro-prod-evidence-audit` 只读采集。
 
 ## Done This Phase
 

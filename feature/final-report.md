@@ -2,7 +2,7 @@
 
 Role: 本轮问题、复现、修复、验证、残余风险与发布结果的最终汇总入口
 
-Status: `release-gate-pass / publish-pending`
+Status: `released / v0.0.114`
 
 Last updated: 2026-07-23
 
@@ -182,9 +182,19 @@ Last updated: 2026-07-23
 
 ## 9. 发布判定
 
-当前判定：`RELEASE-GATE-PASS / PUBLISH-PENDING`。
+当前判定：`RELEASED / v0.0.114`。
 
-2026-07-23 当前统一候选已经完成最终 C0/release build、文档、Node 合同、diff 和 build artifact inventory。Docker 动态验证按用户当前要求豁免，不记为 pass。既有 `127.0.0.1:9022` 服务未被停止、重启、迁移或压测。当前剩余步骤是按 `publish-new-version` 流程 fetch 远端、提交工作、计算最新 patch tag、必要时更新版本、创建 annotated tag，并按“先 branch 后 tag”推送。
+2026-07-23 当前统一候选已经完成最终 C0/release build、文档、Node 合同、diff 和 build artifact inventory。Docker 动态验证按用户当前要求豁免，不记为 pass。既有 `127.0.0.1:9022` 服务未被停止、重启、迁移或压测。发布流程已完成：
+
+- work commit: `b528ead` (`fix: harden runtime protocol and scheduler gates`)；
+- release bump commit: `beb9b3420b20776db489461d65392b5b1d6e5d92` (`chore(release): 0.0.114`)；
+- latest remote semver tag used as base: `v0.0.113`；
+- release model: `rust-crate`；
+- new version: `0.0.114`；
+- annotated tag: `v0.0.114`；
+- tag object: `071ccb3975fb1ae2bf6cd27f9875f9dd4b9a24e8`；
+- tag peeled commit: `beb9b3420b20776db489461d65392b5b1d6e5d92`；
+- push order: branch first, tag second；both succeeded.
 
 发版前最小复核已经完成：
 
@@ -194,4 +204,4 @@ Last updated: 2026-07-23
 4. `git diff --check`: pass。
 5. Rust scoped C0/release gate: pass。
 
-下一步执行 Git 发布。
+Post-release 文档记录见 [feature/releases/README.md](releases/README.md)。该记录在 tag 推送成功后补写，不移动已发布 tag。

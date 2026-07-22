@@ -4,14 +4,13 @@ Date: 2026-07-23
 
 ## Current Phase
 
-`final validation complete / release gate pass / publish pending` on HEAD `401473c` (`v0.0.109`) with a large unreleased dirty tree. Current detailed state lives in [feature/implementation-status.md](../../../../feature/implementation-status.md); this file is the short plan-tree handoff. 2026-07-22 current candidate evidence covers real Claude CLI long session, bare invoke, thinking wire, body/reasoning, runtime quarantine, scheduler Redis chaos and business/observability Redis fault-domain. 2026-07-23 final release gate evidence now exists for repository-external `kiro-rs` SHA `925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee` and `kiro_loadtest` SHA `90babda7388aa93854cbbdb81c132cc436c07f46b0ea22973531b0a7ffb3aff1`; Rust C0/release build, feature docs, Node contracts, `git diff --check` and build inventory all pass. The existing `127.0.0.1:9022` service was not stopped, restarted, migrated or load-tested.
+`released / v0.0.114` from work commit `b528ead` plus release bump commit `beb9b34`. Current detailed state lives in [feature/implementation-status.md](../../../../feature/implementation-status.md); this file is the short plan-tree handoff. 2026-07-22 current candidate evidence covers real Claude CLI long session, bare invoke, thinking wire, body/reasoning, runtime quarantine, scheduler Redis chaos and business/observability Redis fault-domain. 2026-07-23 final release gate evidence exists for repository-external `kiro-rs` SHA `925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee` and `kiro_loadtest` SHA `90babda7388aa93854cbbdb81c132cc436c07f46b0ea22973531b0a7ffb3aff1`; Rust C0/release build, feature docs, Node contracts, `git diff --check` and build inventory all passed. The existing `127.0.0.1:9022` service was not stopped, restarted, migrated or load-tested. Tag `v0.0.114` was pushed and peels to `beb9b3420b20776db489461d65392b5b1d6e5d92`.
 
 ## Active TODO
 
-1. Use `publish-new-version` workflow: fetch remote/tags, commit work separately from any version bump, compute latest remote patch tag, create annotated tag, push branch first then tag.
-2. After release, update [feature/releases/README.md](../../../../feature/releases/README.md), [feature/final-report.md](../../../../feature/final-report.md), this handoff and the evidence index with commit/tag/push results.
-3. Keep `node feature/tests/check-feature-docs.mjs`, `node --test feature/tests/*.test.mjs`, `git diff --check` and `node feature/tests/inventory-build-artifacts.mjs --gate` green after any final release-note edit.
-4. Local Docker dynamic validation remains a user waiver for this phase; keep non-Docker validation programs and contracts in place and do not record Docker as pass.
+1. Push the post-release documentation commit that records `v0.0.114`; do not move the published tag.
+2. Keep Docker dynamic validation recorded as a user waiver for this phase; non-Docker validation programs and contracts remain in place and Docker is not recorded as pass.
+3. Continue post-release observation via read-only production evidence if new recurrence samples appear.
 
 ## Done This Phase
 
