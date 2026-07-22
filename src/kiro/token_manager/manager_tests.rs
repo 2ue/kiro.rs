@@ -1,7 +1,272 @@
 use super::*;
+use crate::anthropic::usage::sampled_request_rejection_usage_record;
+use crate::kiro::token_manager::refresh::{is_token_expiring_soon, refresh_token};
 use std::sync::Arc;
 
 const SONNET_MODEL: &str = "claude-sonnet-4.5";
+
+#[test]
+fn automatic_recovery_revision_fence_accepts_metadata_only_advance_and_rejects_regression() {
+    for round in 1..=5 {
+        let rejected = format!("rejected-access-{round}");
+        let mut credentials = KiroCredentials {
+            access_token: Some(rejected.clone()),
+            storage_revision: 8,
+            ..Default::default()
+        };
+        assert!(
+            MultiTokenManager::automatic_recovery_context_is_current(&credentials, &rejected, 7)
+                .expect("higher metadata revision with the same rejected token remains current")
+        );
+        credentials.access_token = Some(format!("replacement-{round}"));
+        assert!(
+            !MultiTokenManager::automatic_recovery_context_is_current(&credentials, &rejected, 7)
+                .expect("a replaced access token is no longer current")
+        );
+        credentials.storage_revision = 6;
+        assert!(
+            MultiTokenManager::automatic_recovery_context_is_current(&credentials, &rejected, 7)
+                .is_err(),
+            "round {round}: revision regression must fail closed"
+        );
+    }
+}
+
+#[test]
+fn refresh_reset_generation_invalidates_old_leader_without_replacing_its_arc() {
+    for round in 1..=5 {
+        let state = Arc::new(CredentialRefreshState::default());
+        let captured = state.generation();
+        assert!(state.is_generation_current(captured), "round {round}");
+        state.invalidate();
+        assert!(!state.is_generation_current(captured), "round {round}");
+        assert_eq!(state.generation(), captured + 1, "round {round}");
+    }
+}
+
+#[test]
+fn token_refresh_admission_config_is_fail_fast_at_startup_and_runtime_update() {
+    for round in 1..=5 {
+        let mut invalid = Config::default();
+        invalid.token_refresh_max_rpm = 0;
+        assert!(
+            MultiTokenManager::new(invalid, Vec::new(), None, None, false).is_err(),
+            "round {round}: file/startup config must not be silently clamped"
+        );
+
+        let manager = MultiTokenManager::new(Config::default(), Vec::new(), None, None, false)
+            .expect("valid token refresh admission config");
+        let original = manager.runtime_config().token_refresh_burst;
+        assert!(
+            manager
+                .update_runtime_config(|config| config.token_refresh_burst = 0)
+                .is_err(),
+            "round {round}: runtime config must reject an out-of-range burst"
+        );
+        assert_eq!(manager.runtime_config().token_refresh_burst, original);
+    }
+}
+
+#[test]
+fn refresh_negative_result_is_typed_versioned_bounded_and_expires_for_five_rounds() {
+    let mut credentials = KiroCredentials {
+        id: Some(1),
+        storage_revision: 7,
+        refresh_token: Some(format!("refresh-{}", "x".repeat(192))),
+        auth_method: Some("external_idp".to_string()),
+        client_id: Some("client-a".to_string()),
+        token_endpoint: Some("https://oauth.invalid/token".to_string()),
+        ..Default::default()
+    };
+    let identity = RefreshAttemptIdentity::from_credentials(&credentials);
+    assert_eq!(
+        format!("{identity:?}"),
+        "RefreshAttemptIdentity(<redacted>)"
+    );
+    let mut same_payload_new_revision = credentials.clone();
+    same_payload_new_revision.storage_revision += 1;
+    assert_eq!(
+        identity,
+        RefreshAttemptIdentity::from_credentials(&same_payload_new_revision),
+        "metadata-only storage revision changes must not split the refresh wave"
+    );
+    let state = CredentialRefreshState::default();
+    let failure = RefreshFailure::new(
+        RefreshFailureStage::ResponseStatus,
+        RefreshFailureKind::UpstreamUnavailable,
+        Some(500),
+        None,
+        true,
+    );
+    let mut now = Instant::now();
+    let mut previous_delay = StdDuration::ZERO;
+
+    for round in 1..=5 {
+        let delay = state
+            .record_failure(identity, &failure, now, true)
+            .expect("upstream failure is shareable");
+        assert!(
+            delay > previous_delay,
+            "round {round}: exponential failure window must increase"
+        );
+        let replayed = state
+            .replay_failure(&identity, now, true)
+            .expect("same identity reuses the current typed result");
+        assert_eq!(replayed.kind, RefreshFailureKind::UpstreamUnavailable);
+        assert!(replayed.shared_failure_wave);
+        assert!(state.replay_failure(&identity, now + delay, true).is_none());
+        previous_delay = delay;
+        now += delay;
+    }
+    assert!(previous_delay <= TOKEN_REFRESH_NEGATIVE_BACKOFF_MAX);
+    let reset_delay = state
+        .record_failure(
+            identity,
+            &failure,
+            now + TOKEN_REFRESH_NEGATIVE_STREAK_RESET_AFTER + StdDuration::from_millis(1),
+            true,
+        )
+        .expect("a later outage starts a fresh bounded wave");
+    assert!(
+        reset_delay <= TOKEN_REFRESH_NEGATIVE_BACKOFF_BASE,
+        "widely spaced failures must not accumulate a permanent max backoff"
+    );
+
+    credentials.refresh_token = Some(format!("replacement-{}", "y".repeat(192)));
+    let replacement = RefreshAttemptIdentity::from_credentials(&credentials);
+    assert_ne!(identity, replacement);
+    assert!(
+        state
+            .replay_failure(&replacement, Instant::now(), true)
+            .is_none(),
+        "a replaced refresh token must not inherit an old failure wave"
+    );
+    let config = Config::default();
+    let second_config = Config::default();
+    let proxy_a = ProxyConfig {
+        url: "http://proxy-a.invalid:8080".to_string(),
+        username: None,
+        password: None,
+    };
+    let proxy_b = ProxyConfig {
+        url: "http://proxy-b.invalid:8080".to_string(),
+        username: None,
+        password: None,
+    };
+    assert_ne!(
+        RefreshAttemptIdentity::from_refresh_request(&credentials, &config, Some(&proxy_a)),
+        RefreshAttemptIdentity::from_refresh_request(&credentials, &config, Some(&proxy_b)),
+        "a transport change must bypass an old network failure wave"
+    );
+    assert_eq!(
+        RefreshAttemptIdentity::from_refresh_request(&credentials, &config, None),
+        RefreshAttemptIdentity::from_refresh_request(&credentials, &second_config, None),
+        "default config must not randomize refresh identity"
+    );
+
+    let retry_after = RefreshFailure::new(
+        RefreshFailureStage::ResponseStatus,
+        RefreshFailureKind::RateLimited,
+        Some(429),
+        Some(StdDuration::from_secs(45)),
+        true,
+    );
+    let retry_delay = state
+        .record_failure(replacement, &retry_after, Instant::now(), true)
+        .expect("committed 429 closes its immediate race");
+    assert_eq!(retry_delay, StdDuration::from_secs(45));
+    assert!(
+        retry_delay <= TOKEN_REFRESH_NEGATIVE_RETRY_AFTER_MAX,
+        "malicious Retry-After values remain bounded"
+    );
+    let malicious_retry_after = RefreshFailure::new(
+        RefreshFailureStage::ResponseStatus,
+        RefreshFailureKind::RateLimited,
+        Some(429),
+        Some(StdDuration::from_secs(3_600)),
+        true,
+    );
+    assert_eq!(
+        state
+            .record_failure(replacement, &malicious_retry_after, Instant::now(), true)
+            .expect("committed 429 remains shareable"),
+        TOKEN_REFRESH_NEGATIVE_RETRY_AFTER_MAX
+    );
+
+    let other_credential_state = CredentialRefreshState::default();
+    assert!(
+        other_credential_state
+            .replay_failure(&replacement, Instant::now(), true)
+            .is_none(),
+        "different credential slots never share a negative result"
+    );
+
+    let local_validation = RefreshFailure::new(
+        RefreshFailureStage::Validation,
+        RefreshFailureKind::InvalidConfiguration,
+        None,
+        None,
+        false,
+    );
+    assert!(
+        other_credential_state
+            .record_failure(replacement, &local_validation, Instant::now(), true)
+            .is_none(),
+        "local validation failures are not negative-cached"
+    );
+    let direct_failure_at = Instant::now();
+    assert!(
+        other_credential_state
+            .record_failure(replacement, &retry_after, direct_failure_at, false)
+            .is_some(),
+        "an admin/direct leader still closes duplicate OAuth sends"
+    );
+    assert!(
+        other_credential_state
+            .replay_failure(&replacement, direct_failure_at, false)
+            .expect("another direct caller shares the wave")
+            .shared_failure_wave,
+        "a direct caller cannot consume scheduler health ownership"
+    );
+    assert!(
+        !other_credential_state
+            .replay_failure(&replacement, direct_failure_at, true)
+            .expect("the first scheduler caller claims health ownership")
+            .shared_failure_wave,
+        "exactly one scheduler caller must apply the pending 429 health action"
+    );
+    assert!(
+        other_credential_state
+            .replay_failure(&replacement, direct_failure_at, true)
+            .expect("later scheduler callers still share the wave")
+            .shared_failure_wave
+    );
+}
+
+#[tokio::test]
+async fn api_key_token_path_does_not_allocate_oauth_refresh_state() {
+    let credentials = KiroCredentials {
+        id: Some(1),
+        auth_method: Some("api_key".to_string()),
+        kiro_api_key: Some("ksk_test_api_key_identity".to_string()),
+        ..Default::default()
+    };
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![credentials.clone()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    let context = manager
+        .try_ensure_token(1, &credentials, false)
+        .await
+        .expect("API key credentials bypass OAuth refresh");
+    assert_eq!(context.token, "ksk_test_api_key_identity");
+    assert!(manager.refresh_states.lock().is_empty());
+}
 
 #[test]
 fn runtime_state_apply_rejects_stale_and_equal_revisions() {
@@ -182,6 +447,404 @@ async fn test_redis_store() -> Option<Arc<RedisStore>> {
     Some(Arc::new(RedisStore::connect(&config).await.unwrap()))
 }
 
+async fn test_redis_stores_with_shared_namespace(count: usize) -> Option<Vec<Arc<RedisStore>>> {
+    let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
+    let mut config = Config::default();
+    config.redis.url = Some(url);
+    config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+    let mut stores = Vec::with_capacity(count);
+    for _ in 0..count {
+        stores.push(Arc::new(RedisStore::connect(&config).await.unwrap()));
+    }
+    Some(stores)
+}
+
+async fn run_isolated_multi_redis_manager_fixture<F, Fut>(count: usize, body: F)
+where
+    F: FnOnce(Vec<Arc<RedisStore>>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let Some(stores) = test_redis_stores_with_shared_namespace(count).await else {
+        eprintln!("跳过 Redis 多实例集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let cleanup_store = stores[0].clone();
+    let outcome = AssertUnwindSafe(body(stores)).catch_unwind().await;
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    let cleanup = cleanup_store
+        .delete_pattern_bounded("*", None)
+        .await
+        .unwrap();
+    assert!(!cleanup.cancelled);
+    assert!(!cleanup.pass_limit_reached);
+    let after = cleanup_store
+        .delete_pattern_bounded("*", None)
+        .await
+        .unwrap();
+    assert_eq!(after.deleted_keys, 0);
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn run_isolated_redis_manager_fixture<F, Fut>(body: F)
+where
+    F: FnOnce(Arc<RedisStore>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let Some(store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let outcome = AssertUnwindSafe(body(store.clone())).catch_unwind().await;
+    if test_redis_toxiproxy().is_some() {
+        clear_test_redis_latency_toxic().await;
+        set_test_redis_proxy_enabled(true).await;
+    }
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    let cleanup = store.delete_pattern_bounded("*", None).await.unwrap();
+    assert!(
+        !cleanup.cancelled,
+        "Redis manager fixture cleanup was cancelled"
+    );
+    assert!(
+        !cleanup.pass_limit_reached,
+        "Redis manager fixture cleanup did not converge"
+    );
+    let after = store.delete_pattern_bounded("*", None).await.unwrap();
+    assert_eq!(
+        after.deleted_keys, 0,
+        "Redis manager fixture must leave its unique namespace empty"
+    );
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[derive(Debug, Default)]
+struct UsageFaultWaveStats {
+    attempted: u64,
+    succeeded: u64,
+    failed: u64,
+    timed_out: u64,
+}
+
+fn spawn_usage_fault_wave(
+    store: Arc<RedisStore>,
+    scenario: String,
+    workers: usize,
+    records_per_worker: usize,
+    start: Arc<tokio::sync::Barrier>,
+) -> tokio::task::JoinHandle<UsageFaultWaveStats> {
+    tokio::spawn(async move {
+        let tasks = (0..workers)
+            .map(|worker| {
+                let store = store.clone();
+                let scenario = scenario.clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    let mut stats = UsageFaultWaveStats::default();
+                    start.wait().await;
+                    for index in 0..records_per_worker {
+                        let id =
+                            format!("redis-joint-fault-{scenario}-worker-{worker}-record-{index}");
+                        let record = sampled_request_rejection_usage_record(
+                            &id,
+                            "/cc/v1/messages",
+                            Some("redis-joint-fault-key".to_string()),
+                            "redis_joint_fault_validation",
+                            "usage_writer",
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            (worker * records_per_worker + index + 1) as u64,
+                        );
+                        stats.attempted += 1;
+                        match tokio::time::timeout(
+                            StdDuration::from_secs(3),
+                            store.record_usage_summary(&record),
+                        )
+                        .await
+                        {
+                            Ok(Ok(true)) => stats.succeeded += 1,
+                            Ok(Ok(false)) | Ok(Err(_)) => stats.failed += 1,
+                            Err(_) => stats.timed_out += 1,
+                        }
+                    }
+                    stats
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut combined = UsageFaultWaveStats::default();
+        for task in tasks {
+            let stats = task.await.unwrap();
+            combined.attempted += stats.attempted;
+            combined.succeeded += stats.succeeded;
+            combined.failed += stats.failed;
+            combined.timed_out += stats.timed_out;
+        }
+        combined
+    })
+}
+
+fn process_rss_kib_for_test() -> Option<u64> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+fn open_fd_count_for_test() -> Option<usize> {
+    std::fs::read_dir("/dev/fd")
+        .ok()
+        .map(|entries| entries.count())
+}
+
+async fn assert_capacity_breaker_fail_fast_without_redis_spin(
+    manager: &MultiTokenManager,
+    scenario: &str,
+) {
+    const CALLS: u64 = 128;
+    let before = manager.scheduler_redis_breaker.stats_snapshot();
+    let started = Instant::now();
+    for _ in 0..CALLS {
+        assert!(
+            manager.acquire_in_flight_slot(1, 1).await.is_err(),
+            "{scenario}: an open Redis breaker must fail closed"
+        );
+    }
+    let elapsed = started.elapsed();
+    let after = manager.scheduler_redis_breaker.stats_snapshot();
+    assert_eq!(
+        manager.local_pool_route_state(None).kind,
+        LocalPoolRouteStateKind::SchedulerRedisDegraded,
+        "{scenario}: breaker-open requests must not be reported as AllDisabled"
+    );
+    assert_eq!(
+        after.admitted, before.admitted,
+        "{scenario}: breaker-open calls must not reach Redis"
+    );
+    assert_eq!(
+        after.failures, before.failures,
+        "{scenario}: breaker-open calls must not manufacture Redis failures"
+    );
+    assert_eq!(
+        after.fail_fast.saturating_sub(before.fail_fast),
+        CALLS,
+        "{scenario}: each caller should receive exactly one fail-fast admission result"
+    );
+    assert!(
+        elapsed < StdDuration::from_millis(500),
+        "{scenario}: breaker-open admission appears to spin: {elapsed:?}"
+    );
+    assert_eq!(manager.entries.lock()[0].in_flight_requests, 0);
+}
+
+async fn recover_capacity_breaker_five_times(
+    manager: &MultiTokenManager,
+    store: &RedisStore,
+    scenario: &str,
+) {
+    let retry_after = manager
+        .scheduler_redis_breaker
+        .retry_after()
+        .unwrap_or(SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE);
+    tokio::time::sleep(retry_after + StdDuration::from_millis(100)).await;
+    for recovery in 1..=5 {
+        let lease = manager
+            .acquire_in_flight_slot(1, 1)
+            .await
+            .unwrap_or_else(|error| panic!("{scenario}: recovery {recovery}/5 failed: {error}"))
+            .unwrap_or_else(|| panic!("{scenario}: recovery {recovery}/5 had no capacity"));
+        drop(lease);
+    }
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    assert!(
+        !manager.scheduler_redis_breaker.is_degraded(),
+        "{scenario}: breaker must close after healthy recovery probe"
+    );
+    tokio::time::timeout(StdDuration::from_secs(3), async {
+        loop {
+            match store.scheduler_state_for_credentials(&[1]).await {
+                Ok(state)
+                    if state
+                        .get(&1)
+                        .is_none_or(|state| state.in_flight_leases.is_empty()) =>
+                {
+                    break;
+                }
+                Ok(_) | Err(_) => tokio::time::sleep(StdDuration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{scenario}: recovered Redis leases did not drain"));
+}
+
+fn test_redis_toxiproxy() -> Option<(String, String)> {
+    let api = std::env::var("KIRO_RS_TEST_TOXIPROXY_API").ok()?;
+    let proxy = std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").ok()?;
+    Some((api.trim_end_matches('/').to_string(), proxy))
+}
+
+async fn clear_test_redis_latency_toxic() -> bool {
+    let Some((api, proxy)) = test_redis_toxiproxy() else {
+        return false;
+    };
+    let response = reqwest::Client::new()
+        .delete(format!(
+            "{api}/proxies/{proxy}/toxics/scheduler-response-latency"
+        ))
+        .send()
+        .await
+        .expect("delete scheduler Redis latency toxic");
+    assert!(
+        response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND,
+        "unexpected Toxiproxy delete status: {}",
+        response.status()
+    );
+    true
+}
+
+async fn set_test_redis_latency_toxic(latency_ms: u64) -> bool {
+    let Some((api, proxy)) = test_redis_toxiproxy() else {
+        return false;
+    };
+    clear_test_redis_latency_toxic().await;
+    let response = reqwest::Client::new()
+        .post(format!("{api}/proxies/{proxy}/toxics"))
+        .json(&serde_json::json!({
+            "name": "scheduler-response-latency",
+            "type": "latency",
+            "stream": "downstream",
+            "toxicity": 1.0,
+            "attributes": {
+                "latency": latency_ms,
+                "jitter": 0,
+            },
+        }))
+        .send()
+        .await
+        .expect("create scheduler Redis latency toxic");
+    assert!(
+        response.status().is_success(),
+        "unexpected Toxiproxy create status: {}",
+        response.status()
+    );
+    true
+}
+
+async fn set_test_redis_proxy_enabled(enabled: bool) -> bool {
+    let Some((api, proxy)) = test_redis_toxiproxy() else {
+        return false;
+    };
+    let response = reqwest::Client::new()
+        .post(format!("{api}/proxies/{proxy}"))
+        .json(&serde_json::json!({ "enabled": enabled }))
+        .send()
+        .await
+        .expect("update scheduler Redis proxy state");
+    assert!(
+        response.status().is_success(),
+        "unexpected Toxiproxy update status: {}",
+        response.status()
+    );
+    true
+}
+
+fn test_fault_domain_toxiproxy(domain: &str) -> Option<(String, String)> {
+    let domain = domain.to_ascii_uppercase();
+    let api = std::env::var(format!("KIRO_RS_TEST_{domain}_TOXIPROXY_API")).ok()?;
+    let proxy = std::env::var(format!("KIRO_RS_TEST_{domain}_TOXIPROXY_NAME")).ok()?;
+    Some((api.trim_end_matches('/').to_string(), proxy))
+}
+
+async fn clear_fault_domain_latency(domain: &str) -> bool {
+    let Some((api, proxy)) = test_fault_domain_toxiproxy(domain) else {
+        return false;
+    };
+    let response = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(2))
+        .build()
+        .unwrap()
+        .delete(format!(
+            "{api}/proxies/{proxy}/toxics/fault-domain-response-latency"
+        ))
+        .send()
+        .await
+        .expect("delete Redis fault-domain latency toxic");
+    assert!(
+        response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND,
+        "unexpected fault-domain toxic delete status: {}",
+        response.status()
+    );
+    true
+}
+
+async fn set_fault_domain_latency(domain: &str, latency_ms: u64) -> bool {
+    let Some((api, proxy)) = test_fault_domain_toxiproxy(domain) else {
+        return false;
+    };
+    clear_fault_domain_latency(domain).await;
+    let response = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(2))
+        .build()
+        .unwrap()
+        .post(format!("{api}/proxies/{proxy}/toxics"))
+        .json(&serde_json::json!({
+            "name": "fault-domain-response-latency",
+            "type": "latency",
+            "stream": "downstream",
+            "toxicity": 1.0,
+            "attributes": { "latency": latency_ms, "jitter": 0 },
+        }))
+        .send()
+        .await
+        .expect("create Redis fault-domain latency toxic");
+    assert!(
+        response.status().is_success(),
+        "unexpected fault-domain toxic create status: {}",
+        response.status()
+    );
+    true
+}
+
+async fn set_fault_domain_proxy_enabled(domain: &str, enabled: bool) -> bool {
+    let Some((api, proxy)) = test_fault_domain_toxiproxy(domain) else {
+        return false;
+    };
+    let response = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(2))
+        .build()
+        .unwrap()
+        .post(format!("{api}/proxies/{proxy}"))
+        .json(&serde_json::json!({ "enabled": enabled }))
+        .send()
+        .await
+        .expect("update Redis fault-domain proxy state");
+    assert!(
+        response.status().is_success(),
+        "unexpected fault-domain proxy status: {}",
+        response.status()
+    );
+    true
+}
+
+async fn wait_fault_domain_store_healthy(store: &RedisStore, domain: &str) {
+    tokio::time::timeout(StdDuration::from_secs(8), async {
+        loop {
+            if matches!(
+                tokio::time::timeout(StdDuration::from_secs(1), store.ping()).await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{domain} Redis did not recover"));
+}
+
 async fn acquire_test_refresh_lock_until(
     redis: &RedisStore,
     credential_id: u64,
@@ -214,6 +877,22 @@ async fn test_postgres_store() -> Option<Arc<PostgresStore>> {
     Some(Arc::new(
         PostgresStore::connect_test(&config).await.unwrap(),
     ))
+}
+
+async fn run_isolated_postgres_fixture<F, Fut>(body: F)
+where
+    F: FnOnce(Arc<PostgresStore>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+    let outcome = AssertUnwindSafe(body(store.clone())).catch_unwind().await;
+    store.drop_test_schema().await.unwrap();
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 #[derive(Clone)]
@@ -375,6 +1054,80 @@ async fn postgres_stats_reload_preserves_pending_deltas_and_monotonic_local_valu
 
     manager.pending_stats_deltas.lock().clear();
     assert!(manager.refresh_stats_dirty_from_pending());
+    store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steady_success_queues_stats_without_rewriting_unchanged_runtime_state() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL steady-success 测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+    let mut credential = api_key_credential("steady-success");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+
+    for _ in 0..5 {
+        manager.report_success(1);
+    }
+    let steady_success_mutations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1 AND mutation_kind = 'success'",
+    )
+    .bind(1_i64)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        steady_success_mutations, 0,
+        "steady successes must not synchronously rewrite unchanged runtime state"
+    );
+    assert_eq!(
+        manager
+            .pending_stats_deltas
+            .lock()
+            .get(&1)
+            .unwrap()
+            .success_delta,
+        5,
+        "success accounting must remain lossless on the stats-delta path"
+    );
+
+    assert!(manager.report_failure(1));
+    manager.report_success(1);
+    let recovery_success_mutations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM credential_runtime_mutations WHERE credential_id = $1 AND mutation_kind = 'success'",
+    )
+    .bind(1_i64)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        recovery_success_mutations, 1,
+        "a success that resets failure state must still use the authoritative runtime mutation"
+    );
+    let runtime = store.load_credential_runtime_state().await.unwrap();
+    assert_eq!(runtime[&1].failure_count, 0);
+    assert_eq!(runtime[&1].revision, 2);
+    assert_eq!(
+        manager
+            .pending_stats_deltas
+            .lock()
+            .get(&1)
+            .unwrap()
+            .success_delta,
+        6
+    );
+
     store.drop_test_schema().await.unwrap();
 }
 
@@ -1230,31 +1983,38 @@ fn token_refresh_deadlines_reserve_reconciliation_and_bound_coordination() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refresh_step_deadline_preempts_synchronous_first_poll_work() {
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let started_at = Instant::now();
-    let deadline = tokio::time::Instant::now() + StdDuration::from_millis(100);
-    let step = tokio::spawn(async move {
-        run_refresh_step_until("同步冷启动测试", deadline, async move {
-            let _ = started_tx.send(());
-            std::thread::sleep(StdDuration::from_millis(500));
+#[tokio::test]
+async fn auxiliary_focus_refresh_step_deadline_drops_future_owned_resources_before_returning() {
+    struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    for round in 1..=5 {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owned = DropProbe(dropped.clone());
+        let deadline = tokio::time::Instant::now() + StdDuration::from_millis(10);
+        let error = run_refresh_step_until("refresh resource cleanup test", deadline, async move {
+            let _owned = owned;
             std::future::pending::<anyhow::Result<()>>().await
         })
         .await
-    });
-
-    tokio::time::timeout(StdDuration::from_secs(1), started_rx)
-        .await
-        .expect("同步首次 poll 未开始")
-        .expect("同步首次 poll 通知发送端提前关闭");
-    let error = tokio::time::timeout(StdDuration::from_millis(300), step)
-        .await
-        .expect("refresh step deadline 被同步首次 poll 穿透")
-        .expect("refresh step 测试任务异常")
         .unwrap_err();
-    assert!(error.to_string().contains("工作期限"));
-    assert!(started_at.elapsed() < StdDuration::from_millis(300));
+
+        let typed = error
+            .downcast_ref::<RefreshFailure>()
+            .expect("refresh deadline must remain typed");
+        assert_eq!(typed.stage, RefreshFailureStage::Internal, "round {round}");
+        assert_eq!(typed.kind, RefreshFailureKind::Timeout, "round {round}");
+        assert!(typed.send_committed, "round {round}");
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "round {round}: timeout must drop future-owned resources before returning"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1262,8 +2022,8 @@ async fn force_refresh_local_lock_wait_respects_coordination_deadline() {
     let credential = force_refresh_test_credential("http://127.0.0.1:1/token".to_string());
     let manager =
         MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
-    let refresh_lock = manager.refresh_lock_for_credential(1);
-    let _held = refresh_lock.lock().await;
+    let refresh_state = manager.refresh_state_for_credential(1);
+    let _held = refresh_state.gate.lock().await;
     let started_at = Instant::now();
     let error = manager
         .force_refresh_token_for_with_budgets(
@@ -1276,8 +2036,17 @@ async fn force_refresh_local_lock_wait_respects_coordination_deadline() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("本地 Token 刷新锁超时"));
+    let typed = error
+        .downcast_ref::<RefreshFailure>()
+        .expect("local refresh lock timeout must remain typed");
+    assert_eq!(typed.stage, RefreshFailureStage::Coordination);
+    assert_eq!(typed.kind, RefreshFailureKind::Timeout);
+    assert!(!typed.send_committed);
     assert!(started_at.elapsed() < StdDuration::from_millis(250));
+    let snapshot = manager.snapshot();
+    assert_eq!(snapshot.entries[0].refresh_failure_count, 0);
+    assert!(!snapshot.entries[0].disabled);
+    assert!(!snapshot.entries[0].cooled_down);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1289,6 +2058,7 @@ async fn ordinary_refresh_peer_wait_respects_coordination_deadline() {
     let mut credential = force_refresh_test_credential("http://127.0.0.1:1/token".to_string());
     credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
     let inserted = store.insert_credential(&credential).await.unwrap();
+    let credential_id = inserted.id.expect("inserted credential must have an id");
     let manager = MultiTokenManager::new_with_stores(
         Config::default(),
         vec![inserted.clone()],
@@ -1299,12 +2069,16 @@ async fn ordinary_refresh_peer_wait_respects_coordination_deadline() {
         Some(redis.clone()),
     )
     .unwrap();
-    let peer_lock = redis.acquire_refresh_lock(1, 30).await.unwrap().unwrap();
+    let peer_lock = redis
+        .acquire_refresh_lock(credential_id, 30)
+        .await
+        .unwrap()
+        .unwrap();
 
     let started_at = Instant::now();
     let result = manager
         .try_ensure_token_with_budgets(
-            1,
+            credential_id,
             &inserted,
             true,
             TokenRefreshBudgets {
@@ -1314,15 +2088,29 @@ async fn ordinary_refresh_peer_wait_respects_coordination_deadline() {
             },
         )
         .await;
+    let elapsed = started_at.elapsed();
+    let snapshot = manager.snapshot();
+    let lock_released = redis
+        .release_refresh_lock(credential_id, &peer_lock)
+        .await
+        .unwrap();
+    store.drop_test_schema().await.unwrap();
+
     let error = match result {
         Ok(_) => panic!("peer refresh wait unexpectedly succeeded"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("期限") || error.to_string().contains("超时"));
-    assert!(started_at.elapsed() < StdDuration::from_millis(300));
-
-    assert!(redis.release_refresh_lock(1, &peer_lock).await.unwrap());
-    store.drop_test_schema().await.unwrap();
+    let typed = error
+        .downcast_ref::<RefreshFailure>()
+        .expect("peer refresh coordination timeout must remain typed");
+    assert_eq!(typed.stage, RefreshFailureStage::Coordination);
+    assert_eq!(typed.kind, RefreshFailureKind::Timeout);
+    assert!(!typed.send_committed);
+    assert!(elapsed < StdDuration::from_millis(300));
+    assert_eq!(snapshot.entries[0].refresh_failure_count, 0);
+    assert!(!snapshot.entries[0].disabled);
+    assert!(!snapshot.entries[0].cooled_down);
+    assert!(lock_released);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1365,8 +2153,17 @@ async fn pending_force_refresh_respects_total_deadline_and_releases_redis_lock()
     let result = tokio::time::timeout(StdDuration::from_secs(5), &mut refresh)
         .await
         .expect("强制刷新未在总期限后结束");
-    assert!(result.unwrap_err().to_string().contains("工作期限"));
+    let error = result.unwrap_err();
+    let typed = error
+        .downcast_ref::<RefreshFailure>()
+        .expect("pending refresh deadline must remain typed");
+    assert_eq!(typed.kind, RefreshFailureKind::Timeout);
+    assert!(typed.send_committed);
     assert!(started_at.elapsed() < StdDuration::from_secs(5));
+    let snapshot = manager.snapshot();
+    assert_eq!(snapshot.entries[0].refresh_failure_count, 0);
+    assert!(!snapshot.entries[0].disabled);
+    assert!(!snapshot.entries[0].cooled_down);
     let next_lock = redis.acquire_refresh_lock(1, 30).await.unwrap().unwrap();
     assert!(redis.release_refresh_lock(1, &next_lock).await.unwrap());
 
@@ -1496,6 +2293,54 @@ async fn aborting_ordinary_refresh_submits_critical_redis_lock_cleanup() {
         tokio::time::Instant::now() + StdDuration::from_secs(1),
     )
     .await;
+    assert!(redis.release_refresh_lock(1, &next_lock).await.unwrap());
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_refresh_with_redis_without_postgres_uses_local_authority_and_releases_lock() {
+    let Some(redis) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let (token_endpoint, _request_received, server) = spawn_force_refresh_token_endpoint().await;
+    let mut credential = force_refresh_test_credential(token_endpoint);
+    credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+    let refresh_credentials = credential.clone();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        None,
+        Some(redis.clone()),
+    )
+    .unwrap();
+
+    let context = manager
+        .try_ensure_token_with_budgets(
+            1,
+            &refresh_credentials,
+            false,
+            TokenRefreshBudgets {
+                workflow: StdDuration::from_secs(5),
+                coordination: StdDuration::from_secs(1),
+                reconciliation: StdDuration::from_secs(1),
+            },
+        )
+        .await
+        .expect("Redis-only ordinary refresh must use the local credential snapshot");
+    assert_eq!(context.token, "force-refreshed-access-token");
+    assert_eq!(
+        manager.entries.lock()[0]
+            .credentials
+            .access_token
+            .as_deref(),
+        Some("force-refreshed-access-token")
+    );
+    let next_lock = redis.acquire_refresh_lock(1, 30).await.unwrap().unwrap();
     assert!(redis.release_refresh_lock(1, &next_lock).await.unwrap());
 
     server.abort();
@@ -1644,13 +2489,14 @@ async fn force_refresh_holds_redis_lock_until_postgres_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn force_refresh_postgres_failure_returns_error_without_updating_local_credentials() {
+async fn ordinary_refresh_postgres_failure_is_typed_and_credential_health_neutral() {
     let (Some(store), Some(redis)) = (test_postgres_store().await, test_redis_store().await) else {
         eprintln!("跳过 PgSQL/Redis TokenManager 集成测试：未设置存储集成测试环境变量");
         return;
     };
     let (token_endpoint, _request_received, server) = spawn_force_refresh_token_endpoint().await;
-    let credential = force_refresh_test_credential(token_endpoint);
+    let mut credential = force_refresh_test_credential(token_endpoint);
+    credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
     store
         .save_credentials(std::slice::from_ref(&credential))
         .await
@@ -1674,12 +2520,16 @@ async fn force_refresh_postgres_failure_returns_error_without_updating_local_cre
         .await
         .unwrap();
 
-    let error = manager.force_refresh_token_for(1).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("强制刷新 Token 后写入 PgSQL 失败")
-    );
+    let error = match manager.acquire_context(None).await {
+        Ok(_) => panic!("ordinary refresh must fail when credential persistence fails"),
+        Err(error) => error,
+    };
+    let typed = error
+        .downcast_ref::<RefreshFailure>()
+        .expect("refresh persistence failure must remain typed");
+    assert_eq!(typed.stage, RefreshFailureStage::Persistence);
+    assert_eq!(typed.kind, RefreshFailureKind::Persistence);
+    assert!(typed.send_committed);
     let expected_refresh_token = "r".repeat(150);
     {
         let entries = manager.entries.lock();
@@ -1692,6 +2542,9 @@ async fn force_refresh_postgres_failure_returns_error_without_updating_local_cre
             entry.credentials.refresh_token.as_deref(),
             Some(expected_refresh_token.as_str())
         );
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert!(!entry.disabled);
+        assert!(entry.cooldown_until.is_none());
     }
     let next_lock = redis.acquire_refresh_lock(1, 30).await.unwrap().unwrap();
     assert!(redis.release_refresh_lock(1, &next_lock).await.unwrap());
@@ -1747,6 +2600,7 @@ async fn refresh_cas_treats_already_committed_fields_as_success() {
             &inserted,
             refreshed,
             false,
+            None,
             reconciliation_started_at,
             reconciliation_started_at + StdDuration::from_secs(5),
         )
@@ -2039,11 +2893,171 @@ async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
         });
 
     assert!(result.is_none());
-    assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    assert!(!manager.scheduler_redis_breaker.is_degraded());
+    assert!(
+        !manager.scheduler_redis_snapshot_breaker.is_degraded(),
+        "snapshot/state-sync timeout must leave only the local snapshot stale; it must not create a fail-fast breaker window"
+    );
+    assert_eq!(
+        manager.local_pool_route_state(None).kind,
+        LocalPoolRouteStateKind::Ready,
+        "a snapshot timeout must not route a locally dispatchable pool to external fallback"
+    );
+    assert_eq!(
+        manager
+            .scheduler_redis_snapshot_breaker
+            .stats_snapshot()
+            .failures,
+        1
+    );
 }
 
 #[test]
-fn test_scheduler_redis_degraded_backoff_grows_on_repeated_failures() {
+fn dispatch_wakeup_filters_self_and_routes_remote_scope_for_five_rounds() {
+    for round in 0..5u64 {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let self_payload = serde_json::json!({
+            "kind": "dispatch_wakeup",
+            "sourceInstanceId": manager.scheduler_instance_id.as_ref(),
+            "credentialId": round + 1,
+        })
+        .to_string();
+        for _ in 0..1_000 {
+            assert!(!manager.notify_remote_dispatch_state_changed(&self_payload));
+        }
+        assert!(
+            manager
+                .scheduler_redis_dirty_credential_ids
+                .lock()
+                .is_empty()
+        );
+        assert_eq!(
+            manager
+                .scheduler_redis_full_sync_requested
+                .load(Ordering::Acquire),
+            0
+        );
+
+        let targeted = serde_json::json!({
+            "kind": "dispatch_wakeup",
+            "sourceInstanceId": format!("remote-{round}"),
+            "credentialId": round + 10,
+        })
+        .to_string();
+        assert!(manager.notify_remote_dispatch_state_changed(&targeted));
+        assert_eq!(
+            manager
+                .scheduler_redis_dirty_credential_ids
+                .lock()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![round + 10]
+        );
+
+        let broad = serde_json::json!({
+            "kind": "dispatch_wakeup",
+            "sourceInstanceId": format!("remote-broad-{round}"),
+            "removed": 2,
+        })
+        .to_string();
+        assert!(manager.notify_remote_dispatch_state_changed(&broad));
+        assert_eq!(
+            manager
+                .scheduler_redis_full_sync_requested
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(!manager.notify_remote_dispatch_state_changed("not-json"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_scheduler_events_arriving_during_snapshot_are_chased_for_five_rounds() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis remote generation 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    redis_store.set_scheduler_state_delay_millis(100);
+
+    for round in 0..5u64 {
+        let manager = MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![api_key_credential(&format!("remote-generation-{round}"))],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap();
+        redis_store.reset_scheduler_state_round_trips();
+        let started = Instant::now();
+        let first = serde_json::json!({
+            "kind": "dispatch_wakeup",
+            "sourceInstanceId": format!("remote-a-{round}"),
+            "credentialId": 1,
+        })
+        .to_string();
+        assert!(manager.notify_remote_dispatch_state_changed(&first));
+
+        tokio::time::timeout(StdDuration::from_millis(250), async {
+            while redis_store.scheduler_state_round_trips() < 1 {
+                tokio::time::sleep(StdDuration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: first targeted snapshot did not start"));
+
+        let second = serde_json::json!({
+            "kind": "dispatch_wakeup",
+            "sourceInstanceId": format!("remote-b-{round}"),
+            "credentialId": 1,
+        })
+        .to_string();
+        assert!(manager.notify_remote_dispatch_state_changed(&second));
+
+        tokio::time::timeout(StdDuration::from_millis(700), async {
+            loop {
+                if redis_store.scheduler_state_round_trips() >= 2
+                    && !manager
+                        .scheduler_redis_sync_in_flight
+                        .load(Ordering::Acquire)
+                    && manager
+                        .scheduler_redis_dirty_credential_ids
+                        .lock()
+                        .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: second event was not chased"));
+
+        assert_eq!(
+            redis_store.scheduler_state_round_trips(),
+            2,
+            "round {round}"
+        );
+        assert!(started.elapsed() < StdDuration::from_millis(700));
+        assert!(!manager.scheduler_redis_breaker.is_degraded());
+        assert!(!manager.scheduler_redis_snapshot_breaker.is_degraded());
+    }
+
+    redis_store.set_scheduler_state_delay_millis(0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scheduler_affinity_timeout_does_not_degrade_capacity_coordination() {
     let manager = MultiTokenManager::new(
         Config::default(),
         vec![test_access_token_credential("token-1", "Pro")],
@@ -2052,24 +3066,465 @@ fn test_scheduler_redis_degraded_backoff_grows_on_repeated_failures() {
         false,
     )
     .unwrap();
-    let err = anyhow::anyhow!("redis timeout");
 
-    manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
-    let first_deadline = *manager.scheduler_redis_degraded_until.lock();
-    let first_remaining = first_deadline
-        .expect("degraded deadline")
-        .saturating_duration_since(Instant::now());
+    let result = manager.block_on_scheduler_redis_affinity(
+        "测试 Redis 会话粘性",
+        std::future::pending::<anyhow::Result<()>>(),
+    );
 
-    *manager.scheduler_redis_degraded_until.lock() = None;
-    manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
-    let second_deadline = *manager.scheduler_redis_degraded_until.lock();
-    let second_remaining = second_deadline
-        .expect("degraded deadline")
-        .saturating_duration_since(Instant::now());
+    assert!(result.is_none());
+    assert!(
+        !manager.scheduler_redis_breaker.is_degraded(),
+        "会话粘性超时不得冻结凭据并发和全局队列准入"
+    );
+    assert!(
+        manager.scheduler_redis_affinity_breaker.is_degraded(),
+        "会话粘性自身应进入有限退避，避免 Redis 故障时每个请求重复打热路径"
+    );
 
-    assert!(first_remaining <= SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE);
-    assert!(second_remaining > first_remaining);
-    assert!(second_remaining <= SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX);
+    let second_started = Instant::now();
+    let skipped = manager.block_on_scheduler_redis_affinity("测试 Redis 会话粘性退避", async {
+        Ok::<_, anyhow::Error>(())
+    });
+    assert!(skipped.is_none());
+    assert!(second_started.elapsed() < StdDuration::from_millis(20));
+
+    let route_state = manager.local_pool_route_state(None);
+    assert_eq!(route_state.kind, LocalPoolRouteStateKind::Ready);
+    let mut context = manager
+        .acquire_context(None)
+        .await
+        .expect("会话粘性降级不得阻止本地账号取得并发槽");
+    context.release_in_flight();
+}
+
+#[test]
+fn scheduler_redis_backoff_is_stable_and_within_exponential_boundaries() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 1, 0xfeed_beef);
+    let mut previous = StdDuration::ZERO;
+    let mut previous_base = StdDuration::ZERO;
+    for failure in 1..=8 {
+        let base = SchedulerRedisBreaker::base_backoff_for_failure(failure);
+        let first = breaker.backoff_for_failure(failure, failure as u64);
+        let second = breaker.backoff_for_failure(failure, failure as u64);
+        assert_eq!(first, second, "failure {failure}: jitter must be stable");
+        assert!(
+            first <= base,
+            "failure {failure}: jitter must not exceed cap"
+        );
+        assert!(first >= base.saturating_mul(9) / 10);
+        if base > previous_base {
+            assert!(first > previous, "failure {failure}: backoff did not grow");
+        }
+        previous = first;
+        previous_base = base;
+    }
+    assert!(previous <= SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX);
+}
+
+#[tokio::test]
+async fn scheduler_redis_saturation_does_not_open_breaker_c255_c256_c257_c512() {
+    for contenders in [255usize, 256, 257, 512] {
+        let breaker = SchedulerRedisBreaker::new(
+            SchedulerRedisBreakerKind::Capacity,
+            SCHEDULER_REDIS_MAX_IN_FLIGHT_OPERATIONS,
+            contenders as u64,
+        );
+        let admitted = contenders.min(SCHEDULER_REDIS_MAX_IN_FLIGHT_OPERATIONS);
+        let mut held = Vec::with_capacity(admitted);
+        for _ in 0..admitted {
+            held.push(
+                breaker
+                    .begin_until(
+                        tokio::time::Instant::now() + StdDuration::from_secs(1),
+                        StdDuration::from_secs(1),
+                    )
+                    .await
+                    .expect("permit below the hard boundary"),
+            );
+        }
+        for _ in admitted..contenders {
+            assert_eq!(
+                breaker
+                    .begin_until(tokio::time::Instant::now(), SCHEDULER_REDIS_HOT_OP_TIMEOUT)
+                    .await
+                    .err(),
+                Some(SchedulerRedisAdmissionError::LocalSchedulerOverloaded)
+            );
+        }
+        assert_eq!(
+            breaker.state.lock().phase,
+            SchedulerRedisBreakerPhase::Closed,
+            "c{contenders}: local saturation must not open the Redis breaker"
+        );
+        assert_eq!(
+            breaker.stats_snapshot().local_saturated,
+            contenders.saturating_sub(admitted) as u64
+        );
+        drop(held);
+    }
+}
+
+#[tokio::test]
+async fn scheduler_redis_semaphore_wait_uses_total_deadline_and_stays_not_started() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 1, 5);
+    let held = breaker
+        .begin_until(
+            tokio::time::Instant::now() + StdDuration::from_secs(1),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .expect("hold only permit");
+    let started = Arc::new(AtomicBool::new(false));
+    let operation_polled = Arc::new(AtomicBool::new(false));
+    let started_for_hook = started.clone();
+    let polled_for_future = operation_polled.clone();
+    let began_at = Instant::now();
+    let outcome = MultiTokenManager::execute_scheduler_redis_operation(
+        breaker.clone(),
+        SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+        "shared deadline test",
+        move || started_for_hook.store(true, Ordering::Release),
+        async move {
+            polled_for_future.store(true, Ordering::Release);
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        SchedulerRedisExecutionOutcome::NotStarted(
+            SchedulerRedisAdmissionError::LocalSchedulerOverloaded
+        )
+    ));
+    assert!(!started.load(Ordering::Acquire));
+    assert!(!operation_polled.load(Ordering::Acquire));
+    assert!(began_at.elapsed() >= SCHEDULER_REDIS_HOT_OP_TIMEOUT);
+    assert!(began_at.elapsed() < SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(175));
+    assert_eq!(
+        breaker.state.lock().phase,
+        SchedulerRedisBreakerPhase::Closed
+    );
+    assert_eq!(breaker.stats_snapshot().failures, 0);
+    drop(held);
+}
+
+#[tokio::test]
+async fn scheduler_redis_capacity_timeouts_open_only_after_consecutive_threshold() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 1, 0x5151);
+    let timeout = StdDuration::from_millis(5);
+
+    for attempt in 1..SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN {
+        let outcome = MultiTokenManager::execute_scheduler_redis_operation(
+            breaker.clone(),
+            timeout,
+            "capacity timeout threshold test",
+            || {},
+            async move {
+                tokio::time::sleep(timeout.saturating_mul(4)).await;
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                SchedulerRedisExecutionOutcome::Failed {
+                    commit_unknown: true
+                }
+            ),
+            "attempt {attempt} should fail the request closed"
+        );
+        assert_eq!(
+            breaker.state.lock().phase,
+            SchedulerRedisBreakerPhase::Closed,
+            "attempt {attempt} must not open the capacity breaker before the threshold"
+        );
+    }
+
+    let threshold_outcome = MultiTokenManager::execute_scheduler_redis_operation(
+        breaker.clone(),
+        timeout,
+        "capacity timeout threshold test",
+        || {},
+        async move {
+            tokio::time::sleep(timeout.saturating_mul(4)).await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await;
+    assert!(matches!(
+        threshold_outcome,
+        SchedulerRedisExecutionOutcome::Failed {
+            commit_unknown: true
+        }
+    ));
+    assert!(matches!(
+        breaker.state.lock().phase,
+        SchedulerRedisBreakerPhase::Open { .. }
+    ));
+    assert_eq!(
+        breaker.stats_snapshot().failures,
+        u64::from(SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN)
+    );
+}
+
+#[tokio::test]
+async fn scheduler_redis_capacity_timeout_streak_resets_after_success() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 1, 0x5252);
+    let timeout = StdDuration::from_millis(5);
+
+    let timeout_outcome = MultiTokenManager::execute_scheduler_redis_operation(
+        breaker.clone(),
+        timeout,
+        "capacity timeout reset test",
+        || {},
+        async move {
+            tokio::time::sleep(timeout.saturating_mul(4)).await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await;
+    assert!(matches!(
+        timeout_outcome,
+        SchedulerRedisExecutionOutcome::Failed {
+            commit_unknown: true
+        }
+    ));
+    assert_eq!(breaker.state.lock().consecutive_failures, 1);
+    assert_eq!(
+        breaker.state.lock().phase,
+        SchedulerRedisBreakerPhase::Closed
+    );
+
+    let success = MultiTokenManager::execute_scheduler_redis_operation(
+        breaker.clone(),
+        timeout,
+        "capacity timeout reset test",
+        || {},
+        async { Ok::<_, anyhow::Error>(()) },
+    )
+    .await;
+    assert!(matches!(
+        success,
+        SchedulerRedisExecutionOutcome::Completed(())
+    ));
+    assert_eq!(breaker.state.lock().consecutive_failures, 0);
+
+    let next_timeout = MultiTokenManager::execute_scheduler_redis_operation(
+        breaker.clone(),
+        timeout,
+        "capacity timeout reset test",
+        || {},
+        async move {
+            tokio::time::sleep(timeout.saturating_mul(4)).await;
+            Ok::<_, anyhow::Error>(())
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_timeout,
+        SchedulerRedisExecutionOutcome::Failed {
+            commit_unknown: true
+        }
+    ));
+    assert_eq!(breaker.state.lock().consecutive_failures, 1);
+    assert_eq!(
+        breaker.state.lock().phase,
+        SchedulerRedisBreakerPhase::Closed,
+        "a single timeout after a healthy success must not open the breaker"
+    );
+}
+
+#[test]
+fn scheduler_redis_response_errors_do_not_force_commit_unknown_recovery() {
+    let response_error: anyhow::Error = redis::RedisError::from((
+        redis::ErrorKind::ResponseError,
+        "ERR",
+        "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+    ))
+    .into();
+    let timeout_error: anyhow::Error =
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out").into();
+    let connection_refused: anyhow::Error =
+        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused").into();
+
+    assert!(
+        !scheduler_redis_failure_commit_unknown(&response_error),
+        "WRONGTYPE and other deterministic Redis response errors must not be treated as commit-unknown"
+    );
+    assert!(
+        scheduler_redis_failure_commit_unknown(&timeout_error),
+        "timeouts must remain commit-unknown"
+    );
+    assert!(
+        scheduler_redis_failure_commit_unknown(&connection_refused),
+        "unknown non-Redis errors remain conservative"
+    );
+}
+
+#[test]
+fn stale_probe_success_cannot_clear_new_failure_for_10k_interleavings() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 1, 7);
+    for generation in 0..10_000u64 {
+        {
+            let mut state = breaker.state.lock();
+            state.failure_generation = generation.wrapping_add(1);
+            state.consecutive_failures = 1;
+            state.phase = SchedulerRedisBreakerPhase::Open {
+                until: Instant::now() + StdDuration::from_secs(1),
+            };
+        }
+        breaker.complete_success(generation, true);
+        let state = breaker.state.lock();
+        assert_eq!(state.failure_generation, generation.wrapping_add(1));
+        assert!(matches!(
+            state.phase,
+            SchedulerRedisBreakerPhase::Open { .. }
+        ));
+    }
+    assert_eq!(breaker.stats_snapshot().stale_successes, 10_000);
+}
+
+#[tokio::test]
+async fn stale_probe_success_cannot_clear_new_failure_real_admissions() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 2, 9);
+    let stale_success = breaker
+        .begin_until(
+            tokio::time::Instant::now() + StdDuration::from_secs(1),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .expect("first closed admission");
+    let failing = breaker
+        .begin_until(
+            tokio::time::Instant::now() + StdDuration::from_secs(1),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .expect("second closed admission");
+    let failure_generation = failing.failure_generation;
+    failing.failure("generation fencing test", &anyhow::anyhow!("redis timeout"));
+    stale_success.success();
+
+    let state = breaker.state.lock();
+    assert_eq!(state.failure_generation, failure_generation.wrapping_add(1));
+    assert!(matches!(
+        state.phase,
+        SchedulerRedisBreakerPhase::Open { .. }
+    ));
+    assert_eq!(breaker.stats_snapshot().stale_successes, 1);
+}
+
+#[test]
+fn stale_failures_cannot_extend_or_escalate_new_breaker_generation_for_10k_interleavings() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 1, 10);
+    let error = anyhow::anyhow!("redis timeout");
+    breaker.complete_failure(
+        0,
+        false,
+        "first failure",
+        SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+        &error,
+    );
+    let (generation, failures, phase) = {
+        let state = breaker.state.lock();
+        (
+            state.failure_generation,
+            state.consecutive_failures,
+            state.phase,
+        )
+    };
+
+    for _ in 0..10_000 {
+        breaker.complete_failure(
+            0,
+            false,
+            "stale failure",
+            SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+            &error,
+        );
+    }
+
+    let state = breaker.state.lock();
+    assert_eq!(state.failure_generation, generation);
+    assert_eq!(state.consecutive_failures, failures);
+    assert_eq!(state.phase, phase);
+    let stats = breaker.stats_snapshot();
+    assert_eq!(stats.failures, 10_001);
+    assert_eq!(stats.stale_failures, 10_000);
+}
+
+#[tokio::test]
+async fn concurrent_failure_wave_opens_scheduler_breaker_once_without_backoff_amplification() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 256, 12);
+    let mut admissions = Vec::with_capacity(256);
+    for _ in 0..256 {
+        admissions.push(
+            breaker
+                .begin_until(
+                    tokio::time::Instant::now() + StdDuration::from_secs(1),
+                    StdDuration::from_secs(1),
+                )
+                .await
+                .expect("closed breaker must admit the bounded wave"),
+        );
+    }
+    let admitted_generation = admissions[0].failure_generation;
+    for admission in admissions {
+        admission.failure("concurrent wave", &anyhow::anyhow!("redis timeout"));
+    }
+
+    let state = breaker.state.lock();
+    assert_eq!(
+        state.failure_generation,
+        admitted_generation.wrapping_add(1)
+    );
+    assert_eq!(state.consecutive_failures, 1);
+    assert!(matches!(
+        state.phase,
+        SchedulerRedisBreakerPhase::Open { .. }
+    ));
+    let stats = breaker.stats_snapshot();
+    assert_eq!(stats.failures, 256);
+    assert_eq!(stats.stale_failures, 255);
+}
+
+#[tokio::test]
+async fn half_open_route_state_stays_degraded_until_the_single_probe_recovers() {
+    let breaker = SchedulerRedisBreaker::new(SchedulerRedisBreakerKind::Capacity, 2, 11);
+    breaker.state.lock().phase = SchedulerRedisBreakerPhase::Open {
+        until: Instant::now() - StdDuration::from_millis(1),
+    };
+    assert!(breaker.is_degraded());
+    let probe = breaker
+        .begin_until(
+            tokio::time::Instant::now() + StdDuration::from_secs(1),
+            StdDuration::from_secs(1),
+        )
+        .await
+        .expect("expired Open must admit one probe");
+    assert!(probe.recovery_probe());
+    assert_eq!(
+        breaker.state.lock().phase,
+        SchedulerRedisBreakerPhase::HalfOpen
+    );
+    assert_eq!(
+        breaker
+            .begin_until(
+                tokio::time::Instant::now() + StdDuration::from_secs(1),
+                StdDuration::from_secs(1),
+            )
+            .await
+            .err(),
+        Some(SchedulerRedisAdmissionError::BreakerOpen)
+    );
+    probe.success();
+    assert_eq!(
+        breaker.state.lock().phase,
+        SchedulerRedisBreakerPhase::Closed
+    );
+    assert!(!breaker.is_degraded());
 }
 
 fn test_access_token_credential(token: &str, subscription_title: &str) -> KiroCredentials {
@@ -2154,6 +3609,14 @@ fn test_invalid_grant_resource_not_found_is_permanent_refresh_failure() {
         reqwest::StatusCode::BAD_REQUEST,
         r#"{"error":"slow_down"}"#
     ));
+    assert!(!is_invalid_grant_response(
+        reqwest::StatusCode::BAD_REQUEST,
+        r#"{"error":"invalid_request","error_description":"contains invalid_grant text"}"#
+    ));
+    assert!(!is_invalid_grant_response(
+        reqwest::StatusCode::BAD_REQUEST,
+        r#"not-json \"invalid_grant\""#
+    ));
 }
 
 #[test]
@@ -2187,12 +3650,15 @@ async fn test_refresh_token_rejects_api_key_credential() {
     let result = refresh_token(&credentials, &config, None).await;
 
     assert!(result.is_err(), "API Key 凭据应被 refresh_token 拒绝");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("API Key 凭据不支持刷新"),
-        "期望错误消息包含 'API Key 凭据不支持刷新'，实际: {}",
-        err_msg
-    );
+    let error = result.unwrap_err();
+    let typed = error
+        .downcast_ref::<RefreshFailure>()
+        .expect("API Key refresh rejection must remain a low-cardinality typed failure");
+    assert_eq!(typed.stage, RefreshFailureStage::Validation);
+    assert_eq!(typed.kind, RefreshFailureKind::InvalidConfiguration);
+    assert_eq!(typed.status, None);
+    assert_eq!(typed.retry_after, None);
+    assert!(!typed.send_committed);
 }
 
 #[tokio::test]
@@ -2567,7 +4033,8 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
     {
         let entries = manager.entries.lock();
         assert!(entries[0].runtime_persistence_degraded);
-        assert!(entries[0].disabled);
+        assert!(!entries[0].runtime_persistence_quarantined);
+        assert!(!entries[0].disabled);
         assert_eq!(entries[0].failure_count, 1);
         assert_eq!(entries[0].runtime_revision, 1);
     }
@@ -2579,6 +4046,7 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
     {
         let entries = manager.entries.lock();
         assert!(!entries[0].runtime_persistence_degraded);
+        assert!(!entries[0].runtime_persistence_quarantined);
         assert!(!entries[0].disabled);
         assert_eq!(entries[0].failure_count, 1);
         assert_eq!(entries[0].runtime_revision, 3);
@@ -2589,6 +4057,272 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
 
     crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
     store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds() {
+    run_isolated_postgres_fixture(|store| async move {
+        let mut credential = api_key_credential("ksk_pool_pressure_non_terminal");
+        credential.id = Some(1);
+        store.save_credentials(&[credential.clone()]).await.unwrap();
+        let manager = MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+            Some(store.clone()),
+            None,
+        )
+        .unwrap();
+
+        for round in 1..=5 {
+            {
+                let mut entries = manager.entries.lock();
+                let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+                entry.failure_count = 1;
+                assert!(!entry.disabled, "round {round}");
+            }
+
+            let first_connection = store.pool().acquire().await.unwrap();
+            let second_connection = store.pool().acquire().await.unwrap();
+            let started_at = Instant::now();
+            manager.report_success(1);
+            let elapsed = started_at.elapsed();
+            assert!(
+                elapsed >= CREDENTIAL_PGSQL_SYNC_TIMEOUT.saturating_sub(StdDuration::from_millis(250)),
+                "round {round}: real pool pressure should reach the bounded PgSQL timeout, elapsed={elapsed:?}"
+            );
+            assert!(
+                elapsed < CREDENTIAL_PGSQL_SYNC_TIMEOUT + StdDuration::from_secs(3),
+                "round {round}: PgSQL timeout must remain bounded, elapsed={elapsed:?}"
+            );
+
+            assert_eq!(manager.runtime_mutation_backlog(), (1, 0), "round {round}");
+            {
+                let entries = manager.entries.lock();
+                let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+                assert!(entry.runtime_persistence_degraded, "round {round}");
+                assert!(!entry.runtime_persistence_quarantined, "round {round}");
+                assert!(!entry.disabled, "round {round}");
+                assert!(entry.disabled_reason.is_none(), "round {round}");
+            }
+            let route_state = manager.local_pool_route_state(None);
+            assert_eq!(route_state.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+            assert_eq!(route_state.available, 1, "round {round}");
+            assert_eq!(route_state.dispatchable, 1, "round {round}");
+
+            drop(second_connection);
+            drop(first_connection);
+            manager.flush_pending_runtime_mutations();
+
+            assert_eq!(manager.runtime_mutation_backlog(), (0, 0), "round {round}");
+            {
+                let entries = manager.entries.lock();
+                let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+                assert!(!entry.runtime_persistence_degraded, "round {round}");
+                assert!(!entry.runtime_persistence_quarantined, "round {round}");
+                assert!(!entry.disabled, "round {round}");
+                assert_eq!(entry.failure_count, 0, "round {round}");
+                assert_eq!(entry.runtime_revision, round, "round {round}");
+            }
+            let states = store.load_credential_runtime_state().await.unwrap();
+            let state = states.get(&1).unwrap();
+            assert_eq!(state.failure_count, 0, "round {round}");
+            assert_eq!(state.revision, round, "round {round}");
+            assert!(state.disabled_reason.is_none(), "round {round}");
+            assert!(
+                store
+                    .load_credentials()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|credential| credential.id == Some(1) && !credential.disabled),
+                "round {round}"
+            );
+        }
+
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+    })
+    .await;
+}
+
+#[test]
+fn runtime_patch_quarantine_is_field_semantic_for_five_rounds() {
+    for round in 1..=5 {
+        for patch in [
+            CredentialRuntimeStatePatch {
+                failure_count: Some(0),
+                expected_generation: Some(round),
+                ..Default::default()
+            },
+            CredentialRuntimeStatePatch {
+                refresh_failure_count: Some(0),
+                expected_generation: Some(round),
+                ..Default::default()
+            },
+            CredentialRuntimeStatePatch {
+                warmup_remaining: Some(round as u32),
+                expected_generation: Some(round),
+                ..Default::default()
+            },
+            CredentialRuntimeStatePatch {
+                last_used_at: Some(Utc::now().to_rfc3339()),
+                expected_generation: Some(round),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !PendingCredentialRuntimeMutation::Patch {
+                    operation_id: uuid::Uuid::new_v4(),
+                    patch,
+                }
+                .requires_dispatch_quarantine(),
+                "round {round}: health/stat patch must remain dispatchable"
+            );
+        }
+
+        for patch in [
+            CredentialRuntimeStatePatch {
+                credential_disabled: Some(false),
+                ..Default::default()
+            },
+            CredentialRuntimeStatePatch {
+                disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+                ..Default::default()
+            },
+            CredentialRuntimeStatePatch {
+                disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(
+                    DisabledReason::Manual.as_str().to_string(),
+                ),
+                ..Default::default()
+            },
+            CredentialRuntimeStatePatch {
+                advance_generation: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                PendingCredentialRuntimeMutation::Patch {
+                    operation_id: uuid::Uuid::new_v4(),
+                    patch,
+                }
+                .requires_dispatch_quarantine(),
+                "round {round}: dispatch-state patch must quarantine until persisted"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five_rounds() {
+    for round in 1..=5 {
+        let credentials = (0..40)
+            .map(|idx| api_key_credential(&format!("ksk_runtime_backlog_{round}_{idx}")))
+            .collect::<Vec<_>>();
+        let manager =
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+
+        for id in 1..=40_u64 {
+            let mutation = match id % 4 {
+                0 => PendingCredentialRuntimeMutation::Success {
+                    operation_id: uuid::Uuid::new_v4(),
+                    expected_generation: 0,
+                },
+                1 => PendingCredentialRuntimeMutation::ApiFailure {
+                    operation_id: uuid::Uuid::new_v4(),
+                    expected_generation: 0,
+                    last_used_at: Utc::now().to_rfc3339(),
+                },
+                2 => PendingCredentialRuntimeMutation::RefreshFailure {
+                    operation_id: uuid::Uuid::new_v4(),
+                    expected_generation: 0,
+                    last_used_at: Utc::now().to_rfc3339(),
+                },
+                _ => PendingCredentialRuntimeMutation::Patch {
+                    operation_id: uuid::Uuid::new_v4(),
+                    patch: CredentialRuntimeStatePatch {
+                        refresh_failure_count: Some(0),
+                        expected_generation: Some(0),
+                        ..Default::default()
+                    },
+                },
+            };
+            assert!(manager.enqueue_pending_runtime_mutation(id, mutation));
+        }
+
+        let state = manager.local_pool_route_state(None);
+        assert_eq!(state.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+        assert_eq!(state.total, 40, "round {round}");
+        assert_eq!(state.available, 40, "round {round}");
+        assert_eq!(state.dispatchable, 40, "round {round}");
+        assert_eq!(manager.runtime_mutation_backlog().0, 40, "round {round}");
+        {
+            let entries = manager.entries.lock();
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.runtime_persistence_degraded),
+                "round {round}"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| !entry.runtime_persistence_quarantined && !entry.disabled),
+                "round {round}"
+            );
+        }
+
+        assert!(manager.enqueue_pending_runtime_mutation(
+            1,
+            PendingCredentialRuntimeMutation::Disable {
+                operation_id: uuid::Uuid::new_v4(),
+                expected_generation: 0,
+                reason: DisabledReason::TooManyFailures.as_str().to_string(),
+                failure_count: Some(MAX_FAILURES_PER_CREDENTIAL),
+                refresh_failure_count: None,
+                last_used_at: Utc::now().to_rfc3339(),
+            },
+        ));
+        assert!(manager.enqueue_pending_runtime_mutation(
+            2,
+            PendingCredentialRuntimeMutation::Patch {
+                operation_id: uuid::Uuid::new_v4(),
+                patch: CredentialRuntimeStatePatch {
+                    disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(
+                        DisabledReason::Manual.as_str().to_string(),
+                    ),
+                    credential_disabled: Some(true),
+                    advance_generation: true,
+                    ..Default::default()
+                },
+            },
+        ));
+        {
+            let entries = manager.entries.lock();
+            for id in [1_u64, 2] {
+                let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+                assert!(entry.runtime_persistence_degraded, "round {round}, id {id}");
+                assert!(
+                    entry.runtime_persistence_quarantined,
+                    "round {round}, id {id}"
+                );
+                assert!(entry.disabled, "round {round}, id {id}");
+            }
+            assert_eq!(
+                entries.iter().filter(|entry| entry.disabled).count(),
+                2,
+                "round {round}"
+            );
+        }
+        let partially_quarantined = manager.local_pool_route_state(None);
+        assert_eq!(
+            partially_quarantined.kind,
+            LocalPoolRouteStateKind::Ready,
+            "round {round}"
+        );
+        assert_eq!(partially_quarantined.available, 38, "round {round}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2960,6 +4694,34 @@ fn test_update_runtime_config_updates_runtime_memory_without_store() {
     );
 }
 
+#[test]
+fn finite_dispatch_queue_lease_covers_actual_wait_and_unlimited_wait_renews() {
+    for round in 1..=5 {
+        let mut config = Config::default();
+        config.credential_dispatch_max_wait_secs = 120;
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+
+        let configured =
+            dispatch_queue_lease_policy(manager.dispatch_max_wait(AcquireMode::WaitForCapacity));
+        assert_eq!(configured.ttl_secs, 180, "round {round}");
+        assert!(!configured.renewal_required, "round {round}");
+
+        let longer_override = dispatch_queue_lease_policy(
+            manager.dispatch_max_wait(AcquireMode::WaitForCapacityMax(StdDuration::from_secs(300))),
+        );
+        assert_eq!(longer_override.ttl_secs, 360, "round {round}");
+        assert!(!longer_override.renewal_required, "round {round}");
+
+        let fractional_override = dispatch_queue_lease_policy(Some(StdDuration::from_millis(1501)));
+        assert_eq!(fractional_override.ttl_secs, 62, "round {round}");
+        assert!(!fractional_override.renewal_required, "round {round}");
+
+        let unlimited = dispatch_queue_lease_policy(None);
+        assert_eq!(unlimited.ttl_secs, 60, "round {round}");
+        assert!(unlimited.renewal_required, "round {round}");
+    }
+}
+
 #[tokio::test]
 async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
     let config = Config::default();
@@ -2990,7 +4752,7 @@ async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
 }
 
 #[tokio::test]
-async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
+async fn test_multi_token_manager_acquire_context_balanced_request_excludes_bad_configuration() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
@@ -3010,46 +4772,93 @@ async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_cre
     assert_eq!(ctx.id, 2);
     assert_eq!(ctx.token, "good-token");
     ctx.release_in_flight();
+    let snapshot = manager.snapshot();
+    let invalid = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+    assert!(!invalid.disabled);
+    assert!(!invalid.cooled_down);
+    assert_eq!(invalid.refresh_failure_count, 0);
+    assert!(invalid.last_error_kind.is_none());
 }
 
 #[tokio::test]
-async fn test_all_bad_refresh_tokens_are_bounded_by_auth_cooldown() {
-    let mut config = Config::default();
-    config.load_balancing_mode = "balanced".to_string();
+async fn test_all_invalid_refresh_configurations_are_request_bounded_and_health_neutral() {
+    for round in 1..=5 {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
 
-    let mut first = KiroCredentials::default();
-    first.refresh_token = Some("bad".to_string());
-    let mut second = KiroCredentials::default();
-    second.refresh_token = Some("also-bad".to_string());
+        let mut first = KiroCredentials::default();
+        first.refresh_token = Some("bad".to_string());
+        let mut second = KiroCredentials::default();
+        second.refresh_token = Some("also-bad".to_string());
 
-    let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
-    let started = Instant::now();
-    let err = manager
-        .acquire_context(None)
-        .await
-        .err()
-        .unwrap()
-        .to_string();
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        let started = Instant::now();
+        let error = tokio::time::timeout(StdDuration::from_secs(2), manager.acquire_context(None))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "round {round}: all invalid refresh configurations must finish within the request bound"
+                )
+            })
+            .err()
+            .unwrap();
+        let elapsed = started.elapsed();
 
-    assert!(
-        started.elapsed() < StdDuration::from_millis(500),
-        "全部 refreshToken 无效时应按凭据数量和失败阈值有界结束，不应持续打"
-    );
-    assert!(
-        err.contains("所有可用账号均处于上游临时冷却"),
-        "错误应明确结束调度并要求退避，实际: {}",
-        err
-    );
-    let snapshot = manager.snapshot();
-    assert_eq!(snapshot.available, 2);
-    assert!(snapshot.entries.iter().all(|entry| !entry.disabled));
-    assert!(
-        snapshot
-            .entries
-            .iter()
-            .all(|entry| entry.refresh_failure_count == 1)
-    );
-    assert!(snapshot.entries.iter().all(|entry| entry.cooled_down));
+        let typed = error
+            .downcast_ref::<RefreshFailure>()
+            .expect("invalid refresh configuration remains typed");
+        assert_eq!(
+            typed.stage,
+            RefreshFailureStage::Validation,
+            "round {round}"
+        );
+        assert_eq!(
+            typed.kind,
+            RefreshFailureKind::InvalidConfiguration,
+            "round {round}"
+        );
+        assert!(!typed.send_committed, "round {round}");
+
+        let clients = manager.refresh_client_cache_snapshot();
+        assert_eq!(clients.entries, 0, "round {round}");
+        assert_eq!(clients.builds, 0, "round {round}");
+        assert_eq!(clients.hits, 0, "round {round}");
+        assert_eq!(clients.misses, 0, "round {round}");
+        assert_eq!(clients.saturated, 0, "round {round}");
+        let concurrency = manager.auxiliary_concurrency_snapshot();
+        assert_eq!(concurrency.in_flight, 0, "round {round}");
+        assert_eq!(concurrency.peak_in_flight, 0, "round {round}");
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.available, 2, "round {round}");
+        assert!(
+            snapshot.entries.iter().all(|entry| !entry.disabled),
+            "round {round}"
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.refresh_failure_count == 0),
+            "round {round}"
+        );
+        assert!(
+            snapshot.entries.iter().all(|entry| !entry.cooled_down),
+            "round {round}"
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.last_error_kind.is_none()),
+            "round {round}"
+        );
+        eprintln!(
+            "INVALID_REFRESH_CONFIG_BOUND round={round} elapsed_us={}",
+            elapsed.as_micros()
+        );
+    }
 }
 
 #[tokio::test]
@@ -3416,10 +5225,21 @@ async fn test_bound_session_falls_back_when_bound_credential_is_full() {
         .unwrap();
     manager.report_success_for_session(bound.id, Some("sticky-full"));
 
+    let binding_reads_before = manager
+        .request_binding_snapshot_reads
+        .load(Ordering::Acquire);
     let mut fallback = manager
         .acquire_context_for_session(None, Some("sticky-full"), &empty)
         .await
         .unwrap();
+    assert_eq!(
+        manager
+            .request_binding_snapshot_reads
+            .load(Ordering::Acquire)
+            .saturating_sub(binding_reads_before),
+        1,
+        "slot reselects must reuse one request-scoped binding snapshot"
+    );
 
     assert_ne!(
         bound.id, fallback.id,
@@ -3715,6 +5535,7 @@ fn test_health_balanced_score_parameters_are_effective() {
         runtime_revision: 0,
         runtime_generation: 0,
         runtime_persistence_degraded: false,
+        runtime_persistence_quarantined: false,
         disabled: false,
         disabled_reason: None,
         success_count: 0,
@@ -3744,6 +5565,7 @@ fn test_health_balanced_score_parameters_are_effective() {
         runtime_revision: 0,
         runtime_generation: 0,
         runtime_persistence_degraded: false,
+        runtime_persistence_quarantined: false,
         disabled: false,
         disabled_reason: None,
         success_count: 0,
@@ -4488,7 +6310,13 @@ async fn test_global_capacity_limits_dispatch_and_bounds_wait_queue() {
 
     let waiting_manager = manager.clone();
     let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
-    tokio::time::sleep(StdDuration::from_millis(30)).await;
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while manager.queued_requests.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("等待请求应在硬期限内进入唯一队列名额");
     assert_eq!(manager.snapshot().queued_requests, 1);
 
     let rejected = match manager.acquire_context(None).await {
@@ -4510,40 +6338,248 @@ async fn test_global_capacity_limits_dispatch_and_bounds_wait_queue() {
     next.release_in_flight();
 }
 
-#[tokio::test]
-async fn test_fail_fast_global_capacity_full_returns_without_queueing() {
-    let mut config = Config::default();
-    config.dispatch_global_max_concurrent_requests = 1;
-    config.dispatch_max_queued_requests = 10;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_request_keeps_admission_wait_deadline_when_runtime_config_changes_for_five_rounds()
+{
+    for round in 1..=5 {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 1;
+        config.dispatch_global_max_concurrent_requests = 1;
+        config.dispatch_max_queued_requests = 1;
+        config.credential_dispatch_max_wait_secs = 1;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![api_key_credential(&format!(
+                    "stable-queue-deadline-{round}"
+                ))],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
 
-    let first_cred = test_access_token_credential("first", "Pro");
-    let second_cred = test_access_token_credential("second", "Pro");
-    let manager =
-        MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false).unwrap();
+        let mut first = manager.acquire_context(None).await.unwrap();
+        let waiting_manager = manager.clone();
+        let started_at = Instant::now();
+        let mut waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            while manager.queued_requests.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: request should enter the queue"));
 
-    let mut first = manager.acquire_context(None).await.unwrap();
-    let err = manager
-        .acquire_context_for_session_with_mode(
-            None,
-            None,
-            &HashSet::new(),
-            AcquireMode::FailFastOnCapacity,
-            1,
+        manager
+            .update_runtime_config(|config| config.credential_dispatch_max_wait_secs = 5)
+            .unwrap();
+        let joined = match tokio::time::timeout(StdDuration::from_millis(1_750), &mut waiting).await
+        {
+            Ok(joined) => joined,
+            Err(_) => {
+                waiting.abort();
+                let _ = waiting.await;
+                first.release_in_flight();
+                panic!("round {round}: runtime config update extended an admitted request deadline")
+            }
+        };
+        let acquire_error = match joined {
+            Ok(Err(error)) => error,
+            Ok(Ok(mut context)) => {
+                context.release_in_flight();
+                first.release_in_flight();
+                panic!("round {round}: waiter unexpectedly acquired capacity")
+            }
+            Err(error) => {
+                first.release_in_flight();
+                panic!("round {round}: waiter task failed: {error}")
+            }
+        };
+        let elapsed = started_at.elapsed();
+        assert!(acquire_error.to_string().contains("max_wait_secs=1"));
+        assert!(
+            (StdDuration::from_millis(800)..StdDuration::from_millis(1_750)).contains(&elapsed),
+            "round {round}: frozen one-second deadline elapsed={elapsed:?}"
+        );
+        assert_eq!(manager.queued_requests.load(Ordering::Acquire), 0);
+        assert_eq!(manager.available_count(), 1);
+        assert!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .all(|entry| !entry.disabled)
+        );
+        first.release_in_flight();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_five_rounds() {
+    const CREDENTIALS: usize = 40;
+    const PER_CREDENTIAL: u32 = 15;
+    const GLOBAL_LIMIT: u32 = 500;
+
+    for round in 1..=5 {
+        let credentials = (0..CREDENTIALS)
+            .map(|idx| api_key_credential(&format!("ksk_c500_{round}_{idx}")))
+            .collect::<Vec<_>>();
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_rpm = Some(60);
+        config.credential_max_concurrent_requests = PER_CREDENTIAL;
+        config.dispatch_global_max_concurrent_requests = GLOBAL_LIMIT;
+        config.dispatch_max_queued_requests = 1;
+        config.credential_dispatch_max_wait_secs = 1;
+        let manager = Arc::new(
+            MultiTokenManager::new(config.clone(), credentials, None, None, false).unwrap(),
+        );
+
+        let mut held = Vec::with_capacity(GLOBAL_LIMIT as usize);
+        for idx in 0..GLOBAL_LIMIT as usize {
+            let id = (idx % CREDENTIALS) as u64 + 1;
+            held.push(
+                manager
+                    .acquire_in_flight_slot(id, 1)
+                    .await
+                    .unwrap_or_else(|err| panic!("round {round}, slot {idx}: {err}"))
+                    .unwrap_or_else(|| panic!("round {round}, slot {idx} should fit")),
+            );
+        }
+
+        let full = manager.local_pool_route_state(None);
+        assert_eq!(
+            full.kind,
+            LocalPoolRouteStateKind::CapacityFull,
+            "round {round}"
+        );
+        assert_eq!(full.total, CREDENTIALS, "round {round}");
+        assert_eq!(full.available, CREDENTIALS, "round {round}");
+        assert_eq!(
+            full.global_in_flight_requests, GLOBAL_LIMIT,
+            "round {round}"
+        );
+        assert_eq!(full.rate_limit_blocked, 0, "round {round}");
+        assert_eq!(full.concurrency_blocked, CREDENTIALS, "round {round}");
+        assert_eq!(manager.available_count(), CREDENTIALS, "round {round}");
+
+        let waiting_manager = Arc::clone(&manager);
+        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            while manager.queued_requests.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: request should enter the bounded queue"));
+        assert!(!waiting.is_finished(), "round {round}");
+        assert_eq!(manager.available_count(), CREDENTIALS, "round {round}");
+
+        drop(held.pop().unwrap());
+        let mut replacement = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: released capacity should wake waiter"))
+            .unwrap_or_else(|err| panic!("round {round}: waiter task failed: {err}"))
+            .unwrap_or_else(|err| panic!("round {round}: waiter acquire failed: {err}"));
+        replacement.release_in_flight();
+        drop(held);
+        let drained = manager.snapshot();
+        assert_eq!(drained.global_in_flight_requests, 0, "round {round}");
+        assert_eq!(drained.queued_requests, 0, "round {round}");
+        assert!(
+            drained.entries.iter().all(|entry| !entry.disabled),
+            "round {round}"
+        );
+
+        config.dispatch_global_max_concurrent_requests = 0;
+        config.dispatch_max_queued_requests = 0;
+        let credentials = (0..CREDENTIALS)
+            .map(|idx| api_key_credential(&format!("ksk_c501_{round}_{idx}")))
+            .collect::<Vec<_>>();
+        let unlimited_global =
+            MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        let mut below_per_credential_total = Vec::with_capacity(GLOBAL_LIMIT as usize);
+        for idx in 0..GLOBAL_LIMIT as usize {
+            let id = (idx % CREDENTIALS) as u64 + 1;
+            below_per_credential_total.push(
+                unlimited_global
+                    .acquire_in_flight_slot(id, 1)
+                    .await
+                    .unwrap_or_else(|err| panic!("round {round}, unlimited slot {idx}: {err}"))
+                    .unwrap_or_else(|| panic!("round {round}, unlimited slot {idx} should fit")),
+            );
+        }
+        let still_ready = unlimited_global.local_pool_route_state(None);
+        assert_eq!(
+            still_ready.kind,
+            LocalPoolRouteStateKind::Ready,
+            "round {round}"
+        );
+        assert_eq!(
+            still_ready.global_in_flight_requests, GLOBAL_LIMIT,
+            "round {round}"
+        );
+        assert!(still_ready.dispatchable > 0, "round {round}");
+        let mut extra = tokio::time::timeout(
+            StdDuration::from_millis(500),
+            unlimited_global.acquire_context(None),
         )
         .await
-        .err()
-        .unwrap()
-        .to_string();
+        .unwrap_or_else(|_| panic!("round {round}: slot 501 should not queue"))
+        .unwrap_or_else(|err| panic!("round {round}: slot 501 failed: {err}"));
+        extra.release_in_flight();
+        drop(below_per_credential_total);
+        assert_eq!(
+            unlimited_global.snapshot().global_in_flight_requests,
+            0,
+            "round {round}"
+        );
+    }
+}
 
-    assert!(
-        err.contains("本地账号调度容量暂不可用"),
-        "fail-fast 模式全局容量满应直接返回容量错误，实际: {}",
-        err
-    );
-    let snapshot = manager.snapshot();
-    assert_eq!(snapshot.global_in_flight_requests, 1);
-    assert_eq!(snapshot.queued_requests, 0);
-    first.release_in_flight();
+#[tokio::test]
+async fn test_fail_fast_global_capacity_full_returns_without_queueing_for_five_rounds() {
+    for round in 1..=5 {
+        let mut config = Config::default();
+        config.dispatch_global_max_concurrent_requests = 1;
+        config.dispatch_max_queued_requests = 10;
+
+        let first_cred = test_access_token_credential("first", "Pro");
+        let second_cred = test_access_token_credential("second", "Pro");
+        let manager =
+            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
+                .unwrap();
+
+        let mut first = manager.acquire_context(None).await.unwrap();
+        let err = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                1,
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            err.contains("本地账号调度容量暂不可用"),
+            "round {round}: fail-fast 模式全局容量满应直接返回容量错误，实际: {err}"
+        );
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.global_in_flight_requests, 1, "round {round}");
+        assert_eq!(snapshot.queued_requests, 0, "round {round}");
+        first.release_in_flight();
+        assert_eq!(
+            manager.snapshot().global_in_flight_requests,
+            0,
+            "round {round}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4735,34 +6771,44 @@ fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
 }
 
 #[tokio::test]
-async fn test_local_pool_route_state_reports_capacity_full_without_queueing() {
-    let mut config = Config::default();
-    config.credential_max_concurrent_requests = 1;
-    config.dispatch_max_queued_requests = 10;
-    let manager = MultiTokenManager::new(
-        config,
-        vec![test_access_token_credential("first", "Pro")],
-        None,
-        None,
-        false,
-    )
-    .unwrap();
+async fn test_local_pool_route_state_reports_capacity_full_without_queueing_for_five_rounds() {
+    for round in 1..=5 {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 1;
+        config.dispatch_max_queued_requests = 10;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("first", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
-    let ready = manager.local_pool_route_state(None);
-    assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
-    assert_eq!(ready.dispatchable, 1);
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+        assert_eq!(ready.dispatchable, 1, "round {round}");
 
-    let mut ctx = manager.acquire_context(None).await.unwrap();
-    let full = manager.local_pool_route_state(None);
-    assert_eq!(full.kind, LocalPoolRouteStateKind::CapacityFull);
-    assert_eq!(full.dispatchable, 0);
-    assert_eq!(full.concurrency_blocked, 1);
-    assert_eq!(full.queued_requests, 0);
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        let full = manager.local_pool_route_state(None);
+        assert_eq!(
+            full.kind,
+            LocalPoolRouteStateKind::CapacityFull,
+            "round {round}"
+        );
+        assert_eq!(full.dispatchable, 0, "round {round}");
+        assert_eq!(full.concurrency_blocked, 1, "round {round}");
+        assert_eq!(full.queued_requests, 0, "round {round}");
 
-    ctx.release_in_flight();
-    let ready_again = manager.local_pool_route_state(None);
-    assert_eq!(ready_again.kind, LocalPoolRouteStateKind::Ready);
-    assert_eq!(ready_again.dispatchable, 1);
+        ctx.release_in_flight();
+        let ready_again = manager.local_pool_route_state(None);
+        assert_eq!(
+            ready_again.kind,
+            LocalPoolRouteStateKind::Ready,
+            "round {round}"
+        );
+        assert_eq!(ready_again.dispatchable, 1, "round {round}");
+    }
 }
 
 #[tokio::test]
@@ -5028,15 +7074,11 @@ async fn test_local_pool_route_state_proxy_blocked_recovers_after_resource_enabl
             enabled: false,
         },
     );
-    manager.invalidate_local_pool_route_state_cache();
-
     let blocked = manager.local_pool_route_state(None);
     assert_eq!(blocked.kind, LocalPoolRouteStateKind::ProxyBlocked);
     assert_eq!(blocked.proxy_blocked, 1);
 
     manager.proxy_resources.lock().get_mut(&7).unwrap().enabled = true;
-    manager.invalidate_local_pool_route_state_cache();
-
     let ready = manager.local_pool_route_state(None);
     assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
     assert_eq!(ready.dispatchable, 1);
@@ -5294,43 +7336,56 @@ async fn test_concurrency_limiter_waits_until_slot_released() {
 }
 
 #[tokio::test]
-async fn test_fail_fast_slot_race_reselects_other_available_credential() {
-    let mut config = Config::default();
-    config.credential_max_concurrent_requests = 1;
+async fn test_fail_fast_slot_race_reselects_other_available_credential_for_five_rounds() {
+    for round in 1..=5 {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 1;
 
-    let mut first_cred = KiroCredentials::default();
-    first_cred.access_token = Some("t1".to_string());
-    first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    first_cred.priority = 0;
+        let mut first_cred = KiroCredentials::default();
+        first_cred.access_token = Some("t1".to_string());
+        first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        first_cred.priority = 0;
 
-    let mut second_cred = KiroCredentials::default();
-    second_cred.access_token = Some("t2".to_string());
-    second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    second_cred.priority = 0;
+        let mut second_cred = KiroCredentials::default();
+        second_cred.access_token = Some("t2".to_string());
+        second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        second_cred.priority = 0;
 
-    let manager =
-        MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false).unwrap();
-    let mut first = manager.acquire_context(None).await.unwrap();
-    assert_eq!(first.id, 1);
+        let manager =
+            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
+                .unwrap();
+        let mut first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1, "round {round}");
 
-    let mut second = manager
-        .acquire_context_for_session_with_mode(
-            None,
-            None,
-            &HashSet::new(),
-            AcquireMode::FailFastOnCapacity,
-            1,
-        )
-        .await
-        .expect("fail-fast should reselect another credential when the selected slot is full");
+        let mut second = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                1,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "round {round}: fail-fast should reselect another credential when the selected slot is full: {error}"
+                )
+            });
 
-    assert_eq!(second.id, 2);
-    let snapshot = manager.snapshot();
-    assert_eq!(snapshot.entries[0].in_flight_requests, 1);
-    assert_eq!(snapshot.entries[1].in_flight_requests, 1);
+        assert_eq!(second.id, 2, "round {round}");
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].in_flight_requests, 1, "round {round}");
+        assert_eq!(snapshot.entries[1].in_flight_requests, 1, "round {round}");
+        assert_eq!(snapshot.queued_requests, 0, "round {round}");
 
-    first.release_in_flight();
-    second.release_in_flight();
+        first.release_in_flight();
+        second.release_in_flight();
+        assert_eq!(
+            manager.snapshot().global_in_flight_requests,
+            0,
+            "round {round}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5791,6 +7846,310 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_under_concurrency() {
     drop(leases);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn redis_two_instance_connections_preserve_lease_queue_and_rpm_authority_for_five_rounds() {
+    run_isolated_multi_redis_manager_fixture(4, |stores| async move {
+        for round in 1..=5 {
+            stores[0].delete_pattern_bounded("*", None).await.unwrap();
+            let mut config = Config::default();
+            config.credential_max_concurrent_requests = 4;
+            config.credential_in_flight_lease_max_secs = 1;
+            config.credential_dispatch_max_wait_secs = 2;
+            let credentials = vec![api_key_credential(&format!("two-instance-{round}"))];
+            let managers = stores
+                .iter()
+                .map(|store| {
+                    Arc::new(
+                        MultiTokenManager::new_with_stores(
+                            config.clone(),
+                            credentials.clone(),
+                            None,
+                            None,
+                            false,
+                            None,
+                            Some(store.clone()),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let start = Arc::new(tokio::sync::Barrier::new(2));
+            let acquire_a = {
+                let manager = managers[0].clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    manager.acquire_in_flight_slot(1, 1).await.unwrap().unwrap()
+                })
+            };
+            let acquire_b = {
+                let manager = managers[1].clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    manager.acquire_in_flight_slot(1, 1).await.unwrap().unwrap()
+                })
+            };
+            let lease_a = acquire_a.await.unwrap();
+            let lease_b = acquire_b.await.unwrap();
+            assert_ne!(
+                lease_a.id(),
+                lease_b.id(),
+                "round {round}: independent instance lease IDs must not collide"
+            );
+            let state = stores[2]
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap();
+            let ids = state[&1]
+                .in_flight_leases
+                .iter()
+                .map(|lease| lease.id)
+                .collect::<HashSet<_>>();
+            assert_eq!(ids, HashSet::from([lease_a.id(), lease_b.id()]));
+
+            let lease_b_id = lease_b.id();
+            drop(lease_a);
+            assert!(
+                managers[0]
+                    .drain_scheduler_redis_releases(StdDuration::from_secs(3))
+                    .await
+            );
+            let state = stores[2]
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap();
+            assert_eq!(
+                state[&1]
+                    .in_flight_leases
+                    .iter()
+                    .map(|lease| lease.id)
+                    .collect::<Vec<_>>(),
+                vec![lease_b_id],
+                "round {round}: releasing instance A must not remove instance B's lease"
+            );
+
+            let crashed_lease_id = stores[2]
+                .next_in_flight_lease_id()
+                .await
+                .unwrap()
+                .max(1);
+            let crashed_lease = stores[2]
+                .acquire_dispatch_lease(
+                    1,
+                    crashed_lease_id,
+                    4,
+                    0,
+                    1,
+                    Some(StdDuration::from_secs(1)),
+                    InFlightKind::Api.as_str(),
+                )
+                .await
+                .unwrap();
+            assert!(crashed_lease.is_some(), "round {round}");
+            assert_ne!(crashed_lease_id, lease_b_id);
+            for _ in 0..5 {
+                tokio::time::sleep(StdDuration::from_millis(250)).await;
+                lease_b.touch();
+            }
+            crate::kiro::token_manager::drain_best_effort_storage_tasks(
+                StdDuration::from_secs(2),
+            )
+            .await;
+
+            let restarted_lease = managers[3]
+                .acquire_in_flight_slot(1, 1)
+                .await
+                .unwrap()
+                .unwrap();
+            let restarted_lease_id = restarted_lease.id();
+            let state = stores[0]
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap();
+            let ids = state[&1]
+                .in_flight_leases
+                .iter()
+                .map(|lease| lease.id)
+                .collect::<HashSet<_>>();
+            assert!(ids.contains(&lease_b_id), "round {round}");
+            assert!(ids.contains(&restarted_lease_id), "round {round}");
+            assert!(
+                !ids.contains(&crashed_lease_id),
+                "round {round}: an instance-disappearance lease must expire before restart admission"
+            );
+            assert_eq!(ids.len(), 2, "round {round}");
+
+            let queue_calls = (0..16)
+                .map(|index| {
+                    let store = stores[index % 2].clone();
+                    async move {
+                        let lease_id = format!("two-instance-queue-{round}-{index}");
+                        let admitted = store
+                            .try_enter_dispatch_queue(&lease_id, 4, 60)
+                            .await
+                            .unwrap();
+                        (store, lease_id, admitted)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let queue_results = futures::future::join_all(queue_calls).await;
+            let admitted = queue_results
+                .iter()
+                .filter(|(_, _, admitted)| *admitted)
+                .count();
+            assert_eq!(
+                admitted, 4,
+                "round {round}: two instances must share one dispatch queue limit"
+            );
+            for (store, lease_id, admitted) in queue_results {
+                if admitted {
+                    assert!(store.leave_dispatch_queue(&lease_id).await.unwrap());
+                }
+            }
+            assert_eq!(
+                stores[0]
+                    .global_capacity_state()
+                    .await
+                    .unwrap()
+                    .queued_requests,
+                0,
+                "round {round}"
+            );
+
+            let rpm_calls = (0..8)
+                .map(|index| {
+                    let store = stores[index % 2].clone();
+                    async move {
+                        store
+                            .bump_rate_limit_available_at(1, StdDuration::from_millis(10))
+                            .await
+                            .unwrap()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut rate_deadlines = futures::future::join_all(rpm_calls).await;
+            rate_deadlines.sort_unstable();
+            assert_eq!(
+                rate_deadlines.iter().copied().collect::<HashSet<_>>().len(),
+                rate_deadlines.len(),
+                "round {round}: shared RPM reservations must be unique"
+            );
+            assert!(
+                rate_deadlines
+                    .windows(2)
+                    .all(|pair| pair[1].saturating_sub(pair[0]) >= 10),
+                "round {round}: shared RPM reservations must serialize one interval each"
+            );
+            stores[1].clear_rate_limit(1).await.unwrap();
+
+            drop(lease_b);
+            drop(restarted_lease);
+            for manager in &managers {
+                assert!(
+                    manager
+                        .drain_scheduler_redis_releases(StdDuration::from_secs(3))
+                        .await
+                );
+            }
+            let state = stores[0]
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .get(&1)
+                    .is_none_or(|state| state.in_flight_leases.is_empty()),
+                "round {round}: active leases must drain after both instances release"
+            );
+            eprintln!(
+                "redis-two-instance round={round} lease_ids_unique=true crash_ttl_recovered=true queue_admitted={admitted}/16 rpm_reservations={} final_leases=0",
+                rate_deadlines.len(),
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_backed_rpm_reservation_blocks_third_cross_instance_selection() {
+    run_isolated_multi_redis_manager_fixture(2, |stores| async move {
+        let mut config = Config::default();
+        config.credential_rpm = None;
+        config.credential_max_concurrent_requests = 8;
+        config.dispatch_max_queued_requests = 4;
+        config.credential_dispatch_max_wait_secs = 1;
+
+        let mut credential = api_key_credential("shared-rpm-reservation");
+        credential.id = Some(1);
+        credential.rpm = Some(2);
+
+        let manager_a = MultiTokenManager::new_with_stores(
+            config.clone(),
+            vec![credential.clone()],
+            None,
+            None,
+            false,
+            None,
+            Some(stores[0].clone()),
+        )
+        .unwrap();
+        let manager_b = MultiTokenManager::new_with_stores(
+            config,
+            vec![credential],
+            None,
+            None,
+            false,
+            None,
+            Some(stores[1].clone()),
+        )
+        .unwrap();
+
+        let mut first = manager_a.acquire_context(None).await.unwrap();
+        first.release_in_flight();
+        let mut second = manager_b.acquire_context(None).await.unwrap();
+        second.release_in_flight();
+        assert!(
+            stores[0].get_rate_limit_available_at(1).await.unwrap().is_some(),
+            "second cross-instance selection should establish the shared Redis RPM deadline"
+        );
+
+        let started = Instant::now();
+        let error = match manager_a.acquire_context(None).await {
+            Ok(mut context) => {
+                context.release_in_flight();
+                panic!("third cross-instance selection unexpectedly acquired context")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            started.elapsed() >= StdDuration::from_millis(900),
+            "third request should wait for its bounded dispatch deadline, not fail open immediately: {error}"
+        );
+        assert!(
+            error.contains("凭据 RPM 限制"),
+            "third cross-instance selection should be rejected by the shared RPM reservation, actual: {error}"
+        );
+        assert!(manager_a.drain_scheduler_redis_releases(StdDuration::from_secs(3)).await);
+        assert!(manager_b.drain_scheduler_redis_releases(StdDuration::from_secs(3)).await);
+        let state = stores[0]
+            .scheduler_state_for_credentials(&[1])
+            .await
+            .unwrap();
+        assert!(
+            state
+                .get(&1)
+                .is_none_or(|state| state.in_flight_leases.is_empty()),
+            "rate-limited third selection must release its provisional in-flight lease"
+        );
+    })
+    .await;
+}
+
+#[path = "manager_refresh_cluster_tests.rs"]
+mod refresh_cluster_tests;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
     let Some(redis_store) = test_redis_store().await else {
@@ -5800,18 +8159,21 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
 
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
-    let manager = MultiTokenManager::new_with_stores(
-        config,
-        vec![api_key_credential("degraded")],
-        None,
-        None,
-        false,
-        None,
-        Some(redis_store.clone()),
-    )
-    .unwrap();
-    *manager.scheduler_redis_degraded_until.lock() =
-        Some(Instant::now() + StdDuration::from_secs(1));
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            vec![api_key_credential("degraded")],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    manager.scheduler_redis_breaker.state.lock().phase = SchedulerRedisBreakerPhase::Open {
+        until: Instant::now() + StdDuration::from_secs(1),
+    };
     let route_state = manager.local_pool_route_state(None);
     assert_eq!(
         route_state.kind,
@@ -5819,17 +8181,41 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
     );
     assert!(route_state.retry_after_secs.is_some());
 
+    let notifier_manager = manager.clone();
+    let notifier = tokio::spawn(async move {
+        loop {
+            notifier_manager.notify_dispatch_state_changed();
+            tokio::time::sleep(StdDuration::from_millis(1)).await;
+        }
+    });
+    let waited_at = Instant::now();
     let queue_error = manager
-        .acquire_context(None)
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::WaitForCapacityMax(StdDuration::from_millis(25)),
+            1,
+        )
         .await
         .err()
-        .expect("Redis 退避窗口内应拒绝分布式调度准入")
+        .expect("Redis 退避窗口内普通本地请求应有界等待后拒绝")
         .to_string();
+    assert!(
+        waited_at.elapsed() >= StdDuration::from_millis(20),
+        "普通本地请求不应在 Redis breaker 打开时立即形成 429 storm"
+    );
+    notifier.abort();
     assert!(
         queue_error.contains("Redis 调度协调状态不可用"),
         "Redis 退避不应误报为等待队列已满，实际: {queue_error}"
     );
     assert!(queue_error.contains("retry_after_secs="));
+    let breaker_stats = manager.scheduler_redis_breaker.stats_snapshot();
+    assert!(
+        breaker_stats.suppressed <= 3,
+        "Redis degraded 等待不能被普通 capacity signal 唤醒成内部重试风暴，stats={breaker_stats:?}"
+    );
     let selection_failure =
         manager.selection_failure_summary("redis-degraded", "local_account", None, &queue_error);
     assert_eq!(
@@ -5850,6 +8236,42 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
         0,
         "跳过 Redis queue admission 时不应创建全局排队占位"
     );
+    let fail_fast_error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .err()
+        .expect("external preflight fail-fast 仍应快速暴露 Redis degraded")
+        .to_string();
+    assert!(fail_fast_error.contains("Redis 调度协调状态不可用"));
+
+    let bounded_wait_started = Instant::now();
+    let bounded_wait_error = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            None,
+            &HashSet::new(),
+            AcquireMode::FailFastOnCapacityWaitForRedis(StdDuration::from_millis(25)),
+            1,
+        )
+        .await
+        .err()
+        .expect("external fallback mode should wait briefly for Redis degraded recovery")
+        .to_string();
+    assert!(
+        bounded_wait_started.elapsed() >= StdDuration::from_millis(20),
+        "fallback mode must not turn Redis degraded into an immediate external storm"
+    );
+    assert!(
+        bounded_wait_error.contains("Redis 调度协调状态不可用"),
+        "bounded fallback mode should preserve the Redis degraded diagnostic"
+    );
+
     let lease_error = manager
         .acquire_in_flight_slot(1, 1)
         .await
@@ -5917,8 +8339,9 @@ async fn redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades() 
     .await
     .expect("waiter should enter the queue before Redis becomes degraded");
 
-    *manager.scheduler_redis_degraded_until.lock() =
-        Some(Instant::now() + StdDuration::from_secs(5));
+    manager.scheduler_redis_breaker.state.lock().phase = SchedulerRedisBreakerPhase::Open {
+        until: Instant::now() + StdDuration::from_secs(5),
+    };
     first.release_in_flight();
 
     let error = tokio::time::timeout(StdDuration::from_secs(2), waiting)
@@ -6021,6 +8444,1318 @@ async fn redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease()
     next.release_in_flight();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_interval() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    config.dispatch_global_max_concurrent_requests = 1;
+    config.dispatch_max_queued_requests = 1;
+    config.credential_dispatch_max_wait_secs = 30;
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            vec![api_key_credential("finite-redis-queue-no-renew")],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+
+    let mut first = manager.acquire_context(None).await.unwrap();
+    let waiting_manager = manager.clone();
+    let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            if manager.queued_requests.load(Ordering::Acquire) == 1
+                && redis_store
+                    .global_capacity_state()
+                    .await
+                    .unwrap()
+                    .queued_requests
+                    == 1
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finite waiter should enter the Redis queue");
+
+    let initial_deadlines = redis_store
+        .dispatch_queue_lease_deadlines_ms()
+        .await
+        .unwrap();
+    assert_eq!(initial_deadlines.len(), 1);
+    let initial_server_time = redis_store.server_time_ms().await.unwrap() as f64;
+    let initial_remaining_ms = initial_deadlines[0].1 - initial_server_time;
+    assert!(
+        (85_000.0..=91_000.0).contains(&initial_remaining_ms),
+        "finite queue lease must cover 30s wait plus 60s safety margin, remaining={initial_remaining_ms}ms"
+    );
+
+    tokio::time::sleep(StdDuration::from_secs(22)).await;
+    assert!(!waiting.is_finished());
+    let later_deadlines = redis_store
+        .dispatch_queue_lease_deadlines_ms()
+        .await
+        .unwrap();
+    assert_eq!(later_deadlines.len(), 1);
+    assert_eq!(later_deadlines[0].0, initial_deadlines[0].0);
+    assert_eq!(
+        later_deadlines[0].1, initial_deadlines[0].1,
+        "finite queue lease must not issue the old 20-second renewal"
+    );
+
+    waiting.abort();
+    let join_error = match waiting.await {
+        Err(error) => error,
+        Ok(Ok(mut context)) => {
+            context.release_in_flight();
+            panic!("aborted finite queue waiter should not acquire capacity")
+        }
+        Ok(Err(error)) => panic!("aborted finite queue waiter returned an error: {error}"),
+    };
+    assert!(join_error.is_cancelled());
+    first.release_in_flight();
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            if manager.queued_requests.load(Ordering::Acquire) == 0
+                && redis_store
+                    .global_capacity_state()
+                    .await
+                    .unwrap()
+                    .queued_requests
+                    == 0
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled finite waiter should release its Redis queue lease");
+
+    drop(first);
+    drop(manager);
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+    let cleanup = redis_store.delete_pattern_bounded("*", None).await.unwrap();
+    assert!(!cleanup.cancelled);
+    assert!(!cleanup.pass_limit_reached);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_affinity_latency_does_not_degrade_capacity_coordination() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis affinity latency 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+    clear_test_redis_latency_toxic().await;
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis affinity latency 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![api_key_credential("affinity-latency")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
+
+    manager.bind_session_to_credential("latency-session", 1);
+    assert_eq!(manager.bound_credential_id("latency-session"), Some(1));
+    set_test_redis_latency_toxic(500).await;
+
+    let started_at = Instant::now();
+    let bound_id = manager.bound_credential_id("latency-session");
+    let elapsed = started_at.elapsed();
+    let capacity_degraded = manager.scheduler_redis_breaker.is_degraded();
+    let affinity_degraded = manager.scheduler_redis_affinity_breaker.is_degraded();
+
+    clear_test_redis_latency_toxic().await;
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+    assert_eq!(bound_id, Some(1), "Redis 慢时应使用本地 sticky cache");
+    assert!(
+        elapsed >= SCHEDULER_REDIS_AFFINITY_OP_TIMEOUT,
+        "affinity operation should exercise the 75ms timeout, elapsed={elapsed:?}"
+    );
+    assert!(
+        !capacity_degraded,
+        "affinity timeout must not open the capacity coordination breaker"
+    );
+    assert!(affinity_degraded);
+    assert_eq!(
+        manager.local_pool_route_state(None).kind,
+        LocalPoolRouteStateKind::Ready
+    );
+    let mut context = manager
+        .acquire_context(None)
+        .await
+        .expect("capacity coordination must recover immediately after affinity-only failure");
+    context.release_in_flight();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_affinity_breaker_open_does_not_block_selection_admission() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis affinity/selection 隔离测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut config = Config::default();
+    config.credential_rpm = Some(60);
+    let manager = MultiTokenManager::new_with_stores(
+        config,
+        vec![api_key_credential("affinity-open-selection")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    manager.scheduler_redis_affinity_breaker.state.lock().phase =
+        SchedulerRedisBreakerPhase::Open {
+            until: Instant::now() + StdDuration::from_secs(1),
+        };
+
+    let mut context = manager
+        .acquire_context_for_session_with_mode(
+            None,
+            Some("affinity-open-selection-session"),
+            &HashSet::new(),
+            AcquireMode::FailFastOnCapacityWaitForRedis(StdDuration::from_millis(50)),
+            1,
+        )
+        .await
+        .expect("sticky affinity degraded must not block capacity lease or RPM selection");
+    assert_eq!(context.id, 1);
+    assert!(!manager.scheduler_redis_breaker.is_degraded());
+    context.release_in_flight();
+
+    let state = redis_store
+        .scheduler_state_for_credentials(&[1])
+        .await
+        .expect("selection state should remain readable");
+    assert!(
+        state
+            .get(&1)
+            .map(|state| state.health.recent_selection_count_60s >= 1)
+            .unwrap_or(false),
+        "RPM/selection accounting must use the scheduler hot path, not the open affinity breaker"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_capacity_latency_boundary_and_recovery_matrix() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis capacity latency 矩阵：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+
+    for latency_ms in [50_u64, 500] {
+        for round in 1..=3 {
+            clear_test_redis_latency_toxic().await;
+            let Some(redis_store) = test_redis_store().await else {
+                eprintln!("跳过 Redis capacity latency 矩阵：未设置 KIRO_RS_TEST_REDIS_URL");
+                return;
+            };
+            let manager = MultiTokenManager::new_with_stores(
+                Config::default(),
+                vec![api_key_credential(&format!(
+                    "capacity-{latency_ms}-{round}"
+                ))],
+                None,
+                None,
+                false,
+                None,
+                Some(redis_store),
+            )
+            .unwrap();
+            set_test_redis_latency_toxic(latency_ms).await;
+
+            let started_at = Instant::now();
+            let result = manager.acquire_in_flight_slot(1, 1).await;
+            let elapsed = started_at.elapsed();
+            let succeeded = matches!(result, Ok(Some(_)));
+            let error_message = result.as_ref().err().map(ToString::to_string);
+            let degraded = manager.scheduler_redis_breaker.is_degraded();
+
+            clear_test_redis_latency_toxic().await;
+            tokio::time::sleep(StdDuration::from_millis(latency_ms.saturating_add(50))).await;
+
+            assert!(
+                elapsed < SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(175),
+                "hot-path timeout must remain bounded at {latency_ms}ms round {round}: {elapsed:?}"
+            );
+            if latency_ms == 50 {
+                assert!(
+                    succeeded,
+                    "50ms response latency should remain below the capacity hot-path budget: {error_message:?}"
+                );
+                assert!(
+                    !degraded,
+                    "50ms response latency must not degrade capacity coordination"
+                );
+            }
+            if latency_ms >= 500 {
+                assert!(
+                    !succeeded,
+                    "{latency_ms}ms response latency must fail closed at round {round}"
+                );
+                assert!(
+                    !degraded,
+                    "a single timeout should fail this request closed without immediately opening the capacity breaker"
+                );
+            }
+
+            eprintln!(
+                "redis-capacity-latency latency_ms={latency_ms} round={round} succeeded={succeeded} elapsed_ms={} degraded={degraded}",
+                elapsed.as_millis()
+            );
+
+            if let Ok(Some(lease)) = result {
+                drop(lease);
+            } else {
+                assert_ne!(
+                    manager.local_pool_route_state(None).kind,
+                    LocalPoolRouteStateKind::AllDisabled,
+                    "a capacity timeout must not be reported as all credentials disabled"
+                );
+                tokio::time::sleep(StdDuration::from_millis(latency_ms.saturating_add(150))).await;
+            }
+
+            let recovered = manager
+                .acquire_in_flight_slot(1, 1)
+                .await
+                .expect("Redis coordination should accept requests after latency removal/backoff")
+                .expect("the only credential should have capacity after recovery");
+            drop(recovered);
+            assert!(!manager.scheduler_redis_breaker.is_degraded());
+        }
+    }
+    clear_test_redis_latency_toxic().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_capacity_consecutive_timeouts_open_breaker_without_all_disabled() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis capacity timeout breaker 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+    clear_test_redis_latency_toxic().await;
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis capacity timeout breaker 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![api_key_credential("capacity-timeout-breaker")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store),
+    )
+    .unwrap();
+    set_test_redis_latency_toxic(500).await;
+
+    for attempt in 1..SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN {
+        let result = manager.acquire_in_flight_slot(1, 1).await;
+        assert!(
+            result.is_err(),
+            "slow Redis attempt {attempt} must fail this request closed"
+        );
+        assert!(
+            !manager.scheduler_redis_breaker.is_degraded(),
+            "slow Redis attempt {attempt} must not open breaker before the consecutive threshold"
+        );
+        assert_ne!(
+            manager.local_pool_route_state(None).kind,
+            LocalPoolRouteStateKind::AllDisabled,
+            "slow Redis attempt {attempt} must not be reported as all credentials disabled"
+        );
+    }
+
+    let threshold_result = manager.acquire_in_flight_slot(1, 1).await;
+    assert!(
+        threshold_result.is_err(),
+        "threshold slow Redis attempt must fail this request closed"
+    );
+    assert!(
+        manager.scheduler_redis_breaker.is_degraded(),
+        "capacity breaker must open after repeated consecutive timeout failures"
+    );
+    assert_eq!(
+        manager.local_pool_route_state(None).kind,
+        LocalPoolRouteStateKind::SchedulerRedisDegraded
+    );
+
+    clear_test_redis_latency_toxic().await;
+    let retry_after = manager
+        .scheduler_redis_breaker
+        .retry_after()
+        .unwrap_or(SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE);
+    tokio::time::sleep(retry_after + StdDuration::from_millis(100)).await;
+    let recovered = manager
+        .acquire_in_flight_slot(1, 1)
+        .await
+        .expect("Redis coordination should recover after latency removal/backoff")
+        .expect("the only credential should recover capacity");
+    drop(recovered);
+    assert!(!manager.scheduler_redis_breaker.is_degraded());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_spin_or_false_disable()
+ {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis usage/scheduler 联合故障矩阵：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+
+    run_isolated_redis_manager_fixture(|redis_store| async move {
+        const WRITERS: usize = 4;
+        const LOW_LATENCY_RECORDS_PER_WRITER: usize = 4;
+        const FAULT_RECORDS_PER_WRITER: usize = 2;
+        const LOW_LATENCIES_MS: [u64; 6] = [25, 50, 74, 75, 90, 150];
+
+        clear_test_redis_latency_toxic().await;
+        set_test_redis_proxy_enabled(true).await;
+        let rss_start = process_rss_kib_for_test();
+        let fd_start = open_fd_count_for_test();
+
+        for round in 1..=3 {
+            for latency_ms in LOW_LATENCIES_MS {
+                let scenario = format!("latency-{latency_ms}-round-{round}");
+                let manager = MultiTokenManager::new_with_stores(
+                    Config::default(),
+                    vec![api_key_credential(&scenario)],
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(redis_store.clone()),
+                )
+                .unwrap();
+                redis_store.reset_usage_summary_write_round_trips();
+                set_test_redis_latency_toxic(latency_ms).await;
+                let start = Arc::new(tokio::sync::Barrier::new(WRITERS + 1));
+                let usage = spawn_usage_fault_wave(
+                    redis_store.clone(),
+                    scenario.clone(),
+                    WRITERS,
+                    LOW_LATENCY_RECORDS_PER_WRITER,
+                    start.clone(),
+                );
+                start.wait().await;
+
+                let scheduler_started = Instant::now();
+                let scheduler_lease = manager
+                    .acquire_in_flight_slot(1, 1)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{scenario}: scheduler must remain available below the 250ms capacity deadline: {error}"
+                        )
+                    })
+                    .unwrap_or_else(|| panic!("{scenario}: scheduler unexpectedly had no capacity"));
+                let scheduler_elapsed = scheduler_started.elapsed();
+                drop(scheduler_lease);
+                let usage = tokio::time::timeout(StdDuration::from_secs(8), usage)
+                    .await
+                    .unwrap_or_else(|_| panic!("{scenario}: usage writer wave did not finish"))
+                    .unwrap();
+                clear_test_redis_latency_toxic().await;
+
+                let expected_records = (WRITERS * LOW_LATENCY_RECORDS_PER_WRITER) as u64;
+                assert_eq!(usage.attempted, expected_records, "{scenario}");
+                assert_eq!(usage.succeeded, expected_records, "{scenario}");
+                assert_eq!(usage.failed, 0, "{scenario}");
+                assert_eq!(usage.timed_out, 0, "{scenario}");
+                assert_eq!(
+                    redis_store.usage_summary_write_round_trips(),
+                    expected_records,
+                    "{scenario}: usage writes must remain one Redis RTT each without retries"
+                );
+                assert!(
+                    scheduler_elapsed
+                        < SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(175),
+                    "{scenario}: scheduler exceeded its bounded hot-path deadline: {scheduler_elapsed:?}"
+                );
+                assert!(
+                    !manager.scheduler_redis_breaker.is_degraded(),
+                    "{scenario}: sub-deadline latency must not open the capacity breaker"
+                );
+                assert_ne!(
+                    manager.local_pool_route_state(None).kind,
+                    LocalPoolRouteStateKind::AllDisabled,
+                    "{scenario}: Redis latency must never impersonate credential disablement"
+                );
+                crate::kiro::token_manager::drain_best_effort_storage_tasks(
+                    StdDuration::from_secs(3),
+                )
+                .await;
+                eprintln!(
+                    "redis-joint-fault scenario={scenario} usage_attempts={} usage_success={} usage_round_trips={} scheduler_elapsed_ms={} breaker_degraded=false",
+                    usage.attempted,
+                    usage.succeeded,
+                    redis_store.usage_summary_write_round_trips(),
+                    scheduler_elapsed.as_millis(),
+                );
+            }
+
+            let scenario = format!("latency-500-round-{round}");
+            let manager = MultiTokenManager::new_with_stores(
+                Config::default(),
+                vec![api_key_credential(&scenario)],
+                None,
+                None,
+                false,
+                None,
+                Some(redis_store.clone()),
+            )
+            .unwrap();
+            redis_store.reset_usage_summary_write_round_trips();
+            set_test_redis_latency_toxic(500).await;
+            let start = Arc::new(tokio::sync::Barrier::new(WRITERS + 1));
+            let usage = spawn_usage_fault_wave(
+                redis_store.clone(),
+                scenario.clone(),
+                WRITERS,
+                FAULT_RECORDS_PER_WRITER,
+                start.clone(),
+            );
+            start.wait().await;
+            let stats_before = manager.scheduler_redis_breaker.stats_snapshot();
+            for attempt in 1..=SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN {
+                let started = Instant::now();
+                assert!(
+                    manager.acquire_in_flight_slot(1, 1).await.is_err(),
+                    "{scenario}: attempt {attempt} must fail closed"
+                );
+                assert!(
+                    started.elapsed()
+                        < SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(175),
+                    "{scenario}: attempt {attempt} exceeded the hot-path deadline"
+                );
+                assert_ne!(
+                    manager.local_pool_route_state(None).kind,
+                    LocalPoolRouteStateKind::AllDisabled,
+                    "{scenario}: attempt {attempt} must not report AllDisabled"
+                );
+            }
+            let stats_open = manager.scheduler_redis_breaker.stats_snapshot();
+            assert!(manager.scheduler_redis_breaker.is_degraded(), "{scenario}");
+            assert_eq!(
+                stats_open
+                    .failures
+                    .saturating_sub(stats_before.failures),
+                u64::from(SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN),
+                "{scenario}: exactly the configured number of Redis operations may fail before opening"
+            );
+            assert_eq!(
+                stats_open.admitted.saturating_sub(stats_before.admitted),
+                u64::from(SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN),
+                "{scenario}: scheduler attempts must not be internally amplified"
+            );
+            assert_capacity_breaker_fail_fast_without_redis_spin(&manager, &scenario).await;
+            clear_test_redis_latency_toxic().await;
+            let usage = tokio::time::timeout(StdDuration::from_secs(8), usage)
+                .await
+                .unwrap_or_else(|_| panic!("{scenario}: usage writer wave did not finish"))
+                .unwrap();
+            assert_eq!(
+                usage.attempted,
+                (WRITERS * FAULT_RECORDS_PER_WRITER) as u64,
+                "{scenario}"
+            );
+            assert_eq!(
+                redis_store.usage_summary_write_round_trips(),
+                usage.attempted,
+                "{scenario}: usage failures/successes must not retry internally"
+            );
+            recover_capacity_breaker_five_times(&manager, &redis_store, &scenario).await;
+            let stats_recovered = manager.scheduler_redis_breaker.stats_snapshot();
+            eprintln!(
+                "redis-joint-fault scenario={scenario} usage_attempts={} usage_success={} usage_failed={} usage_timed_out={} usage_round_trips={} redis_admitted_delta={} redis_failures_delta={} fail_fast_delta={} recovered=true",
+                usage.attempted,
+                usage.succeeded,
+                usage.failed,
+                usage.timed_out,
+                redis_store.usage_summary_write_round_trips(),
+                stats_recovered.admitted.saturating_sub(stats_before.admitted),
+                stats_recovered.failures.saturating_sub(stats_before.failures),
+                stats_recovered.fail_fast.saturating_sub(stats_before.fail_fast),
+            );
+
+            let scenario = format!("wrongtype-round-{round}");
+            let manager = MultiTokenManager::new_with_stores(
+                Config::default(),
+                vec![api_key_credential(&scenario)],
+                None,
+                None,
+                false,
+                None,
+                Some(redis_store.clone()),
+            )
+            .unwrap();
+            redis_store.reset_usage_summary_write_round_trips();
+            redis_store
+                .set_raw_string_for_test(
+                    "scheduler:inflight:1:last_seen",
+                    "deliberate-wrongtype",
+                )
+                .await
+                .unwrap();
+            let start = Arc::new(tokio::sync::Barrier::new(WRITERS + 1));
+            let usage = spawn_usage_fault_wave(
+                redis_store.clone(),
+                scenario.clone(),
+                WRITERS,
+                LOW_LATENCY_RECORDS_PER_WRITER,
+                start.clone(),
+            );
+            start.wait().await;
+            assert!(
+                manager.acquire_in_flight_slot(1, 1).await.is_err(),
+                "{scenario}: scheduler WRONGTYPE must fail closed"
+            );
+            assert!(manager.scheduler_redis_breaker.is_degraded(), "{scenario}");
+            assert_ne!(
+                manager.local_pool_route_state(None).kind,
+                LocalPoolRouteStateKind::AllDisabled,
+                "{scenario}: Redis protocol/type errors must not disable the credential"
+            );
+            assert_capacity_breaker_fail_fast_without_redis_spin(&manager, &scenario).await;
+            redis_store
+                .del("scheduler:inflight:1:last_seen")
+                .await
+                .unwrap();
+            let usage = tokio::time::timeout(StdDuration::from_secs(8), usage)
+                .await
+                .unwrap_or_else(|_| panic!("{scenario}: usage writer wave did not finish"))
+                .unwrap();
+            assert_eq!(usage.succeeded, usage.attempted, "{scenario}");
+            assert_eq!(
+                redis_store.usage_summary_write_round_trips(),
+                usage.attempted,
+                "{scenario}: usage writer must remain one-RTT and independent of scheduler key type"
+            );
+            recover_capacity_breaker_five_times(&manager, &redis_store, &scenario).await;
+            let wrongtype_stats = manager.scheduler_redis_breaker.stats_snapshot();
+            eprintln!(
+                "redis-joint-fault scenario={scenario} usage_attempts={} usage_success={} usage_failed={} usage_timed_out={} usage_round_trips={} redis_admitted={} redis_failures={} fail_fast={} recovered=true",
+                usage.attempted,
+                usage.succeeded,
+                usage.failed,
+                usage.timed_out,
+                redis_store.usage_summary_write_round_trips(),
+                wrongtype_stats.admitted,
+                wrongtype_stats.failures,
+                wrongtype_stats.fail_fast,
+            );
+
+            let scenario = format!("disconnect-round-{round}");
+            let manager = MultiTokenManager::new_with_stores(
+                Config::default(),
+                vec![api_key_credential(&scenario)],
+                None,
+                None,
+                false,
+                None,
+                Some(redis_store.clone()),
+            )
+            .unwrap();
+            redis_store.reset_usage_summary_write_round_trips();
+            let healthy = manager
+                .acquire_in_flight_slot(1, 1)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(healthy);
+            crate::kiro::token_manager::drain_best_effort_storage_tasks(
+                StdDuration::from_secs(2),
+            )
+            .await;
+            let start = Arc::new(tokio::sync::Barrier::new(WRITERS + 1));
+            let usage = spawn_usage_fault_wave(
+                redis_store.clone(),
+                scenario.clone(),
+                WRITERS,
+                FAULT_RECORDS_PER_WRITER,
+                start.clone(),
+            );
+            set_test_redis_latency_toxic(500).await;
+            start.wait().await;
+            tokio::time::timeout(StdDuration::from_secs(2), async {
+                while redis_store.usage_summary_write_round_trips() == 0 {
+                    tokio::time::sleep(StdDuration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{scenario}: usage writer did not enter Redis"));
+            set_test_redis_proxy_enabled(false).await;
+            let mut attempts = 0_u32;
+            while !manager.scheduler_redis_breaker.is_degraded()
+                && attempts < SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN
+            {
+                attempts += 1;
+                assert!(
+                    manager.acquire_in_flight_slot(1, 1).await.is_err(),
+                    "{scenario}: disconnected scheduler attempt {attempts} must fail closed"
+                );
+                assert_ne!(
+                    manager.local_pool_route_state(None).kind,
+                    LocalPoolRouteStateKind::AllDisabled,
+                    "{scenario}: disconnect must not report AllDisabled"
+                );
+            }
+            assert!(
+                manager.scheduler_redis_breaker.is_degraded(),
+                "{scenario}: disconnect must open the breaker within the bounded threshold"
+            );
+            assert!(
+                attempts <= SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN,
+                "{scenario}: disconnect attempts were internally amplified"
+            );
+            assert_capacity_breaker_fail_fast_without_redis_spin(&manager, &scenario).await;
+            set_test_redis_proxy_enabled(true).await;
+            clear_test_redis_latency_toxic().await;
+            let usage = tokio::time::timeout(StdDuration::from_secs(8), usage)
+                .await
+                .unwrap_or_else(|_| panic!("{scenario}: usage writer wave did not finish"))
+                .unwrap();
+            assert_eq!(
+                usage.attempted,
+                (WRITERS * FAULT_RECORDS_PER_WRITER) as u64,
+                "{scenario}"
+            );
+            assert_eq!(
+                redis_store.usage_summary_write_round_trips(),
+                usage.attempted,
+                "{scenario}: reconnect must not cause hidden usage retries"
+            );
+            recover_capacity_breaker_five_times(&manager, &redis_store, &scenario).await;
+            let disconnect_stats = manager.scheduler_redis_breaker.stats_snapshot();
+            eprintln!(
+                "redis-joint-fault scenario={scenario} scheduler_attempts={attempts} usage_attempts={} usage_success={} usage_failed={} usage_timed_out={} usage_round_trips={} redis_admitted={} redis_failures={} fail_fast={} recovered=true",
+                usage.attempted,
+                usage.succeeded,
+                usage.failed,
+                usage.timed_out,
+                redis_store.usage_summary_write_round_trips(),
+                disconnect_stats.admitted,
+                disconnect_stats.failures,
+                disconnect_stats.fail_fast,
+            );
+
+            assert_eq!(
+                redis_store.global_capacity_state().await.unwrap().queued_requests,
+                0,
+                "round {round}: joint faults must not leave dispatch queue entries"
+            );
+        }
+
+        clear_test_redis_latency_toxic().await;
+        set_test_redis_proxy_enabled(true).await;
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+        let rss_end = process_rss_kib_for_test();
+        let fd_end = open_fd_count_for_test();
+        if let (Some(start), Some(end)) = (rss_start, rss_end) {
+            assert!(
+                end <= start.saturating_add(32 * 1024),
+                "joint fault RSS did not recover within 32 MiB: start={start}, end={end}"
+            );
+        }
+        if let (Some(start), Some(end)) = (fd_start, fd_end) {
+            assert!(
+                end <= start.saturating_add(8),
+                "joint fault test leaked file descriptors: start={start}, end={end}"
+            );
+        }
+        eprintln!(
+            "redis-joint-fault resources rss_start_kib={rss_start:?} rss_end_kib={rss_end:?} fd_start={fd_start:?} fd_end={fd_end:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn redis_business_and_observability_fault_domains_are_independent_for_three_rounds() {
+    let Some(business_url) =
+        crate::storage::integration_test_url("KIRO_RS_TEST_BUSINESS_REDIS_URL")
+    else {
+        eprintln!("跳过双 Redis 故障域测试：未设置 KIRO_RS_TEST_BUSINESS_REDIS_URL");
+        return;
+    };
+    let Some(observability_url) =
+        crate::storage::integration_test_url("KIRO_RS_TEST_OBSERVABILITY_REDIS_URL")
+    else {
+        eprintln!("跳过双 Redis 故障域测试：未设置 KIRO_RS_TEST_OBSERVABILITY_REDIS_URL");
+        return;
+    };
+    let Some(_) = test_fault_domain_toxiproxy("business") else {
+        if std::env::var("KIRO_RS_REQUIRE_STORAGE_TESTS").is_ok() {
+            panic!("business Redis Toxiproxy variables are required");
+        }
+        eprintln!("跳过双 Redis 故障域测试：未设置 business Toxiproxy variables");
+        return;
+    };
+    let Some(_) = test_fault_domain_toxiproxy("observability") else {
+        if std::env::var("KIRO_RS_REQUIRE_STORAGE_TESTS").is_ok() {
+            panic!("observability Redis Toxiproxy variables are required");
+        }
+        eprintln!("跳过双 Redis 故障域测试：未设置 observability Toxiproxy variables");
+        return;
+    };
+
+    let mut business_config = Config::default();
+    business_config.redis.url = Some(business_url);
+    business_config.redis.key_prefix = format!(
+        "kiro_rs:test:business-fault-domain:{}",
+        uuid::Uuid::new_v4()
+    );
+    let business_store = Arc::new(RedisStore::connect(&business_config).await.unwrap());
+
+    let observability_config = crate::model::config::RedisConfig {
+        url: Some(observability_url),
+        key_prefix: format!(
+            "kiro_rs:test:observability-fault-domain:{}",
+            uuid::Uuid::new_v4()
+        ),
+    };
+    let observability_store = Arc::new(
+        RedisStore::connect_observability(&observability_config)
+            .await
+            .unwrap(),
+    );
+    assert!(!business_store.is_observability());
+    assert!(observability_store.is_observability());
+    assert_ne!(
+        business_store.server_run_id().await.unwrap(),
+        observability_store.server_run_id().await.unwrap(),
+        "the two configured authorities must be different Redis server processes"
+    );
+
+    let outcome = AssertUnwindSafe(async {
+        set_fault_domain_proxy_enabled("business", true).await;
+        set_fault_domain_proxy_enabled("observability", true).await;
+        clear_fault_domain_latency("business").await;
+        clear_fault_domain_latency("observability").await;
+        wait_fault_domain_store_healthy(&business_store, "business").await;
+        wait_fault_domain_store_healthy(&observability_store, "observability").await;
+
+        for round in 1..=3 {
+            let manager = MultiTokenManager::new_with_stores(
+                Config::default(),
+                vec![api_key_credential(&format!("redis-fault-domain-{round}"))],
+                None,
+                None,
+                false,
+                None,
+                Some(business_store.clone()),
+            )
+            .unwrap();
+
+            let warm = manager
+                .acquire_in_flight_slot(1, 1)
+                .await
+                .unwrap()
+                .expect("business Redis warm-up must have capacity");
+            drop(warm);
+            crate::kiro::token_manager::drain_best_effort_storage_tasks(
+                StdDuration::from_secs(2),
+            )
+            .await;
+            let baseline_stats = manager.scheduler_redis_breaker.stats_snapshot();
+
+            for latency_ms in [50_u64, 150, 500] {
+                set_fault_domain_latency("observability", latency_ms).await;
+                let started = Instant::now();
+                let lease = tokio::time::timeout(
+                    StdDuration::from_millis(800),
+                    manager.acquire_in_flight_slot(1, 1),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "round {round} observability latency {latency_ms}ms blocked business scheduler"
+                    )
+                })
+                .unwrap()
+                .expect("business scheduler must remain available while observability is slow");
+                assert!(
+                    started.elapsed() < StdDuration::from_millis(500),
+                    "round {round} observability latency {latency_ms}ms inflated business scheduler"
+                );
+                drop(lease);
+
+                let record = sampled_request_rejection_usage_record(
+                    &format!("redis-fault-domain-{round}-{latency_ms}"),
+                    "/cc/v1/messages",
+                    None,
+                    "redis_fault_domain_validation",
+                    "observability_writer",
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    latency_ms,
+                );
+                let usage = tokio::time::timeout(
+                    StdDuration::from_secs(8),
+                    observability_store.record_usage_summary(&record),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "round {round} observability usage write timed out at {latency_ms}ms"
+                    )
+                })
+                .unwrap();
+                assert!(usage, "round {round} observability usage write was not committed");
+                let stats = manager.scheduler_redis_breaker.stats_snapshot();
+                assert_eq!(stats.failures, baseline_stats.failures);
+                clear_fault_domain_latency("observability").await;
+            }
+
+            set_fault_domain_proxy_enabled("observability", false).await;
+            let before_disconnect = manager.scheduler_redis_breaker.stats_snapshot();
+            for index in 0..5 {
+                let started = Instant::now();
+                let lease = tokio::time::timeout(
+                    StdDuration::from_millis(800),
+                    manager.acquire_in_flight_slot(1, 1),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("round {round} observation disconnect blocked scheduler"))
+                .unwrap_or_else(|error| panic!("round {round} scheduler recovery probe {index} failed: {error}"))
+                .expect("business scheduler lost capacity during observation disconnect");
+                assert!(started.elapsed() < StdDuration::from_millis(500));
+                drop(lease);
+            }
+            let after_disconnect = manager.scheduler_redis_breaker.stats_snapshot();
+            assert_eq!(after_disconnect.failures, before_disconnect.failures);
+            set_fault_domain_proxy_enabled("observability", true).await;
+            clear_fault_domain_latency("observability").await;
+            wait_fault_domain_store_healthy(&observability_store, "observability").await;
+            for index in 0..5 {
+                let record = sampled_request_rejection_usage_record(
+                    &format!("redis-fault-domain-recovery-{round}-{index}"),
+                    "/cc/v1/messages",
+                    None,
+                    "redis_fault_domain_validation",
+                    "observability_recovery",
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    index,
+                );
+                assert!(
+                    observability_store.record_usage_summary(&record).await.unwrap(),
+                    "round {round} observation recovery write {index} failed"
+                );
+            }
+
+            let fault_manager = MultiTokenManager::new_with_stores(
+                Config::default(),
+                vec![api_key_credential(&format!("redis-business-fault-{round}"))],
+                None,
+                None,
+                false,
+                None,
+                Some(business_store.clone()),
+            )
+            .unwrap();
+            set_fault_domain_proxy_enabled("business", false).await;
+            let failed = tokio::time::timeout(
+                StdDuration::from_millis(800),
+                fault_manager.acquire_in_flight_slot(1, 1),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("round {round} business Redis fault was not bounded"));
+            assert!(
+                !matches!(failed, Ok(Some(_))),
+                "round {round} business Redis fault must never report a successful lease"
+            );
+            assert_ne!(
+                fault_manager.local_pool_route_state(None).kind,
+                LocalPoolRouteStateKind::AllDisabled,
+                "round {round} business Redis fault must not impersonate credential disablement"
+            );
+            let observer_record = sampled_request_rejection_usage_record(
+                &format!("redis-business-fault-observer-{round}"),
+                "/cc/v1/messages",
+                None,
+                "redis_fault_domain_validation",
+                "observability_business_fault",
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                round as u64,
+            );
+            assert!(
+                observability_store
+                    .record_usage_summary(&observer_record)
+                    .await
+                    .unwrap(),
+                "round {round} observability write must survive business Redis fault"
+            );
+            set_fault_domain_proxy_enabled("business", true).await;
+            clear_fault_domain_latency("business").await;
+            wait_fault_domain_store_healthy(&business_store, "business").await;
+            let recovered_manager = MultiTokenManager::new_with_stores(
+                Config::default(),
+                vec![api_key_credential(&format!("redis-business-recovery-{round}"))],
+                None,
+                None,
+                false,
+                None,
+                Some(business_store.clone()),
+            )
+            .unwrap();
+            recover_capacity_breaker_five_times(
+                &recovered_manager,
+                &business_store,
+                &format!("round {round} business Redis fault recovery"),
+            )
+            .await;
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    let _ = AssertUnwindSafe(async {
+        set_fault_domain_proxy_enabled("business", true).await;
+        set_fault_domain_proxy_enabled("observability", true).await;
+        clear_fault_domain_latency("business").await;
+        clear_fault_domain_latency("observability").await;
+    })
+    .catch_unwind()
+    .await;
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    business_store
+        .delete_pattern_bounded("*", None)
+        .await
+        .unwrap();
+    observability_store
+        .delete_pattern_bounded("*", None)
+        .await
+        .unwrap();
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_lease_release_is_non_blocking_under_latency_and_burst() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis lease release latency 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+    clear_test_redis_latency_toxic().await;
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis lease release latency 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![api_key_credential("release-latency-burst")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+
+    const LEASES: usize = 300;
+    let mut leases = Vec::with_capacity(LEASES);
+    for _ in 0..LEASES {
+        leases.push(
+            manager
+                .acquire_in_flight_slot(1, 1)
+                .await
+                .expect("Redis lease acquire")
+                .expect("unlimited test credential capacity"),
+        );
+    }
+    assert_eq!(manager.entries.lock()[0].in_flight_requests, LEASES as u32);
+
+    let dispatcher = manager
+        .scheduler_redis_release_dispatcher
+        .as_ref()
+        .expect("Redis manager release dispatcher");
+    let stats_before = dispatcher.snapshot();
+    set_test_redis_latency_toxic(500).await;
+    let started_at = Instant::now();
+    drop(leases);
+    let release_call_elapsed = started_at.elapsed();
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    clear_test_redis_latency_toxic().await;
+
+    assert!(
+        release_call_elapsed < StdDuration::from_millis(100),
+        "dropping {LEASES} leases must not synchronously wait for Redis: {release_call_elapsed:?}"
+    );
+    assert_eq!(manager.entries.lock()[0].in_flight_requests, 0);
+
+    assert!(
+        manager
+            .drain_scheduler_redis_releases(StdDuration::from_secs(10))
+            .await,
+        "Redis release reconciliation must drain"
+    );
+    let stats_after = dispatcher.snapshot();
+    assert!(
+        stats_after.enqueued.saturating_sub(stats_before.enqueued) >= LEASES as u64,
+        "every release must enter a bounded background lane"
+    );
+    assert_eq!(stats_after.pending, 0);
+    assert_eq!(
+        stats_after.capacity_available,
+        stats_before.capacity_available + LEASES
+    );
+
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .expect("read Redis scheduler state after reconciliation");
+            if state
+                .get(&1)
+                .is_none_or(|state| state.in_flight_leases.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("all Redis leases should be reconciled after latency removal");
+
+    eprintln!(
+        "redis-lease-release burst={LEASES} drop_elapsed_ms={} retries_delta={} enqueued_delta={}",
+        release_call_elapsed.as_millis(),
+        stats_after.retries.saturating_sub(stats_before.retries),
+        stats_after.enqueued.saturating_sub(stats_before.enqueued),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis reconnect 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+    clear_test_redis_latency_toxic().await;
+    set_test_redis_proxy_enabled(true).await;
+
+    for round in 1..=3 {
+        let Some(redis_store) = test_redis_store().await else {
+            eprintln!("跳过 Redis reconnect 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let manager = MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![api_key_credential(&format!("disconnect-recovery-{round}"))],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap();
+        let healthy = manager
+            .acquire_in_flight_slot(1, 1)
+            .await
+            .expect("healthy Redis acquire")
+            .expect("healthy credential capacity");
+        drop(healthy);
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
+            .await;
+
+        set_test_redis_proxy_enabled(false).await;
+        let started_at = Instant::now();
+        let disconnected = manager.acquire_in_flight_slot(1, 1).await;
+        let elapsed = started_at.elapsed();
+        let first_error = disconnected.as_ref().err().map(ToString::to_string);
+        let mut attempts = 1_u32;
+        while !manager.scheduler_redis_breaker.is_degraded()
+            && attempts < SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN
+        {
+            attempts += 1;
+            let repeated = manager.acquire_in_flight_slot(1, 1).await;
+            assert!(
+                repeated.is_err(),
+                "disconnect round {round} attempt {attempts} must fail closed"
+            );
+            assert_ne!(
+                manager.local_pool_route_state(None).kind,
+                LocalPoolRouteStateKind::AllDisabled,
+                "disconnect round {round} attempt {attempts} must not be reported as all disabled"
+            );
+        }
+        let degraded = manager.scheduler_redis_breaker.is_degraded();
+        set_test_redis_proxy_enabled(true).await;
+
+        assert!(
+            disconnected.is_err(),
+            "disconnect round {round} must fail closed"
+        );
+        assert!(
+            degraded,
+            "disconnect round {round} must open coordination breaker within {attempts} attempts; first_error={first_error:?}"
+        );
+        assert!(
+            elapsed < SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(175),
+            "disconnect round {round} must respect hot-path deadline: {elapsed:?}"
+        );
+        assert_eq!(
+            manager.local_pool_route_state(None).kind,
+            LocalPoolRouteStateKind::SchedulerRedisDegraded
+        );
+
+        let retry_after = manager
+            .scheduler_redis_breaker
+            .retry_after()
+            .unwrap_or(SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE);
+        tokio::time::sleep(retry_after + StdDuration::from_millis(100)).await;
+        let recovered = manager
+            .acquire_in_flight_slot(1, 1)
+            .await
+            .expect("same manager should reconnect after Redis proxy recovery")
+            .expect("credential capacity should recover");
+        drop(recovered);
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
+            .await;
+        assert!(!manager.scheduler_redis_breaker.is_degraded());
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                match redis_store.scheduler_state_for_credentials(&[1]).await {
+                    Ok(state)
+                        if state
+                            .get(&1)
+                            .is_none_or(|state| state.in_flight_leases.is_empty()) =>
+                    {
+                        break;
+                    }
+                    Ok(_) | Err(_) => {
+                        tokio::time::sleep(StdDuration::from_millis(25)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("reconnect round {round} must clear Redis leases"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_capacity_backend_restart_recovers_same_manager() {
+    let Ok(container) = std::env::var("KIRO_RS_TEST_REDIS_RESTART_CONTAINER") else {
+        eprintln!("跳过 Redis backend restart 测试：未设置专用测试容器");
+        return;
+    };
+    assert!(
+        container.starts_with("kiro-rs-validation-redis-"),
+        "只允许重启本任务创建的 Redis validation 容器"
+    );
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis backend restart 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+    clear_test_redis_latency_toxic().await;
+    set_test_redis_proxy_enabled(true).await;
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis backend restart 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![api_key_credential("backend-restart")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+
+    for round in 1..=3 {
+        let stop_status = std::process::Command::new("docker")
+            .args(["stop", "--timeout", "0", &container])
+            .status()
+            .expect("run docker stop for validation Redis");
+        assert!(stop_status.success(), "stop validation Redis round {round}");
+
+        let started_at = Instant::now();
+        let unavailable = manager.acquire_in_flight_slot(1, 1).await;
+        let elapsed = started_at.elapsed();
+        let degraded = manager.scheduler_redis_breaker.is_degraded();
+
+        let start_status = std::process::Command::new("docker")
+            .args(["start", &container])
+            .status()
+            .expect("run docker start for validation Redis");
+        assert!(
+            start_status.success(),
+            "start validation Redis round {round}"
+        );
+
+        assert!(
+            unavailable.is_err(),
+            "stopped Redis round {round} must fail closed"
+        );
+        assert!(
+            degraded,
+            "stopped Redis round {round} must open coordination breaker"
+        );
+        assert!(
+            elapsed < SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(175),
+            "stopped Redis round {round} must respect hot deadline: {elapsed:?}"
+        );
+
+        tokio::time::sleep(SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE).await;
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+        let recovered = manager
+            .acquire_in_flight_slot(1, 1)
+            .await
+            .expect("same manager should reconnect after Redis backend restart")
+            .expect("credential capacity should recover after backend restart");
+        drop(recovered);
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
+            .await;
+        assert!(!manager.scheduler_redis_breaker.is_degraded());
+
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                match redis_store.scheduler_state_for_credentials(&[1]).await {
+                    Ok(state)
+                        if state
+                            .get(&1)
+                            .is_none_or(|state| state.in_flight_leases.is_empty()) =>
+                    {
+                        break;
+                    }
+                    Ok(_) | Err(_) => {
+                        tokio::time::sleep(StdDuration::from_millis(25)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("backend restart round {round} must clear Redis leases"));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers() {
     let Some(redis_store) = test_redis_store().await else {
@@ -6090,6 +9825,698 @@ async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers()
     let mut after_cooldown = manager_b.acquire_context(None).await.unwrap();
     assert_ne!(after_cooldown.id, first_id);
     after_cooldown.release_in_flight();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_backed_temporary_sticky_capacity_fallback_rebounds_without_full_sync() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis sticky stale-state 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_max_concurrent_requests = 1;
+    let credentials = vec![
+        api_key_credential("sticky-a"),
+        api_key_credential("sticky-b"),
+    ];
+    let manager_a = MultiTokenManager::new_with_stores(
+        config.clone(),
+        credentials.clone(),
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        config,
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let empty = HashSet::new();
+    let session_id = "redis-sticky-stale-capacity";
+
+    let mut initial = manager_a
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .unwrap();
+    let bound_id = initial.id;
+    initial.release_in_flight();
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[bound_id])
+                .await
+                .unwrap();
+            if state
+                .get(&bound_id)
+                .is_none_or(|state| state.in_flight_leases.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial sticky lease should release before creating the holder");
+
+    let holder = manager_a
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(holder.id, bound_id);
+    manager_b
+        .refresh_scheduler_state_from_redis_force()
+        .unwrap();
+    assert_eq!(
+        manager_b
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == bound_id)
+            .unwrap()
+            .in_flight_requests,
+        1,
+        "secondary manager must start from a stale full snapshot for this regression"
+    );
+
+    let reads_before_fallback = manager_b
+        .request_binding_snapshot_reads
+        .load(Ordering::Acquire);
+    let mut fallback = manager_b
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_ne!(fallback.id, bound_id);
+    assert!(fallback.fallback_from_sticky);
+    assert_eq!(
+        manager_b
+            .request_binding_snapshot_reads
+            .load(Ordering::Acquire)
+            .saturating_sub(reads_before_fallback),
+        1,
+        "Redis lease rejection and local reselect must not reread the binding"
+    );
+    assert_eq!(
+        redis_store
+            .get_session_binding(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_id,
+        bound_id,
+        "temporary capacity fallback must not migrate the authoritative binding"
+    );
+    fallback.release_in_flight();
+
+    drop(holder);
+    tokio::time::timeout(StdDuration::from_millis(700), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[bound_id])
+                .await
+                .unwrap();
+            if state
+                .get(&bound_id)
+                .is_none_or(|state| state.in_flight_leases.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("holder Redis lease should be released before the 1s full-sync interval");
+    assert_eq!(
+        manager_b
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == bound_id)
+            .unwrap()
+            .in_flight_requests,
+        1,
+        "secondary local snapshot must still be stale when rebound is attempted"
+    );
+
+    let mut rebound = manager_b
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacity,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rebound.id, bound_id,
+        "Redis authority must permit immediate rebound despite stale local remote capacity"
+    );
+    rebound.release_in_flight();
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_backed_sticky_release_grace_keeps_binding_between_managers() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis sticky release grace 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_max_concurrent_requests = 1;
+    config.credential_dispatch_max_wait_secs = 1;
+    let credentials = vec![
+        api_key_credential("sticky-release-grace-a"),
+        api_key_credential("sticky-release-grace-b"),
+    ];
+    let manager_a = MultiTokenManager::new_with_stores(
+        config.clone(),
+        credentials.clone(),
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        config,
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let empty = HashSet::new();
+    let session_id = format!(
+        "redis-sticky-release-grace-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+
+    let mut initial = manager_a
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(&session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacityWaitForRedis(StdDuration::from_secs(1)),
+            1,
+        )
+        .await
+        .unwrap();
+    let bound_id = initial.id;
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        loop {
+            if redis_store
+                .get_session_binding(&session_id)
+                .await
+                .unwrap()
+                .is_some_and(|binding| binding.credential_id == bound_id)
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial Redis sticky binding must be visible before release propagation test");
+
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        initial.release_in_flight();
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
+            .await;
+    });
+
+    let mut rebound = manager_b
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(&session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacityWaitForRedis(StdDuration::from_secs(1)),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rebound.id, bound_id,
+        "short cross-instance Redis release propagation lag must not migrate sticky sessions"
+    );
+    assert!(rebound.sticky_bound);
+    assert!(!rebound.fallback_from_sticky);
+    rebound.release_in_flight();
+    release.await.unwrap();
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_backed_sticky_holder_still_falls_back_after_release_grace() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis sticky holder fallback grace 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_max_concurrent_requests = 1;
+    config.credential_dispatch_max_wait_secs = 1;
+    let credentials = vec![
+        api_key_credential("sticky-holder-grace-a"),
+        api_key_credential("sticky-holder-grace-b"),
+    ];
+    let manager_a = MultiTokenManager::new_with_stores(
+        config.clone(),
+        credentials.clone(),
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        config,
+        credentials,
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let empty = HashSet::new();
+    let session_id = format!(
+        "redis-sticky-holder-grace-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+
+    let holder = manager_a
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(&session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacityWaitForRedis(StdDuration::from_secs(1)),
+            1,
+        )
+        .await
+        .unwrap();
+    let bound_id = holder.id;
+
+    let started = Instant::now();
+    let mut fallback = manager_b
+        .acquire_context_for_session_with_mode(
+            None,
+            Some(&session_id),
+            &empty,
+            AcquireMode::FailFastOnCapacityWaitForRedis(StdDuration::from_secs(1)),
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < StdDuration::from_millis(500),
+        "real sticky holder fallback must remain bounded by the short grace, not the full dispatch wait"
+    );
+    assert_ne!(fallback.id, bound_id);
+    assert!(fallback.fallback_from_sticky);
+    assert!(!fallback.sticky_bound);
+    assert_eq!(
+        redis_store
+            .get_session_binding(&session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_id,
+        bound_id,
+        "temporary sticky holder fallback must not migrate the authoritative binding"
+    );
+    fallback.release_in_flight();
+    drop(holder);
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_dispatch_waiters_share_one_scheduler_state_scan_for_five_rounds() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis waiter singleflight 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+
+    const ACCOUNT_COUNT: usize = 60;
+    const WAITER_COUNT: usize = 64;
+    let credentials = (0..ACCOUNT_COUNT)
+        .map(|index| api_key_credential(&format!("waiter-singleflight-{index}")))
+        .collect();
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            credentials,
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+
+    for round in 0..5 {
+        *manager.last_scheduler_redis_sync_at.lock() = None;
+        manager
+            .scheduler_redis_sync_in_flight
+            .store(false, Ordering::Release);
+        redis_store.reset_scheduler_state_round_trips();
+
+        futures::future::join_all((0..WAITER_COUNT).map(|_| async {
+            let mut waiter = manager.capacity_signal.register();
+            manager
+                .wait_for_dispatch_capacity(
+                    Some(StdDuration::from_millis(1)),
+                    Some(StdDuration::from_secs(1)),
+                    &mut waiter,
+                )
+                .await;
+        }))
+        .await;
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while manager
+                .scheduler_redis_sync_in_flight
+                .load(Ordering::Acquire)
+            {
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("coalesced scheduler state scan must complete");
+
+        assert_eq!(
+            redis_store.scheduler_state_round_trips(),
+            ACCOUNT_COUNT.div_ceil(16) as u64,
+            "round {round}: waiter count must not multiply Redis scheduler scans"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provisional_local_reservation_spreads_concurrent_redis_acquires() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis provisional spread 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+
+    const ACCOUNT_COUNT: usize = 60;
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_max_concurrent_requests = 1;
+    let credentials = (0..ACCOUNT_COUNT)
+        .map(|index| api_key_credential(&format!("provisional-{index}")))
+        .collect();
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            credentials,
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    redis_store.reset_scheduler_state_round_trips();
+    manager.refresh_scheduler_state_from_redis_force().unwrap();
+    assert_eq!(
+        redis_store.scheduler_state_round_trips(),
+        4,
+        "60-account scheduler sync must use bounded batches instead of 11 commands per account"
+    );
+    for contenders in [1usize, 8, 24, 48] {
+        let barrier = Arc::new(tokio::sync::Barrier::new(contenders));
+        let lease_id_before = manager.next_in_flight_lease_id.load(Ordering::Acquire);
+        let mut tasks = Vec::with_capacity(contenders);
+        for _ in 0..contenders {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                manager
+                    .acquire_context_for_session_with_mode(
+                        None,
+                        None,
+                        &HashSet::new(),
+                        AcquireMode::FailFastOnCapacity,
+                        1,
+                    )
+                    .await
+            }));
+        }
+
+        let mut contexts = Vec::with_capacity(contenders);
+        for task in tasks {
+            contexts.push(task.await.unwrap().unwrap());
+        }
+        let selected: HashSet<u64> = contexts.iter().map(|context| context.id).collect();
+        assert_eq!(selected.len(), contenders);
+        let attempts = manager
+            .next_in_flight_lease_id
+            .load(Ordering::Acquire)
+            .saturating_sub(lease_id_before);
+        let max_attempts = (contenders as u64 * 5).div_ceil(4);
+        assert!(
+            attempts <= max_attempts,
+            "provisional acquire amplification exceeded 1.25x: concurrency={contenders}, attempts={attempts}, max={max_attempts}"
+        );
+        eprintln!(
+            "provisional-spread concurrency={contenders} unique={} attempts={attempts} ratio={:.3}",
+            selected.len(),
+            attempts as f64 / contenders as f64
+        );
+        for context in &mut contexts {
+            context.release_in_flight();
+        }
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
+            .await;
+        assert!(
+            redis_store
+                .scheduler_state_for_credentials(&(1..=ACCOUNT_COUNT as u64).collect::<Vec<_>>())
+                .await
+                .unwrap()
+                .values()
+                .all(|state| state.in_flight_leases.is_empty())
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_rejected_provisional_acquire_rolls_back_without_remote_release() {
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis provisional rejection 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 1;
+    let manager_a = MultiTokenManager::new_with_stores(
+        config.clone(),
+        vec![api_key_credential("reject-a")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    let manager_b = MultiTokenManager::new_with_stores(
+        config,
+        vec![api_key_credential("reject-b")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+
+    let holder = manager_a
+        .acquire_in_flight_slot(1, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        manager_b
+            .acquire_in_flight_slot(1, 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let local = &manager_b.entries.lock()[0];
+    assert_eq!(local.in_flight_requests, 0);
+    assert!(local.in_flight_leases.is_empty());
+    assert_eq!(
+        redis_store
+            .scheduler_state_for_credentials(&[1])
+            .await
+            .unwrap()
+            .get(&1)
+            .unwrap()
+            .in_flight_leases
+            .len(),
+        1,
+        "a definitive Redis rejection must not delete the holder lease"
+    );
+    drop(holder);
+    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_provisional_redis_acquire_rolls_back_local_and_tombstones_remote() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis provisional cancel 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+    clear_test_redis_latency_toxic().await;
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis provisional cancel 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![api_key_credential("cancel-provisional")],
+            None,
+            None,
+            false,
+            None,
+            Some(redis_store.clone()),
+        )
+        .unwrap(),
+    );
+    set_test_redis_latency_toxic(150).await;
+
+    let task_manager = manager.clone();
+    let acquire = tokio::spawn(async move { task_manager.acquire_in_flight_slot(1, 1).await });
+    tokio::time::timeout(StdDuration::from_millis(100), async {
+        while manager.entries.lock()[0].in_flight_requests == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provisional local reservation should be visible before cancellation");
+    acquire.abort();
+    assert!(acquire.await.unwrap_err().is_cancelled());
+    assert_eq!(manager.entries.lock()[0].in_flight_requests, 0);
+    assert!(manager.entries.lock()[0].in_flight_leases.is_empty());
+
+    clear_test_redis_latency_toxic().await;
+    let drained =
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
+            .await;
+    assert!(drained.drained, "cancel cleanup should drain: {drained:?}");
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap();
+            if state
+                .get(&1)
+                .is_none_or(|state| state.in_flight_leases.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled commit-unknown lease must be removed before TTL");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redis_commit_unknown_provisional_acquire_leaves_no_lease() {
+    if test_redis_toxiproxy().is_none() {
+        eprintln!("跳过 Redis provisional timeout 测试：未设置 Toxiproxy 测试环境变量");
+        return;
+    }
+    clear_test_redis_latency_toxic().await;
+    let Some(redis_store) = test_redis_store().await else {
+        eprintln!("跳过 Redis provisional timeout 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return;
+    };
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![api_key_credential("timeout-provisional")],
+        None,
+        None,
+        false,
+        None,
+        Some(redis_store.clone()),
+    )
+    .unwrap();
+    set_test_redis_latency_toxic(500).await;
+
+    let result = manager.acquire_in_flight_slot(1, 1).await;
+    assert!(
+        result.is_err(),
+        "capacity Redis deadline must fail this request closed"
+    );
+    assert!(
+        !manager.scheduler_redis_breaker.is_degraded(),
+        "one slow capacity acquire must not immediately open the degraded breaker"
+    );
+    assert_eq!(manager.entries.lock()[0].in_flight_requests, 0);
+    assert!(manager.entries.lock()[0].in_flight_leases.is_empty());
+
+    clear_test_redis_latency_toxic().await;
+    let drained =
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
+            .await;
+    assert!(drained.drained, "timeout cleanup should drain: {drained:?}");
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            let state = redis_store
+                .scheduler_state_for_credentials(&[1])
+                .await
+                .unwrap();
+            if state
+                .get(&1)
+                .is_none_or(|state| state.in_flight_leases.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed-out commit-unknown lease must be removed before TTL");
 }
 
 #[tokio::test]

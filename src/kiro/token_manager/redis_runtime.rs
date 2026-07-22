@@ -217,8 +217,6 @@ pub(super) fn apply_scheduler_states_for_ids(
     if states.is_empty() {
         return;
     }
-    let now_ms = Utc::now().timestamp_millis();
-    let now = Instant::now();
     let (global_rpm, in_flight_max_age) = {
         let config = config.lock();
         (
@@ -227,6 +225,20 @@ pub(super) fn apply_scheduler_states_for_ids(
                 .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
         )
     };
+    apply_scheduler_states_for_ids_with_global_rpm(entries, global_rpm, in_flight_max_age, states);
+}
+
+pub(super) fn apply_scheduler_states_for_ids_with_global_rpm(
+    entries: &Mutex<Vec<CredentialEntry>>,
+    global_rpm: u32,
+    in_flight_max_age: Option<StdDuration>,
+    states: HashMap<u64, SchedulerCredentialState>,
+) {
+    if states.is_empty() {
+        return;
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    let now = Instant::now();
     let mut entries = entries.lock();
     for entry in entries.iter_mut() {
         if let Some(state) = states.get(&entry.id).cloned() {

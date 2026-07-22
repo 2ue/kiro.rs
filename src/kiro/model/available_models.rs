@@ -4,6 +4,49 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// One bounded, pool-aware model discovery result.
+///
+/// Cohort keys are process-internal correctness metadata. They contain no credential secret and
+/// are never serialized to Kiro or exposed through the Admin model payload. Consumers may publish
+/// native reasoning fields only while the current local cohort keys exactly match this snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct KiroAvailableModelCatalog {
+    pub models: Vec<KiroAvailableModel>,
+    pub capability_cohort_keys: Vec<KiroModelCapabilityCohortKey>,
+    pub successful_cohort_count: usize,
+    pub cohort_count: usize,
+    pub complete: bool,
+}
+
+impl std::ops::Deref for KiroAvailableModelCatalog {
+    type Target = [KiroAvailableModel];
+
+    fn deref(&self) -> &Self::Target {
+        &self.models
+    }
+}
+
+/// Static, secret-free attributes expected to determine one Kiro model-capability catalog.
+/// Transient cooldown, RPM, concurrency, token expiry, proxy identity, and credential ID are
+/// intentionally excluded so ordinary failover and same-cohort account additions stay valid.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroModelCapabilityCohortKey {
+    pub endpoint_family: String,
+    pub auth_method: String,
+    pub provider: String,
+    pub effective_auth_region: String,
+    pub effective_api_region: String,
+    pub subscription_class: String,
+    pub supported_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KiroModelCapabilityCohort {
+    pub key: KiroModelCapabilityCohortKey,
+    pub credential_ids: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroAvailableModelsResponse {

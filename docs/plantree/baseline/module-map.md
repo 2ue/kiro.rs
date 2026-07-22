@@ -49,7 +49,7 @@ The project contains real submodules and is not literally unmodularized. The mai
 | Module | Current responsibility | Important behavior |
 | --- | --- | --- |
 | `src/anthropic/body_capabilities.rs` | Body-processing capability plans | Separates parsed/local/external body modes at configuration level |
-| `src/anthropic/body_processing.rs` | File/remote materialization and base64 media normalization | Safe mode downloads remote sources; only per-source byte limit exists |
+| `src/anthropic/body_processing.rs` | File/remote materialization and base64 media normalization | Safe mode downloads remote sources; current dirty tree adds request source/download/base64/attempt/deadline bounds, connection-time DNS filtering and process workflow admission; final load evidence is pending |
 | `src/anthropic/converter.rs` | Conversion entrypoint and shared helpers | Still owns cross-stage conversion coordination |
 | `src/anthropic/converter/content.rs` | Content and PDF conversion | PDF extraction runs in the request conversion path |
 | `src/anthropic/converter/history.rs` | Message history normalization | Compatibility-sensitive history mutation |

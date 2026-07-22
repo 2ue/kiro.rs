@@ -1,8 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -20,7 +21,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout};
 
 use crate::{
@@ -29,6 +30,9 @@ use crate::{
             CacheAmplification, CacheSimulation, CacheUsage, RawUsage, ReportedCacheUsagePolicy,
         },
         envelope,
+        inference_attempt_budget::{
+            InferenceAttemptBudget, InferenceAttemptKind, InferenceAttemptRejection,
+        },
         model_capabilities::ModelCapabilitiesCatalog,
         payload_guard::{
             PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
@@ -44,7 +48,14 @@ use crate::{
             PromptCacheTracker,
         },
         prompt_cache_creation_control::PromptCacheCreationController,
-        request_facts::{probe_raw_messages_body, rewrite_raw_top_level_model},
+        request_facts::{
+            RawMessagesBodyProbe, deserialize_messages_request_with_probe, probe_raw_messages_body,
+            rewrite_raw_top_level_model_with_probe,
+        },
+        transcript_sanitizer::{
+            RESPONSE_PROTOCOL_CONTAMINATION_DETAIL, ToolTranscriptSanitizer,
+            collect_known_tool_names_from_request, sanitize_response_content,
+        },
         types::MessagesRequest,
         usage::{
             ExternalPoolAttempt, ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageLatencyTrace,
@@ -52,9 +63,9 @@ use crate::{
             UsageSource,
         },
     },
-    kiro::token_manager::storage_task::{
-        block_on_storage, spawn_best_effort_storage_task, spawn_critical_storage_task,
-    },
+    common::capacity_signal::{CapacitySignal, CapacityWaiter},
+    http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout},
+    kiro::token_manager::storage_task::spawn_critical_storage_task,
     model::config::{
         ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode,
         ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
@@ -65,10 +76,15 @@ use crate::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
         process_model,
     },
-    model::model_support::model_is_supported_by_list,
+    model::model_support::{normalize_model_id, normalize_supported_models},
     storage::{
         postgres::PostgresStore,
-        redis_cache::{LocalPoolCircuitState, RedisStore},
+        redis_cache::{
+            ExternalPoolCoordinatorGuardError, ExternalPoolCoordinatorGuardState,
+            ExternalPoolCoordinatorSnapshot, ExternalPoolCoordinatorSnapshotRequest,
+            ExternalPoolLeaseAcquireResult as RedisExternalPoolLeaseAcquireResult,
+            ExternalPoolLeaseReleaseRequest, LocalPoolCircuitState, RedisStore,
+        },
     },
     token,
 };
@@ -85,18 +101,62 @@ mod usage_projection;
 use usage_projection::ExternalUsageProjectionContext;
 
 #[cfg(test)]
-use crate::anthropic::request_facts::raw_messages_body_hints;
+use crate::anthropic::request_facts::{
+    raw_body_probe_invocations_for_current_thread, raw_messages_body_hints,
+    rewrite_raw_top_level_model,
+};
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
-const EXTERNAL_POOL_QUEUE_LEASE_TTL_SECS: u64 = 60;
-const EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_SECS: u64 = 20;
+const EXTERNAL_POOL_LEASE_MAX_AGE_SECS: u64 = DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS * 2;
+const EXTERNAL_POOL_LEASE_HEARTBEAT_RETRY_MILLIS: u64 = 250;
+const EXTERNAL_POOL_QUEUE_LEASE_SAFETY_MARGIN_SECS: u64 = 60;
+const EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_MAX_SECS: u64 = 20;
 const EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+const EXTERNAL_POOL_COORDINATOR_REDIS_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
 const EXTERNAL_POOL_QUEUE_REDIS_RETRY_DELAY: Duration = Duration::from_millis(50);
-const EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS: usize = 2;
+const EXTERNAL_POOL_RELEASE_FALLBACK_MAX_IN_FLIGHT: usize = 64;
+const EXTERNAL_POOL_RELEASE_BATCH_SIZE: usize = 256;
+const EXTERNAL_POOL_RELEASE_CAPACITY: usize = 65_536;
+const EXTERNAL_POOL_RELEASE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const EXTERNAL_POOL_COORDINATOR_MAX_IN_FLIGHT: usize = 256;
+const EXTERNAL_POOL_COORDINATOR_BREAKER_BACKOFF_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+const EXTERNAL_POOL_COORDINATOR_RECOVERY_GRACE_SECS: u64 = 35;
+const EXTERNAL_POOL_COORDINATOR_RUN_ID_PROBE_INTERVAL_SECS: u64 = 5;
+const EXTERNAL_POOL_COORDINATOR_RUNTIME_CONFIG_ID: &str = "external_pool_redis_coordination_epoch";
+const EXTERNAL_POOL_COORDINATOR_POSTGRES_LOCK_ID: i64 = 0x4b49_524f_4558_5450;
+#[cfg(test)]
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
+const EXTERNAL_POOL_STATIC_SNAPSHOT_FRESH_TTL: Duration = Duration::from_secs(5);
+const EXTERNAL_POOL_STATIC_SNAPSHOT_STALE_TTL: Duration = Duration::from_secs(30);
+const EXTERNAL_POOL_STATIC_SNAPSHOT_FAILURE_RETRY: Duration = Duration::from_secs(1);
+const EXTERNAL_POOL_STATIC_SNAPSHOT_REFRESH_TIMEOUT: Duration = Duration::from_millis(500);
+const EXTERNAL_POOL_SELECTION_RUNTIME_SNAPSHOT_TTL: Duration = Duration::from_millis(100);
+const EXTERNAL_POOL_SELECTION_POSTGRES_TIMEOUT: Duration = Duration::from_secs(2);
+const EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_TTL: Duration = Duration::from_millis(250);
+const EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_STALE_TTL: Duration = Duration::from_secs(30);
+const EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_FAILURE_RETRY: Duration = Duration::from_millis(100);
+const EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::from_millis(2_250);
+const EXTERNAL_POOL_SELECTION_MAX_IN_FLIGHT: usize = 32;
+const EXTERNAL_POOL_SELECTION_BREAKER_BACKOFF_MILLIS: [u64; 4] = [100, 250, 500, 1_000];
+const EXTERNAL_POOL_SELECTION_BREAKER_JITTER_PERCENT: u8 = 20;
+const EXTERNAL_POOL_DISPATCH_FENCE_TIMEOUT: Duration = Duration::from_millis(500);
+const EXTERNAL_POOL_DISPATCH_FENCE_SHARED_WAIT_TIMEOUT: Duration = Duration::from_millis(600);
+const EXTERNAL_POOL_LOCAL_MUTATION_AUTHORITATIVE_FRESH_TTL: Duration = Duration::from_secs(5);
+const EXTERNAL_POOL_LOCAL_MUTATION_DISPATCH_TRUST_TTL: Duration = Duration::from_secs(30);
+const EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
+const EXTERNAL_POOL_AUTO_DISABLE_POSTGRES_TIMEOUT: Duration = Duration::from_millis(500);
+const EXTERNAL_POOL_AUTO_DISABLE_TRANSITION_CLAIM_TTL_SECS: usize = 5;
+const EXTERNAL_POOL_SUCCESS_RESET_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+const EXTERNAL_POOL_SUCCESS_RESET_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
+const EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS: usize = 64;
+const EXTERNAL_POOL_SUCCESS_RESET_MAX_TRACKED_POOLS: usize = 4_096;
+const EXTERNAL_POOL_STATIC_SNAPSHOT_JITTER_PERCENT: u8 = 10;
 const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
 const EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
+const EXTERNAL_POOL_ERROR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+const EXTERNAL_POOL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const EXTERNAL_POOL_DEFAULT_RESPONSE_BODY_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_AUTO_DISABLE_REASONS: &[&str] = &[
     "auth_error",
     "security_lock",
@@ -120,9 +180,14 @@ impl Default for ExternalPoolAuthType {
 
 impl ExternalPoolAuthType {
     pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "x_api_key" | "x-api-key" | "xapikey" => Self::XApiKey,
-            _ => Self::Bearer,
+            "bearer" => Some(Self::Bearer),
+            "x_api_key" | "x-api-key" | "xapikey" => Some(Self::XApiKey),
+            _ => None,
         }
     }
 
@@ -149,9 +214,14 @@ impl Default for ExternalPoolUsageProjectionMode {
 
 impl ExternalPoolUsageProjectionMode {
     pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "current_path_policy" => Self::CurrentPathPolicy,
-            _ => Self::PassThrough,
+            "pass_through" | "passthrough" => Some(Self::PassThrough),
+            "current_path_policy" => Some(Self::CurrentPathPolicy),
+            _ => None,
         }
     }
 
@@ -178,9 +248,14 @@ impl Default for ExternalPoolRequestBodyMode {
 
 impl ExternalPoolRequestBodyMode {
     pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "raw_passthrough" | "raw" | "passthrough_body" => Self::RawPassthrough,
-            _ => Self::Normalized,
+            "normalized" => Some(Self::Normalized),
+            "raw_passthrough" | "raw" | "passthrough_body" => Some(Self::RawPassthrough),
+            _ => None,
         }
     }
 
@@ -208,10 +283,15 @@ impl Default for ExternalPoolRawModelMode {
 
 impl ExternalPoolRawModelMode {
     pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "probe_only" | "probe" => Self::ProbeOnly,
-            "rewrite_top_level" | "rewrite" | "model_rewrite" => Self::RewriteTopLevel,
-            _ => Self::None,
+            "none" => Some(Self::None),
+            "probe_only" | "probe" => Some(Self::ProbeOnly),
+            "rewrite_top_level" | "rewrite" | "model_rewrite" => Some(Self::RewriteTopLevel),
+            _ => None,
         }
     }
 
@@ -240,10 +320,15 @@ impl Default for ExternalPoolAutoDisablePolicy {
 
 impl ExternalPoolAutoDisablePolicy {
     pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "disabled" => Self::Disabled,
-            "enabled" => Self::Enabled,
-            _ => Self::Inherit,
+            "inherit" => Some(Self::Inherit),
+            "disabled" => Some(Self::Disabled),
+            "enabled" => Some(Self::Enabled),
+            _ => None,
         }
     }
 
@@ -273,13 +358,18 @@ impl Default for ExternalPoolModelMappingMode {
 
 impl ExternalPoolModelMappingMode {
     pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "passthrough" | "pass_through" => Self::Passthrough,
+            "passthrough" | "pass_through" => Some(Self::Passthrough),
             "passthrough_mapping" | "pass_through_mapping" | "passthrough_with_mapping" => {
-                Self::PassthroughMapping
+                Some(Self::PassthroughMapping)
             }
-            "direct_mapping" | "direct" => Self::DirectMapping,
-            _ => Self::ProcessedMapping,
+            "direct_mapping" | "direct" => Some(Self::DirectMapping),
+            "processed_mapping" | "processed" => Some(Self::ProcessedMapping),
+            _ => None,
         }
     }
 
@@ -306,6 +396,9 @@ impl ExternalPoolModelMappingMode {
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPool {
     pub id: u64,
+    /// Monotonic PostgreSQL row revision used to fence selection-to-send races.
+    #[serde(default = "default_external_pool_revision")]
+    pub revision: u64,
     pub name: String,
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,6 +443,43 @@ pub struct ExternalPool {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Secret-free, pre-normalized projection used only for cheap routing eligibility checks.
+/// Dispatch always reloads an authoritative request-scoped `ExternalPool` from PostgreSQL.
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalPoolEligibility {
+    pub(crate) id: u64,
+    pub(crate) enabled: bool,
+    pub(crate) request_body_mode: ExternalPoolRequestBodyMode,
+    pub(crate) auto_disabled: bool,
+    pub(crate) auto_disabled_until: Option<DateTime<Utc>>,
+    pub(crate) supported_models: Arc<HashSet<String>>,
+}
+
+impl ExternalPoolEligibility {
+    fn is_auto_disabled_at(&self, now: DateTime<Utc>) -> bool {
+        self.auto_disabled
+            && self
+                .auto_disabled_until
+                .map(|until| until > now)
+                .unwrap_or(true)
+    }
+}
+
+fn external_pool_eligibility_from_pool(pool: &ExternalPool) -> ExternalPoolEligibility {
+    ExternalPoolEligibility {
+        id: pool.id,
+        enabled: pool.enabled,
+        request_body_mode: pool.request_body_mode,
+        auto_disabled: pool.auto_disabled,
+        auto_disabled_until: pool.auto_disabled_until,
+        supported_models: Arc::new(
+            normalize_supported_models(pool.supported_models.clone())
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        ),
+    }
+}
+
 impl ExternalPool {
     pub fn is_auto_disabled_now(&self) -> bool {
         if !self.auto_disabled {
@@ -358,6 +488,19 @@ impl ExternalPool {
         self.auto_disabled_until
             .map(|until| until > Utc::now())
             .unwrap_or(true)
+    }
+
+    pub(crate) fn masked_for_admin_response(&self) -> Self {
+        let mut masked = self.clone();
+        if masked.masked_api_key.is_none() {
+            masked.masked_api_key = self
+                .api_key
+                .as_deref()
+                .map(mask_external_pool_key)
+                .or_else(|| self.masked_api_key.clone());
+        }
+        masked.api_key = None;
+        masked
     }
 }
 
@@ -476,12 +619,6 @@ pub struct ExternalPoolStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalPoolsListResponse {
-    pub pools: Vec<ExternalPool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ExternalPoolsStatusResponse {
     pub pools: Vec<ExternalPoolStatus>,
 }
@@ -498,8 +635,136 @@ pub struct ExternalPoolTestResponse {
     pub response: Option<String>,
 }
 
+#[derive(Default)]
+pub(crate) struct ExternalRouteRequestPreparationCache {
+    normalized_base: OnceLock<Result<Arc<body_pipeline::NormalizedRequestBase>, PayloadGuardError>>,
+    raw_projection_payload: OnceLock<Option<Arc<MessagesRequest>>>,
+    known_tool_names: OnceLock<Arc<Vec<String>>>,
+    usage_projection_template:
+        OnceLock<Option<Arc<usage_projection::ExternalUsageProjectionTemplate>>>,
+    #[cfg(test)]
+    operation_counts: ExternalRequestPreparationOperationCountState,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ExternalRequestPreparationOperationCounts {
+    pub(crate) raw_payload_parses: u64,
+    pub(crate) normalized_base_builds: u64,
+    pub(crate) normalized_original_value_parses: u64,
+    pub(crate) normalized_json_serializations: u64,
+    pub(crate) payload_guard_serializations: u64,
+    pub(crate) known_tool_name_builds: u64,
+    pub(crate) usage_projection_builds: u64,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ExternalRequestPreparationOperationCountState {
+    raw_payload_parses: AtomicU64,
+    normalized_base_builds: AtomicU64,
+    normalized_original_value_parses: AtomicU64,
+    normalized_json_serializations: AtomicU64,
+    payload_guard_serializations: AtomicU64,
+    known_tool_name_builds: AtomicU64,
+    usage_projection_builds: AtomicU64,
+}
+
+impl ExternalRouteRequestPreparationCache {
+    fn record_raw_payload_parse(&self) {
+        #[cfg(test)]
+        self.operation_counts
+            .raw_payload_parses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_normalized_base_build(&self) {
+        #[cfg(test)]
+        self.operation_counts
+            .normalized_base_builds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_normalized_original_value_parse(&self) {
+        #[cfg(test)]
+        self.operation_counts
+            .normalized_original_value_parses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_normalized_json_serialization(&self) {
+        #[cfg(test)]
+        self.operation_counts
+            .normalized_json_serializations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_payload_guard_serializations(&self, count: usize) {
+        #[cfg(test)]
+        self.operation_counts
+            .payload_guard_serializations
+            .fetch_add(count as u64, Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = count;
+    }
+
+    fn record_known_tool_name_build(&self) {
+        #[cfg(test)]
+        self.operation_counts
+            .known_tool_name_builds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_usage_projection_build(&self) {
+        #[cfg(test)]
+        self.operation_counts
+            .usage_projection_builds
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn operation_counts(&self) -> ExternalRequestPreparationOperationCounts {
+        ExternalRequestPreparationOperationCounts {
+            raw_payload_parses: self
+                .operation_counts
+                .raw_payload_parses
+                .load(Ordering::Relaxed),
+            normalized_base_builds: self
+                .operation_counts
+                .normalized_base_builds
+                .load(Ordering::Relaxed),
+            normalized_original_value_parses: self
+                .operation_counts
+                .normalized_original_value_parses
+                .load(Ordering::Relaxed),
+            normalized_json_serializations: self
+                .operation_counts
+                .normalized_json_serializations
+                .load(Ordering::Relaxed),
+            payload_guard_serializations: self
+                .operation_counts
+                .payload_guard_serializations
+                .load(Ordering::Relaxed),
+            known_tool_name_builds: self
+                .operation_counts
+                .known_tool_name_builds
+                .load(Ordering::Relaxed),
+            usage_projection_builds: self
+                .operation_counts
+                .usage_projection_builds
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ExternalRouteRequest {
+    /// Immutable bytes after entry defaults, before compatibility/body transformations.
+    pub effective_raw_body: Bytes,
+    /// Probe bound to `effective_raw_body`; shared across every failover candidate.
+    pub(crate) effective_raw_probe: Option<Arc<RawMessagesBodyProbe>>,
+    pub(crate) preparation_cache: Arc<ExternalRouteRequestPreparationCache>,
+    /// Mutable working serialization used by normalized/local processing.
     pub raw_body: Bytes,
     pub headers: HeaderMap,
     pub endpoint: String,
@@ -545,6 +810,16 @@ pub struct ExternalRouteRequest {
     pub payload_guard_external_enabled: bool,
     pub payload_guard_initial_config: PayloadGuardConfig,
     pub payload_guard_retry_config: Option<PayloadGuardConfig>,
+    pub inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    pub request_api_key_id: Option<String>,
+}
+
+fn route_allows_degraded_fallback_local_lease(route: &ExternalRouteRequest) -> bool {
+    matches!(
+        route.route_subtype,
+        UsageRouteSubtype::ExternalFallbackPreflight
+            | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
+    ) && route.fallback_reason.as_deref() == Some("local_scheduler_redis_degraded")
 }
 
 impl ExternalRouteRequest {
@@ -606,6 +881,34 @@ impl ExternalRouteRequest {
             .as_ref()
             .and_then(crate::anthropic::converter::extract_stable_conversation_id)
     }
+
+    fn reset_preparation_cache(&mut self) {
+        self.preparation_cache = Arc::new(ExternalRouteRequestPreparationCache::default());
+    }
+
+    #[cfg(test)]
+    fn preparation_operation_counts(&self) -> ExternalRequestPreparationOperationCounts {
+        self.preparation_cache.operation_counts()
+    }
+}
+
+fn external_route_raw_projection_payload(
+    route: &ExternalRouteRequest,
+) -> Option<Arc<MessagesRequest>> {
+    route
+        .preparation_cache
+        .raw_projection_payload
+        .get_or_init(|| {
+            let probe = route
+                .effective_raw_probe
+                .as_deref()
+                .filter(|probe| probe.matches_body(&route.effective_raw_body))?;
+            route.preparation_cache.record_raw_payload_parse();
+            deserialize_messages_request_with_probe(&route.effective_raw_body, probe)
+                .ok()
+                .map(Arc::new)
+        })
+        .clone()
 }
 
 #[derive(Debug, Default)]
@@ -653,6 +956,8 @@ impl ExternalLatencyTraceState {
     fn snapshot(&self) -> Option<UsageLatencyTrace> {
         let first_output_delta_ms = load_nonzero(&self.first_output_delta_ms);
         let trace = UsageLatencyTrace {
+            inference_attempts: None,
+            auxiliary_attempts: None,
             capacity_weight_units: None,
             estimated_input_tokens: None,
             payload_guard_ms: None,
@@ -676,6 +981,7 @@ impl ExternalLatencyTraceState {
             upstream_event_types_before_first_output: None,
             stream_retry_attempts: None,
             stream_retry_reasons: None,
+            stream_retry_dispatch_failures: None,
             client_dropped_ms: None,
             terminal_reason: None,
             upstream_message_status: None,
@@ -685,6 +991,9 @@ impl ExternalLatencyTraceState {
             intent_preamble_risk: None,
             suspected_tool_context_leak_end_turn: None,
             tool_context_leak_markers: None,
+            suppressed_tool_context_leak_blocks: None,
+            suppressed_tool_context_leak_chars: None,
+            suppressed_tool_context_leak_kinds: None,
             assistant_tail_intent_hint: None,
             end_turn_anomaly_reason: None,
             end_turn_anomaly_risk: None,
@@ -707,6 +1016,15 @@ fn load_nonzero(value: &AtomicU64) -> Option<u64> {
     (value > 0).then_some(value)
 }
 
+fn external_pool_coordination_monotonic_ms() -> u64 {
+    static STARTED_AT: OnceLock<Instant> = OnceLock::new();
+    STARTED_AT
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 struct ExternalForwardResponse {
     response: Response,
     outbound_model: Option<String>,
@@ -715,9 +1033,17 @@ struct ExternalForwardResponse {
     stream_usage_projection: Option<ExternalUsageProjectionContext>,
 }
 
+struct PreparedExternalForwardRequest {
+    request: reqwest::RequestBuilder,
+    outbound_model: Option<String>,
+    known_tool_names: Arc<Vec<String>>,
+    response_body_timeout_secs: u64,
+}
+
 struct ExternalForwardError {
     err: ExternalPoolError,
     outbound_model: Option<String>,
+    attempt_rejection: Option<InferenceAttemptRejection>,
 }
 
 impl ExternalForwardError {
@@ -725,6 +1051,19 @@ impl ExternalForwardError {
         Self {
             err,
             outbound_model,
+            attempt_rejection: None,
+        }
+    }
+
+    fn dispatch_rejected(
+        err: ExternalPoolError,
+        outbound_model: Option<String>,
+        rejection: InferenceAttemptRejection,
+    ) -> Self {
+        Self {
+            err,
+            outbound_model,
+            attempt_rejection: Some(rejection),
         }
     }
 }
@@ -732,6 +1071,82 @@ impl ExternalForwardError {
 impl From<ExternalPoolError> for ExternalForwardError {
     fn from(err: ExternalPoolError) -> Self {
         Self::new(err, None)
+    }
+}
+
+fn external_pool_lease_lost_forward_error(outbound_model: Option<String>) -> ExternalForwardError {
+    ExternalForwardError::new(
+        ExternalPoolError {
+            status: Some(StatusCode::SERVICE_UNAVAILABLE),
+            message: "external pool lease coordination was lost".to_string(),
+            retryable: false,
+            auto_disable_reason: None,
+            cooldown: None,
+            protocol_error: None,
+        },
+        outbound_model,
+    )
+}
+
+fn external_response_body_read_error(
+    err: HttpSendError,
+    status: StatusCode,
+    max_bytes: usize,
+    outbound_model: Option<String>,
+) -> ExternalForwardError {
+    let (message, retryable) = match err {
+        HttpSendError::ResponseBodyTooLarge { .. } => (
+            format!("model endpoint response body exceeds {max_bytes} bytes"),
+            false,
+        ),
+        HttpSendError::ResponseBodyTimeout { timeout_secs } => (
+            format!("model endpoint response body timeout after {timeout_secs} seconds"),
+            true,
+        ),
+        HttpSendError::ResponseHeaderTimeout { timeout_secs } => (
+            format!("model endpoint response header timeout after {timeout_secs} seconds"),
+            true,
+        ),
+        HttpSendError::Request(err) => (
+            sanitized_external_network_error("response read failed", &err),
+            true,
+        ),
+    };
+    ExternalForwardError::new(
+        ExternalPoolError {
+            status: Some(status),
+            message,
+            retryable,
+            auto_disable_reason: None,
+            cooldown: None,
+            protocol_error: None,
+        },
+        outbound_model,
+    )
+}
+
+fn inference_attempt_rejection_reason(rejection: InferenceAttemptRejection) -> &'static str {
+    match rejection {
+        InferenceAttemptRejection::Exhausted => "inference_attempt_limit",
+        InferenceAttemptRejection::ReservedForFallback => "inference_attempt_reserved_for_fallback",
+        InferenceAttemptRejection::DownstreamCommitted => "downstream_committed",
+    }
+}
+
+fn external_attempt_rejection_final_error(
+    route: &ExternalRouteRequest,
+    attempts: Vec<ExternalPoolAttempt>,
+) -> ExternalPoolFinalError {
+    ExternalPoolFinalError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        response_error_type: "service_unavailable".to_string(),
+        route_error_type: "inference_attempt_policy".to_string(),
+        message: "Request could not be completed. Please retry shortly.".to_string(),
+        error_id: route.error_id.clone(),
+        retryable: false,
+        attempts,
+        pool_id: None,
+        pool_name: None,
     }
 }
 
@@ -946,112 +1361,1151 @@ fn external_pool_max_input_tokens_for_route(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPoolSelectionFailureKind {
+    AdmissionSaturated,
+    BreakerOpen,
+    PostgresError,
+    PostgresTimeout,
+}
+
+impl ExternalPoolSelectionFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AdmissionSaturated => "admission_saturated",
+            Self::BreakerOpen => "breaker_open",
+            Self::PostgresError => "postgres_error",
+            Self::PostgresTimeout => "postgres_timeout",
+        }
+    }
+
+    fn coordinator_kind(self) -> PoolCoordinatorUnavailableKind {
+        match self {
+            Self::AdmissionSaturated => PoolCoordinatorUnavailableKind::AdmissionSaturated,
+            Self::BreakerOpen => PoolCoordinatorUnavailableKind::PostgresCircuitOpen,
+            Self::PostgresError => PoolCoordinatorUnavailableKind::PostgresError,
+            Self::PostgresTimeout => PoolCoordinatorUnavailableKind::PostgresTimeout,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalPoolSelectionUnavailable {
+    kind: ExternalPoolSelectionFailureKind,
+    retry_after: Duration,
+}
+
+#[derive(Debug, Default)]
+struct ExternalPoolSelectionBreakerState {
+    generation: u64,
+    consecutive_failures: usize,
+    open_until: Option<Instant>,
+    recovery_probe_in_flight: bool,
+}
+
+#[derive(Debug, Default)]
+struct ExternalPoolSelectionBreakerStats {
+    postgres_attempts: AtomicU64,
+    saturated: AtomicU64,
+    fail_fast: AtomicU64,
+    recovery_probes: AtomicU64,
+    failures: AtomicU64,
+    transitions: AtomicU64,
+    recoveries: AtomicU64,
+    cancelled_probes: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ExternalPoolSelectionBreaker {
+    state: SyncMutex<ExternalPoolSelectionBreakerState>,
+    stats: ExternalPoolSelectionBreakerStats,
+    operation_semaphore: Arc<Semaphore>,
+    backoffs: Vec<Duration>,
+    jitter_percent: u8,
+}
+
+impl Default for ExternalPoolSelectionBreaker {
+    fn default() -> Self {
+        Self::new(
+            EXTERNAL_POOL_SELECTION_MAX_IN_FLIGHT,
+            EXTERNAL_POOL_SELECTION_BREAKER_BACKOFF_MILLIS
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect(),
+            EXTERNAL_POOL_SELECTION_BREAKER_JITTER_PERCENT,
+        )
+    }
+}
+
+impl ExternalPoolSelectionBreaker {
+    fn new(max_in_flight: usize, backoffs: Vec<Duration>, jitter_percent: u8) -> Self {
+        let backoffs = if backoffs.is_empty() {
+            vec![Duration::from_millis(100)]
+        } else {
+            backoffs
+                .into_iter()
+                .map(|backoff| backoff.max(Duration::from_millis(1)))
+                .collect()
+        };
+        Self {
+            state: SyncMutex::new(ExternalPoolSelectionBreakerState::default()),
+            stats: ExternalPoolSelectionBreakerStats::default(),
+            operation_semaphore: Arc::new(Semaphore::new(max_in_flight.max(1))),
+            backoffs,
+            jitter_percent: jitter_percent.min(50),
+        }
+    }
+
+    fn base_backoff_for_failure(&self, consecutive_failures: usize) -> Duration {
+        self.backoffs[consecutive_failures
+            .saturating_sub(1)
+            .min(self.backoffs.len().saturating_sub(1))]
+    }
+
+    fn backoff_for_failure(&self, consecutive_failures: usize, generation: u64) -> Duration {
+        deterministic_duration_jitter(
+            self.base_backoff_for_failure(consecutive_failures),
+            self.jitter_percent,
+            generation ^ (consecutive_failures as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        )
+    }
+
+    fn try_begin(
+        self: &Arc<Self>,
+    ) -> Result<ExternalPoolSelectionPermit, ExternalPoolSelectionUnavailable> {
+        let operation_permit = match self.operation_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.stats.saturated.fetch_add(1, Ordering::Relaxed);
+                self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                return Err(ExternalPoolSelectionUnavailable {
+                    kind: ExternalPoolSelectionFailureKind::AdmissionSaturated,
+                    retry_after: Duration::from_millis(100),
+                });
+            }
+        };
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        let recovery_probe = match state.open_until {
+            Some(open_until) if open_until > now => {
+                self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                return Err(ExternalPoolSelectionUnavailable {
+                    kind: ExternalPoolSelectionFailureKind::BreakerOpen,
+                    retry_after: open_until.saturating_duration_since(now),
+                });
+            }
+            Some(_) => {
+                if state.recovery_probe_in_flight {
+                    self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                    self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                    return Err(ExternalPoolSelectionUnavailable {
+                        kind: ExternalPoolSelectionFailureKind::BreakerOpen,
+                        retry_after: Duration::from_millis(100),
+                    });
+                }
+                state.recovery_probe_in_flight = true;
+                self.stats.recovery_probes.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        };
+        self.stats.postgres_attempts.fetch_add(1, Ordering::Relaxed);
+        Ok(ExternalPoolSelectionPermit {
+            breaker: self.clone(),
+            generation: state.generation,
+            recovery_probe,
+            completed: false,
+            _operation_permit: operation_permit,
+        })
+    }
+
+    fn complete_success(&self, generation: u64, recovery_probe: bool) {
+        let mut state = self.state.lock();
+        if generation != state.generation {
+            return;
+        }
+        if recovery_probe {
+            state.generation = state.generation.wrapping_add(1);
+            state.consecutive_failures = 0;
+            state.open_until = None;
+            state.recovery_probe_in_flight = false;
+            self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
+            let suppressed = self.stats.suppressed.swap(0, Ordering::Relaxed);
+            tracing::info!(
+                suppressed_requests = suppressed,
+                "外部池 PostgreSQL selection 恢复，关闭准入熔断"
+            );
+        }
+    }
+
+    fn complete_failure(
+        &self,
+        generation: u64,
+        recovery_probe: bool,
+        kind: ExternalPoolSelectionFailureKind,
+    ) {
+        self.stats.failures.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.state.lock();
+        if generation != state.generation {
+            return;
+        }
+        state.recovery_probe_in_flight = false;
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let backoff = self.backoff_for_failure(state.consecutive_failures, state.generation);
+        state.open_until = Some(Instant::now() + backoff);
+        state.generation = state.generation.wrapping_add(1);
+        self.stats.transitions.fetch_add(1, Ordering::Relaxed);
+        let suppressed = self.stats.suppressed.swap(0, Ordering::Relaxed);
+        tracing::warn!(
+            failure_kind = kind.as_str(),
+            recovery_probe,
+            consecutive_failures = state.consecutive_failures,
+            backoff_ms = backoff.as_millis(),
+            suppressed_requests = suppressed,
+            "外部池 PostgreSQL selection 不可用，短期暂停新的查询"
+        );
+    }
+
+    fn cancel_probe(&self, generation: u64) {
+        let mut state = self.state.lock();
+        if generation != state.generation || !state.recovery_probe_in_flight {
+            return;
+        }
+        state.recovery_probe_in_flight = false;
+        let failure_count = state.consecutive_failures.max(1);
+        let backoff = self.backoff_for_failure(failure_count, state.generation);
+        state.open_until = Some(Instant::now() + backoff);
+        state.generation = state.generation.wrapping_add(1);
+        self.stats.cancelled_probes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct ExternalPoolSelectionPermit {
+    breaker: Arc<ExternalPoolSelectionBreaker>,
+    generation: u64,
+    recovery_probe: bool,
+    completed: bool,
+    _operation_permit: OwnedSemaphorePermit,
+}
+
+impl ExternalPoolSelectionPermit {
+    fn success(mut self) {
+        self.completed = true;
+        self.breaker
+            .complete_success(self.generation, self.recovery_probe);
+    }
+
+    fn failure(mut self, kind: ExternalPoolSelectionFailureKind) {
+        self.completed = true;
+        self.breaker
+            .complete_failure(self.generation, self.recovery_probe, kind);
+    }
+}
+
+impl Drop for ExternalPoolSelectionPermit {
+    fn drop(&mut self) {
+        if !self.completed && self.recovery_probe {
+            self.breaker.cancel_probe(self.generation);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPoolCoordinatorFailureKind {
+    RedisError,
+    Timeout,
+}
+
+impl ExternalPoolCoordinatorFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RedisError => "redis_error",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExternalPoolCoordinatorOpen {
+    retry_after: Duration,
+}
+
+#[derive(Debug)]
+struct ExternalPoolCoordinatorBreakerState {
+    generation: u64,
+    consecutive_failures: usize,
+    open_until: Option<Instant>,
+    recovery_probe_in_flight: bool,
+}
+
+impl Default for ExternalPoolCoordinatorBreakerState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            consecutive_failures: 0,
+            open_until: None,
+            recovery_probe_in_flight: false,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExternalPoolCoordinatorBreakerStats {
+    admitted: AtomicU64,
+    saturated: AtomicU64,
+    fail_fast: AtomicU64,
+    recovery_probes: AtomicU64,
+    failures: AtomicU64,
+    recoveries: AtomicU64,
+    cancelled_probes: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ExternalPoolCoordinatorBreaker {
+    state: SyncMutex<ExternalPoolCoordinatorBreakerState>,
+    stats: ExternalPoolCoordinatorBreakerStats,
+    backoffs: Vec<Duration>,
+    operation_semaphore: Arc<Semaphore>,
+}
+
+impl Default for ExternalPoolCoordinatorBreaker {
+    fn default() -> Self {
+        Self::new(
+            EXTERNAL_POOL_COORDINATOR_BREAKER_BACKOFF_SECS
+                .into_iter()
+                .map(Duration::from_secs)
+                .collect(),
+        )
+    }
+}
+
+impl ExternalPoolCoordinatorBreaker {
+    fn new(backoffs: Vec<Duration>) -> Self {
+        let backoffs = if backoffs.is_empty() {
+            vec![Duration::from_secs(1)]
+        } else {
+            backoffs
+                .into_iter()
+                .map(|backoff| backoff.max(Duration::from_millis(1)))
+                .collect()
+        };
+        Self {
+            state: SyncMutex::new(ExternalPoolCoordinatorBreakerState::default()),
+            stats: ExternalPoolCoordinatorBreakerStats::default(),
+            backoffs,
+            operation_semaphore: Arc::new(Semaphore::new(EXTERNAL_POOL_COORDINATOR_MAX_IN_FLIGHT)),
+        }
+    }
+
+    fn backoff_for_failure(&self, consecutive_failures: usize) -> Duration {
+        self.backoffs[consecutive_failures
+            .saturating_sub(1)
+            .min(self.backoffs.len().saturating_sub(1))]
+    }
+
+    fn try_begin(
+        self: &Arc<Self>,
+    ) -> Result<ExternalPoolCoordinatorPermit, ExternalPoolCoordinatorOpen> {
+        let operation_permit = match self.operation_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.stats.saturated.fetch_add(1, Ordering::Relaxed);
+                self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                return Err(ExternalPoolCoordinatorOpen {
+                    retry_after: Duration::from_millis(100),
+                });
+            }
+        };
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        let recovery_probe = match state.open_until {
+            Some(open_until) if open_until > now => {
+                self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                return Err(ExternalPoolCoordinatorOpen {
+                    retry_after: open_until.saturating_duration_since(now),
+                });
+            }
+            Some(_) => {
+                if state.recovery_probe_in_flight {
+                    self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                    self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                    return Err(ExternalPoolCoordinatorOpen {
+                        retry_after: Duration::from_millis(100),
+                    });
+                }
+                state.recovery_probe_in_flight = true;
+                self.stats.recovery_probes.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        };
+        self.stats.admitted.fetch_add(1, Ordering::Relaxed);
+        Ok(ExternalPoolCoordinatorPermit {
+            breaker: self.clone(),
+            generation: state.generation,
+            recovery_probe,
+            completed: false,
+            _operation_permit: operation_permit,
+        })
+    }
+
+    fn complete_success(&self, generation: u64, recovery_probe: bool) {
+        let mut state = self.state.lock();
+        if generation != state.generation {
+            return;
+        }
+        if recovery_probe {
+            state.generation = state.generation.wrapping_add(1);
+            state.consecutive_failures = 0;
+            state.open_until = None;
+            state.recovery_probe_in_flight = false;
+            self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
+            let suppressed = self.stats.suppressed.swap(0, Ordering::Relaxed);
+            tracing::info!(
+                suppressed_requests = suppressed,
+                "外部池 Redis coordinator 恢复，关闭准入熔断"
+            );
+        }
+    }
+
+    fn complete_failure(
+        &self,
+        generation: u64,
+        recovery_probe: bool,
+        kind: ExternalPoolCoordinatorFailureKind,
+    ) {
+        let mut state = self.state.lock();
+        if generation != state.generation {
+            return;
+        }
+        state.recovery_probe_in_flight = false;
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let backoff = self.backoff_for_failure(state.consecutive_failures);
+        state.open_until = Some(Instant::now() + backoff);
+        state.generation = state.generation.wrapping_add(1);
+        self.stats.failures.fetch_add(1, Ordering::Relaxed);
+        let suppressed = self.stats.suppressed.swap(0, Ordering::Relaxed);
+        tracing::warn!(
+            failure_kind = kind.as_str(),
+            recovery_probe,
+            consecutive_failures = state.consecutive_failures,
+            backoff_ms = backoff.as_millis(),
+            suppressed_requests = suppressed,
+            "外部池 Redis coordinator 不可用，暂停新的外部池准入"
+        );
+    }
+
+    fn cancel_probe(&self, generation: u64) {
+        let mut state = self.state.lock();
+        if generation != state.generation || !state.recovery_probe_in_flight {
+            return;
+        }
+        state.recovery_probe_in_flight = false;
+        let backoff = self.backoff_for_failure(state.consecutive_failures.max(1));
+        state.open_until = Some(Instant::now() + backoff);
+        state.generation = state.generation.wrapping_add(1);
+        self.stats.cancelled_probes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct ExternalPoolCoordinatorPermit {
+    breaker: Arc<ExternalPoolCoordinatorBreaker>,
+    generation: u64,
+    recovery_probe: bool,
+    completed: bool,
+    _operation_permit: OwnedSemaphorePermit,
+}
+
+impl ExternalPoolCoordinatorPermit {
+    fn success(mut self) {
+        self.completed = true;
+        self.breaker
+            .complete_success(self.generation, self.recovery_probe);
+    }
+
+    fn failure(mut self, kind: ExternalPoolCoordinatorFailureKind) {
+        self.completed = true;
+        self.breaker
+            .complete_failure(self.generation, self.recovery_probe, kind);
+    }
+}
+
+impl Drop for ExternalPoolCoordinatorPermit {
+    fn drop(&mut self) {
+        if !self.completed && self.recovery_probe {
+            self.breaker.cancel_probe(self.generation);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ExternalPoolManager {
     postgres: Arc<PostgresStore>,
     redis: Arc<RedisStore>,
     client: reqwest::Client,
-    capacity_notify: Arc<Notify>,
+    capacity_signal: Arc<CapacitySignal>,
+    #[cfg(test)]
     availability_cache: Arc<SyncMutex<Option<CachedPoolAvailabilitySnapshot>>>,
+    static_pool_snapshot: Arc<SyncMutex<Option<CachedStaticPoolSnapshot>>>,
+    static_pool_snapshot_generation: Arc<AtomicU64>,
+    static_pool_snapshot_refresh_lock: Arc<AsyncMutex<()>>,
+    authoritative_pool_snapshot: Arc<SyncMutex<Option<CachedAuthoritativePoolSnapshot>>>,
+    authoritative_pool_snapshot_refresh_lock: Arc<AsyncMutex<()>>,
+    authoritative_pool_snapshot_changed: Arc<Notify>,
+    selection_runtime_snapshot: Arc<SyncMutex<Option<CachedSelectionRuntimeSnapshot>>>,
+    selection_runtime_snapshot_refresh_lock: Arc<AsyncMutex<()>>,
+    static_pool_snapshot_fresh_ttl: Duration,
+    static_pool_snapshot_stale_ttl: Duration,
+    static_pool_snapshot_failure_retry: Duration,
+    static_pool_snapshot_refresh_timeout: Duration,
+    #[cfg(test)]
+    static_pool_snapshot_pg_loads: Arc<AtomicU64>,
+    #[cfg(test)]
+    static_pool_snapshot_background_refreshes: Arc<AtomicU64>,
+    #[cfg(test)]
+    static_pool_snapshot_background_in_flight: Arc<AtomicU64>,
+    #[cfg(test)]
+    authoritative_pool_snapshot_pg_loads: Arc<AtomicU64>,
+    coordinator_breaker: Arc<ExternalPoolCoordinatorBreaker>,
+    selection_breaker: Arc<ExternalPoolSelectionBreaker>,
+    selection_saturated: Arc<AtomicU64>,
+    dispatch_fence_flights: Arc<SyncMutex<HashMap<(u64, u64), Arc<PoolDispatchFenceFlight>>>>,
+    #[cfg(test)]
+    dispatch_fence_pg_loads: Arc<AtomicU64>,
+    #[cfg(test)]
+    dispatch_after_prepare_gate: Arc<SyncMutex<Option<Arc<TestDispatchAfterPrepareGate>>>>,
+    observed_pool_data_generation: Arc<AtomicU64>,
+    success_reset_recent: Arc<SyncMutex<HashMap<u64, Instant>>>,
+    success_reset_semaphore: Arc<Semaphore>,
+    #[cfg(test)]
+    success_reset_tasks_started: Arc<AtomicU64>,
+    #[cfg(test)]
+    success_reset_tasks_in_flight: Arc<AtomicU64>,
+    coordinator_reconcile_lock: Arc<AsyncMutex<()>>,
+    coordinator_epoch: Arc<SyncMutex<Option<String>>>,
+    coordinator_run_id: Arc<SyncMutex<Option<String>>>,
+    coordinator_probe_required: Arc<AtomicBool>,
+    coordinator_next_probe_ms: Arc<AtomicU64>,
+    coordinator_recovery_grace: Duration,
+    release_dispatcher: Arc<ExternalPoolReleaseDispatcher>,
+    degraded_fallback_local_leases: Arc<SyncMutex<HashMap<(u64, u32), Arc<Semaphore>>>>,
+    local_mutation_dispatch_trust: Arc<SyncMutex<HashMap<(u64, u64), Instant>>>,
 }
 
 struct ExternalPoolLease {
     manager: ExternalPoolManager,
     pool_id: u64,
-    lease_id: u64,
+    lease_id: String,
+    coordination_epoch: String,
+    state: ExternalPoolLeaseState,
+    max_age: Duration,
+    heartbeat: Option<ExternalPoolLeaseHeartbeat>,
+    release_permit: Option<OwnedSemaphorePermit>,
+}
+
+struct ExternalPoolLeaseHeartbeat {
+    state: Arc<ExternalPoolLeaseHeartbeatState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ExternalPoolLeaseHeartbeatState {
+    lost: AtomicBool,
+    attempts: AtomicU64,
+    failures: AtomicU64,
+    lost_notify: Notify,
+}
+
+impl ExternalPoolLeaseHeartbeatState {
+    fn mark_lost(&self) {
+        if !self.lost.swap(true, Ordering::AcqRel) {
+            self.lost_notify.notify_waiters();
+        }
+    }
+
+    async fn wait_until_lost(&self) {
+        loop {
+            if self.lost.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.lost_notify.notified();
+            if self.lost.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl ExternalPoolLeaseHeartbeat {
+    fn spawn(
+        manager: ExternalPoolManager,
+        pool_id: u64,
+        lease_id: String,
+        coordination_epoch: String,
+        max_age: Duration,
+    ) -> Self {
+        let state = Arc::new(ExternalPoolLeaseHeartbeatState::default());
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_external_pool_lease_heartbeat(
+                manager,
+                pool_id,
+                lease_id,
+                coordination_epoch,
+                max_age,
+                task_state,
+            )
+            .await;
+        });
+        Self { state, task }
+    }
+
+    async fn wait_until_lost(&self) {
+        self.state.wait_until_lost().await;
+    }
+
+    fn stop(self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPoolLeaseState {
+    Pending,
+    Confirmed,
+    DegradedFallbackLocal,
+    Disarmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExternalPoolLeaseReleaseKind {
+    Pending,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExternalPoolReleaseIntent {
+    pool_id: u64,
+    lease_id: String,
+    release_kind: ExternalPoolLeaseReleaseKind,
+}
+
+#[derive(Default)]
+struct ExternalPoolReleaseDispatcherState {
+    pending: HashMap<ExternalPoolReleaseIntent, ExternalPoolPendingRelease>,
+    order: VecDeque<ExternalPoolReleaseIntent>,
+    system_failures: u32,
+    system_retry_at: Option<Instant>,
+    worker_running: bool,
+}
+
+struct ExternalPoolPendingRelease {
+    _permit: OwnedSemaphorePermit,
+    failures: u32,
+    next_attempt_at: Instant,
+}
+
+impl ExternalPoolReleaseDispatcherState {
+    fn next_ready_batch(
+        &mut self,
+        now: Instant,
+        limit: usize,
+    ) -> (Vec<ExternalPoolReleaseIntent>, Option<Instant>) {
+        if let Some(retry_at) = self.system_retry_at {
+            if retry_at > now {
+                return (Vec::new(), Some(retry_at));
+            }
+            self.system_retry_at = None;
+        }
+        let candidates = self.order.len();
+        let mut batch = Vec::with_capacity(limit);
+        let mut next_attempt_at: Option<Instant> = None;
+        for _ in 0..candidates {
+            if batch.len() >= limit {
+                break;
+            }
+            let Some(intent) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(next_attempt) = self
+                .pending
+                .get(&intent)
+                .map(|pending| pending.next_attempt_at)
+            {
+                self.order.push_back(intent.clone());
+                if next_attempt <= now {
+                    batch.push(intent);
+                } else {
+                    next_attempt_at = Some(
+                        next_attempt_at
+                            .map(|next| next.min(next_attempt))
+                            .unwrap_or(next_attempt),
+                    );
+                }
+            }
+        }
+        (batch, next_attempt_at)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExternalPoolReleaseDispatcherStats {
+    enqueued: AtomicU64,
+    deduplicated: AtomicU64,
+    completed: AtomicU64,
+    retries: AtomicU64,
+    worker_starts: AtomicU64,
+    spawn_failures: AtomicU64,
+}
+
+struct ExternalPoolReleaseDispatcher {
+    redis: Arc<RedisStore>,
+    capacity_signal: Arc<CapacitySignal>,
+    capacity: Arc<Semaphore>,
+    drained_notify: Notify,
+    work_notify: Notify,
+    state: SyncMutex<ExternalPoolReleaseDispatcherState>,
+    stats: ExternalPoolReleaseDispatcherStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalPoolReleaseDrainReport {
+    pub drained: bool,
+    pub pending: usize,
+    pub enqueued: u64,
+    pub completed: u64,
+    pub retries: u64,
+    pub worker_starts: u64,
+    pub spawn_failures: u64,
+}
+
+impl ExternalPoolReleaseDispatcher {
+    fn new(redis: Arc<RedisStore>, capacity_signal: Arc<CapacitySignal>) -> Arc<Self> {
+        Arc::new(Self {
+            redis,
+            capacity_signal,
+            capacity: Arc::new(Semaphore::new(EXTERNAL_POOL_RELEASE_CAPACITY)),
+            drained_notify: Notify::new(),
+            work_notify: Notify::new(),
+            state: SyncMutex::new(ExternalPoolReleaseDispatcherState::default()),
+            stats: ExternalPoolReleaseDispatcherStats::default(),
+        })
+    }
+
+    fn try_reserve(&self) -> Option<OwnedSemaphorePermit> {
+        self.capacity.clone().try_acquire_owned().ok()
+    }
+
+    fn enqueue(self: &Arc<Self>, intent: ExternalPoolReleaseIntent, permit: OwnedSemaphorePermit) {
+        let should_start = {
+            let mut state = self.state.lock();
+            if state.pending.contains_key(&intent) {
+                self.stats.deduplicated.fetch_add(1, Ordering::Relaxed);
+            } else {
+                state.order.push_back(intent.clone());
+                state.pending.insert(
+                    intent,
+                    ExternalPoolPendingRelease {
+                        _permit: permit,
+                        failures: 0,
+                        next_attempt_at: Instant::now(),
+                    },
+                );
+                self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+            }
+            if state.worker_running {
+                false
+            } else {
+                state.worker_running = true;
+                true
+            }
+        };
+        if !should_start {
+            self.work_notify.notify_one();
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.state.lock().worker_running = false;
+            let failures = self.stats.spawn_failures.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                failures,
+                pending = self.pending_len(),
+                "外部池 Redis release worker 无可用 Tokio runtime，lease 将保留到 TTL 回收"
+            );
+            return;
+        };
+        self.stats.worker_starts.fetch_add(1, Ordering::Relaxed);
+        let dispatcher = self.clone();
+        handle.spawn(async move {
+            dispatcher.run().await;
+        });
+    }
+
+    async fn run(self: Arc<Self>) {
+        loop {
+            let work_available = self.work_notify.notified();
+            tokio::pin!(work_available);
+            work_available.as_mut().enable();
+            let (batch, next_attempt_at) = {
+                let mut state = self.state.lock();
+                if state.pending.is_empty() {
+                    state.order.clear();
+                    state.worker_running = false;
+                    self.drained_notify.notify_waiters();
+                    return;
+                }
+                state.next_ready_batch(Instant::now(), EXTERNAL_POOL_RELEASE_BATCH_SIZE)
+            };
+            if batch.is_empty() {
+                match next_attempt_at {
+                    Some(next_attempt_at) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(next_attempt_at) => {}
+                            _ = work_available.as_mut() => {}
+                        }
+                    }
+                    None => tokio::task::yield_now().await,
+                }
+                continue;
+            }
+            let requests = batch
+                .iter()
+                .map(|intent| ExternalPoolLeaseReleaseRequest {
+                    pool_id: intent.pool_id,
+                    lease_id: intent.lease_id.clone(),
+                    pending: intent.release_kind == ExternalPoolLeaseReleaseKind::Pending,
+                })
+                .collect::<Vec<_>>();
+            let result = timeout(
+                EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
+                self.redis.release_external_pool_leases_batch(&requests),
+            )
+            .await;
+
+            let mut completed = 0usize;
+            let mut released_capacity = 0usize;
+            let batch_response_valid = match result {
+                Ok(Ok(results)) if results.len() == batch.len() => {
+                    let mut state = self.state.lock();
+                    for (intent, result) in batch.iter().zip(results) {
+                        if result.completed && state.pending.remove(intent).is_some() {
+                            completed += 1;
+                            if result.removed {
+                                released_capacity += 1;
+                            }
+                        }
+                    }
+                    state.system_failures = 0;
+                    state.system_retry_at = None;
+                    true
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => false,
+            };
+            let mut failed = 0usize;
+            {
+                let mut state = self.state.lock();
+                if batch_response_valid {
+                    for intent in &batch {
+                        if let Some(pending) = state.pending.get_mut(intent) {
+                            failed += 1;
+                            pending.failures = pending.failures.saturating_add(1);
+                            pending.next_attempt_at = Instant::now()
+                                + external_release_retry_delay(pending.failures, intent);
+                        }
+                    }
+                } else {
+                    failed = batch.len();
+                    state.system_failures = state.system_failures.saturating_add(1);
+                    state.system_retry_at = Some(
+                        Instant::now() + external_release_system_retry_delay(state.system_failures),
+                    );
+                }
+            }
+            if completed > 0 {
+                self.stats
+                    .completed
+                    .fetch_add(completed as u64, Ordering::Relaxed);
+            }
+            self.capacity_signal.capacity_released(released_capacity);
+            if failed == 0 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let retries = self.stats.retries.fetch_add(1, Ordering::Relaxed) + 1;
+            if retries == 1 || retries.is_power_of_two() {
+                tracing::warn!(
+                    retries,
+                    pending = self.pending_len(),
+                    batch_size = batch.len(),
+                    completed,
+                    failed,
+                    "外部池 Redis release 批处理未完整完成，保留 intent 并重试"
+                );
+            }
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.state.lock().pending.len()
+    }
+
+    fn is_drained(&self) -> bool {
+        let state = self.state.lock();
+        state.pending.is_empty() && !state.worker_running
+    }
+
+    async fn drain(&self, drain_timeout: Duration) -> ExternalPoolReleaseDrainReport {
+        let deadline = Instant::now() + drain_timeout;
+        let drained = loop {
+            if self.is_drained() {
+                break true;
+            }
+            let notified = self.drained_notify.notified();
+            if self.is_drained() {
+                break true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break self.is_drained();
+            }
+        };
+        ExternalPoolReleaseDrainReport {
+            drained,
+            pending: self.pending_len(),
+            enqueued: self.stats.enqueued.load(Ordering::Relaxed),
+            completed: self.stats.completed.load(Ordering::Relaxed),
+            retries: self.stats.retries.load(Ordering::Relaxed),
+            worker_starts: self.stats.worker_starts.load(Ordering::Relaxed),
+            spawn_failures: self.stats.spawn_failures.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl ExternalPoolLease {
-    fn touch(&self) -> bool {
-        let manager = self.manager.clone();
-        let pool_id = self.pool_id;
-        let lease_id = self.lease_id;
-        spawn_best_effort_storage_task("更新外部池 Redis 并发 lease 活跃时间", async move {
-            manager.touch_pool(pool_id, lease_id).await
-        })
+    fn pending(
+        manager: ExternalPoolManager,
+        pool_id: u64,
+        lease_id: String,
+        coordination_epoch: String,
+        max_age: Duration,
+        release_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            manager,
+            pool_id,
+            lease_id,
+            coordination_epoch,
+            state: ExternalPoolLeaseState::Pending,
+            max_age,
+            heartbeat: None,
+            release_permit: Some(release_permit),
+        }
+    }
+
+    fn degraded_fallback_local(
+        manager: ExternalPoolManager,
+        pool_id: u64,
+        lease_id: String,
+        release_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            manager,
+            pool_id,
+            lease_id,
+            coordination_epoch: "degraded-fallback-local".to_string(),
+            state: ExternalPoolLeaseState::DegradedFallbackLocal,
+            max_age: Duration::from_secs(EXTERNAL_POOL_LEASE_MAX_AGE_SECS),
+            heartbeat: None,
+            release_permit: Some(release_permit),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.state = ExternalPoolLeaseState::Disarmed;
+    }
+
+    fn confirm(&mut self) {
+        debug_assert_eq!(self.state, ExternalPoolLeaseState::Pending);
+        self.state = ExternalPoolLeaseState::Confirmed;
+        self.heartbeat = Some(ExternalPoolLeaseHeartbeat::spawn(
+            self.manager.clone(),
+            self.pool_id,
+            self.lease_id.clone(),
+            self.coordination_epoch.clone(),
+            self.max_age,
+        ));
+    }
+
+    async fn wait_until_lost(&self) {
+        match self.heartbeat.as_ref() {
+            Some(heartbeat) => heartbeat.wait_until_lost().await,
+            None => std::future::pending().await,
+        }
     }
 }
 
 impl Drop for ExternalPoolLease {
     fn drop(&mut self) {
-        release_external_pool_lease_reliably(self.manager.clone(), self.pool_id, self.lease_id);
-    }
-}
-
-async fn release_external_pool_lease_with_retry(
-    manager: ExternalPoolManager,
-    pool_id: u64,
-    lease_id: u64,
-    attempts: usize,
-) -> anyhow::Result<()> {
-    let attempts = attempts.max(1);
-    let mut last_error = None;
-    for attempt in 0..attempts {
-        match timeout(
-            EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
-            manager.release_pool(pool_id, lease_id),
-        )
-        .await
-        {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(err)) => last_error = Some(err),
-            Err(_) => {
-                last_error = Some(anyhow::anyhow!(
-                    "Redis external pool lease release timed out after {}ms",
-                    EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT.as_millis()
-                ));
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.stop();
+        }
+        let release_kind = match self.state {
+            ExternalPoolLeaseState::Pending => ExternalPoolLeaseReleaseKind::Pending,
+            ExternalPoolLeaseState::Confirmed => ExternalPoolLeaseReleaseKind::Confirmed,
+            ExternalPoolLeaseState::DegradedFallbackLocal => {
+                let _ = self.release_permit.take();
+                return;
             }
-        }
-        if attempt + 1 < attempts {
-            tokio::time::sleep(EXTERNAL_POOL_QUEUE_REDIS_RETRY_DELAY).await;
-        }
-    }
-    Err(anyhow::anyhow!(
-        "external pool lease will be reclaimed by its TTL: {}",
-        last_error.expect("at least one external pool lease release attempt must run")
-    ))
-}
-
-fn release_external_pool_lease_reliably(manager: ExternalPoolManager, pool_id: u64, lease_id: u64) {
-    let fallback_manager = manager.clone();
-    let admitted = spawn_critical_storage_task("释放外部池 Redis 并发 lease", async move {
-        release_external_pool_lease_with_retry(
-            manager,
-            pool_id,
-            lease_id,
-            EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS,
-        )
-        .await
-    });
-    if admitted {
-        return;
-    }
-    if let Err(err) = block_on_storage(
-        "关键队列拒绝后同步释放外部池 Redis 并发 lease",
-        async move {
-            release_external_pool_lease_with_retry(
-                fallback_manager,
-                pool_id,
-                lease_id,
-                EXTERNAL_POOL_LEASE_RELEASE_ATTEMPTS,
-            )
-            .await
-        },
-    ) {
-        tracing::error!(
-            pool_id,
-            lease_id,
-            "外部池 Redis 并发 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
+            ExternalPoolLeaseState::Disarmed => return,
+        };
+        let release_permit = self
+            .release_permit
+            .take()
+            .expect("armed external pool lease must retain release capacity");
+        release_external_pool_lease_reliably(
+            self.manager.clone(),
+            self.pool_id,
+            self.lease_id.clone(),
+            release_kind,
+            release_permit,
         );
     }
+}
+
+async fn run_external_pool_lease_heartbeat(
+    manager: ExternalPoolManager,
+    pool_id: u64,
+    lease_id: String,
+    coordination_epoch: String,
+    max_age: Duration,
+    state: Arc<ExternalPoolLeaseHeartbeatState>,
+) {
+    let max_age_ms = max_age.as_millis().max(300) as u64;
+    let interval = Duration::from_millis(
+        (max_age_ms / 3)
+            .clamp(100, EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS * 1_000)
+            .min(max_age_ms / 2),
+    );
+    let operation_timeout = Duration::from_millis((max_age_ms / 4).clamp(
+        50,
+        EXTERNAL_POOL_COORDINATOR_REDIS_OPERATION_TIMEOUT.as_millis() as u64,
+    ));
+    let loss_after = max_age
+        .saturating_sub(interval.saturating_add(operation_timeout))
+        .max(interval);
+    let retry_delay = Duration::from_millis(EXTERNAL_POOL_LEASE_HEARTBEAT_RETRY_MILLIS)
+        .min(interval)
+        .max(Duration::from_millis(50));
+    let retry_cap = interval.min(Duration::from_secs(30)).max(retry_delay);
+    let lease_ttl_secs = max_age.as_secs().saturating_mul(2).max(1) as usize;
+    let mut last_success = Instant::now();
+    let mut delay = interval;
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        let loss_deadline = last_success + loss_after;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = tokio::time::sleep_until(loss_deadline) => {
+                state.mark_lost();
+                tracing::warn!(
+                    pool_id,
+                    heartbeat_attempts = state.attempts.load(Ordering::Relaxed),
+                    heartbeat_failures = state.failures.load(Ordering::Relaxed),
+                    "外部池 Redis lease heartbeat 到达 prune 安全截止时间，中止当前上游响应"
+                );
+                return;
+            }
+        }
+        state.attempts.fetch_add(1, Ordering::Relaxed);
+        let touch = tokio::select! {
+            touch = timeout(
+                operation_timeout,
+                manager.touch_pool(
+                    pool_id,
+                    &lease_id,
+                    lease_ttl_secs,
+                    &coordination_epoch,
+                ),
+            ) => touch,
+            _ = tokio::time::sleep_until(loss_deadline) => {
+                state.mark_lost();
+                tracing::warn!(
+                    pool_id,
+                    heartbeat_attempts = state.attempts.load(Ordering::Relaxed),
+                    heartbeat_failures = state.failures.load(Ordering::Relaxed),
+                    "外部池 Redis lease heartbeat 操作未在 prune 安全截止时间前完成，中止当前上游响应"
+                );
+                return;
+            }
+        };
+        match touch {
+            Ok(Ok(true)) => {
+                last_success = Instant::now();
+                delay = interval;
+                consecutive_failures = 0;
+            }
+            Ok(Ok(false)) => {
+                state.failures.fetch_add(1, Ordering::Relaxed);
+                state.mark_lost();
+                tracing::warn!(
+                    pool_id,
+                    "外部池 Redis lease heartbeat 发现 lease 已丢失，中止当前上游响应"
+                );
+                return;
+            }
+            Ok(Err(_)) | Err(_) => {
+                state.failures.fetch_add(1, Ordering::Relaxed);
+                if Instant::now() >= loss_deadline {
+                    state.mark_lost();
+                    tracing::warn!(
+                        pool_id,
+                        heartbeat_attempts = state.attempts.load(Ordering::Relaxed),
+                        heartbeat_failures = state.failures.load(Ordering::Relaxed),
+                        "外部池 Redis lease heartbeat 在 prune 安全期限前未恢复，中止当前上游响应"
+                    );
+                    return;
+                }
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let multiplier = 1u32
+                    .checked_shl(consecutive_failures.saturating_sub(1).min(16))
+                    .unwrap_or(u32::MAX);
+                delay = retry_delay.saturating_mul(multiplier).min(retry_cap);
+            }
+        }
+    }
+}
+
+fn release_external_pool_lease_reliably(
+    manager: ExternalPoolManager,
+    pool_id: u64,
+    lease_id: String,
+    release_kind: ExternalPoolLeaseReleaseKind,
+    release_permit: OwnedSemaphorePermit,
+) {
+    manager.release_dispatcher.enqueue(
+        ExternalPoolReleaseIntent {
+            pool_id,
+            lease_id,
+            release_kind,
+        },
+        release_permit,
+    );
 }
 
 async fn release_external_pool_queue_lease_with_retry(
     manager: ExternalPoolManager,
     lease_id: String,
     attempts: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let attempts = attempts.max(1);
     let mut last_error = None;
     for attempt in 0..attempts {
@@ -1061,10 +2515,7 @@ async fn release_external_pool_queue_lease_with_retry(
         )
         .await
         {
-            Ok(Ok(_)) => {
-                manager.capacity_notify.notify_waiters();
-                return Ok(());
-            }
+            Ok(Ok(removed)) => return Ok(removed),
             Ok(Err(err)) => last_error = Some(err),
             Err(_) => {
                 last_error = Some(anyhow::anyhow!(
@@ -1084,39 +2535,117 @@ fn release_external_pool_queue_lease_reliably(manager: ExternalPoolManager, leas
     let fallback_manager = manager.clone();
     let fallback_lease_id = lease_id.clone();
     let admitted = spawn_critical_storage_task("释放外部池 Redis 调度排队 lease", async move {
-        release_external_pool_queue_lease_with_retry(manager, lease_id, 2).await
+        release_external_pool_queue_lease_with_retry(manager, lease_id, 2)
+            .await
+            .map(|_| ())
     });
     if admitted {
         return;
     }
-    if let Err(err) = block_on_storage(
-        "关键队列拒绝后同步释放外部池 Redis 调度排队 lease",
+    spawn_external_release_fallback(
+        "关键队列拒绝后异步释放外部池 Redis 调度排队 lease",
         async move {
             release_external_pool_queue_lease_with_retry(fallback_manager, fallback_lease_id, 2)
                 .await
+                .map(|_| ())
         },
-    ) {
-        tracing::error!(
-            "外部池 Redis 调度排队 lease 有界重试仍失败，将由 lease TTL 回收: {}",
-            err
+    );
+}
+
+static EXTERNAL_POOL_RELEASE_FALLBACK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static EXTERNAL_POOL_RELEASE_FALLBACK_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static EXTERNAL_POOL_RELEASE_FALLBACK_REJECTED: AtomicU64 = AtomicU64::new(0);
+static EXTERNAL_POOL_RELEASE_FALLBACK_FINISHED: AtomicU64 = AtomicU64::new(0);
+
+fn external_pool_release_fallback_semaphore() -> Arc<Semaphore> {
+    EXTERNAL_POOL_RELEASE_FALLBACK_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(EXTERNAL_POOL_RELEASE_FALLBACK_MAX_IN_FLIGHT)))
+        .clone()
+}
+
+fn record_external_release_fallback_rejection(description: &'static str, reason: &'static str) {
+    let rejected = EXTERNAL_POOL_RELEASE_FALLBACK_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if rejected == 1 || rejected.is_power_of_two() {
+        tracing::warn!(
+            description,
+            reason,
+            rejected,
+            max_in_flight = EXTERNAL_POOL_RELEASE_FALLBACK_MAX_IN_FLIGHT,
+            "外部池 Redis release fallback 已饱和，剩余 lease 将由 TTL 回收"
         );
     }
+}
+
+fn spawn_external_release_fallback(
+    description: &'static str,
+    future: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        record_external_release_fallback_rejection(description, "runtime_unavailable");
+        return false;
+    };
+    let Ok(permit) = external_pool_release_fallback_semaphore().try_acquire_owned() else {
+        record_external_release_fallback_rejection(description, "fallback_saturated");
+        return false;
+    };
+    EXTERNAL_POOL_RELEASE_FALLBACK_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    handle.spawn(async move {
+        let _permit = permit;
+        if let Err(err) = future.await {
+            tracing::error!(description, error = %err, "外部池 Redis release 有界重试失败，将由 TTL 回收");
+        }
+        EXTERNAL_POOL_RELEASE_FALLBACK_FINISHED.fetch_add(1, Ordering::Release);
+    });
+    true
 }
 
 struct ExternalPoolQueueGuard {
     manager: ExternalPoolManager,
     lease_id: String,
-    next_renew_at: Instant,
+    lease_ttl_secs: u64,
+    next_renew_at: Option<Instant>,
     released: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalPoolQueueLeasePolicy {
+    ttl_secs: u64,
+    renewal_required: bool,
+}
+
+fn external_pool_queue_lease_policy(max_wait: Option<Duration>) -> ExternalPoolQueueLeasePolicy {
+    let Some(max_wait) = max_wait else {
+        return ExternalPoolQueueLeasePolicy {
+            ttl_secs: EXTERNAL_POOL_QUEUE_LEASE_SAFETY_MARGIN_SECS,
+            renewal_required: true,
+        };
+    };
+    let rounded_wait_secs = max_wait
+        .as_secs()
+        .saturating_add(u64::from(max_wait.subsec_nanos() > 0));
+    ExternalPoolQueueLeasePolicy {
+        ttl_secs: rounded_wait_secs
+            .saturating_add(EXTERNAL_POOL_QUEUE_LEASE_SAFETY_MARGIN_SECS)
+            .max(EXTERNAL_POOL_QUEUE_LEASE_SAFETY_MARGIN_SECS),
+        renewal_required: false,
+    }
+}
+
 impl ExternalPoolQueueGuard {
-    fn new(manager: ExternalPoolManager, lease_id: String) -> Self {
+    fn new(
+        manager: ExternalPoolManager,
+        lease_id: String,
+        policy: ExternalPoolQueueLeasePolicy,
+    ) -> Self {
         Self {
             manager,
             lease_id,
-            next_renew_at: Instant::now()
-                + Duration::from_secs(EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_SECS),
+            lease_ttl_secs: policy.ttl_secs,
+            next_renew_at: policy.renewal_required.then(|| {
+                let renew_interval_secs = (policy.ttl_secs / 3)
+                    .clamp(1, EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_MAX_SECS);
+                Instant::now() + Duration::from_secs(renew_interval_secs)
+            }),
             released: false,
         }
     }
@@ -1126,15 +2655,17 @@ impl ExternalPoolQueueGuard {
     }
 
     async fn renew_if_needed(&mut self) -> anyhow::Result<()> {
-        if Instant::now() < self.next_renew_at {
+        if self
+            .next_renew_at
+            .is_none_or(|renew_at| Instant::now() < renew_at)
+        {
             return Ok(());
         }
         let renewed = timeout(
             EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
-            self.manager.redis.renew_external_pool_dispatch_queue(
-                &self.lease_id,
-                EXTERNAL_POOL_QUEUE_LEASE_TTL_SECS,
-            ),
+            self.manager
+                .redis
+                .renew_external_pool_dispatch_queue(&self.lease_id, self.lease_ttl_secs),
         )
         .await
         .map_err(|_| {
@@ -1146,8 +2677,9 @@ impl ExternalPoolQueueGuard {
         if !renewed {
             anyhow::bail!("Redis external pool queue lease expired before renewal");
         }
-        self.next_renew_at =
-            Instant::now() + Duration::from_secs(EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_SECS);
+        let renew_interval_secs =
+            (self.lease_ttl_secs / 3).clamp(1, EXTERNAL_POOL_QUEUE_LEASE_RENEW_INTERVAL_MAX_SECS);
+        self.next_renew_at = Some(Instant::now() + Duration::from_secs(renew_interval_secs));
         Ok(())
     }
 
@@ -1173,7 +2705,7 @@ struct ExternalPoolError {
     retryable: bool,
     auto_disable_reason: Option<String>,
     cooldown: Option<(Duration, String)>,
-    response_body: Option<Bytes>,
+    protocol_error: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1187,7 +2719,6 @@ struct UsageErrorDiagnostics {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ExternalPoolCooldownState {
-    until: DateTime<Utc>,
     reason: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
@@ -1200,6 +2731,27 @@ enum PoolCapacityWaitReason {
     Cooldown,
     ModelUnavailable,
     CoordinatorUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolCoordinatorUnavailableKind {
+    AdmissionSaturated,
+    PostgresCircuitOpen,
+    PostgresError,
+    PostgresTimeout,
+    RedisError,
+}
+
+impl PoolCoordinatorUnavailableKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AdmissionSaturated => "admission_saturated",
+            Self::PostgresCircuitOpen => "postgres_circuit_open",
+            Self::PostgresError => "postgres_error",
+            Self::PostgresTimeout => "postgres_timeout",
+            Self::RedisError => "redis_error",
+        }
+    }
 }
 
 impl PoolCapacityWaitReason {
@@ -1241,12 +2793,21 @@ enum PoolAcquireResult {
     Unavailable(PoolAcquireUnavailable),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolDispatchFenceResult {
+    Current,
+    Changed,
+    CoordinatorUnavailable(ExternalPoolSelectionUnavailable),
+}
+
 #[derive(Debug, Clone, Default)]
 struct PoolAvailabilitySnapshot {
     eligible_pools: usize,
     available_pools: usize,
     temporary_unavailable_pools: usize,
     coordinator_unavailable: bool,
+    coordinator_unavailable_kind: Option<PoolCoordinatorUnavailableKind>,
+    invalid_runtime_pools: usize,
     wait_reason: Option<PoolCapacityWaitReason>,
     wait_for: Option<Duration>,
     cooldown_reason: Option<String>,
@@ -1258,19 +2819,138 @@ struct PoolAvailabilitySnapshot {
 struct PoolSelectionSnapshot {
     selected_pool: Option<ExternalPool>,
     availability: PoolAvailabilitySnapshot,
+    degraded_fallback_local_lease: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PoolRuntimeSnapshot {
+    in_flight: u32,
+    global_in_flight: u32,
+    pool_cooldown_remaining_secs: u64,
+    pool_cooldown_reason: Option<String>,
+    model_cooldown: Option<(u64, Option<String>)>,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct CachedPoolAvailabilitySnapshot {
+    cache_key: String,
     snapshot: PoolAvailabilitySnapshot,
     expires_at: Instant,
 }
 
-impl PoolAvailabilitySnapshot {
-    fn has_eligible_pool(&self) -> bool {
-        self.eligible_pools > 0
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionRuntimeSnapshotKey {
+    pool_ids: Vec<u64>,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSelectionRuntimeSnapshot {
+    key: SelectionRuntimeSnapshotKey,
+    snapshots: Vec<Result<PoolRuntimeSnapshot, String>>,
+    expires_at: Instant,
+}
+
+fn materialize_selection_runtime_snapshots(
+    snapshots: Vec<Result<PoolRuntimeSnapshot, String>>,
+) -> Vec<anyhow::Result<PoolRuntimeSnapshot>> {
+    snapshots
+        .into_iter()
+        .map(|snapshot| snapshot.map_err(anyhow::Error::msg))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct CachedStaticPoolSnapshot {
+    generation: u64,
+    pools: Arc<Vec<ExternalPoolEligibility>>,
+    fresh_until: Instant,
+    stale_until: Instant,
+    load_succeeded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAuthoritativePoolSnapshot {
+    generation: u64,
+    result: Result<Arc<Vec<ExternalPool>>, ExternalPoolSelectionUnavailable>,
+    fresh_until: Instant,
+    stale_until: Instant,
+}
+
+struct PoolDispatchFenceFlight {
+    result: SyncMutex<Option<PoolDispatchFenceResult>>,
+    ready: Notify,
+}
+
+#[cfg(test)]
+struct TestDispatchAfterPrepareGate {
+    prepared: tokio::sync::Barrier,
+    resume: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl TestDispatchAfterPrepareGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            prepared: tokio::sync::Barrier::new(2),
+            resume: tokio::sync::Barrier::new(2),
+        })
+    }
+}
+
+impl PoolDispatchFenceFlight {
+    fn new() -> Self {
+        Self {
+            result: SyncMutex::new(None),
+            ready: Notify::new(),
+        }
     }
 
+    fn complete(&self, result: PoolDispatchFenceResult) {
+        *self.result.lock() = Some(result);
+        self.ready.notify_waiters();
+    }
+
+    async fn wait(&self) -> PoolDispatchFenceResult {
+        loop {
+            if let Some(result) = *self.result.lock() {
+                return result;
+            }
+            let notified = self.ready.notified();
+            if let Some(result) = *self.result.lock() {
+                return result;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CachedStaticPoolSnapshotState {
+    Fresh(Arc<Vec<ExternalPoolEligibility>>),
+    Stale(Arc<Vec<ExternalPoolEligibility>>),
+}
+
+#[derive(Debug, Clone)]
+enum CachedAuthoritativePoolSnapshotState {
+    Fresh(Result<Arc<Vec<ExternalPool>>, ExternalPoolSelectionUnavailable>),
+    Stale(Arc<Vec<ExternalPool>>),
+}
+
+#[cfg(test)]
+struct StaticPoolBackgroundRefreshActivity {
+    in_flight: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+impl Drop for StaticPoolBackgroundRefreshActivity {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl PoolAvailabilitySnapshot {
     fn has_temporary_unavailable_pool(&self) -> bool {
         self.temporary_unavailable_pools > 0
     }
@@ -1322,7 +3002,25 @@ impl PoolAvailabilitySnapshot {
             eligible_pools: self.eligible_pools,
             available_pools: self.available_pools,
             temporary_unavailable_pools: self.temporary_unavailable_pools,
+            coordinator_unavailable_kind: self.coordinator_unavailable_kind,
         }
+    }
+}
+
+fn selection_unavailable_snapshot(
+    unavailable: ExternalPoolSelectionUnavailable,
+) -> PoolSelectionSnapshot {
+    PoolSelectionSnapshot {
+        selected_pool: None,
+        availability: PoolAvailabilitySnapshot {
+            temporary_unavailable_pools: 1,
+            coordinator_unavailable: true,
+            coordinator_unavailable_kind: Some(unavailable.kind.coordinator_kind()),
+            wait_reason: Some(PoolCapacityWaitReason::CoordinatorUnavailable),
+            wait_for: Some(unavailable.retry_after),
+            ..PoolAvailabilitySnapshot::default()
+        },
+        degraded_fallback_local_lease: false,
     }
 }
 
@@ -1336,6 +3034,7 @@ struct PoolCapacityWaitContext {
     eligible_pools: usize,
     available_pools: usize,
     temporary_unavailable_pools: usize,
+    coordinator_unavailable_kind: Option<PoolCoordinatorUnavailableKind>,
 }
 
 impl PoolCapacityWaitContext {
@@ -1349,6 +3048,7 @@ impl PoolCapacityWaitContext {
             eligible_pools: 0,
             available_pools: 0,
             temporary_unavailable_pools: 0,
+            coordinator_unavailable_kind: None,
         }
     }
 
@@ -1365,6 +3065,10 @@ enum ExternalCapacityDecision {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_external_pool_revision() -> u64 {
+    1
 }
 
 fn default_priority() -> i32 {
@@ -1416,14 +3120,973 @@ fn direct_external_policy_static_reason(
 
 impl ExternalPoolManager {
     pub fn new(postgres: Arc<PostgresStore>, redis: Arc<RedisStore>) -> Self {
+        let capacity_signal = Arc::new(CapacitySignal::default());
+        let release_dispatcher =
+            ExternalPoolReleaseDispatcher::new(redis.clone(), capacity_signal.clone());
         Self {
             postgres,
             redis,
             client: reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
-            capacity_notify: Arc::new(Notify::new()),
+            capacity_signal,
+            #[cfg(test)]
             availability_cache: Arc::new(SyncMutex::new(None)),
+            static_pool_snapshot: Arc::new(SyncMutex::new(None)),
+            static_pool_snapshot_generation: Arc::new(AtomicU64::new(0)),
+            static_pool_snapshot_refresh_lock: Arc::new(AsyncMutex::new(())),
+            authoritative_pool_snapshot: Arc::new(SyncMutex::new(None)),
+            authoritative_pool_snapshot_refresh_lock: Arc::new(AsyncMutex::new(())),
+            authoritative_pool_snapshot_changed: Arc::new(Notify::new()),
+            selection_runtime_snapshot: Arc::new(SyncMutex::new(None)),
+            selection_runtime_snapshot_refresh_lock: Arc::new(AsyncMutex::new(())),
+            static_pool_snapshot_fresh_ttl: EXTERNAL_POOL_STATIC_SNAPSHOT_FRESH_TTL,
+            static_pool_snapshot_stale_ttl: EXTERNAL_POOL_STATIC_SNAPSHOT_STALE_TTL,
+            static_pool_snapshot_failure_retry: EXTERNAL_POOL_STATIC_SNAPSHOT_FAILURE_RETRY,
+            static_pool_snapshot_refresh_timeout: EXTERNAL_POOL_STATIC_SNAPSHOT_REFRESH_TIMEOUT,
+            #[cfg(test)]
+            static_pool_snapshot_pg_loads: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            static_pool_snapshot_background_refreshes: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            static_pool_snapshot_background_in_flight: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            authoritative_pool_snapshot_pg_loads: Arc::new(AtomicU64::new(0)),
+            coordinator_breaker: Arc::new(ExternalPoolCoordinatorBreaker::default()),
+            selection_breaker: Arc::new(ExternalPoolSelectionBreaker::default()),
+            selection_saturated: Arc::new(AtomicU64::new(0)),
+            dispatch_fence_flights: Arc::new(SyncMutex::new(HashMap::new())),
+            #[cfg(test)]
+            dispatch_fence_pg_loads: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            dispatch_after_prepare_gate: Arc::new(SyncMutex::new(None)),
+            observed_pool_data_generation: Arc::new(AtomicU64::new(0)),
+            success_reset_recent: Arc::new(SyncMutex::new(HashMap::new())),
+            success_reset_semaphore: Arc::new(Semaphore::new(
+                EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS,
+            )),
+            #[cfg(test)]
+            success_reset_tasks_started: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            success_reset_tasks_in_flight: Arc::new(AtomicU64::new(0)),
+            coordinator_reconcile_lock: Arc::new(AsyncMutex::new(())),
+            coordinator_epoch: Arc::new(SyncMutex::new(None)),
+            coordinator_run_id: Arc::new(SyncMutex::new(None)),
+            coordinator_probe_required: Arc::new(AtomicBool::new(true)),
+            coordinator_next_probe_ms: Arc::new(AtomicU64::new(0)),
+            coordinator_recovery_grace: Duration::from_secs(
+                EXTERNAL_POOL_COORDINATOR_RECOVERY_GRACE_SECS,
+            ),
+            release_dispatcher,
+            degraded_fallback_local_leases: Arc::new(SyncMutex::new(HashMap::new())),
+            local_mutation_dispatch_trust: Arc::new(SyncMutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn drain_release_intents(
+        &self,
+        drain_timeout: Duration,
+    ) -> ExternalPoolReleaseDrainReport {
+        self.release_dispatcher.drain(drain_timeout).await
+    }
+
+    #[cfg(test)]
+    fn with_coordinator_recovery_grace(mut self, recovery_grace: Duration) -> Self {
+        self.coordinator_recovery_grace = recovery_grace.max(Duration::from_millis(1));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_static_pool_snapshot_ttl(mut self, ttl: Duration) -> Self {
+        self.static_pool_snapshot_fresh_ttl = ttl.max(Duration::from_millis(1));
+        self.static_pool_snapshot_stale_ttl = self
+            .static_pool_snapshot_stale_ttl
+            .max(self.static_pool_snapshot_fresh_ttl);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_static_pool_snapshot_timing(
+        mut self,
+        fresh_ttl: Duration,
+        stale_ttl: Duration,
+        failure_retry: Duration,
+        refresh_timeout: Duration,
+    ) -> Self {
+        self.static_pool_snapshot_fresh_ttl = fresh_ttl.max(Duration::from_millis(1));
+        self.static_pool_snapshot_stale_ttl = stale_ttl
+            .max(self.static_pool_snapshot_fresh_ttl)
+            .max(Duration::from_millis(1));
+        self.static_pool_snapshot_failure_retry = failure_retry.max(Duration::from_millis(1));
+        self.static_pool_snapshot_refresh_timeout = refresh_timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    pub fn invalidate_static_pool_snapshot(&self) {
+        self.static_pool_snapshot_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.static_pool_snapshot.lock().take();
+        self.authoritative_pool_snapshot.lock().take();
+        self.local_mutation_dispatch_trust.lock().clear();
+        self.invalidate_external_pool_policy_state();
+    }
+
+    fn static_snapshot_ttls(&self, generation: u64) -> (Duration, Duration) {
+        let fresh_ttl = deterministic_duration_jitter(
+            self.static_pool_snapshot_fresh_ttl,
+            EXTERNAL_POOL_STATIC_SNAPSHOT_JITTER_PERCENT,
+            generation ^ 0x4652_4553_48,
+        );
+        let stale_ttl = deterministic_duration_jitter(
+            self.static_pool_snapshot_stale_ttl,
+            EXTERNAL_POOL_STATIC_SNAPSHOT_JITTER_PERCENT,
+            generation ^ 0x5354_414c_45,
+        )
+        .max(fresh_ttl);
+        (fresh_ttl, stale_ttl)
+    }
+
+    fn publish_static_pool_snapshot_arc(
+        &self,
+        generation: u64,
+        pools: Arc<Vec<ExternalPoolEligibility>>,
+        load_succeeded: bool,
+        fresh_ttl: Duration,
+        stale_ttl: Duration,
+    ) -> Option<Arc<Vec<ExternalPoolEligibility>>> {
+        let now = Instant::now();
+        let mut snapshot = self.static_pool_snapshot.lock();
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        *snapshot = Some(CachedStaticPoolSnapshot {
+            generation,
+            pools: pools.clone(),
+            fresh_until: now + fresh_ttl,
+            stale_until: now + stale_ttl.max(fresh_ttl),
+            load_succeeded,
+        });
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            snapshot.take();
+            return None;
+        }
+        Some(pools)
+    }
+
+    fn publish_authoritative_pool_snapshot_success_arc(
+        &self,
+        generation: u64,
+        pools: Arc<Vec<ExternalPool>>,
+        fresh_ttl: Duration,
+        stale_ttl: Duration,
+    ) -> bool {
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        let now = Instant::now();
+        let mut snapshot = self.authoritative_pool_snapshot.lock();
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        *snapshot = Some(CachedAuthoritativePoolSnapshot {
+            generation,
+            result: Ok(pools),
+            fresh_until: now + fresh_ttl,
+            stale_until: now + stale_ttl.max(fresh_ttl),
+        });
+        true
+    }
+
+    fn sort_authoritative_pools(pools: &mut [ExternalPool]) {
+        pools.sort_by_key(|pool| (pool.priority, pool.id));
+    }
+
+    fn sort_static_pool_eligibility(pools: &mut [ExternalPoolEligibility]) {
+        pools.sort_by_key(|pool| pool.id);
+    }
+
+    fn apply_local_external_pool_snapshot_mutation(
+        &self,
+        upsert_pool: Option<&ExternalPool>,
+        delete_pool_id: Option<u64>,
+    ) {
+        let generation = self
+            .static_pool_snapshot_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let now = Instant::now();
+        let delete_pool_id = delete_pool_id.or_else(|| upsert_pool.map(|pool| pool.id));
+        let upsert_pool_id = upsert_pool.map(|pool| pool.id);
+
+        let previous_static_pools = self
+            .static_pool_snapshot
+            .lock()
+            .as_ref()
+            .filter(|snapshot| snapshot.load_succeeded && snapshot.stale_until > now)
+            .map(|snapshot| snapshot.pools.as_ref().clone());
+        let had_previous_static_pools = previous_static_pools.is_some();
+        let mut static_pools = previous_static_pools.unwrap_or_default();
+        static_pools.retain(|pool| Some(pool.id) != delete_pool_id);
+        if let Some(pool) = upsert_pool {
+            static_pools.push(external_pool_eligibility_from_pool(pool));
+        }
+        Self::sort_static_pool_eligibility(&mut static_pools);
+        if upsert_pool.is_some() || had_previous_static_pools {
+            let (static_fresh_ttl, static_stale_ttl) = self.static_snapshot_ttls(generation);
+            let _ = self.publish_static_pool_snapshot_arc(
+                generation,
+                Arc::new(static_pools),
+                true,
+                static_fresh_ttl,
+                static_stale_ttl,
+            );
+        } else {
+            self.static_pool_snapshot.lock().take();
+        }
+
+        let previous_authoritative_pools = self
+            .authoritative_pool_snapshot
+            .lock()
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.stale_until > now
+                    && snapshot
+                        .result
+                        .as_ref()
+                        .is_ok_and(|pools| !pools.is_empty())
+            })
+            .and_then(|snapshot| {
+                snapshot
+                    .result
+                    .as_ref()
+                    .ok()
+                    .map(|pools| pools.as_ref().clone())
+            });
+        let had_previous_authoritative_pools = previous_authoritative_pools.is_some();
+        let mut authoritative_pools = previous_authoritative_pools.unwrap_or_default();
+        authoritative_pools.retain(|pool| Some(pool.id) != delete_pool_id);
+        if let Some(pool) = upsert_pool {
+            authoritative_pools.push(pool.clone());
+        }
+        Self::sort_authoritative_pools(&mut authoritative_pools);
+        if upsert_pool.is_some() || had_previous_authoritative_pools {
+            let _ = self.publish_authoritative_pool_snapshot_success_arc(
+                generation,
+                Arc::new(authoritative_pools),
+                EXTERNAL_POOL_LOCAL_MUTATION_AUTHORITATIVE_FRESH_TTL,
+                EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_STALE_TTL,
+            );
+        } else {
+            self.authoritative_pool_snapshot.lock().take();
+        }
+
+        let mut trust = self.local_mutation_dispatch_trust.lock();
+        if let Some(pool_id) = delete_pool_id {
+            trust.retain(|(existing_pool_id, _), _| *existing_pool_id != pool_id);
+        }
+        if let Some(pool) = upsert_pool.filter(|pool| {
+            pool.api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+        }) {
+            trust.insert(
+                (pool.id, pool.revision),
+                now + EXTERNAL_POOL_LOCAL_MUTATION_DISPATCH_TRUST_TTL,
+            );
+        }
+        if upsert_pool_id != delete_pool_id {
+            if let Some(pool_id) = upsert_pool_id {
+                trust.retain(|(existing_pool_id, revision), _| {
+                    *existing_pool_id != pool_id
+                        || Some(*revision) == upsert_pool.map(|pool| pool.revision)
+                });
+            }
+        }
+        self.invalidate_external_pool_policy_state();
+    }
+
+    pub fn notify_external_pool_data_changed_with_local_pool(
+        &self,
+        reason: &'static str,
+        pool: &ExternalPool,
+    ) {
+        self.apply_local_external_pool_snapshot_mutation(Some(pool), None);
+        self.publish_external_pool_data_changed_async(reason, Some(pool.id));
+    }
+
+    pub fn notify_external_pool_deleted(&self, reason: &'static str, pool_id: u64) {
+        self.apply_local_external_pool_snapshot_mutation(None, Some(pool_id));
+        self.publish_external_pool_data_changed_async(reason, Some(pool_id));
+    }
+
+    pub fn invalidate_external_pool_policy_state(&self) {
+        #[cfg(test)]
+        self.availability_cache.lock().take();
+    }
+
+    fn observe_pool_data_generation(&self, generation: u64) -> bool {
+        let mut observed = self.observed_pool_data_generation.load(Ordering::Acquire);
+        loop {
+            if generation <= observed {
+                return false;
+            }
+            match self.observed_pool_data_generation.compare_exchange_weak(
+                observed,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.invalidate_static_pool_snapshot();
+                    return true;
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    pub fn observe_external_pool_data_event(&self, payload: &str) -> bool {
+        let generation = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| value.get("generation").and_then(serde_json::Value::as_u64));
+        generation.is_some_and(|generation| self.observe_pool_data_generation(generation))
+    }
+
+    pub async fn publish_external_pool_data_changed(
+        &self,
+        reason: &str,
+        pool_id: Option<u64>,
+    ) -> anyhow::Result<u64> {
+        self.invalidate_static_pool_snapshot();
+        let generation = self
+            .redis
+            .publish_external_pool_data_changed(reason, pool_id)
+            .await?;
+        self.observed_pool_data_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        Ok(generation)
+    }
+
+    fn publish_external_pool_data_changed_async(&self, reason: &'static str, pool_id: Option<u64>) {
+        let redis = self.redis.clone();
+        let observed_generation = self.observed_pool_data_generation.clone();
+        tokio::spawn(async move {
+            match redis
+                .publish_external_pool_data_changed(reason, pool_id)
+                .await
+            {
+                Ok(generation) => {
+                    observed_generation.fetch_max(generation, Ordering::AcqRel);
+                }
+                Err(err) => tracing::warn!(
+                    reason,
+                    pool_id = ?pool_id,
+                    error = %err,
+                    "发布外部池数据跨实例失效通知失败"
+                ),
+            }
+        });
+    }
+
+    fn static_pool_snapshot_state(&self, generation: u64) -> Option<CachedStaticPoolSnapshotState> {
+        let now = Instant::now();
+        let snapshot = self.static_pool_snapshot.lock();
+        let cached = snapshot
+            .as_ref()
+            .filter(|cached| cached.generation == generation && cached.stale_until > now)?;
+        Some(if cached.fresh_until > now {
+            CachedStaticPoolSnapshotState::Fresh(cached.pools.clone())
+        } else {
+            CachedStaticPoolSnapshotState::Stale(cached.pools.clone())
+        })
+    }
+
+    fn spawn_static_pool_snapshot_refresh(
+        &self,
+        generation: u64,
+        refresh_guard: OwnedMutexGuard<()>,
+    ) {
+        #[cfg(test)]
+        let activity = {
+            self.static_pool_snapshot_background_refreshes
+                .fetch_add(1, Ordering::Relaxed);
+            self.static_pool_snapshot_background_in_flight
+                .fetch_add(1, Ordering::AcqRel);
+            StaticPoolBackgroundRefreshActivity {
+                in_flight: self.static_pool_snapshot_background_in_flight.clone(),
+            }
+        };
+        let manager = self.clone();
+        tokio::spawn(async move {
+            #[cfg(test)]
+            let _activity = activity;
+            let deadline = Instant::now() + manager.static_pool_snapshot_refresh_timeout;
+            let _ = manager
+                .refresh_static_pool_snapshot(generation, refresh_guard, deadline)
+                .await;
+        });
+    }
+
+    fn maybe_spawn_static_pool_snapshot_refresh(&self, generation: u64) {
+        let Ok(refresh_guard) = self
+            .static_pool_snapshot_refresh_lock
+            .clone()
+            .try_lock_owned()
+        else {
+            return;
+        };
+        self.spawn_static_pool_snapshot_refresh(generation, refresh_guard);
+    }
+
+    fn publish_static_pool_snapshot_success(
+        &self,
+        generation: u64,
+        pools: Vec<ExternalPoolEligibility>,
+    ) -> Option<Arc<Vec<ExternalPoolEligibility>>> {
+        let pools = Arc::new(pools);
+        let (fresh_ttl, stale_ttl) = self.static_snapshot_ttls(generation);
+        self.publish_static_pool_snapshot_arc(generation, pools, true, fresh_ttl, stale_ttl)
+    }
+
+    fn publish_static_pool_snapshot_failure(
+        &self,
+        generation: u64,
+    ) -> Option<Arc<Vec<ExternalPoolEligibility>>> {
+        let now = Instant::now();
+        let failure_retry = deterministic_duration_jitter(
+            self.static_pool_snapshot_failure_retry,
+            EXTERNAL_POOL_STATIC_SNAPSHOT_JITTER_PERCENT,
+            generation ^ 0x4641_494c,
+        );
+        let stale_ttl = deterministic_duration_jitter(
+            self.static_pool_snapshot_stale_ttl,
+            EXTERNAL_POOL_STATIC_SNAPSHOT_JITTER_PERCENT,
+            generation ^ 0x5354_414c_45,
+        );
+        let mut snapshot = self.static_pool_snapshot.lock();
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        let preserved = snapshot.as_ref().filter(|cached| {
+            cached.generation == generation && cached.load_succeeded && cached.stale_until > now
+        });
+        let (pools, fresh_until, stale_until, load_succeeded) = match preserved {
+            Some(cached) => (
+                cached.pools.clone(),
+                (now + failure_retry).min(cached.stale_until),
+                cached.stale_until,
+                true,
+            ),
+            None => (
+                Arc::new(Vec::new()),
+                now + failure_retry,
+                now + stale_ttl,
+                false,
+            ),
+        };
+        *snapshot = Some(CachedStaticPoolSnapshot {
+            generation,
+            pools: pools.clone(),
+            fresh_until,
+            stale_until: stale_until.max(fresh_until),
+            load_succeeded,
+        });
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            snapshot.take();
+            return None;
+        }
+        Some(pools)
+    }
+
+    async fn refresh_static_pool_snapshot(
+        &self,
+        generation: u64,
+        _refresh_guard: OwnedMutexGuard<()>,
+        deadline: Instant,
+    ) -> Option<Arc<Vec<ExternalPoolEligibility>>> {
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+
+        #[cfg(test)]
+        self.static_pool_snapshot_pg_loads
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let pools =
+            match tokio::time::timeout_at(deadline, self.postgres.list_external_pool_eligibility())
+                .await
+            {
+                Ok(Ok(pools)) => pools,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        error = %err,
+                        snapshot_generation = generation,
+                        refresh_ms = started.elapsed().as_millis(),
+                        "加载外部池静态资格快照失败，短期负缓存后重试"
+                    );
+                    return self.publish_static_pool_snapshot_failure(generation);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        snapshot_generation = generation,
+                        refresh_timeout_ms = self.static_pool_snapshot_refresh_timeout.as_millis(),
+                        "加载外部池静态资格快照超时，短期负缓存后重试"
+                    );
+                    return self.publish_static_pool_snapshot_failure(generation);
+                }
+            };
+        self.publish_static_pool_snapshot_success(generation, pools)
+    }
+
+    async fn load_static_pool_snapshot(&self) -> Arc<Vec<ExternalPoolEligibility>> {
+        let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
+        match self.static_pool_snapshot_state(generation) {
+            Some(CachedStaticPoolSnapshotState::Fresh(pools)) => return pools,
+            Some(CachedStaticPoolSnapshotState::Stale(pools)) => {
+                self.maybe_spawn_static_pool_snapshot_refresh(generation);
+                return pools;
+            }
+            None => {}
+        }
+
+        let deadline = Instant::now() + self.static_pool_snapshot_refresh_timeout;
+        let refresh_guard = match tokio::time::timeout_at(
+            deadline,
+            self.static_pool_snapshot_refresh_lock.clone().lock_owned(),
+        )
+        .await
+        {
+            Ok(refresh_guard) => refresh_guard,
+            Err(_) => return Arc::new(Vec::new()),
+        };
+        let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
+        match self.static_pool_snapshot_state(generation) {
+            Some(CachedStaticPoolSnapshotState::Fresh(pools)) => pools,
+            Some(CachedStaticPoolSnapshotState::Stale(pools)) => {
+                self.spawn_static_pool_snapshot_refresh(generation, refresh_guard);
+                pools
+            }
+            None => self
+                .refresh_static_pool_snapshot(generation, refresh_guard, deadline)
+                .await
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+        }
+    }
+
+    #[cfg(test)]
+    fn static_pool_snapshot_pg_loads_for_test(&self) -> u64 {
+        self.static_pool_snapshot_pg_loads.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn static_pool_snapshot_generation_for_test(&self) -> u64 {
+        self.static_pool_snapshot_generation.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn static_pool_snapshot_cached_generation_for_test(&self) -> Option<u64> {
+        self.static_pool_snapshot
+            .lock()
+            .as_ref()
+            .map(|snapshot| snapshot.generation)
+    }
+
+    #[cfg(test)]
+    fn static_pool_snapshot_background_refreshes_for_test(&self) -> u64 {
+        self.static_pool_snapshot_background_refreshes
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn static_pool_snapshot_background_in_flight_for_test(&self) -> u64 {
+        self.static_pool_snapshot_background_in_flight
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn static_pool_snapshot_pool_count_for_test(&self) -> Option<usize> {
+        self.static_pool_snapshot
+            .lock()
+            .as_ref()
+            .map(|snapshot| snapshot.pools.len())
+    }
+
+    fn cached_authoritative_pool_snapshot(
+        &self,
+        generation: u64,
+    ) -> Option<CachedAuthoritativePoolSnapshotState> {
+        let now = Instant::now();
+        self.authoritative_pool_snapshot
+            .lock()
+            .as_ref()
+            .filter(|snapshot| snapshot.generation == generation && snapshot.stale_until > now)
+            .map(|snapshot| {
+                if snapshot.fresh_until > now {
+                    CachedAuthoritativePoolSnapshotState::Fresh(snapshot.result.clone())
+                } else {
+                    match &snapshot.result {
+                        Ok(pools) => CachedAuthoritativePoolSnapshotState::Stale(pools.clone()),
+                        Err(err) => CachedAuthoritativePoolSnapshotState::Fresh(Err(err.clone())),
+                    }
+                }
+            })
+    }
+
+    fn publish_authoritative_pool_snapshot(
+        &self,
+        generation: u64,
+        result: Result<Arc<Vec<ExternalPool>>, ExternalPoolSelectionUnavailable>,
+    ) -> bool {
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        let now = Instant::now();
+        let mut snapshot = self.authoritative_pool_snapshot.lock();
+        if self.static_pool_snapshot_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        let result = match result {
+            Ok(pools) => Ok(pools),
+            Err(err) => {
+                if let Some(existing) = snapshot.as_ref().filter(|existing| {
+                    existing.generation == generation
+                        && existing.stale_until > now
+                        && existing.result.is_ok()
+                }) {
+                    if let Ok(pools) = &existing.result {
+                        *snapshot = Some(CachedAuthoritativePoolSnapshot {
+                            generation,
+                            result: Ok(pools.clone()),
+                            fresh_until: now + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_FAILURE_RETRY,
+                            stale_until: existing.stale_until,
+                        });
+                        return true;
+                    }
+                }
+                Err(err)
+            }
+        };
+        let (fresh_until, stale_until) = if result.is_ok() {
+            (
+                now + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_TTL,
+                now + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_STALE_TTL,
+            )
+        } else {
+            let retry_until = now + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_FAILURE_RETRY;
+            (retry_until, retry_until)
+        };
+        *snapshot = Some(CachedAuthoritativePoolSnapshot {
+            generation,
+            result,
+            fresh_until,
+            stale_until,
+        });
+        true
+    }
+
+    fn spawn_authoritative_pool_snapshot_refresh(
+        &self,
+        generation: u64,
+        refresh_guard: OwnedMutexGuard<()>,
+    ) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager
+                .refresh_authoritative_pool_snapshot(generation, refresh_guard)
+                .await;
+        });
+    }
+
+    fn maybe_spawn_authoritative_pool_snapshot_refresh(&self, generation: u64) {
+        let Ok(refresh_guard) = self
+            .authoritative_pool_snapshot_refresh_lock
+            .clone()
+            .try_lock_owned()
+        else {
+            return;
+        };
+        self.spawn_authoritative_pool_snapshot_refresh(generation, refresh_guard);
+    }
+
+    async fn refresh_authoritative_pool_snapshot(
+        &self,
+        generation: u64,
+        _refresh_guard: OwnedMutexGuard<()>,
+    ) {
+        let result = match self.selection_breaker.try_begin() {
+            Ok(permit) => {
+                #[cfg(test)]
+                self.authoritative_pool_snapshot_pg_loads
+                    .fetch_add(1, Ordering::Relaxed);
+                match timeout(
+                    EXTERNAL_POOL_SELECTION_POSTGRES_TIMEOUT,
+                    self.postgres.list_dispatchable_external_pools(),
+                )
+                .await
+                {
+                    Ok(Ok(pools)) => {
+                        permit.success();
+                        Ok(Arc::new(pools))
+                    }
+                    Ok(Err(_)) => {
+                        permit.failure(ExternalPoolSelectionFailureKind::PostgresError);
+                        Err(ExternalPoolSelectionUnavailable {
+                            kind: ExternalPoolSelectionFailureKind::PostgresError,
+                            retry_after: Duration::from_millis(250),
+                        })
+                    }
+                    Err(_) => {
+                        permit.failure(ExternalPoolSelectionFailureKind::PostgresTimeout);
+                        Err(ExternalPoolSelectionUnavailable {
+                            kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
+                            retry_after: Duration::from_millis(250),
+                        })
+                    }
+                }
+            }
+            Err(unavailable) => {
+                if unavailable.kind == ExternalPoolSelectionFailureKind::AdmissionSaturated {
+                    self.selection_saturated.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(unavailable)
+            }
+        };
+        self.publish_authoritative_pool_snapshot(generation, result);
+        self.authoritative_pool_snapshot_changed.notify_waiters();
+    }
+
+    async fn load_authoritative_pool_snapshot(
+        &self,
+    ) -> Result<Arc<Vec<ExternalPool>>, ExternalPoolSelectionUnavailable> {
+        let deadline = Instant::now() + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_WAIT_TIMEOUT;
+        loop {
+            let changed = self.authoritative_pool_snapshot_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
+            let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
+            match self.cached_authoritative_pool_snapshot(generation) {
+                Some(CachedAuthoritativePoolSnapshotState::Fresh(result)) => return result,
+                Some(CachedAuthoritativePoolSnapshotState::Stale(pools)) => {
+                    self.maybe_spawn_authoritative_pool_snapshot_refresh(generation);
+                    return Ok(pools);
+                }
+                None => {}
+            }
+            if let Ok(refresh_guard) = self
+                .authoritative_pool_snapshot_refresh_lock
+                .clone()
+                .try_lock_owned()
+            {
+                let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
+                match self.cached_authoritative_pool_snapshot(generation) {
+                    Some(CachedAuthoritativePoolSnapshotState::Fresh(result)) => return result,
+                    Some(CachedAuthoritativePoolSnapshotState::Stale(pools)) => {
+                        self.spawn_authoritative_pool_snapshot_refresh(generation, refresh_guard);
+                        return Ok(pools);
+                    }
+                    None => {}
+                }
+                self.spawn_authoritative_pool_snapshot_refresh(generation, refresh_guard);
+            }
+
+            let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
+            match self.cached_authoritative_pool_snapshot(generation) {
+                Some(CachedAuthoritativePoolSnapshotState::Fresh(result)) => return result,
+                Some(CachedAuthoritativePoolSnapshotState::Stale(pools)) => return Ok(pools),
+                None => {}
+            }
+            if tokio::time::timeout_at(deadline, changed.as_mut())
+                .await
+                .is_err()
+            {
+                return Err(ExternalPoolSelectionUnavailable {
+                    kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
+                    retry_after: Duration::from_millis(250),
+                });
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn authoritative_pool_snapshot_pg_loads_for_test(&self) -> u64 {
+        self.authoritative_pool_snapshot_pg_loads
+            .load(Ordering::Acquire)
+    }
+
+    fn mark_external_pool_coordinator_probe_required(&self) {
+        self.coordinator_probe_required
+            .store(true, Ordering::Release);
+        self.coordinator_next_probe_ms.store(0, Ordering::Release);
+    }
+
+    fn local_mutation_dispatch_trusted(&self, pool: &ExternalPool) -> bool {
+        let now = Instant::now();
+        let mut trust = self.local_mutation_dispatch_trust.lock();
+        trust.retain(|_, expires_at| *expires_at > now);
+        trust
+            .get(&(pool.id, pool.revision))
+            .is_some_and(|expires_at| *expires_at > now)
+    }
+
+    async fn external_pool_coordination_epoch(&self) -> anyhow::Result<String> {
+        let now_ms = external_pool_coordination_monotonic_ms();
+        let cached_epoch = self.coordinator_epoch.lock().clone();
+        if !self.coordinator_probe_required.load(Ordering::Acquire)
+            && now_ms < self.coordinator_next_probe_ms.load(Ordering::Acquire)
+        {
+            if let Some(epoch) = cached_epoch {
+                return Ok(epoch);
+            }
+        }
+        let _local_lock = self.coordinator_reconcile_lock.lock().await;
+        let now_ms = external_pool_coordination_monotonic_ms();
+        let probe_required = self.coordinator_probe_required.load(Ordering::Acquire);
+        let cached_epoch = self.coordinator_epoch.lock().clone();
+        let cached_run_id = self.coordinator_run_id.lock().clone();
+        if !probe_required && now_ms < self.coordinator_next_probe_ms.load(Ordering::Acquire) {
+            if let Some(epoch) = cached_epoch.clone() {
+                return Ok(epoch);
+            }
+        }
+
+        let current_run_id = self.redis.external_pool_redis_run_id().await?;
+        if let (Some(epoch), Some(run_id)) = (cached_epoch.as_ref(), cached_run_id.as_ref()) {
+            if *run_id == current_run_id {
+                if !probe_required {
+                    self.record_external_pool_coordinator_probe(&current_run_id, epoch);
+                    return Ok(epoch.clone());
+                }
+                match self
+                    .redis
+                    .external_pool_coordinator_guard_state_for_epoch(epoch)
+                    .await?
+                {
+                    ExternalPoolCoordinatorGuardState::Ready { .. }
+                    | ExternalPoolCoordinatorGuardState::Recovering { .. } => {
+                        self.record_external_pool_coordinator_probe(&current_run_id, epoch);
+                        return Ok(epoch.clone());
+                    }
+                    ExternalPoolCoordinatorGuardState::EpochMismatch { .. } => {}
+                }
+            }
+        }
+
+        self.reconcile_external_pool_coordinator_guard(current_run_id)
+            .await
+    }
+
+    fn record_external_pool_coordinator_probe(&self, run_id: &str, epoch: &str) {
+        *self.coordinator_run_id.lock() = Some(run_id.to_string());
+        *self.coordinator_epoch.lock() = Some(epoch.to_string());
+        self.coordinator_probe_required
+            .store(false, Ordering::Release);
+        self.coordinator_next_probe_ms.store(
+            external_pool_coordination_monotonic_ms().saturating_add(
+                Duration::from_secs(EXTERNAL_POOL_COORDINATOR_RUN_ID_PROBE_INTERVAL_SECS)
+                    .as_millis() as u64,
+            ),
+            Ordering::Release,
+        );
+    }
+
+    async fn reconcile_external_pool_coordinator_guard(
+        &self,
+        mut current_run_id: String,
+    ) -> anyhow::Result<String> {
+        let mut postgres = self.postgres.pool().acquire().await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(EXTERNAL_POOL_COORDINATOR_POSTGRES_LOCK_ID)
+            .execute(&mut *postgres)
+            .await?;
+
+        let result = async {
+            current_run_id = self.redis.external_pool_redis_run_id().await?;
+            let existing: Option<serde_json::Value> =
+                sqlx::query_scalar("SELECT config FROM runtime_config WHERE id = $1")
+                    .bind(EXTERNAL_POOL_COORDINATOR_RUNTIME_CONFIG_ID)
+                    .fetch_optional(&mut *postgres)
+                    .await?;
+            let existing_run_id = existing
+                .as_ref()
+                .and_then(|value| value.get("redisRunId"))
+                .and_then(serde_json::Value::as_str);
+            let existing_epoch = existing
+                .as_ref()
+                .and_then(|value| value.get("coordinationEpoch"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty());
+
+            if let (Some(run_id), Some(epoch)) = (existing_run_id, existing_epoch) {
+                if run_id == current_run_id {
+                    match self
+                        .redis
+                        .external_pool_coordinator_guard_state_for_epoch(epoch)
+                        .await?
+                    {
+                        ExternalPoolCoordinatorGuardState::Ready { .. }
+                        | ExternalPoolCoordinatorGuardState::Recovering { .. } => {
+                            return Ok(epoch.to_string());
+                        }
+                        ExternalPoolCoordinatorGuardState::EpochMismatch { .. } => {}
+                    }
+                }
+            }
+
+            let recovery_required = existing.is_some();
+            let coordination_epoch = uuid::Uuid::new_v4().to_string();
+            let coordination_record = json!({
+                "redisRunId": current_run_id,
+                "coordinationEpoch": coordination_epoch,
+            });
+            sqlx::query(
+                r#"
+                INSERT INTO runtime_config (id, config, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (id) DO UPDATE
+                SET config = EXCLUDED.config,
+                    version = runtime_config.version + 1,
+                    updated_at = now()
+                "#,
+            )
+            .bind(EXTERNAL_POOL_COORDINATOR_RUNTIME_CONFIG_ID)
+            .bind(coordination_record)
+            .execute(&mut *postgres)
+            .await?;
+            self.redis
+                .install_external_pool_coordinator_guard(
+                    &coordination_epoch,
+                    if recovery_required {
+                        self.coordinator_recovery_grace
+                    } else {
+                        Duration::ZERO
+                    },
+                )
+                .await?;
+            let confirmed_run_id = self.redis.external_pool_redis_run_id().await?;
+            if confirmed_run_id != current_run_id {
+                anyhow::bail!(
+                    "Redis restarted while external pool coordinator epoch was installed"
+                );
+            }
+            Ok(coordination_epoch)
+        }
+        .await;
+        let unlock = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(EXTERNAL_POOL_COORDINATOR_POSTGRES_LOCK_ID)
+            .execute(&mut *postgres)
+            .await;
+        match result {
+            Ok(epoch) => {
+                unlock?;
+                self.record_external_pool_coordinator_probe(&current_run_id, &epoch);
+                Ok(epoch)
+            }
+            Err(err) => {
+                let _ = unlock;
+                self.mark_external_pool_coordinator_probe_required();
+                Err(err)
+            }
         }
     }
 
@@ -1432,10 +4095,25 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
     ) -> anyhow::Result<Vec<ExternalPoolStatus>> {
         let pools = self.postgres.list_external_pools(true).await?;
+        let pool_ids = pools.iter().map(|pool| pool.id).collect::<Vec<_>>();
+        let runtimes = self.load_pool_runtime_snapshots(&pool_ids, &[]).await?;
         let mut statuses = Vec::with_capacity(pools.len());
-        for pool in pools {
-            let (in_flight, global_in_flight, cooldown_remaining_secs, cooldown_reason) =
-                self.pool_runtime_snapshot(pool.id).await?;
+        for (pool, runtime) in pools.into_iter().zip(runtimes) {
+            let Ok(runtime) = runtime else {
+                statuses.push(ExternalPoolStatus {
+                    pool,
+                    in_flight: 0,
+                    cooldown_remaining_secs: 0,
+                    cooldown_reason: None,
+                    dispatchable: false,
+                    skipped_reason: Some("coordinator_state_invalid".to_string()),
+                });
+                continue;
+            };
+            let in_flight = runtime.in_flight;
+            let global_in_flight = runtime.global_in_flight;
+            let cooldown_remaining_secs = runtime.pool_cooldown_remaining_secs;
+            let cooldown_reason = runtime.pool_cooldown_reason;
             let skipped_reason = Self::skip_reason(
                 &pool,
                 in_flight,
@@ -1455,6 +4133,7 @@ impl ExternalPoolManager {
         Ok(statuses)
     }
 
+    #[cfg(test)]
     pub async fn has_available_pool(&self, config: &ExternalPoolsConfig) -> bool {
         self.pool_availability_snapshot(&HashSet::new(), config)
             .await
@@ -1462,47 +4141,49 @@ impl ExternalPoolManager {
             > 0
     }
 
+    #[cfg(test)]
     pub async fn has_eligible_pool(&self, config: &ExternalPoolsConfig) -> bool {
-        self.pool_availability_snapshot(&HashSet::new(), config)
+        self.has_eligible_pool_matching(config, None, None).await
+    }
+
+    pub async fn has_eligible_pool_for_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        model: &str,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_eligible_pool_matching(config, None, Some(&model_candidates))
             .await
-            .has_eligible_pool()
     }
 
-    pub async fn has_eligible_pool_for_body_mode(
+    pub async fn has_eligible_pool_for_body_mode_and_model(
         &self,
         config: &ExternalPoolsConfig,
         body_mode: ExternalPoolRequestBodyMode,
+        model: Option<&str>,
     ) -> bool {
-        self.scan_pool_availability_uncached(
-            &HashSet::new(),
-            config,
-            false,
-            Some(body_mode),
-            None,
-            None,
-        )
-        .await
-        .availability
-        .has_eligible_pool()
+        let model_candidates = normalize_external_pool_support_candidates(model);
+        self.has_eligible_pool_matching(config, Some(body_mode), Some(&model_candidates))
+            .await
     }
 
-    pub async fn has_available_pool_for_body_mode(
+    async fn has_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
-        body_mode: ExternalPoolRequestBodyMode,
+        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+        model_candidates: Option<&[String]>,
     ) -> bool {
-        self.scan_pool_availability_uncached(
-            &HashSet::new(),
-            config,
-            false,
-            Some(body_mode),
-            None,
-            None,
-        )
-        .await
-        .availability
-        .available_pools
-            > 0
+        if !config.external_pools_enabled {
+            return false;
+        }
+        let pools = self.load_static_pool_snapshot().await;
+        let now = Utc::now();
+        pools.iter().any(|pool| {
+            pool.enabled
+                && !pool.is_auto_disabled_at(now)
+                && body_mode_filter.is_none_or(|mode| pool.request_body_mode == mode)
+                && external_pool_eligibility_matches_supported_models(pool, model_candidates)
+        })
     }
 
     pub async fn record_local_pool_failure(
@@ -1674,12 +4355,86 @@ impl ExternalPoolManager {
         let mut queue_guard: Option<ExternalPoolQueueGuard> = None;
         let mut wait_started_at: Option<Instant> = None;
         let mut attempt_index = 0usize;
+        let mut attempt_rejection = None;
+        let mut preselected_pool = None;
+        let authoritative_pools = match self.load_authoritative_pool_snapshot().await {
+            Ok(pools) => pools,
+            Err(unavailable) => {
+                let snapshot = selection_unavailable_snapshot(unavailable).availability;
+                let context = snapshot.capacity_context();
+                let (error_type, message) = external_capacity_error(context.reason);
+                self.record_external_failure(
+                    &route,
+                    None,
+                    Vec::new(),
+                    error_type,
+                    message,
+                    synthetic_external_capacity_error_diagnostics(
+                        &route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                        &config,
+                        Some(&context),
+                    ),
+                );
+                return ExternalPoolForwardOutcome::FinalError(external_capacity_final_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_type,
+                    message,
+                    &route.error_id,
+                ));
+            }
+        };
 
         loop {
+            let mut capacity_waiter = self.capacity_signal.register();
             if max_attempts.is_some_and(|max_attempts| attempt_index >= max_attempts) {
                 break;
             }
-            let selection = self.select_pool_for_route(&excluded, &config, &route).await;
+            if route.inference_attempt_budget.available_attempts(0) == 0 {
+                let snapshot = route.inference_attempt_budget.snapshot();
+                attempt_rejection = Some(if snapshot.downstream_committed {
+                    InferenceAttemptRejection::DownstreamCommitted
+                } else {
+                    InferenceAttemptRejection::Exhausted
+                });
+                break;
+            }
+            let mut selection = match preselected_pool.take() {
+                Some(pool) => PoolSelectionSnapshot {
+                    selected_pool: Some(pool),
+                    availability: PoolAvailabilitySnapshot::default(),
+                    degraded_fallback_local_lease: false,
+                },
+                None => {
+                    self.select_pool_for_route_from_snapshot(
+                        &authoritative_pools,
+                        &excluded,
+                        &config,
+                        &route,
+                    )
+                    .await
+                }
+            };
+            if selection.selected_pool.is_none()
+                && selection.availability.coordinator_unavailable
+                && route_allows_degraded_fallback_local_lease(&route)
+            {
+                if let Some(degraded_selection) = self
+                    .select_degraded_fallback_local_pool_from_snapshot(
+                        &authoritative_pools,
+                        &excluded,
+                        &route,
+                    )
+                {
+                    tracing::warn!(
+                        request_id = %route.request_id,
+                        fallback_reason = ?route.fallback_reason,
+                        "外部池 Redis coordinator 与本地 scheduler 同时不可用，使用进程内有界 emergency external lease"
+                    );
+                    selection = degraded_selection;
+                }
+            }
             if max_attempts.is_none() {
                 max_attempts = Some(
                     selection
@@ -1698,6 +4453,7 @@ impl ExternalPoolManager {
                             snapshot.capacity_context(),
                             &mut queue_guard,
                             &mut wait_started_at,
+                            &mut capacity_waiter,
                         )
                         .await
                     {
@@ -1713,7 +4469,29 @@ impl ExternalPoolManager {
                 break;
             };
             let pool_id = pool.id;
-            let lease = match self.acquire_pool(&pool, &config).await {
+            let acquire_result = if selection.degraded_fallback_local_lease {
+                self.acquire_degraded_fallback_local_pool(&pool)
+            } else {
+                match self.acquire_pool_for_route(&pool, &config, &route).await {
+                    PoolAcquireResult::Acquired(lease) => PoolAcquireResult::Acquired(lease),
+                    PoolAcquireResult::Unavailable(unavailable)
+                        if unavailable.reason == PoolCapacityWaitReason::CoordinatorUnavailable
+                            && route_allows_degraded_fallback_local_lease(&route) =>
+                    {
+                        tracing::warn!(
+                            request_id = %route.request_id,
+                            pool_id,
+                            detail = unavailable.detail,
+                            "外部池 Redis lease 准入在 scheduler degraded fallback 中不可用，尝试进程内有界 emergency external lease"
+                        );
+                        self.acquire_degraded_fallback_local_pool(&pool)
+                    }
+                    PoolAcquireResult::Unavailable(unavailable) => {
+                        PoolAcquireResult::Unavailable(unavailable)
+                    }
+                }
+            };
+            let lease = match acquire_result {
                 PoolAcquireResult::Acquired(lease) => lease,
                 PoolAcquireResult::Unavailable(mut unavailable) => {
                     tracing::debug!(
@@ -1725,8 +4503,14 @@ impl ExternalPoolManager {
                     );
                     if unavailable.exclude_pool_for_reselect {
                         excluded.insert(pool_id);
-                        let reselection =
-                            self.select_pool_for_route(&excluded, &config, &route).await;
+                        let reselection = self
+                            .select_pool_for_route_from_snapshot(
+                                &authoritative_pools,
+                                &excluded,
+                                &config,
+                                &route,
+                            )
+                            .await;
                         if reselection.availability.coordinator_unavailable {
                             unavailable = PoolAcquireUnavailable {
                                 reason: PoolCapacityWaitReason::CoordinatorUnavailable,
@@ -1734,7 +4518,8 @@ impl ExternalPoolManager {
                                 exclude_pool_for_reselect: false,
                                 detail: "reselection_coordinator_error",
                             };
-                        } else if reselection.selected_pool.is_some() {
+                        } else if let Some(next_pool) = reselection.selected_pool {
+                            preselected_pool = Some(next_pool);
                             continue;
                         }
                         excluded.remove(&pool_id);
@@ -1747,6 +4532,7 @@ impl ExternalPoolManager {
                             PoolCapacityWaitContext::from_unavailable(&unavailable),
                             &mut queue_guard,
                             &mut wait_started_at,
+                            &mut capacity_waiter,
                         )
                         .await
                     {
@@ -1757,11 +4543,71 @@ impl ExternalPoolManager {
                     }
                 }
             };
+            capacity_waiter.finish_acquired();
             drop(queue_guard.take());
             let started = std::time::Instant::now();
             let current_attempt = attempt_index.saturating_add(1) as u32;
-            attempt_index = attempt_index.saturating_add(1);
-            let result = self.forward_once(&pool, &route, lease, &config).await;
+            let prepared = self.prepare_forward_once(&pool, &route, &config);
+            let result = match prepared {
+                Ok(prepared) => {
+                    #[cfg(test)]
+                    self.wait_at_dispatch_after_prepare_gate().await;
+                    match self.validate_pool_dispatch_fence(&pool).await {
+                        PoolDispatchFenceResult::Current => {}
+                        PoolDispatchFenceResult::Changed => {
+                            drop(lease);
+                            excluded.insert(pool_id);
+                            tracing::debug!(
+                                pool_id,
+                                expected_revision = pool.revision,
+                                "外部池在请求准备后、HTTP send 前发生配置变更，拒绝旧快照并重选"
+                            );
+                            continue;
+                        }
+                        PoolDispatchFenceResult::CoordinatorUnavailable(unavailable) => {
+                            if route_allows_degraded_fallback_local_lease(&route)
+                                && self.local_mutation_dispatch_trusted(&pool)
+                            {
+                                tracing::warn!(
+                                    request_id = %route.request_id,
+                                    pool_id = pool.id,
+                                    pool_revision = pool.revision,
+                                    fallback_reason = ?route.fallback_reason,
+                                    unavailable_kind = unavailable.kind.as_str(),
+                                    "本地 scheduler degraded 且外部池 dispatch fence 暂不可用，使用本进程刚提交的外部池 revision 有界兜底"
+                                );
+                            } else {
+                                drop(lease);
+                                let snapshot =
+                                    selection_unavailable_snapshot(unavailable).availability;
+                                match self
+                                    .handle_capacity_unavailable(
+                                        &route,
+                                        attempts.clone(),
+                                        &config,
+                                        snapshot.capacity_context(),
+                                        &mut queue_guard,
+                                        &mut wait_started_at,
+                                        &mut capacity_waiter,
+                                    )
+                                    .await
+                                {
+                                    ExternalCapacityDecision::Retry => continue,
+                                    ExternalCapacityDecision::FinalError(err) => {
+                                        return ExternalPoolForwardOutcome::FinalError(err);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.forward_prepared_once(&pool, &route, lease, &config, prepared)
+                        .await
+                }
+                Err(err) => {
+                    drop(lease);
+                    Err(err)
+                }
+            };
             match result {
                 Ok(forwarded) => {
                     attempts.push(ExternalPoolAttempt {
@@ -1790,6 +4636,7 @@ impl ExternalPoolManager {
                     if let Some(projection) = forwarded.stream_usage_projection.as_ref() {
                         projection.record_success();
                     }
+                    route.inference_attempt_budget.mark_downstream_committed();
                     self.record_external_success(
                         &route,
                         &pool,
@@ -1799,6 +4646,11 @@ impl ExternalPoolManager {
                     return ExternalPoolForwardOutcome::Response(forwarded.response);
                 }
                 Err(forward_err) => {
+                    if let Some(rejection) = forward_err.attempt_rejection {
+                        return self
+                            .external_attempt_rejection_outcome(&route, attempts, rejection);
+                    }
+                    attempt_index = attempt_index.saturating_add(1);
                     let outbound_model = forward_err.outbound_model;
                     let err = forward_err.err;
                     let action = if err.retryable { "retry_next" } else { "fail" };
@@ -1923,6 +4775,10 @@ impl ExternalPoolManager {
             ));
         }
 
+        if let Some(rejection) = attempt_rejection {
+            return self.external_attempt_rejection_outcome(&route, attempts, rejection);
+        }
+
         self.record_external_failure(
             &route,
             None,
@@ -1948,13 +4804,34 @@ impl ExternalPoolManager {
         })
     }
 
-    async fn forward_once(
+    fn external_attempt_rejection_outcome(
+        &self,
+        route: &ExternalRouteRequest,
+        attempts: Vec<ExternalPoolAttempt>,
+        rejection: InferenceAttemptRejection,
+    ) -> ExternalPoolForwardOutcome {
+        let reason = inference_attempt_rejection_reason(rejection);
+        let record_message =
+            format!("external dispatch rejected by request attempt policy: {reason}");
+        self.record_external_failure(
+            route,
+            None,
+            attempts.clone(),
+            "inference_attempt_policy",
+            &record_message,
+            synthetic_external_error_diagnostics(route, StatusCode::SERVICE_UNAVAILABLE, reason),
+        );
+        ExternalPoolForwardOutcome::FinalError(external_attempt_rejection_final_error(
+            route, attempts,
+        ))
+    }
+
+    fn prepare_forward_once(
         &self,
         pool: &ExternalPool,
         route: &ExternalRouteRequest,
-        lease: ExternalPoolLease,
         config: &ExternalPoolsConfig,
-    ) -> Result<ExternalForwardResponse, ExternalForwardError> {
+    ) -> Result<PreparedExternalForwardRequest, ExternalForwardError> {
         let url = external_pool_url(pool, &route.endpoint, config)?;
         let mut headers = forward_headers(&route.headers, pool)?;
         if !headers.contains_key(header::CONTENT_TYPE) {
@@ -1965,6 +4842,7 @@ impl ExternalPoolManager {
         }
         let prepared = external_pool_prepare_request(route, pool)?;
         let outbound_model = prepared.outbound_model.clone();
+        let known_tool_names = external_route_known_tool_names(route);
         let mut request = self.client.post(url).headers(headers).body(prepared.body);
         if route.is_stream() {
             if config.external_pool_stream_request_timeout_secs > 0 {
@@ -1977,36 +4855,120 @@ impl ExternalPoolManager {
                 config.external_pool_request_timeout_secs,
             ));
         }
-        let response = request.send().await.map_err(|err| {
+        let response_body_timeout_secs = if config.external_pool_request_timeout_secs == 0 {
+            EXTERNAL_POOL_DEFAULT_RESPONSE_BODY_TIMEOUT_SECS
+        } else {
+            config.external_pool_request_timeout_secs
+        };
+        Ok(PreparedExternalForwardRequest {
+            request,
+            outbound_model,
+            known_tool_names,
+            response_body_timeout_secs,
+        })
+    }
+
+    #[cfg(test)]
+    fn set_dispatch_after_prepare_gate(&self, gate: Arc<TestDispatchAfterPrepareGate>) {
+        *self.dispatch_after_prepare_gate.lock() = Some(gate);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_dispatch_after_prepare_gate(&self) {
+        let gate = self.dispatch_after_prepare_gate.lock().take();
+        if let Some(gate) = gate {
+            gate.prepared.wait().await;
+            gate.resume.wait().await;
+        }
+    }
+
+    async fn forward_prepared_once(
+        &self,
+        pool: &ExternalPool,
+        route: &ExternalRouteRequest,
+        lease: ExternalPoolLease,
+        config: &ExternalPoolsConfig,
+        prepared: PreparedExternalForwardRequest,
+    ) -> Result<ExternalForwardResponse, ExternalForwardError> {
+        let PreparedExternalForwardRequest {
+            request,
+            outbound_model,
+            known_tool_names,
+            response_body_timeout_secs,
+        } = prepared;
+        if let Err(rejection) = route
+            .inference_attempt_budget
+            .reserve(InferenceAttemptKind::ExternalPool, 0)
+        {
             tracing::warn!(
                 request_id = %route.request_id,
                 error_id = %route.error_id,
                 pool_id = pool.id,
-                error = %err,
-                "external pool request send failed"
+                rejection = ?rejection,
+                "shared inference attempt policy rejected external upstream send"
             );
-            ExternalForwardError::new(
+            return Err(ExternalForwardError::dispatch_rejected(
                 ExternalPoolError {
-                    status: None,
-                    message: sanitized_external_network_error("request send failed", &err),
-                    retryable: true,
+                    status: Some(StatusCode::SERVICE_UNAVAILABLE),
+                    message: "inference request dispatch was not available".to_string(),
+                    retryable: false,
                     auto_disable_reason: None,
-                    cooldown: Some((
-                        Duration::from_secs(
-                            config.external_pool_network_error_cooldown_secs.max(1),
-                        ),
-                        "network_error".to_string(),
-                    )),
-                    response_body: None,
+                    cooldown: None,
+                    protocol_error: None,
                 },
-                outbound_model.clone(),
-            )
-        })?;
+                outbound_model,
+                rejection,
+            ));
+        }
+        let response = tokio::select! {
+            response = request.send() => response.map_err(|err| {
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    error_id = %route.error_id,
+                    pool_id = pool.id,
+                    error_class = %sanitized_external_network_error("request send failed", &err),
+                    "external pool request send failed"
+                );
+                ExternalForwardError::new(
+                    ExternalPoolError {
+                        status: None,
+                        message: sanitized_external_network_error("request send failed", &err),
+                        retryable: true,
+                        auto_disable_reason: None,
+                        cooldown: Some((
+                            Duration::from_secs(
+                                config.external_pool_network_error_cooldown_secs.max(1),
+                            ),
+                            "network_error".to_string(),
+                        )),
+                        protocol_error: None,
+                    },
+                    outbound_model.clone(),
+                )
+            })?,
+            _ = lease.wait_until_lost() => {
+                return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
-            let body = response.bytes().await.unwrap_or_default();
+            let body = tokio::select! {
+                body = response_bytes_with_limit_and_body_timeout(
+                    response,
+                    response_body_timeout_secs,
+                    EXTERNAL_POOL_ERROR_RESPONSE_MAX_BYTES,
+                ) => body.map_err(|err| external_response_body_read_error(
+                    err,
+                    status,
+                    EXTERNAL_POOL_ERROR_RESPONSE_MAX_BYTES,
+                    outbound_model.clone(),
+                ))?,
+                _ = lease.wait_until_lost() => {
+                    return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
+                }
+            };
             return Err(ExternalForwardError::new(
                 classify_external_error(status, body, headers, config),
                 outbound_model.clone(),
@@ -2054,27 +5016,27 @@ impl ExternalPoolManager {
                 pool_id: pool.id,
                 pool_name: pool.name.clone(),
             });
+            let transcript_state = Arc::new(SyncMutex::new(
+                ExternalAnthropicTranscriptState::new_with_error_context(
+                    known_tool_names.iter().cloned(),
+                    Some(route.request_id.clone()),
+                    Some(route.error_id.clone()),
+                ),
+            ));
             let stream = futures::stream::unfold(
                 (
                     body_stream,
                     Vec::<u8>::new(),
                     Some(lease),
                     Instant::now(),
-                    Instant::now(),
                     false,
                 ),
-                move |(
-                    mut body_stream,
-                    mut buffer,
-                    lease,
-                    mut last_touch_at,
-                    mut last_chunk_at,
-                    finished,
-                )| {
+                move |(mut body_stream, mut buffer, lease, mut last_chunk_at, finished)| {
                     let projection_context = projection_context.clone();
                     let usage_capture = usage_capture.clone();
                     let latency_trace = latency_trace.clone();
                     let stream_error_mask = stream_error_mask.clone();
+                    let transcript_state = transcript_state.clone();
                     async move {
                         if finished {
                             return None;
@@ -2088,12 +5050,13 @@ impl ExternalPoolManager {
                                                 .mark_first_upstream_chunk(route_started_at);
                                             last_chunk_at = Instant::now();
                                             buffer.extend_from_slice(&chunk);
-                                            let projected = drain_sse_events(
+                                            let projected = drain_sse_events_with_transcript(
                                                 &mut buffer,
                                                 projection_context.as_ref(),
                                                 Some(&usage_capture),
                                                 Some(stream_error_mask.as_ref()),
                                                 stream_plan,
+                                                Some(&mut transcript_state.lock()),
                                             );
                                             if !projected.is_empty() {
                                                 return Some((
@@ -2102,7 +5065,6 @@ impl ExternalPoolManager {
                                                         body_stream,
                                                         buffer,
                                                         lease,
-                                                        last_touch_at,
                                                         last_chunk_at,
                                                         false,
                                                     ),
@@ -2127,20 +5089,19 @@ impl ExternalPoolManager {
                                                         body_stream,
                                                         Vec::new(),
                                                         None,
-                                                        last_touch_at,
                                                         last_chunk_at,
                                                         true,
                                                     ),
                                                 ));
                                             }
                                         }
-                                        Some(Err(err)) => {
+                                        Some(Err(_)) => {
                                             tracing::warn!(
                                                 request_id = %stream_error_mask.request_id,
                                                 error_id = %stream_error_mask.error_id,
                                                 pool_id = stream_error_mask.pool_id,
                                                 pool_name = %stream_error_mask.pool_name,
-                                                error = %err,
+                                                error_class = "external_stream_read_error",
                                                 "external pool stream read failed"
                                             );
                                             drop(lease);
@@ -2152,24 +5113,31 @@ impl ExternalPoolManager {
                                                     body_stream,
                                                     Vec::new(),
                                                     None,
-                                                    last_touch_at,
                                                     last_chunk_at,
                                                     true,
                                                 ),
                                             ));
                                         }
                                         None => {
-                                            let tail = if buffer.is_empty() {
+                                            let mut tail = if buffer.is_empty() {
                                                 Vec::new()
                                             } else {
-                                                process_sse_event_with_plan(
+                                                process_sse_event_with_plan_and_transcript(
                                                     &buffer,
                                                     projection_context.as_ref(),
                                                     Some(&usage_capture),
                                                     Some(stream_error_mask.as_ref()),
                                                     stream_plan,
+                                                    Some(&mut transcript_state.lock()),
                                                 )
                                             };
+                                            {
+                                                let mut transcript_state = transcript_state.lock();
+                                                tail.extend(finish_external_transcript_state(
+                                                    &mut transcript_state,
+                                                    Some(&usage_capture),
+                                                ));
+                                            }
                                             drop(lease);
                                             if tail.is_empty() {
                                                 return None;
@@ -2180,7 +5148,6 @@ impl ExternalPoolManager {
                                                     body_stream,
                                                     Vec::new(),
                                                     None,
-                                                    last_touch_at,
                                                     last_chunk_at,
                                                     true,
                                                 ),
@@ -2188,11 +5155,20 @@ impl ExternalPoolManager {
                                         }
                                     }
                                 }
-                                _ = tokio::time::sleep_until(external_pool_lease_touch_deadline(last_touch_at)) => {
-                                    if let Some(lease) = lease.as_ref() {
-                                        let _ = lease.touch();
-                                    }
-                                    last_touch_at = Instant::now();
+                                _ = external_pool_lease_lost(lease.as_ref()) => {
+                                    drop(lease);
+                                    return Some((
+                                        Err(std::io::Error::other(
+                                            "external pool lease coordination was lost".to_string(),
+                                        )),
+                                        (
+                                            body_stream,
+                                            Vec::new(),
+                                            None,
+                                            last_chunk_at,
+                                            true,
+                                        ),
+                                    ));
                                 }
                                 _ = external_pool_stream_idle_deadline(last_chunk_at, stream_idle_timeout) => {
                                     drop(lease);
@@ -2208,7 +5184,6 @@ impl ExternalPoolManager {
                                             body_stream,
                                             Vec::new(),
                                             None,
-                                            last_touch_at,
                                             last_chunk_at,
                                             true,
                                         ),
@@ -2231,7 +5206,7 @@ impl ExternalPoolManager {
                         retryable: false,
                         auto_disable_reason: None,
                         cooldown: None,
-                        response_body: None,
+                        protocol_error: None,
                     },
                     outbound_model.clone(),
                 )
@@ -2244,31 +5219,21 @@ impl ExternalPoolManager {
                 stream_usage_projection,
             })
         } else {
-            let bytes = response.bytes().await.map_err(|err| {
-                tracing::warn!(
-                    request_id = %route.request_id,
-                    error_id = %route.error_id,
-                    pool_id = pool.id,
-                    error = %err,
-                    "external pool response read failed"
-                );
-                ExternalForwardError::new(
-                    ExternalPoolError {
-                        status: None,
-                        message: sanitized_external_network_error("response read failed", &err),
-                        retryable: true,
-                        auto_disable_reason: None,
-                        cooldown: Some((
-                            Duration::from_secs(
-                                config.external_pool_network_error_cooldown_secs.max(1),
-                            ),
-                            "network_error".to_string(),
-                        )),
-                        response_body: None,
-                    },
+            let bytes = tokio::select! {
+                body = response_bytes_with_limit_and_body_timeout(
+                    response,
+                    response_body_timeout_secs,
+                    EXTERNAL_POOL_NON_STREAM_RESPONSE_MAX_BYTES,
+                ) => body.map_err(|err| external_response_body_read_error(
+                    err,
+                    status,
+                    EXTERNAL_POOL_NON_STREAM_RESPONSE_MAX_BYTES,
                     outbound_model.clone(),
-                )
-            })?;
+                ))?,
+                _ = lease.wait_until_lost() => {
+                    return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
+                }
+            };
             if success_response_looks_like_html(&response_headers, &bytes) {
                 return Err(ExternalForwardError::new(
                     success_protocol_error(
@@ -2295,7 +5260,17 @@ impl ExternalPoolManager {
                 config.external_pool_usage_projection_output_uplift_min_tokens,
                 config.external_pool_usage_projection_output_uplift_percent,
             );
-            let projected = maybe_project_non_stream_usage(bytes, projection_context.as_ref());
+            let projected = maybe_project_non_stream_usage_with_tools(
+                bytes,
+                projection_context.as_ref(),
+                known_tool_names.iter().cloned(),
+            );
+            if projected.protocol_contamination {
+                return Err(ExternalForwardError::new(
+                    external_protocol_contamination_error(config),
+                    outbound_model.clone(),
+                ));
+            }
             let billing = external_pool_billing_from_capture(route, pool, projected.usage_capture);
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
@@ -2307,7 +5282,7 @@ impl ExternalPoolManager {
                         retryable: false,
                         auto_disable_reason: None,
                         cooldown: None,
-                        response_body: None,
+                        protocol_error: None,
                     },
                     outbound_model.clone(),
                 )
@@ -2333,15 +5308,19 @@ impl ExternalPoolManager {
             .selected_pool
     }
 
-    async fn select_pool_for_route(
+    async fn select_pool_for_route_from_snapshot(
         &self,
+        authoritative_pools: &Arc<Vec<ExternalPool>>,
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
         route: &ExternalRouteRequest,
     ) -> PoolSelectionSnapshot {
-        let support_candidates = route.model_candidates_for_support();
+        let support_candidates = normalize_external_pool_support_candidates(
+            route.model_candidates_for_support().into_iter().flatten(),
+        );
         let cooldown_candidates = route.model_cooldown_candidates();
-        self.scan_pool_availability_uncached(
+        self.scan_pool_availability_from_snapshot(
+            authoritative_pools,
             excluded,
             config,
             true,
@@ -2352,6 +5331,65 @@ impl ExternalPoolManager {
         .await
     }
 
+    fn select_degraded_fallback_local_pool_from_snapshot(
+        &self,
+        authoritative_pools: &Arc<Vec<ExternalPool>>,
+        excluded: &HashSet<u64>,
+        route: &ExternalRouteRequest,
+    ) -> Option<PoolSelectionSnapshot> {
+        let support_candidates = normalize_external_pool_support_candidates(
+            route.model_candidates_for_support().into_iter().flatten(),
+        );
+        let candidates = authoritative_pools
+            .iter()
+            .filter(|pool| {
+                !excluded.contains(&pool.id)
+                    && pool.enabled
+                    && !pool.is_auto_disabled_now()
+                    && external_pool_matches_body_mode_filter(pool, route.body_mode_filter)
+                    && external_pool_matches_supported_models_normalized(
+                        pool,
+                        Some(&support_candidates),
+                    )
+            })
+            .cloned()
+            .map(|pool| (pool, 0))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        let eligible_pools = candidates.len();
+        let selected_pool = select_external_pool_candidate(candidates)?;
+        Some(PoolSelectionSnapshot {
+            selected_pool: Some(selected_pool),
+            availability: PoolAvailabilitySnapshot {
+                eligible_pools,
+                available_pools: 1,
+                ..PoolAvailabilitySnapshot::default()
+            },
+            degraded_fallback_local_lease: true,
+        })
+    }
+
+    #[cfg(test)]
+    async fn select_pool_for_route(
+        &self,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+        route: &ExternalRouteRequest,
+    ) -> PoolSelectionSnapshot {
+        if !config.external_pools_enabled {
+            return PoolSelectionSnapshot::default();
+        }
+        let authoritative_pools = match self.load_authoritative_pool_snapshot().await {
+            Ok(pools) => pools,
+            Err(unavailable) => return selection_unavailable_snapshot(unavailable),
+        };
+        self.select_pool_for_route_from_snapshot(&authoritative_pools, excluded, config, route)
+            .await
+    }
+
+    #[cfg(test)]
     async fn scan_pool_availability_uncached(
         &self,
         excluded: &HashSet<u64>,
@@ -2364,67 +5402,127 @@ impl ExternalPoolManager {
         if !config.external_pools_enabled {
             return PoolSelectionSnapshot::default();
         }
-        let Ok(pools) = self.postgres.list_external_pools(false).await else {
-            return PoolSelectionSnapshot::default();
+        let authoritative_pools = match self.load_authoritative_pool_snapshot().await {
+            Ok(pools) => pools,
+            Err(unavailable) => return selection_unavailable_snapshot(unavailable),
         };
+        let normalized_candidates = model_candidates.map(|candidates| {
+            normalize_external_pool_support_candidates(candidates.iter().flatten().copied())
+        });
+        self.scan_pool_availability_from_snapshot(
+            &authoritative_pools,
+            excluded,
+            config,
+            include_selection,
+            body_mode_filter,
+            normalized_candidates.as_deref(),
+            model_cooldown_candidates,
+        )
+        .await
+    }
+
+    async fn scan_pool_availability_from_snapshot(
+        &self,
+        authoritative_pools: &Arc<Vec<ExternalPool>>,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+        include_selection: bool,
+        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+        model_candidates: Option<&[String]>,
+        model_cooldown_candidates: Option<&[String]>,
+    ) -> PoolSelectionSnapshot {
+        if !config.external_pools_enabled {
+            return PoolSelectionSnapshot::default();
+        }
+        let pools = authoritative_pools
+            .iter()
+            .filter(|pool| {
+                !excluded.contains(&pool.id)
+                    && pool.enabled
+                    && !pool.is_auto_disabled_now()
+                    && external_pool_matches_body_mode_filter(pool, body_mode_filter)
+                    && external_pool_matches_supported_models_normalized(pool, model_candidates)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let mut candidates = include_selection.then(Vec::new);
-        let mut availability = PoolAvailabilitySnapshot::default();
-        for pool in pools {
-            if excluded.contains(&pool.id) {
-                continue;
-            }
-            if !pool.enabled || pool.is_auto_disabled_now() {
-                continue;
-            }
-            if !external_pool_matches_body_mode_filter(&pool, body_mode_filter) {
-                continue;
-            }
-            if !external_pool_matches_supported_models(&pool, model_candidates) {
-                continue;
-            }
-            availability.eligible_pools += 1;
-            let (in_flight, global_in_flight, mut cooldown_remaining_secs, mut cooldown_reason) =
-                match self.pool_runtime_snapshot(pool.id).await {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        tracing::warn!(
-                            pool_id = pool.id,
-                            error = %err,
-                            "读取外部池 Redis 调度协调状态失败，暂停外部池准入"
-                        );
-                        availability.temporary_unavailable_pools += 1;
-                        availability.coordinator_unavailable = true;
-                        availability.wait_reason =
-                            Some(PoolCapacityWaitReason::CoordinatorUnavailable);
-                        continue;
-                    }
+        let mut availability = PoolAvailabilitySnapshot {
+            eligible_pools: pools.len(),
+            ..PoolAvailabilitySnapshot::default()
+        };
+        if pools.is_empty() {
+            return PoolSelectionSnapshot {
+                selected_pool: None,
+                availability,
+                degraded_fallback_local_lease: false,
+            };
+        }
+        let requested_model_cooldowns: &[String] = if config
+            .external_pool_model_unavailable_cooldown_mode
+            == ExternalPoolModelUnavailableCooldownMode::Model
+        {
+            model_cooldown_candidates.unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let pool_ids = pools.iter().map(|pool| pool.id).collect::<Vec<_>>();
+        let runtimes = match self
+            .load_selection_runtime_snapshots(&pool_ids, requested_model_cooldowns)
+            .await
+        {
+            Ok(runtimes) => runtimes,
+            Err(err) => {
+                let recovery_wait = err
+                    .downcast_ref::<ExternalPoolCoordinatorGuardError>()
+                    .and_then(|guard| match &guard.state {
+                        ExternalPoolCoordinatorGuardState::Recovering { remaining, .. } => {
+                            Some(*remaining)
+                        }
+                        _ => None,
+                    });
+                tracing::debug!(
+                    pool_count = pools.len(),
+                    error = %err,
+                    "批量读取外部池 Redis 调度协调状态失败，暂停外部池准入"
+                );
+                availability.temporary_unavailable_pools = pools.len();
+                availability.coordinator_unavailable = true;
+                availability.coordinator_unavailable_kind =
+                    Some(PoolCoordinatorUnavailableKind::RedisError);
+                availability.wait_reason = Some(PoolCapacityWaitReason::CoordinatorUnavailable);
+                availability.wait_for = recovery_wait;
+                return PoolSelectionSnapshot {
+                    selected_pool: None,
+                    availability,
+                    degraded_fallback_local_lease: false,
                 };
+            }
+        };
+        for (pool, runtime) in pools.into_iter().zip(runtimes) {
+            let runtime = match runtime {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::debug!(
+                        pool_id = pool.id,
+                        error = %err,
+                        "外部池 Redis cooldown 状态无效，仅隔离当前池"
+                    );
+                    availability.invalid_runtime_pools += 1;
+                    availability.temporary_unavailable_pools += 1;
+                    continue;
+                }
+            };
+            let in_flight = runtime.in_flight;
+            let global_in_flight = runtime.global_in_flight;
+            let mut cooldown_remaining_secs = runtime.pool_cooldown_remaining_secs;
+            let mut cooldown_reason = runtime.pool_cooldown_reason;
             let mut cooldown_scope =
                 (cooldown_remaining_secs > 0).then_some(PoolCooldownScope::Pool);
-            let model_cooldown_candidates = (cooldown_remaining_secs == 0
-                && config.external_pool_model_unavailable_cooldown_mode
-                    == ExternalPoolModelUnavailableCooldownMode::Model)
-                .then_some(model_cooldown_candidates)
-                .flatten()
-                .filter(|candidates| !candidates.is_empty());
-            if let Some(model_cooldown_candidates) = model_cooldown_candidates {
-                match self
-                    .pool_model_cooldown_snapshot(pool.id, model_cooldown_candidates)
-                    .await
-                {
-                    Ok(Some((model_remaining_secs, model_reason))) => {
-                        cooldown_remaining_secs = model_remaining_secs;
-                        cooldown_reason = model_reason;
-                        cooldown_scope = Some(PoolCooldownScope::Model);
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            pool_id = pool.id,
-                            error = %err,
-                            "读取外部池模型级 cooldown 失败，继续按池级状态调度"
-                        );
-                    }
+            if cooldown_remaining_secs == 0 {
+                if let Some((model_remaining_secs, model_reason)) = runtime.model_cooldown {
+                    cooldown_remaining_secs = model_remaining_secs;
+                    cooldown_reason = model_reason;
+                    cooldown_scope = Some(PoolCooldownScope::Model);
                 }
             }
             match Self::skip_reason(
@@ -2459,6 +5557,12 @@ impl ExternalPoolManager {
                 _ => {}
             }
         }
+        if availability.available_pools == 0 && availability.invalid_runtime_pools > 0 {
+            availability.coordinator_unavailable = true;
+            availability.coordinator_unavailable_kind =
+                Some(PoolCoordinatorUnavailableKind::RedisError);
+            availability.wait_reason = Some(PoolCapacityWaitReason::CoordinatorUnavailable);
+        }
         let selected_pool = if availability.coordinator_unavailable {
             None
         } else {
@@ -2467,9 +5571,11 @@ impl ExternalPoolManager {
         PoolSelectionSnapshot {
             selected_pool,
             availability,
+            degraded_fallback_local_lease: false,
         }
     }
 
+    #[cfg(test)]
     async fn pool_availability_snapshot(
         &self,
         excluded: &HashSet<u64>,
@@ -2479,6 +5585,7 @@ impl ExternalPoolManager {
             .await
     }
 
+    #[cfg(test)]
     async fn pool_availability_snapshot_inner(
         &self,
         excluded: &HashSet<u64>,
@@ -2489,13 +5596,14 @@ impl ExternalPoolManager {
             return PoolAvailabilitySnapshot::default();
         }
         let cacheable = allow_cache && excluded.is_empty();
+        let cache_key = "all";
         let now = Instant::now();
         let cached_snapshot = cacheable
             .then(|| {
                 self.availability_cache
                     .lock()
                     .as_ref()
-                    .filter(|cached| cached.expires_at > now)
+                    .filter(|cached| cached.cache_key == cache_key && cached.expires_at > now)
                     .map(|cached| cached.snapshot.clone())
             })
             .flatten();
@@ -2509,6 +5617,7 @@ impl ExternalPoolManager {
             .availability;
         if cacheable {
             *self.availability_cache.lock() = Some(CachedPoolAvailabilitySnapshot {
+                cache_key: cache_key.to_string(),
                 snapshot: snapshot.clone(),
                 expires_at: Instant::now() + EXTERNAL_POOL_AVAILABILITY_CACHE_TTL,
             });
@@ -2524,6 +5633,7 @@ impl ExternalPoolManager {
         context: PoolCapacityWaitContext,
         queue_guard: &mut Option<ExternalPoolQueueGuard>,
         wait_started_at: &mut Option<Instant>,
+        capacity_waiter: &mut CapacityWaiter,
     ) -> ExternalCapacityDecision {
         let reason = context.reason;
         let wait_for = context.wait_for;
@@ -2555,14 +5665,8 @@ impl ExternalPoolManager {
         }
 
         let started = *wait_started_at.get_or_insert_with(Instant::now);
-        let max_wait = if config.external_pool_dispatch_max_wait_secs == 0 {
-            None
-        } else {
-            Some(Duration::from_secs(
-                config.external_pool_dispatch_max_wait_secs,
-            ))
-        };
-        if let Some(max_wait) = max_wait.filter(|max_wait| started.elapsed() >= *max_wait) {
+        let max_wait = Duration::from_secs(config.effective_dispatch_max_wait_secs());
+        if started.elapsed() >= max_wait {
             let message = format!(
                 "Request capacity wait timed out after {} seconds",
                 max_wait.as_secs()
@@ -2591,7 +5695,7 @@ impl ExternalPoolManager {
 
         if queue_guard.is_none() {
             match self
-                .enter_external_pool_queue(config.external_pool_max_queued_requests)
+                .enter_external_pool_queue(config.external_pool_max_queued_requests, max_wait)
                 .await
             {
                 Ok(Some(guard)) => *queue_guard = Some(guard),
@@ -2677,38 +5781,36 @@ impl ExternalPoolManager {
         let mut wakeup = wait_for
             .unwrap_or_else(|| Duration::from_secs(1))
             .min(Duration::from_secs(1));
-        if let Some(max_wait) = max_wait {
-            let remaining = max_wait.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                let message = format!(
-                    "Request capacity wait timed out after {} seconds",
-                    max_wait.as_secs()
-                );
-                self.record_external_failure(
+        let remaining = max_wait.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            let message = format!(
+                "Request capacity wait timed out after {} seconds",
+                max_wait.as_secs()
+            );
+            self.record_external_failure(
+                route,
+                None,
+                attempts,
+                "external_pool_wait_timeout",
+                &message,
+                synthetic_external_capacity_error_diagnostics(
                     route,
-                    None,
-                    attempts,
-                    "external_pool_wait_timeout",
-                    &message,
-                    synthetic_external_capacity_error_diagnostics(
-                        route,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "external_dispatch",
-                        config,
-                        Some(&context),
-                    ),
-                );
-                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "external_pool_wait_timeout",
-                    message,
-                    &route.error_id,
-                ));
-            }
-            wakeup = wakeup.min(remaining);
+                    "external_dispatch",
+                    config,
+                    Some(&context),
+                ),
+            );
+            return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "external_pool_wait_timeout",
+                message,
+                &route.error_id,
+            ));
         }
+        wakeup = wakeup.min(remaining);
         if !wakeup.is_zero() {
-            let _ = timeout(wakeup, self.capacity_notify.notified()).await;
+            let _ = timeout(wakeup, capacity_waiter.wait_for_change()).await;
         }
         ExternalCapacityDecision::Retry
     }
@@ -2743,126 +5845,396 @@ impl ExternalPoolManager {
         None
     }
 
+    async fn acquire_pool_for_route(
+        &self,
+        pool: &ExternalPool,
+        config: &ExternalPoolsConfig,
+        route: &ExternalRouteRequest,
+    ) -> PoolAcquireResult {
+        let model_cooldown_candidates = route.model_cooldown_candidates();
+        self.acquire_pool_with_model_cooldowns(pool, config, &model_cooldown_candidates)
+            .await
+    }
+
+    fn acquire_degraded_fallback_local_pool(&self, pool: &ExternalPool) -> PoolAcquireResult {
+        let max_concurrent = pool.max_concurrent_requests.max(1);
+        let limiter = {
+            let mut limiters = self.degraded_fallback_local_leases.lock();
+            limiters
+                .entry((pool.id, max_concurrent))
+                .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent as usize)))
+                .clone()
+        };
+        match limiter.try_acquire_owned() {
+            Ok(permit) => PoolAcquireResult::Acquired(ExternalPoolLease::degraded_fallback_local(
+                self.clone(),
+                pool.id,
+                uuid::Uuid::new_v4().to_string(),
+                permit,
+            )),
+            Err(_) => PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                reason: PoolCapacityWaitReason::Full,
+                wait_for: None,
+                exclude_pool_for_reselect: true,
+                detail: "degraded_fallback_local_capacity_full",
+            }),
+        }
+    }
+
+    async fn validate_pool_dispatch_fence(&self, pool: &ExternalPool) -> PoolDispatchFenceResult {
+        let key = (pool.id, pool.revision);
+        let (flight, start_query) = {
+            let mut flights = self.dispatch_fence_flights.lock();
+            match flights.get(&key) {
+                Some(flight) => (flight.clone(), false),
+                None => {
+                    let flight = Arc::new(PoolDispatchFenceFlight::new());
+                    flights.insert(key, flight.clone());
+                    (flight, true)
+                }
+            }
+        };
+        if start_query {
+            let manager = self.clone();
+            let query_flight = flight.clone();
+            tokio::spawn(async move {
+                let result = manager.query_pool_dispatch_fence(key.0, key.1).await;
+                {
+                    let mut flights = manager.dispatch_fence_flights.lock();
+                    if flights
+                        .get(&key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &query_flight))
+                    {
+                        flights.remove(&key);
+                    }
+                }
+                query_flight.complete(result);
+            });
+        }
+        match timeout(
+            EXTERNAL_POOL_DISPATCH_FENCE_SHARED_WAIT_TIMEOUT,
+            flight.wait(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                PoolDispatchFenceResult::CoordinatorUnavailable(ExternalPoolSelectionUnavailable {
+                    kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
+                    retry_after: Duration::from_millis(250),
+                })
+            }
+        }
+    }
+
+    async fn query_pool_dispatch_fence(
+        &self,
+        pool_id: u64,
+        revision: u64,
+    ) -> PoolDispatchFenceResult {
+        let permit = match self.selection_breaker.try_begin() {
+            Ok(permit) => permit,
+            Err(unavailable) => {
+                if unavailable.kind == ExternalPoolSelectionFailureKind::AdmissionSaturated {
+                    self.selection_saturated.fetch_add(1, Ordering::Relaxed);
+                }
+                return PoolDispatchFenceResult::CoordinatorUnavailable(unavailable);
+            }
+        };
+        #[cfg(test)]
+        self.dispatch_fence_pg_loads.fetch_add(1, Ordering::Relaxed);
+        match timeout(
+            EXTERNAL_POOL_DISPATCH_FENCE_TIMEOUT,
+            self.postgres
+                .external_pool_dispatch_revision_matches(pool_id, revision),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                permit.success();
+                PoolDispatchFenceResult::Current
+            }
+            Ok(Ok(false)) => {
+                permit.success();
+                PoolDispatchFenceResult::Changed
+            }
+            Ok(Err(_)) => {
+                permit.failure(ExternalPoolSelectionFailureKind::PostgresError);
+                PoolDispatchFenceResult::CoordinatorUnavailable(ExternalPoolSelectionUnavailable {
+                    kind: ExternalPoolSelectionFailureKind::PostgresError,
+                    retry_after: Duration::from_millis(250),
+                })
+            }
+            Err(_) => {
+                permit.failure(ExternalPoolSelectionFailureKind::PostgresTimeout);
+                PoolDispatchFenceResult::CoordinatorUnavailable(ExternalPoolSelectionUnavailable {
+                    kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
+                    retry_after: Duration::from_millis(250),
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn dispatch_fence_pg_loads_for_test(&self) -> u64 {
+        self.dispatch_fence_pg_loads.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     async fn acquire_pool(
         &self,
         pool: &ExternalPool,
         config: &ExternalPoolsConfig,
     ) -> PoolAcquireResult {
-        let (_, _, cooldown_remaining_secs, _) = match self.pool_runtime_snapshot(pool.id).await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                tracing::warn!(
-                    pool_id = pool.id,
-                    error = %err,
-                    "读取外部池 Redis 调度协调状态失败，拒绝占用并发槽"
-                );
-                return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
-                    reason: PoolCapacityWaitReason::CoordinatorUnavailable,
-                    wait_for: None,
-                    exclude_pool_for_reselect: false,
-                    detail: "capacity_state_error",
-                });
-            }
-        };
-        if cooldown_remaining_secs > 0 {
+        self.acquire_pool_with_model_cooldowns(pool, config, &[])
+            .await
+    }
+
+    async fn acquire_pool_with_model_cooldowns(
+        &self,
+        pool: &ExternalPool,
+        config: &ExternalPoolsConfig,
+        model_cooldown_candidates: &[String],
+    ) -> PoolAcquireResult {
+        self.acquire_pool_with_model_cooldowns_and_max_age(
+            pool,
+            config,
+            model_cooldown_candidates,
+            Duration::from_secs(EXTERNAL_POOL_LEASE_MAX_AGE_SECS),
+        )
+        .await
+    }
+
+    async fn acquire_pool_with_model_cooldowns_and_max_age(
+        &self,
+        pool: &ExternalPool,
+        config: &ExternalPoolsConfig,
+        model_cooldown_candidates: &[String],
+        max_age: Duration,
+    ) -> PoolAcquireResult {
+        self.acquire_pool_with_model_cooldowns_and_max_age_inner(
+            pool,
+            config,
+            model_cooldown_candidates,
+            max_age,
+            0,
+        )
+        .await
+    }
+
+    async fn acquire_pool_with_model_cooldowns_and_max_age_inner(
+        &self,
+        pool: &ExternalPool,
+        config: &ExternalPoolsConfig,
+        model_cooldown_candidates: &[String],
+        max_age: Duration,
+        epoch_reconciliations: usize,
+    ) -> PoolAcquireResult {
+        let Some(release_permit) = self.release_dispatcher.try_reserve() else {
             return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
-                reason: PoolCapacityWaitReason::Cooldown,
-                wait_for: Some(Duration::from_secs(cooldown_remaining_secs.max(1))),
-                exclude_pool_for_reselect: true,
-                detail: "cooldown_before_acquire",
+                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                wait_for: Some(Duration::from_millis(50)),
+                exclude_pool_for_reselect: false,
+                detail: "release_backlog_saturated",
             });
-        }
-        let lease_id = match self.redis.next_external_pool_lease_id().await {
-            Ok(lease_id) => lease_id,
+        };
+        let coordination_epoch = match self.external_pool_coordination_epoch().await {
+            Ok(epoch) => epoch,
             Err(err) => {
-                tracing::warn!(pool_id = pool.id, "生成外部池 Redis lease ID 失败: {}", err);
+                self.mark_external_pool_coordinator_probe_required();
+                tracing::warn!(pool_id = pool.id, error = %err, "外部池 Redis 协调 epoch 暂不可用");
                 return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
                     reason: PoolCapacityWaitReason::CoordinatorUnavailable,
                     wait_for: None,
                     exclude_pool_for_reselect: false,
-                    detail: "lease_id_error",
+                    detail: "coordinator_epoch_unavailable",
                 });
             }
         };
-        let max_age = Some(Duration::from_secs(
-            DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS.saturating_mul(2),
+        let mut cooldown_keys = vec![format!("external_pool:{}:cooldown", pool.id)];
+        if config.external_pool_model_unavailable_cooldown_mode
+            == ExternalPoolModelUnavailableCooldownMode::Model
+        {
+            cooldown_keys.extend(
+                model_cooldown_candidates
+                    .iter()
+                    .map(|model| external_pool_model_cooldown_key(pool.id, model)),
+            );
+        }
+        let coordinator_permit = match self.coordinator_breaker.try_begin() {
+            Ok(permit) => permit,
+            Err(open) => {
+                return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                    wait_for: Some(open.retry_after),
+                    exclude_pool_for_reselect: false,
+                    detail: "coordinator_breaker_open",
+                });
+            }
+        };
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let mut pending_lease = Some(ExternalPoolLease::pending(
+            self.clone(),
+            pool.id,
+            lease_id.clone(),
+            coordination_epoch.clone(),
+            max_age,
+            release_permit,
         ));
-        match self
-            .redis
-            .acquire_external_pool_lease(
+        let acquire_result = match timeout(
+            EXTERNAL_POOL_COORDINATOR_REDIS_OPERATION_TIMEOUT,
+            self.redis.acquire_external_pool_lease(
                 pool.id,
-                lease_id,
+                &lease_id,
+                &coordination_epoch,
                 pool.max_concurrent_requests.max(1),
                 config.external_pool_global_max_concurrent_requests,
-                max_age,
-            )
-            .await
+                Some(max_age),
+                &cooldown_keys,
+            ),
+        )
+        .await
         {
-            Ok(Some(_)) => PoolAcquireResult::Acquired(ExternalPoolLease {
-                manager: self.clone(),
-                pool_id: pool.id,
-                lease_id,
-            }),
-            Ok(None) => {
-                let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
-                    match self.pool_runtime_snapshot(pool.id).await {
-                        Ok(snapshot) => snapshot,
-                        Err(err) => {
-                            tracing::warn!(
-                                pool_id = pool.id,
-                                error = %err,
-                                "复核外部池 Redis 调度协调状态失败，暂停外部池准入"
-                            );
-                            return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
-                                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
-                                wait_for: None,
-                                exclude_pool_for_reselect: false,
-                                detail: "capacity_recheck_error",
-                            });
-                        }
-                    };
-                let skip_reason = Self::skip_reason(
-                    pool,
-                    in_flight,
-                    global_in_flight,
-                    cooldown_remaining_secs,
-                    config,
-                );
-                let unavailable = match skip_reason.as_deref() {
-                    Some("cooldown") => PoolAcquireUnavailable {
-                        reason: PoolCapacityWaitReason::Cooldown,
-                        wait_for: Some(Duration::from_secs(cooldown_remaining_secs.max(1))),
-                        exclude_pool_for_reselect: true,
-                        detail: "cooldown_after_acquire_race",
-                    },
-                    Some("global_concurrency_full") => PoolAcquireUnavailable {
-                        reason: PoolCapacityWaitReason::Full,
-                        wait_for: None,
-                        exclude_pool_for_reselect: false,
-                        detail: "global_concurrency_full_after_acquire_race",
-                    },
-                    Some("pool_concurrency_full") => PoolAcquireUnavailable {
-                        reason: PoolCapacityWaitReason::Full,
-                        wait_for: None,
-                        exclude_pool_for_reselect: true,
-                        detail: "pool_concurrency_full_after_acquire_race",
-                    },
-                    _ => PoolAcquireUnavailable {
-                        reason: PoolCapacityWaitReason::Full,
-                        wait_for: Some(Duration::from_secs(1)),
-                        exclude_pool_for_reselect: true,
-                        detail: "lease_acquire_race",
-                    },
-                };
-                PoolAcquireResult::Unavailable(unavailable)
+            Ok(Ok(result)) => {
+                coordinator_permit.success();
+                result
             }
-            Err(err) => {
-                tracing::warn!(pool_id = pool.id, "占用外部池 Redis 并发槽失败: {}", err);
-                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+            Ok(Err(err)) => {
+                self.mark_external_pool_coordinator_probe_required();
+                coordinator_permit.failure(ExternalPoolCoordinatorFailureKind::RedisError);
+                tracing::debug!(
+                    pool_id = pool.id,
+                    error = %err,
+                    "占用外部池 Redis 并发槽失败"
+                );
+                return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
                     reason: PoolCapacityWaitReason::CoordinatorUnavailable,
                     wait_for: None,
                     exclude_pool_for_reselect: false,
                     detail: "lease_acquire_error",
+                });
+            }
+            Err(_) => {
+                self.mark_external_pool_coordinator_probe_required();
+                coordinator_permit.failure(ExternalPoolCoordinatorFailureKind::Timeout);
+                return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                    wait_for: None,
+                    exclude_pool_for_reselect: false,
+                    detail: "lease_acquire_timeout",
+                });
+            }
+        };
+        match acquire_result {
+            RedisExternalPoolLeaseAcquireResult::Acquired {
+                lease_id: acquired_lease_id,
+                ..
+            } if acquired_lease_id == lease_id => {
+                let mut lease = pending_lease.take().expect("pending external pool lease");
+                lease.confirm();
+                PoolAcquireResult::Acquired(lease)
+            }
+            RedisExternalPoolLeaseAcquireResult::Acquired { .. } => {
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                    wait_for: None,
+                    exclude_pool_for_reselect: false,
+                    detail: "lease_acquire_id_mismatch",
+                })
+            }
+            RedisExternalPoolLeaseAcquireResult::PoolCooldown { remaining } => {
+                pending_lease
+                    .take()
+                    .expect("pending external pool lease")
+                    .disarm();
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::Cooldown,
+                    wait_for: Some(remaining.unwrap_or_else(|| Duration::from_secs(1))),
+                    exclude_pool_for_reselect: true,
+                    detail: "cooldown_during_atomic_acquire",
+                })
+            }
+            RedisExternalPoolLeaseAcquireResult::ModelCooldown { remaining } => {
+                pending_lease
+                    .take()
+                    .expect("pending external pool lease")
+                    .disarm();
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::ModelUnavailable,
+                    wait_for: Some(remaining.unwrap_or_else(|| Duration::from_secs(1))),
+                    exclude_pool_for_reselect: true,
+                    detail: "model_cooldown_during_atomic_acquire",
+                })
+            }
+            RedisExternalPoolLeaseAcquireResult::PoolCapacityFull { .. } => {
+                pending_lease
+                    .take()
+                    .expect("pending external pool lease")
+                    .disarm();
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::Full,
+                    wait_for: None,
+                    exclude_pool_for_reselect: true,
+                    detail: "pool_concurrency_full_during_atomic_acquire",
+                })
+            }
+            RedisExternalPoolLeaseAcquireResult::GlobalCapacityFull { .. } => {
+                pending_lease
+                    .take()
+                    .expect("pending external pool lease")
+                    .disarm();
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::Full,
+                    wait_for: None,
+                    exclude_pool_for_reselect: false,
+                    detail: "global_concurrency_full_during_atomic_acquire",
+                })
+            }
+            RedisExternalPoolLeaseAcquireResult::Released => {
+                pending_lease
+                    .take()
+                    .expect("pending external pool lease")
+                    .disarm();
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                    wait_for: None,
+                    exclude_pool_for_reselect: false,
+                    detail: "lease_released_before_acquire",
+                })
+            }
+            RedisExternalPoolLeaseAcquireResult::CoordinatorEpochMismatch { .. } => {
+                pending_lease
+                    .take()
+                    .expect("pending external pool lease")
+                    .disarm();
+                if epoch_reconciliations >= 3 {
+                    return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                        reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                        wait_for: None,
+                        exclude_pool_for_reselect: false,
+                        detail: "coordinator_epoch_churn",
+                    });
+                }
+                self.mark_external_pool_coordinator_probe_required();
+                Box::pin(self.acquire_pool_with_model_cooldowns_and_max_age_inner(
+                    pool,
+                    config,
+                    model_cooldown_candidates,
+                    max_age,
+                    epoch_reconciliations + 1,
+                ))
+                .await
+            }
+            RedisExternalPoolLeaseAcquireResult::CoordinatorRecovering { remaining, .. } => {
+                pending_lease
+                    .take()
+                    .expect("pending external pool lease")
+                    .disarm();
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                    wait_for: Some(remaining),
+                    exclude_pool_for_reselect: false,
+                    detail: "coordinator_restart_recovery",
                 })
             }
         }
@@ -2871,16 +6243,18 @@ impl ExternalPoolManager {
     async fn enter_external_pool_queue(
         &self,
         max_queued: u32,
+        max_wait: Duration,
     ) -> anyhow::Result<Option<ExternalPoolQueueGuard>> {
         let lease_id = uuid::Uuid::new_v4().to_string();
+        let lease_policy = external_pool_queue_lease_policy(Some(max_wait));
         // Arm cleanup before awaiting Redis so cancellation and commit-unknown both remove this ID.
-        let guard = ExternalPoolQueueGuard::new(self.clone(), lease_id.clone());
+        let guard = ExternalPoolQueueGuard::new(self.clone(), lease_id.clone(), lease_policy);
         let admitted = timeout(
             EXTERNAL_POOL_QUEUE_REDIS_OPERATION_TIMEOUT,
             self.redis.try_enter_external_pool_dispatch_queue(
                 &lease_id,
                 max_queued,
-                EXTERNAL_POOL_QUEUE_LEASE_TTL_SECS,
+                lease_policy.ttl_secs,
             ),
         )
         .await
@@ -2898,42 +6272,28 @@ impl ExternalPoolManager {
         }
     }
 
-    async fn release_pool(&self, pool_id: u64, lease_id: u64) -> anyhow::Result<()> {
+    async fn touch_pool(
+        &self,
+        pool_id: u64,
+        lease_id: &str,
+        ttl_secs: usize,
+        coordination_epoch: &str,
+    ) -> anyhow::Result<bool> {
+        let current_epoch = self.external_pool_coordination_epoch().await?;
+        if current_epoch != coordination_epoch {
+            return Ok(false);
+        }
         match self
             .redis
-            .release_external_pool_lease(pool_id, lease_id)
+            .touch_external_pool_lease(pool_id, lease_id, ttl_secs, coordination_epoch)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => tracing::debug!(
-                pool_id,
-                lease_id,
-                "外部池 Redis 并发 lease 已不存在或已释放"
-            ),
-            Err(err) => return Err(err),
+            Ok(touched) => return Ok(touched),
+            Err(err) => {
+                self.mark_external_pool_coordinator_probe_required();
+                return Err(err);
+            }
         }
-        self.capacity_notify.notify_waiters();
-        Ok(())
-    }
-
-    async fn touch_pool(&self, pool_id: u64, lease_id: u64) -> anyhow::Result<()> {
-        let ttl_secs = DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS
-            .saturating_mul(4)
-            .max(60) as usize;
-        match self
-            .redis
-            .touch_external_pool_lease(pool_id, lease_id, ttl_secs)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::debug!(
-                pool_id,
-                lease_id,
-                "外部池 Redis 并发 lease touch 时已不存在"
-            ),
-            Err(err) => return Err(err),
-        }
-        Ok(())
     }
 
     async fn mark_pool_cooldown(&self, pool_id: u64, duration: Duration, reason: String) {
@@ -2988,73 +6348,177 @@ impl ExternalPoolManager {
         }
     }
 
-    async fn pool_model_cooldown_snapshot(
+    #[cfg(test)]
+    async fn load_pool_runtime_snapshot(
         &self,
         pool_id: u64,
         models: &[String],
-    ) -> anyhow::Result<Option<(u64, Option<String>)>> {
-        let now = Utc::now();
-        let mut selected: Option<(u64, Option<String>)> = None;
-        for model in models {
-            let key = external_pool_model_cooldown_key(pool_id, model);
-            let cooldown = self
-                .redis
-                .get_json::<ExternalPoolCooldownState>(key.clone())
-                .await?;
-            let Some(cooldown) = cooldown else {
-                continue;
-            };
-            if cooldown.until <= now {
-                let _ = self.redis.del(key).await;
-                continue;
-            }
-            let remaining_secs = (cooldown.until - now).num_seconds().max(1) as u64;
-            if selected
-                .as_ref()
-                .map(|(selected_secs, _)| remaining_secs < *selected_secs)
-                .unwrap_or(true)
-            {
-                selected = Some((remaining_secs, cooldown.reason));
-            }
-        }
-        Ok(selected)
+    ) -> anyhow::Result<PoolRuntimeSnapshot> {
+        self.load_pool_runtime_snapshots(&[pool_id], models)
+            .await?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Redis returned no external pool runtime snapshot"))
+            .and_then(|runtime| runtime)
     }
 
+    async fn load_pool_runtime_snapshots(
+        &self,
+        pool_ids: &[u64],
+        models: &[String],
+    ) -> anyhow::Result<Vec<anyhow::Result<PoolRuntimeSnapshot>>> {
+        if pool_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests = pool_ids
+            .iter()
+            .map(|pool_id| ExternalPoolCoordinatorSnapshotRequest {
+                pool_id: *pool_id,
+                cooldown_keys: external_pool_cooldown_keys(*pool_id, models),
+            })
+            .collect::<Vec<_>>();
+        let mut epoch_reconciliations = 0usize;
+        let coordinators = loop {
+            let coordinator_permit = self.coordinator_breaker.try_begin().map_err(|open| {
+                anyhow::anyhow!(
+                    "external pool coordinator breaker is open; retry after {}ms",
+                    open.retry_after.as_millis().max(1)
+                )
+            })?;
+            let coordination_epoch = match self.external_pool_coordination_epoch().await {
+                Ok(epoch) => epoch,
+                Err(err) => {
+                    self.mark_external_pool_coordinator_probe_required();
+                    coordinator_permit.failure(ExternalPoolCoordinatorFailureKind::RedisError);
+                    return Err(err);
+                }
+            };
+            if coordination_epoch.is_empty() {
+                coordinator_permit.failure(ExternalPoolCoordinatorFailureKind::RedisError);
+                anyhow::bail!("external pool coordinator epoch is empty");
+            }
+            match timeout(
+                EXTERNAL_POOL_COORDINATOR_REDIS_OPERATION_TIMEOUT,
+                self.redis.external_pool_coordinator_snapshots(
+                    &requests,
+                    Some(Duration::from_secs(
+                        DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS.saturating_mul(2),
+                    )),
+                    &coordination_epoch,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(coordinators)) => {
+                    coordinator_permit.success();
+                    break coordinators;
+                }
+                Ok(Err(err)) => {
+                    let guard_state = err
+                        .downcast_ref::<ExternalPoolCoordinatorGuardError>()
+                        .map(|guard| guard.state.clone());
+                    if let Some(guard_state) = guard_state {
+                        coordinator_permit.success();
+                        match guard_state {
+                            ExternalPoolCoordinatorGuardState::EpochMismatch { .. }
+                                if epoch_reconciliations < 3 =>
+                            {
+                                epoch_reconciliations += 1;
+                                self.mark_external_pool_coordinator_probe_required();
+                                continue;
+                            }
+                            state => {
+                                return Err(anyhow::Error::new(
+                                    ExternalPoolCoordinatorGuardError { state },
+                                ));
+                            }
+                        }
+                    }
+                    self.mark_external_pool_coordinator_probe_required();
+                    coordinator_permit.failure(ExternalPoolCoordinatorFailureKind::RedisError);
+                    return Err(err);
+                }
+                Err(_) => {
+                    self.mark_external_pool_coordinator_probe_required();
+                    coordinator_permit.failure(ExternalPoolCoordinatorFailureKind::Timeout);
+                    return Err(anyhow::anyhow!(
+                        "Redis external pool coordinator snapshot timed out after {}ms",
+                        EXTERNAL_POOL_COORDINATOR_REDIS_OPERATION_TIMEOUT.as_millis()
+                    ));
+                }
+            }
+        };
+        if coordinators.len() != requests.len() {
+            anyhow::bail!("Redis returned an incomplete external pool coordinator snapshot batch");
+        }
+        Ok(requests
+            .iter()
+            .zip(coordinators)
+            .map(|(request, coordinator)| {
+                decode_pool_runtime_snapshot(
+                    request.pool_id,
+                    models,
+                    &request.cooldown_keys,
+                    coordinator,
+                )
+            })
+            .collect())
+    }
+
+    async fn load_selection_runtime_snapshots(
+        &self,
+        pool_ids: &[u64],
+        models: &[String],
+    ) -> anyhow::Result<Vec<anyhow::Result<PoolRuntimeSnapshot>>> {
+        let key = SelectionRuntimeSnapshotKey {
+            pool_ids: pool_ids.to_vec(),
+            models: models.to_vec(),
+        };
+        if let Some(snapshots) = self.cached_selection_runtime_snapshots(&key) {
+            return Ok(materialize_selection_runtime_snapshots(snapshots));
+        }
+
+        let _refresh = self.selection_runtime_snapshot_refresh_lock.lock().await;
+        if let Some(snapshots) = self.cached_selection_runtime_snapshots(&key) {
+            return Ok(materialize_selection_runtime_snapshots(snapshots));
+        }
+
+        let snapshots = self.load_pool_runtime_snapshots(pool_ids, models).await?;
+        let cacheable = snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.map_err(|err| err.to_string()))
+            .collect::<Vec<_>>();
+        *self.selection_runtime_snapshot.lock() = Some(CachedSelectionRuntimeSnapshot {
+            key,
+            snapshots: cacheable.clone(),
+            expires_at: Instant::now() + EXTERNAL_POOL_SELECTION_RUNTIME_SNAPSHOT_TTL,
+        });
+        Ok(materialize_selection_runtime_snapshots(cacheable))
+    }
+
+    fn cached_selection_runtime_snapshots(
+        &self,
+        key: &SelectionRuntimeSnapshotKey,
+    ) -> Option<Vec<Result<PoolRuntimeSnapshot, String>>> {
+        let now = Instant::now();
+        self.selection_runtime_snapshot
+            .lock()
+            .as_ref()
+            .filter(|cached| &cached.key == key && cached.expires_at > now)
+            .map(|cached| cached.snapshots.clone())
+    }
+
+    #[cfg(test)]
     async fn pool_runtime_snapshot(
         &self,
         pool_id: u64,
     ) -> anyhow::Result<(u32, u32, u64, Option<String>)> {
-        let capacity_state = self
-            .redis
-            .external_pool_capacity_state(
-                pool_id,
-                Some(Duration::from_secs(
-                    DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS.saturating_mul(2),
-                )),
-            )
-            .await?;
-        let in_flight = capacity_state.pool_in_flight_requests;
-        let global_in_flight = capacity_state.global_in_flight_requests;
-        let cooldown = self
-            .redis
-            .get_json::<ExternalPoolCooldownState>(format!("external_pool:{}:cooldown", pool_id))
-            .await?;
-        if let Some(cooldown) = cooldown {
-            let now = Utc::now();
-            if cooldown.until > now {
-                return Ok((
-                    in_flight,
-                    global_in_flight,
-                    (cooldown.until - now).num_seconds().max(1) as u64,
-                    cooldown.reason,
-                ));
-            }
-            let _ = self
-                .redis
-                .del(format!("external_pool:{}:cooldown", pool_id))
-                .await;
-        }
-        Ok((in_flight, global_in_flight, 0, None))
+        let snapshot = self.load_pool_runtime_snapshot(pool_id, &[]).await?;
+        Ok((
+            snapshot.in_flight,
+            snapshot.global_in_flight,
+            snapshot.pool_cooldown_remaining_secs,
+            snapshot.pool_cooldown_reason,
+        ))
     }
 
     async fn auto_disable_pool_if_configured(
@@ -3071,51 +6535,160 @@ impl ExternalPoolManager {
             return;
         }
         let threshold = config.external_pool_auto_disable_failure_threshold.max(1) as u64;
-        if threshold > 1 {
-            let key = format!("external_pool:{}:auto_disable_failures:{}", pool.id, reason);
-            let count = self
-                .redis
-                .incr_with_ttl(
-                    key,
-                    config.external_pool_auto_disable_window_secs.max(1) as usize,
-                )
-                .await
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        pool_id = pool.id,
-                        reason,
-                        "记录外部池自动禁用失败计数失败: {}",
-                        err
-                    );
-                    threshold
-                });
-            if count < threshold {
+        let claim = timeout(
+            EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT,
+            self.redis.claim_external_pool_auto_disable_transition(
+                pool.id,
+                pool.revision,
+                reason,
+                threshold,
+                config.external_pool_auto_disable_window_secs.max(1) as usize,
+                EXTERNAL_POOL_AUTO_DISABLE_TRANSITION_CLAIM_TTL_SECS,
+            ),
+        )
+        .await;
+        let (count, claimed) = match claim {
+            Ok(Ok(claim)) => claim,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    pool_id = pool.id,
+                    pool_revision = pool.revision,
+                    reason,
+                    error = %err,
+                    "外部池自动禁用 Redis 计数/claim 失败，跳过 PostgreSQL 变更"
+                );
                 return;
             }
+            Err(_) => {
+                tracing::warn!(
+                    pool_id = pool.id,
+                    pool_revision = pool.revision,
+                    reason,
+                    timeout_ms = EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT.as_millis(),
+                    "外部池自动禁用 Redis 计数/claim 超时，跳过 PostgreSQL 变更"
+                );
+                return;
+            }
+        };
+        if count < threshold || !claimed {
+            return;
         }
-        if let Err(err) = self
-            .postgres
-            .auto_disable_external_pool(
+
+        let changed = timeout(
+            EXTERNAL_POOL_AUTO_DISABLE_POSTGRES_TIMEOUT,
+            self.postgres.auto_disable_external_pool_if_unchanged(
                 pool.id,
+                pool.revision,
                 reason,
                 last_error,
                 config.external_pool_auto_disable_duration_secs,
-            )
-            .await
-        {
-            tracing::warn!(pool_id = pool.id, "自动禁用外部池失败: {}", err);
+            ),
+        )
+        .await;
+        match changed {
+            Ok(Ok(true)) => {
+                if let Err(err) = self
+                    .publish_external_pool_data_changed("auto_disable", Some(pool.id))
+                    .await
+                {
+                    tracing::warn!(
+                        pool_id = pool.id,
+                        pool_revision = pool.revision,
+                        error = %err,
+                        "自动禁用外部池已提交，但跨实例失效通知发布失败"
+                    );
+                }
+            }
+            Ok(Ok(false)) => {
+                tracing::debug!(
+                    pool_id = pool.id,
+                    pool_revision = pool.revision,
+                    reason,
+                    "外部池自动禁用条件更新未生效，pool revision 已变化或状态已转换"
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    pool_id = pool.id,
+                    pool_revision = pool.revision,
+                    error = %err,
+                    "自动禁用外部池 PostgreSQL 条件更新失败"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pool_id = pool.id,
+                    pool_revision = pool.revision,
+                    timeout_ms = EXTERNAL_POOL_AUTO_DISABLE_POSTGRES_TIMEOUT.as_millis(),
+                    "自动禁用外部池 PostgreSQL 条件更新超时"
+                );
+            }
         }
     }
 
     fn reset_pool_auto_disable_failure_counts(&self, pool_id: u64) {
+        let now = Instant::now();
+        let mut recent = self.success_reset_recent.lock();
+        recent.retain(|_, reset_at| {
+            now.saturating_duration_since(*reset_at) < EXTERNAL_POOL_SUCCESS_RESET_COALESCE_WINDOW
+        });
+        if recent.contains_key(&pool_id) {
+            return;
+        }
+        if recent.len() >= EXTERNAL_POOL_SUCCESS_RESET_MAX_TRACKED_POOLS {
+            tracing::warn!(
+                pool_id,
+                tracked_pools = recent.len(),
+                "外部池 success reset 合并索引已达硬上限，跳过本次清理"
+            );
+            return;
+        }
+        let Ok(task_permit) = self.success_reset_semaphore.clone().try_acquire_owned() else {
+            tracing::warn!(
+                pool_id,
+                max_tasks = EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS,
+                "外部池 success reset 后台任务已达硬上限，跳过本次清理"
+            );
+            return;
+        };
+        recent.insert(pool_id, now);
+        drop(recent);
+
         let redis = self.redis.clone();
+        let keys = EXTERNAL_POOL_AUTO_DISABLE_REASONS
+            .iter()
+            .map(|reason| format!("external_pool:{}:auto_disable_failures:{}", pool_id, reason))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let tasks_in_flight = self.success_reset_tasks_in_flight.clone();
+        #[cfg(test)]
+        {
+            self.success_reset_tasks_started
+                .fetch_add(1, Ordering::Relaxed);
+            tasks_in_flight.fetch_add(1, Ordering::Relaxed);
+        }
         tokio::spawn(async move {
-            for reason in EXTERNAL_POOL_AUTO_DISABLE_REASONS {
-                let key = format!("external_pool:{}:auto_disable_failures:{}", pool_id, reason);
-                if let Err(err) = redis.del(key).await {
-                    tracing::warn!(pool_id, reason, "清理外部账号自动禁用失败计数失败: {}", err);
-                }
+            let result = timeout(
+                EXTERNAL_POOL_SUCCESS_RESET_REDIS_TIMEOUT,
+                redis.del_many(&keys),
+            )
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => tracing::warn!(
+                    pool_id,
+                    error = %err,
+                    "单命令清理外部池 5 个自动禁用失败计数失败"
+                ),
+                Err(_) => tracing::warn!(
+                    pool_id,
+                    timeout_ms = EXTERNAL_POOL_SUCCESS_RESET_REDIS_TIMEOUT.as_millis(),
+                    "单命令清理外部池 5 个自动禁用失败计数超时"
+                ),
             }
+            #[cfg(test)]
+            tasks_in_flight.fetch_sub(1, Ordering::Relaxed);
+            drop(task_permit);
         });
     }
 
@@ -3204,18 +6777,24 @@ impl ExternalPoolManager {
                 match data_stream.next().await {
                     Some(Ok(chunk)) => {
                         if let Some(guard_ref) = guard.as_mut() {
+                            if !chunk.is_empty() {
+                                guard_ref
+                                    .route
+                                    .inference_attempt_budget
+                                    .mark_downstream_committed();
+                            }
                             guard_ref.mark_first_token_if_output(&chunk);
                         }
                         Some((Ok(chunk), (data_stream, guard)))
                     }
-                    Some(Err(err)) => {
+                    Some(Err(_)) => {
                         if let Some(mut guard) = guard.take() {
                             tracing::warn!(
                                 request_id = %guard.route.request_id,
                                 error_id = %guard.route.error_id,
                                 pool_id = guard.pool.id,
                                 pool_name = %guard.pool.name,
-                                error = %err,
+                                error_class = "external_stream_response_error",
                                 "external stream response failed"
                             );
                             guard.record_stream_error("external stream response failed");
@@ -3313,6 +6892,7 @@ impl ExternalPoolManager {
             .iter()
             .rev()
             .find_map(|attempt| attempt.outbound_model.clone());
+        let latency_trace = external_usage_latency_trace(route);
         route.recorder.record(UsageRecord {
             id: route.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -3326,6 +6906,7 @@ impl ExternalPoolManager {
             model_resolution_source: route.model_resolution_source.clone(),
             model_resolution_note: route.model_resolution_note.clone(),
             conversation_id: route.stable_conversation_id(),
+            request_api_key_id: route.request_api_key_id.clone(),
             credential_id: None,
             credential_label: None,
             status,
@@ -3358,7 +6939,7 @@ impl ExternalPoolManager {
                 (value > 0).then_some(value)
             },
             response_latency_ms: Some(duration_ms),
-            latency_trace: route.latency_trace.snapshot(),
+            latency_trace: Some(latency_trace),
             simulated: usage_source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,
@@ -3402,6 +6983,13 @@ impl ExternalPoolManager {
                 .and_then(|report| serde_json::to_value(report).ok()),
         });
     }
+}
+
+fn external_usage_latency_trace(route: &ExternalRouteRequest) -> UsageLatencyTrace {
+    let mut latency_trace = route.latency_trace.snapshot().unwrap_or_default();
+    latency_trace.inference_attempts = Some(route.inference_attempt_budget.snapshot());
+    latency_trace.auxiliary_attempts = Some(route.inference_attempt_budget.auxiliary_snapshot());
+    latency_trace
 }
 
 struct ExternalStreamUsageGuard {
@@ -3709,8 +7297,11 @@ fn select_external_pool_candidate(
     best.into_iter().nth(idx).map(|(pool, _)| pool)
 }
 
-fn external_pool_lease_touch_deadline(last_touch_at: Instant) -> Instant {
-    last_touch_at + Duration::from_secs(EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS)
+async fn external_pool_lease_lost(lease: Option<&ExternalPoolLease>) {
+    match lease {
+        Some(lease) => lease.wait_until_lost().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn external_pool_stream_idle_deadline(
@@ -3758,7 +7349,7 @@ fn external_pool_url(
             Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
             "misconfigured_endpoint".to_string(),
         )),
-        response_body: None,
+        protocol_error: None,
     })
 }
 
@@ -3800,7 +7391,7 @@ fn forward_headers(
                     retryable: true,
                     auto_disable_reason: Some("auth_error".to_string()),
                     cooldown: Some((Duration::from_secs(10), "auth_error".to_string())),
-                    response_body: None,
+                    protocol_error: None,
                 }
             })?;
             out.insert(header::AUTHORIZATION, value);
@@ -3813,7 +7404,7 @@ fn forward_headers(
                 retryable: true,
                 auto_disable_reason: Some("auth_error".to_string()),
                 cooldown: Some((Duration::from_secs(10), "auth_error".to_string())),
-                response_body: None,
+                protocol_error: None,
             })?;
             out.insert(HeaderName::from_static("x-api-key"), value);
         }
@@ -3836,6 +7427,94 @@ fn external_pool_matches_body_mode_filter(
     filter.is_none_or(|mode| pool.request_body_mode == mode)
 }
 
+fn normalize_external_pool_support_candidates<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for candidate in candidates {
+        if let Some(candidate) = normalize_model_id(candidate) {
+            if !normalized.iter().any(|existing| existing == &candidate) {
+                normalized.push(candidate);
+            }
+        }
+    }
+    normalized
+}
+
+fn external_pool_matches_supported_models_normalized(
+    pool: &ExternalPool,
+    model_candidates: Option<&[String]>,
+) -> bool {
+    if pool.supported_models.is_empty() {
+        return true;
+    }
+    let Some(model_candidates) = model_candidates else {
+        return false;
+    };
+    model_candidates
+        .iter()
+        .any(|candidate| pool.supported_models.iter().any(|model| model == candidate))
+}
+
+fn external_pool_eligibility_matches_supported_models(
+    pool: &ExternalPoolEligibility,
+    model_candidates: Option<&[String]>,
+) -> bool {
+    if pool.supported_models.is_empty() {
+        return true;
+    }
+    let Some(model_candidates) = model_candidates else {
+        return false;
+    };
+    model_candidates
+        .iter()
+        .any(|candidate| pool.supported_models.contains(candidate))
+}
+
+fn deterministic_duration_jitter(base: Duration, percent: u8, seed: u64) -> Duration {
+    let percent = percent.min(50) as u128;
+    if percent == 0 {
+        return base.max(Duration::from_millis(1));
+    }
+    let base_millis = base.as_millis().max(1);
+    let spread = (base_millis.saturating_mul(percent) / 100).max(1);
+    let slots = spread.saturating_mul(2).saturating_add(1);
+    let mixed = seed
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ seed.rotate_left(27);
+    let offset = (mixed as u128 % slots) as i128 - spread as i128;
+    let jittered = (base_millis as i128 + offset).max(1) as u128;
+    Duration::from_millis(jittered.min(u64::MAX as u128) as u64)
+}
+
+fn external_release_retry_delay(failures: u32, intent: &ExternalPoolReleaseIntent) -> Duration {
+    let multiplier = 1u32
+        .checked_shl(failures.saturating_sub(1).min(16))
+        .unwrap_or(u32::MAX);
+    let base = EXTERNAL_POOL_QUEUE_REDIS_RETRY_DELAY
+        .saturating_mul(multiplier)
+        .min(EXTERNAL_POOL_RELEASE_RETRY_MAX_DELAY);
+    let seed = intent.pool_id
+        ^ ((intent.lease_id.len() as u64) << 32)
+        ^ u64::from(failures)
+        ^ match intent.release_kind {
+            ExternalPoolLeaseReleaseKind::Pending => 0x5045_4e44_494e_47,
+            ExternalPoolLeaseReleaseKind::Confirmed => 0x434f_4e46_4952_4d,
+        };
+    deterministic_duration_jitter(base, 10, seed)
+}
+
+fn external_release_system_retry_delay(failures: u32) -> Duration {
+    let multiplier = 1u32
+        .checked_shl(failures.saturating_sub(1).min(16))
+        .unwrap_or(u32::MAX);
+    EXTERNAL_POOL_QUEUE_REDIS_RETRY_DELAY
+        .saturating_mul(multiplier)
+        .min(EXTERNAL_POOL_RELEASE_RETRY_MAX_DELAY)
+}
+
+#[cfg(test)]
 fn external_pool_matches_supported_models(
     pool: &ExternalPool,
     model_candidates: Option<&[Option<&str>]>,
@@ -3846,7 +7525,9 @@ fn external_pool_matches_supported_models(
     let Some(model_candidates) = model_candidates else {
         return false;
     };
-    model_is_supported_by_list(&pool.supported_models, model_candidates)
+    let normalized =
+        normalize_external_pool_support_candidates(model_candidates.iter().flatten().copied());
+    external_pool_matches_supported_models_normalized(pool, Some(&normalized))
 }
 
 fn normalize_external_pool_model_cooldown_key_model(model: &str) -> Option<String> {
@@ -3859,6 +7540,90 @@ fn external_pool_model_cooldown_key(pool_id: u64, normalized_model: &str) -> Str
     hasher.update(normalized_model.as_bytes());
     let digest = hasher.finalize();
     format!("external_pool:{}:model_cooldown:{:x}", pool_id, digest)
+}
+
+fn external_pool_cooldown_keys(pool_id: u64, models: &[String]) -> Vec<String> {
+    let mut keys = Vec::with_capacity(models.len().saturating_add(1));
+    keys.push(format!("external_pool:{}:cooldown", pool_id));
+    keys.extend(
+        models
+            .iter()
+            .map(|model| external_pool_model_cooldown_key(pool_id, model)),
+    );
+    keys
+}
+
+fn decode_pool_runtime_snapshot(
+    pool_id: u64,
+    models: &[String],
+    cooldown_keys: &[String],
+    coordinator: ExternalPoolCoordinatorSnapshot,
+) -> anyhow::Result<PoolRuntimeSnapshot> {
+    if coordinator.cooldown_values.len() != cooldown_keys.len()
+        || coordinator.cooldown_ttls.len() != cooldown_keys.len()
+    {
+        anyhow::bail!("Redis returned an incomplete external pool coordinator snapshot");
+    }
+
+    let mut snapshot = PoolRuntimeSnapshot {
+        in_flight: coordinator.capacity.pool_in_flight_requests,
+        global_in_flight: coordinator.capacity.global_in_flight_requests,
+        ..PoolRuntimeSnapshot::default()
+    };
+    if let Some(raw) = coordinator
+        .cooldown_values
+        .first()
+        .and_then(Option::as_deref)
+    {
+        let cooldown = serde_json::from_str::<ExternalPoolCooldownState>(raw).map_err(|err| {
+            anyhow::anyhow!("invalid external pool cooldown for pool {pool_id}: {err}")
+        })?;
+        let remaining = coordinator
+            .cooldown_ttls
+            .first()
+            .and_then(|remaining| *remaining)
+            .ok_or_else(|| {
+                anyhow::anyhow!("external pool cooldown for pool {pool_id} is missing a Redis TTL")
+            })?;
+        snapshot.pool_cooldown_remaining_secs =
+            remaining.as_millis().saturating_add(999) as u64 / 1_000;
+        snapshot.pool_cooldown_remaining_secs = snapshot.pool_cooldown_remaining_secs.max(1);
+        snapshot.pool_cooldown_reason = cooldown.reason;
+    }
+
+    if snapshot.pool_cooldown_remaining_secs == 0 {
+        for (((model, _key), raw), remaining) in models
+            .iter()
+            .zip(cooldown_keys.iter().skip(1))
+            .zip(coordinator.cooldown_values.iter().skip(1))
+            .zip(coordinator.cooldown_ttls.iter().skip(1))
+        {
+            let Some(raw) = raw.as_deref() else {
+                continue;
+            };
+            let cooldown =
+                serde_json::from_str::<ExternalPoolCooldownState>(raw).map_err(|err| {
+                anyhow::anyhow!(
+                    "invalid external pool model cooldown for pool {pool_id}, model {model}: {err}"
+                )
+                })?;
+            let remaining = remaining.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "external pool model cooldown for pool {pool_id}, model {model} is missing a Redis TTL"
+                )
+            })?;
+            let remaining_secs = (remaining.as_millis().saturating_add(999) / 1_000).max(1) as u64;
+            if snapshot
+                .model_cooldown
+                .as_ref()
+                .map(|(selected_secs, _)| remaining_secs < *selected_secs)
+                .unwrap_or(true)
+            {
+                snapshot.model_cooldown = Some((remaining_secs, cooldown.reason));
+            }
+        }
+    }
+    Ok(snapshot)
 }
 
 fn external_pool_prepare_request(
@@ -4004,7 +7769,7 @@ fn sanitized_external_network_error(context: &str, err: &reqwest::Error) -> Stri
 }
 
 fn success_error_body_protocol_error(
-    body: &Bytes,
+    _body: &Bytes,
     config: &ExternalPoolsConfig,
 ) -> ExternalPoolError {
     ExternalPoolError {
@@ -4016,32 +7781,42 @@ fn success_error_body_protocol_error(
             Duration::from_secs(config.external_pool_server_error_cooldown_secs.max(1)),
             "server_error".to_string(),
         )),
-        response_body: Some(body.clone()),
+        protocol_error: Some("success_error_envelope"),
+    }
+}
+
+fn external_protocol_contamination_error(config: &ExternalPoolsConfig) -> ExternalPoolError {
+    ExternalPoolError {
+        status: Some(StatusCode::OK),
+        message: RESPONSE_PROTOCOL_CONTAMINATION_DETAIL.to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((
+            Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
+            "protocol_contamination".to_string(),
+        )),
+        protocol_error: None,
     }
 }
 
 fn success_protocol_error(
     headers: &HeaderMap,
-    body: Option<&Bytes>,
+    _body: Option<&Bytes>,
     config: &ExternalPoolsConfig,
     context: &str,
 ) -> ExternalPoolError {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("unknown");
-    let body_prefix = body
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
-                .replace('\n', " ")
-                .replace('\r', " ")
-        })
-        .unwrap_or_default();
-    let message = if body_prefix.is_empty() {
-        format!("{context}; content-type={content_type}")
-    } else {
-        format!("{context}; content-type={content_type}; body_prefix={body_prefix}")
+        .map(str::to_ascii_lowercase);
+    let content_type_class = match content_type.as_deref() {
+        Some(value) if value.contains("application/json") => "json",
+        Some(value) if value.contains("text/event-stream") => "event_stream",
+        Some(value) if value.contains("text/html") => "html",
+        Some(_) => "other",
+        None => "missing_or_invalid",
     };
+    let message = format!("{context}; content_type_class={content_type_class}");
     ExternalPoolError {
         status: Some(StatusCode::OK),
         message,
@@ -4051,7 +7826,7 @@ fn success_protocol_error(
             Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
             "misconfigured_endpoint".to_string(),
         )),
-        response_body: None,
+        protocol_error: Some("unexpected_response_shape"),
     }
 }
 
@@ -4087,17 +7862,11 @@ fn external_final_error_from_error(
     err: &ExternalPoolError,
     error_id: &str,
 ) -> ExternalPoolFinalError {
-    let message = err
-        .response_body
-        .as_ref()
-        .map(|body| String::from_utf8_lossy(body).to_string())
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| err.message.clone());
     ExternalPoolFinalError {
         status: err.status.unwrap_or(StatusCode::BAD_GATEWAY),
         response_error_type: anthropic_error_type_for_external_error(err).to_string(),
         route_error_type: error_type_for_external_error(err),
-        message,
+        message: err.message.clone(),
         error_id: error_id.to_string(),
         retryable: err.retryable,
         attempts,
@@ -4164,13 +7933,14 @@ fn external_capacity_final_error(
     message: impl Into<String>,
     error_id: &str,
 ) -> ExternalPoolFinalError {
+    let retryable = code != "external_pool_wait_timeout";
     ExternalPoolFinalError {
         status,
         response_error_type: code.to_string(),
         route_error_type: code.to_string(),
         message: message.into(),
         error_id: error_id.to_string(),
-        retryable: true,
+        retryable,
         attempts: Vec::new(),
         pool_id: None,
         pool_name: None,
@@ -4193,13 +7963,7 @@ fn compact_usage_error_message(message: &str) -> (String, bool) {
 }
 
 fn external_error_record_message(err: &ExternalPoolError) -> (String, bool) {
-    let message = err
-        .response_body
-        .as_ref()
-        .map(|body| String::from_utf8_lossy(body).to_string())
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| err.message.clone());
-    compact_usage_error_message(&message)
+    compact_usage_error_message(&err.message)
 }
 
 fn metadata_insert(
@@ -4235,19 +7999,8 @@ fn external_error_diagnostics(
     if message_truncated {
         metadata_insert(&mut metadata, "messageTruncated", true);
     }
-    if err.status == Some(StatusCode::OK)
-        && err
-            .response_body
-            .as_ref()
-            .is_some_and(|body| success_response_looks_like_error_body(body))
-    {
-        metadata_insert(&mut metadata, "protocolError", "success_error_envelope");
-    } else if err
-        .auto_disable_reason
-        .as_deref()
-        .is_some_and(|reason| reason == "misconfigured_endpoint")
-    {
-        metadata_insert(&mut metadata, "protocolError", "unexpected_response_shape");
+    if let Some(protocol_error) = err.protocol_error {
+        metadata_insert(&mut metadata, "protocolError", protocol_error);
     }
 
     let route_error_type = error_type_for_external_error(err);
@@ -4321,6 +8074,9 @@ fn synthetic_external_capacity_error_diagnostics(
             "temporaryUnavailablePools",
             context.temporary_unavailable_pools as u64,
         );
+        if let Some(kind) = context.coordinator_unavailable_kind {
+            metadata_insert(&mut metadata, "coordinatorUnavailableKind", kind.as_str());
+        }
         if let Some(reason) = context.cooldown_reason.as_deref() {
             metadata_insert(&mut metadata, "cooldownReason", reason);
         }
@@ -4344,6 +8100,33 @@ fn external_error_message_indicates_model_unavailable(lower_message: &str) -> bo
     lower_message.contains("model_not_found")
         || lower_message.contains("failed to get available channel for model")
         || lower_message.contains("no available channel")
+        || lower_message.contains("model is unavailable")
+}
+
+fn external_error_message_indicates_payload_too_long(lower_message: &str) -> bool {
+    lower_message.contains("context window is full")
+        || lower_message.contains("input is too long")
+        || lower_message.contains("prompt is too long")
+        || lower_message.contains("content_length_exceeds_threshold")
+        || lower_message.contains("request payload is too large")
+        || lower_message.contains("payload is too large")
+}
+
+fn classified_external_error(
+    status: StatusCode,
+    message: &'static str,
+    retryable: bool,
+    auto_disable_reason: Option<&'static str>,
+    cooldown: Option<(Duration, &'static str)>,
+) -> ExternalPoolError {
+    ExternalPoolError {
+        status: Some(status),
+        message: message.to_string(),
+        retryable,
+        auto_disable_reason: auto_disable_reason.map(str::to_string),
+        cooldown: cooldown.map(|(duration, reason)| (duration, reason.to_string())),
+        protocol_error: None,
+    }
 }
 
 fn classify_external_error(
@@ -4352,105 +8135,96 @@ fn classify_external_error(
     _headers: HeaderMap,
     config: &ExternalPoolsConfig,
 ) -> ExternalPoolError {
-    let message = String::from_utf8_lossy(&body).to_string();
-    let lower = message.to_ascii_lowercase();
+    let lower = String::from_utf8_lossy(&body).to_ascii_lowercase();
     if lower.contains("too many requests")
         || lower.contains("service_request_rate_exceeded")
         || lower.contains("rate limit")
         || lower.contains("ratelimit")
     {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: None,
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream rate limited the request",
+            true,
+            None,
+            Some((
                 Duration::from_secs(config.external_pool_rate_limit_cooldown_secs.max(1)),
-                "rate_limit".to_string(),
+                "rate_limit",
             )),
-            response_body: Some(body),
-        };
+        );
     }
     if lower.contains("database is locked") || lower.contains("sqlite_busy") {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: None,
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream database was busy",
+            true,
+            None,
+            Some((
                 Duration::from_secs(config.external_pool_server_error_cooldown_secs.max(1)),
-                "database_busy".to_string(),
+                "database_busy",
             )),
-            response_body: Some(body),
-        };
+        );
     }
     if lower.contains("invalid token") {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: Some("auth_error".to_string()),
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream rejected authentication",
+            true,
+            Some("auth_error"),
+            Some((
                 Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
-                "auth_error".to_string(),
+                "auth_error",
             )),
-            response_body: Some(body),
-        };
+        );
     }
     if lower.contains("channel affinity") && lower.contains("disabled") {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: Some("channel_disabled".to_string()),
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream channel is disabled",
+            true,
+            Some("channel_disabled"),
+            Some((
                 Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
-                "channel_disabled".to_string(),
+                "channel_disabled",
             )),
-            response_body: Some(body),
-        };
+        );
     }
     if external_error_message_indicates_model_unavailable(&lower) {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: None,
-            cooldown: (config.external_pool_model_unavailable_cooldown_mode
+        return classified_external_error(
+            status,
+            "external upstream model is unavailable",
+            true,
+            None,
+            (config.external_pool_model_unavailable_cooldown_mode
                 != ExternalPoolModelUnavailableCooldownMode::Disabled)
                 .then(|| {
                     (
                         Duration::from_secs(
                             config.external_pool_model_unavailable_cooldown_secs.max(1),
                         ),
-                        "model_unavailable".to_string(),
+                        "model_unavailable",
                     )
                 }),
-            response_body: Some(body),
-        };
+        );
     }
     if status == StatusCode::BAD_REQUEST {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: false,
-            auto_disable_reason: None,
-            cooldown: None,
-            response_body: Some(body),
+        let message = if external_error_message_indicates_payload_too_long(&lower) {
+            "external upstream rejected the request because the prompt is too long"
+        } else {
+            "external upstream rejected the request"
         };
+        return classified_external_error(status, message, false, None, None);
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: None,
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream rate limited the request",
+            true,
+            None,
+            Some((
                 Duration::from_secs(config.external_pool_rate_limit_cooldown_secs.max(1)),
-                "rate_limit".to_string(),
+                "rate_limit",
             )),
-            response_body: Some(body),
-        };
+        );
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         let reason = if lower.contains("suspended")
@@ -4462,17 +8236,16 @@ fn classify_external_error(
         } else {
             "auth_error"
         };
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: Some(reason.to_string()),
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream rejected account authorization",
+            true,
+            Some(reason),
+            Some((
                 Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
-                reason.to_string(),
+                reason,
             )),
-            response_body: Some(body),
-        };
+        );
     }
     if status.as_u16() == 402
         || lower.contains("quota")
@@ -4483,39 +8256,36 @@ fn classify_external_error(
         || lower.contains("no credit")
         || lower.contains("not enough credit")
     {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: Some("quota_exhausted".to_string()),
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream quota is unavailable",
+            true,
+            Some("quota_exhausted"),
+            Some((
                 Duration::from_secs(config.external_pool_rate_limit_cooldown_secs.max(1)),
-                "quota_exhausted".to_string(),
+                "quota_exhausted",
             )),
-            response_body: Some(body),
-        };
+        );
     }
     if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
-        return ExternalPoolError {
-            status: Some(status),
-            message,
-            retryable: true,
-            auto_disable_reason: None,
-            cooldown: Some((
+        return classified_external_error(
+            status,
+            "external upstream server was temporarily unavailable",
+            true,
+            None,
+            Some((
                 Duration::from_secs(config.external_pool_server_error_cooldown_secs.max(1)),
-                "server_error".to_string(),
+                "server_error",
             )),
-            response_body: Some(body),
-        };
+        );
     }
-    ExternalPoolError {
-        status: Some(status),
-        message,
-        retryable: false,
-        auto_disable_reason: None,
-        cooldown: None,
-        response_body: Some(body),
-    }
+    classified_external_error(
+        status,
+        "external upstream returned an unexpected error",
+        false,
+        None,
+        None,
+    )
 }
 
 fn should_retry_external_payload_guard(
@@ -4556,6 +8326,9 @@ fn error_type_for_external_error(err: &ExternalPoolError) -> String {
             || reason == "model_mapping_miss"
             || reason == "server_error"
             || reason.starts_with("network_error")
+            || reason == "inference_attempt_limit"
+            || reason == "inference_attempt_reserved_for_fallback"
+            || reason == "downstream_committed"
     }) {
         return reason
             .split_whitespace()
@@ -4591,49 +8364,82 @@ fn anthropic_error_type_for_external_error(err: &ExternalPoolError) -> &'static 
     }
 }
 
+fn external_route_known_tool_names(route: &ExternalRouteRequest) -> Arc<Vec<String>> {
+    route
+        .preparation_cache
+        .known_tool_names
+        .get_or_init(|| {
+            route.preparation_cache.record_known_tool_name_build();
+            let names = route
+                .payload
+                .as_ref()
+                .map(collect_known_tool_names_from_request)
+                .or_else(|| {
+                    external_route_raw_projection_payload(route)
+                        .as_deref()
+                        .map(collect_known_tool_names_from_request)
+                })
+                .unwrap_or_default();
+            Arc::new(names)
+        })
+        .clone()
+}
+
 struct ProjectedNonStreamBody {
     body: Bytes,
     usage_capture: ExternalUsageCapture,
+    protocol_contamination: bool,
 }
 
+#[cfg(test)]
 fn maybe_project_non_stream_usage(
     bytes: Bytes,
     projection: Option<&ExternalUsageProjectionContext>,
+) -> ProjectedNonStreamBody {
+    maybe_project_non_stream_usage_with_tools(bytes, projection, std::iter::empty())
+}
+
+fn maybe_project_non_stream_usage_with_tools(
+    bytes: Bytes,
+    projection: Option<&ExternalUsageProjectionContext>,
+    known_tool_names: impl IntoIterator<Item = String>,
 ) -> ProjectedNonStreamBody {
     let mut usage_capture = ExternalUsageCapture::default();
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return ProjectedNonStreamBody {
             body: bytes,
             usage_capture,
+            protocol_contamination: false,
         };
     };
-    let Some(usage) = value.get_mut("usage") else {
-        return ProjectedNonStreamBody {
-            body: bytes,
-            usage_capture,
-        };
-    };
-    let raw_usage = cache_usage_from_value(usage);
-    usage_capture.raw = raw_usage;
-    usage_capture.reported = raw_usage;
+    let sanitization = sanitize_response_content(&mut value, known_tool_names);
+    let sanitized = sanitization.blocks > 0;
+    let mut usage_changed = false;
+    if let Some(usage) = value.get_mut("usage") {
+        let raw_usage = cache_usage_from_value(usage);
+        usage_capture.raw = raw_usage;
+        usage_capture.reported = raw_usage;
 
-    if let Some(projected) = project_usage_value(usage, projection, true) {
-        usage_capture.request_input_tokens = Some(projected.request_input_tokens);
-        usage_capture.shaped = Some(projected.shaped);
-        usage_capture.reported = cache_usage_from_value(usage)
-            .or(Some(projected.reported))
-            .or(raw_usage);
-        usage_capture.projected = true;
-        let body = serde_json::to_vec(&value).map(Bytes::from).unwrap_or(bytes);
-        return ProjectedNonStreamBody {
-            body,
-            usage_capture,
-        };
+        if let Some(projected) = project_usage_value(usage, projection, true) {
+            usage_capture.request_input_tokens = Some(projected.request_input_tokens);
+            usage_capture.shaped = Some(projected.shaped);
+            usage_capture.reported = cache_usage_from_value(usage)
+                .or(Some(projected.reported))
+                .or(raw_usage);
+            usage_capture.projected = true;
+            usage_changed = true;
+        }
     }
 
+    let body = if sanitized || usage_changed {
+        serde_json::to_vec(&value).map(Bytes::from).unwrap_or(bytes)
+    } else {
+        bytes
+    };
     ProjectedNonStreamBody {
-        body: bytes,
+        body,
         usage_capture,
+        protocol_contamination: sanitized,
     }
 }
 
@@ -4769,6 +8575,540 @@ fn process_single_usage_value(
     rewrite
 }
 
+struct ExternalAnthropicTranscriptState {
+    sanitizer: ToolTranscriptSanitizer,
+    thinking_sanitizer: ToolTranscriptSanitizer,
+    current_text_index: Option<u64>,
+    current_text_visible: bool,
+    current_text_suppressed: bool,
+    buffered_thinking: Option<ExternalBufferedThinkingBlock>,
+    fatal: bool,
+    pending_fatal_error: Option<String>,
+    request_id: Option<String>,
+    error_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalBufferedThinkingKind {
+    Thinking,
+    Redacted,
+}
+
+struct ExternalBufferedThinkingBlock {
+    kind: ExternalBufferedThinkingKind,
+    events: Vec<Vec<u8>>,
+    content: String,
+    integrity_values: Vec<String>,
+    buffered_bytes: usize,
+    overflow: bool,
+}
+
+impl ExternalBufferedThinkingBlock {
+    fn new(kind: ExternalBufferedThinkingKind, event: &[u8], content: Option<&str>) -> Self {
+        let mut block = Self {
+            kind,
+            events: Vec::new(),
+            content: String::new(),
+            integrity_values: Vec::new(),
+            buffered_bytes: 0,
+            overflow: false,
+        };
+        block.push_event(event);
+        if let Some(content) = content {
+            block.push_content(content);
+        }
+        block
+    }
+
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if self.overflow
+            || self.buffered_bytes.saturating_add(bytes) > EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES
+        {
+            if !self.overflow {
+                tracing::warn!(
+                    buffered_bytes = self.buffered_bytes.saturating_add(bytes),
+                    max_buffered_bytes = EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES,
+                    "external thinking block exceeded bounded atomic buffer and was suppressed"
+                );
+            }
+            self.overflow = true;
+            self.events.clear();
+            self.content.clear();
+            self.integrity_values.clear();
+            return false;
+        }
+        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        true
+    }
+
+    fn push_event(&mut self, event: &[u8]) {
+        if self.reserve(event.len()) {
+            self.events.push(event.to_vec());
+        }
+    }
+
+    fn push_content(&mut self, content: &str) {
+        if self.reserve(content.len()) {
+            self.content.push_str(content);
+        }
+    }
+
+    fn push_integrity_value(&mut self, value: &str) {
+        if self.reserve(value.len()) {
+            self.integrity_values.push(value.to_string());
+        }
+    }
+}
+
+impl ExternalAnthropicTranscriptState {
+    #[cfg(test)]
+    fn new(known_tool_names: impl IntoIterator<Item = String>) -> Self {
+        Self::new_with_error_context(known_tool_names, None, None)
+    }
+
+    fn new_with_error_context(
+        known_tool_names: impl IntoIterator<Item = String>,
+        request_id: Option<String>,
+        error_id: Option<String>,
+    ) -> Self {
+        let known_tool_names = known_tool_names.into_iter().collect::<Vec<_>>();
+        Self {
+            sanitizer: ToolTranscriptSanitizer::new(known_tool_names.iter().cloned()),
+            thinking_sanitizer: ToolTranscriptSanitizer::new(known_tool_names),
+            current_text_index: None,
+            current_text_visible: false,
+            current_text_suppressed: false,
+            buffered_thinking: None,
+            fatal: false,
+            pending_fatal_error: None,
+            request_id,
+            error_id,
+        }
+    }
+
+    fn process(&mut self, event: &[u8]) -> Vec<u8> {
+        if self.fatal {
+            return Vec::new();
+        }
+        let Some(mut value) = external_sse_data_value(event) else {
+            return event.to_vec();
+        };
+        let event_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        if self.buffered_thinking.is_some() {
+            match event_type {
+                "content_block_delta" => {
+                    let delta_type = value
+                        .pointer("/delta/type")
+                        .and_then(serde_json::Value::as_str);
+                    let content = (delta_type == Some("thinking_delta"))
+                        .then(|| {
+                            value
+                                .pointer("/delta/thinking")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .flatten();
+                    let integrity = (delta_type == Some("signature_delta"))
+                        .then(|| {
+                            value
+                                .pointer("/delta/signature")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .flatten();
+                    let overflow = {
+                        let block = self
+                            .buffered_thinking
+                            .as_mut()
+                            .expect("buffered thinking exists");
+                        block.push_event(event);
+                        if let Some(content) = content {
+                            block.push_content(content);
+                        }
+                        if let Some(integrity) = integrity {
+                            block.push_integrity_value(integrity);
+                        }
+                        block.overflow
+                    };
+                    if overflow {
+                        self.buffered_thinking = None;
+                        return self.fail_atomic_thinking_buffer();
+                    }
+                    return Vec::new();
+                }
+                "content_block_stop" => {
+                    if let Some(block) = self.buffered_thinking.as_mut() {
+                        block.push_event(event);
+                    }
+                    return self.finish_buffered_thinking(true);
+                }
+                "content_block_start" | "message_delta" | "message_stop" | "error" => {
+                    let mut out = self.finish_buffered_thinking(false);
+                    out.extend(self.process(event));
+                    return out;
+                }
+                "ping" => return event.to_vec(),
+                _ => {
+                    let overflow = if let Some(block) = self.buffered_thinking.as_mut() {
+                        block.push_event(event);
+                        block.overflow
+                    } else {
+                        false
+                    };
+                    if overflow {
+                        self.buffered_thinking = None;
+                        return self.fail_atomic_thinking_buffer();
+                    }
+                    return Vec::new();
+                }
+            }
+        }
+
+        match event_type {
+            "content_block_start" => {
+                let mut out = self.flush_segment(false);
+                if self.fatal {
+                    return out;
+                }
+                let block_type = value
+                    .pointer("/content_block/type")
+                    .and_then(serde_json::Value::as_str);
+                self.reset_text_block();
+                if block_type == Some("text") {
+                    self.current_text_index =
+                        value.get("index").and_then(serde_json::Value::as_u64);
+                    if let Some(text) = value
+                        .pointer("/content_block/text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                    {
+                        let suppressed_before = self.sanitizer.suppressed_blocks();
+                        let safe = self.sanitizer.push(&text);
+                        if self.sanitizer.suppressed_blocks() > suppressed_before {
+                            out.extend(self.fail_protocol_contamination());
+                            return out;
+                        }
+                        self.current_text_visible = !safe.is_empty();
+                        if safe != text {
+                            value["content_block"]["text"] = serde_json::Value::String(safe);
+                            out.extend(rewrite_external_sse_data_value(event, &value));
+                            return out;
+                        }
+                    }
+                } else if matches!(block_type, Some("thinking" | "redacted_thinking")) {
+                    let kind = if block_type == Some("thinking") {
+                        ExternalBufferedThinkingKind::Thinking
+                    } else {
+                        ExternalBufferedThinkingKind::Redacted
+                    };
+                    let content = match kind {
+                        ExternalBufferedThinkingKind::Thinking => value
+                            .pointer("/content_block/thinking")
+                            .and_then(serde_json::Value::as_str),
+                        ExternalBufferedThinkingKind::Redacted => value
+                            .pointer("/content_block/data")
+                            .and_then(serde_json::Value::as_str),
+                    };
+                    let mut buffered = ExternalBufferedThinkingBlock::new(kind, event, content);
+                    if let Some(signature) = value
+                        .pointer("/content_block/signature")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|signature| !signature.is_empty())
+                    {
+                        buffered.push_integrity_value(signature);
+                    }
+                    if buffered.overflow {
+                        return self.fail_atomic_thinking_buffer();
+                    }
+                    self.buffered_thinking = Some(buffered);
+                    return out;
+                }
+                out.extend_from_slice(event);
+                out
+            }
+            "content_block_delta"
+                if value
+                    .pointer("/delta/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("text_delta") =>
+            {
+                if let Some(index) = value.get("index").and_then(serde_json::Value::as_u64) {
+                    self.current_text_index = Some(index);
+                }
+                let Some(text) = value
+                    .pointer("/delta/text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                else {
+                    return event.to_vec();
+                };
+                let before = self.sanitizer.suppressed_blocks();
+                let safe = self.sanitizer.push(&text);
+                let suppressed = self.sanitizer.suppressed_blocks() > before;
+                self.current_text_suppressed |= suppressed;
+                if suppressed {
+                    return self.fail_protocol_contamination();
+                }
+                if safe.is_empty() {
+                    return Vec::new();
+                }
+                self.current_text_visible = true;
+                if safe == text {
+                    return event.to_vec();
+                }
+                value["delta"]["text"] = serde_json::Value::String(safe);
+                rewrite_external_sse_data_value(event, &value)
+            }
+            "content_block_delta" => {
+                let mut out = self.flush_segment(false);
+                if self.fatal {
+                    return out;
+                }
+                match value
+                    .pointer("/delta/type")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("thinking_delta") => {
+                        let Some(thinking) = value
+                            .pointer("/delta/thinking")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                        else {
+                            return out;
+                        };
+                        let suppressed_before = self.thinking_sanitizer.suppressed_blocks();
+                        let mut safe = self.thinking_sanitizer.push(&thinking);
+                        safe.push_str(&self.thinking_sanitizer.finish());
+                        if self.thinking_sanitizer.suppressed_blocks() > suppressed_before {
+                            out.extend(self.fail_protocol_contamination());
+                            return out;
+                        }
+                        if !safe.is_empty() {
+                            value["delta"]["thinking"] = serde_json::Value::String(safe);
+                            out.extend(rewrite_external_sse_data_value(event, &value));
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let Some(signature) = value
+                            .pointer("/delta/signature")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            let suppressed_before = self.thinking_sanitizer.suppressed_blocks();
+                            let _ = self.thinking_sanitizer.push(signature);
+                            let _ = self.thinking_sanitizer.finish();
+                            if self.thinking_sanitizer.suppressed_blocks() > suppressed_before {
+                                out.extend(self.fail_protocol_contamination());
+                                return out;
+                            }
+                        }
+                        tracing::warn!("suppressed orphan external signature delta");
+                    }
+                    _ => out.extend_from_slice(event),
+                }
+                out
+            }
+            "content_block_stop" => {
+                let mut out = self.flush_segment(false);
+                if self.fatal {
+                    return out;
+                }
+                self.reset_text_block();
+                out.extend_from_slice(event);
+                out
+            }
+            "message_delta" | "message_stop" | "error" => {
+                let mut out = self.flush_segment(true);
+                if self.fatal {
+                    return out;
+                }
+                self.reset_text_block();
+                out.extend_from_slice(event);
+                out
+            }
+            _ => event.to_vec(),
+        }
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.fatal {
+            return Vec::new();
+        }
+        let mut out = self.finish_buffered_thinking(false);
+        out.extend(self.flush_segment(true));
+        self.reset_text_block();
+        out
+    }
+
+    fn finish_buffered_thinking(&mut self, complete: bool) -> Vec<u8> {
+        let Some(block) = self.buffered_thinking.take() else {
+            return Vec::new();
+        };
+        if block.overflow {
+            return self.fail_atomic_thinking_buffer();
+        }
+
+        let suppressed_before = self.thinking_sanitizer.suppressed_blocks();
+        let _ = self.thinking_sanitizer.push(&block.content);
+        let _ = self.thinking_sanitizer.finish();
+        for integrity in &block.integrity_values {
+            let _ = self.thinking_sanitizer.push(integrity);
+            let _ = self.thinking_sanitizer.finish();
+        }
+        let polluted = self.thinking_sanitizer.suppressed_blocks() > suppressed_before;
+        let signed = !block.integrity_values.is_empty();
+        if polluted {
+            tracing::warn!(
+                thinking_block_kind = ?block.kind,
+                signed,
+                buffered_bytes = block.buffered_bytes,
+                "suppressed polluted external thinking block atomically"
+            );
+            return self.fail_protocol_contamination();
+        }
+        if !complete || block.events.len() < 2 {
+            return Vec::new();
+        }
+        block.events.concat()
+    }
+
+    fn fail_atomic_thinking_buffer(&mut self) -> Vec<u8> {
+        const DETAIL: &str = "external thinking block exceeded bounded atomic buffer";
+        self.fail_with_processing_error(DETAIL)
+    }
+
+    fn fail_protocol_contamination(&mut self) -> Vec<u8> {
+        self.fail_with_processing_error(RESPONSE_PROTOCOL_CONTAMINATION_DETAIL)
+    }
+
+    fn fail_with_processing_error(&mut self, detail: &str) -> Vec<u8> {
+        self.buffered_thinking = None;
+        self.fatal = true;
+        self.pending_fatal_error = Some(detail.to_string());
+        external_safe_processing_error_event(self.request_id.as_deref(), self.error_id.as_deref())
+    }
+
+    fn take_pending_fatal_error(&mut self) -> Option<String> {
+        self.pending_fatal_error.take()
+    }
+
+    fn flush_segment(&mut self, finish: bool) -> Vec<u8> {
+        let before = self.sanitizer.suppressed_blocks();
+        let pending = if finish {
+            self.sanitizer.finish()
+        } else {
+            self.sanitizer.structured_tool_boundary()
+        };
+        let suppressed = self.sanitizer.suppressed_blocks() > before;
+        self.current_text_suppressed |= suppressed;
+
+        if suppressed {
+            return self.fail_protocol_contamination();
+        }
+
+        let mut out = Vec::new();
+        if !pending.is_empty() {
+            if let Some(index) = self.current_text_index {
+                out.extend(external_text_delta_event(index, &pending));
+                self.current_text_visible = true;
+            }
+        }
+        out
+    }
+
+    fn reset_text_block(&mut self) {
+        self.current_text_index = None;
+        self.current_text_visible = false;
+        self.current_text_suppressed = false;
+    }
+}
+
+fn external_sse_data_value(event: &[u8]) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(event).ok()?;
+    let mut data = String::new();
+    let mut saw_data = false;
+    for line in text.lines() {
+        let Some(value) = line.trim_end_matches('\r').strip_prefix("data:") else {
+            continue;
+        };
+        if saw_data {
+            data.push('\n');
+        }
+        saw_data = true;
+        data.push_str(value.strip_prefix(' ').unwrap_or(value));
+    }
+    let data = data.trim();
+    (!data.is_empty() && data != "[DONE]")
+        .then(|| serde_json::from_str::<serde_json::Value>(data).ok())
+        .flatten()
+}
+
+fn rewrite_external_sse_data_value(event: &[u8], value: &serde_json::Value) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return event.to_vec();
+    };
+    let Ok(serialized) = serde_json::to_string(value) else {
+        return event.to_vec();
+    };
+    let mut replaced = false;
+    let mut out = Vec::with_capacity(event.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed_line_end = line.trim_end_matches(['\r', '\n']);
+        let line_ending = &line[trimmed_line_end.len()..];
+        let Some(data) = trimmed_line_end.strip_prefix("data:") else {
+            out.extend_from_slice(line.as_bytes());
+            continue;
+        };
+        if replaced {
+            continue;
+        }
+        if data.trim().is_empty() || data.trim() == "[DONE]" {
+            out.extend_from_slice(line.as_bytes());
+            continue;
+        }
+        let leading_ws_len = data.len().saturating_sub(data.trim_start().len());
+        out.extend_from_slice(b"data:");
+        out.extend_from_slice(&data.as_bytes()[..leading_ws_len]);
+        out.extend_from_slice(serialized.as_bytes());
+        out.extend_from_slice(line_ending.as_bytes());
+        replaced = true;
+    }
+    if replaced { out } else { event.to_vec() }
+}
+
+fn external_text_delta_event(index: u64, text: &str) -> Vec<u8> {
+    let value = serde_json::json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text},
+    });
+    format!("event: content_block_delta\ndata: {value}\n\n").into_bytes()
+}
+
+fn external_safe_processing_error_event(
+    request_id: Option<&str>,
+    error_id: Option<&str>,
+) -> Vec<u8> {
+    let message = error_id
+        .map(|error_id| {
+            envelope::public_message_with_error_id(
+                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                error_id,
+            )
+        })
+        .unwrap_or_else(|| envelope::PUBLIC_PROCESSING_FAILED_MESSAGE.to_string());
+    let mut value = serde_json::json!({
+        "type": "error",
+        "error": {"type": "api_error", "message": message},
+    });
+    if let Some(request_id) = request_id {
+        value["request_id"] = serde_json::Value::String(request_id.to_string());
+    }
+    format!("event: error\ndata: {value}\n\n").into_bytes()
+}
+
+#[cfg(test)]
 fn process_sse_event_with_plan(
     event: &[u8],
     projection: Option<&ExternalUsageProjectionContext>,
@@ -4776,22 +9116,82 @@ fn process_sse_event_with_plan(
     stream_error_mask: Option<&ExternalStreamErrorMask>,
     plan: ExternalStreamProcessingPlan,
 ) -> Vec<u8> {
+    process_sse_event_with_plan_and_transcript(
+        event,
+        projection,
+        capture,
+        stream_error_mask,
+        plan,
+        None,
+    )
+}
+
+fn process_sse_event_with_plan_and_transcript(
+    event: &[u8],
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_error_mask: Option<&ExternalStreamErrorMask>,
+    plan: ExternalStreamProcessingPlan,
+    transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
+) -> Vec<u8> {
     let masked = plan
         .mask_errors
         .then(|| maybe_mask_external_stream_error_event(event, capture, stream_error_mask))
         .flatten();
     if let Some(masked) = masked {
-        return masked;
+        return transcript_state
+            .map(|state| process_external_transcript_state(state, &masked, capture))
+            .unwrap_or(masked);
     }
-    if projection.is_some() {
-        return rewrite_sse_event_usage(event, projection, capture);
+    let processed = if projection.is_some() {
+        rewrite_sse_event_usage(event, projection, capture)
+    } else {
+        if plan.capture_usage {
+            capture_sse_event_usage(event, projection, capture);
+        }
+        event.to_vec()
+    };
+    if let Some(state) = transcript_state {
+        process_external_transcript_state(state, &processed, capture)
+    } else {
+        processed
     }
-    if plan.capture_usage {
-        capture_sse_event_usage(event, projection, capture);
-    }
-    event.to_vec()
 }
 
+fn process_external_transcript_state(
+    state: &mut ExternalAnthropicTranscriptState,
+    event: &[u8],
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+) -> Vec<u8> {
+    let output = state.process(event);
+    capture_external_transcript_fatal_error(state, capture);
+    output
+}
+
+fn finish_external_transcript_state(
+    state: &mut ExternalAnthropicTranscriptState,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+) -> Vec<u8> {
+    let output = state.finish();
+    capture_external_transcript_fatal_error(state, capture);
+    output
+}
+
+fn capture_external_transcript_fatal_error(
+    state: &mut ExternalAnthropicTranscriptState,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+) {
+    if let Some(detail) = state.take_pending_fatal_error() {
+        if let Some(capture) = capture {
+            let mut capture = capture.lock();
+            if capture.stream_error_message.is_none() {
+                capture.stream_error_message = Some(detail);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn drain_sse_events(
     buffer: &mut Vec<u8>,
     projection: Option<&ExternalUsageProjectionContext>,
@@ -4799,19 +9199,47 @@ fn drain_sse_events(
     stream_error_mask: Option<&ExternalStreamErrorMask>,
     plan: ExternalStreamProcessingPlan,
 ) -> Vec<u8> {
+    drain_sse_events_with_transcript(buffer, projection, capture, stream_error_mask, plan, None)
+}
+
+fn drain_sse_events_with_transcript(
+    buffer: &mut Vec<u8>,
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_error_mask: Option<&ExternalStreamErrorMask>,
+    plan: ExternalStreamProcessingPlan,
+    mut transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
         let end = idx + delimiter_len;
         let event = buffer.drain(..end).collect::<Vec<u8>>();
-        out.extend(process_sse_event_with_plan(
+        out.extend(process_sse_event_with_plan_and_transcript(
             &event,
             projection,
             capture,
             stream_error_mask,
             plan,
+            transcript_state.as_deref_mut(),
         ));
     }
     out
+}
+
+/*
+ * The wrappers above keep the existing unit-test surface for usage-only processing while the live
+ * external route passes a request-scoped transcript state through the extended functions.
+ */
+#[allow(dead_code)]
+fn capture_sse_usage_without_rewrite(
+    event: &[u8],
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    plan: ExternalStreamProcessingPlan,
+) {
+    if plan.capture_usage {
+        capture_sse_event_usage(event, projection, capture);
+    }
 }
 
 fn maybe_mask_external_stream_error_event(
@@ -4853,11 +9281,11 @@ fn maybe_mask_external_stream_error_event(
         return None;
     }
 
-    let raw_event = compact_external_stream_error_event(text, 2048);
+    const SAFE_STREAM_ERROR: &str = "external upstream emitted an error event";
     if let Some(capture) = capture {
         let mut capture = capture.lock();
         if capture.stream_error_message.is_none() {
-            capture.stream_error_message = Some(raw_event.clone());
+            capture.stream_error_message = Some(SAFE_STREAM_ERROR.to_string());
         }
     }
     tracing::warn!(
@@ -4865,7 +9293,7 @@ fn maybe_mask_external_stream_error_event(
         error_id = %mask.error_id,
         pool_id = mask.pool_id,
         pool_name = %mask.pool_name,
-        raw_event = %raw_event,
+        error_class = "external_stream_error_event",
         "external pool stream error event masked"
     );
 
@@ -4899,22 +9327,6 @@ fn external_stream_payload_is_error(explicit_error_event: bool, value: &serde_js
             && value.get("error").is_some_and(|error| {
                 error.is_object() || error.as_str().is_some_and(|value| !value.is_empty())
             }))
-}
-
-fn compact_external_stream_error_event(raw: &str, max_bytes: usize) -> String {
-    let compact = raw.replace(['\r', '\n'], " ");
-    if compact.len() <= max_bytes {
-        return compact;
-    }
-    let mut out = String::with_capacity(max_bytes + 3);
-    for ch in compact.chars() {
-        if out.len() + ch.len_utf8() > max_bytes {
-            out.push_str("...");
-            break;
-        }
-        out.push(ch);
-    }
-    out
 }
 
 fn update_external_usage_capture(
@@ -5381,7 +9793,6 @@ fn build_external_usage_projection_context(
     )
 }
 
-#[cfg(test)]
 fn count_external_route_input_tokens(payload: &MessagesRequest) -> i32 {
     crate::token::count_all_tokens(
         &payload.model,

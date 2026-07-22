@@ -22,8 +22,8 @@ use crate::model::config::{
 
 use super::{
     files::{
-        delete_file, delete_file_dfcache, get_file, get_file_content, get_file_content_dfcache,
-        get_file_dfcache, list_files, upload_file,
+        MAX_FILE_UPLOAD_BODY_SIZE, delete_file, delete_file_dfcache, get_file, get_file_content,
+        get_file_content_dfcache, get_file_dfcache, list_files, upload_file,
     },
     handlers::{
         count_tokens, count_tokens_cc, count_tokens_dfcache, get_models, get_models_dfcache,
@@ -35,15 +35,17 @@ use super::{
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
+    request_admission::{
+        RequestAdmissionController, RequestAdmissionMiddlewareState, request_admission_middleware,
+    },
+    request_body::MAX_MESSAGES_BODY_SIZE,
     tool_format_debug::ToolFormatDebugRecorder,
     usage::UsageRecorder,
 };
 
-/// 请求体最大大小限制 (50MB)
-const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
-
 pub struct AnthropicRouterDependencies {
     pub request_api_keys: Arc<RequestApiKeyStore>,
+    pub request_admission: Arc<RequestAdmissionController>,
     pub kiro_provider: Option<Arc<KiroProvider>>,
     pub usage_recorder: Arc<UsageRecorder>,
     pub prompt_cache: Arc<PromptCacheTracker>,
@@ -161,6 +163,7 @@ pub fn create_router_with_provider(
 ) -> Router {
     let AnthropicRouterDependencies {
         request_api_keys,
+        request_admission,
         kiro_provider,
         usage_recorder,
         prompt_cache,
@@ -206,6 +209,8 @@ pub fn create_router_with_provider(
         tool_format_debug,
     } = config;
     let tool_format_debug_recorder = ToolFormatDebugRecorder::new(tool_format_debug);
+    let request_admission_state =
+        RequestAdmissionMiddlewareState::new(request_admission, usage_recorder.clone());
     let mut base_state = AppState::new(
         request_api_keys,
         extract_thinking,
@@ -266,10 +271,21 @@ pub fn create_router_with_provider(
     // 需要认证的 /v1 路由（默认 high-cache）
     let v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/files", get(list_files).post(upload_file))
+        .route(
+            "/files",
+            get(list_files)
+                .post(upload_file)
+                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
+        )
         .route("/files/{file_id}", get(get_file).delete(delete_file))
         .route("/files/{file_id}/content", get(get_file_content))
-        .route("/messages", post(post_messages))
+        .route(
+            "/messages",
+            post(post_messages).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             v1_state.clone(),
@@ -280,10 +296,21 @@ pub fn create_router_with_provider(
     // 需要认证的 /na/v1 路由（默认 no-cache）
     let na_v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/files", get(list_files).post(upload_file))
+        .route(
+            "/files",
+            get(list_files)
+                .post(upload_file)
+                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
+        )
         .route("/files/{file_id}", get(get_file).delete(delete_file))
         .route("/files/{file_id}/content", get(get_file_content))
-        .route("/messages", post(post_messages_real_cache_usage))
+        .route(
+            "/messages",
+            post(post_messages_real_cache_usage).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             na_v1_state.clone(),
@@ -295,10 +322,21 @@ pub fn create_router_with_provider(
     // 与 /v1 的区别：实时流式返回，最终 message_delta.usage 修正用量。
     let cc_v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/files", get(list_files).post(upload_file))
+        .route(
+            "/files",
+            get(list_files)
+                .post(upload_file)
+                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
+        )
         .route("/files/{file_id}", get(get_file).delete(delete_file))
         .route("/files/{file_id}/content", get(get_file_content))
-        .route("/messages", post(post_messages_cc))
+        .route(
+            "/messages",
+            post(post_messages_cc).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         .route("/messages/count_tokens", post(count_tokens_cc))
         .layer(middleware::from_fn_with_state(
             cc_v1_state.clone(),
@@ -309,10 +347,21 @@ pub fn create_router_with_provider(
     // 需要认证的 /ha/v1 路由（high-cache；usage 上报由 /ha 路径覆盖项独立控制）
     let ha_v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/files", get(list_files).post(upload_file))
+        .route(
+            "/files",
+            get(list_files)
+                .post(upload_file)
+                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
+        )
         .route("/files/{file_id}", get(get_file).delete(delete_file))
         .route("/files/{file_id}/content", get(get_file_content))
-        .route("/messages", post(post_messages_ha))
+        .route(
+            "/messages",
+            post(post_messages_ha).layer(middleware::from_fn_with_state(
+                request_admission_state.clone(),
+                request_admission_middleware,
+            )),
+        )
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             ha_v1_state.clone(),
@@ -324,7 +373,12 @@ pub fn create_router_with_provider(
     // route 必须在 definedCacheRoutes 中显式定义，避免未知路径被默认放行。
     let dfcache_routes = Router::new()
         .route("/{route}/v1/models", get(get_models_dfcache))
-        .route("/{route}/v1/files", get(list_files).post(upload_file))
+        .route(
+            "/{route}/v1/files",
+            get(list_files)
+                .post(upload_file)
+                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_SIZE)),
+        )
         .route(
             "/{route}/v1/files/{file_id}",
             get(get_file_dfcache).delete(delete_file_dfcache),
@@ -333,7 +387,13 @@ pub fn create_router_with_provider(
             "/{route}/v1/files/{file_id}/content",
             get(get_file_content_dfcache),
         )
-        .route("/{route}/v1/messages", post(post_messages_dfcache))
+        .route(
+            "/{route}/v1/messages",
+            post(post_messages_dfcache).layer(middleware::from_fn_with_state(
+                request_admission_state,
+                request_admission_middleware,
+            )),
+        )
         .route(
             "/{route}/v1/messages/count_tokens",
             post(count_tokens_dfcache),
@@ -351,7 +411,7 @@ pub fn create_router_with_provider(
         .nest("/ha/v1", ha_v1_routes)
         .nest("/dfcache", dfcache_routes)
         .layer(cors_layer())
-        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(DefaultBodyLimit::max(MAX_MESSAGES_BODY_SIZE))
 }
 
 fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppState, AppState) {
@@ -371,6 +431,14 @@ fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppSt
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        body::{Body, Bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    use crate::model::config::RequestAdmissionConfig;
+
     use super::*;
 
     fn base_state(mode: PromptCacheSimulationMode) -> AppState {
@@ -424,6 +492,317 @@ mod tests {
                 &v1_state.prompt_cache,
                 &ha_v1_state.prompt_cache
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_is_outer_to_message_admission_for_five_rounds() {
+        let state = base_state(PromptCacheSimulationMode::HighCache);
+        let controller = Arc::new(RequestAdmissionController::new(RequestAdmissionConfig {
+            rpm: 0,
+            max_concurrent_requests: 1,
+            max_queued_requests: 0,
+            queue_timeout_ms: 0,
+        }));
+        let admission_state =
+            RequestAdmissionMiddlewareState::new(controller, state.usage_recorder.clone());
+        let app = Router::new()
+            .route(
+                "/messages",
+                post(|| async { "ok" }).layer(middleware::from_fn_with_state(
+                    admission_state,
+                    request_admission_middleware,
+                )),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        for _ in 0..5 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/messages")
+                .header("x-api-key", "test-key")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+        }
+
+        let unauthorized = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/messages")
+                    .header("x-api-key", "wrong-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn actual_anthropic_message_routes_reject_before_handler_for_five_rounds() {
+        const PATHS: [&str; 5] = [
+            "/v1/messages",
+            "/na/v1/messages",
+            "/cc/v1/messages",
+            "/ha/v1/messages",
+            "/dfcache/demo/v1/messages",
+        ];
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "ping"}]
+        })
+        .to_string();
+
+        for round in 0..5 {
+            let keys = PATHS
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("actual-route-{round}-{index}"))
+                .collect::<Vec<_>>();
+            let mut config = Config::default();
+            config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+            let app = create_router_with_provider(
+                AnthropicRouterDependencies {
+                    request_api_keys: Arc::new(RequestApiKeyStore::new(&keys)),
+                    request_admission: Arc::new(RequestAdmissionController::new(
+                        RequestAdmissionConfig {
+                            rpm: 1,
+                            max_concurrent_requests: 0,
+                            max_queued_requests: 0,
+                            queue_timeout_ms: 0,
+                        },
+                    )),
+                    kiro_provider: None,
+                    usage_recorder: Arc::new(UsageRecorder::new(10)),
+                    prompt_cache: Arc::new(PromptCacheTracker::default()),
+                    prompt_cache_creation_controller: Arc::new(
+                        PromptCacheCreationController::default(),
+                    ),
+                    pricing_catalog: Arc::new(PricingCatalog::new()),
+                    model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+                    external_pool_manager: None,
+                },
+                AnthropicRouterConfig::from_runtime_config(&config),
+            );
+
+            for (path, key) in PATHS.iter().zip(&keys) {
+                let make_request = || {
+                    Request::builder()
+                        .method("POST")
+                        .uri(*path)
+                        .header("content-type", "application/json")
+                        .header("x-api-key", key)
+                        .body(Body::from(body.clone()))
+                        .unwrap()
+                };
+                let first = app.clone().oneshot(make_request()).await.unwrap();
+                assert_ne!(first.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+                axum::body::to_bytes(first.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+
+                let rejected = app.clone().oneshot(make_request()).await.unwrap();
+                assert_eq!(rejected.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn all_message_routes_normalize_oversized_bodies_without_a_provider_for_five_rounds() {
+        const PATHS: [&str; 5] = [
+            "/v1/messages",
+            "/na/v1/messages",
+            "/cc/v1/messages",
+            "/ha/v1/messages",
+            "/dfcache/demo/v1/messages",
+        ];
+        let mut config = Config::default();
+        config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+        let app = create_router_with_provider(
+            AnthropicRouterDependencies {
+                request_api_keys: Arc::new(RequestApiKeyStore::new(["body-limit-key"])),
+                request_admission: Arc::new(RequestAdmissionController::new(
+                    RequestAdmissionConfig::disabled(),
+                )),
+                kiro_provider: None,
+                usage_recorder: Arc::new(UsageRecorder::new(10)),
+                prompt_cache: Arc::new(PromptCacheTracker::default()),
+                prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+                pricing_catalog: Arc::new(PricingCatalog::new()),
+                model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+                external_pool_manager: None,
+            },
+            AnthropicRouterConfig::from_runtime_config(&config),
+        );
+        let oversized = Bytes::from(vec![b'x'; MAX_MESSAGES_BODY_SIZE + 1]);
+
+        for _round in 0..5 {
+            for path in PATHS {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .header("x-api-key", "body-limit-key")
+                            .body(Body::from(oversized.clone()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+                let request_id = response
+                    .headers()
+                    .get("request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .expect("oversized response must carry request-id")
+                    .to_string();
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("anthropic-request-id")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(request_id.as_str())
+                );
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&body)
+                    .expect("oversized response must use the Anthropic JSON envelope");
+                assert_eq!(value["type"], "error");
+                assert_eq!(value["error"]["type"], "invalid_request_error");
+                assert_eq!(value["request_id"], request_id);
+            }
+        }
+    }
+
+    fn multipart_file_body(boundary: &str, file_bytes: usize) -> Bytes {
+        let prefix = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"fixture.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        let suffix = format!("\r\n--{boundary}--\r\n");
+        let mut body = Vec::with_capacity(prefix.len() + file_bytes + suffix.len());
+        body.extend_from_slice(prefix.as_bytes());
+        body.resize(body.len() + file_bytes, b'x');
+        body.extend_from_slice(suffix.as_bytes());
+        Bytes::from(body)
+    }
+
+    #[tokio::test]
+    async fn file_upload_route_accepts_exact_file_limit_and_rejects_one_byte_over_for_five_rounds()
+    {
+        const BOUNDARY: &str = "kiro-rs-file-limit-boundary";
+        let config = Config::default();
+        let app = create_router_with_provider(
+            AnthropicRouterDependencies {
+                request_api_keys: Arc::new(RequestApiKeyStore::new(["file-limit-key"])),
+                request_admission: Arc::new(RequestAdmissionController::new(
+                    RequestAdmissionConfig::disabled(),
+                )),
+                kiro_provider: None,
+                usage_recorder: Arc::new(UsageRecorder::new(10)),
+                prompt_cache: Arc::new(PromptCacheTracker::default()),
+                prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+                pricing_catalog: Arc::new(PricingCatalog::new()),
+                model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+                external_pool_manager: None,
+            },
+            AnthropicRouterConfig::from_runtime_config(&config),
+        );
+        let exact = multipart_file_body(BOUNDARY, crate::anthropic::files::MAX_FILE_BYTES);
+        let over = multipart_file_body(BOUNDARY, crate::anthropic::files::MAX_FILE_BYTES + 1);
+        assert!(exact.len() > MAX_MESSAGES_BODY_SIZE);
+        assert!(over.len() < MAX_FILE_UPLOAD_BODY_SIZE);
+
+        for round in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/files")
+                        .header("x-api-key", "file-limit-key")
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={BOUNDARY}"),
+                        )
+                        .body(Body::from(exact.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::OK,
+                "round {round}"
+            );
+            let response_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let metadata: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+            let file_id = metadata["id"].as_str().expect("uploaded file id");
+
+            let deleted = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/v1/files/{file_id}"))
+                        .header("x-api-key", "file-limit-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                deleted.status(),
+                axum::http::StatusCode::OK,
+                "round {round}"
+            );
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/files")
+                        .header("x-api-key", "file-limit-key")
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={BOUNDARY}"),
+                        )
+                        .body(Body::from(over.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "round {round}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains(&format!(
+                    "uploaded file exceeds {} bytes",
+                    crate::anthropic::files::MAX_FILE_BYTES
+                )),
+                "round {round}: over-limit file must reach the file-content guard"
+            );
         }
     }
 }

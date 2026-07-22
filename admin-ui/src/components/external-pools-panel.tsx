@@ -285,7 +285,7 @@ export function ExternalPoolsPanel() {
           externalPoolGlobalMaxConcurrentRequests: whole(configDraft.externalPoolGlobalMaxConcurrentRequests),
           externalPoolMaxQueuedRequests: whole(configDraft.externalPoolMaxQueuedRequests),
           externalPoolMaxInputTokens: whole(configDraft.externalPoolMaxInputTokens),
-          externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs),
+          externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs, 1),
           externalPoolRetryMaxAttempts: whole(configDraft.externalPoolRetryMaxAttempts),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
@@ -523,7 +523,7 @@ export function ExternalPoolsPanel() {
                   <NumberBox disabled={!externalEnabled} label="全局并发上限" description="限制同时进行的外部池请求数；不是 RPM。0 表示不限。" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(externalPoolGlobalMaxConcurrentRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolGlobalMaxConcurrentRequests }))} />
                   <NumberBox disabled={!waitModeActive} label="外部池排队上限" description="externalPoolMaxQueuedRequests；只限制外部池 wait 队列，不是本地账号 dispatch 队列。" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
                   <NumberBox disabled={!externalEnabled} label="输入上限预检" value={configDraft.externalPoolMaxInputTokens} onChange={(externalPoolMaxInputTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxInputTokens }))} />
-                  <NumberBox disabled={!waitModeActive} label="最大等待秒数" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
+                  <NumberBox disabled={!waitModeActive} label="最大等待秒数" description="必须大于 0；旧配置中的 0 按安全默认值 30 秒处理。" min={1} value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="最大重试次数" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
                   <SelectBox disabled={!externalEnabled} label="流式 SSE 默认转发" value={configDraft.externalPoolStreamResponseMode} onChange={(externalPoolStreamResponseMode) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamResponseMode: externalPoolStreamResponseMode as ExternalPoolsConfig['externalPoolStreamResponseMode'] }))}>
                     <option value="event_passthrough">事件级透传</option>

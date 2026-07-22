@@ -2,13 +2,135 @@
 //!
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
-use bytes::Bytes;
-use reqwest::{Client, Proxy, RequestBuilder, Response};
+use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
+use reqwest::{Client, Proxy, Request, RequestBuilder, Response};
+use serde::Deserialize;
 use std::fmt;
+use std::future::Future;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::Instant;
 
 use crate::model::config::TlsBackend;
+
+#[cfg(test)]
+pub(crate) mod allocation_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct CountingAllocator;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static ALLOCATION_OPS: AtomicUsize = AtomicUsize::new(0);
+    static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[global_allocator]
+    static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() && ENABLED.load(Ordering::Relaxed) {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() && ENABLED.load(Ordering::Relaxed) {
+                record_allocation(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            if ENABLED.load(Ordering::Relaxed) {
+                LIVE_BYTES
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                        Some(live.saturating_sub(layout.size()))
+                    })
+                    .ok();
+            }
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
+            if !new_pointer.is_null() && ENABLED.load(Ordering::Relaxed) {
+                ALLOCATION_OPS.fetch_add(1, Ordering::Relaxed);
+                ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
+                let live = if new_size >= layout.size() {
+                    LIVE_BYTES.fetch_add(new_size - layout.size(), Ordering::Relaxed) + new_size
+                        - layout.size()
+                } else {
+                    LIVE_BYTES
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                            Some(live.saturating_sub(layout.size() - new_size))
+                        })
+                        .unwrap_or_default()
+                        .saturating_sub(layout.size() - new_size)
+                };
+                PEAK_LIVE_BYTES.fetch_max(live, Ordering::Relaxed);
+            }
+            new_pointer
+        }
+    }
+
+    fn record_allocation(size: usize) {
+        ALLOCATION_OPS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed);
+        let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+        PEAK_LIVE_BYTES.fetch_max(live, Ordering::Relaxed);
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct AllocationStats {
+        pub(crate) allocation_ops: usize,
+        pub(crate) allocated_bytes: usize,
+        pub(crate) peak_live_bytes: usize,
+        pub(crate) end_live_bytes: usize,
+    }
+
+    struct MeasurementGuard;
+
+    impl Drop for MeasurementGuard {
+        fn drop(&mut self) {
+            ENABLED.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn measure<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
+        let _lock = MEASUREMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ENABLED.store(false, Ordering::Release);
+        ALLOCATION_OPS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        LIVE_BYTES.store(0, Ordering::Relaxed);
+        PEAK_LIVE_BYTES.store(0, Ordering::Relaxed);
+        assert!(
+            !ENABLED.swap(true, Ordering::AcqRel),
+            "allocation measurement cannot be nested"
+        );
+        let guard = MeasurementGuard;
+        let result = operation();
+        drop(guard);
+        (
+            result,
+            AllocationStats {
+                allocation_ops: ALLOCATION_OPS.load(Ordering::Relaxed),
+                allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+                peak_live_bytes: PEAK_LIVE_BYTES.load(Ordering::Relaxed),
+                end_live_bytes: LIVE_BYTES.load(Ordering::Relaxed),
+            },
+        )
+    }
+}
 
 /// 代理配置
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
@@ -37,10 +159,79 @@ pub fn maybe_compress_json_whitespace(body: String, enabled: bool) -> String {
     if !enabled {
         return body;
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut has_removable_whitespace = false;
+
+    for byte in body.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                has_removable_whitespace = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if !has_removable_whitespace {
         return body;
-    };
-    serde_json::to_string(&value).unwrap_or(body)
+    }
+
+    // Validate without materializing a Value. This keeps invalid payloads unchanged while
+    // preserving duplicate keys, number spellings, escapes, and object order byte-for-byte.
+    let mut deserializer = serde_json::Deserializer::from_str(&body);
+    if serde::de::IgnoredAny::deserialize(&mut deserializer).is_err() || deserializer.end().is_err()
+    {
+        return body;
+    }
+
+    let mut compacted = body.into_bytes();
+    let mut write_index = 0;
+    in_string = false;
+    escaped = false;
+    for read_index in 0..compacted.len() {
+        let byte = compacted[read_index];
+        let keep = if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            true
+        } else {
+            match byte {
+                b'"' => {
+                    in_string = true;
+                    true
+                }
+                b' ' | b'\t' | b'\r' | b'\n' => false,
+                _ => true,
+            }
+        };
+        if keep {
+            compacted[write_index] = byte;
+            write_index += 1;
+        }
+    }
+    compacted.truncate(write_index);
+
+    String::from_utf8(compacted)
+        .expect("removing ASCII JSON whitespace from valid UTF-8 must preserve UTF-8")
 }
 
 #[derive(Debug)]
@@ -48,6 +239,7 @@ pub enum HttpSendError {
     Request(reqwest::Error),
     ResponseHeaderTimeout { timeout_secs: u64 },
     ResponseBodyTimeout { timeout_secs: u64 },
+    ResponseBodyTooLarge { max_bytes: usize },
 }
 
 impl HttpSendError {
@@ -59,6 +251,11 @@ impl HttpSendError {
     #[cfg(test)]
     pub fn is_response_body_timeout(&self) -> bool {
         matches!(self, Self::ResponseBodyTimeout { .. })
+    }
+
+    #[cfg(test)]
+    pub fn is_response_body_too_large(&self) -> bool {
+        matches!(self, Self::ResponseBodyTooLarge { .. })
     }
 }
 
@@ -76,6 +273,9 @@ impl fmt::Display for HttpSendError {
             Self::ResponseBodyTimeout { timeout_secs } => {
                 write!(f, "upstream response body timeout after {}s", timeout_secs)
             }
+            Self::ResponseBodyTooLarge { max_bytes } => {
+                write!(f, "upstream response body exceeds {} bytes", max_bytes)
+            }
         }
     }
 }
@@ -84,9 +284,31 @@ impl std::error::Error for HttpSendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Request(err) => Some(err),
-            Self::ResponseHeaderTimeout { .. } => None,
-            Self::ResponseBodyTimeout { .. } => None,
+            Self::ResponseHeaderTimeout { .. }
+            | Self::ResponseBodyTimeout { .. }
+            | Self::ResponseBodyTooLarge { .. } => None,
         }
+    }
+}
+
+async fn deadline_first_timeout<F>(duration: Duration, future: F) -> Result<F::Output, ()>
+where
+    F: Future,
+{
+    deadline_first_timeout_at(Instant::now() + duration, future).await
+}
+
+async fn deadline_first_timeout_at<F>(deadline: Instant, future: F) -> Result<F::Output, ()>
+where
+    F: Future,
+{
+    let timer = tokio::time::sleep_until(deadline);
+    tokio::pin!(timer);
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = &mut timer => Err(()),
+        output = &mut future => Ok(output),
     }
 }
 
@@ -98,12 +320,35 @@ pub async fn send_with_response_header_timeout(
         return request.send().await.map_err(HttpSendError::Request);
     }
 
-    match timeout(Duration::from_secs(timeout_secs), request.send()).await {
+    match deadline_first_timeout(Duration::from_secs(timeout_secs), request.send()).await {
         Ok(result) => result.map_err(HttpSendError::Request),
         Err(_) => Err(HttpSendError::ResponseHeaderTimeout { timeout_secs }),
     }
 }
 
+/// Execute an already-built request with a response-header deadline.
+///
+/// Callers that account real HTTP sends can build first, then reserve their send budget, and
+/// finally execute here. A request-builder failure therefore cannot consume a send attempt.
+pub async fn execute_with_response_header_timeout(
+    client: &Client,
+    request: Request,
+    timeout_secs: u64,
+) -> Result<Response, HttpSendError> {
+    if timeout_secs == 0 {
+        return client
+            .execute(request)
+            .await
+            .map_err(HttpSendError::Request);
+    }
+
+    match deadline_first_timeout(Duration::from_secs(timeout_secs), client.execute(request)).await {
+        Ok(result) => result.map_err(HttpSendError::Request),
+        Err(_) => Err(HttpSendError::ResponseHeaderTimeout { timeout_secs }),
+    }
+}
+
+#[cfg(test)]
 pub async fn response_text_with_body_timeout(
     response: Response,
     timeout_secs: u64,
@@ -112,24 +357,54 @@ pub async fn response_text_with_body_timeout(
         return response.text().await.map_err(HttpSendError::Request);
     }
 
-    match timeout(Duration::from_secs(timeout_secs), response.text()).await {
+    match deadline_first_timeout(Duration::from_secs(timeout_secs), response.text()).await {
         Ok(result) => result.map_err(HttpSendError::Request),
         Err(_) => Err(HttpSendError::ResponseBodyTimeout { timeout_secs }),
     }
 }
 
-pub async fn response_bytes_with_body_timeout(
+pub async fn response_bytes_with_limit_and_body_timeout(
     response: Response,
     timeout_secs: u64,
+    max_bytes: usize,
 ) -> Result<Bytes, HttpSendError> {
-    if timeout_secs == 0 {
-        return response.bytes().await.map_err(HttpSendError::Request);
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_bytes as u64)
+    {
+        return Err(HttpSendError::ResponseBodyTooLarge { max_bytes });
     }
 
-    match timeout(Duration::from_secs(timeout_secs), response.bytes()).await {
-        Ok(result) => result.map_err(HttpSendError::Request),
+    let read = async move {
+        let mut stream = response.bytes_stream();
+        let mut body = BytesMut::with_capacity(max_bytes.min(16 * 1024));
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(HttpSendError::Request)?;
+            if chunk.len() > max_bytes.saturating_sub(body.len()) {
+                return Err(HttpSendError::ResponseBodyTooLarge { max_bytes });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body.freeze())
+    };
+
+    if timeout_secs == 0 {
+        return read.await;
+    }
+    match deadline_first_timeout(Duration::from_secs(timeout_secs), read).await {
+        Ok(result) => result,
         Err(_) => Err(HttpSendError::ResponseBodyTimeout { timeout_secs }),
     }
+}
+
+pub async fn response_text_with_limit_and_body_timeout(
+    response: Response,
+    timeout_secs: u64,
+    max_bytes: usize,
+) -> Result<String, HttpSendError> {
+    let body =
+        response_bytes_with_limit_and_body_timeout(response, timeout_secs, max_bytes).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 impl ProxyConfig {
@@ -218,7 +493,407 @@ pub fn build_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn sized_json_body(target_size: usize, mode: &str) -> String {
+        let (prefix, suffix) = match mode {
+            "compact" => (r#"{"payload":""#, r#"","z":1e+02}"#),
+            _ => (r#" { "payload" : ""#, "\" , \"z\" : 1e+02 } \n"),
+        };
+        let payload_len = target_size.saturating_sub(prefix.len() + suffix.len());
+        let mut body = String::with_capacity(prefix.len() + payload_len + suffix.len() + 1);
+        body.push_str(prefix);
+        body.extend(std::iter::repeat_n('x', payload_len));
+        body.push_str(suffix);
+        if mode == "invalid" {
+            body.push('x');
+        }
+        body
+    }
+
+    fn percentile(sorted: &[u128], percentile: usize) -> u128 {
+        let index = ((sorted.len() * percentile).saturating_sub(1) / 100).min(sorted.len() - 1);
+        sorted[index]
+    }
+
+    #[test]
+    fn json_whitespace_compression_preserves_token_bytes_for_five_rounds() {
+        let fixtures = [
+            (
+                r#" { "z" : 1.0 , "a" : 1e+02 , "z" : 18446744073709551616 } "#,
+                r#"{"z":1.0,"a":1e+02,"z":18446744073709551616}"#,
+            ),
+            (
+                "{\n  \"literal\": \"é/中\",\n  \"escaped\": \"\\u00e9\\/\\n  x\\\\\\\"\",\n  \"nested\": [ true, null, { \"unknown\" : false } ]\n}",
+                "{\"literal\":\"é/中\",\"escaped\":\"\\u00e9\\/\\n  x\\\\\\\"\",\"nested\":[true,null,{\"unknown\":false}]}",
+            ),
+            (
+                " \r\n\t[ -0, 0.000, 9E-9, \"a b\\t c\" ] \n",
+                "[-0,0.000,9E-9,\"a b\\t c\"]",
+            ),
+        ];
+
+        for round in 0..5 {
+            for (input, expected) in fixtures {
+                assert_eq!(
+                    maybe_compress_json_whitespace(input.to_owned(), true),
+                    expected,
+                    "round {round}: JSON tokens must remain byte-for-byte intact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_whitespace_compression_preserves_invalid_or_disabled_bodies_for_five_rounds() {
+        let invalid = [
+            r#"{ "a" : 1 2 }"#,
+            "{\"unterminated\": \"value}",
+            "{\"unicode-space\":1}\u{00a0}",
+            "not json \n at all",
+        ];
+        let valid = " { \"a\" : [ 1, 2, 3 ], \"b\" : \"x y\" } \n";
+
+        for round in 0..5 {
+            assert_eq!(
+                maybe_compress_json_whitespace(valid.to_owned(), false),
+                valid,
+                "round {round}: disabled compression must be exact identity"
+            );
+            for body in invalid {
+                assert_eq!(
+                    maybe_compress_json_whitespace(body.to_owned(), true),
+                    body,
+                    "round {round}: invalid input must not be rewritten"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_whitespace_raw_and_noop_paths_are_byte_identical_for_one_hundred_rounds() {
+        const SIZES: [usize; 4] = [1 << 10, 100 << 10, 1 << 20, 5 << 20];
+
+        for target_size in SIZES {
+            for mode in ["disabled", "compact"] {
+                let body = sized_json_body(
+                    target_size,
+                    if mode == "compact" {
+                        "compact"
+                    } else {
+                        "valid"
+                    },
+                );
+                let enabled = mode == "compact";
+
+                for round in 0..100 {
+                    let input = body.clone();
+                    let input_pointer = input.as_ptr();
+                    let input_capacity = input.capacity();
+                    let output = maybe_compress_json_whitespace(input, enabled);
+
+                    assert_eq!(
+                        output, body,
+                        "mode={mode}, target_size={target_size}, round={round}"
+                    );
+                    assert_eq!(
+                        output.as_ptr(),
+                        input_pointer,
+                        "identity path allocated a replacement body: mode={mode}, target_size={target_size}, round={round}"
+                    );
+                    assert_eq!(
+                        output.capacity(),
+                        input_capacity,
+                        "mode={mode}, target_size={target_size}, round={round}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn json_whitespace_compression_reuses_the_input_allocation_for_five_rounds() {
+        for round in 0..5 {
+            for (body, enabled) in [
+                (r#"{ "a" : [ 1, 2, 3 ], "b" : "x y" }"#.to_owned(), true),
+                (r#"{"a":[1,2,3],"b":"x y"}"#.to_owned(), true),
+                (r#"{ "a" : [ 1, 2, 3 ] }"#.to_owned(), false),
+            ] {
+                let input_pointer = body.as_ptr();
+                let input_capacity = body.capacity();
+                let compacted = maybe_compress_json_whitespace(body, enabled);
+                assert_eq!(
+                    compacted.as_ptr(),
+                    input_pointer,
+                    "round {round}: compression must not allocate a second body-sized buffer"
+                );
+                assert_eq!(compacted.capacity(), input_capacity, "round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn json_whitespace_compression_scales_to_five_mib_for_five_rounds() {
+        const SIZES: [usize; 4] = [1 << 10, 100 << 10, 1 << 20, 5 << 20];
+
+        for target_size in SIZES {
+            let element = " { \"z\" : 1.0, \"a\" : 1e+02, \"s\" : \"keep  spaces\" },\n";
+            let repeats = target_size.saturating_sub(2) / element.len();
+            let mut body = String::with_capacity(repeats * element.len() + 2);
+            body.push('[');
+            for index in 0..repeats {
+                if index > 0 {
+                    body.push(' ');
+                }
+                body.push_str(element.trim_end_matches([',', '\n']));
+                if index + 1 < repeats {
+                    body.push(',');
+                }
+            }
+            body.push(']');
+
+            for round in 0..5 {
+                let compacted = maybe_compress_json_whitespace(body.clone(), true);
+                assert!(
+                    compacted.len() < body.len(),
+                    "size {target_size}, round {round}"
+                );
+                assert!(
+                    compacted.contains(r#"{"z":1.0,"a":1e+02,"s":"keep  spaces"}"#),
+                    "size {target_size}, round {round}"
+                );
+                assert_eq!(
+                    compacted
+                        .matches(r#"{"z":1.0,"a":1e+02,"s":"keep  spaces"}"#)
+                        .count(),
+                    repeats,
+                    "size {target_size}, round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_whitespace_compression_deep_iterative_validation_and_recovery_for_five_rounds() {
+        let recovery = r#" { "ok" : [ 1, 2, 3 ], "text" : "keep  spaces" } "#;
+        let expected_recovery = r#"{"ok":[1,2,3],"text":"keep  spaces"}"#;
+
+        for depth in [127, 128, 256, 4096] {
+            let deep = format!(" {}0{} ", "[".repeat(depth), "]".repeat(depth));
+            let compact = deep.trim().to_string();
+            let malformed = format!(" {}0{} ", "[".repeat(depth), "]".repeat(depth - 1));
+            for round in 0..5 {
+                assert_eq!(
+                    maybe_compress_json_whitespace(deep.clone(), true),
+                    compact,
+                    "depth {depth}, round {round}: iterative validation must preserve deep JSON tokens"
+                );
+                assert_eq!(
+                    maybe_compress_json_whitespace(malformed.clone(), true),
+                    malformed,
+                    "depth {depth}, round {round}: malformed deep JSON must remain exact"
+                );
+                assert_eq!(
+                    maybe_compress_json_whitespace(recovery.to_string(), true),
+                    expected_recovery,
+                    "depth {depth}, round {round}: deep input must not poison the next request"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run in release as an isolated allocation/latency/RSS body-size probe"]
+    fn json_whitespace_compression_release_perf_probe() {
+        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1 << 20);
+        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5);
+        let mode = std::env::var("KIRO_BODY_PERF_MODE").unwrap_or_else(|_| "valid".to_string());
+        assert!(matches!(
+            mode.as_str(),
+            "valid" | "invalid" | "disabled" | "compact"
+        ));
+        assert!(
+            rounds >= 5,
+            "release evidence requires at least five rounds"
+        );
+        let body = sized_json_body(target_size, &mode);
+        let enabled = mode != "disabled";
+        let mut latencies_us = Vec::with_capacity(rounds);
+        let mut allocation_ops = Vec::with_capacity(rounds);
+        let mut allocated_bytes = Vec::with_capacity(rounds);
+        let mut peak_live_bytes = Vec::with_capacity(rounds);
+
+        for round in 0..rounds {
+            let input = body.clone();
+            let input_pointer = input.as_ptr();
+            let input_capacity = input.capacity();
+            let started = Instant::now();
+            let (output, stats) = allocation_probe::measure(|| {
+                maybe_compress_json_whitespace(std::hint::black_box(input), enabled)
+            });
+            let elapsed = started.elapsed().as_micros();
+            assert_eq!(output.as_ptr(), input_pointer, "round {round}");
+            assert_eq!(output.capacity(), input_capacity, "round {round}");
+            match mode.as_str() {
+                "valid" => assert!(output.len() < body.len(), "round {round}"),
+                "invalid" | "disabled" | "compact" => {
+                    assert_eq!(output, body, "round {round}: identity mode changed bytes")
+                }
+                _ => unreachable!(),
+            }
+            latencies_us.push(elapsed);
+            allocation_ops.push(stats.allocation_ops);
+            allocated_bytes.push(stats.allocated_bytes);
+            peak_live_bytes.push(stats.peak_live_bytes);
+            assert_eq!(
+                stats.end_live_bytes, 0,
+                "round {round}: transform leaked allocator-tracked live bytes"
+            );
+        }
+        latencies_us.sort_unstable();
+        println!(
+            "BODY_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} allocation_ops={:?} allocated_bytes={:?} peak_live_bytes={:?}",
+            mode,
+            body.len(),
+            rounds,
+            percentile(&latencies_us, 50),
+            percentile(&latencies_us, 95),
+            percentile(&latencies_us, 99),
+            allocation_ops,
+            allocated_bytes,
+            peak_live_bytes,
+        );
+    }
+
+    #[test]
+    #[ignore = "run in release as an isolated concurrent body transform/RSS probe"]
+    fn json_whitespace_compression_burst_and_recovery_probe() {
+        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5 << 20);
+        let concurrency = std::env::var("KIRO_BODY_PERF_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5);
+        assert!(rounds >= 5);
+        let body = Arc::new(sized_json_body(target_size, "valid"));
+        let started = Instant::now();
+
+        for round in 0..rounds {
+            std::thread::scope(|scope| {
+                let barrier = Arc::new(std::sync::Barrier::new(concurrency));
+                for worker in 0..concurrency {
+                    let body = body.clone();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        let input = body.as_str().to_string();
+                        let pointer = input.as_ptr();
+                        barrier.wait();
+                        let output = maybe_compress_json_whitespace(input, true);
+                        assert_eq!(output.as_ptr(), pointer, "round {round}, worker {worker}");
+                        assert!(output.len() < body.len(), "round {round}, worker {worker}");
+                    });
+                }
+            });
+        }
+
+        for recovery_round in 0..5 {
+            assert_eq!(
+                maybe_compress_json_whitespace(r#" { "recovered" : true } "#.to_string(), true),
+                r#"{"recovered":true}"#,
+                "recovery round {recovery_round}"
+            );
+        }
+        println!(
+            "BODY_BURST input_bytes={} concurrency={} rounds={} calls={} total_ms={}",
+            body.len(),
+            concurrency,
+            rounds,
+            concurrency * rounds,
+            started.elapsed().as_millis(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "run in isolation to characterize abort latency of the synchronous CPU transform"]
+    async fn json_whitespace_compression_abort_and_recovery_probe() {
+        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5 << 20);
+        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5);
+        assert!(rounds >= 5);
+        let mut abort_latencies_us = Vec::with_capacity(rounds);
+        let mut completed_before_abort_observed = 0;
+        let mut cancelled_after_cpu_poll = 0;
+
+        for round in 0..rounds {
+            let input = sized_json_body(target_size, "valid");
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task_completed = completed.clone();
+            let task = tokio::spawn(async move {
+                let _ = started_tx.send(());
+                let output = maybe_compress_json_whitespace(input, true);
+                task_completed.store(true, std::sync::atomic::Ordering::Release);
+                output.len()
+            });
+            started_rx
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: transform task never started"));
+            let abort_started = Instant::now();
+            task.abort();
+            match task.await {
+                Ok(output_len) => {
+                    assert!(output_len < target_size, "round {round}");
+                    completed_before_abort_observed += 1;
+                }
+                Err(error) if error.is_cancelled() => {
+                    cancelled_after_cpu_poll += 1;
+                }
+                Err(error) => panic!("round {round}: transform task failed: {error}"),
+            }
+            let abort_latency = abort_started.elapsed().as_micros();
+            assert!(
+                completed.load(std::sync::atomic::Ordering::Acquire),
+                "round {round}: abort may cancel the async task only after its synchronous transform poll returns"
+            );
+            abort_latencies_us.push(abort_latency);
+
+            assert_eq!(
+                maybe_compress_json_whitespace(r#" { "recovered" : true } "#.to_string(), true),
+                r#"{"recovered":true}"#,
+                "round {round}: abort observation must not poison later transforms"
+            );
+        }
+        abort_latencies_us.sort_unstable();
+        println!(
+            "BODY_ABORT input_bytes={} rounds={} completed_before_abort_observed={} cancelled_after_cpu_poll={} abort_latency_us_p50={} abort_latency_us_p95={} abort_latency_us_p99={}",
+            target_size,
+            rounds,
+            completed_before_abort_observed,
+            cancelled_after_cpu_poll,
+            percentile(&abort_latencies_us, 50),
+            percentile(&abort_latencies_us, 95),
+            percentile(&abort_latencies_us, 99),
+        );
+    }
 
     fn local_test_client() -> Client {
         Client::builder()
@@ -283,6 +958,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deadline_first_timeout_rejects_ready_future_after_elapsed_deadline_for_five_rounds() {
+        for round in 0..5 {
+            let deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+            let result = deadline_first_timeout_at(deadline, std::future::ready(round)).await;
+            assert_eq!(result, Err(()), "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_first_timeout_accepts_ready_future_before_deadline_for_five_rounds() {
+        for round in 0..5 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let result = deadline_first_timeout_at(deadline, std::future::ready(round)).await;
+            assert_eq!(result, Ok(round), "round {round}");
+        }
+    }
+
+    #[tokio::test]
     async fn send_with_response_header_timeout_expires_before_response_headers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -328,5 +1021,133 @@ mod tests {
 
         assert!(err.is_response_body_timeout());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn bounded_response_body_rejects_content_length_and_chunked_overflow_for_five_rounds() {
+        for _ in 0..5 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabcdef")
+                    .await
+                    .unwrap();
+            });
+            let response = local_test_client()
+                .get(format!("http://{addr}"))
+                .send()
+                .await
+                .unwrap();
+            let error = response_bytes_with_limit_and_body_timeout(response, 5, 5)
+                .await
+                .expect_err("declared body exceeds the hard limit");
+            assert!(error.is_response_body_too_large());
+            server.await.unwrap();
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let response = local_test_client()
+                .get(format!("http://{addr}"))
+                .send()
+                .await
+                .unwrap();
+            let error = response_bytes_with_limit_and_body_timeout(response, 5, 5)
+                .await
+                .expect_err("chunked body exceeds the hard limit while streaming");
+            assert!(error.is_response_body_too_large());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_response_body_accepts_exact_limit_and_recovers_for_five_rounds() {
+        for round in 0..5 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for response in [
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef"
+                        .as_slice(),
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde"
+                        .as_slice(),
+                ] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    stream.write_all(response).await.unwrap();
+                }
+            });
+            let client = local_test_client();
+
+            let oversized = client.get(format!("http://{addr}")).send().await.unwrap();
+            let error = response_bytes_with_limit_and_body_timeout(oversized, 5, 5)
+                .await
+                .expect_err("first response is oversized");
+            assert!(error.is_response_body_too_large(), "round {round}");
+
+            let exact = client.get(format!("http://{addr}")).send().await.unwrap();
+            let body = response_bytes_with_limit_and_body_timeout(exact, 5, 5)
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            assert_eq!(body.as_ref(), b"abcde", "round {round}");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_response_body_timeout_is_total_and_recovers_for_five_rounds() {
+        for round in 0..5 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stalled, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stalled.read(&mut request).await;
+                stalled
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\na")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                drop(stalled);
+
+                let (mut recovered, _) = listener.accept().await.unwrap();
+                let _ = recovered.read(&mut request).await;
+                recovered
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let client = local_test_client();
+
+            let stalled = client.get(format!("http://{addr}")).send().await.unwrap();
+            let error = response_bytes_with_limit_and_body_timeout(stalled, 1, 5)
+                .await
+                .expect_err("body must time out before the declared length arrives");
+            assert!(error.is_response_body_timeout(), "round {round}");
+
+            let recovered = client.get(format!("http://{addr}")).send().await.unwrap();
+            let body = response_bytes_with_limit_and_body_timeout(recovered, 2, 5)
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            assert_eq!(body.as_ref(), b"ok", "round {round}");
+            server.await.unwrap();
+        }
     }
 }

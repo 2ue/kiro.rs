@@ -122,17 +122,27 @@ impl CallContext {
 pub enum AcquireMode {
     WaitForCapacity,
     FailFastOnCapacity,
+    FailFastOnCapacityWaitForRedis(StdDuration),
     WaitForCapacityMax(StdDuration),
 }
 
 impl AcquireMode {
     pub(super) fn is_fail_fast(self) -> bool {
+        matches!(
+            self,
+            Self::FailFastOnCapacity | Self::FailFastOnCapacityWaitForRedis(_)
+        )
+    }
+
+    pub(super) fn is_redis_degraded_fail_fast(self) -> bool {
         matches!(self, Self::FailFastOnCapacity)
     }
 
     pub(super) fn max_wait_override(self) -> Option<StdDuration> {
         match self {
-            Self::WaitForCapacityMax(duration) => Some(duration),
+            Self::FailFastOnCapacityWaitForRedis(duration) | Self::WaitForCapacityMax(duration) => {
+                Some(duration)
+            }
             _ => None,
         }
     }

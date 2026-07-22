@@ -5,7 +5,6 @@ import type {
   ModelCapabilitiesStatus,
   ManualModelResponse,
   ModelPricingStatus,
-  SuccessResponse,
   UpsertManualModelRequest,
   UsageDashboardResponse,
   UsageDashboardBreakdownResponse,
@@ -84,8 +83,8 @@ export async function getUsageDashboardExternalPoolBilling(
   return data
 }
 
-export async function clearUsageRecords(): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>('/usage-records/clear')
+export async function clearUsageRecords(): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/clear')
   return data
 }
 
@@ -106,6 +105,11 @@ export async function getUsageCleanupStatus(): Promise<UsageCleanupStatusRespons
 
 export async function cancelUsageCleanup(): Promise<UsageCleanupStatusResponse> {
   const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/cleanup/cancel')
+  return data
+}
+
+export async function resumeUsageCleanup(jobId: string): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/cleanup/resume', { jobId })
   return data
 }
 

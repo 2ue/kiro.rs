@@ -52,8 +52,8 @@ This section classifies how retained historical sources may be reused. Keep/arch
 | [Prompt-cache strategy family analysis](../../../../prompt-cache-strategy-family-refactor-analysis-20260701.md) | Historical cache analysis | Reuse examples and policy rationale; target usage/cache contracts must restate accepted semantics without copying stale implementation detail |
 | [Current cache strategy issues](../../../../current-cache-strategy-issues-readable-20260701.md) | Historical problem analysis | Reproduce unresolved claims before promoting them into the current problem catalog |
 | [Kiro proxy study](../../../../kiro-proxy-study-20260626/README.md) | External-project research | Use for alternatives, never as current-project authority |
-| [Empty tool description/null schema reproduction](../../../../feature/empty-tool-description-400-invalid-tool-use-format.md) | Current retained finding evidence | Use for `COR-006` reproduction/source facts; decision 012 overrides its remediation suggestion |
-| [Invalid tool property-key reproduction](../../../../feature/tool-property-key-invalid-400-tool-schema-invalid.md) | Current retained finding evidence | Use for `COR-007` reproduction/source facts; decision 012 overrides its blanket-renaming suggestion |
+| [Empty tool description/null schema reproduction](../../../../../feature/issues/empty-tool-description-400-invalid-tool-use-format.md) | Current retained finding evidence | Use for `COR-006` reproduction/source facts; decision 012 overrides its remediation suggestion |
+| [Invalid tool property-key reproduction](../../../../../feature/issues/tool-property-key-invalid-400-tool-schema-invalid.md) | Current retained finding evidence | Use for `COR-007` reproduction/source facts; decision 012 overrides its blanket-renaming suggestion |
 
 ## Known Drift And Resolution State
 

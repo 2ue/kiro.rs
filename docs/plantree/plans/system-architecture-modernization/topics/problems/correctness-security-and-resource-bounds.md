@@ -177,7 +177,7 @@ Technical authority area: public protocol parsing, profile-specific payload norm
 - `Tool.description` defaults a missing field to an empty string and `input_schema` is a non-optional map with only `#[serde(default)]`: `src/anthropic/types.rs:314-326`.
 - Explicit JSON `null` therefore fails map deserialization, while a missing `input_schema` becomes an empty map.
 - The Kiro converter copies description unchanged and performs only suffix/length handling before sending it upstream: `src/anthropic/converter/tools.rs:293-337`.
-- [The retained reproduction report](../../../../../feature/empty-tool-description-400-invalid-tool-use-format.md) records deterministic empty/missing-description and explicit-null cases plus a recent production sample summary. Its remediation proposal is non-binding; decision 012 owns the accepted behavior.
+- [The retained reproduction report](../../../../../../feature/issues/empty-tool-description-400-invalid-tool-use-format.md) records deterministic empty/missing-description and explicit-null cases plus a recent production sample summary. Its remediation proposal is non-binding; decision 012 owns the accepted behavior.
 
 The defect is shared by every route that enters the same typed request parser. It is distinct from payload-size failures: small requests can fail before or at the first upstream attempt solely because a boundary value was not given a profile-specific meaning.
 
@@ -205,7 +205,7 @@ Technical authority area: Anthropic/Kiro/external tool schema codecs, payload po
 ### Evidence
 
 - `normalize_properties` recursively normalizes property values but never validates or maps object property names: `src/anthropic/converter/schema.rs:287-311`.
-- [The retained reproduction report](../../../../../feature/tool-property-key-invalid-400-tool-schema-invalid.md) records Kiro/Anthropic-compatible upstream rejection for names outside `^[a-zA-Z0-9_.-]{1,64}$`.
+- [The retained reproduction report](../../../../../../feature/issues/tool-property-key-invalid-400-tool-schema-invalid.md) records Kiro/Anthropic-compatible upstream rejection for names outside `^[a-zA-Z0-9_.-]{1,64}$`.
 - The report's original blanket replacement suggestion is unsafe as written: two names may collide, `required`/dependency keywords may diverge, and returned `tool_use.input` keys may no longer match the downstream client's names. `patternProperties` keys are regular expressions and `$defs` keys are definition identifiers, not ordinary property names.
 
 ### Required Target
@@ -227,6 +227,8 @@ Technical authority area: Anthropic/Kiro/external tool schema codecs, payload po
 
 Severity: P1
 Technical authority area: remote media adapter, resolver, HTTP transport
+
+Current Rust containment: the 2026-07-16 dirty tree replaces the independent pre-resolution with a filtering resolver used by the actual reqwest transport, disables inherited system proxies and revalidates every redirect. Focused transport tests pass; handler/load/release-candidate evidence remains open in [the active feature issue](../../../../../../feature/issues/remote-multimodal-resource-and-ssrf-bounds.md). The greenfield target requirements below remain authoritative for the later architecture.
 
 ### Evidence
 
@@ -256,6 +258,8 @@ The checked IP is not bound to the actual connection. An attacker-controlled hos
 
 Severity: P1
 Technical authority area: body processing, media fetch, resource governance
+
+Current Rust containment: the 2026-07-16 dirty tree adds source-count, aggregate downloaded/base64, shared HTTP-attempt, workflow-deadline and four-workflow process bounds. This closes the unbounded current-version path at module level but does not replace the target container-aware weighted resource governor; final handler/load/RSS evidence remains open in [the active feature issue](../../../../../../feature/issues/remote-multimodal-resource-and-ssrf-bounds.md).
 
 ### Evidence
 

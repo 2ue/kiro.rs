@@ -96,13 +96,6 @@ pub(super) fn bind_session_to_credential(
     }
 }
 
-pub(super) fn unbind_session(
-    session_bindings: &Mutex<HashMap<String, SessionBinding>>,
-    session_id: &str,
-) {
-    session_bindings.lock().remove(session_id);
-}
-
 pub(super) fn unbind_session_if_bound_to(
     session_bindings: &Mutex<HashMap<String, SessionBinding>>,
     session_id: &str,

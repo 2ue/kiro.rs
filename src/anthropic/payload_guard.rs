@@ -6,7 +6,7 @@
 //! entries while preserving Kiro history invariants.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::{self, Write},
     time::{Duration, Instant},
 };
@@ -31,6 +31,7 @@ const CURRENT_FIT_OVERHEAD_BYTES: usize = 512;
 const PAYLOAD_GUARD_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 const UPSTREAM_IMAGE_SOURCE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
+const EMPTY_USER_CONTENT_PLACEHOLDER: &str = ".";
 const TOOL_FORMAT_DIAGNOSTIC_MAX_HISTORY_ENTRIES: usize = 512;
 const TOOL_FORMAT_DIAGNOSTIC_MAX_ITEMS: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +46,8 @@ pub struct PayloadByteBreakdown {
     pub current_images_bytes: usize,
     pub history_tool_results_bytes: usize,
     pub history_images_bytes: usize,
+    #[serde(default)]
+    pub history_reasoning_content_bytes: usize,
     pub history_entries: usize,
     pub current_tool_count: usize,
     pub current_tool_result_count: usize,
@@ -54,6 +57,8 @@ pub struct PayloadByteBreakdown {
     pub largest_current_tool_result_bytes: usize,
     pub history_tool_use_count: usize,
     pub history_tool_result_count: usize,
+    #[serde(default)]
+    pub history_reasoning_content_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +116,10 @@ pub struct PayloadGuardReport {
     pub original_history_entries: usize,
     pub final_history_entries: usize,
     pub trimmed_history_entries: usize,
+    #[serde(default)]
+    pub guard_serializations: usize,
+    #[serde(default)]
+    pub history_trim_passes: usize,
     pub aligned_leading_entries: usize,
     pub removed_empty_tool_uses: usize,
     #[serde(default)]
@@ -177,6 +186,8 @@ impl PayloadGuardReport {
             original_history_entries: history_entries,
             final_history_entries: history_entries,
             trimmed_history_entries: 0,
+            guard_serializations: 0,
+            history_trim_passes: 0,
             aligned_leading_entries: 0,
             removed_empty_tool_uses: 0,
             removed_duplicate_tool_uses: 0,
@@ -415,15 +426,18 @@ pub fn guard_kiro_request(
     let mut trim_elapsed = Duration::ZERO;
     let mut current_shaping_elapsed = Duration::ZERO;
     let mut history_trim_iterations = 0usize;
+    let mut guard_serializations = 0usize;
 
     let serialize_started_at = Instant::now();
     let original_body = serialize_request(request)?;
+    guard_serializations += 1;
     serialize_elapsed += serialize_started_at.elapsed();
     let original_bytes = original_body.len();
     let original_history_entries = request.conversation_state.history.len();
 
     if !config.enabled {
         let mut report = PayloadGuardReport::disabled(original_bytes, original_history_entries);
+        report.guard_serializations = guard_serializations;
         set_cache_point_report_fields(&mut report, request);
         report.body_sha256 = Some(sha256_hex(&original_body));
         return Ok((original_body, report));
@@ -438,6 +452,8 @@ pub fn guard_kiro_request(
         original_history_entries,
         final_history_entries: original_history_entries,
         trimmed_history_entries: 0,
+        guard_serializations,
+        history_trim_passes: 0,
         aligned_leading_entries: 0,
         removed_empty_tool_uses: 0,
         removed_duplicate_tool_uses: 0,
@@ -483,12 +499,19 @@ pub fn guard_kiro_request(
         align_history_to_user(&mut request.conversation_state.history);
 
     let initial_repair = repair_request(request);
+    let initial_repair_modified = initial_repair.was_modified();
     add_repair_stats_to_report(&mut report, initial_repair);
     repair_elapsed += repair_started_at.elapsed();
 
-    let serialize_started_at = Instant::now();
-    let mut body = serialize_request(request)?;
-    serialize_elapsed += serialize_started_at.elapsed();
+    let mut body = if initial_repair_modified {
+        let serialize_started_at = Instant::now();
+        let body = serialize_request(request)?;
+        guard_serializations += 1;
+        serialize_elapsed += serialize_started_at.elapsed();
+        body
+    } else {
+        original_body
+    };
     report.final_bytes = body.len();
 
     if config.shaping.enabled {
@@ -507,6 +530,7 @@ pub fn guard_kiro_request(
         if should_reserialize {
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
+            guard_serializations += 1;
             serialize_elapsed += serialize_started_at.elapsed();
             report.final_bytes = body.len();
         }
@@ -522,6 +546,7 @@ pub fn guard_kiro_request(
         if should_reserialize {
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
+            guard_serializations += 1;
             serialize_elapsed += serialize_started_at.elapsed();
             report.final_bytes = body.len();
         }
@@ -534,10 +559,23 @@ pub fn guard_kiro_request(
             && !request.conversation_state.history.is_empty()
         {
             history_trim_iterations += 1;
-            let before = request.conversation_state.history.len();
-            trim_oldest_history_unit(&mut request.conversation_state.history);
-            let after_trim = request.conversation_state.history.len();
-            report.trimmed_history_entries += before.saturating_sub(after_trim);
+            let removed = {
+                let state = &mut request.conversation_state;
+                trim_history_to_estimated_budget(
+                    &mut state.history,
+                    &state
+                        .current_message
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results,
+                    report.final_bytes,
+                    config.max_bytes,
+                )
+            };
+            if removed == 0 {
+                break;
+            }
+            report.trimmed_history_entries += removed;
 
             let aligned = align_history_to_user(&mut request.conversation_state.history);
             report.aligned_leading_entries += aligned;
@@ -547,11 +585,9 @@ pub fn guard_kiro_request(
 
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
+            guard_serializations += 1;
             serialize_elapsed += serialize_started_at.elapsed();
             let new_size = body.len();
-            if new_size >= report.final_bytes && after_trim == before {
-                break;
-            }
             report.final_bytes = new_size;
         }
         trim_elapsed += trim_started_at.elapsed();
@@ -568,6 +604,8 @@ pub fn guard_kiro_request(
             config.shaping,
             config.max_bytes,
             body,
+            &mut serialize_elapsed,
+            &mut guard_serializations,
         )?;
         add_current_shaping_stats_to_report(&mut report, &current_stats);
         body = new_body;
@@ -584,6 +622,7 @@ pub fn guard_kiro_request(
             if should_reserialize {
                 let serialize_started_at = Instant::now();
                 body = serialize_request(request)?;
+                guard_serializations += 1;
                 serialize_elapsed += serialize_started_at.elapsed();
                 report.final_bytes = body.len();
             }
@@ -591,17 +630,7 @@ pub fn guard_kiro_request(
     }
 
     let final_repair_started_at = Instant::now();
-    let final_repair = {
-        let conversation_state = &mut request.conversation_state;
-        flatten_completed_history_tool_turns(
-            &mut conversation_state.history,
-            &conversation_state
-                .current_message
-                .user_input_message
-                .user_input_message_context
-                .tool_results,
-        )
-    };
+    let final_repair = repair_request(request);
     let should_reserialize = final_repair.was_modified();
     add_repair_stats_to_report(&mut report, final_repair);
     repair_elapsed += final_repair_started_at.elapsed();
@@ -609,11 +638,14 @@ pub fn guard_kiro_request(
     if should_reserialize {
         let serialize_started_at = Instant::now();
         body = serialize_request(request)?;
+        guard_serializations += 1;
         serialize_elapsed += serialize_started_at.elapsed();
     }
 
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
+    report.guard_serializations = guard_serializations;
+    report.history_trim_passes = history_trim_iterations;
     report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
     set_cache_point_report_fields(&mut report, request);
     report.body_sha256 = Some(sha256_hex(&body));
@@ -640,6 +672,8 @@ pub fn breakdown_kiro_request(
     let state = &request.conversation_state;
     let current_user = &state.current_message.user_input_message;
     let context = &current_user.user_input_message_context;
+    let (history_reasoning_content_count, history_reasoning_content_bytes) =
+        history_reasoning_content_stats(&state.history);
 
     PayloadByteBreakdown {
         total_bytes: serialized_body.len(),
@@ -651,6 +685,7 @@ pub fn breakdown_kiro_request(
         current_images_bytes: json_len(&current_user.images),
         history_tool_results_bytes: history_tool_results_bytes(&state.history),
         history_images_bytes: history_images_bytes(&state.history),
+        history_reasoning_content_bytes,
         history_entries: state.history.len(),
         current_tool_count: context.tools.len(),
         current_tool_result_count: context.tool_results.len(),
@@ -665,6 +700,7 @@ pub fn breakdown_kiro_request(
             .unwrap_or(0),
         history_tool_use_count: count_history_tool_uses(&state.history),
         history_tool_result_count: count_history_tool_results(&state.history),
+        history_reasoning_content_count,
     }
 }
 
@@ -978,9 +1014,11 @@ fn serialize_anthropic_body_into(
     body: &mut Option<String>,
     request: &MessagesRequest,
     serialize_elapsed: &mut Duration,
+    guard_serializations: &mut usize,
 ) -> Result<usize, PayloadGuardError> {
     let serialize_started_at = Instant::now();
     let serialized = serialize_anthropic_request(request)?;
+    *guard_serializations = (*guard_serializations).saturating_add(1);
     *serialize_elapsed += serialize_started_at.elapsed();
     let len = serialized.len();
     *body = Some(serialized);
@@ -991,12 +1029,14 @@ fn take_or_serialize_anthropic_body(
     body: &mut Option<String>,
     request: &MessagesRequest,
     serialize_elapsed: &mut Duration,
+    guard_serializations: &mut usize,
 ) -> Result<String, PayloadGuardError> {
     if let Some(body) = body.take() {
         return Ok(body);
     }
     let serialize_started_at = Instant::now();
     let serialized = serialize_anthropic_request(request)?;
+    *guard_serializations = (*guard_serializations).saturating_add(1);
     *serialize_elapsed += serialize_started_at.elapsed();
     Ok(serialized)
 }
@@ -1014,6 +1054,7 @@ fn guard_anthropic_messages_request_inner(
     let mut trim_elapsed = Duration::ZERO;
     let mut current_shaping_elapsed = Duration::ZERO;
     let mut history_trim_iterations = 0usize;
+    let mut guard_serializations = 0usize;
 
     let mut body = None;
     let original_history_entries = request.messages.len().saturating_sub(1);
@@ -1023,12 +1064,18 @@ fn guard_anthropic_messages_request_inner(
         || !config.enabled
         || (size_limit_enabled && original_body_bytes > config.max_bytes)
     {
-        serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
+        serialize_anthropic_body_into(
+            &mut body,
+            request,
+            &mut serialize_elapsed,
+            &mut guard_serializations,
+        )?;
     }
 
     if !config.enabled {
         let mut report =
             PayloadGuardReport::disabled(original_body_bytes, original_history_entries);
+        report.guard_serializations = guard_serializations;
         let body = body
             .map(Bytes::from)
             .or_else(|| original_body.cloned())
@@ -1056,7 +1103,12 @@ fn guard_anthropic_messages_request_inner(
     repair_elapsed += repair_started_at.elapsed();
 
     if should_reserialize {
-        final_bytes = serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
+        final_bytes = serialize_anthropic_body_into(
+            &mut body,
+            request,
+            &mut serialize_elapsed,
+            &mut guard_serializations,
+        )?;
         report.final_bytes = final_bytes;
     }
 
@@ -1075,8 +1127,12 @@ fn guard_anthropic_messages_request_inner(
         let should_reserialize = should_reserialize || current_safety_shaping.was_modified();
         add_current_shaping_stats_to_report(&mut report, &current_safety_shaping);
         if should_reserialize {
-            final_bytes =
-                serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
+            final_bytes = serialize_anthropic_body_into(
+                &mut body,
+                request,
+                &mut serialize_elapsed,
+                &mut guard_serializations,
+            )?;
             report.final_bytes = final_bytes;
         }
         shaping_elapsed += shaping_started_at.elapsed();
@@ -1089,8 +1145,12 @@ fn guard_anthropic_messages_request_inner(
         add_shaping_stats_to_report(&mut report, shaping);
 
         if should_reserialize {
-            final_bytes =
-                serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
+            final_bytes = serialize_anthropic_body_into(
+                &mut body,
+                request,
+                &mut serialize_elapsed,
+                &mut guard_serializations,
+            )?;
             report.final_bytes = final_bytes;
         }
         shaping_elapsed += shaping_started_at.elapsed();
@@ -1100,21 +1160,27 @@ fn guard_anthropic_messages_request_inner(
         let trim_started_at = Instant::now();
         while final_bytes > config.max_bytes && request.messages.len() > 1 {
             history_trim_iterations += 1;
-            let before = request.messages.len();
-            trim_oldest_anthropic_history_unit(&mut request.messages);
-            let after_trim = request.messages.len();
-            report.trimmed_history_entries += before.saturating_sub(after_trim);
+            let removed = trim_anthropic_history_to_estimated_budget(
+                &mut request.messages,
+                final_bytes,
+                config.max_bytes,
+            );
+            if removed == 0 {
+                break;
+            }
+            report.trimmed_history_entries += removed;
 
             let repair_started_at = Instant::now();
             let repair = repair_anthropic_messages(request);
             add_anthropic_repair_stats_to_report(&mut report, repair);
             repair_elapsed += repair_started_at.elapsed();
 
-            let new_size =
-                serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
-            if new_size >= final_bytes && after_trim == before {
-                break;
-            }
+            let new_size = serialize_anthropic_body_into(
+                &mut body,
+                request,
+                &mut serialize_elapsed,
+                &mut guard_serializations,
+            )?;
             final_bytes = new_size;
             report.final_bytes = final_bytes;
         }
@@ -1127,13 +1193,19 @@ fn guard_anthropic_messages_request_inner(
         && current_payload_shaping_enabled(config.shaping)
     {
         let current_started_at = Instant::now();
-        let current_body =
-            take_or_serialize_anthropic_body(&mut body, request, &mut serialize_elapsed)?;
+        let current_body = take_or_serialize_anthropic_body(
+            &mut body,
+            request,
+            &mut serialize_elapsed,
+            &mut guard_serializations,
+        )?;
         let (new_body, current_stats) = apply_anthropic_current_payload_shaping_until_fit(
             request,
             config.shaping,
             config.max_bytes,
             current_body,
+            &mut serialize_elapsed,
+            &mut guard_serializations,
         )?;
         add_current_shaping_stats_to_report(&mut report, &current_stats);
         final_bytes = new_body.len();
@@ -1149,8 +1221,12 @@ fn guard_anthropic_messages_request_inner(
             repair_elapsed += repair_started_at.elapsed();
 
             if should_reserialize {
-                final_bytes =
-                    serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
+                final_bytes = serialize_anthropic_body_into(
+                    &mut body,
+                    request,
+                    &mut serialize_elapsed,
+                    &mut guard_serializations,
+                )?;
                 report.final_bytes = final_bytes;
             }
         }
@@ -1158,6 +1234,8 @@ fn guard_anthropic_messages_request_inner(
 
     report.final_history_entries = request.messages.len().saturating_sub(1);
     report.still_oversized = size_limit_enabled && final_bytes > config.max_bytes;
+    report.guard_serializations = guard_serializations;
+    report.history_trim_passes = history_trim_iterations;
     let body = body
         .map(Bytes::from)
         .or_else(|| original_body.cloned())
@@ -1183,6 +1261,8 @@ pub fn breakdown_anthropic_messages_request(
 ) -> PayloadByteBreakdown {
     let history_end = request.messages.len().saturating_sub(1);
     let current_message = request.messages.last();
+    let (history_reasoning_content_count, history_reasoning_content_bytes) =
+        anthropic_history_reasoning_content_stats(&request.messages[..history_end]);
 
     PayloadByteBreakdown {
         total_bytes,
@@ -1206,6 +1286,7 @@ pub fn breakdown_anthropic_messages_request(
             .iter()
             .map(|message| content_images_bytes(&message.content))
             .sum(),
+        history_reasoning_content_bytes,
         history_entries: history_end,
         current_tool_count: request.tools.as_ref().map(Vec::len).unwrap_or(0),
         current_tool_result_count: current_message
@@ -1242,6 +1323,7 @@ pub fn breakdown_anthropic_messages_request(
             .iter()
             .map(|message| count_content_blocks_by_type(&message.content, "tool_result"))
             .sum(),
+        history_reasoning_content_count,
     }
 }
 
@@ -1258,6 +1340,8 @@ fn new_payload_guard_report(
         original_history_entries,
         final_history_entries: original_history_entries,
         trimmed_history_entries: 0,
+        guard_serializations: 0,
+        history_trim_passes: 0,
         aligned_leading_entries: 0,
         removed_empty_tool_uses: 0,
         removed_duplicate_tool_uses: 0,
@@ -1449,6 +1533,7 @@ fn log_payload_guard_timing(
             history_trim_ms = duration_ms(trim_elapsed),
             current_shaping_ms = duration_ms(current_shaping_elapsed),
             history_trim_iterations,
+            guard_serializations = report.guard_serializations,
             original_bytes = report.original_bytes,
             final_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
@@ -1508,6 +1593,29 @@ fn content_images_bytes(content: &Value) -> usize {
         .into_iter()
         .map(json_len)
         .sum()
+}
+
+fn is_anthropic_reasoning_content_block(block: &Value) -> bool {
+    matches!(
+        block_type(block),
+        Some("thinking") | Some("redacted_thinking")
+    ) || block.get("thinking").is_some()
+        || block.get("signature").is_some()
+}
+
+fn anthropic_history_reasoning_content_stats(messages: &[AnthropicMessage]) -> (usize, usize) {
+    messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| content_blocks(&message.content))
+        .flat_map(|blocks| blocks.iter())
+        .filter(|block| is_anthropic_reasoning_content_block(block))
+        .fold((0usize, 0usize), |(count, bytes), block| {
+            (
+                count.saturating_add(1),
+                bytes.saturating_add(json_len(block)),
+            )
+        })
 }
 
 fn count_history_tool_uses(history: &[Message]) -> usize {
@@ -1583,13 +1691,89 @@ fn history_images_bytes(history: &[Message]) -> usize {
         .sum()
 }
 
+fn history_reasoning_content_stats(history: &[Message]) -> (usize, usize) {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant(assistant) => assistant
+                .assistant_response_message
+                .reasoning_content
+                .as_ref(),
+            Message::User(_) => None,
+        })
+        .fold((0usize, 0usize), |(count, bytes), reasoning_content| {
+            (
+                count.saturating_add(1),
+                bytes.saturating_add(json_len(reasoning_content)),
+            )
+        })
+}
+
 fn kiro_image_source_bytes(image: &crate::kiro::model::requests::conversation::KiroImage) -> usize {
     image
         .source
         .bytes
         .as_ref()
-        .map(|bytes| bytes.len())
+        .map(|bytes| decoded_base64_source_bytes(bytes).unwrap_or(bytes.len()))
         .unwrap_or_else(|| json_len(image))
+}
+
+fn decoded_base64_source_bytes(value: &str) -> Option<usize> {
+    let value = inline_base64_payload(value);
+    let mut symbols = 0usize;
+    let mut padding = 0usize;
+    let mut saw_padding = false;
+
+    for byte in value.bytes() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            saw_padding = true;
+            padding = padding.checked_add(1)?;
+            if padding > 2 {
+                return None;
+            }
+        } else {
+            if saw_padding || !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')) {
+                return None;
+            }
+        }
+        symbols = symbols.checked_add(1)?;
+    }
+
+    if symbols == 0 {
+        return Some(0);
+    }
+    let complete = (symbols / 4).checked_mul(3)?;
+    let remainder = symbols % 4;
+    if padding > 0 {
+        if remainder != 0 || symbols < 4 {
+            return None;
+        }
+        return complete.checked_sub(padding);
+    }
+    match remainder {
+        0 => Some(complete),
+        2 => complete.checked_add(1),
+        3 => complete.checked_add(2),
+        _ => None,
+    }
+}
+
+fn inline_base64_payload(value: &str) -> &str {
+    let trimmed = value.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+    let Some(rest) = trimmed.strip_prefix("data:") else {
+        return value;
+    };
+    let Some((metadata, payload)) = rest.split_once(',') else {
+        return value;
+    };
+    metadata
+        .split(';')
+        .any(|part| part.trim().eq_ignore_ascii_case("base64"))
+        .then_some(payload)
+        .unwrap_or(value)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2043,11 +2227,7 @@ fn discard_anthropic_history_thinking(messages: &mut [AnthropicMessage]) -> (usi
         let before = blocks.len();
         let mut chars = 0usize;
         blocks.retain(|block| {
-            let is_thinking = matches!(
-                block_type(block),
-                Some("thinking") | Some("redacted_thinking")
-            ) || block.get("thinking").is_some()
-                || block.get("signature").is_some();
+            let is_thinking = is_anthropic_reasoning_content_block(block);
             if is_thinking {
                 chars += json_len(block);
             }
@@ -2069,7 +2249,7 @@ fn anthropic_image_source_bytes(block: &Value) -> usize {
     };
     for key in ["data", "base64", "bytes"] {
         if let Some(value) = source.get(key).and_then(Value::as_str) {
-            return value.len();
+            return decoded_base64_source_bytes(value).unwrap_or(value.len());
         }
     }
     json_len(block)
@@ -2119,10 +2299,15 @@ fn find_oversized_anthropic_images(
     violation
 }
 
-fn oversized_historical_image_placeholder(_bytes: usize, _max_source_bytes: usize) -> Value {
+fn oversized_historical_image_placeholder(dropped: usize) -> Value {
+    let text = if dropped == 1 {
+        "[Historical image was omitted because it exceeded the upstream 5 MB image size limit.]"
+    } else {
+        "[Historical images were omitted because they exceeded the upstream 5 MB image size limit.]"
+    };
     serde_json::json!({
         "type": "text",
-        "text": "[Historical image was omitted because it exceeded the upstream 5 MB image size limit.]"
+        "text": text
     })
 }
 
@@ -2140,18 +2325,28 @@ fn drop_oversized_anthropic_history_images(
         let Some(blocks) = content_blocks_mut(&mut message.content) else {
             continue;
         };
-        for block in blocks {
-            if block_type(block) != Some("image") {
-                continue;
+        let mut retained = Vec::with_capacity(blocks.len());
+        let mut placeholder_index = None;
+        let mut message_dropped = 0usize;
+        for block in std::mem::take(blocks) {
+            let bytes =
+                (block_type(&block) == Some("image")).then(|| anthropic_image_source_bytes(&block));
+            if bytes.is_some_and(|bytes| bytes > max_source_bytes) {
+                placeholder_index.get_or_insert(retained.len());
+                message_dropped += 1;
+                dropped += 1;
+                dropped_bytes += bytes.unwrap_or_default();
+            } else {
+                retained.push(block);
             }
-            let bytes = anthropic_image_source_bytes(block);
-            if bytes <= max_source_bytes {
-                continue;
-            }
-            *block = oversized_historical_image_placeholder(bytes, max_source_bytes);
-            dropped += 1;
-            dropped_bytes += bytes;
         }
+        if let Some(index) = placeholder_index {
+            retained.insert(
+                index,
+                oversized_historical_image_placeholder(message_dropped),
+            );
+        }
+        *blocks = retained;
     }
     (dropped, dropped_bytes)
 }
@@ -2339,7 +2534,7 @@ struct AnthropicRepairStats {
     normalized_empty_tool_results: usize,
     aligned_leading_entries: usize,
     removed_orphan_tool_results: usize,
-    textified_orphan_tool_results: usize,
+    removed_duplicate_tool_results: usize,
     removed_orphan_tool_uses: usize,
 }
 
@@ -2348,7 +2543,7 @@ impl AnthropicRepairStats {
         self.normalized_empty_tool_results > 0
             || self.aligned_leading_entries > 0
             || self.removed_orphan_tool_results > 0
-            || self.textified_orphan_tool_results > 0
+            || self.removed_duplicate_tool_results > 0
             || self.removed_orphan_tool_uses > 0
     }
 }
@@ -2358,9 +2553,9 @@ fn repair_anthropic_messages(request: &mut MessagesRequest) -> AnthropicRepairSt
     stats.normalized_empty_tool_results +=
         normalize_empty_anthropic_tool_result_contents(&mut request.messages);
     stats.aligned_leading_entries += align_anthropic_messages_to_user(&mut request.messages);
-    let result = textify_orphan_anthropic_tool_results(&mut request.messages);
-    stats.removed_orphan_tool_results += result.0;
-    stats.textified_orphan_tool_results += result.1;
+    let result = filter_invalid_anthropic_tool_results(&mut request.messages);
+    stats.removed_orphan_tool_results += result.removed_orphans;
+    stats.removed_duplicate_tool_results += result.removed_duplicates;
     stats.removed_orphan_tool_uses += remove_unpaired_anthropic_tool_uses(&mut request.messages);
     stats
 }
@@ -2371,7 +2566,7 @@ fn add_anthropic_repair_stats_to_report(
 ) {
     report.aligned_leading_entries += repair.aligned_leading_entries;
     report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
-    report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
+    report.removed_duplicate_tool_results += repair.removed_duplicate_tool_results;
     report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
 }
 
@@ -2435,21 +2630,27 @@ fn anthropic_tool_result_item_has_content(item: &Value) -> bool {
 }
 
 fn align_anthropic_messages_to_user(messages: &mut Vec<AnthropicMessage>) -> usize {
-    let mut removed = 0usize;
-    while messages.len() > 1
-        && messages
-            .first()
-            .is_some_and(|message| message.role == "assistant")
-    {
-        messages.remove(0);
-        removed += 1;
+    let removed = messages
+        .iter()
+        .take(messages.len().saturating_sub(1))
+        .take_while(|message| message.role == "assistant")
+        .count();
+    if removed > 0 {
+        messages.drain(..removed);
     }
     removed
 }
 
-fn textify_orphan_anthropic_tool_results(messages: &mut [AnthropicMessage]) -> (usize, usize) {
-    let mut removed = 0usize;
-    let mut textified = 0usize;
+#[derive(Default)]
+struct AnthropicToolResultFilterStats {
+    removed_orphans: usize,
+    removed_duplicates: usize,
+}
+
+fn filter_invalid_anthropic_tool_results(
+    messages: &mut [AnthropicMessage],
+) -> AnthropicToolResultFilterStats {
+    let mut stats = AnthropicToolResultFilterStats::default();
     for idx in 0..messages.len() {
         if messages[idx].role != "user" {
             continue;
@@ -2462,26 +2663,30 @@ fn textify_orphan_anthropic_tool_results(messages: &mut [AnthropicMessage]) -> (
         let Some(blocks) = content_blocks_mut(&mut messages[idx].content) else {
             continue;
         };
-        for block in blocks {
+        let mut seen = HashSet::new();
+        blocks.retain(|block| {
             if block_type(block) != Some("tool_result") {
-                continue;
+                return true;
             }
             let id = block
                 .get("tool_use_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if !valid_ids.contains(id) {
-                let text = anthropic_tool_result_to_text(block);
-                *block = serde_json::json!({
-                    "type": "text",
-                    "text": format!("[trimmed orphan tool_result {}]\n{}", id, text),
-                });
-                removed += 1;
-                textified += 1;
+                stats.removed_orphans += 1;
+                return false;
             }
+            if !seen.insert(id.to_string()) {
+                stats.removed_duplicates += 1;
+                return false;
+            }
+            true
+        });
+        if blocks.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": " "}));
         }
     }
-    (removed, textified)
+    stats
 }
 
 fn remove_unpaired_anthropic_tool_uses(messages: &mut [AnthropicMessage]) -> usize {
@@ -2543,45 +2748,51 @@ fn anthropic_tool_result_ids(content: &Value) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn anthropic_tool_result_to_text(block: &Value) -> String {
-    let Some(content) = block.get("content") else {
-        return block.to_string();
-    };
-    if let Some(text) = content.as_str() {
-        return text.to_string();
+fn trim_anthropic_history_to_estimated_budget(
+    messages: &mut Vec<AnthropicMessage>,
+    current_bytes: usize,
+    target_bytes: usize,
+) -> usize {
+    if messages.len() <= 1 || current_bytes <= target_bytes {
+        return 0;
     }
-    if let Some(items) = content.as_array() {
-        let mut parts = Vec::new();
-        for item in items {
-            if let Some(text) = item.as_str() {
-                parts.push(text.to_string());
-            } else if let Some(text) = item.get("text").and_then(Value::as_str) {
-                parts.push(text.to_string());
-            } else if !item.is_null() {
-                parts.push(item.to_string());
-            }
-        }
-        return parts.join("\n");
-    }
-    content.to_string()
-}
 
-fn trim_oldest_anthropic_history_unit(messages: &mut Vec<AnthropicMessage>) {
-    if messages.len() <= 1 {
-        return;
+    let mut prefix_len = 0usize;
+    let mut removed_item_bytes = 0usize;
+    let mut estimated_bytes = current_bytes;
+    while estimated_bytes > target_bytes && prefix_len + 1 < messages.len() {
+        let Some(relative_end) =
+            messages[prefix_len..]
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(idx, message)| {
+                    (message.role == "user" && !has_anthropic_tool_result(&message.content))
+                        .then_some(idx)
+                })
+        else {
+            break;
+        };
+        let previous_prefix_len = prefix_len;
+        prefix_len += relative_end;
+        removed_item_bytes = removed_item_bytes.saturating_add(
+            messages[previous_prefix_len..prefix_len]
+                .iter()
+                .map(json_len)
+                .sum::<usize>(),
+        );
+        estimated_bytes =
+            current_bytes.saturating_sub(json_array_prefix_reduction_from_item_bytes(
+                messages.len(),
+                prefix_len,
+                removed_item_bytes,
+            ));
     }
-    if messages.len() >= 3
-        && messages
-            .first()
-            .is_some_and(|message| message.role == "assistant")
-        && messages.get(1).is_some_and(|message| {
-            message.role == "user" && has_anthropic_tool_result(&message.content)
-        })
-    {
-        messages.drain(0..2);
-        return;
+
+    if prefix_len > 0 {
+        messages.drain(0..prefix_len);
     }
-    messages.remove(0);
+    prefix_len
 }
 
 fn has_anthropic_tool_result(content: &Value) -> bool {
@@ -2767,6 +2978,14 @@ fn discard_history_thinking(history: &mut [Message]) -> (usize, usize) {
         let Message::Assistant(assistant) = message else {
             continue;
         };
+        if let Some(reasoning_content) = assistant
+            .assistant_response_message
+            .reasoning_content
+            .take()
+        {
+            blocks = blocks.saturating_add(1);
+            chars = chars.saturating_add(json_len(&reasoning_content));
+        }
         let (cleaned, removed_blocks, removed_chars) =
             remove_tagged_blocks(&assistant.assistant_response_message.content, "thinking");
         if removed_blocks > 0 {
@@ -3110,6 +3329,8 @@ fn apply_current_payload_shaping_until_fit(
     config: PayloadShapingConfig,
     max_bytes: usize,
     body: String,
+    serialize_elapsed: &mut Duration,
+    guard_serializations: &mut usize,
 ) -> Result<(String, CurrentShapingStats), PayloadGuardError> {
     let mut body = body;
     let mut stats = CurrentShapingStats::default();
@@ -3172,7 +3393,10 @@ fn apply_current_payload_shaping_until_fit(
         stats.dropped_current_image_bytes += changed.1;
     }
 
+    let serialize_started_at = Instant::now();
     body = serialize_request(request)?;
+    *guard_serializations = (*guard_serializations).saturating_add(1);
+    *serialize_elapsed += serialize_started_at.elapsed();
 
     let mut iterations = 0usize;
     while body.len() > max_bytes && iterations < CURRENT_FIT_MAX_ITERATIONS {
@@ -3233,11 +3457,16 @@ fn apply_current_payload_shaping_until_fit(
         }
 
         if !changed && truncate_images {
-            let result = drop_largest_current_image(
+            let required_reduction = body
+                .len()
+                .saturating_sub(max_bytes)
+                .saturating_add(CURRENT_FIT_OVERHEAD_BYTES);
+            let result = drop_current_images_for_body_reduction(
                 &mut request
                     .conversation_state
                     .current_message
                     .user_input_message,
+                required_reduction,
             );
             if result.0 > 0 {
                 stats.dropped_current_images += result.0;
@@ -3250,7 +3479,10 @@ fn apply_current_payload_shaping_until_fit(
             break;
         }
 
+        let serialize_started_at = Instant::now();
         body = serialize_request(request)?;
+        *guard_serializations = (*guard_serializations).saturating_add(1);
+        *serialize_elapsed += serialize_started_at.elapsed();
         if body.len() >= before_len {
             break;
         }
@@ -3290,6 +3522,8 @@ fn apply_anthropic_current_payload_shaping_until_fit(
     config: PayloadShapingConfig,
     max_bytes: usize,
     body: String,
+    serialize_elapsed: &mut Duration,
+    guard_serializations: &mut usize,
 ) -> Result<(String, CurrentShapingStats), PayloadGuardError> {
     let mut body = body;
     let mut stats = CurrentShapingStats::default();
@@ -3333,7 +3567,10 @@ fn apply_anthropic_current_payload_shaping_until_fit(
         stats.dropped_current_image_bytes += changed.1;
     }
 
+    let serialize_started_at = Instant::now();
     body = serialize_anthropic_request(request)?;
+    *guard_serializations = (*guard_serializations).saturating_add(1);
+    *serialize_elapsed += serialize_started_at.elapsed();
 
     let mut iterations = 0usize;
     while body.len() > max_bytes && iterations < CURRENT_FIT_MAX_ITERATIONS {
@@ -3380,7 +3617,12 @@ fn apply_anthropic_current_payload_shaping_until_fit(
         }
 
         if !changed && truncate_images {
-            let result = drop_largest_anthropic_current_image(request);
+            let required_reduction = body
+                .len()
+                .saturating_sub(max_bytes)
+                .saturating_add(CURRENT_FIT_OVERHEAD_BYTES);
+            let result =
+                drop_anthropic_current_images_for_body_reduction(request, required_reduction);
             if result.0 > 0 {
                 stats.dropped_current_images += result.0;
                 stats.dropped_current_image_bytes += result.1;
@@ -3392,7 +3634,10 @@ fn apply_anthropic_current_payload_shaping_until_fit(
             break;
         }
 
+        let serialize_started_at = Instant::now();
         body = serialize_anthropic_request(request)?;
+        *guard_serializations = (*guard_serializations).saturating_add(1);
+        *serialize_elapsed += serialize_started_at.elapsed();
         if body.len() >= before_len {
             break;
         }
@@ -3544,10 +3789,15 @@ fn drop_anthropic_current_images_to_budget(
     (dropped, dropped_bytes)
 }
 
-fn oversized_current_image_placeholder(_bytes: usize, _max_source_bytes: usize) -> Value {
+fn oversized_current_image_placeholder(dropped: usize) -> Value {
+    let text = if dropped == 1 {
+        "[Current image was omitted because it exceeded the upstream 5 MB image size limit.]"
+    } else {
+        "[Current images were omitted because they exceeded the upstream 5 MB image size limit.]"
+    };
     serde_json::json!({
         "type": "text",
-        "text": "[Current image was omitted because it exceeded the upstream 5 MB image size limit.]"
+        "text": text
     })
 }
 
@@ -3567,18 +3817,23 @@ fn drop_oversized_anthropic_current_images(
 
     let mut dropped = 0usize;
     let mut dropped_bytes = 0usize;
-    for block in blocks {
-        if block_type(block) != Some("image") {
-            continue;
+    let mut retained = Vec::with_capacity(blocks.len());
+    let mut placeholder_index = None;
+    for block in std::mem::take(blocks) {
+        let bytes =
+            (block_type(&block) == Some("image")).then(|| anthropic_image_source_bytes(&block));
+        if bytes.is_some_and(|bytes| bytes > max_source_bytes) {
+            placeholder_index.get_or_insert(retained.len());
+            dropped += 1;
+            dropped_bytes += bytes.unwrap_or_default();
+        } else {
+            retained.push(block);
         }
-        let bytes = anthropic_image_source_bytes(block);
-        if bytes <= max_source_bytes {
-            continue;
-        }
-        *block = oversized_current_image_placeholder(bytes, max_source_bytes);
-        dropped += 1;
-        dropped_bytes += bytes;
     }
+    if let Some(index) = placeholder_index {
+        retained.insert(index, oversized_current_image_placeholder(dropped));
+    }
+    *blocks = retained;
     (dropped, dropped_bytes)
 }
 
@@ -3608,6 +3863,31 @@ fn drop_largest_anthropic_current_image(request: &mut MessagesRequest) -> (usize
     };
     blocks.remove(idx);
     (1, bytes)
+}
+
+fn drop_anthropic_current_images_for_body_reduction(
+    request: &mut MessagesRequest,
+    required_bytes: usize,
+) -> (usize, usize) {
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    while dropped_bytes < required_bytes {
+        let result = drop_largest_anthropic_current_image(request);
+        if result.0 == 0 {
+            break;
+        }
+        dropped += result.0;
+        dropped_bytes = dropped_bytes.saturating_add(result.1);
+    }
+    if dropped > 0 {
+        let note = if dropped == 1 {
+            "[Current image was omitted because it exceeded the request image budget.]"
+        } else {
+            "[Current images were omitted because they exceeded the request image budget.]"
+        };
+        append_anthropic_current_text(request, note);
+    }
+    (dropped, dropped_bytes)
 }
 
 fn append_anthropic_current_text(request: &mut MessagesRequest, text: &str) {
@@ -3919,53 +4199,109 @@ fn drop_largest_current_image(user: &mut UserInputMessage) -> (usize, usize) {
         return (0, 0);
     };
     user.images.remove(idx);
-    if user.images.is_empty() {
-        append_text(
-            &mut user.content,
-            "[Current image was omitted because it exceeded the request image budget.]",
-        );
-    }
     (1, bytes)
 }
 
-fn trim_oldest_history_unit(history: &mut Vec<Message>) {
-    if history.is_empty() {
-        return;
+fn drop_current_images_for_body_reduction(
+    user: &mut UserInputMessage,
+    required_bytes: usize,
+) -> (usize, usize) {
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    while dropped_bytes < required_bytes {
+        let result = drop_largest_current_image(user);
+        if result.0 == 0 {
+            break;
+        }
+        dropped += result.0;
+        dropped_bytes = dropped_bytes.saturating_add(result.1);
     }
-
-    if history.len() >= 2 && starts_with_tool_pair(history) {
-        history.drain(0..2);
-        return;
+    if dropped > 0 {
+        let note = if dropped == 1 {
+            "[Current image was omitted because it exceeded the request image budget.]"
+        } else {
+            "[Current images were omitted because they exceeded the request image budget.]"
+        };
+        append_text(&mut user.content, note);
     }
-
-    history.remove(0);
+    (dropped, dropped_bytes)
 }
 
-fn starts_with_tool_pair(history: &[Message]) -> bool {
-    let Some(Message::Assistant(assistant)) = history.first() else {
-        return false;
-    };
-    let has_tool_uses = assistant
-        .assistant_response_message
-        .tool_uses
-        .as_ref()
-        .is_some_and(|items| !items.is_empty());
-    if !has_tool_uses {
-        return false;
+fn trim_history_to_estimated_budget(
+    history: &mut Vec<Message>,
+    current_results: &[ToolResult],
+    current_bytes: usize,
+    target_bytes: usize,
+) -> usize {
+    if history.is_empty() || current_bytes <= target_bytes {
+        return 0;
     }
-    history
-        .get(1)
-        .and_then(|msg| match msg {
-            Message::User(user) => Some(
-                !user
-                    .user_input_message
+
+    let mut prefix_len = 0usize;
+    let mut removed_item_bytes = 0usize;
+    let mut estimated_bytes = current_bytes;
+    while estimated_bytes > target_bytes && prefix_len < history.len() {
+        let remaining = &history[prefix_len..];
+        let next_turn = remaining
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(idx, message)| {
+                let Message::User(user) = message else {
+                    return None;
+                };
+                user.user_input_message
                     .user_input_message_context
                     .tool_results
-                    .is_empty(),
-            ),
-            Message::Assistant(_) => None,
-        })
-        .unwrap_or(false)
+                    .is_empty()
+                    .then_some(idx)
+            });
+        let relative_end = match next_turn {
+            Some(idx) => idx,
+            None if current_results.is_empty() => remaining.len(),
+            None => break,
+        };
+        if relative_end == 0 {
+            break;
+        }
+        let previous_prefix_len = prefix_len;
+        prefix_len += relative_end;
+        removed_item_bytes = removed_item_bytes.saturating_add(
+            history[previous_prefix_len..prefix_len]
+                .iter()
+                .map(json_len)
+                .sum::<usize>(),
+        );
+        estimated_bytes =
+            current_bytes.saturating_sub(json_array_prefix_reduction_from_item_bytes(
+                history.len(),
+                prefix_len,
+                removed_item_bytes,
+            ));
+    }
+
+    if prefix_len > 0 {
+        history.drain(0..prefix_len);
+    }
+    prefix_len
+}
+
+#[cfg(test)]
+fn json_array_prefix_reduction<T: Serialize>(items: &[T], prefix_len: usize) -> usize {
+    let prefix_len = prefix_len.min(items.len());
+    let item_bytes = items[..prefix_len].iter().map(json_len).sum::<usize>();
+    json_array_prefix_reduction_from_item_bytes(items.len(), prefix_len, item_bytes)
+}
+
+fn json_array_prefix_reduction_from_item_bytes(
+    item_count: usize,
+    prefix_len: usize,
+    item_bytes: usize,
+) -> usize {
+    let prefix_len = prefix_len.min(item_count);
+    let separators_before = item_count.saturating_sub(1);
+    let separators_after = item_count.saturating_sub(prefix_len).saturating_sub(1);
+    item_bytes.saturating_add(separators_before.saturating_sub(separators_after))
 }
 
 fn align_history_to_user(history: &mut Vec<Message>) -> usize {
@@ -3987,12 +4323,7 @@ struct RepairStats {
     renamed_duplicate_tool_uses: usize,
     removed_orphan_tool_results: usize,
     removed_duplicate_tool_results: usize,
-    textified_duplicate_tool_results: usize,
-    textified_orphan_tool_results: usize,
     removed_orphan_tool_uses: usize,
-    flattened_history_tool_uses: usize,
-    textified_history_tool_results: usize,
-    removed_history_tools: usize,
 }
 
 impl RepairStats {
@@ -4003,12 +4334,7 @@ impl RepairStats {
             || self.renamed_duplicate_tool_uses > 0
             || self.removed_orphan_tool_results > 0
             || self.removed_duplicate_tool_results > 0
-            || self.textified_duplicate_tool_results > 0
-            || self.textified_orphan_tool_results > 0
             || self.removed_orphan_tool_uses > 0
-            || self.flattened_history_tool_uses > 0
-            || self.textified_history_tool_results > 0
-            || self.removed_history_tools > 0
     }
 }
 
@@ -4028,14 +4354,11 @@ fn repair_request(request: &mut KiroRequest) -> RepairStats {
     stats.removed_duplicate_tool_results += dedupe_history_tool_results(history);
     let history_results = repair_orphan_tool_results(history);
     stats.removed_orphan_tool_results += history_results.removed_orphan_tool_results;
-    stats.textified_orphan_tool_results += history_results.textified_orphan_tool_results;
 
     let current_dedupe = dedupe_current_tool_results(current_user);
     stats.removed_duplicate_tool_results += current_dedupe.removed_duplicate_tool_results;
-    stats.textified_duplicate_tool_results += current_dedupe.textified_duplicate_tool_results;
     let current_results = repair_current_orphan_tool_results(history, current_user);
     stats.removed_orphan_tool_results += current_results.removed_orphan_tool_results;
-    stats.textified_orphan_tool_results += current_results.textified_orphan_tool_results;
 
     stats.removed_orphan_tool_uses += remove_unpaired_tool_uses(
         history,
@@ -4050,12 +4373,7 @@ fn add_repair_stats_to_report(report: &mut PayloadGuardReport, repair: RepairSta
     report.renamed_duplicate_tool_uses += repair.renamed_duplicate_tool_uses;
     report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
     report.removed_duplicate_tool_results += repair.removed_duplicate_tool_results;
-    report.textified_duplicate_tool_results += repair.textified_duplicate_tool_results;
-    report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
     report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
-    report.flattened_history_tool_uses += repair.flattened_history_tool_uses;
-    report.textified_history_tool_results += repair.textified_history_tool_results;
-    report.removed_history_tools += repair.removed_history_tools;
 }
 
 fn normalize_empty_tool_result_contents(history: &mut [Message]) -> usize {
@@ -4237,8 +4555,6 @@ fn dedupe_history_tool_results(history: &mut [Message]) -> usize {
                 .user_input_message
                 .user_input_message_context
                 .tool_results,
-            &mut user.user_input_message.content,
-            false,
         )
         .removed_duplicate_tool_results;
     }
@@ -4246,18 +4562,10 @@ fn dedupe_history_tool_results(history: &mut [Message]) -> usize {
 }
 
 fn dedupe_current_tool_results(user: &mut UserInputMessage) -> RepairStats {
-    dedupe_tool_results_keep_first(
-        &mut user.user_input_message_context.tool_results,
-        &mut user.content,
-        true,
-    )
+    dedupe_tool_results_keep_first(&mut user.user_input_message_context.tool_results)
 }
 
-fn dedupe_tool_results_keep_first(
-    results: &mut Vec<ToolResult>,
-    content: &mut String,
-    textify_duplicates: bool,
-) -> RepairStats {
+fn dedupe_tool_results_keep_first(results: &mut Vec<ToolResult>) -> RepairStats {
     let mut stats = RepairStats::default();
     if results.len() <= 1 {
         return stats;
@@ -4265,22 +4573,9 @@ fn dedupe_tool_results_keep_first(
 
     let original_len = results.len();
     let mut seen = HashSet::new();
-    let mut duplicate_text = Vec::new();
-    results.retain(|result| {
-        let keep = !result.tool_use_id.trim().is_empty() && seen.insert(result.tool_use_id.clone());
-        if !keep && textify_duplicates {
-            if let Some(text) = tool_result_to_text(result) {
-                duplicate_text.push(format!("[duplicate output]\n{}", text));
-            }
-        }
-        keep
-    });
+    results.retain(|result| seen.insert(result.tool_use_id.clone()));
 
     stats.removed_duplicate_tool_results += original_len.saturating_sub(results.len());
-    stats.textified_duplicate_tool_results += duplicate_text.len();
-    if !duplicate_text.is_empty() {
-        append_text(content, &duplicate_text.join("\n\n"));
-    }
     stats
 }
 
@@ -4294,7 +4589,6 @@ fn repair_orphan_tool_results(history: &mut [Message]) -> RepairStats {
         };
         let repaired = repair_user_tool_results(&valid_ids, &mut user.user_input_message);
         stats.removed_orphan_tool_results += repaired.removed_orphan_tool_results;
-        stats.textified_orphan_tool_results += repaired.textified_orphan_tool_results;
     }
     stats
 }
@@ -4337,20 +4631,10 @@ fn repair_tool_results(
     }
 
     let original_len = results.len();
-    let mut orphan_text = Vec::new();
-    results.retain(|result| {
-        let keep = valid_ids.contains(&result.tool_use_id);
-        if !keep {
-            if let Some(text) = tool_result_to_text(result) {
-                orphan_text.push(format!("[trimmed output]\n{}", text));
-            }
-        }
-        keep
-    });
+    results.retain(|result| valid_ids.contains(&result.tool_use_id));
     stats.removed_orphan_tool_results += original_len.saturating_sub(results.len());
-    stats.textified_orphan_tool_results += orphan_text.len();
-    if !orphan_text.is_empty() {
-        append_text(content, &orphan_text.join("\n\n"));
+    if original_len != results.len() && results.is_empty() && content.trim().is_empty() {
+        *content = EMPTY_USER_CONTENT_PLACEHOLDER.to_string();
     }
     stats
 }
@@ -4373,125 +4657,6 @@ fn remove_unpaired_tool_uses(history: &mut [Message], current_results: &[ToolRes
         }
     }
     removed
-}
-
-fn flatten_completed_history_tool_turns(
-    history: &mut [Message],
-    current_results: &[ToolResult],
-) -> RepairStats {
-    let current_result_ids = collect_tool_result_ids(current_results);
-    let active_idx = active_history_tool_turn_index(history, &current_result_ids);
-    let tool_names = collect_history_tool_names(history);
-    let mut stats = RepairStats::default();
-
-    for (idx, message) in history.iter_mut().enumerate() {
-        match message {
-            Message::Assistant(assistant) => {
-                if active_idx == Some(idx) {
-                    continue;
-                }
-                if let Some(tool_uses) = assistant.assistant_response_message.tool_uses.take() {
-                    stats.flattened_history_tool_uses += tool_uses.len();
-                }
-            }
-            Message::User(user) => {
-                let context = &mut user.user_input_message.user_input_message_context;
-                if !context.tool_results.is_empty() {
-                    let result_count = context.tool_results.len();
-                    if let Some(text) = narrate_tool_results(&context.tool_results, &tool_names) {
-                        append_text(&mut user.user_input_message.content, &text);
-                        stats.textified_history_tool_results += result_count;
-                    }
-                    context.tool_results.clear();
-                }
-                if !context.tools.is_empty() {
-                    stats.removed_history_tools += context.tools.len();
-                    context.tools.clear();
-                }
-            }
-        }
-    }
-
-    stats
-}
-
-fn collect_tool_result_ids(results: &[ToolResult]) -> HashSet<String> {
-    results
-        .iter()
-        .filter_map(|result| {
-            let id = result.tool_use_id.trim();
-            (!id.is_empty()).then(|| id.to_string())
-        })
-        .collect()
-}
-
-fn active_history_tool_turn_index(
-    history: &[Message],
-    current_result_ids: &HashSet<String>,
-) -> Option<usize> {
-    if current_result_ids.is_empty() {
-        return None;
-    }
-
-    let idx = history.len().checked_sub(1)?;
-    let Message::Assistant(assistant) = &history[idx] else {
-        return None;
-    };
-    let tool_uses = assistant
-        .assistant_response_message
-        .tool_uses
-        .as_deref()
-        .filter(|tool_uses| !tool_uses.is_empty())?;
-
-    tool_uses
-        .iter()
-        .all(|tool_use| current_result_ids.contains(tool_use.tool_use_id.trim()))
-        .then_some(idx)
-}
-
-fn collect_history_tool_names(history: &[Message]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    for message in history {
-        let Message::Assistant(assistant) = message else {
-            continue;
-        };
-        let Some(tool_uses) = &assistant.assistant_response_message.tool_uses else {
-            continue;
-        };
-        for tool_use in tool_uses {
-            let id = tool_use.tool_use_id.trim();
-            let name = tool_use.name.trim();
-            if !id.is_empty() && !name.is_empty() {
-                names.insert(id.to_string(), name.to_string());
-            }
-        }
-    }
-    names
-}
-
-fn narrate_tool_results(
-    results: &[ToolResult],
-    tool_names: &HashMap<String, String>,
-) -> Option<String> {
-    let mut parts = Vec::new();
-    for result in results {
-        let body = tool_result_to_text(result)
-            .unwrap_or_else(|| EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER.to_string());
-        let id = result.tool_use_id.trim();
-        let label = tool_names
-            .get(id)
-            .cloned()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| "output".to_string());
-        let status = if result.is_error || result.status.as_deref() == Some("error") {
-            " error"
-        } else {
-            ""
-        };
-        parts.push(format!("{}{}: {}", label, status, body));
-    }
-
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn previous_assistant_tool_use_ids(history: &[Message], idx: usize) -> HashSet<String> {
@@ -4547,24 +4712,6 @@ fn assistant_tool_use_ids(message: Option<&Message>) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn tool_result_to_text(result: &ToolResult) -> Option<String> {
-    let mut parts = Vec::new();
-    for item in &result.content {
-        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
-            if !text.is_empty() {
-                parts.push(text.to_string());
-            }
-        } else if !item.is_empty() {
-            parts.push(serde_json::Value::Object(item.clone()).to_string());
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
-}
-
 fn append_text(content: &mut String, text: &str) {
     if text.is_empty() {
         return;
@@ -4582,7 +4729,7 @@ mod tests {
     use super::*;
     use crate::kiro::model::requests::conversation::{
         AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-        HistoryUserMessage, KiroImage, UserInputMessage, UserInputMessageContext,
+        HistoryUserMessage, KiroImage, ReasoningContent, UserInputMessage, UserInputMessageContext,
     };
     use crate::kiro::model::requests::tool::{
         InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -4644,6 +4791,18 @@ mod tests {
         }
     }
 
+    fn base64_zeros_for_decoded_bytes(decoded_bytes: usize) -> String {
+        let complete_groups = decoded_bytes / 3;
+        let remainder = decoded_bytes % 3;
+        let mut encoded = "A".repeat(complete_groups.saturating_mul(4));
+        match remainder {
+            1 => encoded.push_str("AA=="),
+            2 => encoded.push_str("AAA="),
+            _ => {}
+        }
+        encoded
+    }
+
     fn guard_config_with_shaping(
         max_bytes: usize,
         trim_history: bool,
@@ -4662,6 +4821,36 @@ mod tests {
             .get("text")
             .and_then(|value| value.as_str())
             .expect("tool result text")
+    }
+
+    fn assert_structured_history_tool_turn(
+        history: &[Message],
+        assistant_idx: usize,
+        result_idx: usize,
+        expected_id: &str,
+        expected_result: &str,
+    ) {
+        let Message::Assistant(assistant) = &history[assistant_idx] else {
+            panic!("expected assistant at history index {assistant_idx}");
+        };
+        let tool_uses = assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("expected structured tool use");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, expected_id);
+
+        let Message::User(user) = &history[result_idx] else {
+            panic!("expected user at history index {result_idx}");
+        };
+        let tool_results = &user
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].tool_use_id, expected_id);
+        assert_eq!(tool_result_text(&tool_results[0]), expected_result);
     }
 
     #[test]
@@ -4703,6 +4892,252 @@ mod tests {
         assert!(serialized.contains("bodySha256"));
         assert!(!serialized.contains("current user content"));
         assert!(!serialized.contains(&body));
+    }
+
+    #[test]
+    fn clean_anthropic_raw_body_is_zero_copy_and_byte_identical_for_one_hundred_rounds() {
+        for content_bytes in [1_024usize, 100 * 1_024, 1_024 * 1_024, 5 * 1_024 * 1_024] {
+            let content = "x".repeat(content_bytes);
+            let raw = Bytes::from(format!(
+                "{{\n  \"futureField\": {{\"preserve\": true}},\n  \"model\": \"claude-sonnet-4-6\",\n  \"max_tokens\": 128,\n  \"messages\": [{{\"role\":\"user\",\"content\":{}}}],\n  \"stream\": false\n}}\n",
+                serde_json::to_string(&content).unwrap()
+            ));
+            let parsed = serde_json::from_slice::<MessagesRequest>(&raw).unwrap();
+
+            for round in 0..100 {
+                let mut request = parsed.clone();
+                let (guarded, report) = guard_anthropic_messages_request_reusing_body(
+                    &mut request,
+                    guard_config(raw.len() + 1),
+                    &raw,
+                )
+                .expect("clean raw body should pass without serialization");
+
+                assert_eq!(guarded, raw, "content_bytes={content_bytes}, round={round}");
+                assert_eq!(
+                    guarded.as_ptr(),
+                    raw.as_ptr(),
+                    "clean raw Bytes must share the original allocation: content_bytes={content_bytes}, round={round}"
+                );
+                assert_eq!(report.guard_serializations, 0);
+                assert_eq!(report.history_trim_passes, 0);
+                assert!(!report.was_modified());
+                assert_eq!(report.original_bytes, raw.len());
+                assert_eq!(report.final_bytes, raw.len());
+                assert_eq!(
+                    report.body_sha256.as_deref(),
+                    Some(sha256_hex_bytes(&raw).as_str())
+                );
+                assert!(
+                    std::str::from_utf8(&guarded)
+                        .unwrap()
+                        .contains("futureField")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clean_kiro_guard_serializes_once_and_is_stable_for_one_hundred_rounds() {
+        for content_bytes in [1_024usize, 100 * 1_024, 1_024 * 1_024, 5 * 1_024 * 1_024] {
+            let mut template = request_with_history(Vec::new());
+            template
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content = "x".repeat(content_bytes);
+            let expected = serialize_kiro_request(&template).expect("baseline Kiro serialization");
+
+            for round in 0..100 {
+                let mut request = template.clone();
+                let (body, report) = guard_kiro_request(
+                    &mut request,
+                    guard_config(expected.len().saturating_add(1)),
+                )
+                .expect("clean Kiro guard");
+
+                assert_eq!(
+                    body, expected,
+                    "content_bytes={content_bytes}, round={round}"
+                );
+                assert_eq!(
+                    report.guard_serializations, 1,
+                    "clean Kiro guard must not perform a redundant second full serialization: content_bytes={content_bytes}, round={round}"
+                );
+                assert_eq!(report.history_trim_passes, 0);
+                assert!(!report.was_modified());
+                assert!(!report.still_oversized);
+            }
+        }
+    }
+
+    #[test]
+    fn leading_assistant_repair_is_batched_and_stable_for_five_rounds() {
+        for entries in [1_000usize, 4_000, 16_000] {
+            let messages = (0..entries)
+                .map(|index| {
+                    anthropic_message(
+                        "assistant",
+                        serde_json::json!({"type": "text", "text": format!("assistant-{index}")}),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let template = anthropic_request(messages);
+            let raw = Bytes::from(serde_json::to_vec(&template).expect("raw leading history"));
+
+            for round in 0..5 {
+                let mut request = template.clone();
+                let (_body, report) = guard_anthropic_messages_request_reusing_body(
+                    &mut request,
+                    guard_config(raw.len().saturating_add(1)),
+                    &raw,
+                )
+                .expect("batch leading-assistant repair");
+
+                assert_eq!(
+                    request.messages.len(),
+                    1,
+                    "entries={entries}, round={round}"
+                );
+                assert_eq!(
+                    report.aligned_leading_entries,
+                    entries - 1,
+                    "entries={entries}, round={round}"
+                );
+                assert_eq!(report.guard_serializations, 1);
+                assert_eq!(report.history_trim_passes, 0);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run in release as an isolated clean/dirty payload size and serialization probe"]
+    fn payload_guard_release_size_matrix_probe() {
+        fn percentile(sorted: &[u128], percentile: usize) -> u128 {
+            let index = ((sorted.len() * percentile).saturating_sub(1) / 100).min(sorted.len() - 1);
+            sorted[index]
+        }
+
+        fn dirty_request(content_bytes: usize) -> MessagesRequest {
+            anthropic_request(vec![
+                anthropic_message("user", Value::String("x".repeat(content_bytes))),
+                anthropic_message(
+                    "assistant",
+                    serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "tool-valid",
+                        "name": "Bash",
+                        "input": {"command": "true"}
+                    }]),
+                ),
+                anthropic_message(
+                    "user",
+                    serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-valid", "content": "valid"},
+                        {"type": "tool_result", "tool_use_id": "tool-valid", "content": "duplicate-marker"},
+                        {"type": "tool_result", "tool_use_id": "tool-orphan", "content": "orphan-marker"},
+                        {"type": "text", "text": "current"}
+                    ]),
+                ),
+            ])
+        }
+
+        const SIZES: [usize; 4] = [1 << 10, 100 << 10, 1 << 20, 5 << 20];
+        const ROUNDS: usize = 5;
+
+        for content_bytes in SIZES {
+            for mode in ["clean_anthropic", "dirty_anthropic", "clean_kiro"] {
+                let (anthropic_template, raw, kiro_template) = match mode {
+                    "clean_anthropic" => {
+                        let request = anthropic_request(vec![anthropic_message(
+                            "user",
+                            Value::String("x".repeat(content_bytes)),
+                        )]);
+                        let raw = Bytes::from(format!(
+                            " {{\n  \"future_field\" : true,\n  \"model\" : \"claude-sonnet-4-6\",\n  \"max_tokens\" : 128,\n  \"messages\" : [{{\"role\":\"user\",\"content\":{}}}],\n  \"stream\" : false\n }} ",
+                            serde_json::to_string(&"x".repeat(content_bytes)).unwrap()
+                        ));
+                        (Some(request), Some(raw), None)
+                    }
+                    "dirty_anthropic" => {
+                        let request = dirty_request(content_bytes);
+                        let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+                        (Some(request), Some(raw), None)
+                    }
+                    "clean_kiro" => {
+                        let mut request = request_with_history(Vec::new());
+                        request
+                            .conversation_state
+                            .current_message
+                            .user_input_message
+                            .content = "x".repeat(content_bytes);
+                        (None, None, Some(request))
+                    }
+                    _ => unreachable!(),
+                };
+                let input_bytes = raw
+                    .as_ref()
+                    .map(Bytes::len)
+                    .or_else(|| {
+                        kiro_template
+                            .as_ref()
+                            .map(|request| serialize_kiro_request(request).unwrap().len())
+                    })
+                    .unwrap();
+                let mut latencies_us = Vec::with_capacity(ROUNDS);
+                let mut observed_serializations = Vec::with_capacity(ROUNDS);
+
+                for round in 0..ROUNDS {
+                    let started = Instant::now();
+                    let report = if let (Some(template), Some(raw)) =
+                        (anthropic_template.as_ref(), raw.as_ref())
+                    {
+                        let mut request = template.clone();
+                        let (body, report) = guard_anthropic_messages_request_reusing_body(
+                            &mut request,
+                            guard_config(raw.len().saturating_add(1)),
+                            raw,
+                        )
+                        .expect("Anthropic perf probe");
+                        if mode == "clean_anthropic" {
+                            assert_eq!(body, *raw, "round {round}");
+                            assert_eq!(body.as_ptr(), raw.as_ptr(), "round {round}");
+                            assert_eq!(report.guard_serializations, 0, "round {round}");
+                        } else {
+                            assert!(report.was_modified(), "round {round}");
+                            assert_eq!(report.guard_serializations, 1, "round {round}");
+                            assert!(!body.windows(16).any(|window| window == b"duplicate-marker"));
+                            assert!(!body.windows(13).any(|window| window == b"orphan-marker"));
+                        }
+                        report
+                    } else {
+                        let mut request = kiro_template.as_ref().unwrap().clone();
+                        let (body, report) = guard_kiro_request(
+                            &mut request,
+                            guard_config(input_bytes.saturating_add(1)),
+                        )
+                        .expect("Kiro perf probe");
+                        assert_eq!(body.len(), input_bytes, "round {round}");
+                        assert_eq!(report.guard_serializations, 1, "round {round}");
+                        report
+                    };
+                    latencies_us.push(started.elapsed().as_micros());
+                    observed_serializations.push(report.guard_serializations);
+                }
+
+                latencies_us.sort_unstable();
+                println!(
+                    "PAYLOAD_GUARD_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} serializations={:?}",
+                    mode,
+                    input_bytes,
+                    ROUNDS,
+                    percentile(&latencies_us, 50),
+                    percentile(&latencies_us, 95),
+                    percentile(&latencies_us, 99),
+                    observed_serializations,
+                );
+            }
+        }
     }
 
     #[test]
@@ -4776,6 +5211,319 @@ mod tests {
     }
 
     #[test]
+    fn kiro_history_trim_removes_a_complete_logical_tool_turn_atomically() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("calling")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-old", "Bash")]),
+        };
+        let mut result = HistoryUserMessage::new("tool result envelope", TEST_MODEL);
+        result.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-old", "secret old output")]);
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("old prompt", TEST_MODEL)),
+            Message::Assistant(assistant),
+            Message::User(result),
+            Message::Assistant(HistoryAssistantMessage::new("old final")),
+            Message::User(HistoryUserMessage::new("next prompt", TEST_MODEL)),
+            Message::Assistant(HistoryAssistantMessage::new("next answer")),
+        ];
+
+        let current_bytes = json_len(&history);
+        let target_bytes = current_bytes.saturating_sub(json_array_prefix_reduction(&history, 4));
+        let removed =
+            trim_history_to_estimated_budget(&mut history, &[], current_bytes, target_bytes);
+
+        assert_eq!(removed, 4);
+        assert_eq!(history.len(), 2);
+        let Message::User(first) = &history[0] else {
+            panic!("next logical turn must start with its user prompt");
+        };
+        assert_eq!(first.user_input_message.content, "next prompt");
+        let serialized = serde_json::to_string(&history).unwrap();
+        assert!(!serialized.contains("old prompt"));
+        assert!(!serialized.contains("secret old output"));
+        assert!(!serialized.contains("old final"));
+    }
+
+    #[test]
+    fn kiro_history_trim_preserves_the_active_current_tool_result_pair() {
+        let active_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("calling")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-active", "Bash")]),
+        };
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new("active prompt", TEST_MODEL)),
+            Message::Assistant(active_assistant),
+        ];
+        let current_results = vec![ToolResult::success("tool-active", "active output")];
+
+        let current_bytes = json_len(&history);
+        assert_eq!(
+            trim_history_to_estimated_budget(&mut history, &current_results, current_bytes, 0),
+            0
+        );
+        assert_eq!(history.len(), 2);
+
+        let mut request = request_with_history(history);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context =
+            UserInputMessageContext::new().with_tool_results(current_results);
+        let (_body, report) = guard_kiro_request(&mut request, guard_config(1)).expect("guard");
+        assert_eq!(report.trimmed_history_entries, 0);
+        assert_eq!(report.removed_orphan_tool_results, 0);
+        assert_eq!(report.removed_orphan_tool_uses, 0);
+        assert!(report.still_oversized);
+        assert_eq!(request.conversation_state.history.len(), 2);
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn anthropic_history_trim_removes_a_complete_logical_tool_turn_atomically() {
+        let mut messages = vec![
+            anthropic_message("user", serde_json::json!("old prompt")),
+            anthropic_message(
+                "assistant",
+                serde_json::json!([
+                    {"type": "text", "text": "calling"},
+                    {"type": "tool_use", "id": "tool-old", "name": "Bash", "input": {}}
+                ]),
+            ),
+            anthropic_message(
+                "user",
+                serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-old",
+                    "content": "secret old output"
+                }]),
+            ),
+            anthropic_message("assistant", serde_json::json!("old final")),
+            anthropic_message("user", serde_json::json!("next prompt")),
+        ];
+
+        let current_bytes = json_len(&messages);
+        let target_bytes = current_bytes.saturating_sub(json_array_prefix_reduction(&messages, 4));
+        let removed =
+            trim_anthropic_history_to_estimated_budget(&mut messages, current_bytes, target_bytes);
+
+        assert_eq!(removed, 4);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, serde_json::json!("next prompt"));
+    }
+
+    #[test]
+    fn anthropic_history_trim_preserves_an_active_tool_result_pair() {
+        let mut messages = vec![
+            anthropic_message("user", serde_json::json!("active prompt")),
+            anthropic_message(
+                "assistant",
+                serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "tool-active",
+                    "name": "Bash",
+                    "input": {}
+                }]),
+            ),
+            anthropic_message(
+                "user",
+                serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-active",
+                    "content": "active output"
+                }]),
+            ),
+        ];
+        let original = serde_json::to_value(&messages).unwrap();
+
+        let current_bytes = json_len(&messages);
+        assert_eq!(
+            trim_anthropic_history_to_estimated_budget(&mut messages, current_bytes, 0),
+            0
+        );
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    #[test]
+    fn anthropic_history_batch_trim_matches_exact_json_reduction() {
+        let mut messages = Vec::new();
+        for idx in 0..200 {
+            messages.push(anthropic_message(
+                "user",
+                serde_json::json!(format!("history-{idx}-{}", "x".repeat(128))),
+            ));
+            messages.push(anthropic_message(
+                "assistant",
+                serde_json::json!([{
+                    "type": "text",
+                    "text": format!("answer-{idx}-{}", "y".repeat(128)),
+                }]),
+            ));
+        }
+        messages.push(anthropic_message("user", serde_json::json!("current")));
+
+        let before = serde_json::to_vec(&messages).unwrap().len();
+        let expected_prefix = 300usize;
+        let expected_reduction = json_array_prefix_reduction(&messages, expected_prefix);
+        let target = before.saturating_sub(expected_reduction);
+        let removed = trim_anthropic_history_to_estimated_budget(&mut messages, before, target);
+        let after = serde_json::to_vec(&messages).unwrap().len();
+
+        assert_eq!(removed, expected_prefix);
+        assert_eq!(before.saturating_sub(after), expected_reduction);
+        assert_eq!(after, target);
+        assert_eq!(
+            messages.last().unwrap().content,
+            serde_json::json!("current")
+        );
+        assert_eq!(messages.first().unwrap().role, "user");
+    }
+
+    #[test]
+    fn kiro_history_batch_trim_matches_exact_json_reduction() {
+        let mut history = Vec::new();
+        for idx in 0..200 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("history-{idx}-{}", "x".repeat(128)),
+                TEST_MODEL,
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "answer-{idx}-{}",
+                "y".repeat(128)
+            ))));
+        }
+
+        let before = serde_json::to_vec(&history).unwrap().len();
+        let expected_prefix = 300usize;
+        let expected_reduction = json_array_prefix_reduction(&history, expected_prefix);
+        let target = before.saturating_sub(expected_reduction);
+        let removed = trim_history_to_estimated_budget(&mut history, &[], before, target);
+        let after = serde_json::to_vec(&history).unwrap().len();
+
+        assert_eq!(removed, expected_prefix);
+        assert_eq!(before.saturating_sub(after), expected_reduction);
+        assert_eq!(after, target);
+        assert!(matches!(history.first(), Some(Message::User(_))));
+    }
+
+    #[test]
+    fn anthropic_guard_large_history_uses_one_trim_pass_and_constant_serializations() {
+        let mut messages = Vec::new();
+        for idx in 0..1_000 {
+            messages.push(anthropic_message(
+                "user",
+                serde_json::json!(format!("history-{idx}-{}", "x".repeat(256))),
+            ));
+            messages.push(anthropic_message(
+                "assistant",
+                serde_json::json!([{
+                    "type": "text",
+                    "text": format!("answer-{idx}-{}", "y".repeat(256)),
+                }]),
+            ));
+        }
+        messages.push(anthropic_message("user", serde_json::json!("current")));
+        let mut request = anthropic_request(messages);
+        let original = serde_json::to_vec(&request).unwrap();
+
+        let (body, report) =
+            guard_anthropic_messages_request(&mut request, guard_config(40_000), original.len())
+                .expect("large Anthropic history should be trimmed in one batch");
+
+        assert!(body.len() <= 40_000);
+        assert_eq!(report.history_trim_passes, 1);
+        assert!(report.guard_serializations <= 2, "report={report:?}");
+        assert!(report.trimmed_history_entries > 1_000);
+        assert_eq!(
+            request.messages.last().unwrap().content,
+            serde_json::json!("current")
+        );
+    }
+
+    #[test]
+    fn kiro_guard_large_history_uses_one_trim_pass_and_constant_serializations() {
+        let mut history = Vec::new();
+        for idx in 0..1_000 {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("history-{idx}-{}", "x".repeat(256)),
+                TEST_MODEL,
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "answer-{idx}-{}",
+                "y".repeat(256)
+            ))));
+        }
+        let mut request = request_with_history(history);
+
+        let (body, report) = guard_kiro_request(&mut request, guard_config(40_000))
+            .expect("large Kiro history should be trimmed in one batch");
+
+        assert!(body.len() <= 40_000);
+        assert_eq!(report.history_trim_passes, 1);
+        assert!(report.guard_serializations <= 3, "report={report:?}");
+        assert!(report.trimmed_history_entries > 1_000);
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "current"
+        );
+    }
+
+    #[test]
+    fn anthropic_guard_keeps_first_valid_result_and_drops_duplicate_and_orphan_content() {
+        let messages = vec![
+            anthropic_message("user", serde_json::json!("run")),
+            anthropic_message(
+                "assistant",
+                serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "Bash",
+                    "input": {}
+                }]),
+            ),
+            anthropic_message(
+                "user",
+                serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "first valid output"},
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "duplicate secret output"},
+                    {"type": "tool_result", "tool_use_id": "tool-orphan", "content": "orphan secret output"},
+                    {"type": "text", "text": "safe user text"}
+                ]),
+            ),
+        ];
+        let mut request = anthropic_request(messages);
+        let original_len = serde_json::to_vec(&request).unwrap().len();
+
+        let (body, report) =
+            guard_anthropic_messages_request(&mut request, guard_config(usize::MAX), original_len)
+                .expect("guard");
+
+        assert_eq!(report.removed_duplicate_tool_results, 1);
+        assert_eq!(report.removed_orphan_tool_results, 1);
+        assert_eq!(report.textified_duplicate_tool_results, 0);
+        assert_eq!(report.textified_orphan_tool_results, 0);
+        let serialized = body;
+        assert!(serialized.contains("first valid output"));
+        assert!(serialized.contains("safe user text"));
+        assert!(!serialized.contains("duplicate secret output"));
+        assert!(!serialized.contains("orphan secret output"));
+    }
+
+    #[test]
     fn guard_repairs_orphan_tool_results_after_trim() {
         let assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("tool call")
@@ -4798,23 +5546,21 @@ mod tests {
             .expect("guard should repair");
 
         assert_eq!(report.removed_orphan_tool_results, 1);
-        assert_eq!(report.flattened_history_tool_uses, 1);
-        assert_eq!(report.textified_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            1,
+            2,
+            "tool-1",
+            "valid result",
+        );
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected user");
         };
-        assert!(
-            user.user_input_message
-                .user_input_message_context
-                .tool_results
-                .is_empty()
-        );
-        assert!(
-            user.user_input_message
-                .content
-                .contains("readFile: valid result")
-        );
-        assert!(user.user_input_message.content.contains("orphan result"));
+        assert_eq!(user.user_input_message.content, "result message");
+        assert!(!user.user_input_message.content.contains("orphan result"));
+        assert!(!user.user_input_message.content.contains("valid result"));
     }
 
     #[test]
@@ -4837,22 +5583,15 @@ mod tests {
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_orphan_tool_results, 0);
-        assert_eq!(report.flattened_history_tool_uses, 1);
-        assert_eq!(report.textified_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
         assert!(body.contains(EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER));
-        let Message::User(user) = &request.conversation_state.history[2] else {
-            panic!("expected user");
-        };
-        assert!(
-            user.user_input_message
-                .user_input_message_context
-                .tool_results
-                .is_empty()
-        );
-        assert!(
-            user.user_input_message
-                .content
-                .contains(EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER)
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            1,
+            2,
+            "tool-1",
+            EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER,
         );
     }
 
@@ -4890,7 +5629,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_flattens_completed_history_tool_cycles_for_plain_current_message() {
+    fn guard_preserves_completed_history_tool_cycles_for_plain_current_message() {
         let first_assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("running build")
                 .with_tool_uses(vec![ToolUseEntry::new("tool-1", "exec_command")]),
@@ -4924,40 +5663,32 @@ mod tests {
         let (_body, report) =
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
-        assert_eq!(report.flattened_history_tool_uses, 2);
-        assert_eq!(report.textified_history_tool_results, 2);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
         assert_eq!(report.removed_orphan_tool_uses, 0);
         assert_eq!(report.removed_orphan_tool_results, 0);
-
-        let mut combined_history = String::new();
-        for message in &request.conversation_state.history {
-            match message {
-                Message::Assistant(assistant) => {
-                    assert!(assistant.assistant_response_message.tool_uses.is_none());
-                    assert!(
-                        !assistant
-                            .assistant_response_message
-                            .content
-                            .contains("[Called tool")
-                    );
-                    combined_history.push_str(&assistant.assistant_response_message.content);
-                    combined_history.push('\n');
-                }
-                Message::User(user) => {
-                    assert!(
-                        user.user_input_message
-                            .user_input_message_context
-                            .tool_results
-                            .is_empty()
-                    );
-                    combined_history.push_str(&user.user_input_message.content);
-                    combined_history.push('\n');
-                }
-            }
-        }
-
-        assert!(combined_history.contains("exec_command: build ok"));
-        assert!(combined_history.contains("exec_command: tests pass"));
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            1,
+            2,
+            "tool-1",
+            "build ok",
+        );
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            3,
+            4,
+            "tool-2",
+            "tests pass",
+        );
+        let Message::User(first_result) = &request.conversation_state.history[2] else {
+            panic!("expected first result user");
+        };
+        let Message::User(second_result) = &request.conversation_state.history[4] else {
+            panic!("expected second result user");
+        };
+        assert!(first_result.user_input_message.content.is_empty());
+        assert!(second_result.user_input_message.content.is_empty());
         assert!(
             request
                 .conversation_state
@@ -4970,7 +5701,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_keeps_only_active_current_tool_turn_structured() {
+    fn guard_preserves_completed_and_active_current_tool_turns() {
         let completed_assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("first")
                 .with_tool_uses(vec![ToolUseEntry::new("tool-old", "readFile")]),
@@ -4999,17 +5730,14 @@ mod tests {
         let (_body, report) =
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
-        assert_eq!(report.flattened_history_tool_uses, 1);
-        assert_eq!(report.textified_history_tool_results, 1);
-
-        let Message::Assistant(first_assistant) = &request.conversation_state.history[1] else {
-            panic!("expected completed assistant");
-        };
-        assert!(
-            first_assistant
-                .assistant_response_message
-                .tool_uses
-                .is_none()
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            1,
+            2,
+            "tool-old",
+            "old content",
         );
 
         let Message::Assistant(active_assistant) =
@@ -5105,23 +5833,38 @@ mod tests {
         assert_eq!(report.renamed_duplicate_tool_uses, 1);
         assert_eq!(report.removed_orphan_tool_uses, 0);
         assert_eq!(report.removed_orphan_tool_results, 0);
-        assert_eq!(report.flattened_history_tool_uses, 2);
-        assert_eq!(report.textified_history_tool_results, 2);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            1,
+            2,
+            "tool-1",
+            "first content",
+        );
 
         let Message::Assistant(assistant) = &request.conversation_state.history[3] else {
             panic!("expected second assistant");
         };
-        assert!(assistant.assistant_response_message.tool_uses.is_none());
+        let renamed_id = assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("second structured tool use")[0]
+            .tool_use_id
+            .clone();
+        assert_ne!(renamed_id, "tool-1");
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            3,
+            4,
+            &renamed_id,
+            "second content",
+        );
         let Message::User(user) = &request.conversation_state.history[4] else {
             panic!("expected second result user");
         };
-        assert!(
-            user.user_input_message
-                .user_input_message_context
-                .tool_results
-                .is_empty()
-        );
-        assert!(user.user_input_message.content.contains("second content"));
+        assert_eq!(user.user_input_message.content, "second result");
     }
 
     #[test]
@@ -5154,8 +5897,15 @@ mod tests {
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.renamed_duplicate_tool_uses, 1);
-        assert_eq!(report.flattened_history_tool_uses, 1);
-        assert_eq!(report.textified_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
+        assert_structured_history_tool_turn(
+            &request.conversation_state.history,
+            1,
+            2,
+            "tool-1",
+            "first content",
+        );
         let Message::Assistant(assistant) = request.conversation_state.history.last().unwrap()
         else {
             panic!("expected last assistant");
@@ -5179,7 +5929,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_textifies_duplicate_current_tool_results() {
+    fn guard_drops_duplicate_current_tool_results_without_textifying() {
         let assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("tool call").with_tool_uses(vec![
                 ToolUseEntry::new("tool-1", "readFile"),
@@ -5204,13 +5954,52 @@ mod tests {
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_duplicate_tool_results, 1);
-        assert_eq!(report.textified_duplicate_tool_results, 1);
+        assert_eq!(report.textified_duplicate_tool_results, 0);
         let current = &request
             .conversation_state
             .current_message
             .user_input_message;
         assert_eq!(current.user_input_message_context.tool_results.len(), 2);
-        assert!(current.content.contains("duplicate result"));
+        assert_eq!(
+            tool_result_text(&current.user_input_message_context.tool_results[0]),
+            "first result"
+        );
+        assert!(!current.content.contains("duplicate result"));
+    }
+
+    #[test]
+    fn guard_counts_empty_tool_result_id_as_orphan_without_exposing_content() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
+        };
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read", TEST_MODEL)),
+            Message::Assistant(assistant),
+        ]);
+        let current = &mut request
+            .conversation_state
+            .current_message
+            .user_input_message;
+        current.content = "safe current text".to_string();
+        current.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("", "empty-id secret result")]);
+
+        let (body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.removed_orphan_tool_results, 1);
+        assert_eq!(report.removed_duplicate_tool_results, 0);
+        assert_eq!(report.textified_orphan_tool_results, 0);
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "safe current text"
+        );
+        assert!(!body.contains("empty-id secret result"));
     }
 
     #[test]
@@ -5240,6 +6029,7 @@ mod tests {
             assistant_response_message: AssistantMessage {
                 content: "empty tools".to_string(),
                 tool_uses: Some(Vec::new()),
+                reasoning_content: None,
             },
         };
         let mut request = request_with_history(vec![
@@ -5274,6 +6064,454 @@ mod tests {
             panic!("expected assistant");
         };
         assert!(assistant.assistant_response_message.tool_uses.is_none());
+    }
+
+    #[test]
+    fn guard_zero_max_bytes_preserves_multi_turn_structured_tool_history() {
+        const TOOL_CYCLES: usize = 12;
+        let mut history = vec![Message::User(HistoryUserMessage::new(
+            "run all checks",
+            TEST_MODEL,
+        ))];
+        for idx in 0..TOOL_CYCLES {
+            let tool_use_id = format!("tool-{idx}");
+            history.push(Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new(format!("running check {idx}"))
+                    .with_tool_uses(vec![ToolUseEntry::new(tool_use_id.clone(), "exec_command")]),
+            }));
+            let mut result = HistoryUserMessage::new(format!("result turn {idx}"), TEST_MODEL);
+            result.user_input_message.user_input_message_context = UserInputMessageContext::new()
+                .with_tool_results(vec![ToolResult::success(
+                    tool_use_id,
+                    format!("check {idx} passed"),
+                )]);
+            history.push(Message::User(result));
+        }
+
+        let mut request = request_with_history(history);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = "summarize the checks".to_string();
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: 0,
+                trim_history: true,
+                shaping: PayloadShapingConfig::default(),
+            },
+        )
+        .expect("zero max bytes should preserve valid structured history");
+
+        assert_eq!(report.max_bytes, 0);
+        assert_eq!(report.trimmed_history_entries, 0);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
+        assert!(!report.still_oversized);
+        assert_eq!(
+            request.conversation_state.history.len(),
+            1 + TOOL_CYCLES * 2
+        );
+
+        let serialized: Value = serde_json::from_str(&body).expect("serialized Kiro request");
+        let serialized_history = serialized["conversationState"]["history"]
+            .as_array()
+            .expect("serialized history");
+        for idx in 0..TOOL_CYCLES {
+            let assistant_idx = 1 + idx * 2;
+            let result_idx = assistant_idx + 1;
+            let tool_use_id = format!("tool-{idx}");
+            let result_text = format!("check {idx} passed");
+            assert_structured_history_tool_turn(
+                &request.conversation_state.history,
+                assistant_idx,
+                result_idx,
+                &tool_use_id,
+                &result_text,
+            );
+            assert!(
+                serialized_history[assistant_idx]["assistantResponseMessage"]["toolUses"]
+                    .is_array()
+            );
+            assert!(
+                serialized_history[result_idx]["userInputMessage"]["userInputMessageContext"]
+                    ["toolResults"]
+                    .is_array()
+            );
+        }
+
+        let breakdown = breakdown_kiro_request(&request, &body);
+        assert_eq!(breakdown.history_tool_use_count, TOOL_CYCLES);
+        assert_eq!(breakdown.history_tool_result_count, TOOL_CYCLES);
+    }
+
+    #[test]
+    fn converted_twelve_cycle_bash_history_stays_structured_without_transcript_text() {
+        const TOOL_CYCLES: usize = 12;
+        let mut messages = vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("run checks"),
+        }];
+        for idx in 0..TOOL_CYCLES {
+            let tool_use_id = format!("toolu_{idx}");
+            messages.push(AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": format!("running {idx}")},
+                    {"type": "tool_use", "id": tool_use_id, "name": "Bash", "input": {"command": format!("check-{idx}")}}
+                ]),
+            });
+            messages.push(AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": format!("result-{idx}")
+                }]),
+            });
+        }
+        messages.push(AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!("checks complete"),
+        });
+        messages.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("summarize"),
+        });
+
+        let mut input_schema = std::collections::HashMap::new();
+        input_schema.insert("type".to_string(), serde_json::json!("object"));
+        input_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({"command": {"type": "string"}}),
+        );
+        let anthropic = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages,
+            system: None,
+            stream: true,
+            tools: Some(vec![AnthropicTool {
+                name: "Bash".to_string(),
+                description: "run a command".to_string(),
+                input_schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+        let converted = crate::anthropic::converter::convert_request(&anthropic).expect("convert");
+        let mapped_bash = converted
+            .tool_name_map
+            .iter()
+            .find_map(|(mapped, original)| (original == "Bash").then(|| mapped.clone()))
+            .expect("mapped Bash name");
+        let mut request = KiroRequest {
+            conversation_state: converted.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: converted.additional_model_request_fields,
+            tool_cache_point_insert_after: converted.tool_cache_point_insert_after,
+            cache_point_plan_recording_enabled: converted.cache_point_plan_recording_enabled,
+        };
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: 0,
+                trim_history: true,
+                shaping: PayloadShapingConfig::default(),
+            },
+        )
+        .expect("guard");
+
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
+        assert_eq!(report.trimmed_history_entries, 0);
+        assert!(!body.contains("user Continue"));
+        assert!(!body.contains("Tool results:"));
+        assert!(!body.contains(&format!("{mapped_bash}:")));
+        assert!(body.contains(&mapped_bash));
+        let breakdown = breakdown_kiro_request(&request, &body);
+        assert_eq!(breakdown.history_tool_use_count, TOOL_CYCLES);
+        assert_eq!(breakdown.history_tool_result_count, TOOL_CYCLES);
+
+        for message in &request.conversation_state.history {
+            match message {
+                Message::Assistant(assistant) => {
+                    assert!(
+                        !assistant
+                            .assistant_response_message
+                            .content
+                            .contains(&mapped_bash)
+                    );
+                }
+                Message::User(user) => {
+                    assert!(!user.user_input_message.content.contains(&mapped_bash));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn converted_20_and_100_cycle_histories_trim_atomically_for_five_rounds() {
+        fn build_request(tool_cycles: usize) -> (KiroRequest, String) {
+            let mut messages = vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("run structured check 0"),
+            }];
+            for idx in 0..tool_cycles {
+                let tool_use_id = format!("toolu_cycle_{idx}");
+                messages.push(AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": format!("running structured check {idx}")},
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": "Bash",
+                            "input": {"command": format!("check-{idx}")}
+                        }
+                    ]),
+                });
+                messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": format!("result-{idx}-{}", "x".repeat(256))
+                    }]),
+                });
+                if idx + 1 < tool_cycles {
+                    messages.push(AnthropicMessage {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!(format!("structured check {idx} complete")),
+                    });
+                    messages.push(AnthropicMessage {
+                        role: "user".to_string(),
+                        content: serde_json::json!(format!("run structured check {}", idx + 1)),
+                    });
+                }
+            }
+
+            let mut input_schema = std::collections::HashMap::new();
+            input_schema.insert("type".to_string(), serde_json::json!("object"));
+            input_schema.insert(
+                "properties".to_string(),
+                serde_json::json!({"command": {"type": "string"}}),
+            );
+            let anthropic = MessagesRequest {
+                model: "claude-sonnet-4".to_string(),
+                max_tokens: 1024,
+                messages,
+                system: None,
+                stream: true,
+                tools: Some(vec![AnthropicTool {
+                    name: "Bash".to_string(),
+                    description: "run a command".to_string(),
+                    input_schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                }]),
+                thinking: None,
+                tool_choice: None,
+                output_config: None,
+                metadata: None,
+            };
+            let converted =
+                crate::anthropic::converter::convert_request(&anthropic).expect("convert cycles");
+            let mapped_bash = converted
+                .tool_name_map
+                .iter()
+                .find_map(|(mapped, original)| (original == "Bash").then(|| mapped.clone()))
+                .expect("mapped Bash name");
+            (
+                KiroRequest {
+                    conversation_state: converted.conversation_state,
+                    profile_arn: None,
+                    additional_model_request_fields: converted.additional_model_request_fields,
+                    tool_cache_point_insert_after: converted.tool_cache_point_insert_after,
+                    cache_point_plan_recording_enabled: converted
+                        .cache_point_plan_recording_enabled,
+                },
+                mapped_bash,
+            )
+        }
+
+        fn tool_use_ids(message: &Message) -> Vec<&str> {
+            let Message::Assistant(assistant) = message else {
+                return Vec::new();
+            };
+            assistant
+                .assistant_response_message
+                .tool_uses
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|tool_use| tool_use.tool_use_id.as_str())
+                .collect()
+        }
+
+        fn tool_result_ids(message: &Message) -> Vec<&str> {
+            let Message::User(user) = message else {
+                return Vec::new();
+            };
+            user.user_input_message
+                .user_input_message_context
+                .tool_results
+                .iter()
+                .map(|result| result.tool_use_id.as_str())
+                .collect()
+        }
+
+        for tool_cycles in [20usize, 100] {
+            for round in 1..=5 {
+                let (mut request, mapped_bash) = build_request(tool_cycles);
+                let original_history_len = request.conversation_state.history.len();
+                let mut baseline_request = request.clone();
+                let (untrimmed_body, baseline_report) = guard_kiro_request(
+                    &mut baseline_request,
+                    PayloadGuardConfig {
+                        enabled: true,
+                        max_bytes: 0,
+                        trim_history: true,
+                        shaping: PayloadShapingConfig::default(),
+                    },
+                )
+                .expect("serialize untrimmed baseline");
+                assert_eq!(baseline_report.trimmed_history_entries, 0);
+                let max_bytes = untrimmed_body.len() * 2 / 3;
+
+                let (body, report) = guard_kiro_request(
+                    &mut request,
+                    PayloadGuardConfig {
+                        enabled: true,
+                        max_bytes,
+                        trim_history: true,
+                        shaping: PayloadShapingConfig::default(),
+                    },
+                )
+                .expect("trim structured cycles");
+
+                assert!(
+                    report.trimmed_history_entries > 0,
+                    "cycles={tool_cycles} round={round} baseline_bytes={} max_bytes={} original_bytes={} final_bytes={} original_history={} final_history={} removed_orphan_uses={} removed_orphan_results={}",
+                    untrimmed_body.len(),
+                    max_bytes,
+                    report.original_bytes,
+                    report.final_bytes,
+                    report.original_history_entries,
+                    report.final_history_entries,
+                    report.removed_orphan_tool_uses,
+                    report.removed_orphan_tool_results,
+                );
+                assert!(
+                    !report.still_oversized,
+                    "cycles={tool_cycles} round={round}"
+                );
+                assert!(
+                    body.len() <= max_bytes,
+                    "cycles={tool_cycles} round={round}"
+                );
+                assert!(
+                    request.conversation_state.history.len() < original_history_len,
+                    "cycles={tool_cycles} round={round}"
+                );
+                assert_eq!(report.flattened_history_tool_uses, 0);
+                assert_eq!(report.textified_history_tool_results, 0);
+                assert!(!body.contains("user Continue"));
+                assert!(!body.contains("Tool results:"));
+                assert!(!body.contains(&format!("{mapped_bash}:")));
+
+                let history = &request.conversation_state.history;
+                let current_results = &request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results;
+                assert_eq!(
+                    current_results.len(),
+                    1,
+                    "cycles={tool_cycles} round={round}"
+                );
+                let active_id = format!("toolu_cycle_{}", tool_cycles - 1);
+                assert_eq!(current_results[0].tool_use_id, active_id);
+
+                let mut use_count = 0usize;
+                let mut history_result_count = 0usize;
+                for (index, message) in history.iter().enumerate() {
+                    let uses = tool_use_ids(message);
+                    if !uses.is_empty() {
+                        use_count += uses.len();
+                        let paired_results = if let Some(next) = history.get(index + 1) {
+                            tool_result_ids(next)
+                        } else {
+                            current_results
+                                .iter()
+                                .map(|result| result.tool_use_id.as_str())
+                                .collect()
+                        };
+                        for tool_use_id in uses {
+                            assert!(
+                                paired_results.contains(&tool_use_id),
+                                "orphan tool_use={tool_use_id} cycles={tool_cycles} round={round}"
+                            );
+                        }
+                    }
+
+                    let results = tool_result_ids(message);
+                    if !results.is_empty() {
+                        history_result_count += results.len();
+                        assert!(
+                            index > 0,
+                            "leading tool_result cycles={tool_cycles} round={round}"
+                        );
+                        let paired_uses = tool_use_ids(&history[index - 1]);
+                        for tool_result_id in results {
+                            assert!(
+                                paired_uses.contains(&tool_result_id),
+                                "orphan tool_result={tool_result_id} cycles={tool_cycles} round={round}"
+                            );
+                        }
+                    }
+                }
+
+                assert!(use_count > 0, "cycles={tool_cycles} round={round}");
+                assert_eq!(
+                    use_count,
+                    history_result_count + current_results.len(),
+                    "cycles={tool_cycles} round={round}"
+                );
+                assert!(
+                    tool_use_ids(history.last().expect("active assistant"))
+                        .contains(&active_id.as_str()),
+                    "active tool use was trimmed cycles={tool_cycles} round={round}"
+                );
+
+                for message in history {
+                    match message {
+                        Message::Assistant(assistant) => assert!(
+                            !assistant
+                                .assistant_response_message
+                                .content
+                                .contains(&mapped_bash)
+                        ),
+                        Message::User(user) => {
+                            assert!(!user.user_input_message.content.contains(&mapped_bash))
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5462,6 +6700,8 @@ mod tests {
             original_history_entries: 4,
             final_history_entries: 2,
             trimmed_history_entries: 2,
+            guard_serializations: 3,
+            history_trim_passes: 1,
             aligned_leading_entries: 1,
             removed_empty_tool_uses: 1,
             removed_duplicate_tool_uses: 1,
@@ -5608,6 +6848,7 @@ mod tests {
             assistant_response_message: AssistantMessage {
                 content: "empty tools".to_string(),
                 tool_uses: Some(Vec::new()),
+                reasoning_content: None,
             },
         };
         let mut request = request_with_history(vec![
@@ -5623,6 +6864,51 @@ mod tests {
             panic!("expected assistant");
         };
         assert!(assistant.assistant_response_message.tool_uses.is_none());
+    }
+
+    #[test]
+    fn stripping_empty_tool_uses_preserves_native_reasoning_for_five_rounds() {
+        for round in 0..5 {
+            let expected = ReasoningContent::reasoning_text(
+                format!("thought {round}"),
+                format!("signature-{round}"),
+            );
+            let assistant = HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage {
+                    content: format!("answer {round}"),
+                    tool_uses: Some(Vec::new()),
+                    reasoning_content: Some(expected.clone()),
+                },
+            };
+            let mut request = request_with_history(vec![
+                Message::User(HistoryUserMessage::new("user", TEST_MODEL)),
+                Message::Assistant(assistant),
+            ]);
+
+            let (_body, report) = guard_kiro_request(
+                &mut request,
+                guard_config_with_shaping(
+                    usize::MAX,
+                    true,
+                    PayloadShapingConfig {
+                        discard_historical_thinking: false,
+                        ..PayloadShapingConfig::default()
+                    },
+                ),
+            )
+            .expect("guard");
+
+            assert_eq!(report.removed_empty_tool_uses, 1, "round {round}");
+            let Message::Assistant(assistant) = &request.conversation_state.history[1] else {
+                panic!("expected assistant");
+            };
+            assert!(assistant.assistant_response_message.tool_uses.is_none());
+            assert_eq!(
+                assistant.assistant_response_message.reasoning_content,
+                Some(expected),
+                "round {round}"
+            );
+        }
     }
 
     #[test]
@@ -5738,20 +7024,27 @@ mod tests {
         .expect("guard");
 
         assert_eq!(report.truncated_history_tool_results, 1);
-        assert_eq!(report.flattened_history_tool_uses, 1);
-        assert_eq!(report.textified_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected historical user");
         };
-        assert!(
+        assert_eq!(
             user.user_input_message
                 .user_input_message_context
                 .tool_results
-                .is_empty()
+                .len(),
+            1
         );
-        let historical_text = &user.user_input_message.content;
+        let historical_text = tool_result_text(
+            &user
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
         assert!(historical_text.chars().count() <= 1_120);
         assert!(historical_text.contains("historical tool result truncated by proxy"));
+        assert_eq!(user.user_input_message.content, "old result");
 
         let current_text = tool_result_text(
             &request
@@ -5766,55 +7059,57 @@ mod tests {
 
     #[test]
     fn payload_shaping_truncates_current_tool_results_when_enabled() {
-        let assistant = HistoryAssistantMessage {
-            assistant_response_message: AssistantMessage::new("current tool call")
-                .with_tool_uses(vec![ToolUseEntry::new("current-tool", "readFile")]),
-        };
-        let mut request = request_with_history(vec![
-            Message::User(HistoryUserMessage::new("read", TEST_MODEL)),
-            Message::Assistant(assistant),
-        ]);
-        request
-            .conversation_state
-            .current_message
-            .user_input_message
-            .user_input_message_context =
-            UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
-                "current-tool",
-                "current result\n".repeat(5_000),
-            )]);
-
-        let (body, report) = guard_kiro_request(
-            &mut request,
-            guard_config_with_shaping(
-                6_000,
-                false,
-                PayloadShapingConfig {
-                    truncate_historical_tool_results: false,
-                    discard_historical_thinking: false,
-                    compress_tool_definitions: false,
-                    web_fetch_trim_enabled: false,
-                    truncate_current_tool_results: true,
-                    current_tool_result_max_chars: 1_000,
-                    ..PayloadShapingConfig::default()
-                },
-            ),
-        )
-        .expect("guard");
-
-        assert!(body.len() <= 6_000);
-        assert!(!report.still_oversized);
-        assert!(report.truncated_current_tool_results > 0);
-        let current_text = tool_result_text(
-            &request
+        for round in 0..5 {
+            let assistant = HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("current tool call")
+                    .with_tool_uses(vec![ToolUseEntry::new("current-tool", "readFile")]),
+            };
+            let mut request = request_with_history(vec![
+                Message::User(HistoryUserMessage::new("read", TEST_MODEL)),
+                Message::Assistant(assistant),
+            ]);
+            request
                 .conversation_state
                 .current_message
                 .user_input_message
-                .user_input_message_context
-                .tool_results[0],
-        );
-        assert!(current_text.chars().count() <= 1_000);
-        assert!(current_text.contains("current tool result truncated by proxy"));
+                .user_input_message_context =
+                UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
+                    "current-tool",
+                    "current result\n".repeat(5_000),
+                )]);
+
+            let (body, report) = guard_kiro_request(
+                &mut request,
+                guard_config_with_shaping(
+                    6_000,
+                    false,
+                    PayloadShapingConfig {
+                        truncate_historical_tool_results: false,
+                        discard_historical_thinking: false,
+                        compress_tool_definitions: false,
+                        web_fetch_trim_enabled: false,
+                        truncate_current_tool_results: true,
+                        current_tool_result_max_chars: 1_000,
+                        ..PayloadShapingConfig::default()
+                    },
+                ),
+            )
+            .expect("guard");
+
+            assert!(body.len() <= 6_000, "round {round}");
+            assert!(!report.still_oversized, "round {round}");
+            assert!(report.truncated_current_tool_results > 0, "round {round}");
+            let current_text = tool_result_text(
+                &request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results[0],
+            );
+            assert!(current_text.chars().count() <= 1_000);
+            assert!(current_text.contains("current tool result truncated by proxy"));
+        }
     }
 
     #[test]
@@ -5859,48 +7154,50 @@ mod tests {
 
     #[test]
     fn payload_shaping_truncates_current_documents_without_breaking_tags() {
-        let mut request = request_with_history(Vec::new());
-        request
-            .conversation_state
-            .current_message
-            .user_input_message
-            .content = format!(
-            "before\n<document media_type=\"application/pdf\">\n{}\n</document>\nafter",
-            "pdf body ".repeat(5_000)
-        );
+        for round in 0..5 {
+            let mut request = request_with_history(Vec::new());
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content = format!(
+                "before\n<document media_type=\"application/pdf\">\n{}\n</document>\nafter",
+                "pdf body ".repeat(5_000)
+            );
 
-        let (body, report) = guard_kiro_request(
-            &mut request,
-            guard_config_with_shaping(
-                6_000,
-                false,
-                PayloadShapingConfig {
-                    truncate_historical_tool_results: false,
-                    discard_historical_thinking: false,
-                    compress_tool_definitions: false,
-                    web_fetch_trim_enabled: false,
-                    truncate_current_documents: true,
-                    truncate_current_user_content: true,
-                    current_document_max_chars: 1_200,
-                    current_user_content_max_chars: 1_200,
-                    ..PayloadShapingConfig::default()
-                },
-            ),
-        )
-        .expect("guard");
+            let (body, report) = guard_kiro_request(
+                &mut request,
+                guard_config_with_shaping(
+                    6_000,
+                    false,
+                    PayloadShapingConfig {
+                        truncate_historical_tool_results: false,
+                        discard_historical_thinking: false,
+                        compress_tool_definitions: false,
+                        web_fetch_trim_enabled: false,
+                        truncate_current_documents: true,
+                        truncate_current_user_content: true,
+                        current_document_max_chars: 1_200,
+                        current_user_content_max_chars: 1_200,
+                        ..PayloadShapingConfig::default()
+                    },
+                ),
+            )
+            .expect("guard");
 
-        let content = &request
-            .conversation_state
-            .current_message
-            .user_input_message
-            .content;
-        assert!(body.len() <= 6_000);
-        assert!(!report.still_oversized);
-        assert!(report.truncated_current_documents > 0);
-        assert_eq!(report.truncated_current_user_content, 0);
-        assert!(content.contains("<document media_type=\"application/pdf\">"));
-        assert!(content.contains("</document>"));
-        assert!(content.contains("current document truncated by proxy"));
+            let content = &request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content;
+            assert!(body.len() <= 6_000, "round {round}");
+            assert!(!report.still_oversized, "round {round}");
+            assert!(report.truncated_current_documents > 0, "round {round}");
+            assert_eq!(report.truncated_current_user_content, 0);
+            assert!(content.contains("<document media_type=\"application/pdf\">"));
+            assert!(content.contains("</document>"));
+            assert!(content.contains("current document truncated by proxy"));
+        }
     }
 
     #[test]
@@ -5954,6 +7251,132 @@ mod tests {
                     "Current images were omitted because they exceeded the request image budget"
                 )
         );
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .matches(
+                    "Current images were omitted because they exceeded the request image budget"
+                )
+                .count(),
+            1,
+            "image budget shaping must emit exactly one summary placeholder"
+        );
+    }
+
+    #[test]
+    fn current_fit_batches_image_drops_and_counts_serializations_for_five_rounds() {
+        let encoded = "A".repeat(512 * 1_024);
+
+        for round in 0..5 {
+            let mut kiro_template = request_with_history(Vec::new());
+            kiro_template
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images = (0..4)
+                .map(|_| KiroImage::from_base64("png", encoded.clone()))
+                .collect();
+            let mut one_kiro_image = request_with_history(Vec::new());
+            one_kiro_image
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images = vec![KiroImage::from_base64("png", encoded.clone())];
+            let kiro_target = serialize_kiro_request(&one_kiro_image)
+                .unwrap()
+                .len()
+                .saturating_add(4 * 1_024);
+            let shaping = PayloadShapingConfig {
+                truncate_historical_tool_results: false,
+                discard_historical_thinking: false,
+                compress_tool_definitions: false,
+                web_fetch_trim_enabled: false,
+                fit_current_payload_to_budget: true,
+                current_tool_result_max_chars: 0,
+                current_document_max_chars: 0,
+                current_user_content_max_chars: 0,
+                current_images_max_bytes: usize::MAX,
+                ..PayloadShapingConfig::default()
+            };
+
+            let (kiro_body, kiro_report) = guard_kiro_request(
+                &mut kiro_template,
+                guard_config_with_shaping(kiro_target, false, shaping),
+            )
+            .expect("batched Kiro current image fit");
+            assert!(kiro_body.len() <= kiro_target, "round {round}");
+            assert_eq!(kiro_report.dropped_current_images, 3, "round {round}");
+            assert_eq!(kiro_report.guard_serializations, 3, "round {round}");
+            assert_eq!(
+                kiro_template
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .images
+                    .len(),
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                kiro_template
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .content
+                    .matches(
+                        "Current images were omitted because they exceeded the request image budget"
+                    )
+                    .count(),
+                1,
+                "round {round}"
+            );
+
+            let image_block = |data: &str| {
+                serde_json::json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": data}
+                })
+            };
+            let mut anthropic_template = anthropic_request(vec![anthropic_message(
+                "user",
+                Value::Array((0..4).map(|_| image_block(&encoded)).collect()),
+            )]);
+            let one_anthropic_image = anthropic_request(vec![anthropic_message(
+                "user",
+                Value::Array(vec![image_block(&encoded)]),
+            )]);
+            let anthropic_target = serde_json::to_vec(&one_anthropic_image)
+                .unwrap()
+                .len()
+                .saturating_add(4 * 1_024);
+            let anthropic_raw = Bytes::from(serde_json::to_vec(&anthropic_template).unwrap());
+            let (anthropic_body, anthropic_report) = guard_anthropic_messages_request_reusing_body(
+                &mut anthropic_template,
+                guard_config_with_shaping(anthropic_target, false, shaping),
+                &anthropic_raw,
+            )
+            .expect("batched Anthropic current image fit");
+            assert!(anthropic_body.len() <= anthropic_target, "round {round}");
+            assert_eq!(anthropic_report.dropped_current_images, 3, "round {round}");
+            assert_eq!(anthropic_report.guard_serializations, 3, "round {round}");
+            assert_eq!(
+                count_content_blocks_by_type(&anthropic_template.messages[0].content, "image"),
+                1,
+                "round {round}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&anthropic_body)
+                    .matches(
+                        "Current images were omitted because they exceeded the request image budget"
+                    )
+                    .count(),
+                1,
+                "round {round}"
+            );
+        }
     }
 
     #[test]
@@ -6006,6 +7429,10 @@ mod tests {
 
         assert!(body.len() <= 9_000, "final body was {} bytes", body.len());
         assert!(!report.still_oversized);
+        assert_eq!(
+            report.guard_serializations, 2,
+            "the initial measurement and current-fit serialization must both be counted"
+        );
         assert!(report.truncated_current_tool_results > 0);
         assert!(report.truncated_current_documents > 0);
         let content = &request
@@ -6101,6 +7528,79 @@ mod tests {
     }
 
     #[test]
+    fn payload_shaping_discards_native_reasoning_as_one_atomic_block_for_five_rounds() {
+        for round in 0..5 {
+            for native in [
+                ReasoningContent::reasoning_text(
+                    format!("native thought {round}"),
+                    format!("signature-{round}"),
+                ),
+                ReasoningContent::redacted_content(base64_zeros_for_decoded_bytes(round + 1)),
+            ] {
+                let native_bytes = json_len(&native);
+                let assistant = HistoryAssistantMessage {
+                    assistant_response_message: AssistantMessage::new(format!(
+                        "visible\n<thinking>legacy {round}</thinking>\nanswer"
+                    ))
+                    .with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")])
+                    .with_reasoning_content(native),
+                };
+                let mut request = request_with_history(vec![
+                    Message::User(HistoryUserMessage::new("question", TEST_MODEL)),
+                    Message::Assistant(assistant),
+                ]);
+                request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context = UserInputMessageContext::new()
+                    .with_tool_results(vec![ToolResult::success("tool-1", "done")]);
+
+                let (body, report) = guard_kiro_request(
+                    &mut request,
+                    shaping_config(PayloadShapingConfig {
+                        truncate_historical_tool_results: false,
+                        compress_tool_definitions: false,
+                        web_fetch_trim_enabled: false,
+                        ..PayloadShapingConfig::default()
+                    }),
+                )
+                .expect("guard");
+
+                assert_eq!(report.removed_history_thinking_blocks, 2, "round {round}");
+                assert!(
+                    report.removed_history_thinking_chars >= native_bytes,
+                    "round {round}"
+                );
+                let Message::Assistant(assistant) = &request.conversation_state.history[1] else {
+                    panic!("expected assistant");
+                };
+                assert_eq!(
+                    assistant.assistant_response_message.content,
+                    "visible\n\nanswer"
+                );
+                assert!(
+                    assistant
+                        .assistant_response_message
+                        .reasoning_content
+                        .is_none()
+                );
+                assert_eq!(
+                    assistant
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(Vec::len),
+                    Some(1)
+                );
+                assert!(!body.contains("reasoningContent"));
+                assert!(!body.contains("signature-"));
+                assert!(!body.contains("<thinking>"));
+            }
+        }
+    }
+
+    #[test]
     fn anthropic_guard_discards_historical_thinking_even_when_body_fits() {
         let mut request = anthropic_request(vec![
             anthropic_message("user", serde_json::json!("question")),
@@ -6143,7 +7643,7 @@ mod tests {
 
     #[test]
     fn anthropic_guard_drops_oversized_historical_images_even_when_body_fits() {
-        let oversized = "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let oversized = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
         let mut request = anthropic_request(vec![
             anthropic_message(
                 "user",
@@ -6188,8 +7688,138 @@ mod tests {
     }
 
     #[test]
+    fn image_source_size_uses_decoded_base64_bytes_for_five_rounds() {
+        for round in 0..5 {
+            for decoded_bytes in [
+                UPSTREAM_IMAGE_SOURCE_MAX_BYTES - 1,
+                UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+                UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1,
+            ] {
+                let encoded = base64_zeros_for_decoded_bytes(decoded_bytes);
+                let plain = serde_json::json!({
+                    "type": "image",
+                    "source": {"type": "base64", "data": encoded}
+                });
+                assert_eq!(
+                    anthropic_image_source_bytes(&plain),
+                    decoded_bytes,
+                    "round {round}"
+                );
+
+                let wrapped = serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "data": format!("data:image/png;base64,{}\n", encoded)
+                    }
+                });
+                assert_eq!(
+                    anthropic_image_source_bytes(&wrapped),
+                    decoded_bytes,
+                    "round {round}"
+                );
+
+                let kiro = KiroImage::from_base64("png", encoded);
+                assert_eq!(
+                    kiro_image_source_bytes(&kiro),
+                    decoded_bytes,
+                    "round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_five_mib_decoded_images_are_not_dropped_for_five_rounds() {
+        for _round in 0..5 {
+            let encoded = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES);
+            let mut anthropic = anthropic_request(vec![anthropic_message(
+                "user",
+                serde_json::json!([{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": encoded
+                    }
+                }]),
+            )]);
+            let (body, report) = guard_anthropic_messages_request(
+                &mut anthropic,
+                guard_config(usize::MAX),
+                UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+            )
+            .expect("exact-limit Anthropic image");
+            assert_eq!(report.dropped_current_images, 0);
+            assert_eq!(
+                count_content_blocks_by_type(&anthropic.messages[0].content, "image"),
+                1
+            );
+            assert!(body.contains(r#""type":"image""#));
+
+            let mut kiro = request_with_history(Vec::new());
+            kiro.conversation_state
+                .current_message
+                .user_input_message
+                .images = vec![KiroImage::from_base64(
+                "png",
+                base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
+            )];
+            let (_body, report) = guard_kiro_request(&mut kiro, guard_config(usize::MAX))
+                .expect("exact-limit Kiro image");
+            assert_eq!(report.dropped_current_images, 0);
+            assert_eq!(
+                kiro.conversation_state
+                    .current_message
+                    .user_input_message
+                    .images
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_oversized_current_images_emit_one_summary_placeholder() {
+        let encoded = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let image = || {
+            serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": encoded.clone()
+                }
+            })
+        };
+        let mut request = anthropic_request(vec![anthropic_message(
+            "user",
+            serde_json::json!([
+                {"type": "text", "text": "before"},
+                image(),
+                image(),
+                {"type": "text", "text": "after"}
+            ]),
+        )]);
+
+        let (body, report) =
+            guard_anthropic_messages_request(&mut request, guard_config(usize::MAX), encoded.len())
+                .expect("guard");
+
+        assert_eq!(report.dropped_current_images, 2);
+        assert_eq!(
+            report.dropped_current_image_bytes,
+            2 * (UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1)
+        );
+        assert_eq!(body.matches("Current images were omitted").count(), 1);
+        assert!(!body.contains(r#""type":"image""#));
+        assert!(body.contains("before"));
+        assert!(body.contains("after"));
+    }
+
+    #[test]
     fn anthropic_guard_drops_oversized_current_images_even_when_body_fits() {
-        let oversized = "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let oversized = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
         let mut request = anthropic_request(vec![anthropic_message(
             "user",
             serde_json::json!([
@@ -6233,7 +7863,7 @@ mod tests {
 
     #[test]
     fn anthropic_guard_rejects_oversized_images_when_configured() {
-        let oversized = "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let oversized = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
         let mut request = anthropic_request(vec![anthropic_message(
             "user",
             serde_json::json!([
@@ -6316,21 +7946,28 @@ mod tests {
 
         assert_eq!(report.trimmed_web_fetch_blocks, 1);
         assert_eq!(report.truncated_history_tool_results, 0);
-        assert_eq!(report.flattened_history_tool_uses, 1);
-        assert_eq!(report.textified_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected historical user");
         };
-        assert!(
+        assert_eq!(
             user.user_input_message
                 .user_input_message_context
                 .tool_results
-                .is_empty()
+                .len(),
+            1
         );
-        let text = &user.user_input_message.content;
+        let text = tool_result_text(
+            &user
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
         assert!(text.contains("Proxy note: web page navigation"));
         assert!(text.chars().count() > 1_000);
         assert!(text.chars().count() < 4_120);
+        assert_eq!(user.user_input_message.content, "web result");
     }
 
     #[test]
@@ -6366,146 +8003,163 @@ mod tests {
 
         assert_eq!(report.trimmed_web_fetch_blocks, 0);
         assert_eq!(report.truncated_history_tool_results, 1);
-        assert_eq!(report.flattened_history_tool_uses, 1);
-        assert_eq!(report.textified_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 0);
+        assert_eq!(report.textified_history_tool_results, 0);
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected historical user");
         };
-        assert!(
+        assert_eq!(
             user.user_input_message
                 .user_input_message_context
                 .tool_results
-                .is_empty()
+                .len(),
+            1
         );
-        let text = &user.user_input_message.content;
+        let text = tool_result_text(
+            &user
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
         assert!(text.chars().count() <= 1_120);
+        assert_eq!(user.user_input_message.content, "web result");
     }
 
     #[test]
     fn payload_shaping_compresses_current_tool_definitions_without_removing_tools() {
-        let mut request = request_with_history(Vec::new());
-        request
-            .conversation_state
-            .current_message
-            .user_input_message
-            .user_input_message_context = UserInputMessageContext::new().with_tools(vec![Tool {
-            tool_specification: ToolSpecification {
-                name: "largeTool".to_string(),
-                description: "description ".repeat(1_000),
-                input_schema: InputSchema::from_json(serde_json::json!({
-                    "type": "object",
-                    "description": "root ".repeat(500),
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "path ".repeat(500),
-                            "examples": [
-                                "example ".repeat(500),
-                                "example ".repeat(500),
-                                "example ".repeat(500),
-                                "example ".repeat(500)
-                            ]
-                        }
-                    }
-                })),
-            },
-        }]);
-
-        let (_body, report) = guard_kiro_request(
-            &mut request,
-            shaping_config(PayloadShapingConfig {
-                truncate_historical_tool_results: false,
-                discard_historical_thinking: false,
-                web_fetch_trim_enabled: false,
-                tool_definitions_budget_bytes: 1_024,
-                tool_description_max_chars: 256,
-                tool_schema_annotation_max_chars: 128,
-                ..PayloadShapingConfig::default()
-            }),
-        )
-        .expect("guard");
-
-        assert!(report.compressed_tool_definitions > 0);
-        assert!(report.compressed_tool_definition_bytes > 0);
-        let tools = &request
-            .conversation_state
-            .current_message
-            .user_input_message
-            .user_input_message_context
-            .tools;
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].tool_specification.name, "largeTool");
-        assert!(
-            tools[0]
-                .tool_specification
-                .description
-                .contains("tool description truncated by proxy")
-        );
-        assert!(
-            serde_json::to_string(&tools[0].tool_specification.input_schema)
-                .expect("schema")
-                .contains("schema annotation truncated by proxy")
-        );
-    }
-
-    #[test]
-    fn payload_shaping_tool_definition_budget_zero_disables_tool_compression() {
-        let mut request = request_with_history(Vec::new());
-        let description = "description ".repeat(1_000);
-        request
-            .conversation_state
-            .current_message
-            .user_input_message
-            .user_input_message_context = UserInputMessageContext::new().with_tools(vec![Tool {
-            tool_specification: ToolSpecification {
-                name: "largeTool".to_string(),
-                description: description.clone(),
-                input_schema: InputSchema::from_json(serde_json::json!({
-                    "type": "object",
-                    "description": "root ".repeat(500),
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "path ".repeat(500)
-                        }
-                    }
-                })),
-            },
-        }]);
-
-        let (_body, report) = guard_kiro_request(
-            &mut request,
-            shaping_config(PayloadShapingConfig {
-                truncate_historical_tool_results: false,
-                discard_historical_thinking: false,
-                web_fetch_trim_enabled: false,
-                tool_definitions_budget_bytes: 0,
-                tool_description_max_chars: 256,
-                tool_schema_annotation_max_chars: 128,
-                ..PayloadShapingConfig::default()
-            }),
-        )
-        .expect("guard");
-
-        assert_eq!(report.compressed_tool_definitions, 0);
-        assert_eq!(
+        for round in 0..5 {
+            let mut request = request_with_history(Vec::new());
             request
                 .conversation_state
                 .current_message
                 .user_input_message
+                .user_input_message_context =
+                UserInputMessageContext::new().with_tools(vec![Tool {
+                    tool_specification: ToolSpecification {
+                        name: "largeTool".to_string(),
+                        description: "description ".repeat(1_000),
+                        input_schema: InputSchema::from_json(serde_json::json!({
+                            "type": "object",
+                            "description": "root ".repeat(500),
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "path ".repeat(500),
+                                    "examples": [
+                                        "example ".repeat(500),
+                                        "example ".repeat(500),
+                                        "example ".repeat(500),
+                                        "example ".repeat(500)
+                                    ]
+                                }
+                            }
+                        })),
+                    },
+                }]);
+
+            let (_body, report) = guard_kiro_request(
+                &mut request,
+                shaping_config(PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    web_fetch_trim_enabled: false,
+                    tool_definitions_budget_bytes: 1_024,
+                    tool_description_max_chars: 256,
+                    tool_schema_annotation_max_chars: 128,
+                    ..PayloadShapingConfig::default()
+                }),
+            )
+            .expect("guard");
+
+            assert!(report.compressed_tool_definitions > 0, "round {round}");
+            assert!(report.compressed_tool_definition_bytes > 0, "round {round}");
+            let tools = &request
+                .conversation_state
+                .current_message
+                .user_input_message
                 .user_input_message_context
-                .tools[0]
-                .tool_specification
-                .description,
-            description
-        );
+                .tools;
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].tool_specification.name, "largeTool");
+            assert!(
+                tools[0]
+                    .tool_specification
+                    .description
+                    .contains("tool description truncated by proxy")
+            );
+            assert!(
+                serde_json::to_string(&tools[0].tool_specification.input_schema)
+                    .expect("schema")
+                    .contains("schema annotation truncated by proxy")
+            );
+        }
+    }
+
+    #[test]
+    fn payload_shaping_tool_definition_budget_zero_disables_tool_compression() {
+        for round in 0..5 {
+            let mut request = request_with_history(Vec::new());
+            let description = "description ".repeat(1_000);
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context =
+                UserInputMessageContext::new().with_tools(vec![Tool {
+                    tool_specification: ToolSpecification {
+                        name: "largeTool".to_string(),
+                        description: description.clone(),
+                        input_schema: InputSchema::from_json(serde_json::json!({
+                            "type": "object",
+                            "description": "root ".repeat(500),
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "path ".repeat(500)
+                                }
+                            }
+                        })),
+                    },
+                }]);
+
+            let (_body, report) = guard_kiro_request(
+                &mut request,
+                shaping_config(PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    web_fetch_trim_enabled: false,
+                    tool_definitions_budget_bytes: 0,
+                    tool_description_max_chars: 256,
+                    tool_schema_annotation_max_chars: 128,
+                    ..PayloadShapingConfig::default()
+                }),
+            )
+            .expect("guard");
+
+            assert_eq!(report.compressed_tool_definitions, 0, "round {round}");
+            assert_eq!(
+                request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tools[0]
+                    .tool_specification
+                    .description,
+                description
+            );
+        }
     }
 
     #[test]
     fn payload_breakdown_reports_current_tool_and_history_sizes() {
         let assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("tool call")
-                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")])
+                .with_reasoning_content(ReasoningContent::reasoning_text(
+                    "native thought",
+                    "signature",
+                )),
         };
         let mut user = HistoryUserMessage::new("result message", TEST_MODEL);
         user.user_input_message.user_input_message_context = UserInputMessageContext::new()
@@ -6542,12 +8196,79 @@ mod tests {
         assert_eq!(breakdown.current_tool_count, 1);
         assert_eq!(breakdown.history_tool_use_count, 1);
         assert_eq!(breakdown.history_tool_result_count, 1);
+        assert_eq!(breakdown.history_reasoning_content_count, 1);
         assert!(breakdown.current_tools_bytes > 0);
         assert!(breakdown.current_tool_results_bytes > 0);
         assert!(breakdown.history_tool_results_bytes > 0);
+        assert!(breakdown.history_reasoning_content_bytes > 0);
         assert!(breakdown.largest_tool_bytes > 0);
         assert!(breakdown.largest_history_tool_result_bytes > 0);
         assert!(breakdown.largest_current_tool_result_bytes > 0);
+    }
+
+    #[test]
+    fn anthropic_breakdown_counts_whole_native_reasoning_blocks_for_five_rounds() {
+        for round in 0..5 {
+            let mut request = anthropic_request(vec![
+                anthropic_message("user", serde_json::json!("initial")),
+                anthropic_message(
+                    "assistant",
+                    serde_json::json!([
+                        {
+                            "type": "thinking",
+                            "thinking": format!("thought {round}"),
+                            "signature": format!("signature-{round}")
+                        },
+                        {
+                            "type": "redacted_thinking",
+                            "data": base64_zeros_for_decoded_bytes(round + 1)
+                        },
+                        {"type": "text", "text": "visible"}
+                    ]),
+                ),
+                anthropic_message("user", serde_json::json!("continue")),
+            ]);
+            let total_bytes = serde_json::to_vec(&request).unwrap().len();
+            let breakdown = breakdown_anthropic_messages_request(&request, total_bytes);
+
+            assert_eq!(
+                breakdown.history_reasoning_content_count, 2,
+                "round {round}"
+            );
+            let expected_bytes = request.messages[1]
+                .content
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(2)
+                .map(json_len)
+                .sum::<usize>();
+            assert_eq!(
+                breakdown.history_reasoning_content_bytes, expected_bytes,
+                "round {round}"
+            );
+
+            let (_body, report) = guard_anthropic_messages_request(
+                &mut request,
+                guard_config_with_shaping(
+                    usize::MAX,
+                    false,
+                    PayloadShapingConfig {
+                        truncate_historical_tool_results: false,
+                        compress_tool_definitions: false,
+                        web_fetch_trim_enabled: false,
+                        discard_historical_thinking: true,
+                        ..PayloadShapingConfig::default()
+                    },
+                ),
+                total_bytes,
+            )
+            .expect("guard");
+            assert_eq!(report.removed_history_thinking_blocks, 2, "round {round}");
+            let after = breakdown_anthropic_messages_request(&request, total_bytes);
+            assert_eq!(after.history_reasoning_content_count, 0, "round {round}");
+            assert_eq!(after.history_reasoning_content_bytes, 0, "round {round}");
+        }
     }
 
     #[test]
@@ -6567,7 +8288,7 @@ mod tests {
         let mut user = HistoryUserMessage::new("image", TEST_MODEL);
         user.user_input_message.images = vec![KiroImage::from_base64(
             "png",
-            "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+            base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
         )];
         let mut request = request_with_history(vec![Message::User(user)]);
 
@@ -6586,7 +8307,7 @@ mod tests {
         assert!(user.user_input_message.content.contains(
             "Historical image was omitted because it exceeded the upstream 5 MB image size limit"
         ));
-        assert!(!body.contains(&"a".repeat(128)));
+        assert!(!body.contains(&"A".repeat(128)));
     }
 
     #[test]
@@ -6598,7 +8319,7 @@ mod tests {
             .user_input_message
             .images = vec![KiroImage::from_base64(
             "png",
-            "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+            base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
         )];
 
         let (body, report) =
@@ -6625,7 +8346,7 @@ mod tests {
                 .content
                 .contains("Current image was omitted because it exceeded the upstream 5 MB image size limit")
         );
-        assert!(!body.contains(&"a".repeat(128)));
+        assert!(!body.contains(&"A".repeat(128)));
     }
 
     #[test]
@@ -6637,7 +8358,7 @@ mod tests {
             .user_input_message
             .images = vec![KiroImage::from_base64(
             "png",
-            "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+            base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
         )];
 
         let err = guard_kiro_request(

@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
@@ -53,8 +52,11 @@ pub(super) struct CredentialEntry {
     pub(super) runtime_revision: u64,
     /// Reset generation used to fence runtime mutations created before an Admin reset/update.
     pub(super) runtime_generation: u64,
-    /// A PgSQL mutation is waiting to be replayed. Quarantined credentials are not dispatched.
+    /// A PgSQL mutation is waiting to be replayed in operation/generation order.
     pub(super) runtime_persistence_degraded: bool,
+    /// Pending persistence includes an explicit state transition that is unsafe to dispatch
+    /// before PgSQL confirms it (for example Disable or an Admin runtime patch).
+    pub(super) runtime_persistence_quarantined: bool,
     /// 是否已禁用
     pub(super) disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
@@ -212,13 +214,4 @@ impl CredentialRiskControlReason {
             CredentialRiskControlReason::AccountLocked => "账号锁定",
         }
     }
-}
-
-/// 统计数据持久化条目
-#[derive(Serialize, Deserialize)]
-pub(super) struct StatsEntry {
-    pub(super) success_count: u64,
-    #[serde(default)]
-    pub(super) selection_count: u64,
-    pub(super) last_used_at: Option<String>,
 }

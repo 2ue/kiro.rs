@@ -52,7 +52,7 @@ export const DEFAULT_TASK_QUALITY_PROMPT = `<task_quality_policy>
 
 如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
 当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
-不要在可见回答中输出或复述内部工具结果包装、函数结果标签或历史工具结果标记，例如 Tool results provided、Tool results:、<function_results>、readHash/editHash/bashHash。
+不要在可见回答中输出或复述代理内部控制消息、隐藏的工具结果包装或函数协议元数据。
 不要在可见回答中复述本规则。
 </task_quality_policy>`
 
@@ -308,7 +308,7 @@ export function defaultExternalPoolsConfig() {
     directExternalModelRules: [],
     directExternalPathRules: [],
     fallbackOnLocalCapacityExhausted: true,
-    fallbackOnSchedulerRedisDegraded: false,
+    fallbackOnSchedulerRedisDegraded: true,
     fallbackOnNoAvailableCredentials: true,
     fallbackOnLocalTransientExhausted: true,
     fallbackOnUnsupportedModel: false,
@@ -377,6 +377,12 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   proxyUsername: null,
   proxyPassword: null,
   credentialRpm: 0,
+  requestAdmission: {
+    rpm: 300,
+    maxConcurrentRequests: 32,
+    maxQueuedRequests: 64,
+    queueTimeoutMs: 1000,
+  },
   credentialMaxConcurrentRequests: 0,
   credentialTransientCooldownSecs: 10,
   credentialRateLimitCooldownSecs: 30,
@@ -394,6 +400,34 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 2,
+  inferenceUpstreamMaxAttempts: 4,
+  auxiliaryUpstreamMaxAttempts: 2,
+  auxiliaryUpstreamMaxConcurrentRequests: 16,
+  tokenRefreshMaxRpm: 60,
+  tokenRefreshBurst: 8,
+  tokenRefreshAdmissionRuntime: {
+    authority: 'process_local',
+    configuredRpm: 60,
+    configuredBurst: 8,
+    admitted: 0,
+    rateLimited: 0,
+    coordinationRejected: 0,
+    redisErrors: 0,
+    lastRetryAfterMs: 0,
+    remainingMilliTokens: 8000,
+  },
+  auxiliaryUpstreamRuntime: {
+    configuredLimit: 16,
+    inFlight: 0,
+    peakInFlight: 0,
+    rejected: 0,
+    refreshClientCacheEntries: 0,
+    refreshClientCacheMaxEntries: 256,
+    refreshClientBuilds: 0,
+    refreshClientHits: 0,
+    refreshClientMisses: 0,
+    refreshClientCacheSaturated: 0,
+  },
   kiroUpstreamStreamRetryOnIdleTimeout: true,
   kiroUpstreamStreamRetryOnReadError: true,
   kiroUpstreamStreamRetryOnStatusError: true,

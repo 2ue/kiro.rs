@@ -10,12 +10,13 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::anthropic::body_capabilities::KiroConverterPlan;
-use crate::anthropic::model_capabilities::ModelResolution;
+use crate::anthropic::model_capabilities::{KiroReasoningCapabilityState, ModelResolution};
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 #[cfg(test)]
 use crate::kiro::model::requests::conversation::{
-    AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserMessage,
+    AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ReasoningContent,
+    UserMessage,
 };
 use crate::kiro::model::requests::conversation::{
     ConversationState, CurrentMessage, UserInputMessage, UserInputMessageContext,
@@ -51,14 +52,12 @@ pub(crate) use content::{infer_document_media_type_from_url, infer_image_format_
 use history::build_history;
 #[cfg(test)]
 use history::{convert_assistant_message, merge_assistant_messages};
-use model::build_additional_model_request_fields;
+use model::{build_additional_model_request_fields, requested_native_reasoning};
 pub use model::{get_context_window_size, map_model};
 #[cfg(test)]
 use schema::normalize_json_schema;
-#[cfg(test)]
-use tool_pairing::kiro_tool_result_to_text;
 use tool_pairing::{
-    append_orphan_tool_result_texts, remove_orphaned_tool_uses, validate_tool_pairing,
+    remove_orphaned_tool_uses, sanitize_history_tool_results, validate_tool_pairing,
 };
 #[cfg(test)]
 use tools::{
@@ -66,7 +65,19 @@ use tools::{
 };
 use tools::{collect_history_tool_names, convert_tools, create_placeholder_tool};
 
-const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Continue";
+pub(crate) fn deterministic_mapped_tool_name(name: &str) -> String {
+    tools::deterministic_mapped_tool_name(name)
+}
+
+pub(crate) fn legacy_overlong_mapped_tool_name(name: &str) -> Option<String> {
+    tools::legacy_overlong_mapped_tool_name(name)
+}
+
+/// Kiro requires a non-empty user message even when structured tool results
+/// carry the entire turn. Keep the placeholder semantically inert so it cannot
+/// prime the model to reproduce an internal `user Continue` transcript.
+const EMPTY_USER_CONTENT_PLACEHOLDER: &str = ".";
+const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = EMPTY_USER_CONTENT_PLACEHOLDER;
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 
 /// 转换结果
@@ -102,6 +113,7 @@ pub struct ConverterOptions {
     pub kiro_cache_point_tools_only: bool,
     pub kiro_cache_point_record_plan: bool,
     pub force_visible_thinking: bool,
+    pub(crate) native_reasoning_capability: KiroReasoningCapabilityState,
     pub prompt_steering: PromptSteeringConfig,
 }
 
@@ -115,6 +127,7 @@ impl Default for ConverterOptions {
             kiro_cache_point_tools_only: true,
             kiro_cache_point_record_plan: true,
             force_visible_thinking: false,
+            native_reasoning_capability: KiroReasoningCapabilityState::LegacyFallback,
             prompt_steering: PromptSteeringConfig::default(),
         }
     }
@@ -145,8 +158,8 @@ impl ConverterOptions {
 
     fn inject_thinking_prefix(&self) -> bool {
         let prompt_steering = self.prompt_steering.clone().normalized();
-        self.conversion.thinking_prompt_controls.is_enabled()
-            && prompt_steering.enabled
+        prompt_steering.enabled
+            && self.conversion.thinking_prompt_controls.is_enabled()
             && prompt_steering.thinking.enabled
             && (self.force_visible_thinking || !self.is_strict())
     }
@@ -160,10 +173,7 @@ impl ConverterOptions {
     }
 
     fn tool_choice_steering_enabled(&self) -> bool {
-        let prompt_steering = self.prompt_steering.clone().normalized();
-        prompt_steering.enabled
-            && prompt_steering.tool_choice.enabled
-            && self.conversion.tool_choice_steering.is_enabled()
+        self.conversion.tool_choice_steering.is_enabled()
     }
 }
 
@@ -174,18 +184,22 @@ pub struct ProxyWarnings {
     pub prefill_dropped: u32,
     /// 因找不到对应 tool_use 而被跳过的当前轮 tool_result
     pub orphan_tool_results: u32,
-    /// 孤立 tool_result 被转成普通文本保留的次数
+    /// 兼容性保留字段；安全修复不再把孤立 tool_result 转为普通文本。
     pub orphan_tool_results_textified: u32,
     /// 因找不到对应 tool_result 而被从历史移除的 tool_use
     pub orphan_tool_uses: u32,
     /// 历史中重复出现的 tool_result（已配对过）被跳过
     pub duplicate_tool_results: u32,
-    /// 重复 tool_result 被转成普通文本保留的次数
+    /// 兼容性保留字段；安全修复不再把重复 tool_result 转为普通文本。
     pub duplicate_tool_results_textified: u32,
     /// user 消息只有 tool_result 且文本为空时补了 Kiro content 占位
     pub tool_result_content_placeholders: u32,
-    /// user 消息没有文本也没有 tool_result 时补了 Continue 占位
+    /// user 消息没有文本也没有 tool_result 时补了无语义非空占位
     pub empty_content_placeholders: u32,
+    /// 已从 assistant 历史正文中移除的内部工具 transcript 数量
+    pub sanitized_assistant_history_leaks: u32,
+    /// 已从 assistant 历史正文中移除的内部工具 transcript 字符数
+    pub sanitized_assistant_history_leak_chars: u32,
 }
 
 impl ProxyWarnings {
@@ -229,6 +243,18 @@ impl ProxyWarnings {
             parts.push(format!(
                 "empty-content-placeholder={}",
                 self.empty_content_placeholders
+            ));
+        }
+        if self.sanitized_assistant_history_leaks > 0 {
+            parts.push(format!(
+                "sanitized-assistant-history-leak={}",
+                self.sanitized_assistant_history_leaks
+            ));
+        }
+        if self.sanitized_assistant_history_leak_chars > 0 {
+            parts.push(format!(
+                "sanitized-assistant-history-leak-chars={}",
+                self.sanitized_assistant_history_leak_chars
             ));
         }
         if parts.is_empty() {
@@ -442,6 +468,7 @@ fn convert_request_with_model_id(
         messages,
         &model_id,
         &mut tool_name_map,
+        &mut warnings,
         options.clone(),
     )?;
 
@@ -449,15 +476,14 @@ fn convert_request_with_model_id(
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let repair_tool_pairing = options.conversion.tool_pairing_repair.is_enabled();
-    let (validated_tool_results, orphaned_tool_use_ids, orphan_tool_result_texts) =
+    if repair_tool_pairing || options.is_strict() {
+        sanitize_history_tool_results(&mut history, &mut warnings);
+    }
+    let (validated_tool_results, orphaned_tool_use_ids) =
         if repair_tool_pairing || options.is_strict() {
             validate_tool_pairing(&history, &tool_results, &mut warnings)
         } else {
-            (
-                tool_results.clone(),
-                std::collections::HashSet::new(),
-                Vec::new(),
-            )
+            (tool_results.clone(), std::collections::HashSet::new())
         };
 
     if options.is_strict()
@@ -514,15 +540,12 @@ fn convert_request_with_model_id(
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut content = text_content;
-    if !options.is_strict() && repair_tool_pairing {
-        append_orphan_tool_result_texts(&mut content, &orphan_tool_result_texts);
-    }
     if content.trim().is_empty() {
         if !context.tool_results.is_empty() {
             content = TOOL_RESULTS_PROVIDED_PLACEHOLDER.to_string();
             warnings.tool_result_content_placeholders += 1;
         } else {
-            content = "Continue".to_string();
+            content = EMPTY_USER_CONTENT_PLACEHOLDER.to_string();
             warnings.empty_content_placeholders += 1;
         }
     }
@@ -559,10 +582,20 @@ fn convert_request_with_model_id(
         req,
         &model_id,
         options.conversion.native_reasoning_fields.is_enabled(),
-    );
+        &options.native_reasoning_capability,
+    )?;
+    if additional_model_request_fields.is_none()
+        && requested_native_reasoning(req)
+        && !options.inject_thinking_prefix()
+    {
+        return Err(ConversionError::UnsupportedContent(
+            "reasoning was requested, but both native reasoning fields and compatible thinking prompt controls are unavailable"
+                .to_string(),
+        ));
+    }
     if additional_model_request_fields.is_none() {
         if let Some(oc) = &req.output_config {
-            if !oc.effort.trim().is_empty() {
+            if oc.effort.is_some() {
                 tracing::debug!(
                     model_id = %model_id,
                     "skipping unsupported additionalModelRequestFields for model"
@@ -594,6 +627,9 @@ mod tests {
     use super::*;
 
     const VALID_PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+    const VALID_GIF_BASE64: &str = "R0lGODlhCgAKAIMAAExpccrKyt3d3djY2MzMzNXV1dbW1tfX19TU1MjIyMXFxcnJydra2gAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQFAAAAACwAAAAACgAKAAAEFlDISau9uI60zggEIjFKUBigmK3sGgEAOw==";
+    const VALID_WEBP_BASE64: &str =
+        "UklGRi4AAABXRUJQVlA4ICIAAAAwAQCdASoKAAoAAUAmJaQAA3AA/vowTCBmfRlsxdYrgAAA";
 
     fn valid_jpeg_base64() -> String {
         BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xdb, 0xff, 0xd9])
@@ -732,6 +768,55 @@ mod tests {
             images[0].source.bytes.as_deref(),
             Some(VALID_PNG_1X1_BASE64)
         );
+    }
+
+    #[test]
+    fn supported_gif_and_webp_sources_round_trip_for_five_rounds() {
+        for round in 1..=5 {
+            for (media_type, expected_format, data) in [
+                ("image/gif", "gif", VALID_GIF_BASE64),
+                ("image/webp", "webp", VALID_WEBP_BASE64),
+            ] {
+                for source in [
+                    serde_json::json!({
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data
+                    }),
+                    serde_json::json!({
+                        "type": "url",
+                        "url": format!("data:{media_type};base64,{data}")
+                    }),
+                ] {
+                    let content = serde_json::json!([{
+                        "type": "image",
+                        "source": source
+                    }]);
+                    let (text, images, tool_results) = process_message_content(&content)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "round={round} media_type={media_type} conversion failed: {error}"
+                            )
+                        });
+
+                    assert!(text.is_empty(), "round={round} media_type={media_type}");
+                    assert!(
+                        tool_results.is_empty(),
+                        "round={round} media_type={media_type}"
+                    );
+                    assert_eq!(images.len(), 1, "round={round} media_type={media_type}");
+                    assert_eq!(
+                        images[0].format, expected_format,
+                        "round={round} media_type={media_type}"
+                    );
+                    assert_eq!(
+                        images[0].source.bytes.as_deref(),
+                        Some(data),
+                        "round={round} media_type={media_type}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1234,6 +1319,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_overlong_mapper_is_exact_and_never_used_for_short_names() {
+        let long_name =
+            "mcp__legacy_server_with_a_very_long_name__tool_with_a_very_long_historical_name";
+        let first = legacy_overlong_mapped_tool_name(long_name).expect("legacy overlong mapping");
+        let second = legacy_overlong_mapped_tool_name(long_name).expect("legacy overlong mapping");
+        assert_eq!(first, second);
+        assert!(first.len() <= TOOL_NAME_MAX_LEN);
+        assert_ne!(first, deterministic_mapped_tool_name(long_name));
+        assert!(legacy_overlong_mapped_tool_name("Bash").is_none());
+    }
+
+    #[test]
     fn test_map_tool_name_short_passthrough() {
         let mut map = HashMap::new();
         let result = map_tool_name("shortName", &mut map, ConverterOptions::default());
@@ -1279,6 +1376,51 @@ mod tests {
     }
 
     #[test]
+    fn convert_tools_rejects_raw_name_that_collides_with_another_mapped_name_atomically() {
+        let invalid_name = "foo-bar";
+        let mapped_name = deterministic_mapped_tool_name(invalid_name);
+
+        for names in [
+            [invalid_name.to_string(), mapped_name.clone()],
+            [mapped_name.clone(), invalid_name.to_string()],
+        ] {
+            let tools = Some(names.into_iter().map(|name| test_tool(&name)).collect());
+            let mut reverse_map = HashMap::from([(
+                "existingMapped".to_string(),
+                "existing-original".to_string(),
+            )]);
+            let before = reverse_map.clone();
+            let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
+                .expect_err("raw-vs-mapped collision must be rejected");
+
+            assert!(error.to_string().contains("same Kiro tool name"));
+            assert_eq!(reverse_map, before, "reverse map commit must be atomic");
+        }
+    }
+
+    #[test]
+    fn convert_tools_rejects_real_32_bit_hash_collision_in_either_order() {
+        // Precomputed SHA-256 first-8-hex collision. Both sanitized names share
+        // the same 51-byte prefix, so the final 63-byte Kiro names are equal.
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa__collision_4197";
+        let second = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa__collision_65941";
+        assert_eq!(
+            deterministic_mapped_tool_name(first),
+            deterministic_mapped_tool_name(second)
+        );
+
+        for names in [[first, second], [second, first]] {
+            let tools = Some(names.into_iter().map(test_tool).collect());
+            let mut reverse_map = HashMap::new();
+            let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
+                .expect_err("hash collision must be rejected instead of silently skipping a tool");
+
+            assert!(error.to_string().contains("same Kiro tool name"));
+            assert!(reverse_map.is_empty());
+        }
+    }
+
+    #[test]
     fn test_tool_name_mapping_can_be_disabled_by_conversion_plan() {
         use crate::anthropic::body_capabilities::BodyStageState;
 
@@ -1319,6 +1461,60 @@ mod tests {
                         if user.user_input_message.content.contains("<tool_choice>")
                 ))
         );
+    }
+
+    #[test]
+    fn operator_prompt_master_disables_all_proxy_prompt_additions() {
+        let mut options = ConverterOptions::default();
+        options.prompt_steering.enabled = false;
+
+        assert!(!options.inject_chunked_policy());
+        assert!(!options.inject_chunked_tool_descriptions());
+        assert!(!options.inject_thinking_prefix());
+        assert!(!options.inject_tool_choice_prefix());
+        assert!(options.tool_choice_steering_enabled());
+
+        options.prompt_steering.enabled = true;
+        options.prompt_steering.chunked_write.enabled = false;
+        options.prompt_steering.thinking.enabled = false;
+        options.prompt_steering.tool_choice.enabled = false;
+
+        assert!(!options.inject_chunked_policy());
+        assert!(!options.inject_chunked_tool_descriptions());
+        assert!(!options.inject_thinking_prefix());
+        assert!(!options.inject_tool_choice_prefix());
+        assert!(
+            options.tool_choice_steering_enabled(),
+            "prompt-only toggles must not disable structured tool filtering"
+        );
+    }
+
+    #[test]
+    fn operator_prompt_master_off_preserves_structured_tool_filtering() {
+        let req = base_tool_choice_request(serde_json::json!({
+            "type": "tool",
+            "name": "read_file"
+        }));
+        let mut options = ConverterOptions::default();
+        options.prompt_steering.enabled = false;
+
+        let result = convert_request_with_options(&req, options).unwrap();
+        let context = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context;
+
+        assert_eq!(context.tools.len(), 1);
+        assert!(result.conversation_state.history.iter().all(|message| {
+            !matches!(
+                message,
+                Message::User(user)
+                    if user.user_input_message.content.contains("<tool_choice>")
+                        || user.user_input_message.content.contains("<thinking_mode>")
+                        || user.user_input_message.content.contains(SYSTEM_CHUNKED_POLICY)
+            )
+        }));
     }
 
     #[test]
@@ -1804,7 +2000,7 @@ mod tests {
                 },
                 AnthropicTool {
                     name: "read".to_string(),
-                    description: "Duplicate tool".to_string(),
+                    description: "A test tool".to_string(),
                     input_schema: schema,
                     tool_type: None,
                     max_uses: None,
@@ -1827,6 +2023,67 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].tool_specification.name, "read");
+    }
+
+    #[test]
+    fn duplicate_declared_tool_definition_conflicts_fail_closed_for_five_rounds() {
+        let base = test_tool("read");
+        let mut conflicts = Vec::new();
+
+        let mut description = base.clone();
+        description.description = "conflicting description".to_string();
+        conflicts.push(("description", description));
+
+        let mut schema = base.clone();
+        schema
+            .input_schema
+            .insert("required".to_string(), serde_json::json!(["path"]));
+        conflicts.push(("input_schema", schema));
+
+        let mut tool_type = base.clone();
+        tool_type.tool_type = Some("computer_20250124".to_string());
+        conflicts.push(("type", tool_type));
+
+        let mut cache_control = base.clone();
+        cache_control.cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+        conflicts.push(("cache_control", cache_control));
+
+        let mut max_uses = base.clone();
+        max_uses.max_uses = Some(1);
+        conflicts.push(("max_uses", max_uses));
+
+        for round in 1..=5 {
+            for (field, conflicting) in &conflicts {
+                for reverse in [false, true] {
+                    let definitions = if reverse {
+                        vec![conflicting.clone(), base.clone()]
+                    } else {
+                        vec![base.clone(), conflicting.clone()]
+                    };
+                    let mut reverse_map = HashMap::new();
+                    let error = match convert_tools(
+                        &Some(definitions),
+                        &None,
+                        &mut reverse_map,
+                        ConverterOptions::default(),
+                    ) {
+                        Ok(converted) => panic!(
+                            "field={field} reverse={reverse} round={round}: conflicting duplicate unexpectedly converted as {} tool(s)",
+                            converted.tools.len()
+                        ),
+                        Err(error) => error,
+                    };
+                    assert!(
+                        error.to_string().contains("not structurally equivalent"),
+                        "field={field} reverse={reverse} round={round}: {error}"
+                    );
+                    assert!(
+                        reverse_map.is_empty(),
+                        "field={field} reverse={reverse} round={round}: reverse map commit must remain atomic"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1872,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn current_empty_user_message_gets_continue_placeholder() {
+    fn current_empty_user_message_gets_inert_placeholder() {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
@@ -1894,7 +2151,7 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let current = &result.conversation_state.current_message.user_input_message;
 
-        assert_eq!(current.content, "Continue");
+        assert_eq!(current.content, EMPTY_USER_CONTENT_PLACEHOLDER);
         assert!(current.user_input_message_context.tool_results.is_empty());
         assert_eq!(result.warnings.empty_content_placeholders, 1);
         assert_eq!(result.warnings.tool_result_content_placeholders, 0);
@@ -2159,11 +2416,15 @@ mod tests {
 
     #[test]
     fn test_anthropic_strict_avoids_chunk_policy_and_thinking_prefix() {
+        use crate::anthropic::model_capabilities::{
+            KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+
         use super::super::types::{Message as AnthropicMessage, SystemMessage, Thinking};
 
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
-            max_tokens: 1024,
+            max_tokens: 32768,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -2187,6 +2448,15 @@ mod tests {
             &req,
             ConverterOptions {
                 compat_profile: CompatProfile::AnthropicStrict,
+                native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                    KiroReasoningFieldCapability {
+                        path: KiroReasoningFieldPath::OutputConfig,
+                        efforts: ["low", "medium", "high", "max"]
+                            .map(str::to_string)
+                            .to_vec(),
+                        default_effort: Some("high".to_string()),
+                    },
+                ),
                 ..ConverterOptions::default()
             },
         )
@@ -2206,6 +2476,15 @@ mod tests {
         assert!(!first_user.contains(SYSTEM_CHUNKED_POLICY));
         assert!(!first_user.contains("<thinking_mode>"));
         assert!(!first_user.contains("<thinking_output_policy>"));
+        assert_eq!(
+            result
+                .additional_model_request_fields
+                .expect("strict reasoning must use the verified native transport")
+                .output_config
+                .expect("output_config reasoning path")
+                .effort,
+            "high"
+        );
     }
 
     #[test]
@@ -2216,7 +2495,7 @@ mod tests {
 
         let req = MessagesRequest {
             model: "claude-sonnet-4-6-thinking".to_string(),
-            max_tokens: 1024,
+            max_tokens: 32768,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -2238,9 +2517,15 @@ mod tests {
             ModelResolutionSource::FamilyNormalized,
         );
 
-        let result =
-            convert_request_with_resolved_model(&req, ConverterOptions::default(), &resolution)
-                .expect("thinking request should convert through resolved base model");
+        let mut prompt_transport_options = ConverterOptions::default();
+        prompt_transport_options.conversion.native_reasoning_fields =
+            crate::anthropic::body_capabilities::BodyStageState::Disabled;
+        let result = convert_request_with_resolved_model(
+            &req,
+            prompt_transport_options.clone(),
+            &resolution,
+        )
+        .expect("thinking request should convert through resolved base model");
 
         assert_eq!(
             result
@@ -2293,7 +2578,7 @@ mod tests {
                 budget_tokens: 0,
             }),
             output_config: Some(OutputConfig {
-                effort: "high".to_string(),
+                effort: Some("high".to_string()),
             }),
             metadata: None,
         };
@@ -2304,7 +2589,7 @@ mod tests {
         );
         let adaptive_result = convert_request_with_resolved_model(
             &adaptive_req,
-            ConverterOptions::default(),
+            prompt_transport_options,
             &adaptive_resolution,
         )
         .expect("adaptive request should convert");
@@ -2349,7 +2634,7 @@ mod tests {
                 budget_tokens: 0,
             }),
             output_config: Some(OutputConfig {
-                effort: "xhigh".to_string(),
+                effort: Some("xhigh".to_string()),
             }),
             metadata: None,
         };
@@ -2376,7 +2661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sonnet_4_6_xhigh_downgrades_to_max_for_native_schema() {
+    fn test_sonnet_4_6_explicit_unsupported_xhigh_is_rejected() {
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
         let req = MessagesRequest {
@@ -2395,18 +2680,558 @@ mod tests {
                 budget_tokens: 0,
             }),
             output_config: Some(OutputConfig {
-                effort: "xhigh".to_string(),
+                effort: Some("xhigh".to_string()),
             }),
             metadata: None,
         };
 
-        let result = convert_request_with_options(&req, ConverterOptions::default())
-            .expect("sonnet native reasoning request should convert");
+        let error = convert_request_with_options(&req, ConverterOptions::default())
+            .expect_err("explicit unsupported effort must not be silently remapped");
+        assert!(error.to_string().contains("not supported"));
+    }
 
-        let fields = result
+    #[test]
+    fn explicit_reasoning_effort_falls_back_to_compat_prompt_without_native_schema_five_rounds() {
+        use crate::anthropic::body_capabilities::{BodyStageState, KiroConverterPlan};
+
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-haiku-4.5".to_string(),
+            max_tokens: 4096,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: Some("high".to_string()),
+            }),
+            metadata: None,
+        };
+
+        for round in 0..5 {
+            for state in [
+                KiroReasoningCapabilityState::LegacyFallback,
+                KiroReasoningCapabilityState::Unknown,
+                KiroReasoningCapabilityState::AuthoritativeAbsent,
+                KiroReasoningCapabilityState::AuthoritativeInvalid,
+            ] {
+                let result = convert_request_with_options(
+                    &req,
+                    ConverterOptions {
+                        native_reasoning_capability: state.clone(),
+                        ..ConverterOptions::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("round {round}: {state:?}: {error}"));
+                assert!(
+                    result.additional_model_request_fields.is_none(),
+                    "round {round}: {state:?}: native fields must not be invented"
+                );
+                let injected = result
+                    .conversation_state
+                    .history
+                    .iter()
+                    .find_map(|message| match message {
+                        Message::User(user) => Some(&user.user_input_message.content),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("round {round}: {state:?}: missing compat history"));
+                assert!(
+                    injected.contains("<thinking_mode>adaptive</thinking_mode>"),
+                    "round {round}: {state:?}: {injected}"
+                );
+                assert!(
+                    injected.contains("<thinking_effort>high</thinking_effort>"),
+                    "round {round}: {state:?}: {injected}"
+                );
+            }
+
+            let mut conversion = KiroConverterPlan::default();
+            conversion.thinking_prompt_controls = BodyStageState::Disabled;
+            let error = convert_request_with_options(
+                &req,
+                ConverterOptions {
+                    conversion,
+                    native_reasoning_capability: KiroReasoningCapabilityState::AuthoritativeAbsent,
+                    ..ConverterOptions::default()
+                },
+            )
+            .expect_err("reasoning must fail when both native and compat controls are unavailable");
+            assert!(
+                error.to_string().contains(
+                    "both native reasoning fields and compatible thinking prompt controls"
+                ),
+                "round {round}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn opus_legacy_and_advertised_reasoning_defaults_are_exact_for_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, Thinking};
+
+        for round in 0..5 {
+            for (model, expected) in [
+                ("claude-opus-4.6", "high"),
+                ("claude-opus-4.7", "xhigh"),
+                ("claude-opus-4.8", "xhigh"),
+            ] {
+                let req = MessagesRequest {
+                    model: model.to_string(),
+                    max_tokens: 4096,
+                    messages: vec![AnthropicMessage {
+                        role: "user".to_string(),
+                        content: serde_json::json!("Hello"),
+                    }],
+                    stream: false,
+                    system: None,
+                    tools: None,
+                    tool_choice: None,
+                    thinking: Some(Thinking {
+                        thinking_type: "adaptive".to_string(),
+                        budget_tokens: 0,
+                    }),
+                    output_config: None,
+                    metadata: None,
+                };
+                let fields = convert_request_with_options(&req, ConverterOptions::default())
+                    .unwrap_or_else(|error| panic!("round {round}: {model}: {error}"))
+                    .additional_model_request_fields
+                    .unwrap_or_else(|| panic!("round {round}: {model} native fields"));
+                assert_eq!(
+                    fields.output_config.expect("output config").effort,
+                    expected,
+                    "round {round}: {model}"
+                );
+            }
+
+            let req = MessagesRequest {
+                model: "claude-opus-4.8".to_string(),
+                max_tokens: 4096,
+                messages: vec![AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Hello"),
+                }],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: Some(Thinking {
+                    thinking_type: "adaptive".to_string(),
+                    budget_tokens: 0,
+                }),
+                output_config: None,
+                metadata: None,
+            };
+            let fields = convert_request_with_options(
+                &req,
+                ConverterOptions {
+                    native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                        KiroReasoningFieldCapability {
+                            path: KiroReasoningFieldPath::Reasoning,
+                            efforts: ["high", "max"].map(str::to_string).to_vec(),
+                            default_effort: Some("max".to_string()),
+                        },
+                    ),
+                    ..ConverterOptions::default()
+                },
+            )
+            .expect("advertised default conversion")
             .additional_model_request_fields
-            .expect("sonnet 4.6 should emit native reasoning fields");
-        assert_eq!(fields.output_config.unwrap().effort, "max");
+            .expect("advertised native fields");
+            assert_eq!(
+                fields.reasoning.expect("reasoning path").effort,
+                "max",
+                "round {round}: advertised default must win"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_output_config_effort_uses_authoritative_max_wire_default_for_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 4096,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig::default()),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::OutputConfig,
+                    efforts: ["low", "max"].map(str::to_string).to_vec(),
+                    default_effort: Some("max".to_string()),
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for round in 0..5 {
+            let fields = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                .additional_model_request_fields
+                .expect("authoritative native fields");
+            assert_eq!(
+                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::json!({"output_config": {"effort": "max"}}),
+                "round {round}: omitted effort must use the schema default even when high is not in the enum"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_high_output_config_effort_survives_authoritative_wire_conversion_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 4096,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: Some("high".to_string()),
+            }),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::OutputConfig,
+                    efforts: ["high", "max"].map(str::to_string).to_vec(),
+                    default_effort: Some("max".to_string()),
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for round in 0..5 {
+            let fields = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                .additional_model_request_fields
+                .expect("authoritative native fields");
+            assert_eq!(
+                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::json!({"output_config": {"effort": "high"}}),
+                "round {round}: explicit high must not be replaced by the schema default"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_output_config_effort_fails_closed_without_authoritative_default_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 4096,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig::default()),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::OutputConfig,
+                    efforts: vec!["max".to_string()],
+                    default_effort: None,
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for round in 0..5 {
+            let error = convert_request_with_options(&req, options.clone())
+                .expect_err("omitted effort without an authoritative default must reject");
+            assert!(
+                error.to_string().contains("no default effort"),
+                "round {round}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_output_config_effort_uses_legacy_prompt_compat_default_five_rounds() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
+        use super::super::types::{Message as AnthropicMessage, OutputConfig};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 4096,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig::default()),
+            metadata: None,
+        };
+        let mut options = ConverterOptions::default();
+        options.conversion.native_reasoning_fields = BodyStageState::Disabled;
+
+        for round in 0..5 {
+            let result = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            assert!(result.additional_model_request_fields.is_none());
+            let injected = result
+                .conversation_state
+                .history
+                .iter()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(user.user_input_message.content.as_str()),
+                    Message::Assistant(_) => None,
+                })
+                .expect("compatibility prompt history");
+            assert!(
+                injected.contains("<thinking_effort>high</thinking_effort>"),
+                "round {round}: {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_thinking_remains_authoritative_over_omitted_output_config_effort_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 4096,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "disabled".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig::default()),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::OutputConfig,
+                    efforts: vec!["max".to_string()],
+                    default_effort: Some("max".to_string()),
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for round in 0..5 {
+            let result = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            assert!(
+                result.additional_model_request_fields.is_none(),
+                "round {round}"
+            );
+            assert!(
+                result
+                    .conversation_state
+                    .history
+                    .iter()
+                    .all(|message| match message {
+                        Message::User(user) =>
+                            !user.user_input_message.content.contains("<thinking_mode>"),
+                        Message::Assistant(_) => true,
+                    }),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_thinking_budget_remains_authoritative_over_omitted_output_effort_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 64_000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 32_000,
+            }),
+            output_config: Some(OutputConfig::default()),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::OutputConfig,
+                    efforts: ["high", "max"].map(str::to_string).to_vec(),
+                    default_effort: Some("max".to_string()),
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for round in 0..5 {
+            let fields = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                .additional_model_request_fields
+                .expect("native reasoning fields");
+            assert_eq!(
+                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::json!({"output_config": {"effort": "high"}}),
+                "round {round}: enabled budget mapping must win over the max schema default"
+            );
+        }
+    }
+
+    #[test]
+    fn native_reasoning_uses_discovered_reasoning_path_and_preserves_max() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8-thinking".to_string(),
+            max_tokens: 128_000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: Some("max".to_string()),
+            }),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::Reasoning,
+                    efforts: vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                    default_effort: Some("high".to_string()),
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for _round in 0..5 {
+            let fields = convert_request_with_options(&req, options.clone())
+                .expect("schema-driven conversion")
+                .additional_model_request_fields
+                .expect("native reasoning fields");
+            assert!(fields.output_config.is_none());
+            assert_eq!(fields.reasoning.expect("reasoning path").effort, "max");
+        }
+    }
+
+    #[test]
+    fn enabled_large_budget_maps_without_parse_time_truncation() {
+        use super::super::types::{Message as AnthropicMessage, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.6-thinking".to_string(),
+            max_tokens: 128_000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 100_000,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+
+        let fields = convert_request_with_options(&req, ConverterOptions::default())
+            .expect("budget compatibility mapping")
+            .additional_model_request_fields
+            .expect("native fields");
+        assert_eq!(fields.output_config.expect("output config").effort, "max");
     }
 
     #[test]
@@ -2431,7 +3256,7 @@ mod tests {
                 budget_tokens: 0,
             }),
             output_config: Some(OutputConfig {
-                effort: "xhigh".to_string(),
+                effort: Some("xhigh".to_string()),
             }),
             metadata: None,
         };
@@ -2454,7 +3279,93 @@ mod tests {
     }
 
     #[test]
+    fn output_config_without_thinking_uses_adaptive_compatibility_prompt_for_five_rounds() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
+        use super::super::types::{Message as AnthropicMessage, OutputConfig};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: Some("max".to_string()),
+            }),
+            metadata: None,
+        };
+        let mut options = ConverterOptions::default();
+        options.conversion.native_reasoning_fields = BodyStageState::Disabled;
+
+        for round in 0..5 {
+            let result = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            assert!(result.additional_model_request_fields.is_none());
+            let injected = result
+                .conversation_state
+                .history
+                .iter()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(user.user_input_message.content.as_str()),
+                    Message::Assistant(_) => None,
+                })
+                .expect("compatibility prompt history");
+            assert!(injected.contains("<thinking_mode>adaptive</thinking_mode>"));
+            assert!(injected.contains("<thinking_effort>max</thinking_effort>"));
+        }
+    }
+
+    #[test]
+    fn explicit_reasoning_fails_closed_when_native_and_prompt_transports_are_disabled() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: Some("max".to_string()),
+            }),
+            metadata: None,
+        };
+        let mut options = ConverterOptions::default();
+        options.conversion.native_reasoning_fields = BodyStageState::Disabled;
+        options.conversion.thinking_prompt_controls = BodyStageState::Disabled;
+
+        for round in 0..5 {
+            let error = convert_request_with_options(&req, options.clone())
+                .expect_err("disabled reasoning transports must reject");
+            assert!(
+                error.to_string().contains("both native reasoning fields"),
+                "round {round}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_force_visible_thinking_adds_policy_for_adaptive_request() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
         let req = MessagesRequest {
@@ -2473,19 +3384,18 @@ mod tests {
                 budget_tokens: 0,
             }),
             output_config: Some(OutputConfig {
-                effort: "high".to_string(),
+                effort: Some("high".to_string()),
             }),
             metadata: None,
         };
 
-        let result = convert_request_with_options(
-            &req,
-            ConverterOptions {
-                force_visible_thinking: true,
-                ..ConverterOptions::default()
-            },
-        )
-        .expect("adaptive request should convert");
+        let mut options = ConverterOptions {
+            force_visible_thinking: true,
+            ..ConverterOptions::default()
+        };
+        options.conversion.native_reasoning_fields = BodyStageState::Disabled;
+        let result = convert_request_with_options(&req, options)
+            .expect("adaptive request should convert through compatibility prompt transport");
         let first_history_user = result
             .conversation_state
             .history
@@ -2503,6 +3413,8 @@ mod tests {
 
     #[test]
     fn test_force_visible_thinking_overrides_strict_prefix_suppression() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
         use super::super::types::{
             Message as AnthropicMessage, OutputConfig, SystemMessage, Thinking,
         };
@@ -2526,20 +3438,19 @@ mod tests {
                 budget_tokens: 0,
             }),
             output_config: Some(OutputConfig {
-                effort: "high".to_string(),
+                effort: Some("high".to_string()),
             }),
             metadata: None,
         };
 
-        let result = convert_request_with_options(
-            &req,
-            ConverterOptions {
-                compat_profile: CompatProfile::AnthropicStrict,
-                force_visible_thinking: true,
-                ..ConverterOptions::default()
-            },
-        )
-        .expect("strict adaptive request should convert with forced visible thinking");
+        let mut options = ConverterOptions {
+            compat_profile: CompatProfile::AnthropicStrict,
+            force_visible_thinking: true,
+            ..ConverterOptions::default()
+        };
+        options.conversion.native_reasoning_fields = BodyStageState::Disabled;
+        let result = convert_request_with_options(&req, options)
+            .expect("strict adaptive request should use forced compatibility prompt transport");
         let first_history_user = result
             .conversation_state
             .history
@@ -2697,6 +3608,155 @@ mod tests {
     }
 
     #[test]
+    fn named_tool_choice_prefers_exact_name_across_profiles_and_prompt_master_states() {
+        for compat_profile in [CompatProfile::ClaudeCode, CompatProfile::AnthropicStrict] {
+            for prompt_master_enabled in [false, true] {
+                for requested in ["foo-bar", "foo_bar"] {
+                    let mut req = base_tool_choice_request(serde_json::json!({
+                        "type": "tool",
+                        "name": requested
+                    }));
+                    req.tools = Some(vec![test_tool("foo-bar"), test_tool("foo_bar")]);
+                    let mut options = ConverterOptions {
+                        compat_profile,
+                        ..ConverterOptions::default()
+                    };
+                    options.prompt_steering.enabled = prompt_master_enabled;
+
+                    let result = convert_request_with_options(&req, options)
+                        .expect("an exact named choice must remain unambiguous");
+                    let tools = &result
+                        .conversation_state
+                        .current_message
+                        .user_input_message
+                        .user_input_message_context
+                        .tools;
+                    assert_eq!(tools.len(), 1);
+                    let upstream_name = &tools[0].tool_specification.name;
+                    assert_eq!(
+                        result.tool_name_map.get(upstream_name).map(String::as_str),
+                        Some(requested)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn named_tool_choice_rejects_ambiguous_normalized_fallback_across_modes() {
+        for compat_profile in [CompatProfile::ClaudeCode, CompatProfile::AnthropicStrict] {
+            for prompt_master_enabled in [false, true] {
+                let mut req = base_tool_choice_request(serde_json::json!({
+                    "type": "tool",
+                    "name": "foo.bar"
+                }));
+                req.tools = Some(vec![test_tool("foo-bar"), test_tool("foo_bar")]);
+                let mut options = ConverterOptions {
+                    compat_profile,
+                    ..ConverterOptions::default()
+                };
+                options.prompt_steering.enabled = prompt_master_enabled;
+
+                let error = convert_request_with_options(&req, options)
+                    .expect_err("ambiguous normalized tool choice must fail locally");
+                assert!(error.to_string().contains("tool_choice name is ambiguous"));
+            }
+        }
+    }
+
+    #[test]
+    fn named_tool_choice_allows_a_unique_normalized_fallback() {
+        let mut req = base_tool_choice_request(serde_json::json!({
+            "type": "tool",
+            "name": "foo.bar"
+        }));
+        req.tools = Some(vec![test_tool("foo-bar"), test_tool("unrelated")]);
+
+        let result = convert_request_with_options(&req, ConverterOptions::default())
+            .expect("a unique normalized fallback remains compatible");
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        assert_eq!(tools.len(), 1);
+        let upstream_name = &tools[0].tool_specification.name;
+        assert_eq!(
+            result.tool_name_map.get(upstream_name).map(String::as_str),
+            Some("foo-bar")
+        );
+    }
+
+    #[test]
+    fn disabled_operator_prompt_master_disables_prompt_but_preserves_structured_tool_choice_semantics()
+     {
+        let cases = [
+            (serde_json::json!({"type": "none"}), 0usize),
+            (serde_json::json!({"type": "any"}), 2usize),
+            (
+                serde_json::json!({"type": "tool", "name": "read_file"}),
+                1usize,
+            ),
+        ];
+
+        for (tool_choice, expected_tool_count) in cases {
+            let req = base_tool_choice_request(tool_choice);
+            let mut options = ConverterOptions::default();
+            options.prompt_steering.enabled = false;
+
+            let result = convert_request_with_options(&req, options).unwrap();
+            assert_eq!(
+                result
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tools
+                    .len(),
+                expected_tool_count
+            );
+            assert!(result.conversation_state.history.iter().all(|message| {
+                !matches!(
+                    message,
+                    Message::User(user)
+                        if user.user_input_message.content.contains("<tool_choice>")
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn disabled_tool_choice_prompt_subtoggle_keeps_structured_named_filtering() {
+        let req = base_tool_choice_request(serde_json::json!({
+            "type": "tool",
+            "name": "read_file"
+        }));
+        let mut options = ConverterOptions::default();
+        options.prompt_steering.enabled = false;
+        options.prompt_steering.tool_choice.enabled = false;
+
+        let result = convert_request_with_options(&req, options).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools
+                .len(),
+            1
+        );
+        assert!(result.conversation_state.history.iter().all(|message| {
+            !matches!(
+                message,
+                Message::User(user)
+                    if user.user_input_message.content.contains("<tool_choice>")
+            )
+        }));
+    }
+
+    #[test]
     fn test_anthropic_strict_filters_tool_choice_without_prompt_steering() {
         let req = base_tool_choice_request(serde_json::json!({
             "type": "tool",
@@ -2803,13 +3863,13 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("orphan-123", "some result")];
 
-        let (filtered, _, orphan_texts) =
-            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
+        let mut warnings = ProxyWarnings::default();
+        let (filtered, _) = validate_tool_pairing(&history, &tool_results, &mut warnings);
 
         // 孤立的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
-        assert_eq!(orphan_texts.len(), 1);
-        assert!(orphan_texts[0].contains("some result"));
+        assert_eq!(warnings.orphan_tool_results, 1);
+        assert_eq!(warnings.orphan_tool_results_textified, 0);
     }
 
     #[test]
@@ -2836,7 +3896,7 @@ mod tests {
         // 没有 tool_result
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned, _) =
+        let (filtered, orphaned) =
             validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 结果应该为空（因为没有 tool_result）
@@ -2868,7 +3928,7 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "file content")];
 
-        let (filtered, orphaned, _) =
+        let (filtered, orphaned) =
             validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 配对成功，应该保留，无孤立
@@ -2901,16 +3961,16 @@ mod tests {
             ToolResult::success("tool-3", "orphan result"), // 孤立
         ];
 
-        let (filtered, orphaned, orphan_texts) =
-            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
+        let mut warnings = ProxyWarnings::default();
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results, &mut warnings);
 
         // 只有 tool-1 应该保留
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
         // tool-2 是孤立的 tool_use（无 result），tool-3 是孤立的 tool_result
         assert!(orphaned.contains("tool-2"));
-        assert_eq!(orphan_texts.len(), 1);
-        assert!(orphan_texts[0].contains("orphan result"));
+        assert_eq!(warnings.orphan_tool_results, 1);
+        assert_eq!(warnings.orphan_tool_results_textified, 0);
     }
 
     #[test]
@@ -2952,7 +4012,7 @@ mod tests {
         // 当前消息没有 tool_results（用户只是继续对话）
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned, _) =
+        let (filtered, orphaned) =
             validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 结果应该为空，且不应该有孤立 tool_use
@@ -2995,7 +4055,7 @@ mod tests {
         // 当前消息又发送了相同的 tool_result（重复）
         let tool_results = vec![ToolResult::success("tool-1", "file content again")];
 
-        let (filtered, _, _) =
+        let (filtered, _) =
             validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 重复的 tool_result 应该被过滤掉
@@ -3003,7 +4063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_tool_pairing_textifies_duplicate_current_result() {
+    fn test_validate_tool_pairing_drops_duplicate_current_result_without_textifying() {
         use crate::kiro::model::requests::tool::ToolUseEntry;
 
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -3028,16 +4088,19 @@ mod tests {
         ];
         let mut warnings = ProxyWarnings::default();
 
-        let (filtered, orphaned, textified) =
-            validate_tool_pairing(&history, &tool_results, &mut warnings);
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results, &mut warnings);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
+        assert_eq!(
+            filtered[0].content[0]
+                .get("text")
+                .and_then(serde_json::Value::as_str),
+            Some("first result")
+        );
         assert!(orphaned.is_empty());
-        assert_eq!(textified.len(), 1);
-        assert!(textified[0].contains("duplicate result"));
         assert_eq!(warnings.duplicate_tool_results, 1);
-        assert_eq!(warnings.duplicate_tool_results_textified, 1);
+        assert_eq!(warnings.duplicate_tool_results_textified, 0);
     }
 
     #[test]
@@ -3074,17 +4137,16 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "second")];
 
-        let (filtered, orphaned, orphan_texts) =
+        let (filtered, orphaned) =
             validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
         assert!(orphaned.is_empty());
-        assert!(orphan_texts.is_empty());
     }
 
     #[test]
-    fn test_validate_tool_pairing_textifies_result_for_non_adjacent_tool_use() {
+    fn test_validate_tool_pairing_drops_result_for_non_adjacent_tool_use() {
         use crate::kiro::model::requests::tool::ToolUseEntry;
 
         let mut first_assistant = AssistantMessage::new("First read.");
@@ -3117,13 +4179,114 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "stale repeat")];
 
-        let (filtered, orphaned, orphan_texts) =
-            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
+        let mut warnings = ProxyWarnings::default();
+        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results, &mut warnings);
 
         assert!(filtered.is_empty());
         assert!(orphaned.contains("tool-2"));
-        assert_eq!(orphan_texts.len(), 1);
-        assert!(orphan_texts[0].contains("stale repeat"));
+        assert_eq!(warnings.orphan_tool_results, 1);
+        assert_eq!(warnings.orphan_tool_results_textified, 0);
+    }
+
+    #[test]
+    fn converted_request_never_copies_duplicate_or_orphan_tool_result_content_into_text() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": "run"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "true"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "first structured result"},
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "duplicate secret result"},
+                    {"type": "tool_result", "tool_use_id": "toolu_orphan", "content": "orphan secret result"},
+                    {"type": "text", "text": "safe current text"}
+                ]}
+            ],
+            "tools": [{
+                "name": "Bash",
+                "description": "run a command",
+                "input_schema": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+
+        let converted = convert_request(&req).expect("convert");
+        let current = &converted
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.content, "safe current text");
+        assert_eq!(current.user_input_message_context.tool_results.len(), 1);
+        assert_eq!(
+            current.user_input_message_context.tool_results[0].content[0]
+                .get("text")
+                .and_then(serde_json::Value::as_str),
+            Some("first structured result")
+        );
+        assert_eq!(converted.warnings.duplicate_tool_results, 1);
+        assert_eq!(converted.warnings.orphan_tool_results, 1);
+        assert_eq!(converted.warnings.duplicate_tool_results_textified, 0);
+        assert_eq!(converted.warnings.orphan_tool_results_textified, 0);
+        let serialized = serde_json::to_string(&converted.conversation_state).unwrap();
+        assert!(!serialized.contains("duplicate secret result"));
+        assert!(!serialized.contains("orphan secret result"));
+    }
+
+    #[test]
+    fn converted_history_keeps_first_valid_result_and_drops_invalid_result_content() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": "run"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "true"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "first history result"},
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "duplicate history secret"},
+                    {"type": "tool_result", "tool_use_id": "toolu_orphan", "content": "orphan history secret"},
+                    {"type": "text", "text": "safe history text"}
+                ]},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "next"}
+            ],
+            "tools": [{
+                "name": "Bash",
+                "description": "run a command",
+                "input_schema": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+
+        let converted = convert_request(&req).expect("convert");
+        let Message::User(history_result) = &converted.conversation_state.history[2] else {
+            panic!("expected historical tool result user");
+        };
+        let results = &history_result
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_use_id, "toolu_1");
+        assert_eq!(
+            results[0].content[0]
+                .get("text")
+                .and_then(serde_json::Value::as_str),
+            Some("first history result")
+        );
+        assert_eq!(
+            history_result.user_input_message.content,
+            "safe history text"
+        );
+        assert_eq!(converted.warnings.duplicate_tool_results, 1);
+        assert_eq!(converted.warnings.orphan_tool_results, 1);
+        let serialized = serde_json::to_string(&converted.conversation_state).unwrap();
+        assert!(!serialized.contains("duplicate history secret"));
+        assert!(!serialized.contains("orphan history secret"));
     }
 
     #[test]
@@ -3171,6 +4334,178 @@ mod tests {
         assert_eq!(
             tool_name_map.get(&tool_uses[0].name),
             Some(&"read_file".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitizes_continue_transcript_but_preserves_following_tool_use() {
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "可信前言。\n\nuser Cont"},
+                {"type": "text", "text": "inue\n\nbashHashd1e9567d: hidden output\nsecret tail"},
+                {"type": "tool_use", "id": "toolu_real", "name": "Bash", "input": {"command": "pwd"}},
+                {"type": "text", "text": "after tool"}
+            ]),
+        };
+
+        let mut tool_name_map =
+            HashMap::from([(deterministic_mapped_tool_name("Bash"), "Bash".to_string())]);
+        let result =
+            convert_assistant_message(&msg, &mut tool_name_map, ConverterOptions::default())
+                .expect("convert");
+
+        assert_eq!(
+            result.assistant_response_message.content,
+            "可信前言。\n\nafter tool"
+        );
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("structured tool use");
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "toolu_real");
+        assert_eq!(tool_uses[0].input, serde_json::json!({"command": "pwd"}));
+    }
+
+    #[test]
+    fn sanitizes_legacy_tool_results_and_discards_post_close_prose() {
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "Safe prefix\nuser Tool results pro"},
+                {"type": "text", "text": "vided.\n\nTool results:\n\n[readHash9b9a8d05] hidden\n</function_results>\nLet me continue"}
+            ]),
+        };
+
+        let mut tool_name_map =
+            HashMap::from([(deterministic_mapped_tool_name("Read"), "Read".to_string())]);
+        let result =
+            convert_assistant_message(&msg, &mut tool_name_map, ConverterOptions::default())
+                .expect("convert");
+        assert_eq!(result.assistant_response_message.content, "Safe prefix\n");
+    }
+
+    #[test]
+    fn assistant_history_sanitizer_preserves_fenced_and_strict_content() {
+        let fixture = "```text\nuser Continue\n\nbashHashd1e9567d: example\n```";
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([{"type": "text", "text": fixture}]),
+        };
+        let normal =
+            convert_assistant_message(&msg, &mut HashMap::new(), ConverterOptions::default())
+                .expect("convert");
+        assert_eq!(normal.assistant_response_message.content, fixture);
+
+        let leaked = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("user Continue\n\nbashHashd1e9567d: strict payload"),
+        };
+        let mut strict = ConverterOptions::default();
+        strict.compat_profile = CompatProfile::AnthropicStrict;
+        let strict_result =
+            convert_assistant_message(&leaked, &mut HashMap::new(), strict).expect("strict");
+        assert_eq!(
+            strict_result.assistant_response_message.content,
+            "user Continue\n\nbashHashd1e9567d: strict payload"
+        );
+    }
+
+    #[test]
+    fn polluted_history_round_trip_keeps_tool_pairing_and_reports_sanitization() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "inspect"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "I will inspect.\n\nuser Continue\n\nbashHashd1e9567d: credential-like output\nnever replay"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pwd"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}
+                ]},
+                {"role": "assistant", "content": "The command completed."},
+                {"role": "user", "content": "continue analysis"}
+            ],
+            "tools": [{
+                "name": "Bash",
+                "description": "run a command",
+                "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }]
+        }))
+        .expect("request");
+
+        let converted = convert_request(&req).expect("convert");
+        assert_eq!(converted.warnings.sanitized_assistant_history_leaks, 1);
+        assert!(converted.warnings.sanitized_assistant_history_leak_chars > 0);
+        assert!(
+            converted
+                .warnings
+                .encode_header()
+                .expect("warning header")
+                .contains("sanitized-assistant-history-leak=1")
+        );
+
+        let history_json = serde_json::to_string(&converted.conversation_state.history).unwrap();
+        assert!(!history_json.contains("user Continue"));
+        assert!(!history_json.contains("credential-like output"));
+        let assistant = converted
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant(assistant)
+                    if assistant
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .is_some_and(|tools| !tools.is_empty()) =>
+                {
+                    Some(assistant)
+                }
+                _ => None,
+            })
+            .expect("assistant tool turn");
+        assert_eq!(
+            assistant.assistant_response_message.content,
+            "I will inspect.\n\n"
+        );
+        assert_eq!(
+            assistant
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .unwrap()[0]
+                .tool_use_id,
+            "toolu_1"
+        );
+        let result_user = converted
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(user)
+                    if user
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter()
+                        .any(|result| result.tool_use_id == "toolu_1") =>
+                {
+                    Some(user)
+                }
+                _ => None,
+            })
+            .expect("tool result turn");
+        assert_eq!(
+            result_user
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0]
+                .tool_use_id,
+            "toolu_1"
         );
     }
 
@@ -3303,7 +4638,12 @@ mod tests {
         ]);
 
         let (_, images, tool_results) = process_message_content(&content).expect("process");
-        let text = kiro_tool_result_to_text(&tool_results[0]).expect("text");
+        let text = tool_results[0]
+            .content
+            .iter()
+            .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "png");
@@ -3572,6 +4912,499 @@ mod tests {
             .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+    }
+
+    #[test]
+    fn merge_consecutive_suppressed_assistant_messages_keeps_non_empty_placeholder() {
+        let first = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("user Continue\n\nbashHashd1e9567d: first hidden payload"),
+        };
+        let second = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!(
+                "user Tool results provided.\n\nTool results:\n\n[readHash9b9a8d05] second hidden payload"
+            ),
+        };
+
+        let mut tool_name_map = HashMap::from([
+            (deterministic_mapped_tool_name("Bash"), "Bash".to_string()),
+            (deterministic_mapped_tool_name("Read"), "Read".to_string()),
+        ]);
+        let merged = merge_assistant_messages(
+            &[&first, &second],
+            &mut tool_name_map,
+            ConverterOptions::default(),
+        )
+        .expect("merge");
+        assert_eq!(merged.assistant_response_message.content, " ");
+        assert!(merged.assistant_response_message.tool_uses.is_none());
+    }
+
+    #[test]
+    fn merge_consecutive_assistant_messages_sanitizes_reconstructed_content() {
+        let first = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("safe prefix\nuser Continue\n\n"),
+        };
+        let second = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "bashHashd1e9567d: hidden across records"},
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pwd"}},
+                {"type": "text", "text": "after tool"}
+            ]),
+        };
+
+        let merged = merge_assistant_messages(
+            &[&first, &second],
+            &mut HashMap::new(),
+            ConverterOptions::default(),
+        )
+        .expect("merge");
+        assert_eq!(merged.assistant_response_message.content, "safe prefix\n");
+        let tools = merged
+            .assistant_response_message
+            .tool_uses
+            .expect("tool use");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_use_id, "toolu_1");
+    }
+
+    #[test]
+    fn merge_separator_cannot_reconstruct_a_tool_transcript() {
+        let first = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("user Continue"),
+        };
+        let second = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("bashHashd1e9567d: hidden after merge"),
+        };
+
+        let mut tool_name_map =
+            HashMap::from([(deterministic_mapped_tool_name("Bash"), "Bash".to_string())]);
+        let merged = merge_assistant_messages(
+            &[&first, &second],
+            &mut tool_name_map,
+            ConverterOptions::default(),
+        )
+        .expect("merge");
+        assert_eq!(merged.assistant_response_message.content, " ");
+    }
+
+    #[test]
+    fn merge_separator_prevents_false_partial_role_match() {
+        let first = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("user Cont"),
+        };
+        let second = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("inue\n\nbashHashd1e9567d: discussed as ordinary text"),
+        };
+
+        let merged = merge_assistant_messages(
+            &[&first, &second],
+            &mut HashMap::new(),
+            ConverterOptions::default(),
+        )
+        .expect("merge");
+        assert_eq!(
+            merged.assistant_response_message.content,
+            "user Cont\n\ninue\n\nbashHashd1e9567d: discussed as ordinary text"
+        );
+    }
+
+    #[test]
+    fn flattened_tool_boundary_cannot_reconstruct_a_tool_transcript() {
+        let message = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "user Continue\n\n"},
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pwd"}},
+                {"type": "text", "text": "Bash: hidden after flattening"}
+            ]),
+        };
+        let merged = merge_assistant_messages(
+            &[&message],
+            &mut HashMap::new(),
+            ConverterOptions::default(),
+        )
+        .expect("merge");
+        assert_eq!(merged.assistant_response_message.content, " ");
+        let tools = merged
+            .assistant_response_message
+            .tool_uses
+            .expect("structured tool use");
+        assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn reconstructed_scan_preserves_complete_unsigned_thinking_prefix() {
+        let fixture = "user Continue\n\nbashHashd1e9567d: discussed inside thinking";
+        let message = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": fixture},
+                {"type": "text", "text": "visible answer"}
+            ]),
+        };
+
+        let merged = merge_assistant_messages(
+            &[&message],
+            &mut HashMap::new(),
+            ConverterOptions::default(),
+        )
+        .expect("merge");
+        assert_eq!(
+            merged.assistant_response_message.content,
+            format!("<thinking>{fixture}</thinking>\n\nvisible answer")
+        );
+    }
+
+    #[test]
+    fn visible_literal_thinking_close_cannot_hide_reconstructed_transcript() {
+        let message = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "safe reasoning"},
+                {"type": "text", "text": "user Continue\n\n"},
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pwd"}},
+                {"type": "text", "text": "Bash: hidden\n</thinking>"}
+            ]),
+        };
+
+        let merged = merge_assistant_messages(
+            &[&message],
+            &mut HashMap::new(),
+            ConverterOptions::default(),
+        )
+        .expect("merge");
+        assert_eq!(
+            merged.assistant_response_message.content,
+            "<thinking>safe reasoning</thinking>\n\n"
+        );
+        assert_eq!(
+            merged
+                .assistant_response_message
+                .tool_uses
+                .expect("structured tool use")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn signed_thinking_uses_native_reasoning_without_xml_for_five_rounds() {
+        for round in 0..5 {
+            let thinking = format!("signed thought {round}");
+            let signature = format!("signature-{round}");
+            let message = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": thinking, "signature": signature},
+                    {"type": "text", "text": format!("visible answer {round}")},
+                    {"type": "tool_use", "id": format!("toolu_{round}"), "name": "Bash", "input": {"command": "pwd"}}
+                ]),
+            };
+
+            let converted = convert_assistant_message(
+                &message,
+                &mut HashMap::new(),
+                ConverterOptions::default(),
+            )
+            .expect("signed thinking should convert");
+            let assistant = converted.assistant_response_message;
+
+            assert_eq!(assistant.content, format!("visible answer {round}"));
+            assert!(!assistant.content.contains("<thinking>"));
+            assert!(!assistant.content.contains(&thinking));
+            assert_eq!(assistant.tool_uses.as_ref().map(Vec::len), Some(1));
+            assert_eq!(
+                assistant.reasoning_content,
+                Some(ReasoningContent::reasoning_text(thinking, signature))
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_thinking_keeps_compat_xml_without_native_reasoning_for_five_rounds() {
+        for round in 0..5 {
+            let thinking = format!("unsigned thought {round}");
+            let message = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": thinking},
+                    {"type": "text", "text": format!("answer {round}")}
+                ]),
+            };
+
+            let converted = convert_assistant_message(
+                &message,
+                &mut HashMap::new(),
+                ConverterOptions::default(),
+            )
+            .expect("unsigned thinking should convert");
+            assert_eq!(
+                converted.assistant_response_message.content,
+                format!("<thinking>{thinking}</thinking>\n\nanswer {round}")
+            );
+            assert!(
+                converted
+                    .assistant_response_message
+                    .reasoning_content
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_uses_native_union_without_content_loss_for_five_rounds() {
+        for round in 0..5 {
+            let data = BASE64_STANDARD.encode(format!("opaque-{round}"));
+            let message = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "redacted_thinking", "data": data},
+                    {"type": "text", "text": format!("visible {round}")}
+                ]),
+            };
+
+            let converted = convert_assistant_message(
+                &message,
+                &mut HashMap::new(),
+                ConverterOptions::default(),
+            )
+            .expect("redacted thinking should convert");
+            assert_eq!(
+                converted.assistant_response_message.content,
+                format!("visible {round}")
+            );
+            assert_eq!(
+                converted.assistant_response_message.reasoning_content,
+                Some(ReasoningContent::redacted_content(data))
+            );
+        }
+    }
+
+    #[test]
+    fn full_request_preserves_separate_signed_and_redacted_history_turns() {
+        for round in 0..5 {
+            let signed_text = format!("signed thought {round}");
+            let signature = format!("signature-{round}");
+            let redacted = BASE64_STANDARD.encode(format!("opaque-{round}"));
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 128,
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": signed_text, "signature": signature},
+                        {"type": "text", "text": "first answer"},
+                        {"type": "tool_use", "id": "toolu_signed", "name": "Bash", "input": {"command": "pwd"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_signed", "content": "done"}
+                    ]},
+                    {"role": "assistant", "content": [
+                        {"type": "redacted_thinking", "data": redacted},
+                        {"type": "text", "text": "second answer"}
+                    ]},
+                    {"role": "user", "content": "continue"}
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "description": "run a command",
+                    "input_schema": {"type": "object"}
+                }]
+            }))
+            .expect("request");
+
+            let converted = convert_request(&request).expect("convert full request");
+            let assistant_messages = converted
+                .conversation_state
+                .history
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant(assistant) => Some(&assistant.assistant_response_message),
+                    Message::User(_) => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(assistant_messages.len(), 2, "round {round}");
+            assert_eq!(
+                assistant_messages[0].reasoning_content,
+                Some(ReasoningContent::reasoning_text(
+                    signed_text.clone(),
+                    signature.clone()
+                ))
+            );
+            assert_eq!(
+                assistant_messages[1].reasoning_content,
+                Some(ReasoningContent::redacted_content(redacted.clone()))
+            );
+            assert_eq!(assistant_messages[0].content, "first answer");
+            assert_eq!(assistant_messages[1].content, "second answer");
+            assert_eq!(
+                assistant_messages[0].tool_uses.as_ref().map(Vec::len),
+                Some(1),
+                "round {round}"
+            );
+            assert_eq!(
+                assistant_messages[0].tool_uses.as_ref().unwrap()[0].tool_use_id,
+                "toolu_signed"
+            );
+            let paired_result_count = converted
+                .conversation_state
+                .history
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(user) => Some(
+                        &user
+                            .user_input_message
+                            .user_input_message_context
+                            .tool_results,
+                    ),
+                    Message::Assistant(_) => None,
+                })
+                .flatten()
+                .filter(|result| result.tool_use_id == "toolu_signed")
+                .count();
+            assert_eq!(paired_result_count, 1, "round {round}");
+
+            let body = serde_json::to_string(&converted.conversation_state).unwrap();
+            assert_eq!(body.matches("reasoningContent").count(), 2, "round {round}");
+            assert_eq!(body.matches(&signed_text).count(), 1, "round {round}");
+            assert_eq!(body.matches(&signature).count(), 1, "round {round}");
+            assert!(!body.contains("<thinking>"), "round {round}");
+        }
+    }
+
+    #[test]
+    fn multiple_or_mixed_native_reasoning_blocks_are_rejected_for_five_rounds() {
+        for round in 0..5 {
+            let redacted = BASE64_STANDARD.encode(format!("opaque-{round}"));
+            for content in [
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "first", "signature": "sig-1"},
+                    {"type": "thinking", "thinking": "second", "signature": "sig-2"}
+                ]),
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "first", "signature": "sig-1"},
+                    {"type": "redacted_thinking", "data": redacted}
+                ]),
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "signed", "signature": "sig-1"},
+                    {"type": "thinking", "thinking": "unsigned"}
+                ]),
+            ] {
+                let message = super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content,
+                };
+                let error = convert_assistant_message(
+                    &message,
+                    &mut HashMap::new(),
+                    ConverterOptions::default(),
+                )
+                .expect_err("multiple native reasoning blocks must fail");
+                assert!(
+                    error.to_string().contains("native") && error.to_string().contains("reasoning"),
+                    "round {round}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_assistant_native_reasoning_cannot_be_merged_lossily() {
+        for round in 0..5 {
+            let first = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": format!("first {round}"), "signature": "sig-1"},
+                    {"type": "text", "text": "first answer"}
+                ]),
+            };
+            let second = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": format!("second {round}"), "signature": "sig-2"},
+                    {"type": "text", "text": "second answer"}
+                ]),
+            };
+
+            let error = merge_assistant_messages(
+                &[&first, &second],
+                &mut HashMap::new(),
+                ConverterOptions::default(),
+            )
+            .expect_err("multiple native reasoning messages cannot be merged");
+            assert!(
+                error.to_string().contains("cannot be merged losslessly"),
+                "round {round}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_native_reasoning_survives_consecutive_assistant_merge() {
+        for round in 0..5 {
+            let signed = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": format!("thought {round}"), "signature": format!("sig-{round}")},
+                    {"type": "text", "text": "first answer"}
+                ]),
+            };
+            let visible = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{"type": "text", "text": "second answer"}]),
+            };
+
+            let merged = merge_assistant_messages(
+                &[&signed, &visible],
+                &mut HashMap::new(),
+                ConverterOptions::default(),
+            )
+            .expect("one native reasoning block should merge");
+            assert_eq!(
+                merged.assistant_response_message.content,
+                "first answer\n\nsecond answer"
+            );
+            assert_eq!(
+                merged.assistant_response_message.reasoning_content,
+                Some(ReasoningContent::reasoning_text(
+                    format!("thought {round}"),
+                    format!("sig-{round}")
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_native_reasoning_is_rejected_for_five_rounds() {
+        for round in 0..5 {
+            for block in [
+                serde_json::json!({"type": "thinking", "signature": "sig"}),
+                serde_json::json!({"type": "redacted_thinking"}),
+                serde_json::json!({"type": "redacted_thinking", "data": format!("not base64 {round}")}),
+            ] {
+                let message = super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([block]),
+                };
+                assert!(
+                    convert_assistant_message(
+                        &message,
+                        &mut HashMap::new(),
+                        ConverterOptions::default(),
+                    )
+                    .is_err(),
+                    "round {round}"
+                );
+            }
+        }
     }
 
     #[test]

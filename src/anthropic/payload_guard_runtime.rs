@@ -42,7 +42,6 @@ pub(crate) fn prepare_kiro_request_body(
 }
 
 pub(crate) struct PreparedExternalMessagesPayload {
-    pub raw_body: Bytes,
     pub payload: MessagesRequest,
     pub report: Option<PayloadGuardReport>,
     pub guard_applied: bool,
@@ -56,7 +55,6 @@ pub(crate) fn prepare_external_messages_payload(
 ) -> Result<PreparedExternalMessagesPayload, PayloadGuardError> {
     if !external_guard_enabled || !config.enabled {
         return Ok(PreparedExternalMessagesPayload {
-            raw_body: raw_body.clone(),
             payload: payload.clone(),
             report: None,
             guard_applied: false,
@@ -64,20 +62,10 @@ pub(crate) fn prepare_external_messages_payload(
     }
 
     let mut prepared_payload = payload.clone();
-    let (guarded_body, report) =
+    let (_, report) =
         guard_anthropic_messages_request_reusing_body(&mut prepared_payload, config, raw_body)?;
-    let should_send_serialized = report.was_modified()
-        || (config.max_bytes > 0
-            && raw_body.len() > config.max_bytes
-            && guarded_body.len() <= raw_body.len());
-    let raw_body = if should_send_serialized {
-        guarded_body
-    } else {
-        raw_body.clone()
-    };
 
     Ok(PreparedExternalMessagesPayload {
-        raw_body,
         payload: prepared_payload,
         report: Some(report),
         guard_applied: true,
@@ -163,7 +151,6 @@ mod tests {
             prepare_external_messages_payload(&request, &raw_body, true, guard_config(false, 1024))
                 .expect("prepare");
 
-        assert_eq!(prepared.raw_body, raw_body);
         assert_eq!(prepared.payload.messages.len(), 1);
         assert!(prepared.report.is_none());
         assert!(!prepared.guard_applied);
@@ -178,7 +165,7 @@ mod tests {
             prepare_external_messages_payload(&request, &raw_body, false, guard_config(true, 1024))
                 .expect("prepare");
 
-        assert_eq!(prepared.raw_body, raw_body);
+        assert_eq!(prepared.payload.messages.len(), 1);
         assert!(prepared.report.is_none());
         assert!(!prepared.guard_applied);
     }

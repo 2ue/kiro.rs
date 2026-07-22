@@ -15,6 +15,7 @@ import {
   useModelPricing,
   usePreviewUsageCleanup,
   useRefreshUsageQueriesAfterCleanup,
+  useResumeUsageCleanup,
   useStartUsageCleanup,
   useSyncModelPricing,
   useUsageCleanupStatus,
@@ -24,7 +25,10 @@ import {
 import { getExternalPools } from '@/api/credentials'
 import { getUsageRecords } from '@/api/usage'
 import { extractErrorMessage } from '@/lib/utils'
+import { formatUsd, formatUsdCsv, formatUsdDetailed } from '@/lib/format'
+import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
 import type { ExternalPoolUsageSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
+import { RequestApiKeyIdDisplay } from '@/components/request-api-key-id'
 
 const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
@@ -105,6 +109,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
   const headers = [
     'created_at',
     'request_id',
+    'request_api_key_id',
     'conversation_id',
     'status',
     'stream',
@@ -136,6 +141,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
   const rows = records.map((record) => [
     record.createdAt,
     record.id,
+    normalizeRequestApiKeyId(record.requestApiKeyId),
     record.conversationId,
     record.status,
     record.stream ? 'stream' : 'non_stream',
@@ -155,8 +161,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.outputTokens,
     record.cacheReadInputTokens,
     record.cacheCreationInputTokens,
-    record.estimatedCostUsd,
-    record.originalCostUsd,
+    formatUsdCsv(record.estimatedCostUsd),
+    formatUsdCsv(record.originalCostUsd),
     record.kiroMeteringUsage,
     record.pricingModel,
     record.durationMs,
@@ -177,26 +183,6 @@ function downloadTextFile(content: string, filename: string, type: string) {
   a.click()
   a.remove()
   URL.revokeObjectURL(url)
-}
-
-function formatUsd(value: number): string {
-  if (!Number.isFinite(value)) return '-'
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: value >= 1 ? 2 : 6,
-    maximumFractionDigits: value >= 1 ? 2 : 6,
-  }).format(value)
-}
-
-function formatUsdDetailed(value: number): string {
-  if (!Number.isFinite(value)) return '-'
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 8,
-    maximumFractionDigits: 8,
-  }).format(value)
 }
 
 function ratio(part: number, total: number): number {
@@ -249,6 +235,8 @@ function statusVariant(status: string): 'success' | 'destructive' | 'warning' {
 
 function statusLabel(status: string): string {
   switch (status) {
+    case 'queued':
+      return '排队中'
     case 'success':
       return '成功'
     case 'error':
@@ -428,6 +416,10 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="首次思考" value={formatLatency(trace.firstThinkingDeltaMs)} />
         <UsageMetric label="首次可见文本" value={formatLatency(trace.firstVisibleTextDeltaMs)} tone="success" />
         <UsageMetric label="分片到输出" value={formatLatency(trace.streamGapToFirstOutputMs)} />
+        <UsageMetric label="推理发送" value={trace.inferenceAttempts ? `${formatNumber(trace.inferenceAttempts.consumed)} / ${formatNumber(trace.inferenceAttempts.maxAttempts)}` : '-'} tone={trace.inferenceAttempts?.exhausted ? 'warning' : 'info'} />
+        <UsageMetric label="推理发送分项" value={trace.inferenceAttempts ? `本地 ${formatNumber(trace.inferenceAttempts.localAttempts)} / 外部 ${formatNumber(trace.inferenceAttempts.externalAttempts)} / MCP ${formatNumber(trace.inferenceAttempts.mcpAttempts)}` : '-'} />
+        <UsageMetric label="辅助发送" value={trace.auxiliaryAttempts ? `${formatNumber(trace.auxiliaryAttempts.consumed)} / ${formatNumber(trace.auxiliaryAttempts.maxAttempts)}` : '-'} tone={trace.auxiliaryAttempts?.exhausted ? 'warning' : 'info'} />
+        <UsageMetric label="辅助发送分项" value={trace.auxiliaryAttempts ? `刷新 ${formatNumber(trace.auxiliaryAttempts.tokenRefreshAttempts)} / Profile ${formatNumber(trace.auxiliaryAttempts.profileDiscoveryAttempts)}` : '-'} />
         <UsageMetric label="本地容量权重" value={typeof trace.capacityWeightUnits === 'number' ? `${formatNumber(trace.capacityWeightUnits)} 单位` : '-'} tone="info" />
         <UsageMetric label="权重估算输入" value={typeof trace.estimatedInputTokens === 'number' ? `${formatNumber(trace.estimatedInputTokens)} token` : '-'} />
         <UsageMetric label="输出前分片" value={typeof trace.chunksBeforeFirstOutput === 'number' ? formatNumber(trace.chunksBeforeFirstOutput) : '-'} />
@@ -441,6 +433,7 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="输出前事件解析错" value={typeof trace.upstreamEventParseErrorsBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamEventParseErrorsBeforeFirstOutput) : '-'} />
         <UsageMetric label="输出前上游类型" value={formatUpstreamEventTypeCounts(trace.upstreamEventTypesBeforeFirstOutput)} />
         <UsageMetric label="首输出前重试" value={typeof trace.streamRetryAttempts === 'number' ? formatNumber(trace.streamRetryAttempts) : '-'} tone="warning" />
+        <UsageMetric label="重试调度失败" value={typeof trace.streamRetryDispatchFailures === 'number' ? formatNumber(trace.streamRetryDispatchFailures) : '-'} tone="warning" />
         <UsageMetric label="重试原因" value={trace.streamRetryReasons?.length ? trace.streamRetryReasons.join(' / ') : '-'} />
         <UsageMetric label="客户端断开" value={formatLatency(trace.clientDroppedMs)} />
         <UsageMetric label="结束原因" value={trace.terminalReason || '-'} />
@@ -470,6 +463,7 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
 
 export function UsageRecordsPanel() {
   const [searchText, setSearchText] = useState('')
+  const [requestApiKeyId, setRequestApiKeyId] = useState('')
   const [model, setModel] = useState('')
   const [endpoint, setEndpoint] = useState('')
   const [conversationId, setConversationId] = useState('')
@@ -487,10 +481,13 @@ export function UsageRecordsPanel() {
   const [exporting, setExporting] = useState(false)
   const itemsPerPage = 20
   const autoRefresh = useAutoRefreshPreference(USAGE_AUTO_REFRESH_KEY)
+  const normalizedRequestApiKeyId = normalizeRequestApiKeyId(requestApiKeyId)
+  const requestApiKeyIdInvalid = Boolean(requestApiKeyId.trim() && !normalizedRequestApiKeyId)
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page: currentPage, limit: itemsPerPage }
     const qValue = searchText.trim()
+    if (normalizedRequestApiKeyId) next.requestApiKeyId = normalizedRequestApiKeyId
     if (qValue) {
       if (REQUEST_ID_PATTERN.test(qValue)) next.requestId = qValue
       else next.q = qValue
@@ -532,7 +529,7 @@ export function UsageRecordsPanel() {
     const untilIso = datetimeLocalToIso(until)
     if (untilIso) next.until = untilIso
     return next
-  }, [conversationId, currentPage, endpoint, minCacheRead, minFirstTokenLatencyMs, model, routeTarget, searchText, since, source, status, streamMode, until])
+  }, [conversationId, currentPage, endpoint, minCacheRead, minFirstTokenLatencyMs, model, normalizedRequestApiKeyId, routeTarget, searchText, since, source, status, streamMode, until])
 
   const summary = useUsageSummary(autoRefresh.refetchInterval)
   const records = useUsageRecordsPage(query, autoRefresh.refetchInterval)
@@ -543,7 +540,7 @@ export function UsageRecordsPanel() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [conversationId, minCacheRead, minFirstTokenLatencyMs, model, routeTarget, searchText, since, source, status, streamMode, until])
+  }, [conversationId, minCacheRead, minFirstTokenLatencyMs, model, requestApiKeyId, routeTarget, searchText, since, source, status, streamMode, until])
 
   const credentialLabels = useMemo(() => {
     const labels = new Map<number, string>()
@@ -604,6 +601,7 @@ export function UsageRecordsPanel() {
 
   const hasFilters = Boolean(
     searchText.trim() ||
+    requestApiKeyId.trim() ||
     model.trim() ||
     endpoint.trim() ||
     conversationId.trim() ||
@@ -619,6 +617,7 @@ export function UsageRecordsPanel() {
 
   const handleResetFilters = () => {
     setSearchText('')
+    setRequestApiKeyId('')
     setModel('')
     setEndpoint('')
     setConversationId('')
@@ -775,6 +774,19 @@ export function UsageRecordsPanel() {
             onChange={(event) => setConversationId(event.target.value)}
             placeholder="会话 ID"
           />
+          <div>
+            <Input
+              value={requestApiKeyId}
+              maxLength={64}
+              aria-invalid={requestApiKeyIdInvalid}
+              onChange={(event) => setRequestApiKeyId(event.target.value)}
+              placeholder="请求渠道 ID（64 位 digest）"
+              className="font-mono"
+            />
+            {requestApiKeyIdInvalid && (
+              <div className="mt-1 text-xs text-destructive">无效值不会发送；请复制完整渠道 ID</div>
+            )}
+          </div>
           <select
             value={routeTarget}
             onChange={(event) => setRouteTarget(event.target.value)}
@@ -1010,6 +1022,10 @@ export function UsageRecordsPanel() {
                       </td>
                       <td className="px-3 py-2">
                         <div className="max-w-[220px] truncate">{record.conversationId || '-'}</div>
+                        <div className="mt-1 flex max-w-[220px] items-center gap-1 text-xs text-muted-foreground">
+                          <span className="shrink-0">渠道</span>
+                          <RequestApiKeyIdDisplay value={record.requestApiKeyId} />
+                        </div>
                         <div className="mt-1 flex flex-wrap gap-1">
                           {record.stickyBound && <Badge variant="secondary">sticky</Badge>}
                           {record.fallbackFromSticky && (
@@ -1130,6 +1146,10 @@ export function UsageRecordsPanel() {
                 <div>
                   <div className="text-xs text-muted-foreground">请求 ID</div>
                   <div className="break-all font-mono">{selectedRecord.id}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">请求渠道 ID</div>
+                  <RequestApiKeyIdDisplay value={selectedRecord.requestApiKeyId} />
                 </div>
                 <div>
                   <div className="text-xs text-muted-foreground">时间</div>
@@ -1469,6 +1489,8 @@ function cleanupStatusLabel(status?: string): string {
   switch (status) {
     case 'running':
       return '运行中'
+    case 'paused':
+      return '已暂停'
     case 'completed':
       return '已完成'
     case 'cancelled':
@@ -1482,7 +1504,8 @@ function cleanupStatusLabel(status?: string): string {
 
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES = 10000
 const USAGE_CLEANUP_MAX_OLDER_THAN_DAYS = 3650
-const USAGE_CLEANUP_MAX_BATCH_SIZE = 5000
+const USAGE_CLEANUP_DEFAULT_BATCH_SIZE = 250
+const USAGE_CLEANUP_MAX_BATCH_SIZE = 500
 const USAGE_CLEANUP_MAX_PAUSE_MS = 10000
 
 function parseCleanupInteger(value: string, fallback: number, min: number, max: number): number {
@@ -1494,17 +1517,18 @@ function parseCleanupInteger(value: string, fallback: number, min: number, max: 
 function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const [mode, setMode] = useState<UsageCleanupMode>('soft_delete')
   const [olderThanDays, setOlderThanDays] = useState('7')
-  const [batchSize, setBatchSize] = useState('1000')
+  const [batchSize, setBatchSize] = useState(String(USAGE_CLEANUP_DEFAULT_BATCH_SIZE))
   const [pauseMs, setPauseMs] = useState('100')
   const cleanupStatus = useUsageCleanupStatus()
   const previewCleanup = usePreviewUsageCleanup()
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
   const clearRecords = useClearUsageRecords()
+  const resumeCleanup = useResumeUsageCleanup()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
   const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0, USAGE_CLEANUP_MAX_OLDER_THAN_DAYS)
-  const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1, USAGE_CLEANUP_MAX_BATCH_SIZE)
+  const parsedBatchSize = parseCleanupInteger(batchSize, USAGE_CLEANUP_DEFAULT_BATCH_SIZE, 1, USAGE_CLEANUP_MAX_BATCH_SIZE)
   const parsedPauseMs = parseCleanupInteger(pauseMs, 100, 0, USAGE_CLEANUP_MAX_PAUSE_MS)
   const cleanupRangeText = (cutoffLabel: string) => (
     parsedOlderThanDays === 0
@@ -1518,7 +1542,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
     pauseMsBetweenBatches: parsedPauseMs,
   })
 
-  const running = cleanupStatus.data?.status === 'running'
+  const running = ['queued', 'running'].includes(cleanupStatus.data?.status || '')
   const preview = previewCleanup.data
   const estimatedBatches = preview
     ? Math.ceil(preview.matchedRows / Math.max(parsedBatchSize, 1))
@@ -1533,7 +1557,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const start = () => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
     const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。`
+      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或本次执行达到安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批；达到上限后可显式恢复下一轮。\n\n软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删的记录。`
     )
     if (!confirmed) return
 
@@ -1556,13 +1580,21 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
     })
   }
 
+  const resume = () => {
+    const jobId = cleanupStatus.data?.jobId
+    if (!jobId) return
+    resumeCleanup.mutate(jobId, {
+      onSuccess: () => toast.success('Usage 清理任务已重新排队'),
+      onError: (error) => toast.error(`恢复失败: ${extractErrorMessage(error)}`),
+    })
+  }
+
   const clearAll = () => {
-    const confirmed = confirm('确定清空所有 Usage 展示记录吗？此操作无法撤销，只影响后台展示记录，不影响实际计费。')
+    const confirmed = confirm('将提交后台任务，分批软删除全部 Usage 明细，并同步扣除这些记录对应的累计统计、费用和 Dashboard 汇总。任务可取消并审计。确认继续？')
     if (!confirmed) return
     clearRecords.mutate(undefined, {
       onSuccess: () => {
-        toast.success('已清空 Usage 展示记录')
-        onOpenChange(false)
+        toast.success('全量 Usage 明细清理任务已提交')
       },
       onError: (error) => toast.error(`清空失败: ${extractErrorMessage(error)}`),
     })
@@ -1578,7 +1610,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
           <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3">
             <div className="text-xs font-semibold text-destructive">危险操作</div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              清空所有 Usage 展示记录会删除全部历史明细，仅影响后台展示和查询，不影响实际计费，且无法撤销。
+              后台分批软删除全部历史明细，并同步扣除对应的累计统计、费用和 Dashboard 汇总。任务状态会持久化，可取消并审计。
             </p>
             <Button
               className="mt-3 w-full text-destructive"
@@ -1586,12 +1618,12 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
               onClick={clearAll}
               disabled={clearRecords.isPending || running}
             >
-              {running ? '清理任务执行中' : clearRecords.isPending ? '清空中...' : '清空全部展示记录'}
+              {running ? '清理任务执行中' : clearRecords.isPending ? '提交中...' : '清理全部历史明细'}
             </Button>
           </div>
 
           <div className="rounded-md border border-kiro-warning-soft bg-kiro-warning-soft p-3 text-kiro-warning">
-            这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。
+            这是手动任务，不会定时执行。系统会自动分批清理；每次执行最多 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批，达到上限后暂停并等待管理员显式恢复。软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删的记录。
           </div>
 
           <div className="grid gap-3 md:grid-cols-2">
@@ -1635,10 +1667,12 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                 <span>任务 {cleanupStatus.data.jobId}</span>
                 <span>模式 {cleanupModeLabel(cleanupStatus.data.mode)}</span>
                 <span>已处理 {formatNumber(cleanupStatus.data.processedRows)} 条</span>
-                <span>剩余约 {formatNumber(cleanupStatus.data.remainingRows || 0)} 条</span>
-                <span>已执行 {formatNumber(cleanupStatus.data.batches)} 批</span>
-                <span>内部安全上限 {formatNumber(cleanupStatus.data.maxBatches)} 批</span>
+                <span>阶段 {cleanupStatus.data.phase}</span>
+                <span>剩余 {cleanupStatus.data.remainingRows === undefined ? '未知' : `${formatNumber(cleanupStatus.data.remainingRows)} 条`}</span>
+                <span>累计执行 {formatNumber(cleanupStatus.data.batches)} 批</span>
+                <span>单次执行上限 {formatNumber(cleanupStatus.data.maxBatches)} 批</span>
                 <span>最后一批 {formatNumber(cleanupStatus.data.lastBatchRows)} 条</span>
+                {cleanupStatus.data.redisDeleteCommands > 0 && <span>Redis {formatNumber(cleanupStatus.data.redisDeletedKeys)} keys / {formatNumber(cleanupStatus.data.redisDeleteCommands)} commands</span>}
                 {cleanupStatus.data.stopReason && <span>停止原因 {cleanupStatus.data.stopReason}</span>}
                 {cleanupStatus.data.lastError && <span className="text-destructive">错误 {cleanupStatus.data.lastError}</span>}
               </div>
@@ -1654,6 +1688,9 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             </Button>
             <Button variant="outline" onClick={cancel} disabled={!running || cancelCleanup.isPending}>
               请求取消
+            </Button>
+            <Button variant="outline" onClick={resume} disabled={!['paused', 'failed', 'cancelled'].includes(cleanupStatus.data?.status || '') || resumeCleanup.isPending}>
+              {resumeCleanup.isPending ? '恢复中...' : '恢复任务'}
             </Button>
           </div>
         </div>

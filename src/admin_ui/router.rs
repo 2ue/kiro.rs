@@ -407,25 +407,15 @@ async fn proxy_external(state: &UiServeState, uri: &Uri) -> Response<Body> {
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            match response.bytes().await {
-                Ok(bytes) => {
-                    let mut builder = Response::builder()
-                        .status(status)
-                        .header(header::CACHE_CONTROL, "no-cache");
-                    if let Some(content_type) = content_type {
-                        builder = builder.header(header::CONTENT_TYPE, content_type);
-                    }
-                    builder
-                        .body(Body::from(bytes))
-                        .expect("Failed to build response")
-                }
-                Err(err) => Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from(format!(
-                        "Failed to read UI proxy response: {err}"
-                    )))
-                    .expect("Failed to build response"),
+            let mut builder = Response::builder()
+                .status(status)
+                .header(header::CACHE_CONTROL, "no-cache");
+            if let Some(content_type) = content_type {
+                builder = builder.header(header::CONTENT_TYPE, content_type);
             }
+            builder
+                .body(Body::from_stream(response.bytes_stream()))
+                .expect("Failed to build response")
         }
         Err(err) => Response::builder()
             .status(StatusCode::BAD_GATEWAY)

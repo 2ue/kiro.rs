@@ -11,6 +11,36 @@ use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+/// 已认证的下游请求 API Key 身份。
+///
+/// 这里只保留 SHA-256 digest。限流、日志关联和请求扩展都不得保存原始 key。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestApiKeyIdentity {
+    digest: [u8; 32],
+}
+
+impl RequestApiKeyIdentity {
+    pub(crate) fn digest(self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// 可稳定关联同一个请求渠道、但不可还原原始 key 的 ID。
+    ///
+    /// 使用完整 SHA-256，避免短摘要碰撞，并与管理端展示的 key ID 保持一致。
+    pub fn stable_id(self) -> String {
+        hex::encode(self.digest)
+    }
+}
+
+impl std::fmt::Debug for RequestApiKeyIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestApiKeyIdentity")
+            .field("stable_id", &self.stable_id())
+            .finish()
+    }
+}
+
 /// 从请求中提取 API Key
 ///
 /// 支持两种认证方式：
@@ -52,6 +82,11 @@ fn api_key_digest(key: &str) -> [u8; 32] {
     out
 }
 
+/// 返回请求 API Key 的规范化稳定 ID。原始 key 不会被保留。
+pub fn request_api_key_id(key: &str) -> String {
+    hex::encode(api_key_digest(key.trim()))
+}
+
 fn api_key_hashes(keys: impl IntoIterator<Item = impl AsRef<str>>) -> HashSet<[u8; 32]> {
     keys.into_iter()
         .map(|key| key.as_ref().trim().to_string())
@@ -80,8 +115,17 @@ impl RequestApiKeyStore {
         *self.hashes.write() = api_key_hashes(keys);
     }
 
+    #[cfg(test)]
     pub fn contains(&self, key: &str) -> bool {
-        self.hashes.read().contains(&api_key_digest(key.trim()))
+        self.authenticate(key).is_some()
+    }
+
+    pub fn authenticate(&self, key: &str) -> Option<RequestApiKeyIdentity> {
+        let digest = api_key_digest(key.trim());
+        self.hashes
+            .read()
+            .contains(&digest)
+            .then_some(RequestApiKeyIdentity { digest })
     }
 
     pub fn len(&self) -> usize {
@@ -91,7 +135,7 @@ impl RequestApiKeyStore {
 
 #[cfg(test)]
 mod tests {
-    use super::RequestApiKeyStore;
+    use super::{RequestApiKeyStore, request_api_key_id};
 
     #[test]
     fn request_api_key_store_supports_multiple_keys() {
@@ -112,5 +156,19 @@ mod tests {
         assert!(!store.contains("sk-old"));
         assert!(store.contains("sk-new"));
         assert!(store.contains("sk-extra"));
+    }
+
+    #[test]
+    fn authenticated_identity_is_stable_and_never_formats_plaintext() {
+        let store = RequestApiKeyStore::new(["sk-super-secret"]);
+
+        let first = store.authenticate("sk-super-secret").unwrap();
+        let second = store.authenticate(" sk-super-secret ").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.stable_id().len(), 64);
+        assert_eq!(first.stable_id(), request_api_key_id(" sk-super-secret "));
+        assert!(!format!("{first:?}").contains("sk-super-secret"));
+        assert!(store.authenticate("sk-other").is_none());
     }
 }

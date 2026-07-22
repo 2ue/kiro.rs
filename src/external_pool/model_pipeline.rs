@@ -1,30 +1,5 @@
 use super::*;
 
-pub(super) fn outbound_model_for_value(
-    route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-    value: &serde_json::Value,
-) -> Result<Option<String>, ExternalPoolError> {
-    let original_model = value
-        .get("model")
-        .and_then(|model| model.as_str())
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .or_else(|| {
-            route.payload.as_ref().and_then(|payload| {
-                let model = payload.model.trim();
-                (!model.is_empty()).then_some(model)
-            })
-        });
-    let processed_model = route
-        .upstream_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .or(original_model);
-    process_external_pool_model(pool, original_model, processed_model)
-}
-
 pub(super) fn outbound_model_for_raw(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -117,7 +92,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
             retryable: false,
             auto_disable_reason: None,
             cooldown: None,
-            response_body: None,
+            protocol_error: None,
         },
         ModelProcessingError::MappingMiss { model } => ExternalPoolError {
             status: Some(StatusCode::BAD_GATEWAY),
@@ -128,7 +103,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
             retryable: true,
             auto_disable_reason: None,
             cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
-            response_body: None,
+            protocol_error: None,
         },
     }
 }

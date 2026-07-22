@@ -250,6 +250,12 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
   const next: RuntimeConfig = {
     ...draft,
     credentialRpm: toWhole(draft.credentialRpm),
+    requestAdmission: {
+      rpm: toWhole(draft.requestAdmission.rpm, 0, 1_000_000),
+      maxConcurrentRequests: toWhole(draft.requestAdmission.maxConcurrentRequests, 0, 10_000),
+      maxQueuedRequests: toWhole(draft.requestAdmission.maxQueuedRequests, 0, 100_000),
+      queueTimeoutMs: toWhole(draft.requestAdmission.queueTimeoutMs, 0, 300_000),
+    },
     credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
     credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
     credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
@@ -267,6 +273,11 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
     kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
     kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
+    inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
+    auxiliaryUpstreamMaxAttempts: toWhole(draft.auxiliaryUpstreamMaxAttempts, 1, 10),
+    auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
+    tokenRefreshMaxRpm: toWhole(draft.tokenRefreshMaxRpm, 1, 6000),
+    tokenRefreshBurst: toWhole(draft.tokenRefreshBurst, 1, 256),
     kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
     kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
     kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
@@ -306,12 +317,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     highCacheThreshold: toWhole(draft.highCacheThreshold),
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     imageProcessing: normalizeImageProcessing(draft.imageProcessing),
-    bodyConversion: {
-      ...normalizeBodyConversion(draft.bodyConversion),
-      toolChoiceSteering: normalizePromptSteering(draft.promptSteering).toolChoice.enabled,
-      chunkedToolPolicy: normalizePromptSteering(draft.promptSteering).chunkedWrite.enabled,
-      thinkingPromptControls: normalizePromptSteering(draft.promptSteering).thinking.enabled,
-    },
+    bodyConversion: normalizeBodyConversion(draft.bodyConversion),
     promptSteering: normalizePromptSteering(draft.promptSteering),
     missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
@@ -324,7 +330,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
       externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
       externalPoolMaxInputTokens: toWhole(draft.externalPools.externalPoolMaxInputTokens),
-      externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs),
+      externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs, 1),
       externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
       externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
       localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
@@ -378,6 +384,18 @@ export function RuntimePage() {
       setDraft({
         ...emptyRuntimeConfig,
         ...config.data,
+        requestAdmission: {
+          ...emptyRuntimeConfig.requestAdmission,
+          ...config.data.requestAdmission,
+        },
+        auxiliaryUpstreamRuntime: {
+          ...emptyRuntimeConfig.auxiliaryUpstreamRuntime,
+          ...config.data.auxiliaryUpstreamRuntime,
+        },
+        tokenRefreshAdmissionRuntime: {
+          ...emptyRuntimeConfig.tokenRefreshAdmissionRuntime,
+          ...config.data.tokenRefreshAdmissionRuntime,
+        },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
         bodyConversion,
         promptSteering,
@@ -399,6 +417,12 @@ export function RuntimePage() {
 
   const set = <K extends keyof RuntimeConfig>(k: K) => (v: RuntimeConfig[K]) =>
     setDraft((prev) => ({ ...prev, [k]: v }))
+
+  const setRequestAdmission = <K extends keyof RuntimeConfig['requestAdmission']>(k: K) => (v: RuntimeConfig['requestAdmission'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      requestAdmission: { ...prev.requestAdmission, [k]: v },
+    }))
 
   const setImageProcessing = <K extends keyof RuntimeConfig['imageProcessing']>(k: K) => (v: RuntimeConfig['imageProcessing'][K]) =>
     setDraft((prev) => ({
@@ -459,11 +483,6 @@ export function RuntimePage() {
   const setPromptSteeringToggle = (key: 'toolChoice' | 'thinking') => (enabled: boolean) =>
     setDraft((prev) => ({
       ...prev,
-      bodyConversion: {
-        ...defaultBodyConversion(),
-        ...prev.bodyConversion,
-        ...(key === 'toolChoice' ? { toolChoiceSteering: enabled } : { thinkingPromptControls: enabled }),
-      },
       promptSteering: {
         ...defaultPromptSteering(),
         ...prev.promptSteering,
@@ -476,11 +495,6 @@ export function RuntimePage() {
     (value: boolean) =>
       setDraft((prev) => ({
         ...prev,
-        bodyConversion: {
-          ...defaultBodyConversion(),
-          ...prev.bodyConversion,
-          ...(key === 'enabled' ? { chunkedToolPolicy: value } : {}),
-        },
         promptSteering: {
           ...defaultPromptSteering(),
           ...prev.promptSteering,
@@ -634,6 +648,10 @@ export function RuntimePage() {
 
             {activeSection === 'capacity' && (
               <TwoCol>
+                <NumField label="每实例 · 每 Key RPM" desc="每个实例分别限制每个已认证请求 API Key；多实例总量最多可近似放大为实例数倍。0 表示关闭。" value={draft.requestAdmission.rpm} min={0} max={1_000_000} suffix="次/分钟" onChange={setRequestAdmission('rpm')} />
+                <NumField label="每实例 · 每 Key 并发" desc="每个实例分别统计同一请求 API Key 持有的 /messages response body；多实例不是全局聚合。0 表示关闭。" value={draft.requestAdmission.maxConcurrentRequests} min={0} max={10_000} suffix="并发" onChange={setRequestAdmission('maxConcurrentRequests')} />
+                <NumField label="每实例 · 每 Key 队列" desc="每个实例内同一 Key 并发占满时最多等待的请求数；0 表示不排队并立即返回 429。" value={draft.requestAdmission.maxQueuedRequests} min={0} max={100_000} suffix="请求" onChange={setRequestAdmission('maxQueuedRequests')} />
+                <NumField label="每实例 · 每 Key 等待" desc="每个实例内同一 Key 等待并发名额的最长时间；0 表示不排队并立即返回 429。" value={draft.requestAdmission.queueTimeoutMs} min={0} max={300_000} suffix="毫秒" onChange={setRequestAdmission('queueTimeoutMs')} />
                 <NumField label="单账号每分钟请求上限" desc="每个账号一分钟最多接多少个请求；0 表示不做本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={set('credentialRpm')} />
                 <NumField label="单账号最大并发" desc="每个账号同一时间最多处理多少个请求；0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={set('credentialMaxConcurrentRequests')} />
                 <NumField label="全局最大并发" desc="整个服务同一时间最多处理多少个请求；0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={set('dispatchGlobalMaxConcurrentRequests')} />
@@ -729,10 +747,19 @@ export function RuntimePage() {
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
                 <TogField label="首输出前流式换号" desc="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试。" checked={draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryEnabled')} />
                 <NumField label="首输出前最多尝试" desc="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。" value={draft.kiroUpstreamStreamRetryMaxAttempts} min={1} max={100} suffix="次" disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryMaxAttempts')} />
+                <NumField label="单请求推理发送硬上限" desc="本地换号、首输出前重试、请求体重试、外部池故障转移和本地救援共享；默认 4，与账号数量无关。" value={draft.inferenceUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('inferenceUpstreamMaxAttempts')} />
+                <NumField label="单请求辅助发送硬上限" desc="Token 刷新与企业 Profile 探测共享；默认 2，与账号数量无关，不计入推理发送次数。" value={draft.auxiliaryUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('auxiliaryUpstreamMaxAttempts')} />
+                <NumField label="单实例辅助并发上限" desc="限制同时进行的 Token 刷新、Profile 探测和模型目录请求；饱和时立即拒绝，不进入无界等待队列。" value={draft.auxiliaryUpstreamMaxConcurrentRequests} min={1} max={256} suffix="路" onChange={set('auxiliaryUpstreamMaxConcurrentRequests')} />
+                <NumField label="Token 刷新 RPM 上限" desc="Redis 可用时为跨实例共享上限；未配置 Redis 时为单进程上限。" value={draft.tokenRefreshMaxRpm} min={1} max={6000} suffix="RPM" onChange={set('tokenRefreshMaxRpm')} />
+                <NumField label="Token 刷新突发容量" desc="允许立即发送的刷新数量；之后按 RPM 速率补充。" value={draft.tokenRefreshBurst} min={1} max={256} suffix="次" onChange={set('tokenRefreshBurst')} />
+                <div className="rounded-lg border bg-muted/20 p-4 text-xs leading-5 text-muted-foreground md:col-span-2">
+                  当前辅助通道：进行中 {draft.auxiliaryUpstreamRuntime.inFlight}，历史峰值 {draft.auxiliaryUpstreamRuntime.peakInFlight}，饱和拒绝 {draft.auxiliaryUpstreamRuntime.rejected}。Refresh client 缓存 {draft.auxiliaryUpstreamRuntime.refreshClientCacheEntries}/{draft.auxiliaryUpstreamRuntime.refreshClientCacheMaxEntries}，构建 {draft.auxiliaryUpstreamRuntime.refreshClientBuilds}，命中 {draft.auxiliaryUpstreamRuntime.refreshClientHits}，未命中 {draft.auxiliaryUpstreamRuntime.refreshClientMisses}，容量拒绝 {draft.auxiliaryUpstreamRuntime.refreshClientCacheSaturated}。
+                  <br />Token refresh authority {draft.tokenRefreshAdmissionRuntime.authority}，准入 {draft.tokenRefreshAdmissionRuntime.admitted}，RPM 拒绝 {draft.tokenRefreshAdmissionRuntime.rateLimited}，协调拒绝 {draft.tokenRefreshAdmissionRuntime.coordinationRejected}，Redis 错误 {draft.tokenRefreshAdmissionRuntime.redisErrors}，剩余 {draft.tokenRefreshAdmissionRuntime.remainingMilliTokens / 1000} tokens。
+                </div>
                 <TogField label="静默超时可换号" desc="上游流在首输出前长时间无内容时允许换号。" checked={draft.kiroUpstreamStreamRetryOnIdleTimeout} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnIdleTimeout')} />
                 <TogField label="读取错误可换号" desc="首输出前连接中断、流读取失败时允许换号。" checked={draft.kiroUpstreamStreamRetryOnReadError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnReadError')} />
                 <TogField label="状态错误可换号" desc="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。" checked={draft.kiroUpstreamStreamRetryOnStatusError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnStatusError')} />
-                <NumField label="单请求最大重试次数" desc="一个请求失败后最多重试几次；0 表示系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
+                <NumField label="本地 provider 尝试上限" desc="单次本地调用最多尝试多少个凭据；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
                 <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />
                 <NumField label="异常并发自动回收" desc="请求长时间没有结束时自动释放占用，避免账号并发数被卡住；0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={set('credentialInFlightLeaseMaxSecs')} />
@@ -870,13 +897,13 @@ export function RuntimePage() {
                   <div>
                     <div className="text-sm font-semibold">提示词引导</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      统一管理 Claude Code 的 system prompt 引导。默认只影响 /cc，不做输出硬改写；语言约束允许保留代码、命令、路径、日志、错误原文和正常技术英文。
+                      管理代理新增的语言、任务质量、tool_choice、thinking 与分块兼容提示；关闭总开关后不新增任何这类提示，客户端原始结构化字段仍保留。
                     </div>
                   </div>
                   <TwoCol>
                     <TogField
                       label="启用提示词引导"
-                      desc="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示。"
+                      desc="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示；客户端已提供的结构化字段仍按原语义处理。"
                       checked={draft.promptSteering.enabled}
                       onChange={setPromptSteering('enabled')}
                     />
@@ -918,19 +945,19 @@ export function RuntimePage() {
                     />
                     <TogField
                       label="tool_choice 引导"
-                      desc="按请求的 tool_choice 过滤工具并在本地 Kiro 转换中注入兼容提示。"
+                      desc="控制本地 Kiro 的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
                       checked={draft.promptSteering.toolChoice.enabled}
                       onChange={setPromptSteeringToggle('toolChoice')}
                     />
                     <TogField
                       label="thinking 提示控制"
-                      desc="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。"
+                      desc="控制 synthetic thinking 兼容提示；总开关关闭时不注入提示，客户端显式 thinking 仍保留。"
                       checked={draft.promptSteering.thinking.enabled}
                       onChange={setPromptSteeringToggle('thinking')}
                     />
                     <TogField
                       label="分块写入提示"
-                      desc="启用 Write/Edit 分块写入相关的提示词和工具描述增强。"
+                      desc="控制 Write/Edit 分块兼容提示及其两个提示位置；总开关关闭时不注入这些提示。"
                       checked={draft.promptSteering.chunkedWrite.enabled}
                       onChange={setChunkedWriteSteering('enabled')}
                     />
@@ -1037,7 +1064,10 @@ export function RuntimePage() {
                       />
                     </div>
                     <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
-                    <TogField label="工具配对修复" desc="修复或文本化不严格配对的 tool_use/tool_result。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
+                    <TogField label="结构化 tool_choice" desc="按请求语义执行 none=0、any=N、named=1 工具过滤；提示词总开关只控制额外提示，不删除结构化语义。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
+                    <TogField label="thinking 转换能力" desc="允许本地 Kiro 生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
+                    <TogField label="分块工具策略" desc="定义 Write/Edit 分块协议能力；额外 system/工具描述提示受上方总开关控制。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
+                    <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
                   </TwoCol>
                 </div>

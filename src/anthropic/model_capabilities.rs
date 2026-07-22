@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -6,13 +6,285 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::types::Model;
-use crate::kiro::model::available_models::KiroAvailableModel;
+use crate::kiro::model::available_models::{
+    KiroAvailableModel, KiroAvailableModelCatalog, KiroModelCapabilityCohortKey,
+};
 use crate::model::config::{ModelMappingConfig, ModelMappingRuleKind, ModelResolutionMode};
 
 pub const SEED_SOURCE: &str = "kiro-upstream-seed";
 pub const KIRO_SOURCE: &str = "kiro-list-available-models";
 pub const MANUAL_SOURCE: &str = "manual";
+pub const REASONING_CAPABILITY_CONTRACT_VERSION: u32 = 1;
 const SEED_JSON: &str = include_str!("../../data/kiro-upstream-models.seed.json");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KiroReasoningFieldPath {
+    OutputConfig,
+    Reasoning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroReasoningFieldCapability {
+    pub path: KiroReasoningFieldPath,
+    pub efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+}
+
+/// Provenance-aware native reasoning contract for one upstream model.
+///
+/// Absence, malformed authoritative data, and a catalog whose credential cohort can no longer be
+/// proven are intentionally distinct. In particular, neither authoritative state may be replaced
+/// by a model-name heuristic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KiroReasoningCapabilityState {
+    /// No authoritative Kiro catalog has been observed for this model. Unit/legacy conversion may
+    /// use the narrow, versioned compatibility table.
+    LegacyFallback,
+    /// A catalog existed, but its credential cohort is not current or was not fully observed.
+    Unknown,
+    /// Every authoritative cohort member omitted a usable reasoning field.
+    AuthoritativeAbsent,
+    /// The authoritative schema was malformed or heterogeneous in a way that has no safe common
+    /// wire representation.
+    AuthoritativeInvalid,
+    /// All authoritative cohort members share this safe contract (possibly an effort
+    /// intersection).
+    Supported(KiroReasoningFieldCapability),
+}
+
+/// Relationship between the verified cohort fence and the cohorts that can dispatch locally now.
+///
+/// A contract observed across a strict superset remains conservative for a current subset: its
+/// effort enum is already the intersection across every old cohort. The reverse is unsafe because
+/// a newly introduced cohort was never represented in that intersection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KiroReasoningCohortContractMatch {
+    None,
+    Exact,
+    ConservativeSubset,
+}
+
+impl KiroReasoningCapabilityState {
+    pub(crate) fn capability(&self) -> Option<&KiroReasoningFieldCapability> {
+        match self {
+            Self::Supported(capability) => Some(capability),
+            Self::LegacyFallback
+            | Self::Unknown
+            | Self::AuthoritativeAbsent
+            | Self::AuthoritativeInvalid => None,
+        }
+    }
+}
+
+fn reasoning_cohort_contract_match(
+    verified_cohort_keys: Option<&[KiroModelCapabilityCohortKey]>,
+    current_cohort_keys: &[KiroModelCapabilityCohortKey],
+) -> KiroReasoningCohortContractMatch {
+    // An empty local cohort means there is no local dispatch population whose wire contract can be
+    // proven. In particular, it must not vacuously match every persisted contract.
+    if current_cohort_keys.is_empty()
+        || current_cohort_keys
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return KiroReasoningCohortContractMatch::None;
+    }
+    let Some(verified_cohort_keys) = verified_cohort_keys else {
+        return KiroReasoningCohortContractMatch::None;
+    };
+    if verified_cohort_keys == current_cohort_keys {
+        return KiroReasoningCohortContractMatch::Exact;
+    }
+    if current_cohort_keys.len() < verified_cohort_keys.len()
+        && current_cohort_keys
+            .iter()
+            .all(|key| verified_cohort_keys.binary_search(key).is_ok())
+    {
+        return KiroReasoningCohortContractMatch::ConservativeSubset;
+    }
+    KiroReasoningCohortContractMatch::None
+}
+
+impl KiroReasoningFieldCapability {
+    pub(crate) fn from_schema(schema: &serde_json::Value) -> Option<Self> {
+        let mut discovered = None;
+        'field_candidates: for (field, path) in [
+            ("output_config", KiroReasoningFieldPath::OutputConfig),
+            ("reasoning", KiroReasoningFieldPath::Reasoning),
+        ] {
+            let Some(container) = schema
+                .get("properties")
+                .and_then(|properties| properties.get(field))
+            else {
+                continue;
+            };
+            if container
+                .get("type")
+                .is_some_and(|value| value.as_str() != Some("object"))
+            {
+                continue;
+            }
+            let Some(effort) = container
+                .get("properties")
+                .and_then(|properties| properties.get("effort"))
+            else {
+                continue;
+            };
+            if effort
+                .get("type")
+                .is_some_and(|value| value.as_str() != Some("string"))
+            {
+                continue;
+            }
+            let mut efforts = Vec::new();
+            let Some(values) = effort.get("enum").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            if values.is_empty() {
+                continue;
+            }
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    continue 'field_candidates;
+                };
+                if value.is_empty()
+                    || value.len() > 32
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte == b'-')
+                    || efforts.iter().any(|existing| existing == value)
+                {
+                    continue 'field_candidates;
+                }
+                efforts.push(value.to_string());
+            }
+            let default_effort = match effort.get("default") {
+                None => None,
+                Some(value) => {
+                    let Some(value) = value.as_str() else {
+                        continue;
+                    };
+                    if !efforts.iter().any(|effort| effort == value) {
+                        continue;
+                    }
+                    Some(value.to_string())
+                }
+            };
+            let capability = Self {
+                path,
+                efforts,
+                default_effort,
+            };
+            if discovered.replace(capability).is_some() {
+                return None;
+            }
+        }
+        discovered
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.efforts.is_empty()
+            && self.efforts.iter().all(|value| {
+                !value.is_empty()
+                    && value.len() <= 32
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte == b'-')
+            })
+            && self.efforts.iter().collect::<HashSet<_>>().len() == self.efforts.len()
+            && self
+                .default_effort
+                .as_ref()
+                .is_none_or(|default| self.efforts.iter().any(|effort| effort == default))
+    }
+
+    pub(crate) fn to_schema(&self) -> serde_json::Value {
+        let field = match self.path {
+            KiroReasoningFieldPath::OutputConfig => "output_config",
+            KiroReasoningFieldPath::Reasoning => "reasoning",
+        };
+        let mut effort = serde_json::json!({
+            "type": "string",
+            "enum": self.efforts,
+        });
+        if let Some(default) = self.default_effort.as_ref() {
+            effort["default"] = serde_json::Value::String(default.clone());
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                (field): {
+                    "type": "object",
+                    "properties": {"effort": effort}
+                }
+            }
+        })
+    }
+}
+
+/// Compute the only native reasoning schema that is safe for every credential in a cohort.
+pub(crate) fn intersect_authoritative_reasoning_schemas<'a>(
+    schemas: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
+) -> KiroReasoningCapabilityState {
+    let mut capabilities = Vec::new();
+    let mut observed = 0usize;
+    let mut saw_authoritative_absence = false;
+    for schema in schemas {
+        observed += 1;
+        let Some(schema) = schema else {
+            saw_authoritative_absence = true;
+            continue;
+        };
+        let Some(capability) = KiroReasoningFieldCapability::from_schema(schema) else {
+            return KiroReasoningCapabilityState::AuthoritativeInvalid;
+        };
+        capabilities.push(capability);
+    }
+    if observed == 0 {
+        return KiroReasoningCapabilityState::Unknown;
+    }
+    if saw_authoritative_absence {
+        return KiroReasoningCapabilityState::AuthoritativeAbsent;
+    }
+
+    let mut capabilities = capabilities.into_iter();
+    let Some(first) = capabilities.next() else {
+        return KiroReasoningCapabilityState::AuthoritativeAbsent;
+    };
+    let mut efforts = first.efforts.clone();
+    let mut default_effort = first.default_effort.clone();
+    for capability in capabilities {
+        if capability.path != first.path {
+            return KiroReasoningCapabilityState::AuthoritativeInvalid;
+        }
+        efforts.retain(|effort| {
+            capability
+                .efforts
+                .iter()
+                .any(|candidate| candidate == effort)
+        });
+        if default_effort != capability.default_effort {
+            default_effort = None;
+        }
+    }
+    if efforts.is_empty() {
+        return KiroReasoningCapabilityState::AuthoritativeInvalid;
+    }
+    if default_effort
+        .as_ref()
+        .is_some_and(|default| !efforts.iter().any(|effort| effort == default))
+    {
+        default_effort = None;
+    }
+    KiroReasoningCapabilityState::Supported(KiroReasoningFieldCapability {
+        path: first.path,
+        efforts,
+        default_effort,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +311,17 @@ pub struct ModelCapabilitiesStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub models: Vec<ModelCapabilityItem>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_fields: BTreeMap<String, KiroReasoningFieldCapability>,
+    /// Persistence-only fence. Admin JSON must not expose account cohort metadata.
+    #[serde(skip)]
+    pub reasoning_capability_cohort_keys: Vec<KiroModelCapabilityCohortKey>,
+    #[serde(skip)]
+    pub reasoning_capability_cohort_complete: bool,
+    #[serde(skip)]
+    pub reasoning_capability_contract_version: u32,
+    #[serde(skip)]
+    pub reasoning_invalid_models: Vec<String>,
 }
 
 impl ModelCapabilitiesStatus {
@@ -50,6 +333,9 @@ impl ModelCapabilitiesStatus {
 #[derive(Debug, Clone)]
 struct ModelCapabilitiesSnapshot {
     models: BTreeMap<String, ModelCapabilityItem>,
+    reasoning_fields: BTreeMap<String, KiroReasoningFieldCapability>,
+    reasoning_states: BTreeMap<String, KiroReasoningCapabilityState>,
+    reasoning_capability_cohort_keys: Option<Vec<KiroModelCapabilityCohortKey>>,
     source: String,
     last_synced_at: Option<String>,
     last_error: Option<String>,
@@ -65,6 +351,21 @@ impl ModelCapabilitiesSnapshot {
             last_synced_at: self.last_synced_at.clone(),
             last_error: self.last_error.clone(),
             models,
+            reasoning_fields: self.reasoning_fields.clone(),
+            reasoning_capability_cohort_keys: self
+                .reasoning_capability_cohort_keys
+                .clone()
+                .unwrap_or_default(),
+            reasoning_capability_cohort_complete: self.reasoning_capability_cohort_keys.is_some(),
+            reasoning_capability_contract_version: REASONING_CAPABILITY_CONTRACT_VERSION,
+            reasoning_invalid_models: self
+                .reasoning_states
+                .iter()
+                .filter_map(|(model, state)| {
+                    matches!(state, KiroReasoningCapabilityState::AuthoritativeInvalid)
+                        .then_some(model.clone())
+                })
+                .collect(),
         }
     }
 }
@@ -74,9 +375,17 @@ impl Default for ModelCapabilitiesSnapshot {
         let models = seed_model_capabilities()
             .into_iter()
             .map(|model| (model.model.clone(), model))
+            .collect::<BTreeMap<_, _>>();
+        let reasoning_states = models
+            .keys()
+            .cloned()
+            .map(|model| (model, KiroReasoningCapabilityState::LegacyFallback))
             .collect();
         Self {
             models,
+            reasoning_fields: BTreeMap::new(),
+            reasoning_states,
+            reasoning_capability_cohort_keys: None,
             source: SEED_SOURCE.to_string(),
             last_synced_at: None,
             last_error: None,
@@ -116,7 +425,61 @@ impl ModelCapabilitiesCatalog {
             return;
         }
         let mut inner = self.inner.write();
+        let reasoning_fields = status
+            .reasoning_fields
+            .into_iter()
+            .filter_map(|(model, capability)| {
+                let model = normalize_model_id(&model);
+                (models
+                    .get(&model)
+                    .is_some_and(|item| !is_manual_source(item.source.as_deref()))
+                    && capability.is_valid())
+                .then_some((model, capability))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut reasoning_states = models
+            .iter()
+            .map(|(model, item)| {
+                let state = if is_manual_source(item.source.as_deref()) {
+                    KiroReasoningCapabilityState::Unknown
+                } else if item.source.as_deref() == Some(KIRO_SOURCE) {
+                    KiroReasoningCapabilityState::AuthoritativeAbsent
+                } else {
+                    KiroReasoningCapabilityState::LegacyFallback
+                };
+                (model.clone(), state)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (model, capability) in &reasoning_fields {
+            reasoning_states.insert(
+                model.clone(),
+                KiroReasoningCapabilityState::Supported(capability.clone()),
+            );
+        }
+        for model in status.reasoning_invalid_models {
+            let model = normalize_model_id(&model);
+            if models
+                .get(&model)
+                .is_some_and(|item| !is_manual_source(item.source.as_deref()))
+                && !reasoning_fields.contains_key(&model)
+            {
+                reasoning_states.insert(model, KiroReasoningCapabilityState::AuthoritativeInvalid);
+            }
+        }
+        let mut persisted_cohort_keys = status.reasoning_capability_cohort_keys;
+        persisted_cohort_keys.sort();
+        let had_duplicate_cohort_keys = persisted_cohort_keys
+            .windows(2)
+            .any(|pair| pair[0] == pair[1]);
         inner.models = models;
+        inner.reasoning_fields = reasoning_fields;
+        inner.reasoning_states = reasoning_states;
+        inner.reasoning_capability_cohort_keys = (status.reasoning_capability_cohort_complete
+            && status.reasoning_capability_contract_version
+                == REASONING_CAPABILITY_CONTRACT_VERSION
+            && !persisted_cohort_keys.is_empty()
+            && !had_duplicate_cohort_keys)
+            .then_some(persisted_cohort_keys);
         inner.source = status.source;
         inner.last_synced_at = status.last_synced_at;
         inner.last_error = status.last_error;
@@ -207,6 +570,47 @@ impl ModelCapabilitiesCatalog {
     }
 
     #[cfg(test)]
+    pub(crate) fn reasoning_field_capability_for(
+        &self,
+        model: &str,
+    ) -> Option<KiroReasoningFieldCapability> {
+        let model = normalize_model_id(model);
+        self.inner.read().reasoning_fields.get(&model).cloned()
+    }
+
+    pub(crate) fn reasoning_capability_state_for(
+        &self,
+        model: &str,
+        current_capability_cohort_keys: &[KiroModelCapabilityCohortKey],
+    ) -> KiroReasoningCapabilityState {
+        let model = normalize_model_id(model);
+        let inner = self.inner.read();
+        if reasoning_cohort_contract_match(
+            inner.reasoning_capability_cohort_keys.as_deref(),
+            current_capability_cohort_keys,
+        ) == KiroReasoningCohortContractMatch::None
+        {
+            return KiroReasoningCapabilityState::Unknown;
+        }
+        inner
+            .reasoning_states
+            .get(&model)
+            .cloned()
+            .unwrap_or(KiroReasoningCapabilityState::Unknown)
+    }
+
+    pub(crate) fn reasoning_capability_cohort_contract_match(
+        &self,
+        current_capability_cohort_keys: &[KiroModelCapabilityCohortKey],
+    ) -> KiroReasoningCohortContractMatch {
+        let inner = self.inner.read();
+        reasoning_cohort_contract_match(
+            inner.reasoning_capability_cohort_keys.as_deref(),
+            current_capability_cohort_keys,
+        )
+    }
+
+    #[cfg(test)]
     pub fn resolve_model(&self, requested_model: &str) -> ModelResolution {
         self.resolve_model_with_mode(requested_model, ModelResolutionMode::Compatible)
     }
@@ -262,16 +666,86 @@ impl ModelCapabilitiesCatalog {
             last_synced_at: None,
             last_error: None,
             models,
+            reasoning_fields: BTreeMap::new(),
+            reasoning_capability_cohort_keys: Vec::new(),
+            reasoning_capability_cohort_complete: false,
+            reasoning_capability_contract_version: REASONING_CAPABILITY_CONTRACT_VERSION,
+            reasoning_invalid_models: Vec::new(),
         }
     }
 
+    pub fn sync_from_kiro_catalog(
+        &self,
+        mut catalog: KiroAvailableModelCatalog,
+    ) -> ModelCapabilitiesStatus {
+        catalog.capability_cohort_keys.sort();
+        let cohort_keys_valid = !catalog.capability_cohort_keys.is_empty()
+            && catalog
+                .capability_cohort_keys
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && catalog.capability_cohort_keys.len() == catalog.cohort_count;
+        catalog.complete &= cohort_keys_valid;
+        if !catalog.complete {
+            let mut inner = self.inner.write();
+            let contract_match = reasoning_cohort_contract_match(
+                inner.reasoning_capability_cohort_keys.as_deref(),
+                &catalog.capability_cohort_keys,
+            );
+            if contract_match != KiroReasoningCohortContractMatch::None {
+                inner.last_error = Some(format!(
+                    "native reasoning capability discovery is incomplete ({}/{} cohorts observed); retained the {:?} verified contract",
+                    catalog.successful_cohort_count, catalog.cohort_count, contract_match
+                ));
+                return inner.status();
+            }
+        }
+        self.sync_from_kiro_models_with_cohort(
+            catalog.models,
+            Some(catalog.capability_cohort_keys),
+            catalog.complete,
+            catalog.successful_cohort_count,
+            catalog.cohort_count,
+        )
+    }
+
+    #[cfg(test)]
     pub fn sync_from_kiro_models(
         &self,
         models: Vec<KiroAvailableModel>,
     ) -> ModelCapabilitiesStatus {
+        self.sync_from_kiro_models_with_cohort(models, None, true, 1, 1)
+    }
+
+    fn sync_from_kiro_models_with_cohort(
+        &self,
+        models: Vec<KiroAvailableModel>,
+        reasoning_capability_cohort_keys: Option<Vec<KiroModelCapabilityCohortKey>>,
+        cohort_complete: bool,
+        successful_cohort_count: usize,
+        cohort_count: usize,
+    ) -> ModelCapabilitiesStatus {
         let mut merged: BTreeMap<String, ModelCapabilityItem> = BTreeMap::new();
+        let mut reasoning_fields = BTreeMap::new();
+        let mut reasoning_states = BTreeMap::new();
+        let mut upstream_model_ids = HashSet::new();
         for model in models {
+            let reasoning_state = if cohort_complete {
+                match model.additional_model_request_fields_schema.as_ref() {
+                    None => KiroReasoningCapabilityState::AuthoritativeAbsent,
+                    Some(schema) => KiroReasoningFieldCapability::from_schema(schema)
+                        .map(KiroReasoningCapabilityState::Supported)
+                        .unwrap_or(KiroReasoningCapabilityState::AuthoritativeInvalid),
+                }
+            } else {
+                KiroReasoningCapabilityState::Unknown
+            };
             if let Some(item) = model_capability_from_kiro(model) {
+                upstream_model_ids.insert(item.model.clone());
+                if let KiroReasoningCapabilityState::Supported(capability) = &reasoning_state {
+                    reasoning_fields.insert(item.model.clone(), capability.clone());
+                }
+                reasoning_states.insert(item.model.clone(), reasoning_state);
                 merged.insert(item.model.clone(), item);
             }
         }
@@ -281,8 +755,31 @@ impl ModelCapabilitiesCatalog {
                 .into_iter()
                 .map(|item| (item.model.clone(), item))
                 .collect();
+            reasoning_states = merged
+                .keys()
+                .cloned()
+                .map(|model| (model, KiroReasoningCapabilityState::LegacyFallback))
+                .collect();
         }
         let mut inner = self.inner.write();
+        if cohort_complete
+            && inner.reasoning_capability_cohort_keys.as_deref()
+                == reasoning_capability_cohort_keys.as_deref()
+        {
+            for (model, previous_state) in &inner.reasoning_states {
+                if matches!(
+                    previous_state,
+                    KiroReasoningCapabilityState::AuthoritativeInvalid
+                ) && merged.contains_key(model)
+                {
+                    reasoning_states.insert(
+                        model.clone(),
+                        KiroReasoningCapabilityState::AuthoritativeInvalid,
+                    );
+                    reasoning_fields.remove(model);
+                }
+            }
+        }
         if !using_seed_fallback && !contains_claude_model_id(merged.keys().map(String::as_str)) {
             let previous_claude_models = inner
                 .models
@@ -299,6 +796,10 @@ impl ModelCapabilitiesCatalog {
                 previous_claude_models
             };
             for item in fallback_claude_models {
+                if !upstream_model_ids.contains(&item.model) {
+                    reasoning_states
+                        .insert(item.model.clone(), KiroReasoningCapabilityState::Unknown);
+                }
                 merged.entry(item.model.clone()).or_insert(item);
             }
         }
@@ -309,6 +810,8 @@ impl ModelCapabilitiesCatalog {
             .cloned()
             .collect::<Vec<_>>();
         for item in manual_models {
+            reasoning_states.insert(item.model.clone(), KiroReasoningCapabilityState::Unknown);
+            reasoning_fields.remove(&item.model);
             if using_seed_fallback {
                 merged.insert(item.model.clone(), item);
             } else {
@@ -316,9 +819,21 @@ impl ModelCapabilitiesCatalog {
             }
         }
         inner.models = merged;
+        reasoning_fields.retain(|model, _| inner.models.contains_key(model));
+        reasoning_states.retain(|model, _| inner.models.contains_key(model));
+        inner.reasoning_fields = reasoning_fields;
+        inner.reasoning_states = reasoning_states;
+        inner.reasoning_capability_cohort_keys = cohort_complete
+            .then_some(reasoning_capability_cohort_keys)
+            .flatten()
+            .filter(|keys| !keys.is_empty());
         inner.source = KIRO_SOURCE.to_string();
         inner.last_synced_at = Some(Utc::now().to_rfc3339());
-        inner.last_error = None;
+        inner.last_error = (!cohort_complete).then(|| {
+            format!(
+                "native reasoning capability discovery is incomplete ({successful_cohort_count}/{cohort_count} cohorts observed)"
+            )
+        });
         inner.status()
     }
 
@@ -333,6 +848,10 @@ impl ModelCapabilitiesCatalog {
             return self.status();
         };
         let mut inner = self.inner.write();
+        inner.reasoning_fields.remove(&item.model);
+        inner
+            .reasoning_states
+            .insert(item.model.clone(), KiroReasoningCapabilityState::Unknown);
         inner.models.insert(item.model.clone(), item);
         inner.status()
     }
@@ -346,6 +865,8 @@ impl ModelCapabilitiesCatalog {
             .is_some_and(|item| is_manual_source(item.source.as_deref()))
         {
             inner.models.remove(&model);
+            inner.reasoning_fields.remove(&model);
+            inner.reasoning_states.remove(&model);
         }
         inner.status()
     }
@@ -1336,6 +1857,523 @@ mod tests {
     use super::*;
     use crate::kiro::model::available_models::{KiroAvailableModel, KiroModelTokenLimits};
 
+    fn reasoning_schema(
+        field: &str,
+        efforts: serde_json::Value,
+        default: Option<&str>,
+    ) -> serde_json::Value {
+        let mut effort = serde_json::json!({"type": "string", "enum": efforts});
+        if let Some(default) = default {
+            effort["default"] = serde_json::json!(default);
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                (field): {
+                    "type": "object",
+                    "properties": {"effort": effort}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn reasoning_schema_extracts_output_config_path_enum_and_default_for_five_rounds() {
+        let schema = reasoning_schema(
+            "output_config",
+            serde_json::json!(["low", "medium", "high", "xhigh", "max"]),
+            Some("high"),
+        );
+        for round in 0..5 {
+            let capability = KiroReasoningFieldCapability::from_schema(&schema)
+                .unwrap_or_else(|| panic!("round {round}: capability"));
+            assert_eq!(capability.path, KiroReasoningFieldPath::OutputConfig);
+            assert_eq!(
+                capability.efforts,
+                ["low", "medium", "high", "xhigh", "max"].map(str::to_string)
+            );
+            assert_eq!(capability.default_effort.as_deref(), Some("high"));
+        }
+    }
+
+    fn capability_cohort_key(class: &str) -> KiroModelCapabilityCohortKey {
+        KiroModelCapabilityCohortKey {
+            endpoint_family: "ide".to_string(),
+            auth_method: "social".to_string(),
+            provider: "builderid".to_string(),
+            effective_auth_region: "us-east-1".to_string(),
+            effective_api_region: "us-east-1".to_string(),
+            subscription_class: class.to_string(),
+            supported_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn catalog_reasoning_state_is_authoritative_and_cohort_fenced_for_five_rounds() {
+        for round in 0..5 {
+            let key = capability_cohort_key("pro");
+            let catalog = ModelCapabilitiesCatalog::new();
+            catalog.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-cohort-state".to_string(),
+                    additional_model_request_fields_schema: Some(reasoning_schema(
+                        "output_config",
+                        serde_json::json!(["low", "high"]),
+                        Some("high"),
+                    )),
+                    ..Default::default()
+                }],
+                capability_cohort_keys: vec![key.clone()],
+                successful_cohort_count: 1,
+                cohort_count: 1,
+                complete: true,
+            });
+            assert!(matches!(
+                catalog.reasoning_capability_state_for(
+                    "claude-cohort-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::Supported(_)
+            ));
+            assert_eq!(
+                catalog.reasoning_capability_state_for(
+                    "claude-cohort-state",
+                    &[key.clone(), capability_cohort_key("free")]
+                ),
+                KiroReasoningCapabilityState::Unknown,
+                "round {round}: a new capability cohort invalidates the old contract"
+            );
+
+            let absent = ModelCapabilitiesCatalog::new();
+            absent.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-cohort-state".to_string(),
+                    additional_model_request_fields_schema: None,
+                    ..Default::default()
+                }],
+                capability_cohort_keys: vec![key.clone()],
+                successful_cohort_count: 1,
+                cohort_count: 1,
+                complete: true,
+            });
+            assert_eq!(
+                absent.reasoning_capability_state_for(
+                    "claude-cohort-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::AuthoritativeAbsent
+            );
+
+            let invalid = ModelCapabilitiesCatalog::new();
+            invalid.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-cohort-state".to_string(),
+                    additional_model_request_fields_schema: Some(serde_json::Value::Null),
+                    ..Default::default()
+                }],
+                capability_cohort_keys: vec![key.clone()],
+                successful_cohort_count: 1,
+                cohort_count: 1,
+                complete: true,
+            });
+            assert_eq!(
+                invalid.reasoning_capability_state_for(
+                    "claude-cohort-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::AuthoritativeInvalid
+            );
+            let invalid_restored = ModelCapabilitiesCatalog::new();
+            invalid_restored.load_persisted_status(invalid.status());
+            assert_eq!(
+                invalid_restored.reasoning_capability_state_for(
+                    "claude-cohort-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::AuthoritativeInvalid,
+                "round {round}: invalid authoritative schema survives restart"
+            );
+            invalid_restored.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-cohort-state".to_string(),
+                    additional_model_request_fields_schema: Some(reasoning_schema(
+                        "output_config",
+                        serde_json::json!(["high"]),
+                        Some("high"),
+                    )),
+                    ..Default::default()
+                }],
+                capability_cohort_keys: vec![key.clone()],
+                successful_cohort_count: 1,
+                cohort_count: 1,
+                complete: true,
+            });
+            assert_eq!(
+                invalid_restored.reasoning_capability_state_for(
+                    "claude-cohort-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::AuthoritativeInvalid,
+                "round {round}: a sampled conflict remains sticky for the same cohort contract"
+            );
+
+            let incomplete_keys = (0..5)
+                .map(|index| capability_cohort_key(&format!("class-{index}")))
+                .collect::<Vec<_>>();
+            let incomplete = ModelCapabilitiesCatalog::new();
+            let status = incomplete.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-cohort-state".to_string(),
+                    additional_model_request_fields_schema: Some(reasoning_schema(
+                        "output_config",
+                        serde_json::json!(["high"]),
+                        Some("high"),
+                    )),
+                    ..Default::default()
+                }],
+                capability_cohort_keys: incomplete_keys.clone(),
+                successful_cohort_count: 4,
+                cohort_count: 5,
+                complete: false,
+            });
+            assert!(!status.reasoning_capability_cohort_complete);
+            assert_eq!(
+                incomplete.reasoning_capability_state_for("claude-cohort-state", &incomplete_keys),
+                KiroReasoningCapabilityState::Unknown,
+                "round {round}: more than four cohorts must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_reasoning_contract_accepts_only_exact_or_current_subset_for_five_rounds() {
+        for round in 0..5 {
+            let mut verified_keys =
+                vec![capability_cohort_key("pro"), capability_cohort_key("free")];
+            verified_keys.sort();
+            let source = ModelCapabilitiesCatalog::new();
+            source.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-persisted-subset".to_string(),
+                    additional_model_request_fields_schema: Some(reasoning_schema(
+                        "output_config",
+                        serde_json::json!(["low", "high"]),
+                        Some("high"),
+                    )),
+                    ..Default::default()
+                }],
+                capability_cohort_keys: verified_keys.clone(),
+                successful_cohort_count: verified_keys.len(),
+                cohort_count: verified_keys.len(),
+                complete: true,
+            });
+
+            let restored = ModelCapabilitiesCatalog::new();
+            restored.load_persisted_status(source.status());
+            assert_eq!(
+                restored.reasoning_capability_cohort_contract_match(&verified_keys),
+                KiroReasoningCohortContractMatch::Exact,
+                "round {round}: exact persisted fence"
+            );
+            assert!(matches!(
+                restored.reasoning_capability_state_for("claude-persisted-subset", &verified_keys),
+                KiroReasoningCapabilityState::Supported(_)
+            ));
+
+            let current_subset = vec![capability_cohort_key("pro")];
+            assert_eq!(
+                restored.reasoning_capability_cohort_contract_match(&current_subset),
+                KiroReasoningCohortContractMatch::ConservativeSubset,
+                "round {round}: a persisted superset is a conservative contract"
+            );
+            assert!(matches!(
+                restored.reasoning_capability_state_for("claude-persisted-subset", &current_subset),
+                KiroReasoningCapabilityState::Supported(_)
+            ));
+
+            let mut current_with_addition = verified_keys.clone();
+            current_with_addition.push(capability_cohort_key("enterprise"));
+            current_with_addition.sort();
+            assert_eq!(
+                restored.reasoning_capability_cohort_contract_match(&current_with_addition),
+                KiroReasoningCohortContractMatch::None,
+                "round {round}: any new cohort invalidates the old fence"
+            );
+            assert_eq!(
+                restored.reasoning_capability_state_for(
+                    "claude-persisted-subset",
+                    &current_with_addition
+                ),
+                KiroReasoningCapabilityState::Unknown
+            );
+
+            assert_eq!(
+                restored.reasoning_capability_cohort_contract_match(&[]),
+                KiroReasoningCohortContractMatch::None,
+                "round {round}: an empty local cohort is never a verified match"
+            );
+            assert_eq!(
+                restored.reasoning_capability_state_for("claude-persisted-subset", &[]),
+                KiroReasoningCapabilityState::Unknown
+            );
+
+            let incomplete_status = restored.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: Vec::new(),
+                capability_cohort_keys: current_subset.clone(),
+                successful_cohort_count: 0,
+                cohort_count: current_subset.len(),
+                complete: false,
+            });
+            assert!(
+                incomplete_status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("ConservativeSubset")),
+                "round {round}: incomplete discovery must report retained subset provenance"
+            );
+            assert!(matches!(
+                restored.reasoning_capability_state_for("claude-persisted-subset", &current_subset),
+                KiroReasoningCapabilityState::Supported(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn persisted_reasoning_cohort_survives_restart_and_old_rows_fail_closed_five_rounds() {
+        for round in 0..5 {
+            let key = capability_cohort_key("pro");
+            let source = ModelCapabilitiesCatalog::new();
+            source.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-restart-state".to_string(),
+                    additional_model_request_fields_schema: Some(reasoning_schema(
+                        "output_config",
+                        serde_json::json!(["high"]),
+                        Some("high"),
+                    )),
+                    ..Default::default()
+                }],
+                capability_cohort_keys: vec![key.clone()],
+                successful_cohort_count: 1,
+                cohort_count: 1,
+                complete: true,
+            });
+            let persisted = source.status();
+
+            let restored = ModelCapabilitiesCatalog::new();
+            restored.load_persisted_status(persisted.clone());
+            assert!(matches!(
+                restored.reasoning_capability_state_for(
+                    "claude-restart-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::Supported(_)
+            ));
+            restored.record_sync_error("controlled startup sync failure");
+            assert!(matches!(
+                restored.reasoning_capability_state_for(
+                    "claude-restart-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::Supported(_)
+            ));
+            restored.sync_from_kiro_catalog(KiroAvailableModelCatalog {
+                models: vec![KiroAvailableModel {
+                    model_id: "claude-restart-state".to_string(),
+                    ..Default::default()
+                }],
+                capability_cohort_keys: vec![key.clone()],
+                successful_cohort_count: 0,
+                cohort_count: 1,
+                complete: false,
+            });
+            assert!(matches!(
+                restored.reasoning_capability_state_for(
+                    "claude-restart-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::Supported(_)
+            ));
+
+            let mut old_row = persisted;
+            old_row.reasoning_capability_cohort_keys.clear();
+            old_row.reasoning_capability_cohort_complete = false;
+            old_row.reasoning_capability_contract_version = 0;
+            let old_restored = ModelCapabilitiesCatalog::new();
+            old_restored.load_persisted_status(old_row);
+            assert_eq!(
+                old_restored.reasoning_capability_state_for(
+                    "claude-restart-state",
+                    std::slice::from_ref(&key)
+                ),
+                KiroReasoningCapabilityState::Unknown,
+                "round {round}: an old row has no safe startup fence"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_schema_falls_through_to_reasoning_path_for_five_rounds() {
+        let mut schema = reasoning_schema(
+            "reasoning",
+            serde_json::json!(["low", "high", "max"]),
+            Some("max"),
+        );
+        schema["properties"]["output_config"] = serde_json::json!({
+            "type": "array",
+            "properties": {"effort": {"type": "string", "enum": ["high"]}}
+        });
+        for round in 0..5 {
+            let capability = KiroReasoningFieldCapability::from_schema(&schema)
+                .unwrap_or_else(|| panic!("round {round}: reasoning fallback"));
+            assert_eq!(capability.path, KiroReasoningFieldPath::Reasoning);
+            assert_eq!(
+                capability.efforts,
+                ["low", "high", "max"].map(str::to_string)
+            );
+            assert_eq!(capability.default_effort.as_deref(), Some("max"));
+        }
+    }
+
+    #[test]
+    fn reasoning_schema_rejects_ambiguous_or_malformed_contracts_for_five_rounds() {
+        let invalid = [
+            reasoning_schema("output_config", serde_json::json!([]), None),
+            reasoning_schema("output_config", serde_json::json!(["high", 1]), None),
+            reasoning_schema("output_config", serde_json::json!(["high", "high"]), None),
+            reasoning_schema("output_config", serde_json::json!(["High"]), None),
+            reasoning_schema("output_config", serde_json::json!(["high"]), Some("max")),
+            serde_json::json!({
+                "properties": {
+                    "output_config": {
+                        "type": "object",
+                        "properties": {"effort": {"type": "number", "enum": ["high"]}}
+                    }
+                }
+            }),
+            serde_json::json!({
+                "properties": {
+                    "output_config": {
+                        "type": "object",
+                        "properties": {
+                            "effort": {"type": "string", "enum": ["high"], "default": "high"}
+                        }
+                    },
+                    "reasoning": {
+                        "type": "object",
+                        "properties": {
+                            "effort": {"type": "string", "enum": ["high"], "default": "high"}
+                        }
+                    }
+                }
+            }),
+        ];
+        for round in 0..5 {
+            for schema in &invalid {
+                assert!(
+                    KiroReasoningFieldCapability::from_schema(schema).is_none(),
+                    "round {round}: malformed schema must not become a runtime capability"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_sync_tracks_and_replaces_reasoning_schema_capability_for_five_rounds() {
+        for round in 0..5 {
+            let catalog = ModelCapabilitiesCatalog::new();
+            catalog.sync_from_kiro_models(vec![KiroAvailableModel {
+                model_id: "claude-test-reasoning".to_string(),
+                additional_model_request_fields_schema: Some(reasoning_schema(
+                    "reasoning",
+                    serde_json::json!(["low", "high", "max"]),
+                    Some("high"),
+                )),
+                ..Default::default()
+            }]);
+            let capability = catalog
+                .reasoning_field_capability_for("claude-test-reasoning")
+                .unwrap_or_else(|| panic!("round {round}: synced capability"));
+            assert_eq!(capability.path, KiroReasoningFieldPath::Reasoning);
+            assert_eq!(capability.default_effort.as_deref(), Some("high"));
+
+            catalog.sync_from_kiro_models(vec![KiroAvailableModel {
+                model_id: "claude-test-reasoning".to_string(),
+                additional_model_request_fields_schema: None,
+                ..Default::default()
+            }]);
+            assert!(
+                catalog
+                    .reasoning_field_capability_for("claude-test-reasoning")
+                    .is_none(),
+                "round {round}: a later authoritative schema omission must clear stale capability"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_catalog_restores_only_valid_reasoning_capabilities_for_five_rounds() {
+        for round in 0..5 {
+            let source = ModelCapabilitiesCatalog::new();
+            source.sync_from_kiro_models(vec![KiroAvailableModel {
+                model_id: "claude-persisted-reasoning".to_string(),
+                additional_model_request_fields_schema: Some(reasoning_schema(
+                    "output_config",
+                    serde_json::json!(["low", "high", "max"]),
+                    Some("high"),
+                )),
+                ..Default::default()
+            }]);
+            let mut status = source.status();
+            status.reasoning_fields.insert(
+                "missing-model".to_string(),
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::Reasoning,
+                    efforts: vec!["high".to_string()],
+                    default_effort: Some("high".to_string()),
+                },
+            );
+            status.models.push(ModelCapabilityItem {
+                model: "claude-corrupt-reasoning".to_string(),
+                display_name: "Corrupt fixture".to_string(),
+                description: None,
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(64_000),
+                supports_prompt_caching: None,
+                supported_input_types: vec!["TEXT".to_string()],
+                source: Some(KIRO_SOURCE.to_string()),
+            });
+            status.reasoning_fields.insert(
+                "claude-corrupt-reasoning".to_string(),
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::Reasoning,
+                    efforts: vec!["High".to_string()],
+                    default_effort: Some("High".to_string()),
+                },
+            );
+
+            let restored = ModelCapabilitiesCatalog::new();
+            restored.load_persisted_status(status);
+            let capability = restored
+                .reasoning_field_capability_for("claude-persisted-reasoning")
+                .unwrap_or_else(|| panic!("round {round}: persisted capability"));
+            assert_eq!(capability.path, KiroReasoningFieldPath::OutputConfig);
+            assert_eq!(capability.default_effort.as_deref(), Some("high"));
+            assert!(
+                restored
+                    .reasoning_field_capability_for("missing-model")
+                    .is_none(),
+                "round {round}: capability without a catalog model must be discarded"
+            );
+            assert!(
+                restored
+                    .reasoning_field_capability_for("claude-corrupt-reasoning")
+                    .is_none(),
+                "round {round}: malformed persisted capability must be discarded"
+            );
+        }
+    }
+
     #[test]
     fn sync_from_kiro_models_uses_upstream_models_without_static_merge() {
         let catalog = ModelCapabilitiesCatalog::new();
@@ -1967,6 +3005,11 @@ mod tests {
                 supported_input_types: vec!["TEXT".to_string()],
                 source: None,
             }],
+            reasoning_fields: BTreeMap::new(),
+            reasoning_capability_cohort_keys: Vec::new(),
+            reasoning_capability_cohort_complete: false,
+            reasoning_capability_contract_version: 0,
+            reasoning_invalid_models: Vec::new(),
         };
         assert!(legacy.should_refresh_from_seed());
 

@@ -15,11 +15,18 @@ Use this skill to validate that kiro.rs remains fast and stable under normal tra
 - Real upstream pressure requires an explicit purpose, low starting concurrency, and a hard cap.
 - Do not print secrets or full credentials.
 - Stop every fake server, temp proxy, and background load process.
-- Save reports under `target/loadtest/` or another generated-output directory.
+- Save raw reports under an owned temporary directory. Retain only redacted summaries and hashes under `feature/evidence/`, then remove the raw directory.
+
+## Build Artifact Contract
+
+- Every local Cargo command must run through `feature/tests/run-cargo-scoped.sh <scope> -- <command...>`. CI is exempt only when the job explicitly uses an ephemeral filesystem that is discarded in full.
+- Concurrent branches are allowed when the wrapper admits their atomic disk reservations. Every branch still deletes its own scoped target immediately after its logical build batch on success, failure, timeout, or signal.
+- Copy only a completed candidate binary out of `$CARGO_TARGET_DIR` before wrapper cleanup. All load, chaos, runtime, and restart runners must receive the resulting absolute immutable `KIRO_RS_BINARY`; they must not inspect `target/debug`, `target/release`, or rebuild automatically.
+- Run `node feature/tests/inventory-build-artifacts.mjs --gate` before release validation. Unknown/unmanaged targets, stale/active reservations, incomplete process inspection, and target-referencing live processes are release blockers. Docker disk information is read-only evidence; Docker cleanup always requires separate manual review.
 
 ## Tier Selection
 
-- **L0 static/resource gate**: `cargo fmt --check`, `git diff --check`, `cargo test`, `cargo build --release`, and source diff review.
+- **L0 static/resource gate**: source diff review, `git diff --check`, and one scoped batch containing `cargo fmt --check`, `cargo test`, and `cargo build --release`; copy and hash the frozen binary before scoped cleanup.
 - **L1 fake upstream smoke**: validate loadtest tooling, streaming parsing, thinking, tool-use, malformed SSE, and error normalization without consuming real accounts.
 - **L2 real low-concurrency gate**: validate `/cc`, `/v1`, `/dfcache/*`, RPM limits, model aliases, high-cache reporting, and usage records with small real traffic.
 - **L3 burst and recovery gate**: sudden concurrency spike, sudden invalid traffic spike, mixed success/error traffic, and sudden drop to zero.
@@ -97,4 +104,3 @@ Fail the validation if any of these occur:
 - Error responses expose internal pool, credential, fallback, or private scheduler wording.
 - A restart leaves sockets, tasks, or temp processes behind.
 - A sudden error burst prevents later normal traffic from recovering.
-

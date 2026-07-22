@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::collections::{HashMap, VecDeque};
 
 use axum::{
     body::Body,
@@ -14,20 +11,95 @@ use bytes::Bytes;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 use super::{envelope, middleware::AppState, types::Message};
 
-const MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_FILE_UPLOAD_BODY_SIZE: usize = MAX_FILE_BYTES + 1024 * 1024;
 const MAX_STORED_FILES: usize = 128;
 const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_CONCURRENT_FILE_UPLOADS: usize = 2;
+const MAX_FILE_SOURCES_PER_REQUEST: usize = 20;
+const MAX_FILE_IMAGE_SOURCE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_FILE_DOCUMENT_SOURCE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_FILE_SOURCE_BYTES_PER_REQUEST: usize = 32 * 1024 * 1024;
+const MAX_FILE_MATERIALIZED_BYTES_PER_REQUEST: usize = 44 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct FileMaterializationLimits {
+    max_sources: usize,
+    max_image_bytes: usize,
+    max_document_bytes: usize,
+    max_source_bytes: usize,
+    max_materialized_bytes: usize,
+}
+
+const FILE_MATERIALIZATION_LIMITS: FileMaterializationLimits = FileMaterializationLimits {
+    max_sources: MAX_FILE_SOURCES_PER_REQUEST,
+    max_image_bytes: MAX_FILE_IMAGE_SOURCE_BYTES,
+    max_document_bytes: MAX_FILE_DOCUMENT_SOURCE_BYTES,
+    max_source_bytes: MAX_FILE_SOURCE_BYTES_PER_REQUEST,
+    max_materialized_bytes: MAX_FILE_MATERIALIZED_BYTES_PER_REQUEST,
+};
+
+#[derive(Debug, Default)]
+struct FileMaterializationBudget {
+    sources: usize,
+    source_bytes: usize,
+    materialized_bytes: usize,
+}
+
+impl FileMaterializationBudget {
+    fn reserve(
+        &mut self,
+        block_type: &str,
+        source_bytes: usize,
+        limits: FileMaterializationLimits,
+    ) -> Result<(), String> {
+        let source_limit = match block_type {
+            "image" => limits.max_image_bytes,
+            "document" => limits.max_document_bytes,
+            _ => return Err(format!("unsupported file source block: {block_type}")),
+        };
+        if source_bytes > source_limit {
+            return Err(format!(
+                "uploaded {block_type} exceeds {source_limit} bytes"
+            ));
+        }
+        let next_sources = self.sources.saturating_add(1);
+        if next_sources > limits.max_sources {
+            return Err(format!("file source count exceeds {}", limits.max_sources));
+        }
+        let next_source_bytes = self.source_bytes.saturating_add(source_bytes);
+        if next_source_bytes > limits.max_source_bytes {
+            return Err(format!(
+                "file source bytes exceed {}",
+                limits.max_source_bytes
+            ));
+        }
+        let encoded_bytes = source_bytes.saturating_add(2) / 3 * 4;
+        let next_materialized_bytes = self.materialized_bytes.saturating_add(encoded_bytes);
+        if next_materialized_bytes > limits.max_materialized_bytes {
+            return Err(format!(
+                "materialized file source bytes exceed {}",
+                limits.max_materialized_bytes
+            ));
+        }
+        self.sources = next_sources;
+        self.source_bytes = next_source_bytes;
+        self.materialized_bytes = next_materialized_bytes;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoredFile {
     pub id: String,
     pub filename: String,
     pub media_type: String,
-    pub bytes: Arc<Vec<u8>>,
+    pub bytes: Bytes,
     pub created_at: i64,
 }
 
@@ -56,9 +128,19 @@ struct FileStoreInner {
     total_bytes: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct AnthropicFileStore {
     inner: Mutex<FileStoreInner>,
+    upload_permits: Semaphore,
+}
+
+impl Default for AnthropicFileStore {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(FileStoreInner::default()),
+            upload_permits: Semaphore::new(MAX_CONCURRENT_FILE_UPLOADS),
+        }
+    }
 }
 
 impl AnthropicFileStore {
@@ -80,7 +162,7 @@ impl AnthropicFileStore {
             id: id.clone(),
             filename: sanitize_filename(filename.into()),
             media_type: normalize_media_type(&media_type.into()),
-            bytes: Arc::new(bytes),
+            bytes: Bytes::from(bytes),
             created_at: Utc::now().timestamp(),
         };
 
@@ -114,6 +196,7 @@ impl AnthropicFileStore {
             return false;
         };
         inner.total_bytes = inner.total_bytes.saturating_sub(file.size_bytes());
+        inner.order.retain(|queued_id| queued_id != id);
         true
     }
 
@@ -125,15 +208,29 @@ impl AnthropicFileStore {
             .filter_map(|id| inner.files.get(id).cloned())
             .collect()
     }
+
+    fn try_begin_upload(&self) -> Result<SemaphorePermit<'_>, ()> {
+        self.upload_permits.try_acquire().map_err(|_| ())
+    }
 }
 
 pub(crate) async fn upload_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Response {
+    let _upload_permit = match state.file_store.try_begin_upload() {
+        Ok(permit) => permit,
+        Err(()) => {
+            return envelope::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "too many file uploads are already in progress",
+            );
+        }
+    };
     let mut selected: Option<(String, String, Vec<u8>)> = None;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         let field_name = field.name().unwrap_or_default().to_string();
         let filename = field.file_name().map(str::to_string);
         if field_name != "file" && filename.is_none() && selected.is_some() {
@@ -150,16 +247,30 @@ pub(crate) async fn upload_file(
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        let bytes = match field.bytes().await {
-            Ok(bytes) => bytes.to_vec(),
-            Err(err) => {
-                return envelope::error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    format!("failed to read uploaded file: {}", err),
-                );
+        let mut bytes = Vec::with_capacity(16 * 1024);
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    if let Err(message) =
+                        append_bounded_upload_chunk(&mut bytes, &chunk, MAX_FILE_BYTES)
+                    {
+                        return envelope::error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "invalid_request_error",
+                            message,
+                        );
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    return envelope::error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        format!("failed to read uploaded file: {}", err),
+                    );
+                }
             }
-        };
+        }
 
         selected = Some((filename, media_type, bytes));
         if field_name == "file" {
@@ -181,6 +292,18 @@ pub(crate) async fn upload_file(
             envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
         }
     }
+}
+
+fn append_bounded_upload_chunk(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), String> {
+    if chunk.len() > max_bytes.saturating_sub(buffer.len()) {
+        return Err(format!("uploaded file exceeds {} bytes", max_bytes));
+    }
+    buffer.extend_from_slice(chunk);
+    Ok(())
 }
 
 pub(crate) async fn list_files(State(state): State<AppState>) -> impl IntoResponse {
@@ -264,7 +387,7 @@ fn get_file_content_by_id(state: AppState, file_id: String) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, file.media_type)
-        .body(Body::from(Bytes::from(file.bytes.as_ref().clone())))
+        .body(Body::from(file.bytes))
         .unwrap_or_else(|_| {
             envelope::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -287,9 +410,11 @@ pub(crate) fn materialize_file_sources(
     store: &AnthropicFileStore,
     messages: &mut [Message],
 ) -> Result<usize, String> {
+    let mut budget = FileMaterializationBudget::default();
     let mut materialized = 0usize;
     for message in messages {
-        materialized += materialize_file_sources_in_content(store, &mut message.content)?;
+        materialized +=
+            materialize_file_sources_in_content(store, &mut message.content, &mut budget)?;
     }
     Ok(materialized)
 }
@@ -297,6 +422,7 @@ pub(crate) fn materialize_file_sources(
 fn materialize_file_sources_in_content(
     store: &AnthropicFileStore,
     content: &mut Value,
+    budget: &mut FileMaterializationBudget,
 ) -> Result<usize, String> {
     let Value::Array(items) = content else {
         return Ok(0);
@@ -328,12 +454,13 @@ fn materialize_file_sources_in_content(
                 file_id, block_type, file.media_type
             )
         })?;
+        budget.reserve(&block_type, file.size_bytes(), FILE_MATERIALIZATION_LIMITS)?;
         source.clear();
         source.insert("type".to_string(), Value::String("base64".to_string()));
         source.insert("media_type".to_string(), Value::String(media_type));
         source.insert(
             "data".to_string(),
-            Value::String(BASE64_STANDARD.encode(file.bytes.as_slice())),
+            Value::String(BASE64_STANDARD.encode(file.bytes.as_ref())),
         );
         materialized += 1;
     }
@@ -355,7 +482,7 @@ fn source_file_id(source: &serde_json::Map<String, Value>) -> Option<String> {
 
 fn media_type_for_block(block_type: &str, file: &StoredFile) -> Option<String> {
     match block_type {
-        "image" => infer_image_media_type_from_bytes(file.bytes.as_slice())
+        "image" => infer_image_media_type_from_bytes(file.bytes.as_ref())
             .map(str::to_string)
             .or_else(|| {
                 is_supported_image_media_type(&file.media_type).then(|| file.media_type.clone())
@@ -365,7 +492,7 @@ fn media_type_for_block(block_type: &str, file: &StoredFile) -> Option<String> {
                 Some(file.media_type.clone())
             } else if file.bytes.starts_with(b"%PDF") {
                 Some("application/pdf".to_string())
-            } else if std::str::from_utf8(file.bytes.as_slice()).is_ok() {
+            } else if std::str::from_utf8(file.bytes.as_ref()).is_ok() {
                 Some("text/plain".to_string())
             } else {
                 None
@@ -460,5 +587,118 @@ mod tests {
         assert_eq!(messages[0].content[0]["source"]["type"], "base64");
         assert_eq!(messages[0].content[0]["source"]["media_type"], "image/png");
         assert!(messages[0].content[0]["source"]["data"].as_str().is_some());
+    }
+
+    #[test]
+    fn stored_file_clones_share_bytes_and_upload_chunk_limit_is_exact_for_five_rounds() {
+        for round in 0..5 {
+            let store = AnthropicFileStore::default();
+            let file = store
+                .insert("fixture.bin", "application/octet-stream", vec![1, 2, 3, 4])
+                .unwrap();
+            let loaded = store.get(&file.id).expect("stored file");
+            assert_eq!(loaded.bytes.as_ptr(), file.bytes.as_ptr(), "round {round}");
+
+            let mut body = Vec::new();
+            append_bounded_upload_chunk(&mut body, b"abc", 5).unwrap();
+            append_bounded_upload_chunk(&mut body, b"de", 5).unwrap();
+            assert_eq!(body, b"abcde", "round {round}");
+            let error = append_bounded_upload_chunk(&mut body, b"f", 5)
+                .expect_err("one byte above the boundary must fail");
+            assert!(error.contains("exceeds 5 bytes"), "round {round}");
+            assert_eq!(body, b"abcde", "round {round}");
+        }
+    }
+
+    #[test]
+    fn file_upload_admission_is_fail_fast_and_recovers_for_five_rounds() {
+        for round in 0..5 {
+            let store = AnthropicFileStore::default();
+            let first = store.try_begin_upload().expect("first upload permit");
+            let second = store.try_begin_upload().expect("second upload permit");
+            assert!(store.try_begin_upload().is_err(), "round {round}");
+            drop(first);
+            let recovered = store
+                .try_begin_upload()
+                .expect("permit recovers after drop");
+            drop(recovered);
+            drop(second);
+            assert_eq!(store.upload_permits.available_permits(), 2, "round {round}");
+        }
+    }
+
+    #[test]
+    fn file_delete_churn_keeps_fifo_metadata_bounded_for_five_rounds() {
+        for round in 0..5 {
+            let store = AnthropicFileStore::default();
+            for index in 0..1_000 {
+                let file = store
+                    .insert(
+                        format!("fixture-{round}-{index}.bin"),
+                        "application/octet-stream",
+                        vec![index as u8],
+                    )
+                    .expect("insert churn fixture");
+                assert!(store.delete(&file.id), "round {round} index {index}");
+            }
+
+            let inner = store.inner.lock();
+            assert!(inner.files.is_empty(), "round {round}");
+            assert!(inner.order.is_empty(), "round {round}");
+            assert_eq!(inner.total_bytes, 0, "round {round}");
+        }
+    }
+
+    #[test]
+    fn file_materialization_budget_checks_every_boundary_before_commit_for_five_rounds() {
+        let limits = FileMaterializationLimits {
+            max_sources: 2,
+            max_image_bytes: 5,
+            max_document_bytes: 8,
+            max_source_bytes: 8,
+            max_materialized_bytes: 12,
+        };
+        for round in 0..5 {
+            let mut budget = FileMaterializationBudget::default();
+            budget.reserve("image", 5, limits).unwrap();
+            assert_eq!(
+                (
+                    budget.sources,
+                    budget.source_bytes,
+                    budget.materialized_bytes
+                ),
+                (1, 5, 8),
+                "round {round}"
+            );
+            let before = (
+                budget.sources,
+                budget.source_bytes,
+                budget.materialized_bytes,
+            );
+            assert!(budget.reserve("image", 6, limits).is_err(), "round {round}");
+            assert_eq!(
+                (
+                    budget.sources,
+                    budget.source_bytes,
+                    budget.materialized_bytes,
+                ),
+                before,
+                "round {round}"
+            );
+            budget.reserve("document", 3, limits).unwrap();
+            assert_eq!(
+                (
+                    budget.sources,
+                    budget.source_bytes,
+                    budget.materialized_bytes
+                ),
+                (2, 8, 12),
+                "round {round}"
+            );
+            assert!(
+                budget.reserve("document", 1, limits).is_err(),
+                "round {round}"
+            );
+        }
     }
 }

@@ -8,7 +8,7 @@ use crate::model::config::{
     ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
     ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
     PromptCacheCreationControlConfig, PromptSteeringConfig, ReportedUsageConfig,
-    ThinkingTriggerMode, WeightedCapacityConfig,
+    RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -674,7 +674,9 @@ impl Default for UsageCleanupMode {
 #[serde(rename_all = "snake_case")]
 pub enum UsageCleanupJobStatus {
     Idle,
+    Queued,
     Running,
+    Paused,
     Completed,
     Cancelled,
     Failed,
@@ -704,6 +706,12 @@ pub struct UsageCleanupRequest {
     pub pause_ms_between_batches: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCleanupResumeRequest {
+    pub job_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageCleanupPreviewResponse {
@@ -722,6 +730,7 @@ pub struct UsageCleanupStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
     pub status: UsageCleanupJobStatus,
+    pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<UsageCleanupMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -736,6 +745,12 @@ pub struct UsageCleanupStatusResponse {
     pub processed_rows: u64,
     pub last_batch_rows: u64,
     pub batches: usize,
+    pub redis_deleted_keys: usize,
+    pub redis_delete_commands: usize,
+    pub redis_max_command_keys: usize,
+    pub redis_scan_passes: usize,
+    pub redis_used_del_fallback: bool,
+    pub redis_pass_limit_reached: bool,
     pub cancel_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
@@ -1409,6 +1424,37 @@ pub struct UpdateAdminApiKeyRequest {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AuxiliaryUpstreamRuntimeResponse {
+    pub configured_limit: u32,
+    pub in_flight: u32,
+    pub peak_in_flight: u32,
+    pub rejected: u64,
+    pub refresh_client_cache_entries: usize,
+    pub refresh_client_cache_max_entries: usize,
+    pub refresh_client_builds: u64,
+    pub refresh_client_hits: u64,
+    pub refresh_client_misses: u64,
+    pub refresh_client_cache_saturated: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenRefreshAdmissionRuntimeResponse {
+    pub authority: String,
+    pub breaker_state: String,
+    pub next_probe_after_ms: u64,
+    pub configured_rpm: u32,
+    pub configured_burst: u32,
+    pub admitted: u64,
+    pub rate_limited: u64,
+    pub coordination_rejected: u64,
+    pub redis_errors: u64,
+    pub last_retry_after_ms: u64,
+    pub remaining_milli_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeConfigResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
@@ -1417,6 +1463,8 @@ pub struct RuntimeConfigResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
     pub credential_rpm: u32,
+    /// 单实例、单个请求 API Key 的准入配置；不表示跨实例聚合上限。
+    pub request_admission: RequestAdmissionConfig,
     pub credential_max_concurrent_requests: u32,
     pub credential_transient_cooldown_secs: u64,
     pub credential_rate_limit_cooldown_secs: u64,
@@ -1434,6 +1482,13 @@ pub struct RuntimeConfigResponse {
     pub kiro_upstream_stream_idle_timeout_secs: u64,
     pub kiro_upstream_stream_retry_enabled: bool,
     pub kiro_upstream_stream_retry_max_attempts: u32,
+    pub inference_upstream_max_attempts: u32,
+    pub auxiliary_upstream_max_attempts: u32,
+    pub auxiliary_upstream_max_concurrent_requests: u32,
+    pub auxiliary_upstream_runtime: AuxiliaryUpstreamRuntimeResponse,
+    pub token_refresh_max_rpm: u32,
+    pub token_refresh_burst: u32,
+    pub token_refresh_admission_runtime: TokenRefreshAdmissionRuntimeResponse,
     pub kiro_upstream_stream_retry_on_idle_timeout: bool,
     pub kiro_upstream_stream_retry_on_read_error: bool,
     pub kiro_upstream_stream_retry_on_status_error: bool,
@@ -1504,6 +1559,8 @@ pub struct RuntimeConfigResponse {
 pub struct UpdateRuntimeConfigRequest {
     pub credential_rpm: u32,
     #[serde(default)]
+    pub request_admission: Option<RequestAdmissionConfig>,
+    #[serde(default)]
     pub credential_max_concurrent_requests: u32,
     pub credential_transient_cooldown_secs: u64,
     #[serde(default)]
@@ -1535,6 +1592,16 @@ pub struct UpdateRuntimeConfigRequest {
     pub kiro_upstream_stream_retry_enabled: Option<bool>,
     #[serde(default)]
     pub kiro_upstream_stream_retry_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub inference_upstream_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub auxiliary_upstream_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub auxiliary_upstream_max_concurrent_requests: Option<u32>,
+    #[serde(default)]
+    pub token_refresh_max_rpm: Option<u32>,
+    #[serde(default)]
+    pub token_refresh_burst: Option<u32>,
     #[serde(default)]
     pub kiro_upstream_stream_retry_on_idle_timeout: Option<bool>,
     #[serde(default)]

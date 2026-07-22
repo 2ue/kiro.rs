@@ -1,20 +1,1937 @@
 use super::*;
 use crate::anthropic::cache::{self, CacheUsage};
+use crate::anthropic::model_capabilities::ModelCapabilitiesCatalog;
 use crate::anthropic::pricing::PricingCatalog;
 use crate::anthropic::prompt_cache::PromptCacheTracker;
 use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
+use crate::anthropic::request_admission::RequestAdmissionController;
+use crate::anthropic::router::{
+    AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider,
+};
 use crate::anthropic::types::{Message, Metadata, SystemMessage};
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder};
+use crate::common::auth::RequestApiKeyStore;
 use crate::kiro::call_trace::{
     AccountRejectReason, KiroCallError, SelectionFailureStage, SelectionFailureSummary,
 };
+use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::MetadataTokenUsage;
+use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{
     CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch, CacheSimulationPolicyPatch,
     PromptCacheCreationControlConfig, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
+    RequestAdmissionConfig,
 };
+use axum::{Router, body::Body, http::Request, routing::post};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Mutex as StdMutex, atomic::AtomicUsize};
+use tower::ServiceExt;
+
+fn eventstream_test_frame(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
+    fn push_string_header(headers: &mut Vec<u8>, name: &str, value: &str) {
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name.as_bytes());
+        headers.push(7);
+        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        headers.extend_from_slice(value.as_bytes());
+    }
+
+    let mut headers = Vec::new();
+    push_string_header(&mut headers, ":message-type", "event");
+    push_string_header(&mut headers, ":event-type", event_type);
+    push_string_header(&mut headers, ":content-type", "application/json");
+    let payload = serde_json::to_vec(&payload).expect("test event payload serializes");
+    let total_length = 12 + headers.len() + payload.len() + 4;
+
+    let mut frame = Vec::with_capacity(total_length);
+    frame.extend_from_slice(&(total_length as u32).to_be_bytes());
+    frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    let prelude_crc = crate::kiro::parser::crc::crc32(&frame[..8]);
+    frame.extend_from_slice(&prelude_crc.to_be_bytes());
+    frame.extend_from_slice(&headers);
+    frame.extend_from_slice(&payload);
+    let message_crc = crate::kiro::parser::crc::crc32(&frame);
+    frame.extend_from_slice(&message_crc.to_be_bytes());
+    frame
+}
+
+#[derive(Clone, Default)]
+struct MultimodalHandlerUpstreamState {
+    hits: Arc<AtomicUsize>,
+}
+
+struct MultimodalHandlerUpstream {
+    base_url: String,
+    state: MultimodalHandlerUpstreamState,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MultimodalHandlerUpstream {
+    async fn start() -> Self {
+        let state = MultimodalHandlerUpstreamState::default();
+        let app = Router::new()
+            .route(
+                "/generateAssistantResponse",
+                post(multimodal_handler_upstream),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind multimodal handler upstream probe");
+        let address = listener
+            .local_addr()
+            .expect("multimodal handler upstream probe address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve multimodal handler upstream probe");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            state,
+            task,
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.state.hits.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for MultimodalHandlerUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+const TEST_MCP_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Default)]
+struct WebSearchHandlerUpstreamState {
+    mcp_hits: Arc<AtomicUsize>,
+    normal_hits: Arc<AtomicUsize>,
+    queries: Arc<StdMutex<Vec<String>>>,
+}
+
+impl WebSearchHandlerUpstreamState {
+    fn mcp_hits(&self) -> usize {
+        self.mcp_hits.load(Ordering::Acquire)
+    }
+
+    fn normal_hits(&self) -> usize {
+        self.normal_hits.load(Ordering::Acquire)
+    }
+
+    fn queries(&self) -> Vec<String> {
+        self.queries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+struct WebSearchHandlerUpstream {
+    base_url: String,
+    state: WebSearchHandlerUpstreamState,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Default)]
+struct CapturedTestLogs(Arc<StdMutex<Vec<u8>>>);
+
+struct CapturedTestLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedTestLogs {
+    type Writer = CapturedTestLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedTestLogWriter(self.0.clone())
+    }
+}
+
+impl std::io::Write for CapturedTestLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedTestLogs {
+    fn snapshot(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+        .into_owned()
+    }
+}
+
+impl WebSearchHandlerUpstream {
+    async fn start() -> Self {
+        let state = WebSearchHandlerUpstreamState::default();
+        let app = Router::new()
+            .route("/mcp", post(websearch_handler_mcp_upstream))
+            .route(
+                "/generateAssistantResponse",
+                post(websearch_handler_normal_upstream),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake WebSearch/MCP upstream");
+        let address = listener.local_addr().expect("fake WebSearch/MCP address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake WebSearch/MCP upstream");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            state,
+            task,
+        }
+    }
+}
+
+impl Drop for WebSearchHandlerUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn valid_mcp_search_response(request_id: &str, query: &str) -> Value {
+    let result = json!({
+        "results": [{
+            "title": format!("result for {query}"),
+            "url": "https://fixture.example.invalid/result",
+            "snippet": format!("WEBSEARCH_RAW_RESULT_MARKER snippet for {query}")
+        }],
+        "totalResults": 1,
+        "query": query
+    });
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": result.to_string()}],
+            "isError": false
+        }
+    })
+}
+
+fn zero_result_mcp_search_response(request_id: &str, query: &str) -> Value {
+    let result = json!({
+        "results": [],
+        "totalResults": 0,
+        "query": query
+    });
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": result.to_string()}],
+            "isError": false
+        }
+    })
+}
+
+async fn websearch_handler_mcp_upstream(
+    State(state): State<WebSearchHandlerUpstreamState>,
+    body: Bytes,
+) -> Response {
+    state.mcp_hits.fetch_add(1, Ordering::AcqRel);
+    let request = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+    let request_id = request
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("missing-id")
+        .to_string();
+    let query = request
+        .pointer("/params/arguments/query")
+        .and_then(Value::as_str)
+        .unwrap_or("missing-query")
+        .to_string();
+    state
+        .queries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(query.clone());
+
+    match query.as_str() {
+        value if value.starts_with("http-400") => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "private-400-marker falsely says 429 timeout"})),
+        )
+            .into_response(),
+        value if value.starts_with("http-429") => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"message": "private-429-marker falsely says 400 timeout"})),
+        )
+            .into_response(),
+        value if value.starts_with("http-500") => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": "private-500-marker falsely says 429 timeout 400"})),
+        )
+            .into_response(),
+        value if value.starts_with("header-timeout") => {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Json(valid_mcp_search_response(&request_id, &query)).into_response()
+        }
+        value if value.starts_with("body-timeout") => {
+            let response = valid_mcp_search_response(&request_id, &query).to_string();
+            let body = Body::from_stream(stream::once(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok::<_, Infallible>(Bytes::from(response))
+            }));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .expect("body-timeout response")
+        }
+        value if value.starts_with("disconnect") => {
+            let body = Body::from_stream(stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from_static(b"{")),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "controlled MCP disconnect",
+                )),
+            ]));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .expect("disconnect response")
+        }
+        value if value.starts_with("malformed") => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            "not-json",
+        )
+            .into_response(),
+        value if value.starts_with("jsonrpc-error") => Json(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32000, "message": "private-jsonrpc-marker"}
+        }))
+        .into_response(),
+        value if value.starts_with("is-error") => Json(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": "private-is-error-marker"}],
+                "isError": true
+            }
+        }))
+        .into_response(),
+        value if value.starts_with("non-text-content") => Json(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "image", "text": "private-non-text-marker"}],
+                "isError": false
+            }
+        }))
+        .into_response(),
+        value if value.starts_with("mismatched-id") => {
+            Json(valid_mcp_search_response("different-request-id", &query)).into_response()
+        }
+        value if value.starts_with("content-length-over-limit") => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                header::CONTENT_LENGTH,
+                (TEST_MCP_RESPONSE_MAX_BYTES + 1).to_string(),
+            )
+            .body(Body::empty())
+            .expect("declared over-limit response"),
+        value if value.starts_with("chunked-over-limit") => {
+            let chunks = (0..17).map(|_| Ok::<_, Infallible>(Bytes::from(vec![b'x'; 256 * 1024])));
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(stream::iter(chunks)))
+                .expect("chunked over-limit response")
+        }
+        value if value.starts_with("zero-results") => {
+            Json(zero_result_mcp_search_response(&request_id, &query)).into_response()
+        }
+        _ => Json(valid_mcp_search_response(&request_id, &query)).into_response(),
+    }
+}
+
+async fn websearch_handler_normal_upstream(
+    State(state): State<WebSearchHandlerUpstreamState>,
+) -> Response {
+    state.normal_hits.fetch_add(1, Ordering::AcqRel);
+    let mut body = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"normal-tool-path","messageStatus":"COMPLETED"}),
+    );
+    body.extend(eventstream_test_frame(
+        "metadataEvent",
+        json!({
+            "tokenUsage": {
+                "uncachedInputTokens": 10,
+                "outputTokens": 2,
+                "totalTokens": 12,
+                "cacheReadInputTokens": 0,
+                "cacheWriteInputTokens": 0
+            }
+        }),
+    ));
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")],
+        body,
+    )
+        .into_response()
+}
+
+async fn multimodal_handler_upstream(
+    State(state): State<MultimodalHandlerUpstreamState>,
+) -> Response {
+    state.hits.fetch_add(1, Ordering::AcqRel);
+    let mut body = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"inline-ok","messageStatus":"COMPLETED"}),
+    );
+    body.extend(eventstream_test_frame(
+        "metadataEvent",
+        json!({
+            "tokenUsage": {
+                "uncachedInputTokens": 100,
+                "outputTokens": 3,
+                "totalTokens": 103,
+                "cacheReadInputTokens": 0,
+                "cacheWriteInputTokens": 0
+            }
+        }),
+    ));
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")],
+        body,
+    )
+        .into_response()
+}
+
+fn multimodal_handler_test_provider(config: Config) -> Arc<KiroProvider> {
+    let credentials = vec![KiroCredentials {
+        id: Some(1),
+        access_token: Some("multimodal-handler-test-token".to_string()),
+        profile_arn: Some(
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/HANDLER_TEST".to_string(),
+        ),
+        expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+        auth_method: Some("social".to_string()),
+        rate_limit_auto_disable_enabled: Some(false),
+        ..Default::default()
+    }];
+    let manager = Arc::new(
+        MultiTokenManager::new(config, credentials, None, None, false)
+            .expect("build multimodal handler token manager"),
+    );
+    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    Arc::new(KiroProvider::with_proxy(
+        manager,
+        None,
+        endpoints,
+        "ide".to_string(),
+    ))
+}
+
+fn multimodal_handler_test_router(base_url: &str) -> Router {
+    multimodal_handler_test_router_with_usage(base_url).0
+}
+
+fn multimodal_handler_test_router_with_usage(base_url: &str) -> (Router, Arc<UsageRecorder>) {
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(base_url.to_string());
+    config.kiro_upstream_response_timeout_secs = 2;
+    config.credential_retry_max_attempts = 1;
+    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+    multimodal_handler_test_router_from_config(config)
+}
+
+fn multimodal_handler_test_router_from_config(config: Config) -> (Router, Arc<UsageRecorder>) {
+    let provider = multimodal_handler_test_provider(config.clone());
+    let usage_recorder = Arc::new(UsageRecorder::new(1_000));
+    let router = create_router_with_provider(
+        AnthropicRouterDependencies {
+            request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
+            kiro_provider: Some(provider),
+            usage_recorder: usage_recorder.clone(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            external_pool_manager: None,
+        },
+        AnthropicRouterConfig::from_runtime_config(&config),
+    );
+    (router, usage_recorder)
+}
+
+async fn run_strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(upstream.base_url.clone());
+    config.kiro_upstream_response_timeout_secs = 2;
+    config.credential_retry_max_attempts = 1;
+    config.compat_profile = CompatProfile::AnthropicStrict;
+    let (app, usage_recorder) = multimodal_handler_test_router_from_config(config);
+
+    for round in 1..=5 {
+        let hidden = format!("credential-like-output-{round}");
+        let response = app
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 32,
+                    "stream": false,
+                    "messages": [{
+                        "role": "assistant",
+                        "content": format!("safe prefix\nuser Continue\n\nbashHashd1e9567d: {hidden}")
+                    }],
+                    "tools": [{"name": "bashHashd1e9567d", "input_schema": {"type": "object"}}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("strict contamination response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "round {round}");
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("request-id")
+            .to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get("anthropic-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id.as_str())
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-error-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id.as_str())
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("strict contamination body");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf-8 error body");
+        let value: Value = serde_json::from_str(&body_text).expect("error JSON");
+        assert_eq!(value["request_id"], request_id);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&request_id))
+        );
+        assert!(!body_text.contains(&hidden));
+        assert!(!body_text.contains("bashHashd1e9567d"));
+
+        let records = usage_recorder.query(UsageRecordQuery {
+            request_id: Some(request_id.clone()),
+            ..UsageRecordQuery::default()
+        });
+        assert_eq!(records.records.len(), 1, "round {round}");
+        let record = records.records.first().expect("strict error usage record");
+        assert_eq!(record.status, UsageRecordStatus::Error);
+        assert_eq!(record.error_source.as_deref(), Some("request_rejection"));
+        assert_eq!(record.error_status_code, Some(400));
+        assert_eq!(record.error_id.as_deref(), Some(request_id.as_str()));
+        assert_eq!(record.total_input_tokens, 0);
+        assert_eq!(record.output_tokens, 0);
+        let metadata = record.error_metadata.as_ref().expect("error metadata");
+        assert_eq!(metadata["stage"], "request_entry");
+        assert_eq!(metadata["sampled"], true);
+        assert_eq!(metadata["observedCountIsExact"], false);
+        assert_eq!(metadata["observedCount"], round);
+        assert_eq!(
+            metadata.get("reason").and_then(Value::as_str),
+            Some("strict_request_protocol_contamination")
+        );
+        let serialized_record = serde_json::to_string(record).expect("serialize usage record");
+        assert!(!serialized_record.contains(&hidden));
+        assert!(!serialized_record.contains("bashHashd1e9567d"));
+    }
+
+    assert_eq!(
+        upstream.hits(),
+        0,
+        "strict contamination must never hit upstream"
+    );
+}
+
+#[test]
+fn strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("strict-contamination-matrix", || async {
+        run_strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let (router, usage_recorder) = multimodal_handler_test_router_with_usage(&upstream.base_url);
+
+    for round in 1..=5 {
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 32,
+                    "stream": false,
+                    "messages": [{"role": "user", "content": format!("round {round}")}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("local non-stream request");
+        assert_eq!(response.status(), StatusCode::OK, "round {round}");
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("non-stream response request id")
+            .to_string();
+        axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("read local non-stream response");
+
+        let records = usage_recorder.query(UsageRecordQuery {
+            request_id: Some(request_id),
+            ..UsageRecordQuery::default()
+        });
+        let record = records
+            .records
+            .first()
+            .expect("non-stream success usage record");
+        let attempts = record
+            .latency_trace
+            .as_ref()
+            .and_then(|trace| trace.inference_attempts)
+            .expect("non-stream inference attempt snapshot");
+        assert_eq!(attempts.consumed, 1, "round {round}");
+        assert!(attempts.downstream_committed, "round {round}");
+    }
+    assert_eq!(upstream.hits(), 5);
+}
+
+#[test]
+fn local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("local-non-stream-matrix", || async {
+        run_local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds()
+            .await;
+    });
+}
+
+fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(base_url.to_string());
+    config.kiro_upstream_response_timeout_secs = 1;
+    config.credential_retry_max_attempts = 1;
+    config.credential_transient_cooldown_secs = 0;
+    config.credential_rate_limit_cooldown_secs = 0;
+    config.credential_server_error_cooldown_secs = 0;
+    config.credential_network_error_cooldown_secs = 0;
+    config.credential_stream_error_cooldown_secs = 0;
+    config.credential_protocol_error_cooldown_secs = 0;
+    config.credential_auth_error_cooldown_secs = 0;
+    config.credential_cooldown_backoff_multiplier = 1.0;
+    config.credential_cooldown_jitter_percent = 0;
+    config.credential_max_cooldown_secs = 0;
+    let credentials = (1..=80)
+        .map(|id| KiroCredentials {
+            id: Some(id),
+            access_token: Some(format!("websearch-handler-test-token-{id}")),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/WEBSEARCH_TEST".to_string(),
+            ),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("social".to_string()),
+            rate_limit_auto_disable_enabled: Some(false),
+            ..Default::default()
+        })
+        .collect();
+    let manager = Arc::new(
+        MultiTokenManager::new(config.clone(), credentials, None, None, false)
+            .expect("build WebSearch handler token manager"),
+    );
+    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    let provider = Arc::new(KiroProvider::with_proxy(
+        manager,
+        None,
+        endpoints,
+        "ide".to_string(),
+    ));
+    let usage_recorder = Arc::new(UsageRecorder::new(1_000));
+    let router = create_router_with_provider(
+        AnthropicRouterDependencies {
+            request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
+            kiro_provider: Some(provider),
+            usage_recorder: usage_recorder.clone(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            external_pool_manager: None,
+        },
+        AnthropicRouterConfig::from_runtime_config(&config),
+    );
+    (router, usage_recorder)
+}
+
+fn websearch_messages_body(
+    messages: Vec<Value>,
+    stream: bool,
+    tool_type: Option<&str>,
+    include_second_tool: bool,
+) -> String {
+    let mut tools = vec![json!({
+        "name": "web_search",
+        "type": tool_type,
+        "max_uses": 8,
+        "description": "same name custom tool",
+        "input_schema": {"type": "object"}
+    })];
+    if include_second_tool {
+        tools.push(json!({
+            "name": "fixture",
+            "description": "ordinary tool",
+            "input_schema": {"type": "object"}
+        }));
+    }
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 256,
+        "stream": stream,
+        "messages": messages,
+        "tools": tools
+    })
+    .to_string()
+}
+
+fn single_query_websearch_body(query: &str, stream: bool) -> String {
+    websearch_messages_body(
+        vec![json!({"role": "user", "content": query})],
+        stream,
+        Some("web_search_20250305"),
+        false,
+    )
+}
+
+fn response_request_id(response: &Response) -> String {
+    response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("response request-id")
+        .to_string()
+}
+
+fn usage_record_for_request(recorder: &UsageRecorder, request_id: &str) -> UsageRecord {
+    let records = recorder.query(UsageRecordQuery {
+        request_id: Some(request_id.to_string()),
+        ..UsageRecordQuery::default()
+    });
+    assert_eq!(records.records.len(), 1, "one usage record per request");
+    records.records.into_iter().next().unwrap()
+}
+
+fn assert_websearch_usage_attribution(
+    record: &UsageRecord,
+    context: &str,
+    forbidden_markers: &[&str],
+) {
+    let request_api_key_id = record
+        .request_api_key_id
+        .as_deref()
+        .expect("WebSearch usage must retain the stable request-key channel ID");
+    assert_eq!(request_api_key_id.len(), 64, "{context}");
+    assert!(
+        request_api_key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()),
+        "{context}: request-key channel ID must be a hexadecimal digest"
+    );
+    assert_ne!(request_api_key_id, "b07-handler-key", "{context}");
+    assert_eq!(
+        record.route_kind,
+        Some(crate::anthropic::usage::UsageRouteKind::LocalCredential),
+        "{context}"
+    );
+    let credential_id = record
+        .credential_id
+        .expect("WebSearch usage must retain the selected credential");
+    assert!(
+        (1..=80).contains(&credential_id),
+        "{context}: unexpected credential id {credential_id}"
+    );
+    assert!(
+        !record.credential_attempts.is_empty(),
+        "{context}: WebSearch usage lost all MCP attempts"
+    );
+    assert!(
+        record.credential_attempts.len() <= 4,
+        "{context}: MCP attempt chain exceeded the shared hard budget: {:?}",
+        record.credential_attempts
+    );
+    let final_attempt = record
+        .credential_attempts
+        .last()
+        .expect("non-empty WebSearch attempt chain");
+    assert_eq!(
+        final_attempt.credential_id, credential_id,
+        "{context}: selected credential must match the final MCP attempt"
+    );
+    assert_eq!(
+        final_attempt.credential_label.as_deref(),
+        record.credential_label.as_deref(),
+        "{context}: selected credential label must match the final MCP attempt"
+    );
+
+    for (index, attempt) in record.credential_attempts.iter().enumerate() {
+        assert_eq!(attempt.attempt as usize, index + 1, "{context}");
+        assert!(
+            matches!(attempt.action.as_str(), "success" | "retry" | "fail"),
+            "{context}: unstable MCP attempt action {:?}",
+            attempt.action
+        );
+        for (field, marker) in [
+            ("error_type", attempt.error_type.as_deref()),
+            ("error_message", attempt.error_message.as_deref()),
+        ] {
+            let Some(marker) = marker else {
+                continue;
+            };
+            assert!(
+                marker.len() <= 64
+                    && marker.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "{context}: {field} must be a fixed taxonomy marker, got {marker:?}"
+            );
+        }
+    }
+
+    let attempts = record
+        .latency_trace
+        .as_ref()
+        .and_then(|trace| trace.inference_attempts)
+        .expect("WebSearch usage inference attempt snapshot");
+    assert_eq!(
+        attempts.consumed as usize,
+        record.credential_attempts.len(),
+        "{context}: real MCP sends and attributed attempts must agree"
+    );
+    assert!(attempts.consumed <= attempts.max_attempts, "{context}");
+    assert!(attempts.consumed <= 4, "{context}");
+    assert_eq!(attempts.local_attempts, 0, "{context}");
+    assert_eq!(attempts.external_attempts, 0, "{context}");
+    assert_eq!(
+        attempts.mcp_attempts, attempts.consumed,
+        "{context}: every real MCP send must use the explicit MCP channel"
+    );
+
+    let attribution = serde_json::to_string(&(
+        record.credential_id,
+        &record.credential_label,
+        &record.credential_attempts,
+    ))
+    .expect("serialize WebSearch attribution");
+    for marker in forbidden_markers {
+        assert!(
+            !attribution.contains(marker),
+            "{context}: WebSearch attribution captured raw marker {marker:?}: {attribution}"
+        );
+    }
+}
+
+async fn run_websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds()
+ {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, _usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+
+    for round in 1..=5 {
+        let canonical_query = format!("canonical-current-{round}");
+        let canonical = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                websearch_messages_body(
+                    vec![
+                        json!({"role": "user", "content": format!("stale-{round}")}),
+                        json!({"role": "assistant", "content": "old answer"}),
+                        json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": format!("Perform a web search for the query: {canonical_query}")
+                            }]
+                        }),
+                    ],
+                    false,
+                    Some("web_search_20250305"),
+                    false,
+                ),
+            ))
+            .await
+            .expect("canonical WebSearch response");
+        assert_eq!(canonical.status(), StatusCode::OK, "round {round}");
+        axum::body::to_bytes(canonical.into_body(), 256 * 1024)
+            .await
+            .expect("canonical response body");
+
+        let custom = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                websearch_messages_body(
+                    vec![json!({"role": "user", "content": format!("custom-{round}")})],
+                    false,
+                    None,
+                    false,
+                ),
+            ))
+            .await
+            .expect("same-name custom tool response");
+        assert_eq!(custom.status(), StatusCode::OK, "round {round}");
+        axum::body::to_bytes(custom.into_body(), 256 * 1024)
+            .await
+            .expect("same-name custom body");
+
+        let mixed = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                websearch_messages_body(
+                    vec![json!({"role": "user", "content": format!("mixed-{round}")})],
+                    false,
+                    Some("web_search_20250305"),
+                    true,
+                ),
+            ))
+            .await
+            .expect("mixed tools response");
+        assert_eq!(mixed.status(), StatusCode::OK, "round {round}");
+        axum::body::to_bytes(mixed.into_body(), 256 * 1024)
+            .await
+            .expect("mixed tools body");
+    }
+
+    assert_eq!(upstream.state.mcp_hits(), 5);
+    assert_eq!(upstream.state.normal_hits(), 10);
+    assert_eq!(
+        upstream.state.queries(),
+        (1..=5)
+            .map(|round| format!("canonical-current-{round}"))
+            .collect::<Vec<_>>()
+    );
+
+    for tool_cycles in [20, 100] {
+        for round in 1..=5 {
+            let mut messages = vec![json!({"role": "user", "content": "stale query"})];
+            for cycle in 0..tool_cycles {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": format!("tool-{cycle}"),
+                        "name": "fixture",
+                        "input": {"cycle": cycle}
+                    }]
+                }));
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": format!("tool-{cycle}"),
+                        "content": format!("result-{cycle}")
+                    }]
+                }));
+            }
+            let current = format!("long-current-{tool_cycles}-{round}");
+            messages.push(json!({"role": "user", "content": current}));
+            let response = router
+                .clone()
+                .oneshot(multimodal_handler_request(
+                    "/cc/v1/messages",
+                    websearch_messages_body(messages, false, Some("web_search_20250305"), false),
+                ))
+                .await
+                .expect("long history WebSearch response");
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .expect("long history body");
+        }
+    }
+    let queries = upstream.state.queries();
+    for tool_cycles in [20, 100] {
+        for round in 1..=5 {
+            assert!(
+                queries.contains(&format!("long-current-{tool_cycles}-{round}")),
+                "captured current query for {tool_cycles} cycles round {round}"
+            );
+        }
+    }
+}
+
+#[test]
+fn websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-routing-matrix", || async {
+        run_websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds(
+        )
+        .await;
+    });
+}
+
+async fn run_websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_for_five_rounds() {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+    let expected_key_id = crate::common::auth::request_api_key_id("b07-handler-key");
+
+    for round in 1..=5 {
+        for current_content in [
+            json!([{
+                "type": "tool_result",
+                "tool_use_id": format!("tool-{round}"),
+                "content": "current turn has no query"
+            }]),
+            json!([{"type": "text", "text": "   \n\t  "}]),
+        ] {
+            let stale_query = format!("STALE_WEBSEARCH_QUERY_MARKER_{round}");
+            let response = router
+                .clone()
+                .oneshot(multimodal_handler_request(
+                    "/cc/v1/messages",
+                    websearch_messages_body(
+                        vec![
+                            json!({"role": "user", "content": stale_query}),
+                            json!({"role": "assistant", "content": "old answer"}),
+                            json!({"role": "user", "content": current_content}),
+                        ],
+                        round % 2 == 0,
+                        Some("web_search_20250305"),
+                        false,
+                    ),
+                ))
+                .await
+                .expect("invalid current-turn WebSearch response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "round {round}");
+            let request_id = response_request_id(&response);
+            let error_id = response
+                .headers()
+                .get("x-error-id")
+                .and_then(|value| value.to_str().ok())
+                .expect("invalid current-turn error-id")
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .expect("invalid current-turn body");
+            let body = String::from_utf8(body.to_vec()).expect("invalid body UTF-8");
+            assert!(body.contains(&error_id));
+            assert!(!body.contains(&stale_query));
+
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(record.status, UsageRecordStatus::Error);
+            assert_eq!(record.public_error_status_code, Some(400));
+            assert_eq!(
+                record.public_error_type.as_deref(),
+                Some("invalid_request_error")
+            );
+            assert_eq!(record.error_id.as_deref(), Some(error_id.as_str()));
+            assert_eq!(
+                record.request_api_key_id.as_deref(),
+                Some(expected_key_id.as_str())
+            );
+            assert_eq!(record.credential_id, None);
+            assert!(record.credential_attempts.is_empty());
+            let attempts = record
+                .latency_trace
+                .as_ref()
+                .and_then(|trace| trace.inference_attempts)
+                .expect("invalid current-turn attempt snapshot");
+            assert_eq!(attempts.consumed, 0);
+            assert_eq!(attempts.local_attempts, 0);
+            assert_eq!(attempts.external_attempts, 0);
+            assert_eq!(attempts.mcp_attempts, 0);
+            assert!(!attempts.downstream_committed);
+            let serialized = serde_json::to_string(&record).expect("serialize invalid usage");
+            assert!(!serialized.contains(&stale_query));
+        }
+    }
+
+    assert_eq!(upstream.state.mcp_hits(), 0);
+    assert_eq!(upstream.state.normal_hits(), 0);
+    assert!(upstream.state.queries().is_empty());
+}
+
+#[test]
+fn websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-empty-query-matrix", || async {
+        run_websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_websearch_valid_zero_results_keep_stream_and_non_stream_success_for_five_rounds() {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+
+    for stream in [true, false] {
+        for round in 1..=5 {
+            let query = format!("zero-results-{stream}-{round}");
+            let response = router
+                .clone()
+                .oneshot(multimodal_handler_request(
+                    "/cc/v1/messages",
+                    single_query_websearch_body(&query, stream),
+                ))
+                .await
+                .expect("zero-result WebSearch response");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "stream={stream} round={round}"
+            );
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .expect("zero-result content type");
+            if stream {
+                assert_eq!(content_type, "text/event-stream");
+            } else {
+                assert!(content_type.starts_with("application/json"));
+            }
+            let request_id = response_request_id(&response);
+            let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+                .await
+                .expect("zero-result body");
+            let body = String::from_utf8(body.to_vec()).expect("zero-result UTF-8");
+            assert!(body.contains("No results found."));
+            assert!(body.contains(r#""type":"web_search_tool_result""#));
+            assert!(body.contains(r#""content":[]"#));
+            if stream {
+                assert!(body.contains("event: message_stop"));
+            } else {
+                let value: Value = serde_json::from_str(&body).expect("zero-result message JSON");
+                assert_eq!(value["type"], "message");
+                assert_eq!(value["stop_reason"], "end_turn");
+            }
+
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(record.status, UsageRecordStatus::Success);
+            assert_websearch_usage_attribution(
+                &record,
+                &format!("zero-result stream={stream} round={round}"),
+                &[query.as_str(), "WEBSEARCH_RAW_RESULT_MARKER"],
+            );
+            assert_eq!(record.downstream_stop_reason.as_deref(), Some("end_turn"));
+            assert!(record.output_tokens > 0);
+        }
+    }
+
+    assert_eq!(upstream.state.mcp_hits(), 10);
+    assert_eq!(upstream.state.normal_hits(), 0);
+}
+
+#[test]
+fn websearch_valid_zero_results_keep_stream_and_non_stream_success_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-zero-results-matrix", || async {
+        run_websearch_valid_zero_results_keep_stream_and_non_stream_success_for_five_rounds().await;
+    });
+}
+
+async fn run_websearch_stream_completion_and_client_drop_usage_ownership_hold_for_five_rounds() {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+    let expected_key_id = crate::common::auth::request_api_key_id("b07-handler-key");
+
+    for round in 1..=5 {
+        let full_query = format!("full-stream-{round}");
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                single_query_websearch_body(&full_query, true),
+            ))
+            .await
+            .expect("full stream response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let request_id = response_request_id(&response);
+        let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .expect("consume complete WebSearch stream");
+        let body = String::from_utf8(body.to_vec()).expect("SSE body UTF-8");
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: message_stop"));
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success);
+        assert_websearch_usage_attribution(
+            &record,
+            &format!("full stream round {round}"),
+            &[full_query.as_str(), "WEBSEARCH_RAW_RESULT_MARKER"],
+        );
+        assert_eq!(
+            record.request_api_key_id.as_deref(),
+            Some(expected_key_id.as_str())
+        );
+        assert_ne!(
+            record.request_api_key_id.as_deref(),
+            Some("b07-handler-key")
+        );
+        assert_eq!(record.downstream_stop_reason.as_deref(), Some("end_turn"));
+        assert!(record.output_tokens > 0);
+        let trace = record.latency_trace.expect("full stream latency trace");
+        let attempts = trace.inference_attempts.expect("full stream attempts");
+        assert_eq!(attempts.consumed, 1);
+        assert!(attempts.downstream_committed);
+        assert_eq!(trace.terminal_reason, Some(StreamTerminalReason::Completed));
+
+        let never_polled_query = format!("never-polled-{round}");
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                single_query_websearch_body(&never_polled_query, true),
+            ))
+            .await
+            .expect("never-polled stream response");
+        let request_id = response_request_id(&response);
+        drop(response);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::ClientDropped);
+        assert_websearch_usage_attribution(
+            &record,
+            &format!("never-polled stream round {round}"),
+            &[never_polled_query.as_str(), "WEBSEARCH_RAW_RESULT_MARKER"],
+        );
+        let trace = record.latency_trace.expect("never-polled latency trace");
+        let attempts = trace.inference_attempts.expect("never-polled attempts");
+        assert_eq!(attempts.consumed, 1);
+        assert!(!attempts.downstream_committed);
+        assert_eq!(
+            trace.terminal_reason,
+            Some(StreamTerminalReason::ClientDropped)
+        );
+
+        let partial_drop_query = format!("partial-drop-{round}");
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                single_query_websearch_body(&partial_drop_query, true),
+            ))
+            .await
+            .expect("partial stream response");
+        let request_id = response_request_id(&response);
+        let mut data_stream = response.into_body().into_data_stream();
+        let first = data_stream
+            .next()
+            .await
+            .expect("first WebSearch chunk")
+            .expect("first WebSearch chunk succeeds");
+        assert!(!first.is_empty());
+        drop(data_stream);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::ClientDropped);
+        assert_websearch_usage_attribution(
+            &record,
+            &format!("partial-drop stream round {round}"),
+            &[partial_drop_query.as_str(), "WEBSEARCH_RAW_RESULT_MARKER"],
+        );
+        let trace = record.latency_trace.expect("partial-drop latency trace");
+        let attempts = trace.inference_attempts.expect("partial-drop attempts");
+        assert_eq!(attempts.consumed, 1);
+        assert!(attempts.downstream_committed);
+        assert_eq!(
+            trace.terminal_reason,
+            Some(StreamTerminalReason::ClientDropped)
+        );
+    }
+}
+
+#[test]
+fn websearch_stream_completion_and_client_drop_usage_ownership_hold_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-stream-drop-matrix", || async {
+        run_websearch_stream_completion_and_client_drop_usage_ownership_hold_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds() {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+    let expected_key_id = crate::common::auth::request_api_key_id("b07-handler-key");
+
+    // Keep the historical test filter stable while covering both pre-header and body-read drops.
+    for cancel_phase in ["header-timeout", "body-timeout"] {
+        for round in 1..=5 {
+            let records_before = usage_recorder
+                .query(UsageRecordQuery::default())
+                .records
+                .len();
+            let hits_before = upstream.state.mcp_hits();
+            let task = tokio::spawn(router.clone().oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                single_query_websearch_body(&format!("{cancel_phase}-cancel-{round}"), true),
+            )));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while upstream.state.mcp_hits() == hits_before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel fixture must reach the MCP upstream");
+            task.abort();
+            let _ = task.await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                upstream.state.mcp_hits(),
+                hits_before + 1,
+                "{cancel_phase} round {round}: cancellation must not trigger another MCP send"
+            );
+
+            let records = usage_recorder.query(UsageRecordQuery::default()).records;
+            assert_eq!(
+                records.len(),
+                records_before + 1,
+                "{cancel_phase} round {round}: cancelling during MCP validation lost usage"
+            );
+            let record = &records[0];
+            assert_eq!(
+                record.status,
+                UsageRecordStatus::ClientDropped,
+                "{cancel_phase} round {round}"
+            );
+            assert_eq!(
+                record.request_api_key_id.as_deref(),
+                Some(expected_key_id.as_str()),
+                "{cancel_phase} round {round}"
+            );
+            let attempts = record
+                .latency_trace
+                .as_ref()
+                .and_then(|trace| trace.inference_attempts)
+                .expect("cancelled WebSearch attempt snapshot");
+            assert_eq!(attempts.consumed, 1, "{cancel_phase} round {round}");
+            assert_eq!(attempts.local_attempts, 0, "{cancel_phase} round {round}");
+            assert_eq!(
+                attempts.external_attempts, 0,
+                "{cancel_phase} round {round}"
+            );
+            assert_eq!(attempts.mcp_attempts, 1, "{cancel_phase} round {round}");
+            assert!(
+                !attempts.downstream_committed,
+                "{cancel_phase} round {round}"
+            );
+            assert!(
+                record.credential_id.is_some(),
+                "{cancel_phase} round {round}"
+            );
+            assert_eq!(
+                record.credential_attempts.len(),
+                1,
+                "{cancel_phase} round {round}"
+            );
+            assert_eq!(
+                record.credential_attempts[0].attempt, 1,
+                "{cancel_phase} round {round}"
+            );
+            assert_eq!(
+                record.credential_attempts[0].action, "fail",
+                "{cancel_phase} round {round}"
+            );
+            assert_eq!(
+                record.credential_attempts[0].error_type.as_deref(),
+                Some("client_dropped"),
+                "{cancel_phase} round {round}"
+            );
+            assert_eq!(
+                record.credential_attempts[0].error_message.as_deref(),
+                Some("mcp_client_cancelled"),
+                "{cancel_phase} round {round}"
+            );
+        }
+    }
+}
+
+#[test]
+fn websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-cancel-matrix", || async {
+        run_websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds().await;
+    });
+}
+
+async fn run_websearch_non_stream_success_has_json_shape_usage_and_stable_key_for_five_rounds() {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+    let expected_key_id = crate::common::auth::request_api_key_id("b07-handler-key");
+
+    for round in 1..=5 {
+        let query = format!("non-stream-{round}");
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                single_query_websearch_body(&query, false),
+            ))
+            .await
+            .expect("non-stream WebSearch response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"))
+        );
+        let request_id = response_request_id(&response);
+        let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .expect("non-stream WebSearch body");
+        let value: Value = serde_json::from_slice(&body).expect("non-stream message JSON");
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["stop_reason"], "end_turn");
+        assert!(
+            value["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| {
+                    block["type"] == "server_tool_use" && block["input"]["query"] == query
+                }))
+        );
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success);
+        assert_websearch_usage_attribution(
+            &record,
+            &format!("non-stream success round {round}"),
+            &[query.as_str(), "WEBSEARCH_RAW_RESULT_MARKER"],
+        );
+        assert_eq!(
+            record.request_api_key_id.as_deref(),
+            Some(expected_key_id.as_str())
+        );
+        assert_eq!(record.downstream_stop_reason.as_deref(), Some("end_turn"));
+        let attempts = record
+            .latency_trace
+            .and_then(|trace| trace.inference_attempts)
+            .expect("non-stream attempts");
+        assert_eq!(attempts.consumed, 1);
+        assert!(attempts.downstream_committed);
+    }
+}
+
+#[test]
+fn websearch_non_stream_success_has_json_shape_usage_and_stable_key_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-non-stream-matrix", || async {
+        run_websearch_non_stream_success_has_json_shape_usage_and_stable_key_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_websearch_debug_logs_and_usage_never_capture_raw_query_or_result_markers_for_five_rounds()
+ {
+    let captured = CapturedTestLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(captured.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+
+    for round in 1..=5 {
+        let query_marker = format!("WEBSEARCH_RAW_QUERY_MARKER_{round}");
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                single_query_websearch_body(&query_marker, round % 2 == 0),
+            ))
+            .await
+            .expect("privacy marker WebSearch response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response_request_id(&response);
+        axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .expect("consume privacy marker response");
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_websearch_usage_attribution(
+            &record,
+            &format!("privacy round {round}"),
+            &[query_marker.as_str(), "WEBSEARCH_RAW_RESULT_MARKER"],
+        );
+        let serialized = serde_json::to_string(&record).expect("serialize privacy usage record");
+        assert!(!serialized.contains(&query_marker));
+        assert!(!serialized.contains("WEBSEARCH_RAW_RESULT_MARKER"));
+    }
+
+    let logs = captured.snapshot();
+    for round in 1..=5 {
+        assert!(
+            !logs.contains(&format!("WEBSEARCH_RAW_QUERY_MARKER_{round}")),
+            "round {round}: DEBUG logs captured raw query"
+        );
+    }
+    assert!(
+        !logs.contains("WEBSEARCH_RAW_RESULT_MARKER"),
+        "DEBUG logs captured raw MCP result"
+    );
+    assert!(logs.contains("query_bytes"));
+    assert!(logs.contains("native WebSearch"));
+}
+
+#[test]
+fn websearch_debug_logs_and_usage_never_capture_raw_query_or_result_markers_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-privacy-matrix", || async {
+        run_websearch_debug_logs_and_usage_never_capture_raw_query_or_result_markers_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for_five_rounds() {
+    let captured = CapturedTestLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(captured.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+    let cases = [
+        ("http-400", StatusCode::BAD_REQUEST, "invalid_request_error"),
+        (
+            "http-429",
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+        ),
+        ("http-500", StatusCode::BAD_GATEWAY, "api_error"),
+        ("header-timeout", StatusCode::GATEWAY_TIMEOUT, "api_error"),
+        ("body-timeout", StatusCode::GATEWAY_TIMEOUT, "api_error"),
+        ("disconnect", StatusCode::BAD_GATEWAY, "api_error"),
+        ("malformed", StatusCode::BAD_GATEWAY, "api_error"),
+        ("jsonrpc-error", StatusCode::BAD_GATEWAY, "api_error"),
+        ("is-error", StatusCode::BAD_GATEWAY, "api_error"),
+        ("non-text-content", StatusCode::BAD_GATEWAY, "api_error"),
+        ("mismatched-id", StatusCode::BAD_GATEWAY, "api_error"),
+        (
+            "content-length-over-limit",
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+        ),
+        ("chunked-over-limit", StatusCode::BAD_GATEWAY, "api_error"),
+    ];
+    let private_markers = [
+        "private-400-marker",
+        "private-429-marker",
+        "private-500-marker",
+        "private-jsonrpc-marker",
+        "private-is-error-marker",
+        "private-non-text-marker",
+    ];
+
+    for (scenario, expected_status, expected_error_type) in cases {
+        for round in 1..=5 {
+            let query = format!("{scenario}-{round}");
+            let response = router
+                .clone()
+                .oneshot(multimodal_handler_request(
+                    "/cc/v1/messages",
+                    single_query_websearch_body(&query, round % 2 == 0),
+                ))
+                .await
+                .expect("WebSearch error response");
+            assert_eq!(
+                response.status(),
+                expected_status,
+                "{scenario} round {round}"
+            );
+            let request_id = response_request_id(&response);
+            let error_id = response
+                .headers()
+                .get("x-error-id")
+                .and_then(|value| value.to_str().ok())
+                .expect("normalized WebSearch error-id")
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .expect("normalized WebSearch error body");
+            let body = String::from_utf8(body.to_vec()).expect("error body UTF-8");
+            let value: Value = serde_json::from_str(&body).expect("error response JSON");
+            assert_eq!(value["type"], "error");
+            assert_eq!(value["error"]["type"], expected_error_type);
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(&error_id)),
+                "{scenario} round {round}"
+            );
+            assert_eq!(value["request_id"], request_id);
+            assert!(!body.contains(&query));
+            for marker in private_markers {
+                assert!(!body.contains(marker), "{scenario} round {round}: {marker}");
+            }
+
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(record.status, UsageRecordStatus::Error);
+            assert_websearch_usage_attribution(
+                &record,
+                &format!("{scenario} round {round}"),
+                &[query.as_str(), "private-", "WEBSEARCH_RAW_RESULT_MARKER"],
+            );
+            assert_eq!(record.error_id.as_deref(), Some(error_id.as_str()));
+            assert_eq!(
+                record.public_error_status_code,
+                Some(expected_status.as_u16())
+            );
+            assert_eq!(
+                record.public_error_type.as_deref(),
+                Some(expected_error_type)
+            );
+            assert_eq!(record.output_tokens, 0);
+            let serialized = serde_json::to_string(&record).expect("serialize error usage");
+            assert!(!serialized.contains(&query));
+            for marker in private_markers {
+                assert!(!serialized.contains(marker));
+            }
+            let attempts = record
+                .latency_trace
+                .and_then(|trace| trace.inference_attempts)
+                .expect("error attempt snapshot");
+            assert_eq!(attempts.consumed, 1, "{scenario} round {round}");
+            assert!(!attempts.downstream_committed);
+        }
+    }
+
+    for round in 1..=5 {
+        let recovery_query = format!("recovery-normal-{round}");
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                single_query_websearch_body(&recovery_query, false),
+            ))
+            .await
+            .expect("recovery response");
+        assert_eq!(response.status(), StatusCode::OK, "recovery round {round}");
+        let request_id = response_request_id(&response);
+        axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .expect("recovery body");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success);
+        assert_websearch_usage_attribution(
+            &record,
+            &format!("recovery round {round}"),
+            &[recovery_query.as_str(), "WEBSEARCH_RAW_RESULT_MARKER"],
+        );
+    }
+
+    let logs = captured.snapshot();
+    for (scenario, _, _) in cases {
+        for round in 1..=5 {
+            assert!(
+                !logs.contains(&format!("{scenario}-{round}")),
+                "{scenario} round {round}: DEBUG logs captured raw query"
+            );
+        }
+    }
+    for marker in private_markers {
+        assert!(
+            !logs.contains(marker),
+            "DEBUG logs captured private MCP marker {marker}"
+        );
+    }
+    assert!(logs.contains("native WebSearch MCP request failed"));
+}
+
+#[test]
+fn websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-error-matrix", || async {
+        run_websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for_five_rounds().await;
+    });
+}
+
+fn remote_multimodal_limit_body(include_max_tokens: bool) -> String {
+    let content = (0..21)
+        .map(|index| {
+            let block_type = if index % 2 == 0 { "image" } else { "document" };
+            json!({
+                "type": block_type,
+                "source": {
+                    "type": "url",
+                    "url": format!("https://b07-source-{index}.invalid/resource")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": content}]
+    });
+    if include_max_tokens {
+        body["max_tokens"] = json!(16);
+        body["stream"] = json!(false);
+    }
+    body.to_string()
+}
+
+fn inline_multimodal_body(include_max_tokens: bool) -> String {
+    const ONE_PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let mut content = Vec::new();
+    for index in 0..21 {
+        content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": format!("data:image/png;base64,{ONE_PIXEL_PNG}")
+            }
+        }));
+        content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": ONE_PIXEL_PNG
+            }
+        }));
+        content.push(json!({"type": "text", "text": format!("inline image pair {index}")}));
+    }
+    let mut body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": content}]
+    });
+    if include_max_tokens {
+        body["max_tokens"] = json!(16);
+        body["stream"] = json!(false);
+    }
+    body.to_string()
+}
+
+fn multimodal_handler_request(path: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-api-key", "b07-handler-key")
+        .body(Body::from(body))
+        .expect("build multimodal handler request")
+}
+
+async fn assert_remote_multimodal_limit_response(response: Response, path: &str, round: usize) {
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "round {round} path {path}"
+    );
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("remote source limit response carries request-id")
+        .to_string();
+    assert_eq!(
+        response
+            .headers()
+            .get("anthropic-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(request_id.as_str()),
+        "round {round} path {path}"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read remote source limit response");
+    let value: Value = serde_json::from_slice(&body).expect("Anthropic error JSON");
+    assert_eq!(value["type"], "error", "round {round} path {path}");
+    assert_eq!(
+        value["error"]["type"], "invalid_request_error",
+        "round {round} path {path}"
+    );
+    assert_eq!(value["request_id"], request_id, "round {round} path {path}");
+    assert_eq!(
+        value["error"]["message"],
+        "remote image/document source count 21 exceeds the request limit of 20",
+        "round {round} path {path}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).contains("b07-source-"),
+        "round {round} path {path}: public error must not echo source URLs"
+    );
+}
+
+#[test]
+fn all_multimodal_handlers_reject_21_remote_sources_before_upstream_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("multimodal-handler-matrix", || async {
+        const MESSAGE_PATHS: [&str; 5] = [
+            "/v1/messages",
+            "/cc/v1/messages",
+            "/na/v1/messages",
+            "/ha/v1/messages",
+            "/dfcache/demo/v1/messages",
+        ];
+        const COUNT_TOKEN_PATHS: [&str; 5] = [
+            "/v1/messages/count_tokens",
+            "/cc/v1/messages/count_tokens",
+            "/na/v1/messages/count_tokens",
+            "/ha/v1/messages/count_tokens",
+            "/dfcache/demo/v1/messages/count_tokens",
+        ];
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let app = multimodal_handler_test_router(&upstream.base_url);
+
+        for round in 1..=5 {
+            for path in MESSAGE_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        remote_multimodal_limit_body(true),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("round {round} path {path}: handler waited on I/O"))
+                .expect("message handler response");
+                assert_remote_multimodal_limit_response(response, path, round).await;
+            }
+            for path in COUNT_TOKEN_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        remote_multimodal_limit_body(false),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("round {round} path {path}: handler waited on I/O"))
+                .expect("count_tokens handler response");
+                assert_remote_multimodal_limit_response(response, path, round).await;
+            }
+        }
+
+        assert_eq!(
+            upstream.hits(),
+            0,
+            "remote source preflight must run before inference HTTP"
+        );
+
+        for round in 1..=5 {
+            for path in COUNT_TOKEN_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        inline_multimodal_body(false),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("inline round {round} path {path}: handler timed out"))
+                .expect("inline count_tokens response");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "inline round {round} path {path}"
+                );
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("read inline count_tokens response");
+                let value: Value = serde_json::from_slice(&body).expect("count_tokens JSON");
+                assert!(
+                    value["input_tokens"]
+                        .as_i64()
+                        .is_some_and(|tokens| tokens > 0),
+                    "inline round {round} path {path}: {value}"
+                );
+            }
+        }
+        assert_eq!(
+            upstream.hits(),
+            0,
+            "count_tokens inline controls must remain local"
+        );
+
+        for round in 1..=5 {
+            for path in MESSAGE_PATHS {
+                let response = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    app.clone().oneshot(multimodal_handler_request(
+                        path,
+                        inline_multimodal_body(true),
+                    )),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("inline message round {round} path {path}: handler timed out")
+                })
+                .expect("inline message response");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "inline message round {round} path {path}"
+                );
+                let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .expect("read inline message response");
+                let value: Value = serde_json::from_slice(&body).expect("inline message JSON");
+                assert_eq!(value["content"][0]["type"], "text");
+                assert_eq!(value["content"][0]["text"], "inline-ok");
+            }
+        }
+        assert_eq!(
+            upstream.hits(),
+            25,
+            "five rounds across five inline message routes should each reach inference exactly once"
+        );
+    });
+}
 
 fn messages_request_for_model(model: &str) -> MessagesRequest {
     MessagesRequest {
@@ -32,6 +1949,1373 @@ fn messages_request_for_model(model: &str) -> MessagesRequest {
         output_config: None,
         metadata: None,
     }
+}
+
+#[test]
+fn local_stream_protocol_contamination_retry_uses_status_policy_and_explicit_terminal() {
+    let enabled = LocalStreamRetryConfig {
+        enabled: true,
+        max_attempts: 2,
+        on_idle_timeout: false,
+        on_read_error: false,
+        on_status_error: true,
+    };
+    assert!(enabled.allows(StreamRetryReason::ProtocolContamination));
+    assert_eq!(
+        StreamRetryReason::ProtocolContamination.as_str(),
+        "protocol_contamination"
+    );
+
+    let disabled = LocalStreamRetryConfig {
+        on_status_error: false,
+        ..enabled
+    };
+    assert!(!disabled.allows(StreamRetryReason::ProtocolContamination));
+    assert_eq!(
+        serde_json::to_value(StreamTerminalReason::ProtocolContamination).unwrap(),
+        json!("protocol_contamination")
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HandlerEventStreamFault {
+    JsonExceptionBeforeOutput,
+    JsonBodyWithEventStreamContentType,
+    ReadErrorBeforeOutput,
+    IdleBeforeOutput,
+    BadCrcBeforeOutput,
+    TruncatedFrameBeforeOutput,
+    IncompleteStatusBeforeOutput,
+    ProtocolContaminationBeforeOutput,
+    UnknownEventOnly,
+    MissingCompletionAfterText,
+    LegacyTextWithMetadataNoStatus,
+    CompleteToolWithoutStatus,
+    TextThenReadError,
+    ThinkingThenReadError,
+    ToolThenReadError,
+    NonStreamContentLengthOverLimit,
+    NonStreamChunkedOverLimit,
+    NonStreamExactLimit,
+    NonStreamSmallBody,
+}
+
+#[derive(Clone)]
+struct HandlerEventStreamFaultState {
+    fault: HandlerEventStreamFault,
+    hits: Arc<AtomicUsize>,
+    json_secret_marker: String,
+}
+
+struct HandlerEventStreamFaultUpstream {
+    base_url: String,
+    state: HandlerEventStreamFaultState,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HandlerEventStreamFaultUpstream {
+    async fn start(fault: HandlerEventStreamFault) -> Self {
+        Self::start_with_json_secret_marker(fault, "private fault fixture detail".to_string()).await
+    }
+
+    async fn start_with_json_secret_marker(
+        fault: HandlerEventStreamFault,
+        json_secret_marker: String,
+    ) -> Self {
+        let state = HandlerEventStreamFaultState {
+            fault,
+            hits: Arc::new(AtomicUsize::new(0)),
+            json_secret_marker,
+        };
+        let app = Router::new()
+            .route(
+                "/generateAssistantResponse",
+                post(handler_eventstream_fault_upstream),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind EventStream fault upstream");
+        let address = listener
+            .local_addr()
+            .expect("EventStream fault upstream address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve EventStream fault upstream");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            state,
+            task,
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.state.hits.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for HandlerEventStreamFaultUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn handler_eventstream_normal_body() -> Vec<u8> {
+    let mut body = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"recovered-ok","messageStatus":"COMPLETED"}),
+    );
+    body.extend(eventstream_test_frame(
+        "metadataEvent",
+        json!({
+            "tokenUsage": {
+                "uncachedInputTokens": 100,
+                "outputTokens": 4,
+                "totalTokens": 104,
+                "cacheReadInputTokens": 0,
+                "cacheWriteInputTokens": 0
+            }
+        }),
+    ));
+    body
+}
+
+fn handler_eventstream_exact_non_stream_limit_body() -> Vec<u8> {
+    let terminal = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"exact-limit-ok","messageStatus":"COMPLETED"}),
+    );
+    let empty_padding = eventstream_test_frame("futurePaddingEvent", json!({"padding":""}));
+    let padding_bytes = LOCAL_NON_STREAM_RESPONSE_MAX_BYTES
+        .checked_sub(terminal.len() + empty_padding.len())
+        .expect("16 MiB limit leaves room for fixture framing");
+    let padding = eventstream_test_frame(
+        "futurePaddingEvent",
+        json!({"padding":"x".repeat(padding_bytes)}),
+    );
+    let mut body = Vec::with_capacity(LOCAL_NON_STREAM_RESPONSE_MAX_BYTES);
+    body.extend(padding);
+    body.extend(terminal);
+    assert_eq!(body.len(), LOCAL_NON_STREAM_RESPONSE_MAX_BYTES);
+    body
+}
+
+fn handler_eventstream_bytes_response(bytes: Vec<u8>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+        .body(Body::from(bytes))
+        .expect("build EventStream bytes response")
+}
+
+fn handler_eventstream_chunked_response(
+    chunks: Vec<(Duration, Result<Bytes, std::io::Error>)>,
+) -> Response {
+    let body_stream =
+        futures::StreamExt::then(futures::stream::iter(chunks), |(delay, chunk)| async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            chunk
+        });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+        .body(Body::from_stream(body_stream))
+        .expect("build EventStream chunked response")
+}
+
+async fn handler_eventstream_fault_upstream(
+    State(state): State<HandlerEventStreamFaultState>,
+) -> Response {
+    let hit = state.hits.fetch_add(1, Ordering::AcqRel) + 1;
+    if hit > 1 {
+        return handler_eventstream_bytes_response(handler_eventstream_normal_body());
+    }
+
+    match state.fault {
+        HandlerEventStreamFault::JsonExceptionBeforeOutput => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(json!({
+                "__type": "ThrottlingException",
+                "message": state.json_secret_marker
+            })),
+        )
+            .into_response(),
+        HandlerEventStreamFault::JsonBodyWithEventStreamContentType => {
+            handler_eventstream_bytes_response(
+                serde_json::to_vec(&json!({
+                    "__type": "ThrottlingException",
+                    "message": state.json_secret_marker
+                }))
+                .expect("serialize mislabeled JSON EventStream fixture"),
+            )
+        }
+        HandlerEventStreamFault::ReadErrorBeforeOutput => {
+            handler_eventstream_chunked_response(vec![
+                (Duration::ZERO, Ok(Bytes::from_static(&[0]))),
+                (
+                    Duration::from_millis(20),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "fixture read reset before output",
+                    )),
+                ),
+            ])
+        }
+        HandlerEventStreamFault::IdleBeforeOutput => handler_eventstream_chunked_response(vec![(
+            Duration::from_millis(1_250),
+            Ok(Bytes::from(handler_eventstream_normal_body())),
+        )]),
+        HandlerEventStreamFault::BadCrcBeforeOutput => {
+            let mut body = eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":state.json_secret_marker,"messageStatus":"COMPLETED"}),
+            );
+            let last = body.len() - 1;
+            body[last] ^= 0xff;
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::TruncatedFrameBeforeOutput => {
+            let body = eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"must-not-appear","messageStatus":"COMPLETED"}),
+            );
+            handler_eventstream_bytes_response(body[..body.len() / 2].to_vec())
+        }
+        HandlerEventStreamFault::IncompleteStatusBeforeOutput => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"IN_PROGRESS"}),
+            ))
+        }
+        HandlerEventStreamFault::ProtocolContaminationBeforeOutput => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({
+                    "content":"user Continue\n\nbashHashd1e9567d: private fault output"
+                }),
+            ))
+        }
+        HandlerEventStreamFault::UnknownEventOnly => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "futureUnknownEvent",
+                json!({"opaque":state.json_secret_marker}),
+            ))
+        }
+        HandlerEventStreamFault::MissingCompletionAfterText => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"unterminated-visible"}),
+            ))
+        }
+        HandlerEventStreamFault::LegacyTextWithMetadataNoStatus => {
+            let mut body = eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"legacy-terminal-ok"}),
+            );
+            body.extend(eventstream_test_frame(
+                "metadataEvent",
+                json!({
+                    "tokenUsage": {
+                        "uncachedInputTokens": 100,
+                        "outputTokens": 4,
+                        "totalTokens": 104,
+                        "cacheReadInputTokens": 0,
+                        "cacheWriteInputTokens": 0
+                    }
+                }),
+            ));
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::CompleteToolWithoutStatus => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_legacy_terminal",
+                    "input":"{\"command\":\"printf legacy-tool-ok\"}",
+                    "stop":true
+                }),
+            ))
+        }
+        HandlerEventStreamFault::TextThenReadError => handler_eventstream_chunked_response(vec![
+            (
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "assistantResponseEvent",
+                    json!({"content":"postcommit-visible"}),
+                ))),
+            ),
+            (
+                Duration::from_millis(20),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "fixture read reset after text",
+                )),
+            ),
+        ]),
+        HandlerEventStreamFault::ThinkingThenReadError => {
+            handler_eventstream_chunked_response(vec![
+                (
+                    Duration::ZERO,
+                    Ok(Bytes::from(eventstream_test_frame(
+                        "reasoningContentEvent",
+                        json!({"text":"postcommit reasoning","signature":"fixture-signature"}),
+                    ))),
+                ),
+                (
+                    Duration::from_millis(5),
+                    Ok(Bytes::from(eventstream_test_frame(
+                        "assistantResponseEvent",
+                        json!({"content":"post-thinking-visible"}),
+                    ))),
+                ),
+                (
+                    Duration::from_millis(20),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "fixture read reset after thinking",
+                    )),
+                ),
+            ])
+        }
+        HandlerEventStreamFault::ToolThenReadError => handler_eventstream_chunked_response(vec![
+            (
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "toolUseEvent",
+                    json!({
+                        "name":"bashHashd1e9567d",
+                        "toolUseId":"toolu_fault_1",
+                        "input":"{\"command\":\"printf fault-ok\"}",
+                        "stop":true
+                    }),
+                ))),
+            ),
+            (
+                Duration::from_millis(20),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "fixture read reset after tool",
+                )),
+            ),
+        ]),
+        HandlerEventStreamFault::NonStreamContentLengthOverLimit => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+            .header(
+                header::CONTENT_LENGTH,
+                (LOCAL_NON_STREAM_RESPONSE_MAX_BYTES + 1).to_string(),
+            )
+            .body(Body::empty())
+            .expect("build declared over-limit response"),
+        HandlerEventStreamFault::NonStreamChunkedOverLimit => {
+            handler_eventstream_chunked_response(vec![
+                (
+                    Duration::ZERO,
+                    Ok(Bytes::from(vec![b'x'; LOCAL_NON_STREAM_RESPONSE_MAX_BYTES])),
+                ),
+                (Duration::ZERO, Ok(Bytes::from_static(b"x"))),
+            ])
+        }
+        HandlerEventStreamFault::NonStreamExactLimit => {
+            handler_eventstream_bytes_response(handler_eventstream_exact_non_stream_limit_body())
+        }
+        HandlerEventStreamFault::NonStreamSmallBody => {
+            handler_eventstream_bytes_response(handler_eventstream_normal_body())
+        }
+    }
+}
+
+fn handler_eventstream_fault_router_with_credential_count(
+    base_url: &str,
+    credential_count: u64,
+) -> (Router, Arc<UsageRecorder>) {
+    handler_eventstream_fault_router_with_limits(base_url, credential_count, 1)
+}
+
+fn handler_eventstream_fault_router_with_limits(
+    base_url: &str,
+    credential_count: u64,
+    credential_retry_max_attempts: u32,
+) -> (Router, Arc<UsageRecorder>) {
+    assert!(credential_count > 0);
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(base_url.to_string());
+    // The non-stream exact-limit fixture intentionally reads and decodes a 16 MiB
+    // EventStream body.  Under the full all-target test tree, CPU contention can
+    // make that boundary-control path exceed the previous 3s fixture timeout and
+    // turn a limit test into a false upstream body-timeout 502.  The caller-side
+    // test timeout remains 5s, so real stalls still fail the fixture promptly.
+    config.kiro_upstream_response_timeout_secs = 10;
+    config.kiro_upstream_stream_idle_timeout_secs = 1;
+    config.kiro_upstream_stream_retry_enabled = true;
+    config.kiro_upstream_stream_retry_max_attempts = 2;
+    config.kiro_upstream_stream_retry_on_idle_timeout = true;
+    config.kiro_upstream_stream_retry_on_read_error = true;
+    config.kiro_upstream_stream_retry_on_status_error = true;
+    config.credential_retry_max_attempts = credential_retry_max_attempts;
+    config.inference_upstream_max_attempts = 4;
+    let credentials = (1..=credential_count)
+        .map(|id| KiroCredentials {
+            id: Some(id),
+            access_token: Some(format!("handler-eventstream-fault-token-{id}")),
+            profile_arn: Some(format!(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/HANDLER_FAULT_{id}"
+            )),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            auth_method: Some("social".to_string()),
+            rate_limit_auto_disable_enabled: Some(false),
+            ..Default::default()
+        })
+        .collect();
+    let manager = Arc::new(
+        MultiTokenManager::new(config.clone(), credentials, None, None, false)
+            .expect("build EventStream fault token manager"),
+    );
+    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    let provider = Arc::new(KiroProvider::with_proxy(
+        manager,
+        None,
+        endpoints,
+        "ide".to_string(),
+    ));
+    let usage_recorder = Arc::new(UsageRecorder::new(1_000));
+    let router = create_router_with_provider(
+        AnthropicRouterDependencies {
+            request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
+            kiro_provider: Some(provider),
+            usage_recorder: usage_recorder.clone(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            external_pool_manager: None,
+        },
+        AnthropicRouterConfig::from_runtime_config(&config),
+    );
+    (router, usage_recorder)
+}
+
+fn handler_eventstream_fault_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
+    handler_eventstream_fault_router_with_credential_count(base_url, 2)
+}
+
+fn handler_eventstream_fault_request(stream: bool) -> Request<Body> {
+    multimodal_handler_request(
+        "/cc/v1/messages",
+        json!({
+            "model":"claude-sonnet-4-20250514",
+            "max_tokens":2048,
+            "stream":stream,
+            "messages":[{"role":"user","content":"exercise the EventStream fixture"}],
+            "thinking":{"type":"enabled","budget_tokens":1024},
+            "tools":[{
+                "name":"Bash",
+                "description":"run one command",
+                "input_schema":{
+                    "type":"object",
+                    "properties":{"command":{"type":"string"}},
+                    "required":["command"]
+                }
+            }]
+        })
+        .to_string(),
+    )
+}
+
+async fn call_handler_eventstream_fault(app: Router, stream: bool) -> (StatusCode, String, String) {
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.oneshot(handler_eventstream_fault_request(stream)),
+    )
+    .await
+    .expect("fault handler response timed out")
+    .expect("fault handler response");
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("fault response request-id")
+        .to_string();
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await
+    .expect("fault response body timed out")
+    .expect("read fault response body");
+    (
+        status,
+        request_id,
+        String::from_utf8(body.to_vec()).expect("fault response UTF-8"),
+    )
+}
+
+fn assert_fault_usage(
+    usage_recorder: &UsageRecorder,
+    request_id: &str,
+    expected_status: UsageRecordStatus,
+    expected_attempts: u32,
+) {
+    let records = usage_recorder.query(UsageRecordQuery {
+        request_id: Some(request_id.to_string()),
+        ..UsageRecordQuery::default()
+    });
+    assert_eq!(records.records.len(), 1, "request_id={request_id}");
+    let record = &records.records[0];
+    assert_eq!(record.status, expected_status, "request_id={request_id}");
+    let attempts = record
+        .latency_trace
+        .as_ref()
+        .and_then(|trace| trace.inference_attempts)
+        .expect("fault usage inference attempt snapshot");
+    assert_eq!(
+        attempts.consumed, expected_attempts,
+        "request_id={request_id}"
+    );
+    assert!(attempts.consumed <= 4, "request_id={request_id}");
+}
+
+fn expected_precommit_retry_reason(fault: HandlerEventStreamFault) -> &'static str {
+    match fault {
+        HandlerEventStreamFault::ReadErrorBeforeOutput => "read_error:sends=1",
+        HandlerEventStreamFault::IdleBeforeOutput => "idle_timeout:sends=1",
+        HandlerEventStreamFault::BadCrcBeforeOutput
+        | HandlerEventStreamFault::TruncatedFrameBeforeOutput
+        | HandlerEventStreamFault::IncompleteStatusBeforeOutput => "protocol_error:sends=1",
+        HandlerEventStreamFault::ProtocolContaminationBeforeOutput => {
+            "protocol_contamination:sends=1"
+        }
+        HandlerEventStreamFault::JsonBodyWithEventStreamContentType => "protocol_error:sends=1",
+        other => panic!("not a precommit retry fixture: {other:?}"),
+    }
+}
+
+async fn assert_handler_eventstream_precommit_retry(fault: HandlerEventStreamFault, round: usize) {
+    let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+    let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+    let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+    let usage_debug = serde_json::to_string(
+        &usage_recorder
+            .query(UsageRecordQuery {
+                request_id: Some(request_id.clone()),
+                ..UsageRecordQuery::default()
+            })
+            .records,
+    )
+    .expect("serialize precommit retry usage evidence");
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fault={fault:?} round={round} hits={} body={body} usage={usage_debug}",
+        upstream.hits()
+    );
+    assert!(
+        body.contains("recovered-ok"),
+        "fault={fault:?} round={round} hits={} body={body}",
+        upstream.hits()
+    );
+    assert_eq!(
+        body.matches("event: message_stop").count(),
+        1,
+        "fault={fault:?} round={round}"
+    );
+    assert!(!body.contains(r#""type":"error""#));
+    assert!(!body.contains("private fault fixture detail"));
+    assert!(!body.contains("private fault output"));
+    assert!(!body.contains("must-not-appear"));
+    assert_eq!(upstream.hits(), 2, "fault={fault:?} round={round}");
+    assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    let trace = record
+        .latency_trace
+        .as_ref()
+        .expect("precommit retry latency trace");
+    assert_eq!(trace.stream_retry_attempts, Some(1));
+    assert_eq!(trace.stream_retry_dispatch_failures, None);
+    assert_eq!(
+        trace.stream_retry_reasons.as_deref(),
+        Some(&[expected_precommit_retry_reason(fault).to_string()][..])
+    );
+}
+
+fn boxed_precommit_retry_matrix() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async {
+        for fault in [
+            HandlerEventStreamFault::ReadErrorBeforeOutput,
+            HandlerEventStreamFault::IdleBeforeOutput,
+            HandlerEventStreamFault::BadCrcBeforeOutput,
+            HandlerEventStreamFault::TruncatedFrameBeforeOutput,
+            HandlerEventStreamFault::IncompleteStatusBeforeOutput,
+            HandlerEventStreamFault::ProtocolContaminationBeforeOutput,
+        ] {
+            for round in 1..=5 {
+                assert_handler_eventstream_precommit_retry(fault, round).await;
+            }
+        }
+    })
+}
+
+fn run_handler_fixture_on_four_mib_thread<F, Fut>(thread_name: &'static str, fixture: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build handler fixture runtime");
+            runtime.block_on(fixture());
+        })
+        .expect("spawn handler fixture thread")
+        .join()
+        .expect("run handler fixture thread");
+}
+
+#[test]
+fn handler_eventstream_precommit_faults_retry_once_and_recover_for_five_rounds() {
+    std::thread::Builder::new()
+        .name("precommit-matrix-constructor".to_string())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build debug-safe precommit matrix runtime");
+            runtime.block_on(boxed_precommit_retry_matrix());
+        })
+        .expect("spawn precommit matrix thread")
+        .join()
+        .expect("run precommit matrix thread");
+}
+
+async fn run_provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds()
+ {
+    let captured = CapturedTestLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(captured.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    for round in 1..=5 {
+        let marker = format!("PROVIDER_JSON_RETRY_PRIVATE_MARKER_{round}");
+        let upstream = HandlerEventStreamFaultUpstream::start_with_json_secret_marker(
+            HandlerEventStreamFault::JsonExceptionBeforeOutput,
+            marker.clone(),
+        )
+        .await;
+        let (app, usage_recorder) =
+            handler_eventstream_fault_router_with_limits(&upstream.base_url, 2, 2);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert!(body.contains("recovered-ok"), "round={round} body={body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert!(!body.contains(&marker));
+        assert_eq!(upstream.hits(), 2, "round={round}");
+        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.credential_attempts.len(), 2, "round={round}");
+        assert_ne!(
+            record.credential_attempts[0].credential_id,
+            record.credential_attempts[1].credential_id,
+            "round={round}: provider retry must move to the alternate credential"
+        );
+        let trace = record.latency_trace.as_ref().expect("provider retry trace");
+        assert_eq!(trace.stream_retry_attempts, None);
+        assert_eq!(trace.stream_retry_dispatch_failures, None);
+        assert_eq!(trace.stream_retry_reasons, None);
+        let serialized = serde_json::to_string(&record).expect("serialize provider retry usage");
+        assert!(!serialized.contains(&marker));
+    }
+
+    for round in 1..=5 {
+        let marker = format!("PROVIDER_JSON_SINGLE_PRIVATE_MARKER_{round}");
+        let upstream = HandlerEventStreamFaultUpstream::start_with_json_secret_marker(
+            HandlerEventStreamFault::JsonExceptionBeforeOutput,
+            marker.clone(),
+        )
+        .await;
+        let (app, usage_recorder) =
+            handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "round={round} body={body}"
+        );
+        assert!(body.contains(&request_id));
+        assert!(!body.contains(&marker));
+        assert_eq!(upstream.hits(), 1, "round={round}");
+        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.public_error_status_code, Some(429));
+        assert_eq!(
+            record.public_error_type.as_deref(),
+            Some("rate_limit_error")
+        );
+        assert_eq!(record.credential_attempts.len(), 1);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("single provider failure trace");
+        assert_eq!(trace.stream_retry_attempts, None);
+        assert_eq!(trace.stream_retry_dispatch_failures, None);
+        assert_eq!(trace.stream_retry_reasons, None);
+        let serialized =
+            serde_json::to_string(&record).expect("serialize provider JSON failure usage");
+        assert!(!serialized.contains(&marker));
+    }
+
+    let logs = captured.snapshot();
+    for round in 1..=5 {
+        assert!(!logs.contains(&format!("PROVIDER_JSON_RETRY_PRIVATE_MARKER_{round}")));
+        assert!(!logs.contains(&format!("PROVIDER_JSON_SINGLE_PRIVATE_MARKER_{round}")));
+    }
+}
+
+#[test]
+fn provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("provider-json-fault-matrix", || async {
+        run_provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds()
+            .await;
+    });
+}
+
+#[test]
+fn eventstream_content_type_with_json_bytes_uses_protocol_retry_for_five_rounds() {
+    std::thread::Builder::new()
+        .name("mislabeled-json-eventstream-fixture".to_string())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build mislabeled JSON EventStream runtime");
+            runtime.block_on(async {
+                for round in 1..=5 {
+                    assert_handler_eventstream_precommit_retry(
+                        HandlerEventStreamFault::JsonBodyWithEventStreamContentType,
+                        round,
+                    )
+                    .await;
+                }
+            });
+        })
+        .expect("spawn mislabeled JSON EventStream fixture")
+        .join()
+        .expect("run mislabeled JSON EventStream fixture");
+}
+
+#[cfg(not(debug_assertions))]
+fn boxed_precommit_retry_heap_control(rounds: usize) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        for round in 1..=rounds {
+            assert_handler_eventstream_precommit_retry(
+                HandlerEventStreamFault::BadCrcBeforeOutput,
+                round,
+            )
+            .await;
+        }
+    })
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn handler_precommit_retry_runs_on_two_mib_worker_stack_for_one_minimal_case() {
+    let future = std::thread::Builder::new()
+        .name("precommit-fixture-constructor".to_string())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| boxed_precommit_retry_heap_control(1))
+        .expect("spawn bounded fixture constructor")
+        .join()
+        .expect("construct boxed precommit retry future");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(2 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build two-MiB worker runtime");
+    runtime.block_on(async move {
+        tokio::spawn(future)
+            .await
+            .expect("heap-spawned precommit retry task");
+    });
+}
+
+#[test]
+fn handler_precommit_retry_future_sizes_remain_below_four_mib() {
+    fn two_arg_future_size<A, B, F: Future>(_: fn(A, B) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    fn one_arg_future_size<A, F: Future>(_: fn(A) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    let case_future = two_arg_future_size(assert_handler_eventstream_precommit_retry);
+    let handler_call_future = two_arg_future_size(call_handler_eventstream_fault);
+    let upstream_start_future = one_arg_future_size(HandlerEventStreamFaultUpstream::start);
+    eprintln!(
+        "precommit future sizes: case={case_future} handler_call={handler_call_future} upstream_start={upstream_start_future}"
+    );
+    assert!(case_future < 4 * 1024 * 1024);
+    assert!(handler_call_future < 4 * 1024 * 1024);
+    assert!(upstream_start_future < 4 * 1024 * 1024);
+}
+
+async fn run_single_credential_precommit_retry_matrix() {
+    let captured = CapturedTestLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(captured.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    for round in 1..=5 {
+        let marker = format!("SINGLE_CREDENTIAL_PROTOCOL_SECRET_MARKER_{round}");
+        let upstream = HandlerEventStreamFaultUpstream::start_with_json_secret_marker(
+            HandlerEventStreamFault::BadCrcBeforeOutput,
+            marker.clone(),
+        )
+        .await;
+        let (app, usage_recorder) =
+            handler_eventstream_fault_router_with_credential_count(&upstream.base_url, 1);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert_eq!(
+            body.matches("event: message_start").count(),
+            1,
+            "round={round} body={body}"
+        );
+        assert_eq!(
+            body.matches("event: error").count(),
+            1,
+            "round={round} body={body}"
+        );
+        assert!(body.contains(r#""type":"api_error""#));
+        assert!(!body.contains("event: message_stop"));
+        assert!(!body.contains("recovered-ok"));
+        assert!(!body.contains(&marker));
+        assert_eq!(upstream.hits(), 1, "round={round} body={body}");
+
+        assert_fault_usage(
+            &usage_recorder,
+            &request_id,
+            UsageRecordStatus::StreamError,
+            1,
+        );
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("single-credential latency trace");
+        let attempts = trace
+            .inference_attempts
+            .expect("single-credential inference attempt snapshot");
+        assert_eq!(attempts.local_attempts, 1, "round={round}");
+        assert_eq!(attempts.external_attempts, 0, "round={round}");
+        assert!(attempts.consumed <= attempts.max_attempts, "round={round}");
+        assert_eq!(trace.stream_retry_attempts, None, "round={round}");
+        assert_eq!(
+            trace.stream_retry_dispatch_failures,
+            Some(1),
+            "round={round}"
+        );
+        assert_eq!(
+            trace.stream_retry_reasons.as_deref(),
+            Some(&["protocol_error:dispatch_failed_without_send".to_string()][..]),
+            "round={round}"
+        );
+        assert!(record.credential_attempts.len() <= 1, "round={round}");
+        let error_id = record
+            .error_id
+            .as_deref()
+            .expect("single-credential stream error-id");
+        assert!(body.contains(error_id), "round={round} body={body}");
+        let serialized = serde_json::to_string(&record).expect("serialize single-credential usage");
+        assert!(!serialized.contains(&marker), "round={round}: {serialized}");
+    }
+
+    let logs = captured.snapshot();
+    assert_eq!(
+        logs.matches("本地 Kiro 流式响应在首个下游事件前失败，准备换号重试")
+            .count(),
+        5,
+        "logs={logs}"
+    );
+    assert_eq!(
+        logs.matches("本地 Kiro 流式首输出前重试失败").count(),
+        5,
+        "logs={logs}"
+    );
+    for round in 1..=5 {
+        assert!(!logs.contains(&format!("SINGLE_CREDENTIAL_PROTOCOL_SECRET_MARKER_{round}")));
+    }
+}
+
+#[test]
+fn handler_single_credential_precommit_retry_is_bounded_and_fails_closed_for_five_rounds() {
+    std::thread::Builder::new()
+        .name("single-credential-precommit-fixture".to_string())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build single-credential precommit runtime");
+            runtime.block_on(run_single_credential_precommit_retry_matrix());
+        })
+        .expect("spawn single-credential precommit fixture")
+        .join()
+        .expect("run single-credential precommit fixture");
+}
+
+async fn run_handler_eventstream_postcommit_faults_matrix() {
+    let cases = [
+        (
+            HandlerEventStreamFault::TextThenReadError,
+            "postcommit-visible",
+        ),
+        (
+            HandlerEventStreamFault::ThinkingThenReadError,
+            "thinking_delta",
+        ),
+        (
+            HandlerEventStreamFault::ToolThenReadError,
+            r#""type":"tool_use""#,
+        ),
+    ];
+
+    for (fault, expected_visible) in cases {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+
+            assert_eq!(status, StatusCode::OK, "fault={fault:?} round={round}");
+            assert!(
+                body.contains(expected_visible),
+                "fault={fault:?} round={round} body={body}"
+            );
+            assert!(body.contains(r#""type":"error""#));
+            assert!(body.contains(r#""type":"api_error""#));
+            assert!(!body.contains("event: message_stop"));
+            assert!(!body.contains("upstream stream read error"));
+            assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
+            assert_fault_usage(
+                &usage_recorder,
+                &request_id,
+                UsageRecordStatus::StreamError,
+                1,
+            );
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(
+                record.public_error_type.as_deref(),
+                Some("api_error"),
+                "fault={fault:?} round={round}"
+            );
+            let error_id = record
+                .error_id
+                .as_deref()
+                .expect("postcommit stream error usage error-id");
+            assert!(
+                body.contains(error_id),
+                "fault={fault:?} round={round} request_id={request_id} error_id={error_id} hits={} body={body}",
+                upstream.hits()
+            );
+        }
+    }
+}
+
+#[test]
+fn handler_eventstream_postcommit_faults_never_retry_or_fake_success_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "postcommit-eventstream-fixture",
+        run_handler_eventstream_postcommit_faults_matrix,
+    );
+}
+
+async fn run_handler_non_stream_eventstream_faults_matrix() {
+    let cases = [
+        HandlerEventStreamFault::JsonExceptionBeforeOutput,
+        HandlerEventStreamFault::BadCrcBeforeOutput,
+        HandlerEventStreamFault::TruncatedFrameBeforeOutput,
+        HandlerEventStreamFault::IncompleteStatusBeforeOutput,
+    ];
+
+    for fault in cases {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+
+            assert!(status.is_client_error() || status.is_server_error());
+            assert!(body.contains(&request_id));
+            assert!(!body.contains("private fault fixture detail"));
+            assert!(!body.contains("must-not-appear"));
+            assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
+        }
+    }
+}
+
+#[test]
+fn handler_non_stream_eventstream_faults_fail_closed_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "non-stream-eventstream-fixture",
+        run_handler_non_stream_eventstream_faults_matrix,
+    );
+}
+
+async fn run_handler_json_stream_secret_markers_matrix() {
+    let captured = CapturedTestLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(captured.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    for round in 1..=5 {
+        let marker = format!("JSON_STREAM_PRIVATE_SECRET_MARKER_{round}");
+        let upstream = HandlerEventStreamFaultUpstream::start_with_json_secret_marker(
+            HandlerEventStreamFault::JsonExceptionBeforeOutput,
+            marker.clone(),
+        )
+        .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "round={round} body={body}"
+        );
+        assert!(body.contains(&request_id), "round={round} body={body}");
+        assert!(!body.contains(&marker), "round={round} body={body}");
+        assert_eq!(upstream.hits(), 1, "round={round}");
+        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.public_error_status_code, Some(429), "round={round}");
+        assert_eq!(
+            record.public_error_type.as_deref(),
+            Some("rate_limit_error"),
+            "round={round}"
+        );
+        let serialized = serde_json::to_string(&record).expect("serialize JSON error usage");
+        assert!(
+            !serialized.contains(&marker),
+            "round={round}: usage captured private JSON marker: {serialized}"
+        );
+    }
+
+    let logs = captured.snapshot();
+    for round in 1..=5 {
+        let marker = format!("JSON_STREAM_PRIVATE_SECRET_MARKER_{round}");
+        assert!(
+            !logs.contains(&marker),
+            "round={round}: DEBUG logs captured private JSON marker"
+        );
+    }
+}
+
+#[test]
+fn handler_json_stream_secret_markers_never_reach_logs_or_usage_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "json-stream-privacy-fixture",
+        run_handler_json_stream_secret_markers_matrix,
+    );
+}
+
+async fn run_handler_unknown_event_only_matrix() {
+    for round in 1..=5 {
+        let marker = format!("UNKNOWN_EVENT_PRIVATE_MARKER_{round}");
+        let upstream = HandlerEventStreamFaultUpstream::start_with_json_secret_marker(
+            HandlerEventStreamFault::UnknownEventOnly,
+            marker.clone(),
+        )
+        .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "unknown round={round}");
+        assert!(
+            body.contains("recovered-ok"),
+            "unknown round={round} body={body}"
+        );
+        assert!(!body.contains(&marker), "unknown round={round} body={body}");
+        assert_eq!(upstream.hits(), 2, "unknown round={round}");
+        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("unknown-event retry latency trace");
+        assert_eq!(trace.stream_retry_attempts, Some(1));
+        assert_eq!(trace.stream_retry_dispatch_failures, None);
+        assert_eq!(
+            trace.stream_retry_reasons.as_deref(),
+            Some(&["protocol_error:sends=1".to_string()][..])
+        );
+        let serialized = serde_json::to_string(&record).expect("serialize unknown-event usage");
+        assert!(!serialized.contains(&marker), "unknown round={round}");
+    }
+}
+
+#[test]
+fn handler_unknown_event_only_retries_before_empty_success_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "unknown-event-terminal-fixture",
+        run_handler_unknown_event_only_matrix,
+    );
+}
+
+async fn run_handler_missing_completion_after_text_matrix() {
+    for round in 1..=5 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::MissingCompletionAfterText,
+        )
+        .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "missing completion round={round}");
+        assert!(body.contains("unterminated-visible"));
+        assert!(
+            body.contains(r#""type":"error""#),
+            "missing completion round={round} hits={} body={body}",
+            upstream.hits()
+        );
+        assert!(!body.contains("event: message_stop"));
+        assert!(!body.contains("upstream eventstream"));
+        assert_eq!(upstream.hits(), 1, "missing completion round={round}");
+        assert_fault_usage(
+            &usage_recorder,
+            &request_id,
+            UsageRecordStatus::StreamError,
+            1,
+        );
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("missing-completion latency trace");
+        assert_eq!(trace.stream_retry_attempts, None);
+        assert_eq!(trace.stream_retry_dispatch_failures, None);
+        let error_id = record
+            .error_id
+            .as_deref()
+            .expect("missing-completion stream error-id");
+        assert!(body.contains(error_id), "round={round} body={body}");
+    }
+}
+
+#[test]
+fn handler_missing_completion_after_text_fails_closed_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "missing-completion-terminal-fixture",
+        run_handler_missing_completion_after_text_matrix,
+    );
+}
+
+async fn run_handler_non_stream_untrusted_eof_matrix() {
+    for (fault, forbidden) in [
+        (
+            HandlerEventStreamFault::UnknownEventOnly,
+            "UNKNOWN_NON_STREAM_PRIVATE_MARKER",
+        ),
+        (
+            HandlerEventStreamFault::MissingCompletionAfterText,
+            "unterminated-visible",
+        ),
+    ] {
+        for round in 1..=5 {
+            let marker = format!("{forbidden}_{round}");
+            let upstream = HandlerEventStreamFaultUpstream::start_with_json_secret_marker(
+                fault,
+                marker.clone(),
+            )
+            .await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "fault={fault:?} round={round} body={body}"
+            );
+            assert!(body.contains(&request_id));
+            assert!(!body.contains("upstream eventstream"));
+            assert!(!body.contains(&marker));
+            assert!(!body.contains("unterminated-visible"));
+            assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(record.public_error_status_code, Some(502));
+            assert_eq!(record.public_error_type.as_deref(), Some("api_error"));
+            let serialized = serde_json::to_string(&record).expect("serialize untrusted EOF usage");
+            assert!(!serialized.contains(&marker));
+            assert!(!serialized.contains("unterminated-visible"));
+        }
+    }
+}
+
+#[test]
+fn handler_non_stream_untrusted_eof_fails_closed_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "non-stream-untrusted-eof-fixture",
+        run_handler_non_stream_untrusted_eof_matrix,
+    );
+}
+
+async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
+    for (fault, expected_content, expected_stop_reason) in [
+        (
+            HandlerEventStreamFault::LegacyTextWithMetadataNoStatus,
+            "legacy-terminal-ok",
+            "end_turn",
+        ),
+        (
+            HandlerEventStreamFault::CompleteToolWithoutStatus,
+            r#""name":"Bash""#,
+            "tool_use",
+        ),
+    ] {
+        for stream in [true, false] {
+            for round in 1..=5 {
+                let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+                let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+                let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "fault={fault:?} stream={stream} round={round} body={body}"
+                );
+                assert!(
+                    body.contains(expected_content),
+                    "fault={fault:?} stream={stream} round={round} body={body}"
+                );
+                assert!(
+                    body.contains(&format!(r#""stop_reason":"{expected_stop_reason}""#)),
+                    "fault={fault:?} stream={stream} round={round} body={body}"
+                );
+                assert!(!body.contains(r#""type":"error""#));
+                if stream {
+                    assert_eq!(body.matches("event: message_stop").count(), 1);
+                }
+                assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
+                assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 1);
+                let record = usage_record_for_request(&usage_recorder, &request_id);
+                assert_eq!(
+                    record.downstream_stop_reason.as_deref(),
+                    Some(expected_stop_reason)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn handler_legacy_metadata_and_complete_tool_are_trusted_terminals_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "legacy-terminal-positive-fixture",
+        run_handler_legacy_metadata_and_complete_tool_matrix,
+    );
+}
+
+async fn run_handler_non_stream_response_body_limit_matrix() {
+    for fault in [
+        HandlerEventStreamFault::NonStreamContentLengthOverLimit,
+        HandlerEventStreamFault::NonStreamChunkedOverLimit,
+    ] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) =
+                call_handler_eventstream_fault(app.clone(), false).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "fault={fault:?} round={round} body={body}"
+            );
+            assert!(body.contains(&request_id));
+            assert!(!body.contains("upstream response body"));
+            assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
+
+            let (recovery_status, recovery_request_id, recovery_body) =
+                call_handler_eventstream_fault(app, false).await;
+            assert_eq!(
+                recovery_status,
+                StatusCode::OK,
+                "recovery fault={fault:?} round={round} body={recovery_body}"
+            );
+            assert!(recovery_body.contains("recovered-ok"));
+            assert_eq!(upstream.hits(), 2, "recovery fault={fault:?} round={round}");
+            assert_fault_usage(
+                &usage_recorder,
+                &recovery_request_id,
+                UsageRecordStatus::Success,
+                1,
+            );
+        }
+    }
+
+    for fault in [
+        HandlerEventStreamFault::NonStreamExactLimit,
+        HandlerEventStreamFault::NonStreamSmallBody,
+    ] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "control fault={fault:?} round={round} body={body}"
+            );
+            let expected = if matches!(fault, HandlerEventStreamFault::NonStreamExactLimit) {
+                "exact-limit-ok"
+            } else {
+                "recovered-ok"
+            };
+            assert!(body.contains(expected));
+            assert_eq!(upstream.hits(), 1, "control fault={fault:?} round={round}");
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 1);
+        }
+    }
+}
+
+#[test]
+fn handler_non_stream_response_body_limit_and_recovery_hold_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "non-stream-response-limit-fixture",
+        run_handler_non_stream_response_body_limit_matrix,
+    );
 }
 
 #[test]
@@ -70,21 +3354,183 @@ fn count_tool_use_blocks_counts_assistant_tool_uses_without_text_hashing() {
 }
 
 #[test]
+fn non_stream_redacted_thinking_keeps_following_visible_text() {
+    let mut content = Vec::new();
+    let mut thinking_sanitizer = super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(
+        std::iter::empty::<String>(),
+    );
+    let redacted = BASE64_STANDARD.encode(b"opaque-redacted-data");
+    append_non_stream_reasoning_and_text(
+        &mut content,
+        true,
+        true,
+        Some(&redacted),
+        "",
+        None,
+        "visible answer",
+        &HashSet::new(),
+        &HashMap::new(),
+        &ToolSchemaKeyMap::default(),
+        &mut HashSet::new(),
+        &mut thinking_sanitizer,
+    )
+    .expect("canonical redacted blob");
+
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "redacted_thinking");
+    assert_eq!(content[0]["data"], redacted);
+    assert_eq!(
+        content[1],
+        json!({"type": "text", "text": "visible answer"})
+    );
+}
+
+#[test]
+fn non_stream_native_reasoning_is_independent_from_xml_extraction_for_five_rounds() {
+    let redacted = BASE64_STANDARD.encode(b"opaque-strict-redacted");
+    for round in 0..5 {
+        let mut signed = Vec::new();
+        let mut signed_sanitizer =
+            super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(std::iter::empty::<
+                String,
+            >());
+        append_non_stream_reasoning_and_text(
+            &mut signed,
+            true,
+            false,
+            None,
+            "native reasoning",
+            Some("opaque-signature"),
+            "visible",
+            &HashSet::new(),
+            &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
+            &mut HashSet::new(),
+            &mut signed_sanitizer,
+        )
+        .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert_eq!(signed[0]["type"], "thinking");
+        assert_eq!(signed[0]["signature"], "opaque-signature");
+
+        let mut opaque = Vec::new();
+        let mut opaque_sanitizer =
+            super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(std::iter::empty::<
+                String,
+            >());
+        append_non_stream_reasoning_and_text(
+            &mut opaque,
+            true,
+            false,
+            Some(&redacted),
+            "",
+            None,
+            "visible",
+            &HashSet::new(),
+            &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
+            &mut HashSet::new(),
+            &mut opaque_sanitizer,
+        )
+        .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert_eq!(opaque[0]["type"], "redacted_thinking");
+        assert_eq!(opaque[0]["data"], redacted);
+    }
+}
+
+#[test]
+fn non_stream_thinking_policy_sanitizes_unsigned_and_drops_atomic_blocks() {
+    let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
+    for _round in 0..5 {
+        let known = HashSet::from(["Bash".to_string()]);
+
+        let mut unsigned = Vec::new();
+        let mut unsigned_sanitizer =
+            super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(known.clone());
+        append_non_stream_reasoning_and_text(
+            &mut unsigned,
+            true,
+            true,
+            None,
+            polluted,
+            None,
+            "visible",
+            &known,
+            &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
+            &mut HashSet::new(),
+            &mut unsigned_sanitizer,
+        )
+        .expect("unsigned thinking");
+        assert_eq!(unsigned[0]["type"], "thinking");
+        assert_eq!(unsigned[0]["thinking"], "safe prefix\n");
+        assert_eq!(unsigned[1]["text"], "visible");
+
+        let mut signed = Vec::new();
+        let mut signed_sanitizer =
+            super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(known.clone());
+        append_non_stream_reasoning_and_text(
+            &mut signed,
+            true,
+            true,
+            None,
+            polluted,
+            Some("opaque-signature"),
+            "visible",
+            &known,
+            &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
+            &mut HashSet::new(),
+            &mut signed_sanitizer,
+        )
+        .expect("signed thinking");
+        assert_eq!(signed, vec![json!({"type":"text","text":"visible"})]);
+
+        let mut redacted = Vec::new();
+        let mut redacted_sanitizer =
+            super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(known.clone());
+        let error = append_non_stream_reasoning_and_text(
+            &mut redacted,
+            true,
+            true,
+            Some(polluted),
+            "",
+            None,
+            "visible",
+            &known,
+            &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
+            &mut HashSet::new(),
+            &mut redacted_sanitizer,
+        )
+        .expect_err("plaintext redacted data must be rejected");
+        assert!(error.contains("canonical base64"));
+        assert!(redacted.is_empty());
+    }
+}
+
+#[test]
 fn json_stream_sniffer_detects_request_body_invalid_exception() {
-    let mut sniffer = JsonStreamErrorSniffer::new(Some("application/json; charset=utf-8"));
+    for round in 1..=5 {
+        let marker = format!("JSON_STREAM_INVALID_SECRET_MARKER_{round}");
+        let raw = serde_json::to_vec(&json!({
+            "message": format!("Invalid tool use format. {marker}"),
+            "reason": "REQUEST_BODY_INVALID"
+        }))
+        .expect("serialize invalid request fixture");
+        let mut sniffer = JsonStreamErrorSniffer::new(Some("application/json; charset=utf-8"));
 
-    let result = sniffer.inspect(Bytes::from_static(
-        br#"{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#,
-    ));
-
-    match result {
-        JsonStreamSniffResult::Error(error) => {
-            assert_eq!(error.error_type, "invalid_request_error");
-            assert!(error.internal_detail.contains("REQUEST_BODY_INVALID"));
-            assert!(error.internal_detail.contains("Invalid tool use format."));
-            assert!(error.body_preview.contains("Invalid tool use format."));
+        match sniffer.inspect(Bytes::from(raw.clone())) {
+            JsonStreamSniffResult::Error(error) => {
+                assert_eq!(error.error_type, "invalid_request_error");
+                assert_eq!(
+                    error.internal_detail,
+                    "json_stream_exception classified_as=invalid_request_error code_present=false reason_present=true message_present=true"
+                );
+                assert_eq!(error.body_bytes, raw.len());
+                assert!(!error.internal_detail.contains(&marker));
+            }
+            _ => panic!("round {round}: expected JSON stream error"),
         }
-        _ => panic!("expected JSON stream error"),
     }
 }
 
@@ -94,30 +3540,131 @@ fn json_stream_sniffer_passes_binary_eventstream_mislabeled_as_json() {
     let chunk = Bytes::from_static(&[0, 0, 0, 16, 0, 0, 0, 0]);
 
     match sniffer.inspect(chunk.clone()) {
-        JsonStreamSniffResult::Pass(passed) => assert_eq!(passed, chunk),
+        JsonStreamSniffResult::Pass(passed) => {
+            assert_eq!(passed, chunk);
+            assert_eq!(
+                passed.as_ptr(),
+                chunk.as_ptr(),
+                "binary fast path is zero-copy"
+            );
+        }
         _ => panic!("expected binary eventstream chunk to pass through"),
     }
 }
 
 #[test]
 fn json_stream_sniffer_accumulates_split_json_exception() {
-    let mut sniffer = JsonStreamErrorSniffer::new(Some("application/json"));
+    for round in 1..=5 {
+        let marker = format!("JSON_STREAM_SPLIT_SECRET_MARKER_{round}");
+        let first = Bytes::from_static(br#"{"message":"Too many"#);
+        let second = Bytes::from(format!(
+            " requests {marker}\",\"code\":\"ThrottlingException\"}}"
+        ));
+        let expected_body_bytes = first.len() + second.len();
+        let mut sniffer = JsonStreamErrorSniffer::new(Some("application/json"));
 
-    assert!(matches!(
-        sniffer.inspect(Bytes::from_static(br#"{"message":"Too many"#)),
-        JsonStreamSniffResult::Pending
-    ));
+        assert!(matches!(
+            sniffer.inspect(first),
+            JsonStreamSniffResult::Pending
+        ));
 
-    match sniffer.inspect(Bytes::from_static(
-        br#" requests","code":"ThrottlingException"}"#,
-    )) {
-        JsonStreamSniffResult::Error(error) => {
-            assert_eq!(error.error_type, "rate_limit_error");
-            assert!(error.internal_detail.contains("ThrottlingException"));
-            assert!(error.internal_detail.contains("Too many requests"));
+        match sniffer.inspect(second) {
+            JsonStreamSniffResult::Error(error) => {
+                assert_eq!(error.error_type, "rate_limit_error");
+                assert_eq!(
+                    error.internal_detail,
+                    "json_stream_exception classified_as=rate_limit_error code_present=true reason_present=false message_present=true"
+                );
+                assert_eq!(error.body_bytes, expected_body_bytes);
+                assert!(!error.internal_detail.contains(&marker));
+            }
+            _ => panic!("round {round}: expected split JSON stream error"),
         }
-        _ => panic!("expected split JSON stream error"),
     }
+}
+
+#[test]
+fn complete_upstream_body_rejects_json_exception_without_copying_eventstream() {
+    for round in 1..=5 {
+        let marker = format!("JSON_STREAM_COMPLETE_SECRET_MARKER_{round}");
+        let raw = serde_json::to_vec(&json!({
+            "__type": "ThrottlingException",
+            "message": format!("Rate exceeded {marker}")
+        }))
+        .expect("serialize complete JSON exception fixture");
+        let error =
+            inspect_complete_upstream_body(Some("application/json"), Bytes::from(raw.clone()))
+                .expect_err("JSON exception must not be treated as an EventStream body");
+        assert_eq!(error.error_type, "rate_limit_error");
+        assert_eq!(
+            error.internal_detail,
+            "json_stream_exception classified_as=rate_limit_error code_present=true reason_present=false message_present=true"
+        );
+        assert_eq!(error.body_bytes, raw.len());
+        assert!(!error.internal_detail.contains(&marker));
+    }
+
+    let frame = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"exact body","messageStatus":"COMPLETED"}),
+    );
+    let passed =
+        inspect_complete_upstream_body(Some("application/json"), Bytes::from(frame.clone()))
+            .expect("binary EventStream mislabeled as JSON remains byte-exact");
+    assert_eq!(passed.as_ref(), frame.as_slice());
+}
+
+#[test]
+fn complete_eventstream_decoder_accepts_only_complete_valid_frames() {
+    let frame = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"visible answer","messageStatus":"COMPLETED"}),
+    );
+
+    for _ in 0..5 {
+        let events = decode_complete_eventstream(&frame).expect("valid frame decodes");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::AssistantResponse(response) => {
+                assert_eq!(response.content, "visible answer");
+                assert_eq!(response.message_status.as_deref(), Some("COMPLETED"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    let empty = decode_complete_eventstream(&[]).expect_err("empty body is not success");
+    assert!(empty.contains("without any frames"));
+
+    for cut in [1, 4, 8, frame.len() / 2, frame.len() - 1] {
+        let error = decode_complete_eventstream(&frame[..cut])
+            .expect_err("truncated frame must not be accepted");
+        assert!(error.contains("undecoded bytes"), "{error}");
+    }
+}
+
+#[test]
+fn complete_eventstream_decoder_rejects_crc_and_payload_corruption() {
+    let frame = eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content":"visible answer","messageStatus":"COMPLETED"}),
+    );
+    for _ in 0..5 {
+        let mut bad_crc = frame.clone();
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xff;
+        let error = decode_complete_eventstream(&bad_crc)
+            .expect_err("bad message CRC must not be accepted");
+        assert!(error.contains("CRC"), "{error}");
+    }
+
+    let invalid_payload = eventstream_test_frame(
+        "assistantResponseEvent",
+        serde_json::Value::String("not an assistant event object".to_string()),
+    );
+    let error = decode_complete_eventstream(&invalid_payload)
+        .expect_err("invalid event payload must not be accepted");
+    assert!(error.contains("payload parse error"), "{error}");
 }
 
 #[test]
@@ -227,9 +3774,12 @@ fn raw_external_route_request_is_preparse_raw_only() {
         Some("local_capacity_full".to_string()),
         None,
         Some(json!({"preflightStage":"before_parse"})),
+        Arc::new(InferenceAttemptBudget::new(4)),
+        None,
     );
 
     assert_eq!(route.raw_body, raw_body);
+    assert_eq!(route.effective_raw_body, raw_body);
     assert!(route.payload.is_none());
     assert_eq!(
         route.body_mode_filter,
@@ -246,6 +3796,38 @@ fn raw_external_route_request_is_preparse_raw_only() {
             .and_then(|value| value.get("preflightStage"))
             .and_then(|value| value.as_str()),
         Some("before_parse")
+    );
+}
+
+#[test]
+fn contaminated_fallback_requires_normalized_pool_for_five_rounds() {
+    for _round in 0..5 {
+        assert_eq!(external_fallback_body_mode_filter(false), None);
+        assert_eq!(
+            external_fallback_body_mode_filter(true),
+            Some(ExternalPoolRequestBodyMode::Normalized)
+        );
+    }
+}
+
+#[test]
+fn all_parsed_external_fallback_entrypoints_share_model_and_body_mode_eligibility() {
+    let source = include_str!("../handlers.rs");
+    assert_eq!(
+        source
+            .matches(".has_eligible_external_pool_for_model(")
+            .count(),
+        3,
+        "local attempt policy, parsed preflight and local-error fallback must share one route eligibility query"
+    );
+    assert_eq!(
+        source
+            .matches("async fn has_eligible_external_pool_for_model")
+            .count(),
+        1
+    );
+    assert!(
+        source.contains("match external_fallback_body_mode_filter(self.requires_normalized_body)")
     );
 }
 
@@ -303,6 +3885,8 @@ fn raw_external_route_request_applies_non_stream_skip_cache_route() {
             None,
             Some("direct_policy".to_string()),
             None,
+            Arc::new(InferenceAttemptBudget::new(4)),
+            None,
         );
 
     assert_eq!(
@@ -335,6 +3919,8 @@ fn raw_external_route_request_applies_non_stream_skip_cache_route() {
             UsageRouteSubtype::ExternalDirectPolicy,
             None,
             Some("direct_policy".to_string()),
+            None,
+            Arc::new(InferenceAttemptBudget::new(4)),
             None,
         );
 
@@ -387,6 +3973,8 @@ fn runtime_config_for_payload_guard(
         kiro_upstream_stream_idle_timeout_secs: 180,
         kiro_upstream_stream_retry_enabled: true,
         kiro_upstream_stream_retry_max_attempts: 2,
+        inference_upstream_max_attempts: 4,
+        auxiliary_upstream_max_attempts: 2,
         kiro_upstream_stream_retry_on_idle_timeout: true,
         kiro_upstream_stream_retry_on_read_error: true,
         kiro_upstream_stream_retry_on_status_error: true,
@@ -396,6 +3984,462 @@ fn runtime_config_for_payload_guard(
         missing_max_tokens: MissingMaxTokensConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
         external_pools: ExternalPoolsConfig::default(),
+    }
+}
+
+fn thinking_signature_retry_kiro_fixture() -> KiroRequest {
+    let mut request = serde_json::from_value::<KiroRequest>(json!({
+        "conversationState": {
+            "conversationId": "thinking-signature-handler-fixture",
+            "history": [
+                {
+                    "assistantResponseMessage": {
+                        "content": "signed-visible-content",
+                        "toolUses": [{
+                            "toolUseId": "tool-signed",
+                            "name": "read",
+                            "input": {"path": "README.md"}
+                        }],
+                        "reasoningContent": {
+                            "reasoningText": {
+                                "text": "private-signed-thought",
+                                "signature": "private-signature"
+                            }
+                        }
+                    }
+                },
+                {
+                    "userInputMessage": {
+                        "content": "continue after signed block",
+                        "modelId": "claude-sonnet-4"
+                    }
+                },
+                {
+                    "assistantResponseMessage": {
+                        "content": "redacted-visible-content",
+                        "reasoningContent": {
+                            "redactedContent": "cHJpdmF0ZS1yZWRhY3RlZA=="
+                        }
+                    }
+                }
+            ],
+            "currentMessage": {
+                "userInputMessage": {
+                    "content": "current-visible-content",
+                    "modelId": "claude-sonnet-4",
+                    "userInputMessageContext": {
+                        "tools": [{
+                            "toolSpecification": {
+                                "name": "read",
+                                "description": "Read a file",
+                                "inputSchema": {
+                                    "json": {
+                                        "type": "object",
+                                        "properties": {"path": {"type": "string"}},
+                                        "required": ["path"]
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        },
+        "additionalModelRequestFields": {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        }
+    }))
+    .expect("deserialize thinking signature retry handler fixture");
+    request.tool_cache_point_insert_after = vec![0];
+    request
+}
+
+fn count_serialized_cache_points(value: &serde_json::Value) -> usize {
+    value
+        .pointer("/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools")
+        .and_then(serde_json::Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.get("cachePoint").is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn thinking_signature_retry_body_removes_only_native_reasoning_five_rounds() {
+    for round in 1..=5 {
+        let request = thinking_signature_retry_kiro_fixture();
+        let original_body = serialize_kiro_request(&request).expect("serialize original fixture");
+        let original: serde_json::Value =
+            serde_json::from_str(&original_body).expect("original fixture JSON");
+        let retry_body = build_thinking_signature_retry_body(&request)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        let retry: serde_json::Value =
+            serde_json::from_str(&retry_body).expect("retry fixture JSON");
+
+        assert!(
+            original
+                .pointer(
+                    "/conversationState/history/0/assistantResponseMessage/reasoningContent/reasoningText/signature"
+                )
+                .is_some()
+        );
+        assert!(
+            original
+                .pointer(
+                    "/conversationState/history/2/assistantResponseMessage/reasoningContent/redactedContent"
+                )
+                .is_some()
+        );
+        assert!(
+            retry
+                .pointer("/conversationState/history/0/assistantResponseMessage/reasoningContent")
+                .is_none(),
+            "round {round}: signed reasoning removed"
+        );
+        assert!(
+            retry
+                .pointer("/conversationState/history/2/assistantResponseMessage/reasoningContent")
+                .is_none(),
+            "round {round}: redacted reasoning removed"
+        );
+        for pointer in [
+            "/conversationState/history/0/assistantResponseMessage/content",
+            "/conversationState/history/0/assistantResponseMessage/toolUses",
+            "/conversationState/history/1/userInputMessage/content",
+            "/conversationState/history/2/assistantResponseMessage/content",
+            "/conversationState/currentMessage/userInputMessage/content",
+            "/additionalModelRequestFields",
+        ] {
+            assert_eq!(
+                original.pointer(pointer),
+                retry.pointer(pointer),
+                "round {round}: non-reasoning field changed at {pointer}"
+            );
+        }
+        assert_eq!(count_serialized_cache_points(&original), 1);
+        assert_eq!(count_serialized_cache_points(&retry), 1);
+        assert!(!retry_body.contains("private-signature"));
+        assert!(!retry_body.contains("private-signed-thought"));
+        assert!(!retry_body.contains("cHJpdmF0ZS1yZWRhY3RlZA=="));
+        assert_eq!(
+            serialize_kiro_request(&request).expect("reserialize original fixture"),
+            original_body,
+            "round {round}: lazy retry clone must not mutate original request"
+        );
+    }
+}
+
+#[test]
+fn cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds() {
+    for round in 1..=5 {
+        let mut cache_retry_request = thinking_signature_retry_kiro_fixture();
+        assert_eq!(cache_retry_request.clear_tool_cache_point_plan(), 1);
+        let cache_retry_body =
+            serialize_kiro_request(&cache_retry_request).expect("serialize cache retry fixture");
+        let cache_retry: serde_json::Value =
+            serde_json::from_str(&cache_retry_body).expect("cache retry JSON");
+        assert_eq!(count_serialized_cache_points(&cache_retry), 0);
+        assert!(
+            cache_retry_request
+                .conversation_state
+                .has_history_reasoning_content()
+        );
+
+        let signature_retry_body = build_thinking_signature_retry_body(&cache_retry_request)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        let signature_retry: serde_json::Value =
+            serde_json::from_str(&signature_retry_body).expect("signature retry JSON");
+        assert_eq!(
+            count_serialized_cache_points(&signature_retry),
+            0,
+            "round {round}: signature retry must preserve cleared cachePoint plan"
+        );
+        assert!(
+            signature_retry
+                .pointer("/conversationState/history/0/assistantResponseMessage/reasoningContent")
+                .is_none()
+        );
+        assert_eq!(
+            cache_retry.pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools/0/toolSpecification"
+            ),
+            signature_retry.pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools/0/toolSpecification"
+            )
+        );
+    }
+}
+
+#[test]
+fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_rounds() {
+    for round in 1..=5 {
+        let old_marker = format!("OLD_HISTORY_MUST_STAY_TRIMMED_{round}_{}", "x".repeat(4096));
+        let mut request = serde_json::from_value::<KiroRequest>(json!({
+            "conversationState": {
+                "conversationId": format!("guard-signature-{round}"),
+                "history": [
+                    {
+                        "userInputMessage": {
+                            "content": old_marker,
+                            "modelId": "claude-sonnet-4"
+                        }
+                    },
+                    {
+                        "assistantResponseMessage": {
+                            "content": format!("old-answer-{}", "y".repeat(4096))
+                        }
+                    },
+                    {
+                        "userInputMessage": {
+                            "content": "RECENT_USER_MUST_REMAIN",
+                            "modelId": "claude-sonnet-4"
+                        }
+                    },
+                    {
+                        "assistantResponseMessage": {
+                            "content": "RECENT_ASSISTANT_MUST_REMAIN",
+                            "reasoningContent": {
+                                "reasoningText": {
+                                    "text": "recent-private-thought",
+                                    "signature": "recent-private-signature"
+                                }
+                            }
+                        }
+                    }
+                ],
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "CURRENT_MUST_REMAIN",
+                        "modelId": "claude-sonnet-4",
+                        "userInputMessageContext": {}
+                    }
+                }
+            }
+        }))
+        .expect("deserialize payload guard signature fixture");
+        let mut expected_trimmed = request.clone();
+        expected_trimmed.conversation_state.history.drain(0..2);
+        let expected_trimmed_len = serialize_kiro_request(&expected_trimmed)
+            .expect("serialize expected trimmed fixture")
+            .len();
+        let mut shaping = PayloadShapingConfig::default();
+        shaping.enabled = false;
+        let (guarded_body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: expected_trimmed_len,
+                trim_history: true,
+                shaping,
+            },
+        )
+        .unwrap_or_else(|error| panic!("round {round}: {error}"));
+
+        assert_eq!(report.trimmed_history_entries, 2, "round {round}");
+        assert_eq!(request.conversation_state.history.len(), 2, "round {round}");
+        assert!(!guarded_body.contains("OLD_HISTORY_MUST_STAY_TRIMMED"));
+        assert!(guarded_body.contains("RECENT_USER_MUST_REMAIN"));
+        assert!(guarded_body.contains("RECENT_ASSISTANT_MUST_REMAIN"));
+        assert!(request.conversation_state.has_history_reasoning_content());
+
+        let signature_retry_body = build_thinking_signature_retry_body(&request)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert!(!signature_retry_body.contains("OLD_HISTORY_MUST_STAY_TRIMMED"));
+        assert!(!signature_retry_body.contains("recent-private-thought"));
+        assert!(!signature_retry_body.contains("recent-private-signature"));
+        assert!(signature_retry_body.contains("RECENT_USER_MUST_REMAIN"));
+        assert!(signature_retry_body.contains("RECENT_ASSISTANT_MUST_REMAIN"));
+        assert!(signature_retry_body.contains("CURRENT_MUST_REMAIN"));
+    }
+}
+
+#[test]
+fn thinking_signature_typed_failures_never_enter_external_fallback_five_rounds() {
+    let mut config = ExternalPoolsConfig::default();
+    config.fallback_on_local_capacity_exhausted = true;
+    config.fallback_on_no_available_credentials = true;
+    config.fallback_on_local_transient_exhausted = true;
+    config.fallback_on_scheduler_redis_degraded = true;
+    config.fallback_on_unsupported_model = true;
+    for round in 1..=5 {
+        for kind in [
+            KiroCallFailureKind::ThinkingSignatureInvalid,
+            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+        ] {
+            for misleading_message in [
+                "429 rate limit capacity exhausted",
+                "500 timeout network error",
+                "all credentials disabled; scheduler Redis degraded",
+                "invalid model not available",
+            ] {
+                assert_eq!(
+                    classify_local_error_for_external_fallback_with_kind(
+                        misleading_message,
+                        &[],
+                        &config,
+                        Some(kind),
+                    ),
+                    None,
+                    "round {round}: typed signature failure {kind:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn thinking_signature_typed_failures_map_to_stable_public_errors_five_rounds() {
+    for round in 1..=5 {
+        for (kind, expected_status, expected_type, expected_message) in [
+            (
+                KiroCallFailureKind::ThinkingSignatureInvalid,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                UPSTREAM_INVALID_REQUEST_MESSAGE,
+            ),
+            (
+                KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            ),
+        ] {
+            let private_marker = format!("PRIVATE_SIGNATURE_HANDLER_ERROR_{round}_{kind:?}");
+            let error: anyhow::Error =
+                crate::kiro::call_trace::KiroCallError::new(private_marker.clone(), Vec::new())
+                    .with_failure_kind(kind)
+                    .into();
+            let response = map_provider_error(
+                error,
+                Some("req_signature_handler"),
+                Some("err_signature_handler"),
+                None,
+            );
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read signature public error body");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("signature public error JSON");
+            assert_eq!(value["error"]["type"], expected_type);
+            assert_eq!(
+                value["error"]["message"],
+                envelope::public_message_with_error_id(expected_message, "err_signature_handler")
+            );
+            assert!(!String::from_utf8_lossy(&body).contains(&private_marker));
+        }
+    }
+}
+
+#[test]
+fn signature_error_token_cannot_trigger_cache_point_retry_five_rounds() {
+    for round in 1..=5 {
+        for value in [
+            "upstream_failure reason=THINKING_SIGNATURE_INVALID",
+            "400 Bad Request reason=THINKING_SIGNATURE_INVALID Invalid tool use format",
+            "bad_request improperly formed reason=THINKING_SIGNATURE_INVALID",
+        ] {
+            assert!(
+                !should_retry_without_cache_point_after_error(value),
+                "round {round}: signature retry terminal result must not stack cachePoint retry"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_internal_terms() {
+    for _ in 0..5 {
+        for failure_kind in [
+            KiroCallFailureKind::InferenceAttemptsExhausted,
+            KiroCallFailureKind::InferenceAttemptReservedForFallback,
+            KiroCallFailureKind::DownstreamCommitted,
+            KiroCallFailureKind::AuxiliaryAttemptsExhausted,
+            KiroCallFailureKind::AuxiliaryConcurrencySaturated,
+        ] {
+            let err: anyhow::Error = crate::kiro::call_trace::KiroCallError::new(
+                "local inference attempt reserved for fallback",
+                Vec::new(),
+            )
+            .with_failure_kind(failure_kind)
+            .into();
+            let response = map_provider_error(
+                err,
+                Some("req_attempt_limit_test"),
+                Some("req_attempt_limit_error"),
+                None,
+            );
+            let expected_status = if failure_kind == KiroCallFailureKind::DownstreamCommitted {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            assert_eq!(response.status(), expected_status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read public error response");
+            let body = String::from_utf8(body.to_vec()).expect("utf-8 public error response");
+            assert!(body.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+            assert!(body.contains("req_attempt_limit_error"));
+            for internal in ["budget", "upstream", "pool", "credential", "reserved"] {
+                assert!(!body.to_ascii_lowercase().contains(internal));
+            }
+        }
+    }
+}
+
+#[test]
+fn fallback_reservation_has_a_dedicated_internal_classification() {
+    let reason = classify_local_error_for_external_fallback(
+        "local inference attempt reserved for fallback",
+        &[],
+        &ExternalPoolsConfig::default(),
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("local_attempt_reserved_for_fallback")
+    );
+}
+
+#[test]
+fn auxiliary_focus_typed_failures_use_local_transient_fallback_policy_for_five_rounds() {
+    for _ in 0..5 {
+        let mut config = ExternalPoolsConfig::default();
+        config.fallback_on_local_transient_exhausted = true;
+        for (kind, expected) in [
+            (
+                KiroCallFailureKind::AuxiliaryAttemptsExhausted,
+                "local_auxiliary_attempts_exhausted",
+            ),
+            (
+                KiroCallFailureKind::AuxiliaryConcurrencySaturated,
+                "local_auxiliary_concurrency_saturated",
+            ),
+        ] {
+            let reason = classify_local_error_for_external_fallback_with_kind(
+                "misleading deterministic request body error",
+                &[],
+                &config,
+                Some(kind),
+            );
+            assert_eq!(reason.as_deref(), Some(expected));
+
+            config.fallback_on_local_transient_exhausted = false;
+            assert_eq!(
+                classify_local_error_for_external_fallback_with_kind(
+                    "misleading 503 transient text",
+                    &[],
+                    &config,
+                    Some(kind),
+                ),
+                None
+            );
+            config.fallback_on_local_transient_exhausted = true;
+        }
     }
 }
 
@@ -482,80 +4526,81 @@ fn request_body_invalid_tool_format_is_bad_request_diagnostic_error() {
 fn thinking_suffix_opus_4_7_uses_adaptive_by_default() {
     let mut payload = messages_request_for_model("claude-opus-4-7-thinking");
 
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload).expect("thinking model override");
 
     let thinking = payload.thinking.expect("thinking should be set");
     assert_eq!(thinking.thinking_type, "adaptive");
-    assert_eq!(
-        payload
-            .output_config
-            .expect("output_config should be filled")
-            .effort,
-        "xhigh"
-    );
+    assert!(payload.output_config.is_none());
 }
 
 #[test]
 fn thinking_suffix_opus_alias_uses_adaptive_by_default() {
     let mut payload = messages_request_for_model("opus-thinking");
 
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload).expect("thinking model override");
 
     let thinking = payload.thinking.expect("thinking should be set");
     assert_eq!(thinking.thinking_type, "adaptive");
-    assert_eq!(
-        payload
-            .output_config
-            .expect("output_config should be filled")
-            .effort,
-        "xhigh"
-    );
+    assert!(payload.output_config.is_none());
 }
 
 #[test]
 fn thinking_suffix_sonnet_4_6_uses_adaptive_by_default() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
 
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload).expect("thinking model override");
 
     let thinking = payload.thinking.expect("thinking should be set");
     assert_eq!(thinking.thinking_type, "adaptive");
-    assert_eq!(
-        payload
-            .output_config
-            .expect("output_config should be filled")
-            .effort,
-        "high"
-    );
+    assert!(payload.output_config.is_none());
 }
 
 #[test]
 fn thinking_suffix_sonnet_alias_uses_adaptive_by_default() {
     let mut payload = messages_request_for_model("sonnet-thinking");
 
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload).expect("thinking model override");
 
     let thinking = payload.thinking.expect("thinking should be set");
     assert_eq!(thinking.thinking_type, "adaptive");
-    assert_eq!(
-        payload
-            .output_config
-            .expect("output_config should be filled")
-            .effort,
-        "high"
-    );
+    assert!(payload.output_config.is_none());
 }
 
 #[test]
 fn thinking_suffix_sonnet_4_5_uses_enabled_by_default() {
     let mut payload = messages_request_for_model("claude-sonnet-4-5-thinking");
+    payload.max_tokens = 32_768;
 
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload).expect("thinking model override");
 
     let thinking = payload.thinking.expect("thinking should be set");
     assert_eq!(thinking.thinking_type, "enabled");
     assert_eq!(thinking.budget_tokens, 20000);
     assert!(payload.output_config.is_none());
+}
+
+#[test]
+fn thinking_suffix_sonnet_4_5_rejects_when_minimum_budget_cannot_fit() {
+    for max_tokens in [1, 1_024] {
+        let mut payload = messages_request_for_model("claude-sonnet-4-5-thinking");
+        payload.max_tokens = max_tokens;
+
+        let error = override_thinking_from_model_name(&mut payload)
+            .expect_err("enabled thinking requires room above the minimum budget");
+        assert!(
+            error.contains("greater than 1024"),
+            "max_tokens={max_tokens}"
+        );
+        assert!(payload.thinking.is_none(), "max_tokens={max_tokens}");
+    }
+
+    let mut boundary = messages_request_for_model("claude-sonnet-4-5-thinking");
+    boundary.max_tokens = 1_025;
+    override_thinking_from_model_name(&mut boundary).expect("minimum thinking budget fits");
+    assert_eq!(
+        boundary.thinking.expect("boundary thinking").budget_tokens,
+        1_024
+    );
 }
 
 #[test]
@@ -566,7 +4611,7 @@ fn thinking_suffix_preserves_explicit_enabled_without_effort() {
         budget_tokens: 4096,
     });
 
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload).expect("thinking model override");
 
     let thinking = payload.thinking.expect("thinking should be preserved");
     assert_eq!(thinking.thinking_type, "enabled");
@@ -575,25 +4620,19 @@ fn thinking_suffix_preserves_explicit_enabled_without_effort() {
 }
 
 #[test]
-fn thinking_suffix_fills_effort_for_explicit_adaptive() {
+fn thinking_suffix_preserves_omitted_effort_for_explicit_adaptive() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
     payload.thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
         budget_tokens: 4096,
     });
 
-    override_thinking_from_model_name(&mut payload);
+    override_thinking_from_model_name(&mut payload).expect("thinking model override");
 
     let thinking = payload.thinking.expect("thinking should be preserved");
     assert_eq!(thinking.thinking_type, "adaptive");
     assert_eq!(thinking.budget_tokens, 4096);
-    assert_eq!(
-        payload
-            .output_config
-            .expect("output_config should be filled")
-            .effort,
-        "high"
-    );
+    assert!(payload.output_config.is_none());
 }
 
 #[test]
@@ -606,6 +4645,24 @@ fn thinking_trigger_real_request_preserves_empty_payload() {
 
     assert!(payload.thinking.is_none());
     assert!(payload.output_config.is_none());
+    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+}
+
+#[test]
+fn disabled_prompt_master_suppresses_automatic_thinking_additions() {
+    let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
+    payload.messages[0].content = json!("ultrathink analyze this issue");
+    let mut runtime_config =
+        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    runtime_config.prompt_steering.enabled = false;
+    runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+
+    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+    assert!(
+        payload.thinking.is_none(),
+        "master-off must not synthesize thinking from model suffix or prompt signal"
+    );
     assert!(!should_force_visible_thinking(&payload, &runtime_config));
 }
 
@@ -624,14 +4681,7 @@ fn thinking_trigger_real_request_uses_claude_code_ultrathink_signal() {
         .expect("ultrathink should inject adaptive thinking");
     assert_eq!(thinking.thinking_type, "adaptive");
     assert_eq!(thinking.budget_tokens, 0);
-    assert_eq!(
-        payload
-            .output_config
-            .as_ref()
-            .expect("output_config should be filled")
-            .effort,
-        "high"
-    );
+    assert!(payload.output_config.is_none());
     assert!(should_force_visible_thinking(&payload, &runtime_config));
 }
 
@@ -768,7 +4818,7 @@ fn thinking_trigger_real_request_keeps_signal_across_tool_result_continuation() 
 }
 
 #[test]
-fn thinking_trigger_always_adds_adaptive_and_effort() {
+fn thinking_trigger_always_adds_adaptive_without_forging_explicit_effort() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6");
     let mut runtime_config =
         runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
@@ -782,15 +4832,63 @@ fn thinking_trigger_always_adds_adaptive_and_effort() {
         .expect("thinking should be injected");
     assert_eq!(thinking.thinking_type, "adaptive");
     assert_eq!(thinking.budget_tokens, 0);
-    assert_eq!(
-        payload
-            .output_config
-            .as_ref()
-            .expect("output_config should be filled")
-            .effort,
-        "high"
-    );
+    assert!(payload.output_config.is_none());
     assert!(should_force_visible_thinking(&payload, &runtime_config));
+}
+
+#[test]
+fn synthetic_thinking_activation_never_forges_client_effort_five_rounds() {
+    for round in 0..5 {
+        for model in [
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-8-thinking",
+            "claude-sonnet-4-6-thinking",
+        ] {
+            let mut payload = messages_request_for_model(model);
+            override_thinking_from_model_name(&mut payload)
+                .unwrap_or_else(|error| panic!("round {round}: {model}: {error}"));
+            assert_eq!(
+                payload
+                    .thinking
+                    .as_ref()
+                    .map(|thinking| thinking.thinking_type.as_str()),
+                Some("adaptive")
+            );
+            assert!(
+                payload.output_config.is_none(),
+                "round {round}: {model} omitted effort must remain omitted"
+            );
+        }
+
+        let mut triggered = messages_request_for_model("claude-sonnet-4-6");
+        triggered.messages[0].content = json!("ultrathink inspect this");
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+        apply_thinking_trigger_mode(&mut triggered, &runtime_config);
+        assert_eq!(
+            triggered
+                .thinking
+                .as_ref()
+                .map(|thinking| thinking.thinking_type.as_str()),
+            Some("adaptive")
+        );
+        assert!(triggered.output_config.is_none(), "round {round}");
+
+        let mut explicit = messages_request_for_model("claude-opus-4-8-thinking");
+        explicit.output_config = Some(OutputConfig {
+            effort: Some("max".to_string()),
+        });
+        override_thinking_from_model_name(&mut explicit).expect("explicit effort override");
+        assert_eq!(
+            explicit
+                .output_config
+                .expect("explicit effort preserved")
+                .effort
+                .as_deref(),
+            Some("max"),
+            "round {round}"
+        );
+    }
 }
 
 #[test]
@@ -824,7 +4922,7 @@ fn thinking_trigger_always_preserves_enabled_and_output_config() {
         budget_tokens: 4096,
     });
     payload.output_config = Some(OutputConfig {
-        effort: "low".to_string(),
+        effort: Some("low".to_string()),
     });
     let mut runtime_config =
         runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
@@ -843,14 +4941,15 @@ fn thinking_trigger_always_preserves_enabled_and_output_config() {
             .output_config
             .as_ref()
             .expect("output_config should be preserved")
-            .effort,
-        "low"
+            .effort
+            .as_deref(),
+        Some("low")
     );
     assert!(should_force_visible_thinking(&payload, &runtime_config));
 }
 
 #[test]
-fn thinking_trigger_always_rewrites_unknown_type_to_adaptive() {
+fn thinking_trigger_always_preserves_unknown_type_without_implicit_activation() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6");
     payload.thinking = Some(Thinking {
         thinking_type: "mystery".to_string(),
@@ -865,18 +4964,44 @@ fn thinking_trigger_always_rewrites_unknown_type_to_adaptive() {
     let thinking = payload
         .thinking
         .as_ref()
-        .expect("thinking should be rewritten");
-    assert_eq!(thinking.thinking_type, "adaptive");
-    assert_eq!(thinking.budget_tokens, 0);
-    assert_eq!(
-        payload
-            .output_config
-            .as_ref()
-            .expect("output_config should be filled")
-            .effort,
-        "high"
-    );
-    assert!(should_force_visible_thinking(&payload, &runtime_config));
+        .expect("thinking should be preserved for the entry validator to reject");
+    assert_eq!(thinking.thinking_type, "mystery");
+    assert_eq!(thinking.budget_tokens, 4096);
+    assert!(payload.output_config.is_none());
+    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+}
+
+#[test]
+fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pools_enabled = true;
+    config.local_pool_preflight_enabled = true;
+    config.fallback_on_local_capacity_exhausted = true;
+    config.external_pool_dispatch_max_wait_secs = 7;
+
+    for round in 1..=5 {
+        assert_eq!(
+            local_pool_acquire_mode(&config),
+            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
+            "round {round}: external eligibility was already established, so local capacity races still fail fast for reselect/fallback, while Redis degraded uses the external fallback's bounded wait window"
+        );
+
+        config.fallback_on_local_capacity_exhausted = false;
+        assert_eq!(
+            local_pool_acquire_mode(&config),
+            AcquireMode::WaitForCapacity,
+            "round {round}: the capacity fallback toggle remains authoritative"
+        );
+        config.fallback_on_local_capacity_exhausted = true;
+
+        config.local_pool_preflight_enabled = false;
+        assert_eq!(
+            local_pool_acquire_mode(&config),
+            AcquireMode::WaitForCapacity,
+            "round {round}: the operator preflight switch remains authoritative"
+        );
+        config.local_pool_preflight_enabled = true;
+    }
 }
 
 #[test]
@@ -1096,6 +5221,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-limit".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-limit".to_string()),
         input_tokens: 100_000,
         context_window_tokens: 200_000,
@@ -1202,6 +5328,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-upstream-raw-limit".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-upstream-raw-limit".to_string()),
         input_tokens: 1_234,
         context_window_tokens: 200_000,
@@ -1291,6 +5418,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-prod-like".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("conversation-prod-like".to_string()),
         input_tokens: request_input_tokens,
         context_window_tokens: 200_000,
@@ -1415,6 +5543,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("context-estimate-session".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: None,
         input_tokens: 141,
         context_window_tokens: 200_000,
@@ -1489,6 +5618,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-kiro-strategy".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("conversation-kiro-strategy".to_string()),
         input_tokens: 100_000,
         context_window_tokens: 200_000,
@@ -1627,6 +5757,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-latency".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-latency".to_string()),
         input_tokens: 100,
         context_window_tokens: 200_000,
@@ -1705,6 +5836,11 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         }),
     )]);
     usage_context.mark_stream_terminal(StreamTerminalReason::Completed);
+    usage_context.mark_suppressed_tool_context_leak(
+        2,
+        321,
+        vec!["continue_tool_result".to_string()],
+    );
 
     let trace = usage_context.latency_trace().expect("latency trace");
     assert_eq!(trace.payload_guard_ms, Some(3));
@@ -1743,6 +5879,12 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
     );
     assert!(trace.stream_gap_to_first_output_ms.is_some());
     assert_eq!(trace.terminal_reason, Some(StreamTerminalReason::Completed));
+    assert_eq!(trace.suppressed_tool_context_leak_blocks, Some(2));
+    assert_eq!(trace.suppressed_tool_context_leak_chars, Some(321));
+    assert_eq!(
+        trace.suppressed_tool_context_leak_kinds,
+        Some(vec!["continue_tool_result".to_string()])
+    );
 }
 
 #[test]
@@ -1946,6 +6088,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-policy".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-policy".to_string()),
         input_tokens: 100_000,
         context_window_tokens: 200_000,
@@ -2111,6 +6254,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-creation-policy".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-creation-policy".to_string()),
         input_tokens: 100_000,
         context_window_tokens: 200_000,
@@ -2211,6 +6355,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-error".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-error".to_string()),
         input_tokens: 4096,
         context_window_tokens: 200_000,
@@ -2744,6 +6889,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-a".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-a".to_string()),
         input_tokens: 4096,
         context_window_tokens: 200_000,
@@ -2835,6 +6981,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-high-cache".to_string()),
+        request_api_key_id: None,
         prompt_cache_scope_conversation_id: Some("session-high-cache".to_string()),
         input_tokens: 4096,
         context_window_tokens: 200_000,
@@ -3893,6 +8040,7 @@ fn external_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard
 fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
     let mut config = ExternalPoolsConfig {
         fallback_on_local_capacity_exhausted: false,
+        fallback_on_scheduler_redis_degraded: false,
         ..Default::default()
     };
 
@@ -3919,18 +8067,18 @@ fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
             "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
             &[],
             &config,
-        ),
-        None
+        )
+        .as_deref(),
+        Some("local_scheduler_redis_degraded")
     );
-    config.fallback_on_scheduler_redis_degraded = true;
+    config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
         classify_local_error_for_external_fallback(
             "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
             &[],
             &config,
-        )
-        .as_deref(),
-        Some("local_scheduler_redis_degraded")
+        ),
+        None
     );
 
     config = ExternalPoolsConfig::default();
@@ -3999,7 +8147,7 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
     );
     assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::SchedulerRedisDegraded, &config),
-        None
+        Some("local_scheduler_redis_degraded")
     );
     assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoModelCompatible, &config),
@@ -4036,10 +8184,10 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
     );
 
     config = ExternalPoolsConfig::default();
-    config.fallback_on_scheduler_redis_degraded = true;
+    config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::SchedulerRedisDegraded, &config),
-        Some("local_scheduler_redis_degraded")
+        None
     );
 
     config = ExternalPoolsConfig::default();
@@ -4051,6 +8199,116 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
 
     config.local_pool_preflight_enabled = false;
     assert!(!local_pool_capacity_fail_fast_enabled(&config));
+}
+
+#[test]
+fn fresh_local_pool_state_blocks_external_while_any_local_account_is_dispatchable() {
+    let mut config = ExternalPoolsConfig::default();
+
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(LocalPoolRouteStateKind::Ready, 1, &config,),
+        None
+    );
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::AllCoolingDown,
+            1,
+            &config,
+        ),
+        None
+    );
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::CapacityFull,
+            1,
+            &config,
+        ),
+        None
+    );
+
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::AllCoolingDown,
+            0,
+            &config,
+        ),
+        Some("local_all_cooling_down")
+    );
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::CapacityFull,
+            0,
+            &config,
+        ),
+        Some("local_capacity_full")
+    );
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::SchedulerRedisDegraded,
+            0,
+            &config,
+        ),
+        Some("local_scheduler_redis_degraded")
+    );
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::SchedulerRedisDegraded,
+            1,
+            &config,
+        ),
+        None,
+        "when local memory still has dispatchable accounts, Redis degraded must be handled by the bounded local acquire path instead of preflight-routing the whole burst to external"
+    );
+
+    config.fallback_on_unsupported_model = true;
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::NoModelCompatible,
+            0,
+            &config,
+        ),
+        Some("local_no_model_compatible")
+    );
+
+    config.fallback_on_scheduler_redis_degraded = false;
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::SchedulerRedisDegraded,
+            1,
+            &config,
+        ),
+        None
+    );
+}
+
+#[test]
+fn classified_scheduler_degraded_fallback_is_not_suppressed_by_stale_ready_snapshot() {
+    assert_eq!(
+        classified_local_error_route_reason("local_scheduler_redis_degraded"),
+        Some("local_scheduler_redis_degraded")
+    );
+    assert_eq!(
+        classified_local_error_route_reason("local_attempt_reserved_for_fallback"),
+        Some("local_attempt_reserved_for_fallback")
+    );
+    assert_eq!(
+        classified_local_error_route_reason("unsupported_model"),
+        Some("unsupported_model")
+    );
+    assert_eq!(
+        classified_local_error_route_reason("local_capacity_exhausted"),
+        None,
+        "capacity fallback still uses fresh route state to preserve strict local-first"
+    );
+    assert_eq!(
+        local_pool_fallback_reason_for_fresh_state(
+            LocalPoolRouteStateKind::Ready,
+            1,
+            &ExternalPoolsConfig::default(),
+        ),
+        None,
+        "a fresh Ready snapshot alone must not trigger external fallback"
+    );
 }
 
 #[test]
@@ -4230,6 +8488,64 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         ),
         Some("external_error")
     );
+}
+
+#[test]
+fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
+    use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
+
+    let config = ExternalPoolsConfig::default();
+    let rate_limit = ExternalPoolFinalError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        response_error_type: "rate_limit_error".to_string(),
+        route_error_type: "rate_limit".to_string(),
+        message: "redacted external rate limit".to_string(),
+        error_id: "req_rescue_budget".to_string(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: Some(1),
+        pool_name: Some("backup".to_string()),
+    };
+
+    for round in 1..=5 {
+        let remaining = InferenceAttemptBudget::new(4);
+        remaining
+            .reserve(InferenceAttemptKind::LocalCredential, 0)
+            .unwrap();
+        remaining
+            .reserve(InferenceAttemptKind::ExternalPool, 0)
+            .unwrap();
+        assert_eq!(
+            budgeted_local_rescue_reason_after_external_error(
+                &config,
+                &rate_limit,
+                None,
+                &remaining,
+            ),
+            Some("external_rate_limit"),
+            "round {round}: two attempts remain for a one-send rescue"
+        );
+
+        let exhausted = InferenceAttemptBudget::new(4);
+        for _ in 0..3 {
+            exhausted
+                .reserve(InferenceAttemptKind::LocalCredential, 0)
+                .unwrap();
+        }
+        exhausted
+            .reserve(InferenceAttemptKind::ExternalPool, 0)
+            .unwrap();
+        assert_eq!(
+            budgeted_local_rescue_reason_after_external_error(
+                &config,
+                &rate_limit,
+                None,
+                &exhausted,
+            ),
+            None,
+            "round {round}: exhausted budget must skip rescue before logging or waiting"
+        );
+    }
 }
 
 #[test]

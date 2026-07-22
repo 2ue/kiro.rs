@@ -4,27 +4,41 @@
 //! 支持多凭据 (MultiTokenManager) 管理
 
 use chrono::Utc;
+use futures::FutureExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, Notify, oneshot};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::error::Error as StdError;
+use std::fmt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
+use crate::anthropic::inference_attempt_budget::{
+    AuxiliaryAttemptBudget, AuxiliaryAttemptBudgetExhausted, AuxiliaryAttemptKind,
+};
+use crate::common::capacity_signal::{CapacitySignal, CapacityWaiter};
 use crate::http_client::ProxyConfig;
 use crate::kiro::call_trace::{
     AccountRejectReason, RejectedAccountSample, SelectionFailureStage, SelectionFailureSummary,
 };
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::{
+    KiroModelCapabilityCohort, KiroModelCapabilityCohortKey,
+};
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{
+    Config, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
+    MIN_TOKEN_REFRESH_MAX_RPM,
+};
 use crate::storage::postgres::{
     CredentialRefreshExpectedContext, CredentialRefreshFieldsCasOutcome,
     CredentialRefreshFieldsPatch, CredentialRuntimeDisabledReasonPatch,
@@ -33,7 +47,9 @@ use crate::storage::postgres::{
     CredentialUpsertCasOutcome, CredentialWithRuntimePatchCasOutcome, PostgresStore,
 };
 use crate::storage::redis_cache::{
-    RedisStore, SchedulerCredentialState, SchedulerGlobalCapacityState, SchedulerHealthState,
+    RedisRefreshBegin, RedisRefreshFailure, RedisRefreshFailureKind, RedisRefreshFailureStage,
+    RedisRefreshHealthClaim, RedisRefreshLease, RedisStore, SchedulerCredentialState,
+    SchedulerGlobalCapacityState, SchedulerHealthState, SchedulerSelectionReservation,
     SchedulerSessionBinding,
 };
 
@@ -45,6 +61,11 @@ use super::admin_snapshot::{
     ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
     base_snapshot_from_entry, runtime_snapshot_from_entry,
 };
+use super::auxiliary::{
+    AuxiliaryConcurrencyController, AuxiliaryConcurrencySaturated, AuxiliaryConcurrencySnapshot,
+    AuxiliaryRuntime, RefreshClientCacheSnapshot, TokenRefreshAdmissionRejected,
+    TokenRefreshAdmissionSnapshot,
+};
 use super::capacity::{
     credential_is_dispatch_candidate, credential_is_dispatchable,
     credential_is_temporarily_available, credential_is_usable_for_model,
@@ -53,34 +74,32 @@ use super::capacity::{
     global_has_concurrency_capacity, is_opus_model, normalize_capacity_weight_units,
     proxy_unavailable_error,
 };
+#[cfg(test)]
+use super::concurrency::record_released_in_flight_lease_tombstone;
 use super::concurrency::{
     DispatchQueueGuard, InFlightLeaseGuard, ReleasedInFlightLeaseTombstones,
-    filter_released_in_flight_leases_from_scheduler_states,
-    record_released_in_flight_lease_tombstone, release_redis_dispatch_queue_lease_reliably,
-    release_redis_in_flight_lease_and_wakeup,
+    SchedulerRedisReleaseDispatcher, filter_released_in_flight_leases_from_scheduler_states,
 };
 use super::cooldown::{entry_any_cooldown_remaining, entry_cooldown_remaining, model_state_key};
 use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
-    format_effective_concurrency_range, min_dispatch_wait,
+    format_effective_concurrency_range, min_dispatch_wait, rate_limit_blocked_count,
 };
 use super::redis_runtime::{
     apply_scheduler_states as apply_redis_scheduler_states,
     apply_scheduler_states_for_ids as apply_redis_scheduler_states_for_ids,
+    apply_scheduler_states_for_ids_with_global_rpm as apply_redis_scheduler_states_for_ids_with_global_rpm,
     apply_scheduler_states_with_global_rpm as apply_redis_scheduler_states_with_global_rpm,
     clear_scheduler_state_for_credential_local, clear_scheduler_state_for_credential_redis,
     publish_credentials_changed as publish_redis_credentials_changed,
     publish_runtime_config_changed as publish_redis_runtime_config_changed,
 };
 use super::refresh::{
-    RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
-    refresh_token, set_overage_status, validate_refresh_token,
+    RefreshFailure, RefreshFailureKind, RefreshFailureStage, RefreshSendAdmission,
+    get_usage_limits, is_token_expired, refresh_token_with_client, set_overage_status,
+    validate_refresh_token,
 };
-use super::route_state::{
-    CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind,
-    cached_local_pool_route_state, invalidate_local_pool_route_state_cache,
-    local_pool_route_state_cache_key, store_local_pool_route_state_cache,
-};
+use super::route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 use super::rpm::{
     effective_rpm, entry_rate_limit_remaining, entry_rate_limit_window_remaining,
     rate_limit_interval_for_rpm,
@@ -92,7 +111,6 @@ use super::sticky::{
     cache_redis_binding as cache_sticky_redis_binding,
     clear_session_soft_failure as clear_sticky_session_soft_failure,
     record_session_soft_failure as record_sticky_session_soft_failure,
-    unbind_session as unbind_sticky_session,
     unbind_session_if_bound_to as unbind_sticky_session_if_bound_to,
     unbind_sessions_for_credential as unbind_sticky_sessions_for_credential,
 };
@@ -123,6 +141,26 @@ fn sha256_hex(input: &str) -> String {
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
     format!("{:x}", result)
+}
+
+fn validate_token_refresh_admission_config(config: &Config) -> anyhow::Result<()> {
+    if !(MIN_TOKEN_REFRESH_MAX_RPM..=MAX_TOKEN_REFRESH_MAX_RPM)
+        .contains(&config.token_refresh_max_rpm)
+    {
+        anyhow::bail!(
+            "tokenRefreshMaxRpm must be between {} and {}",
+            MIN_TOKEN_REFRESH_MAX_RPM,
+            MAX_TOKEN_REFRESH_MAX_RPM
+        );
+    }
+    if !(MIN_TOKEN_REFRESH_BURST..=MAX_TOKEN_REFRESH_BURST).contains(&config.token_refresh_burst) {
+        anyhow::bail!(
+            "tokenRefreshBurst must be between {} and {}",
+            MIN_TOKEN_REFRESH_BURST,
+            MAX_TOKEN_REFRESH_BURST
+        );
+    }
+    Ok(())
 }
 
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
@@ -360,6 +398,412 @@ impl StatsFlushWorkerHandle {
     }
 }
 
+#[derive(Debug)]
+struct ModelCapabilityCohortCache {
+    generation: u64,
+    cohorts: Arc<Vec<KiroModelCapabilityCohort>>,
+    keys: Arc<Vec<KiroModelCapabilityCohortKey>>,
+    #[cfg(test)]
+    rebuilds: u64,
+}
+
+impl Default for ModelCapabilityCohortCache {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            cohorts: Arc::new(Vec::new()),
+            keys: Arc::new(Vec::new()),
+            #[cfg(test)]
+            rebuilds: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RefreshAttemptIdentity([u8; 32]);
+
+impl std::fmt::Debug for RefreshAttemptIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RefreshAttemptIdentity(<redacted>)")
+    }
+}
+
+impl RefreshAttemptIdentity {
+    fn from_credentials(credentials: &KiroCredentials) -> Self {
+        fn update_optional(hasher: &mut Sha256, value: Option<&str>) {
+            match value {
+                Some(value) => {
+                    hasher.update([1]);
+                    hasher.update((value.len() as u64).to_le_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        for value in [
+            credentials.access_token.as_deref(),
+            credentials.auth_method.as_deref(),
+            credentials.provider.as_deref(),
+            credentials.refresh_token.as_deref(),
+            credentials.client_id.as_deref(),
+            credentials.client_secret.as_deref(),
+            credentials.token_endpoint.as_deref(),
+            credentials.auth_region.as_deref(),
+            credentials.region.as_deref(),
+            credentials.scopes.as_deref(),
+            credentials.machine_id.as_deref(),
+        ] {
+            update_optional(&mut hasher, value);
+        }
+        Self(hasher.finalize().into())
+    }
+
+    fn from_refresh_request(
+        credentials: &KiroCredentials,
+        config: &Config,
+        effective_proxy: Option<&ProxyConfig>,
+    ) -> Self {
+        let base = Self::from_credentials(credentials);
+        let mut hasher = Sha256::new();
+        hasher.update(base.0);
+        hasher.update([match config.tls_backend {
+            crate::model::config::TlsBackend::Rustls => 0,
+            crate::model::config::TlsBackend::NativeTls => 1,
+        }]);
+        for value in [
+            Some(credentials.effective_auth_region(config)),
+            Some(config.kiro_version.as_str()),
+            config.machine_id.as_deref(),
+            Some(config.system_version.as_str()),
+            Some(config.node_version.as_str()),
+            effective_proxy.map(|proxy| proxy.url.as_str()),
+            effective_proxy.and_then(|proxy| proxy.username.as_deref()),
+            effective_proxy.and_then(|proxy| proxy.password.as_deref()),
+        ] {
+            match value {
+                Some(value) => {
+                    hasher.update([1]);
+                    hasher.update((value.len() as u64).to_le_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        }
+        Self(hasher.finalize().into())
+    }
+
+    fn from_automatic_recovery_request(
+        credentials: &KiroCredentials,
+        rejected_access_token: &str,
+        config: &Config,
+        effective_proxy: Option<&ProxyConfig>,
+    ) -> Self {
+        let mut identity_credentials = credentials.clone();
+        // Metadata-only storage revisions must not split callers that observed the same rejected
+        // bearer token. Auth/proxy fields remain part of the identity and still fence real changes.
+        identity_credentials.storage_revision = 0;
+        identity_credentials.access_token = Some(rejected_access_token.to_string());
+        Self::from_refresh_request(&identity_credentials, config, effective_proxy)
+    }
+
+    fn stable_jitter_percent(&self) -> u32 {
+        let seed = u64::from_le_bytes(self.0[..8].try_into().expect("SHA-256 prefix"));
+        80 + (seed % 21) as u32
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedRefreshFailure {
+    identity: RefreshAttemptIdentity,
+    failure: RefreshFailure,
+    consecutive_failures: u8,
+    retry_at: Instant,
+    health_action_pending: bool,
+}
+
+#[derive(Debug)]
+struct CredentialRefreshState {
+    gate: TokioMutex<()>,
+    negative_result: Mutex<Option<CachedRefreshFailure>>,
+    reset_generation: AtomicU64,
+}
+
+impl Default for CredentialRefreshState {
+    fn default() -> Self {
+        Self {
+            gate: TokioMutex::new(()),
+            negative_result: Mutex::new(None),
+            reset_generation: AtomicU64::new(0),
+        }
+    }
+}
+
+impl CredentialRefreshState {
+    fn replay_failure(
+        &self,
+        identity: &RefreshAttemptIdentity,
+        now: Instant,
+        caller_owns_health_action: bool,
+    ) -> Option<RefreshFailure> {
+        let mut cached = self.negative_result.lock();
+        let cached = cached
+            .as_mut()
+            .filter(|cached| cached.identity == *identity && now < cached.retry_at)?;
+        let mut failure = cached.failure.clone();
+        if cached.health_action_pending && caller_owns_health_action {
+            cached.health_action_pending = false;
+        } else {
+            failure = failure.into_shared_failure_wave();
+        }
+        Some(failure)
+    }
+
+    fn record_failure(
+        &self,
+        identity: RefreshAttemptIdentity,
+        failure: &RefreshFailure,
+        now: Instant,
+        leader_owns_health_action: bool,
+    ) -> Option<StdDuration> {
+        if !refresh_failure_is_shareable(failure) {
+            return None;
+        }
+
+        let mut cached = self.negative_result.lock();
+        let consecutive_failures = cached
+            .as_ref()
+            .filter(|cached| {
+                cached.identity == identity
+                    && now
+                        .checked_duration_since(cached.retry_at)
+                        .is_none_or(|idle| idle <= TOKEN_REFRESH_NEGATIVE_STREAK_RESET_AFTER)
+            })
+            .map(|cached| cached.consecutive_failures.saturating_add(1))
+            .unwrap_or(1)
+            .min(TOKEN_REFRESH_NEGATIVE_BACKOFF_MAX_STREAK);
+        let shift = u32::from(consecutive_failures.saturating_sub(1)).min(20);
+        let exponential = TOKEN_REFRESH_NEGATIVE_BACKOFF_BASE
+            .saturating_mul(1_u32 << shift)
+            .min(TOKEN_REFRESH_NEGATIVE_BACKOFF_MAX);
+        let jittered = exponential.saturating_mul(identity.stable_jitter_percent()) / 100;
+        // The scheduler owns longer credential cooldowns. This short result cache only closes
+        // the race before the leader records that cooldown, while still honoring ordinary
+        // Retry-After values and bounding malicious headers.
+        let retry_after = failure
+            .retry_after
+            .map(|duration| duration.min(TOKEN_REFRESH_NEGATIVE_RETRY_AFTER_MAX))
+            .unwrap_or_default();
+        let delay = jittered.max(retry_after).max(StdDuration::from_millis(1));
+        *cached = Some(CachedRefreshFailure {
+            identity,
+            failure: failure.clone(),
+            consecutive_failures,
+            retry_at: now + delay,
+            health_action_pending: refresh_failure_requires_health_action(failure)
+                && !leader_owns_health_action,
+        });
+        Some(delay)
+    }
+
+    fn clear_failure(&self) {
+        self.negative_result.lock().take();
+    }
+
+    fn generation(&self) -> u64 {
+        self.reset_generation.load(Ordering::Acquire)
+    }
+
+    fn is_generation_current(&self, expected: u64) -> bool {
+        self.generation() == expected
+    }
+
+    fn invalidate(&self) {
+        self.reset_generation.fetch_add(1, Ordering::AcqRel);
+        self.clear_failure();
+    }
+}
+
+struct RefreshFailureWaveDropGuard {
+    state: Arc<CredentialRefreshState>,
+    identity: RefreshAttemptIdentity,
+    reset_generation: u64,
+    send_started: Arc<AtomicBool>,
+    disarmed: bool,
+}
+
+impl RefreshFailureWaveDropGuard {
+    fn new(
+        state: Arc<CredentialRefreshState>,
+        identity: RefreshAttemptIdentity,
+        reset_generation: u64,
+        send_started: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            state,
+            identity,
+            reset_generation,
+            send_started,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for RefreshFailureWaveDropGuard {
+    fn drop(&mut self) {
+        if self.disarmed
+            || !self.send_started.load(Ordering::Acquire)
+            || !self.state.is_generation_current(self.reset_generation)
+        {
+            return;
+        }
+        let failure = RefreshFailure::new(
+            RefreshFailureStage::Internal,
+            RefreshFailureKind::Internal,
+            None,
+            None,
+            true,
+        );
+        self.state
+            .record_failure(self.identity, &failure, Instant::now(), false);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutomaticTokenRecoveryOutcome {
+    Refreshed,
+    CredentialChanged,
+}
+
+fn refresh_failure_requires_health_action(failure: &RefreshFailure) -> bool {
+    matches!(
+        failure.kind,
+        RefreshFailureKind::InvalidGrant
+            | RefreshFailureKind::CredentialAuth
+            | RefreshFailureKind::RateLimited
+    )
+}
+
+fn refresh_failure_is_shareable(failure: &RefreshFailure) -> bool {
+    if failure.shared_failure_wave || failure.kind == RefreshFailureKind::InvalidConfiguration {
+        return false;
+    }
+    failure.send_committed
+        || (failure.stage == RefreshFailureStage::Coordination
+            && matches!(
+                failure.kind,
+                RefreshFailureKind::Coordination | RefreshFailureKind::Timeout
+            ))
+        || (failure.stage == RefreshFailureStage::RequestSend
+            && matches!(
+                failure.kind,
+                RefreshFailureKind::Network | RefreshFailureKind::Timeout
+            ))
+}
+
+fn redis_refresh_failure_stage(stage: RefreshFailureStage) -> RedisRefreshFailureStage {
+    match stage {
+        RefreshFailureStage::Validation => RedisRefreshFailureStage::Validation,
+        RefreshFailureStage::RequestSend => RedisRefreshFailureStage::RequestSend,
+        RefreshFailureStage::ResponseHeaders => RedisRefreshFailureStage::ResponseHeaders,
+        RefreshFailureStage::ResponseBody => RedisRefreshFailureStage::ResponseBody,
+        RefreshFailureStage::ResponseStatus => RedisRefreshFailureStage::ResponseStatus,
+        RefreshFailureStage::ResponseDecode => RedisRefreshFailureStage::ResponseDecode,
+        RefreshFailureStage::ResponseValidate => RedisRefreshFailureStage::ResponseValidate,
+        RefreshFailureStage::Coordination => RedisRefreshFailureStage::Coordination,
+        RefreshFailureStage::Persistence => RedisRefreshFailureStage::Persistence,
+        RefreshFailureStage::Internal => RedisRefreshFailureStage::Internal,
+    }
+}
+
+fn redis_refresh_failure_kind(kind: RefreshFailureKind) -> RedisRefreshFailureKind {
+    match kind {
+        RefreshFailureKind::InvalidGrant => RedisRefreshFailureKind::InvalidGrant,
+        RefreshFailureKind::CredentialAuth => RedisRefreshFailureKind::CredentialAuth,
+        RefreshFailureKind::RateLimited => RedisRefreshFailureKind::RateLimited,
+        RefreshFailureKind::UpstreamUnavailable => RedisRefreshFailureKind::UpstreamUnavailable,
+        RefreshFailureKind::Network => RedisRefreshFailureKind::Network,
+        RefreshFailureKind::Timeout => RedisRefreshFailureKind::Timeout,
+        RefreshFailureKind::Protocol => RedisRefreshFailureKind::Protocol,
+        RefreshFailureKind::Oversize => RedisRefreshFailureKind::Oversize,
+        RefreshFailureKind::MalformedResponse => RedisRefreshFailureKind::MalformedResponse,
+        RefreshFailureKind::MissingToken => RedisRefreshFailureKind::MissingToken,
+        RefreshFailureKind::InvalidConfiguration => RedisRefreshFailureKind::InvalidConfiguration,
+        RefreshFailureKind::Coordination => RedisRefreshFailureKind::Coordination,
+        RefreshFailureKind::Persistence => RedisRefreshFailureKind::Persistence,
+        RefreshFailureKind::Internal => RedisRefreshFailureKind::Internal,
+    }
+}
+
+fn refresh_failure_stage_from_redis(stage: RedisRefreshFailureStage) -> RefreshFailureStage {
+    match stage {
+        RedisRefreshFailureStage::Validation => RefreshFailureStage::Validation,
+        RedisRefreshFailureStage::RequestSend => RefreshFailureStage::RequestSend,
+        RedisRefreshFailureStage::ResponseHeaders => RefreshFailureStage::ResponseHeaders,
+        RedisRefreshFailureStage::ResponseBody => RefreshFailureStage::ResponseBody,
+        RedisRefreshFailureStage::ResponseStatus => RefreshFailureStage::ResponseStatus,
+        RedisRefreshFailureStage::ResponseDecode => RefreshFailureStage::ResponseDecode,
+        RedisRefreshFailureStage::ResponseValidate => RefreshFailureStage::ResponseValidate,
+        RedisRefreshFailureStage::Coordination => RefreshFailureStage::Coordination,
+        RedisRefreshFailureStage::Persistence => RefreshFailureStage::Persistence,
+        RedisRefreshFailureStage::Internal => RefreshFailureStage::Internal,
+    }
+}
+
+fn refresh_failure_kind_from_redis(kind: RedisRefreshFailureKind) -> RefreshFailureKind {
+    match kind {
+        RedisRefreshFailureKind::InvalidGrant => RefreshFailureKind::InvalidGrant,
+        RedisRefreshFailureKind::CredentialAuth => RefreshFailureKind::CredentialAuth,
+        RedisRefreshFailureKind::RateLimited => RefreshFailureKind::RateLimited,
+        RedisRefreshFailureKind::UpstreamUnavailable => RefreshFailureKind::UpstreamUnavailable,
+        RedisRefreshFailureKind::Network => RefreshFailureKind::Network,
+        RedisRefreshFailureKind::Timeout => RefreshFailureKind::Timeout,
+        RedisRefreshFailureKind::Protocol => RefreshFailureKind::Protocol,
+        RedisRefreshFailureKind::Oversize => RefreshFailureKind::Oversize,
+        RedisRefreshFailureKind::MalformedResponse => RefreshFailureKind::MalformedResponse,
+        RedisRefreshFailureKind::MissingToken => RefreshFailureKind::MissingToken,
+        RedisRefreshFailureKind::InvalidConfiguration => RefreshFailureKind::InvalidConfiguration,
+        RedisRefreshFailureKind::Coordination => RefreshFailureKind::Coordination,
+        RedisRefreshFailureKind::Persistence => RefreshFailureKind::Persistence,
+        RedisRefreshFailureKind::Internal => RefreshFailureKind::Internal,
+    }
+}
+
+fn refresh_failure_to_redis(failure: &RefreshFailure) -> RedisRefreshFailure {
+    RedisRefreshFailure {
+        stage: redis_refresh_failure_stage(failure.stage),
+        kind: redis_refresh_failure_kind(failure.kind),
+        status: failure.status,
+        retry_after: failure.retry_after,
+        send_committed: failure.send_committed,
+        health_action_required: refresh_failure_requires_health_action(failure),
+    }
+}
+
+fn refresh_failure_from_redis(failure: &RedisRefreshFailure) -> RefreshFailure {
+    RefreshFailure::new(
+        refresh_failure_stage_from_redis(failure.stage),
+        refresh_failure_kind_from_redis(failure.kind),
+        failure.status,
+        failure.retry_after,
+        failure.send_committed,
+    )
+}
+
+enum DistributedRefreshDecision {
+    Leader(RedisRefreshLease),
+    Replay(RefreshFailure),
+    Succeeded {
+        generation: u64,
+        storage_revision: u64,
+    },
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -371,8 +815,11 @@ pub struct MultiTokenManager {
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁按凭据隔离，避免单个坏凭据刷新等待阻塞其他凭据。
-    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
+    /// Token 刷新状态按凭据隔离。每个槽位只有一个 gate 和一个短期 typed 失败结果，
+    /// 因而状态量受 credential 数量硬限制，不会随请求或失败波增长。
+    refresh_states: Mutex<HashMap<u64, Arc<CredentialRefreshState>>>,
+    /// 单实例辅助上游并发边界与有界 refresh HTTP client cache。
+    auxiliary_runtime: AuxiliaryRuntime,
     /// PgSQL 存储后端。生产运行必须配置；测试可使用 None 避免依赖外部数据库。
     postgres_store: Option<Arc<PostgresStore>>,
     /// Redis 运行态存储后端。生产用于跨实例调度状态；测试可使用 None 走本地内存。
@@ -386,15 +833,25 @@ pub struct MultiTokenManager {
     /// 最近一次清理 PgSQL 运行态 mutation 幂等记录的时间。
     last_runtime_mutation_cleanup_at: Mutex<Option<Instant>>,
     /// 最近一次从 Redis 全量同步调度状态的时间，用于避免每个请求重复拉取所有凭据状态。
-    last_scheduler_redis_sync_at: Mutex<Option<Instant>>,
+    last_scheduler_redis_sync_at: Arc<Mutex<Option<Instant>>>,
     /// 最近一次执行 Redis 超时 lease 清理的时间。清理是全局操作，不能放在请求热路径每轮执行。
     last_scheduler_redis_cleanup_at: Mutex<Option<Instant>>,
-    /// Redis 调度热路径最近一次超时/失败后的退避截止时间。退避期间暂停分布式调度准入。
-    scheduler_redis_degraded_until: Mutex<Option<Instant>>,
-    /// Redis 调度热路径连续失败次数。Redis 持续慢时拉长退避，避免每个退避周期重复制造阻塞。
-    scheduler_redis_degraded_streak: AtomicU32,
+    /// Redis 容量协调 breaker；Open/HalfOpen 都保持 fail-closed，恢复时严格单 probe。
+    scheduler_redis_breaker: Arc<SchedulerRedisBreaker>,
+    /// 后台 snapshot 独立降级；失败只能让本地快照变旧，不能冻结原子容量准入。
+    scheduler_redis_snapshot_breaker: Arc<SchedulerRedisBreaker>,
+    /// 会话粘性是可降级的辅助能力，不能因其 Redis 读写失败冻结凭据并发准入。
+    scheduler_redis_affinity_breaker: Arc<SchedulerRedisBreaker>,
+    /// lease/queue release 使用独立硬有界 reconciliation lane，不占请求热路径 semaphore。
+    scheduler_redis_release_dispatcher: Option<Arc<SchedulerRedisReleaseDispatcher>>,
+    #[cfg(test)]
+    request_binding_snapshot_reads: AtomicU64,
     /// Redis 全量调度状态同步后台任务是否正在运行，避免高并发下重复扫全部账号状态。
     scheduler_redis_sync_in_flight: Arc<AtomicBool>,
+    scheduler_redis_full_sync_requested: Arc<AtomicU64>,
+    scheduler_redis_full_sync_applied: Arc<AtomicU64>,
+    scheduler_redis_dirty_credential_ids: Arc<Mutex<HashSet<u64>>>,
+    scheduler_instance_id: Arc<str>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// 未落盘的统计增量。请求热路径只合并内存 delta，后台任务定期写入 PgSQL。
@@ -407,26 +864,46 @@ pub struct MultiTokenManager {
     runtime_mutation_flush_cursor: AtomicU64,
     /// 会话粘性绑定：conversationId -> credential id
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
-    /// 凭据并发槽释放通知，用于所有凭据占满时排队等待。
-    in_flight_notify: Arc<Notify>,
+    /// 凭据容量 credit 与广播 generation；多槽释放不会折叠成一个通知。
+    capacity_signal: Arc<CapacitySignal>,
     /// 本进程近期已经释放的 Redis lease。Redis release 是异步写，后台同步可能先读到旧快照；
     /// 这里用短 TTL tombstone 避免旧 lease 被重新导入本地并发槽。
     released_in_flight_lease_tombstones: ReleasedInFlightLeaseTombstones,
     next_in_flight_lease_id: AtomicU64,
     queued_requests: Arc<AtomicU32>,
-    /// 短 TTL 派生缓存，只用于避免高并发下本地池预检重复全量扫描。
-    local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
+    /// Serializes only candidate selection plus the local provisional reservation.
+    /// Redis and upstream awaits always run after this guard is dropped.
+    selection_reservation_gate: Mutex<()>,
+    /// Secret-free capability cohorts are rebuilt only after a relevant credential/config/proxy
+    /// mutation. Request reads clone one Arc and never scan the account pool.
+    model_capability_cohort_generation: AtomicU64,
+    model_capability_cohort_cache: Mutex<ModelCapabilityCohortCache>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 并发排队等待的周期性唤醒间隔，避免极端竞态下丢失通知后永久睡眠。
 const CONCURRENCY_WAIT_WAKEUP_SECS: u64 = 30;
+const DISPATCH_QUEUE_LEASE_SAFETY_MARGIN_SECS: u64 = 60;
 const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
-const SCHEDULER_REDIS_HOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(75);
+/// Capacity/queue operations are correctness-critical, but a single Docker/Redis/runtime jitter
+/// above the old 75ms budget must not turn a healthy local pool into a global 429 wave.
+/// Affinity/sticky operations keep their stricter budget on a separate breaker.
+const SCHEDULER_REDIS_HOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(250);
+const SCHEDULER_REDIS_AFFINITY_OP_TIMEOUT: StdDuration = StdDuration::from_millis(75);
+const SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN: u32 = 3;
+const SCHEDULER_REDIS_SNAPSHOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+const SCHEDULER_REDIS_MAX_IN_FLIGHT_OPERATIONS: usize = 256;
+const SCHEDULER_REDIS_SNAPSHOT_MAX_IN_FLIGHT_OPERATIONS: usize = 1;
+const SCHEDULER_REDIS_AFFINITY_MAX_IN_FLIGHT_OPERATIONS: usize = 128;
+const SCHEDULER_REDIS_REMOTE_SYNC_DEBOUNCE: StdDuration = StdDuration::from_millis(25);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE: StdDuration = StdDuration::from_secs(2);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX: StdDuration = StdDuration::from_secs(30);
+/// In local-preflight/external-fallback mode, a sticky-bound request should not immediately
+/// migrate to another credential solely because the previous cross-instance Redis release has
+/// not become visible yet. Keep this window short so a real holder still falls back quickly.
+const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_millis(250);
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 const CREDENTIAL_RUNTIME_MUTATION_RETENTION: StdDuration =
@@ -445,14 +922,526 @@ const TOKEN_REFRESH_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 const TOKEN_REFRESH_COORDINATION_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const TOKEN_REFRESH_RECONCILIATION_RESERVE: StdDuration = StdDuration::from_secs(15);
 const TOKEN_REFRESH_REDIS_LOCK_TTL_SECS: usize = 120;
+const TOKEN_REFRESH_NEGATIVE_BACKOFF_BASE: StdDuration = StdDuration::from_millis(500);
+const TOKEN_REFRESH_NEGATIVE_BACKOFF_MAX: StdDuration = StdDuration::from_secs(30);
+const TOKEN_REFRESH_NEGATIVE_RETRY_AFTER_MAX: StdDuration = StdDuration::from_secs(60);
+const TOKEN_REFRESH_NEGATIVE_STREAK_RESET_AFTER: StdDuration = StdDuration::from_secs(60);
+const TOKEN_REFRESH_NEGATIVE_BACKOFF_MAX_STREAK: u8 = 16;
 const LOCAL_REDIS_LEASE_COUNTER_SPACE: u64 = 1_000_000_000;
 const LOCAL_REDIS_LEASE_NAMESPACE_COUNT: u64 = 9_000_000_000;
 static LOCAL_REDIS_LEASE_NAMESPACE_SEQ: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchQueueLeasePolicy {
+    ttl_secs: u64,
+    renewal_required: bool,
+}
+
+fn dispatch_queue_lease_policy(max_wait: Option<StdDuration>) -> DispatchQueueLeasePolicy {
+    let Some(max_wait) = max_wait else {
+        return DispatchQueueLeasePolicy {
+            ttl_secs: DISPATCH_QUEUE_LEASE_SAFETY_MARGIN_SECS,
+            renewal_required: true,
+        };
+    };
+    let rounded_wait_secs = max_wait
+        .as_secs()
+        .saturating_add(u64::from(max_wait.subsec_nanos() > 0));
+    DispatchQueueLeasePolicy {
+        ttl_secs: rounded_wait_secs
+            .saturating_add(DISPATCH_QUEUE_LEASE_SAFETY_MARGIN_SECS)
+            .max(DISPATCH_QUEUE_LEASE_SAFETY_MARGIN_SECS),
+        renewal_required: false,
+    }
+}
+
 enum SchedulerRedisHotOutcome<T> {
     Completed(T),
     Skipped,
-    Failed,
+    LocalSchedulerOverloaded,
+    Failed { commit_unknown: bool },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SchedulerRedisUnavailableError {
+    retry_after_secs: u64,
+    local_overloaded: bool,
+}
+
+impl fmt::Display for SchedulerRedisUnavailableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.local_overloaded {
+            f.write_str("本地账号调度容量暂不可用（本地 scheduler admission 已饱和）")
+        } else {
+            write!(
+                f,
+                "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
+                self.retry_after_secs
+            )
+        }
+    }
+}
+
+impl StdError for SchedulerRedisUnavailableError {}
+
+#[derive(Debug, Clone, Copy)]
+struct SchedulerRedisRateLimitWait {
+    retry_after: StdDuration,
+    available_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SchedulerRedisSelectionAdmission {
+    NotRequired,
+    Recorded {
+        rate_limit_available_at: Option<Instant>,
+    },
+    RateLimited(SchedulerRedisRateLimitWait),
+}
+
+enum SchedulerRedisExecutionOutcome<T> {
+    Completed(T),
+    NotStarted(SchedulerRedisAdmissionError),
+    Failed { commit_unknown: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerRedisAdmissionError {
+    BreakerOpen,
+    LocalSchedulerOverloaded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerRedisBreakerPhase {
+    Closed,
+    Open { until: Instant },
+    HalfOpen,
+}
+
+#[derive(Debug)]
+struct SchedulerRedisBreakerState {
+    failure_generation: u64,
+    consecutive_failures: u32,
+    phase: SchedulerRedisBreakerPhase,
+}
+
+impl Default for SchedulerRedisBreakerState {
+    fn default() -> Self {
+        Self {
+            failure_generation: 0,
+            consecutive_failures: 0,
+            phase: SchedulerRedisBreakerPhase::Closed,
+        }
+    }
+}
+
+fn scheduler_redis_failure_commit_unknown(err: &anyhow::Error) -> bool {
+    let redis_error = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<redis::RedisError>());
+    let Some(redis_error) = redis_error else {
+        return true;
+    };
+
+    if redis_error.is_connection_refusal() {
+        return false;
+    }
+
+    redis_error.is_timeout()
+        || redis_error.is_connection_dropped()
+        || redis_error.kind() == redis::ErrorKind::IoError
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerRedisBreakerKind {
+    Capacity,
+    Snapshot,
+    Affinity,
+}
+
+impl SchedulerRedisBreakerKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::Snapshot => "snapshot",
+            Self::Affinity => "affinity",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SchedulerRedisBreakerStats {
+    admitted: AtomicU64,
+    local_saturated: AtomicU64,
+    fail_fast: AtomicU64,
+    recovery_probes: AtomicU64,
+    failures: AtomicU64,
+    recoveries: AtomicU64,
+    cancelled_probes: AtomicU64,
+    stale_successes: AtomicU64,
+    stale_failures: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SchedulerRedisBreakerStatsSnapshot {
+    admitted: u64,
+    local_saturated: u64,
+    fail_fast: u64,
+    recovery_probes: u64,
+    failures: u64,
+    recoveries: u64,
+    cancelled_probes: u64,
+    stale_successes: u64,
+    stale_failures: u64,
+    suppressed: u64,
+}
+
+#[derive(Debug)]
+struct SchedulerRedisBreaker {
+    kind: SchedulerRedisBreakerKind,
+    state: Mutex<SchedulerRedisBreakerState>,
+    stats: SchedulerRedisBreakerStats,
+    operation_semaphore: Arc<Semaphore>,
+    jitter_seed: u64,
+}
+
+impl SchedulerRedisBreaker {
+    fn new(kind: SchedulerRedisBreakerKind, max_in_flight: usize, jitter_seed: u64) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            state: Mutex::new(SchedulerRedisBreakerState::default()),
+            stats: SchedulerRedisBreakerStats::default(),
+            operation_semaphore: Arc::new(Semaphore::new(max_in_flight.max(1))),
+            jitter_seed,
+        })
+    }
+
+    fn base_backoff_for_failure(consecutive_failures: u32) -> StdDuration {
+        let shift = consecutive_failures.saturating_sub(1).min(4);
+        SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE
+            .saturating_mul(1u32 << shift)
+            .min(SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX)
+    }
+
+    fn backoff_for_failure(
+        &self,
+        consecutive_failures: u32,
+        failure_generation: u64,
+    ) -> StdDuration {
+        stable_scheduler_backoff_jitter(
+            Self::base_backoff_for_failure(consecutive_failures),
+            self.jitter_seed
+                ^ failure_generation.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ u64::from(consecutive_failures).rotate_left(17),
+        )
+    }
+
+    async fn begin_until(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        operation_timeout: StdDuration,
+    ) -> Result<SchedulerRedisOperationAdmission, SchedulerRedisAdmissionError> {
+        let (failure_generation, recovery_probe) = {
+            let now = Instant::now();
+            let mut state = self.state.lock();
+            match state.phase {
+                SchedulerRedisBreakerPhase::Closed => (state.failure_generation, false),
+                SchedulerRedisBreakerPhase::Open { until } if until > now => {
+                    self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                    self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                    return Err(SchedulerRedisAdmissionError::BreakerOpen);
+                }
+                SchedulerRedisBreakerPhase::Open { .. } => {
+                    state.phase = SchedulerRedisBreakerPhase::HalfOpen;
+                    self.stats.recovery_probes.fetch_add(1, Ordering::Relaxed);
+                    (state.failure_generation, true)
+                }
+                SchedulerRedisBreakerPhase::HalfOpen => {
+                    self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+                    self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+                    return Err(SchedulerRedisAdmissionError::BreakerOpen);
+                }
+            }
+        };
+        let mut admission = SchedulerRedisOperationAdmission {
+            breaker: self.clone(),
+            operation_permit: None,
+            failure_generation,
+            recovery_probe,
+            operation_timeout,
+            completed: false,
+        };
+        let permit = match tokio::time::timeout_at(
+            deadline,
+            self.operation_semaphore.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) if tokio::time::Instant::now() < deadline => permit,
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                let saturated = self.stats.local_saturated.fetch_add(1, Ordering::Relaxed) + 1;
+                if saturated == 1 || saturated.is_power_of_two() {
+                    tracing::warn!(
+                        breaker = self.kind.as_str(),
+                        saturated,
+                        timeout_ms = operation_timeout.as_millis() as u64,
+                        "本地 Redis scheduler operation semaphore 饱和，Redis breaker 保持原状态"
+                    );
+                }
+                return Err(SchedulerRedisAdmissionError::LocalSchedulerOverloaded);
+            }
+        };
+        let still_current = {
+            let state = self.state.lock();
+            state.failure_generation == failure_generation
+                && if recovery_probe {
+                    state.phase == SchedulerRedisBreakerPhase::HalfOpen
+                } else {
+                    state.phase == SchedulerRedisBreakerPhase::Closed
+                }
+        };
+        if !still_current {
+            admission.completed = true;
+            self.stats.fail_fast.fetch_add(1, Ordering::Relaxed);
+            self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
+            return Err(SchedulerRedisAdmissionError::BreakerOpen);
+        }
+        admission.operation_permit = Some(permit);
+        self.stats.admitted.fetch_add(1, Ordering::Relaxed);
+        Ok(admission)
+    }
+
+    fn complete_success(&self, failure_generation: u64, recovery_probe: bool) {
+        let mut state = self.state.lock();
+        if state.failure_generation != failure_generation {
+            let stale = self.stats.stale_successes.fetch_add(1, Ordering::Relaxed) + 1;
+            if stale == 1 || stale.is_power_of_two() {
+                tracing::debug!(
+                    breaker = self.kind.as_str(),
+                    failure_generation,
+                    current_generation = state.failure_generation,
+                    stale_successes = stale,
+                    "忽略旧 generation 的 Redis scheduler success"
+                );
+            }
+            return;
+        }
+        match (recovery_probe, state.phase) {
+            (true, SchedulerRedisBreakerPhase::HalfOpen) => {
+                state.phase = SchedulerRedisBreakerPhase::Closed;
+                state.consecutive_failures = 0;
+                self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
+                let suppressed = self.stats.suppressed.swap(0, Ordering::Relaxed);
+                tracing::info!(
+                    breaker = self.kind.as_str(),
+                    failure_generation,
+                    suppressed_requests = suppressed,
+                    "Redis scheduler breaker 恢复，关闭 HalfOpen"
+                );
+            }
+            (false, SchedulerRedisBreakerPhase::Closed) => {
+                state.consecutive_failures = 0;
+            }
+            _ => {
+                self.stats.stale_successes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn complete_failure(
+        &self,
+        failure_generation: u64,
+        recovery_probe: bool,
+        operation: &'static str,
+        operation_timeout: StdDuration,
+        err: &anyhow::Error,
+    ) {
+        self.stats.failures.fetch_add(1, Ordering::Relaxed);
+        let timeout_failure = err
+            .chain()
+            .any(|cause| cause.to_string().contains("超过共享总期限"));
+        let (next_generation, consecutive_failures, backoff) = {
+            let mut state = self.state.lock();
+            if state.failure_generation != failure_generation {
+                self.stats.stale_failures.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1).max(1);
+            if self.kind == SchedulerRedisBreakerKind::Snapshot && !recovery_probe {
+                tracing::warn!(
+                    operation,
+                    breaker = self.kind.as_str(),
+                    failure_generation,
+                    consecutive_failures = state.consecutive_failures,
+                    timeout_ms = operation_timeout.as_millis() as u64,
+                    "Redis scheduler snapshot operation 失败但不打开 breaker，沿用本地调度缓存: {}",
+                    err
+                );
+                return;
+            }
+            if self.kind == SchedulerRedisBreakerKind::Capacity
+                && timeout_failure
+                && !recovery_probe
+                && state.consecutive_failures < SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN
+            {
+                tracing::warn!(
+                    operation,
+                    breaker = self.kind.as_str(),
+                    failure_generation,
+                    consecutive_failures = state.consecutive_failures,
+                    timeout_ms = operation_timeout.as_millis() as u64,
+                    open_after_failures = SCHEDULER_REDIS_TIMEOUT_FAILURES_TO_OPEN,
+                    "Redis scheduler capacity operation 超时但未打开 breaker: {}",
+                    err
+                );
+                return;
+            }
+            state.failure_generation = state.failure_generation.wrapping_add(1);
+            let backoff =
+                self.backoff_for_failure(state.consecutive_failures, state.failure_generation);
+            state.phase = SchedulerRedisBreakerPhase::Open {
+                until: Instant::now() + backoff,
+            };
+            (
+                state.failure_generation,
+                state.consecutive_failures,
+                backoff,
+            )
+        };
+        let suppressed = self.stats.suppressed.swap(0, Ordering::Relaxed);
+        tracing::warn!(
+            operation,
+            breaker = self.kind.as_str(),
+            failure_generation,
+            next_generation,
+            recovery_probe,
+            consecutive_failures,
+            timeout_ms = operation_timeout.as_millis() as u64,
+            backoff_ms = backoff.as_millis() as u64,
+            suppressed_requests = suppressed,
+            "Redis scheduler operation 失败，打开 breaker: {}",
+            err
+        );
+    }
+
+    fn cancel_probe(&self, failure_generation: u64) {
+        let mut state = self.state.lock();
+        if state.failure_generation != failure_generation
+            || state.phase != SchedulerRedisBreakerPhase::HalfOpen
+        {
+            return;
+        }
+        let backoff =
+            self.backoff_for_failure(state.consecutive_failures.max(1), state.failure_generation);
+        state.phase = SchedulerRedisBreakerPhase::Open {
+            until: Instant::now() + backoff,
+        };
+        self.stats.cancelled_probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn recovery_probe_due(&self) -> bool {
+        matches!(
+            self.state.lock().phase,
+            SchedulerRedisBreakerPhase::Open { until } if until <= Instant::now()
+        )
+    }
+
+    #[cfg(test)]
+    fn is_degraded(&self) -> bool {
+        self.state.lock().phase != SchedulerRedisBreakerPhase::Closed
+    }
+
+    fn retry_after(&self) -> Option<StdDuration> {
+        let now = Instant::now();
+        match self.state.lock().phase {
+            SchedulerRedisBreakerPhase::Closed => None,
+            SchedulerRedisBreakerPhase::Open { until } => Some(
+                until
+                    .checked_duration_since(now)
+                    .unwrap_or_else(|| StdDuration::from_millis(1)),
+            ),
+            SchedulerRedisBreakerPhase::HalfOpen => Some(StdDuration::from_millis(1)),
+        }
+    }
+
+    fn stats_snapshot(&self) -> SchedulerRedisBreakerStatsSnapshot {
+        SchedulerRedisBreakerStatsSnapshot {
+            admitted: self.stats.admitted.load(Ordering::Relaxed),
+            local_saturated: self.stats.local_saturated.load(Ordering::Relaxed),
+            fail_fast: self.stats.fail_fast.load(Ordering::Relaxed),
+            recovery_probes: self.stats.recovery_probes.load(Ordering::Relaxed),
+            failures: self.stats.failures.load(Ordering::Relaxed),
+            recoveries: self.stats.recoveries.load(Ordering::Relaxed),
+            cancelled_probes: self.stats.cancelled_probes.load(Ordering::Relaxed),
+            stale_successes: self.stats.stale_successes.load(Ordering::Relaxed),
+            stale_failures: self.stats.stale_failures.load(Ordering::Relaxed),
+            suppressed: self.stats.suppressed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct SchedulerRedisOperationAdmission {
+    breaker: Arc<SchedulerRedisBreaker>,
+    operation_permit: Option<OwnedSemaphorePermit>,
+    failure_generation: u64,
+    recovery_probe: bool,
+    operation_timeout: StdDuration,
+    completed: bool,
+}
+
+impl SchedulerRedisOperationAdmission {
+    #[cfg(test)]
+    fn recovery_probe(&self) -> bool {
+        self.recovery_probe
+    }
+
+    fn success(mut self) {
+        self.completed = true;
+        self.breaker
+            .complete_success(self.failure_generation, self.recovery_probe);
+    }
+
+    fn failure(mut self, operation: &'static str, err: &anyhow::Error) {
+        self.completed = true;
+        self.breaker.complete_failure(
+            self.failure_generation,
+            self.recovery_probe,
+            operation,
+            self.operation_timeout,
+            err,
+        );
+    }
+}
+
+impl Drop for SchedulerRedisOperationAdmission {
+    fn drop(&mut self) {
+        if !self.completed && self.recovery_probe {
+            self.breaker.cancel_probe(self.failure_generation);
+        }
+    }
+}
+
+fn stable_scheduler_backoff_jitter(base: StdDuration, seed: u64) -> StdDuration {
+    let base_millis = base.as_millis().max(1);
+    let spread = (base_millis / 10).max(1);
+    let mixed = seed
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ seed.rotate_left(27);
+    let reduction = mixed as u128 % spread.saturating_add(1);
+    StdDuration::from_millis(base_millis.saturating_sub(reduction).min(u64::MAX as u128) as u64)
+}
+
+enum PreparedInFlightSlot {
+    Local(InFlightLeaseGuard),
+    Redis {
+        guard: InFlightLeaseGuard,
+        effective_max_concurrent_requests: u32,
+        global_max_concurrent_requests: u32,
+        request_weight_units: u32,
+        max_age: Option<StdDuration>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -466,6 +1455,7 @@ enum PendingCredentialRuntimeMutation {
         expected_generation: u64,
         last_used_at: String,
     },
+    #[cfg(test)]
     RefreshFailure {
         operation_id: uuid::Uuid,
         expected_generation: u64,
@@ -518,7 +1508,14 @@ struct TokenRefreshDeadlines {
 impl TokenRefreshBudgets {
     fn deadlines(self) -> anyhow::Result<TokenRefreshDeadlines> {
         if self.reconciliation > self.workflow {
-            anyhow::bail!("Token 刷新 reconciliation 预算不能超过总预算");
+            return Err(RefreshFailure::new(
+                RefreshFailureStage::Internal,
+                RefreshFailureKind::InvalidConfiguration,
+                None,
+                None,
+                false,
+            )
+            .into());
         }
         let now = tokio::time::Instant::now();
         let work_budget = self.workflow.saturating_sub(self.reconciliation);
@@ -530,42 +1527,54 @@ impl TokenRefreshBudgets {
     }
 }
 
-struct AbortOnDropJoinHandle<T>(JoinHandle<T>);
-
-impl<T> Drop for AbortOnDropJoinHandle<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-async fn run_refresh_step_until<T: Send + 'static>(
+async fn run_refresh_step_until<T>(
     operation: &'static str,
     deadline: tokio::time::Instant,
-    future: impl Future<Output = anyhow::Result<T>> + Send + 'static,
+    future: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    // The per-credential refresh mutex bounds these tasks. Spawning gives the
-    // deadline an independent poller even if the future's first poll performs
-    // synchronous TLS/client initialization.
-    let mut task = AbortOnDropJoinHandle(tokio::spawn(future));
-    match tokio::time::timeout_at(deadline, &mut task.0).await {
+    // Keep the permit-owning refresh future in the request task. Dropping a request must drop the
+    // HTTP future and its auxiliary concurrency permit synchronously; aborting an unjoined child
+    // task only schedules that cleanup and can transiently strand the shared permit. Potentially
+    // blocking client construction is already isolated by AuxiliaryRuntime::refresh_client.
+    match tokio::time::timeout_at(deadline, AssertUnwindSafe(future).catch_unwind()).await {
         Ok(Ok(result)) => result,
-        Ok(Err(err)) => Err(anyhow::anyhow!("{}任务异常结束: {}", operation, err)),
-        Err(_) => Err(anyhow::anyhow!("{}超过工作期限", operation)),
+        Ok(Err(_)) => {
+            tracing::warn!(operation, "token refresh task terminated unexpectedly");
+            Err(RefreshFailure::new(
+                RefreshFailureStage::Internal,
+                RefreshFailureKind::Internal,
+                None,
+                None,
+                true,
+            )
+            .into())
+        }
+        Err(_) => {
+            tracing::warn!(operation, "token refresh step exceeded its deadline");
+            Err(RefreshFailure::new(
+                RefreshFailureStage::Internal,
+                RefreshFailureKind::Timeout,
+                None,
+                None,
+                true,
+            )
+            .into())
+        }
     }
 }
 
 async fn refresh_token_until(
     credentials: &KiroCredentials,
     config: &Config,
-    proxy: Option<&ProxyConfig>,
+    client: Arc<reqwest::Client>,
+    admission: Option<RefreshSendAdmission>,
     deadline: tokio::time::Instant,
     operation: &'static str,
 ) -> anyhow::Result<KiroCredentials> {
     let credentials = credentials.clone();
     let config = config.clone();
-    let proxy = proxy.cloned();
     run_refresh_step_until(operation, deadline, async move {
-        refresh_token(&credentials, &config, proxy.as_ref()).await
+        refresh_token_with_client(&credentials, &config, client, admission).await
     })
     .await
 }
@@ -650,6 +1659,124 @@ impl Drop for RedisRefreshLockGuard {
     }
 }
 
+struct RedisRefreshLeaseDropGuard {
+    redis: Arc<RedisStore>,
+    postgres: Option<Arc<PostgresStore>>,
+    lease: Option<RedisRefreshLease>,
+    send_started: Arc<AtomicBool>,
+    persisted_storage_revision: Arc<AtomicU64>,
+    rejected_access_token: Option<String>,
+}
+
+impl RedisRefreshLeaseDropGuard {
+    fn new(
+        redis: Arc<RedisStore>,
+        postgres: Option<Arc<PostgresStore>>,
+        lease: RedisRefreshLease,
+        send_started: Arc<AtomicBool>,
+        persisted_storage_revision: Arc<AtomicU64>,
+        rejected_access_token: Option<String>,
+    ) -> Self {
+        Self {
+            redis,
+            postgres,
+            lease: Some(lease),
+            send_started,
+            persisted_storage_revision,
+            rejected_access_token,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.lease.take();
+    }
+}
+
+impl Drop for RedisRefreshLeaseDropGuard {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let redis = self.redis.clone();
+        let postgres = self.postgres.clone();
+        let send_committed = self.send_started.load(Ordering::Acquire);
+        let mut persisted_storage_revision =
+            self.persisted_storage_revision.load(Ordering::Acquire);
+        let rejected_access_token = self.rejected_access_token.take();
+        let credential_id = lease.credential_id;
+        let refresh_generation = lease.generation;
+        let accepted =
+            spawn_critical_storage_task("提交取消中的 Redis Token 刷新 outcome", async move {
+                if !send_committed {
+                    let _ = tokio::time::timeout(
+                        REFRESH_REDIS_LOCK_OP_TIMEOUT,
+                        redis.cancel_token_refresh(&lease),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("取消未发送的 Redis Token 刷新 leader 超时"))??;
+                    return Ok(());
+                }
+                if persisted_storage_revision == 0 && send_committed {
+                    if let Some(postgres) = postgres {
+                        if let Ok(Ok(credentials)) = tokio::time::timeout(
+                            CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                            postgres.load_credentials(),
+                        )
+                        .await
+                        {
+                            if let Some(authoritative) =
+                                credentials.into_iter().find(|credential| {
+                                    let token_changed =
+                                        rejected_access_token.as_deref().map_or_else(
+                                            || credential.access_token.is_some(),
+                                            |rejected| {
+                                                credential.access_token.as_deref() != Some(rejected)
+                                            },
+                                        );
+                                    credential.id == Some(credential_id) && token_changed
+                                })
+                            {
+                                persisted_storage_revision = authoritative.storage_revision;
+                            }
+                        }
+                    }
+                }
+                if persisted_storage_revision > 0 {
+                    let _ = tokio::time::timeout(
+                        REFRESH_REDIS_LOCK_OP_TIMEOUT,
+                        redis.complete_token_refresh_success(&lease, persisted_storage_revision),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("取消清理 Redis Token 刷新 success 超时"))??;
+                    return Ok(());
+                }
+                let failure = RedisRefreshFailure {
+                    stage: RedisRefreshFailureStage::Internal,
+                    kind: RedisRefreshFailureKind::Internal,
+                    status: None,
+                    retry_after: None,
+                    send_committed,
+                    health_action_required: false,
+                };
+                let _ = tokio::time::timeout(
+                    REFRESH_REDIS_LOCK_OP_TIMEOUT,
+                    redis.complete_token_refresh_failure(&lease, &failure, false),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("取消清理 Redis Token 刷新 outcome 超时"))??;
+                Ok(())
+            });
+        if !accepted {
+            tracing::error!(
+                credential_id,
+                refresh_generation,
+                send_committed,
+                "Critical cleanup lane rejected a cancelled Redis token refresh outcome"
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PendingCredentialStatsBatch {
     operation_id: uuid::Uuid,
@@ -681,9 +1808,27 @@ impl PendingCredentialRuntimeMutation {
         match self {
             Self::Success { operation_id, .. }
             | Self::ApiFailure { operation_id, .. }
-            | Self::RefreshFailure { operation_id, .. }
             | Self::Disable { operation_id, .. }
             | Self::Patch { operation_id, .. } => *operation_id,
+            #[cfg(test)]
+            Self::RefreshFailure { operation_id, .. } => *operation_id,
+        }
+    }
+
+    fn requires_dispatch_quarantine(&self) -> bool {
+        match self {
+            Self::Disable { .. } => true,
+            Self::Patch { patch, .. } => {
+                patch.credential_disabled.is_some()
+                    || !matches!(
+                        patch.disabled_reason,
+                        CredentialRuntimeDisabledReasonPatch::Preserve
+                    )
+                    || patch.advance_generation
+            }
+            Self::Success { .. } | Self::ApiFailure { .. } => false,
+            #[cfg(test)]
+            Self::RefreshFailure { .. } => false,
         }
     }
 }
@@ -722,9 +1867,19 @@ async fn acquire_refresh_lock_until<'a>(
 ) -> anyhow::Result<tokio::sync::MutexGuard<'a, ()>> {
     tokio::time::timeout_at(deadline, lock.lock())
         .await
-        .map_err(|_| anyhow::anyhow!("等待凭据 #{} 的本地 Token 刷新锁超时", credential_id))
+        .map_err(|_| {
+            tracing::warn!(credential_id, "local token refresh lock wait timed out");
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Timeout,
+                None,
+                None,
+                false,
+            ))
+        })
 }
 
+#[cfg(test)]
 fn refresh_step_timeout(deadline: tokio::time::Instant, cap: StdDuration) -> Option<StdDuration> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     (!remaining.is_zero()).then_some(remaining.min(cap))
@@ -886,6 +2041,7 @@ impl MultiTokenManager {
         redis_store: Option<Arc<RedisStore>>,
         initial_runtime_states: Option<HashMap<u64, CredentialRuntimeStateRow>>,
     ) -> anyhow::Result<Self> {
+        validate_token_refresh_admission_config(&config)?;
         if credentials.iter().any(|credential| credential.id.is_none()) {
             if let Some(store) = &postgres_store {
                 let store = store.clone();
@@ -938,6 +2094,7 @@ impl MultiTokenManager {
                     runtime_revision: 0,
                     runtime_generation: 0,
                     runtime_persistence_degraded: false,
+                    runtime_persistence_quarantined: false,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
                         Some(DisabledReason::Manual)
@@ -1023,23 +2180,55 @@ impl MultiTokenManager {
             HashMap::new()
         };
         let redis_enabled = redis_store.is_some();
+        let initial_lease_id = initial_in_flight_lease_id(redis_enabled);
+        let scheduler_instance_id: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
+        let scheduler_redis_breaker = SchedulerRedisBreaker::new(
+            SchedulerRedisBreakerKind::Capacity,
+            SCHEDULER_REDIS_MAX_IN_FLIGHT_OPERATIONS,
+            initial_lease_id ^ 0x4341_5041_4349_5459,
+        );
+        let scheduler_redis_snapshot_breaker = SchedulerRedisBreaker::new(
+            SchedulerRedisBreakerKind::Snapshot,
+            SCHEDULER_REDIS_SNAPSHOT_MAX_IN_FLIGHT_OPERATIONS,
+            initial_lease_id ^ 0x534e_4150_5348_4f54,
+        );
+        let scheduler_redis_affinity_breaker = SchedulerRedisBreaker::new(
+            SchedulerRedisBreakerKind::Affinity,
+            SCHEDULER_REDIS_AFFINITY_MAX_IN_FLIGHT_OPERATIONS,
+            initial_lease_id ^ 0x4146_4649_4e49_5459,
+        );
+        let scheduler_redis_release_dispatcher = redis_store.as_ref().map(|redis| {
+            SchedulerRedisReleaseDispatcher::new(redis.clone(), scheduler_instance_id.clone())
+        });
+        let auxiliary_runtime =
+            AuxiliaryRuntime::new(&config, proxy.as_ref(), postgres_store.is_some())?;
+        auxiliary_runtime.set_token_refresh_redis_store(redis_store.clone());
         let manager = Self {
             config: Mutex::new(config),
             proxy,
             entries: Arc::new(Mutex::new(entries)),
             current_id: Mutex::new(initial_id),
-            refresh_locks: Mutex::new(HashMap::new()),
+            refresh_states: Mutex::new(HashMap::new()),
+            auxiliary_runtime,
             postgres_store,
             redis_store,
             proxy_resources: Arc::new(Mutex::new(proxy_resources)),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             last_runtime_mutation_cleanup_at: Mutex::new(None),
-            last_scheduler_redis_sync_at: Mutex::new(None),
+            last_scheduler_redis_sync_at: Arc::new(Mutex::new(None)),
             last_scheduler_redis_cleanup_at: Mutex::new(None),
-            scheduler_redis_degraded_until: Mutex::new(None),
-            scheduler_redis_degraded_streak: AtomicU32::new(0),
+            scheduler_redis_breaker,
+            scheduler_redis_snapshot_breaker,
+            scheduler_redis_affinity_breaker,
+            scheduler_redis_release_dispatcher,
+            #[cfg(test)]
+            request_binding_snapshot_reads: AtomicU64::new(0),
             scheduler_redis_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            scheduler_redis_full_sync_requested: Arc::new(AtomicU64::new(0)),
+            scheduler_redis_full_sync_applied: Arc::new(AtomicU64::new(0)),
+            scheduler_redis_dirty_credential_ids: Arc::new(Mutex::new(HashSet::new())),
+            scheduler_instance_id,
             stats_dirty: AtomicBool::new(false),
             pending_stats_deltas: Mutex::new(HashMap::new()),
             pending_stats_batches: Mutex::new(VecDeque::new()),
@@ -1047,11 +2236,13 @@ impl MultiTokenManager {
             overflow_runtime_mutations: AtomicU64::new(0),
             runtime_mutation_flush_cursor: AtomicU64::new(0),
             session_bindings: Mutex::new(HashMap::new()),
-            in_flight_notify: Arc::new(Notify::new()),
+            capacity_signal: Arc::new(CapacitySignal::default()),
             released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
-            next_in_flight_lease_id: AtomicU64::new(initial_in_flight_lease_id(redis_enabled)),
+            next_in_flight_lease_id: AtomicU64::new(initial_lease_id),
             queued_requests: Arc::new(AtomicU32::new(0)),
-            local_pool_route_state_cache: Arc::new(Mutex::new(HashMap::new())),
+            selection_reservation_gate: Mutex::new(()),
+            model_capability_cohort_generation: AtomicU64::new(1),
+            model_capability_cohort_cache: Mutex::new(ModelCapabilityCohortCache::default()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到 PgSQL。
@@ -1091,6 +2282,81 @@ impl MultiTokenManager {
     /// 获取当前运行时配置快照。
     pub fn runtime_config(&self) -> Config {
         self.config.lock().clone()
+    }
+
+    pub(crate) fn auxiliary_concurrency_controller(&self) -> Arc<AuxiliaryConcurrencyController> {
+        self.auxiliary_runtime.controller()
+    }
+
+    pub(crate) async fn refresh_http_client(
+        &self,
+        tls_backend: crate::model::config::TlsBackend,
+        proxy: Option<&ProxyConfig>,
+    ) -> anyhow::Result<Arc<reqwest::Client>> {
+        self.auxiliary_runtime
+            .refresh_client(tls_backend, proxy)
+            .await
+    }
+
+    pub(crate) fn auxiliary_concurrency_snapshot(&self) -> AuxiliaryConcurrencySnapshot {
+        self.auxiliary_runtime.concurrency_snapshot()
+    }
+
+    pub(crate) fn refresh_client_cache_snapshot(&self) -> RefreshClientCacheSnapshot {
+        self.auxiliary_runtime.refresh_client_cache_snapshot()
+    }
+
+    pub(crate) fn token_refresh_admission_snapshot(&self) -> TokenRefreshAdmissionSnapshot {
+        self.auxiliary_runtime.token_refresh_admission_snapshot()
+    }
+
+    pub(crate) async fn drain_scheduler_redis_releases(&self, timeout: StdDuration) -> bool {
+        for (breaker, stats) in [
+            ("capacity", self.scheduler_redis_breaker.stats_snapshot()),
+            (
+                "snapshot",
+                self.scheduler_redis_snapshot_breaker.stats_snapshot(),
+            ),
+            (
+                "affinity",
+                self.scheduler_redis_affinity_breaker.stats_snapshot(),
+            ),
+        ] {
+            tracing::info!(
+                breaker,
+                admitted = stats.admitted,
+                local_saturated = stats.local_saturated,
+                fail_fast = stats.fail_fast,
+                recovery_probes = stats.recovery_probes,
+                failures = stats.failures,
+                recoveries = stats.recoveries,
+                cancelled_probes = stats.cancelled_probes,
+                stale_successes = stats.stale_successes,
+                stale_failures = stats.stale_failures,
+                suppressed = stats.suppressed,
+                "Redis scheduler breaker 累计指标"
+            );
+        }
+        match &self.scheduler_redis_release_dispatcher {
+            Some(dispatcher) => {
+                let drained = dispatcher.drain(timeout).await;
+                let snapshot = dispatcher.snapshot();
+                tracing::info!(
+                    drained,
+                    pending = snapshot.pending,
+                    capacity_available = snapshot.capacity_available,
+                    enqueued = snapshot.enqueued,
+                    completed = snapshot.completed,
+                    retries = snapshot.retries,
+                    worker_starts = snapshot.worker_starts,
+                    spawn_failures = snapshot.spawn_failures,
+                    saturated = snapshot.saturated,
+                    "Redis scheduler release reconciliation 排空阶段已结束"
+                );
+                drained
+            }
+            None => true,
+        }
     }
 
     pub fn current_id(&self) -> u64 {
@@ -1248,6 +2514,7 @@ impl MultiTokenManager {
         let mut updated = self.runtime_config();
         update(&mut updated);
         updated.set_config_path_for_runtime(None);
+        validate_token_refresh_admission_config(&updated)?;
 
         let mut saved_version: Option<i64> = None;
         if let Some(store) = &self.postgres_store {
@@ -1263,8 +2530,13 @@ impl MultiTokenManager {
             let mut config = self.config.lock();
             *config = updated;
         }
-        self.invalidate_local_pool_route_state_cache();
+        let config = self.config.lock().clone();
+        let auxiliary_limit = config.auxiliary_upstream_max_concurrent_requests;
+        self.auxiliary_runtime.update_limit(auxiliary_limit);
+        self.auxiliary_runtime
+            .update_token_refresh_limits(config.token_refresh_max_rpm, config.token_refresh_burst);
         self.update_credential_rpm_from_config();
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         self.publish_runtime_config_changed(saved_version, "runtime_config_updated");
 
@@ -1285,13 +2557,18 @@ impl MultiTokenManager {
             return Ok(false);
         };
         config.set_config_path_for_runtime(None);
+        validate_token_refresh_admission_config(&config)?;
         {
             let mut current = self.config.lock();
             *current = config.clone();
         }
+        self.auxiliary_runtime
+            .update_limit(config.auxiliary_upstream_max_concurrent_requests);
+        self.auxiliary_runtime
+            .update_token_refresh_limits(config.token_refresh_max_rpm, config.token_refresh_burst);
         *self.load_balancing_mode.lock() = config.load_balancing_mode.clone();
-        self.invalidate_local_pool_route_state_cache();
         self.update_credential_rpm_from_config();
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         Ok(true)
     }
@@ -1310,29 +2587,16 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
-    fn invalidate_local_pool_route_state_cache(&self) {
-        invalidate_local_pool_route_state_cache(&self.local_pool_route_state_cache);
+    #[cfg(test)]
+    pub fn local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
+        self.local_pool_route_state_fresh(model)
     }
 
-    pub fn local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
-        let cache_key = local_pool_route_state_cache_key(model);
-        let now = Instant::now();
-        if let Some(state) =
-            cached_local_pool_route_state(&self.local_pool_route_state_cache, &cache_key, now)
-        {
-            return state;
-        }
-
+    pub fn local_pool_route_state_fresh(&self, model: Option<&str>) -> LocalPoolRouteState {
         let mut state = self.compute_local_pool_route_state(model);
         if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {
             state = self.compute_local_pool_route_state(model);
         }
-        store_local_pool_route_state_cache(
-            &self.local_pool_route_state_cache,
-            cache_key,
-            state.clone(),
-            Instant::now(),
-        );
         state
     }
 
@@ -1387,6 +2651,12 @@ impl MultiTokenManager {
             return (
                 SelectionFailureStage::DispatchQueue,
                 AccountRejectReason::GlobalConcurrencyFull,
+            );
+        }
+        if error_message.contains("凭据 RPM 限制") {
+            return (
+                SelectionFailureStage::RpmLimit,
+                AccountRejectReason::RpmLimited,
             );
         }
         if error_message.contains("排队等待超时") {
@@ -1571,6 +2841,7 @@ impl MultiTokenManager {
             config.dispatch_global_max_concurrent_requests,
             1,
         );
+        self.probe_scheduler_redis_capacity_recovery_if_due();
         let scheduler_redis_retry_after_secs = self.scheduler_redis_degraded_retry_after_secs();
         let mut model_usable = 0usize;
         let mut usable = 0usize;
@@ -1765,7 +3036,7 @@ impl MultiTokenManager {
                 }),
             );
         }
-        self.invalidate_local_pool_route_state_cache();
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("auto_heal_too_many_failures");
         true
@@ -1796,27 +3067,49 @@ impl MultiTokenManager {
         self.config.lock().dispatch_max_queued_requests
     }
 
-    fn scheduler_redis_hot_path_allowed(&self) -> bool {
-        if self.redis_store.is_none() {
-            return false;
-        }
-        let now = Instant::now();
-        let mut degraded_until = self.scheduler_redis_degraded_until.lock();
-        match *degraded_until {
-            Some(until) if until > now => false,
-            Some(_) => {
-                *degraded_until = None;
-                true
+    async fn execute_scheduler_redis_operation<T, F>(
+        breaker: Arc<SchedulerRedisBreaker>,
+        operation_timeout: StdDuration,
+        operation: &'static str,
+        on_started: F,
+        future: impl Future<Output = anyhow::Result<T>>,
+    ) -> SchedulerRedisExecutionOutcome<T>
+    where
+        F: FnOnce(),
+    {
+        let deadline = tokio::time::Instant::now() + operation_timeout;
+        let admission = match breaker.begin_until(deadline, operation_timeout).await {
+            Ok(admission) => admission,
+            Err(err) => return SchedulerRedisExecutionOutcome::NotStarted(err),
+        };
+        on_started();
+        match tokio::time::timeout_at(deadline, future).await {
+            Ok(Ok(value)) => {
+                admission.success();
+                SchedulerRedisExecutionOutcome::Completed(value)
             }
-            None => true,
+            Ok(Err(err)) => {
+                let commit_unknown = scheduler_redis_failure_commit_unknown(&err);
+                admission.failure(operation, &err);
+                SchedulerRedisExecutionOutcome::Failed { commit_unknown }
+            }
+            Err(_) => {
+                let err = anyhow::anyhow!(
+                    "{}超过共享总期限 {}ms",
+                    operation,
+                    operation_timeout.as_millis()
+                );
+                admission.failure(operation, &err);
+                SchedulerRedisExecutionOutcome::Failed {
+                    commit_unknown: true,
+                }
+            }
         }
     }
 
     fn scheduler_redis_retry_after_secs(&self) -> u64 {
-        let now = Instant::now();
-        let degraded_until = *self.scheduler_redis_degraded_until.lock();
-        degraded_until
-            .and_then(|until| until.checked_duration_since(now))
+        self.scheduler_redis_breaker
+            .retry_after()
             .map(|remaining| remaining.as_secs().saturating_add(1))
             .unwrap_or(1)
             .max(1)
@@ -1824,120 +3117,148 @@ impl MultiTokenManager {
 
     fn scheduler_redis_degraded_retry_after_secs(&self) -> Option<u64> {
         self.redis_store.as_ref()?;
-        let now = Instant::now();
-        let degraded_until = *self.scheduler_redis_degraded_until.lock();
-        degraded_until
-            .and_then(|until| until.checked_duration_since(now))
+        self.scheduler_redis_breaker
+            .retry_after()
             .map(|remaining| remaining.as_secs().saturating_add(1).max(1))
     }
 
-    fn mark_scheduler_redis_degraded(&self, operation: &'static str, err: &anyhow::Error) {
-        let now = Instant::now();
-        let (already_degraded, backoff) = {
-            let mut degraded_until = self.scheduler_redis_degraded_until.lock();
-            let already_degraded = degraded_until.is_some_and(|existing| existing > now);
-            let streak = if already_degraded {
-                self.scheduler_redis_degraded_streak.load(Ordering::Acquire)
-            } else {
-                self.scheduler_redis_degraded_streak
-                    .fetch_add(1, Ordering::AcqRel)
-                    .saturating_add(1)
-            };
-            let shift = streak.saturating_sub(1).min(4);
-            let multiplier = 1u32 << shift;
-            let backoff = SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE
-                .saturating_mul(multiplier)
-                .min(SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX);
-            let until = now + backoff;
-            *degraded_until = Some(until);
-            (already_degraded, backoff)
-        };
-        if already_degraded {
-            tracing::debug!(
-                operation,
-                timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
-                backoff_ms = backoff.as_millis() as u64,
-                "Redis 调度热路径仍在退避窗口内，暂停分布式调度准入: {}",
-                err
-            );
-        } else {
-            tracing::warn!(
-                operation,
-                timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
-                backoff_ms = backoff.as_millis() as u64,
-                "Redis 调度热路径不可用，本进程暂时暂停分布式调度准入: {}",
-                err
-            );
-        }
-    }
-
-    fn block_on_scheduler_redis_hot<T: Send>(
+    fn block_on_scheduler_redis_affinity<T: Send>(
         &self,
         operation: &'static str,
         future: impl Future<Output = anyhow::Result<T>> + Send,
     ) -> Option<T> {
-        match self.block_on_scheduler_redis_hot_outcome(operation, future) {
-            SchedulerRedisHotOutcome::Completed(value) => Some(value),
-            SchedulerRedisHotOutcome::Skipped | SchedulerRedisHotOutcome::Failed => None,
+        let breaker = self.scheduler_redis_affinity_breaker.clone();
+        match block_on_storage(operation, async move {
+            Ok(Self::execute_scheduler_redis_operation(
+                breaker,
+                SCHEDULER_REDIS_AFFINITY_OP_TIMEOUT,
+                operation,
+                || {},
+                future,
+            )
+            .await)
+        }) {
+            Ok(SchedulerRedisExecutionOutcome::Completed(value)) => Some(value),
+            Ok(
+                SchedulerRedisExecutionOutcome::NotStarted(_)
+                | SchedulerRedisExecutionOutcome::Failed { .. },
+            )
+            | Err(_) => None,
         }
     }
 
-    fn block_on_scheduler_redis_hot_outcome<T: Send>(
-        &self,
-        operation: &'static str,
-        future: impl Future<Output = anyhow::Result<T>> + Send,
-    ) -> SchedulerRedisHotOutcome<T> {
-        if !self.scheduler_redis_hot_path_allowed() {
-            return SchedulerRedisHotOutcome::Skipped;
-        }
-        let result = block_on_storage(operation, async move {
-            match tokio::time::timeout(SCHEDULER_REDIS_HOT_OP_TIMEOUT, future).await {
-                Ok(result) => result,
-                Err(_) => anyhow::bail!(
-                    "{}超过 {}ms",
-                    operation,
-                    SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis()
-                ),
-            }
-        });
-        match result {
-            Ok(value) => {
-                self.scheduler_redis_degraded_streak
-                    .store(0, Ordering::Release);
-                SchedulerRedisHotOutcome::Completed(value)
-            }
-            Err(err) => {
-                self.mark_scheduler_redis_degraded(operation, &err);
-                SchedulerRedisHotOutcome::Failed
-            }
-        }
-    }
-
-    async fn await_scheduler_redis_hot_outcome<T>(
+    async fn await_scheduler_redis_affinity<T>(
         &self,
         operation: &'static str,
         future: impl Future<Output = anyhow::Result<T>>,
+    ) -> Option<T> {
+        match Self::execute_scheduler_redis_operation(
+            self.scheduler_redis_affinity_breaker.clone(),
+            SCHEDULER_REDIS_AFFINITY_OP_TIMEOUT,
+            operation,
+            || {},
+            future,
+        )
+        .await
+        {
+            SchedulerRedisExecutionOutcome::Completed(value) => Some(value),
+            SchedulerRedisExecutionOutcome::NotStarted(_)
+            | SchedulerRedisExecutionOutcome::Failed { .. } => None,
+        }
+    }
+
+    fn block_on_scheduler_redis_hot_outcome<T: Send, F: FnOnce() + Send>(
+        &self,
+        operation: &'static str,
+        on_started: F,
+        future: impl Future<Output = anyhow::Result<T>> + Send,
     ) -> SchedulerRedisHotOutcome<T> {
-        if !self.scheduler_redis_hot_path_allowed() {
+        if self.redis_store.is_none() {
             return SchedulerRedisHotOutcome::Skipped;
         }
-        let result = match tokio::time::timeout(SCHEDULER_REDIS_HOT_OP_TIMEOUT, future).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "{}超过 {}ms",
+        let breaker = self.scheduler_redis_breaker.clone();
+        let execution = block_on_storage(operation, async move {
+            Ok(Self::execute_scheduler_redis_operation(
+                breaker,
+                SCHEDULER_REDIS_HOT_OP_TIMEOUT,
                 operation,
-                SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis()
-            )),
-        };
-        match result {
-            Ok(value) => {
-                self.scheduler_redis_degraded_streak
-                    .store(0, Ordering::Release);
+                on_started,
+                future,
+            )
+            .await)
+        });
+        match execution {
+            Ok(SchedulerRedisExecutionOutcome::Completed(value)) => {
                 SchedulerRedisHotOutcome::Completed(value)
             }
-            Err(err) => {
-                self.mark_scheduler_redis_degraded(operation, &err);
-                SchedulerRedisHotOutcome::Failed
+            Ok(SchedulerRedisExecutionOutcome::NotStarted(
+                SchedulerRedisAdmissionError::BreakerOpen,
+            )) => SchedulerRedisHotOutcome::Skipped,
+            Ok(SchedulerRedisExecutionOutcome::NotStarted(
+                SchedulerRedisAdmissionError::LocalSchedulerOverloaded,
+            )) => SchedulerRedisHotOutcome::LocalSchedulerOverloaded,
+            Ok(SchedulerRedisExecutionOutcome::Failed { commit_unknown }) => {
+                SchedulerRedisHotOutcome::Failed { commit_unknown }
+            }
+            Err(_) => SchedulerRedisHotOutcome::Failed {
+                commit_unknown: true,
+            },
+        }
+    }
+
+    fn probe_scheduler_redis_capacity_recovery_if_due(&self) {
+        if !self.scheduler_redis_breaker.recovery_probe_due() {
+            return;
+        }
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        let redis = redis.clone();
+        match self.block_on_scheduler_redis_hot_outcome(
+            "探测 Redis 调度协调恢复",
+            || {},
+            async move { redis.ping().await },
+        ) {
+            SchedulerRedisHotOutcome::Completed(()) => {
+                tracing::debug!("Redis 调度容量 breaker 预检恢复探测成功");
+            }
+            SchedulerRedisHotOutcome::Skipped
+            | SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {}
+            SchedulerRedisHotOutcome::Failed { .. } => {
+                tracing::debug!("Redis 调度容量 breaker 预检恢复探测失败，继续 degraded");
+            }
+        }
+    }
+
+    async fn await_scheduler_redis_hot_outcome<T, F: FnOnce()>(
+        &self,
+        operation: &'static str,
+        on_started: F,
+        future: impl Future<Output = anyhow::Result<T>>,
+    ) -> SchedulerRedisHotOutcome<T> {
+        if self.redis_store.is_none() {
+            return SchedulerRedisHotOutcome::Skipped;
+        }
+        match Self::execute_scheduler_redis_operation(
+            self.scheduler_redis_breaker.clone(),
+            SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+            operation,
+            on_started,
+            future,
+        )
+        .await
+        {
+            SchedulerRedisExecutionOutcome::Completed(value) => {
+                SchedulerRedisHotOutcome::Completed(value)
+            }
+            SchedulerRedisExecutionOutcome::NotStarted(
+                SchedulerRedisAdmissionError::BreakerOpen,
+            ) => SchedulerRedisHotOutcome::Skipped,
+            SchedulerRedisExecutionOutcome::NotStarted(
+                SchedulerRedisAdmissionError::LocalSchedulerOverloaded,
+            ) => SchedulerRedisHotOutcome::LocalSchedulerOverloaded,
+            SchedulerRedisExecutionOutcome::Failed { commit_unknown } => {
+                SchedulerRedisHotOutcome::Failed { commit_unknown }
             }
         }
     }
@@ -1947,17 +3268,24 @@ impl MultiTokenManager {
         operation: &'static str,
         future: impl Future<Output = anyhow::Result<T>> + Send,
     ) -> Option<T> {
-        if self.redis_store.is_some() && !self.scheduler_redis_hot_path_allowed() {
-            return None;
-        }
+        let breaker = self.scheduler_redis_snapshot_breaker.clone();
         let result = block_on_storage(operation, async move {
-            match tokio::time::timeout(SCHEDULER_REDIS_HOT_OP_TIMEOUT, future).await {
-                Ok(result) => result,
-                Err(_) => anyhow::bail!(
-                    "{}超过 {}ms",
-                    operation,
-                    SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis()
-                ),
+            match Self::execute_scheduler_redis_operation(
+                breaker,
+                SCHEDULER_REDIS_SNAPSHOT_OP_TIMEOUT,
+                operation,
+                || {},
+                future,
+            )
+            .await
+            {
+                SchedulerRedisExecutionOutcome::Completed(value) => Ok(value),
+                SchedulerRedisExecutionOutcome::NotStarted(reason) => Err(anyhow::anyhow!(
+                    "Redis scheduler state-sync 未准入: {reason:?}"
+                )),
+                SchedulerRedisExecutionOutcome::Failed { .. } => {
+                    Err(anyhow::anyhow!("Redis scheduler state-sync 执行失败"))
+                }
             }
         });
         match result {
@@ -1965,7 +3293,7 @@ impl MultiTokenManager {
             Err(err) => {
                 tracing::debug!(
                     operation,
-                    timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
+                    timeout_ms = SCHEDULER_REDIS_SNAPSHOT_OP_TIMEOUT.as_millis() as u64,
                     "Redis 调度状态同步未在预算内完成，沿用本地调度缓存: {}",
                     err
                 );
@@ -1974,20 +3302,370 @@ impl MultiTokenManager {
         }
     }
 
-    fn refresh_lock_for_credential(&self, id: u64) -> Arc<TokioMutex<()>> {
-        let mut locks = self.refresh_locks.lock();
-        locks
+    fn refresh_state_for_credential(&self, id: u64) -> Arc<CredentialRefreshState> {
+        let mut states = self.refresh_states.lock();
+        states
             .entry(id)
-            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .or_insert_with(|| Arc::new(CredentialRefreshState::default()))
             .clone()
     }
 
-    fn retain_refresh_locks_for_ids(&self, ids: &HashSet<u64>) {
-        self.refresh_locks.lock().retain(|id, _| ids.contains(id));
+    fn retain_refresh_states_for_ids(&self, ids: &HashSet<u64>) {
+        self.refresh_states.lock().retain(|id, _| ids.contains(id));
     }
 
-    fn remove_refresh_lock_for_credential(&self, id: u64) {
-        self.refresh_locks.lock().remove(&id);
+    fn remove_refresh_state_for_credential(&self, id: u64) {
+        self.refresh_states.lock().remove(&id);
+    }
+
+    fn invalidate_refresh_state_for_credential(&self, id: u64) {
+        self.refresh_state_for_credential(id).invalidate();
+    }
+
+    fn ensure_refresh_state_generation(
+        state: &CredentialRefreshState,
+        expected: u64,
+        send_committed: bool,
+    ) -> anyhow::Result<()> {
+        if state.is_generation_current(expected) {
+            return Ok(());
+        }
+        Err(RefreshFailure::new(
+            RefreshFailureStage::Coordination,
+            RefreshFailureKind::Coordination,
+            None,
+            None,
+            send_committed,
+        )
+        .into())
+    }
+
+    async fn apply_refresh_health_action(
+        &self,
+        id: u64,
+        failure: &RefreshFailure,
+        claim: Option<&RedisRefreshHealthClaim>,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        if let (Some(redis), Some(claim)) = (&self.redis_store, claim) {
+            let consumed =
+                tokio::time::timeout_at(deadline, redis.ack_token_refresh_health_claim(id, claim))
+                    .await
+                    .map_err(|_| {
+                        anyhow::Error::new(RefreshFailure::new(
+                            RefreshFailureStage::Coordination,
+                            RefreshFailureKind::Timeout,
+                            None,
+                            None,
+                            false,
+                        ))
+                    })?
+                    .map_err(|_| {
+                        anyhow::Error::new(RefreshFailure::new(
+                            RefreshFailureStage::Coordination,
+                            RefreshFailureKind::Coordination,
+                            None,
+                            None,
+                            false,
+                        ))
+                    })?;
+            if !consumed {
+                tracing::debug!(
+                    credential_id = id,
+                    refresh_generation = claim.generation,
+                    "Skipped a stale or already-consumed token refresh health claim"
+                );
+                return Ok(());
+            }
+        }
+
+        // Redis claims are consumed before the idempotent mutation. This intentionally chooses
+        // at-most-once behavior: a process crash in this small interval may lose one health action,
+        // but a stale owner can never apply it to a newer credential generation.
+        match failure.kind {
+            RefreshFailureKind::InvalidGrant => {
+                self.report_refresh_token_invalid(id);
+            }
+            RefreshFailureKind::CredentialAuth => {
+                self.report_transient_failure_kind(
+                    id,
+                    None,
+                    TransientFailureKind::Auth,
+                    failure.retry_after,
+                    "token_refresh_credential_auth",
+                )?;
+            }
+            RefreshFailureKind::RateLimited => {
+                self.report_transient_failure_kind(
+                    id,
+                    None,
+                    TransientFailureKind::RateLimit,
+                    failure.retry_after,
+                    "token_refresh_rate_limited",
+                )?;
+            }
+            _ => return Ok(()),
+        }
+        Ok(())
+    }
+
+    async fn begin_distributed_refresh_until(
+        &self,
+        id: u64,
+        identity: RefreshAttemptIdentity,
+        caller_can_claim_health: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<DistributedRefreshDecision> {
+        let redis = self.redis_store.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                false,
+            ))
+        })?;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Timeout,
+                    None,
+                    None,
+                    false,
+                )
+                .into());
+            }
+            let begin = tokio::time::timeout_at(
+                deadline,
+                redis.begin_token_refresh(id, identity.0, caller_can_claim_health),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Timeout,
+                    None,
+                    None,
+                    false,
+                ))
+            })?
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Coordination,
+                    None,
+                    None,
+                    false,
+                ))
+            })?;
+            match begin {
+                RedisRefreshBegin::Leader(lease) => {
+                    return Ok(DistributedRefreshDecision::Leader(lease));
+                }
+                RedisRefreshBegin::Wait { poll_after, .. } => {
+                    let wake_at = (tokio::time::Instant::now() + poll_after).min(deadline);
+                    tokio::time::sleep_until(wake_at).await;
+                }
+                RedisRefreshBegin::Replay {
+                    outcome,
+                    health_claim,
+                } => {
+                    let failure = refresh_failure_from_redis(&outcome.failure);
+                    if let Some(claim) = health_claim.as_ref() {
+                        self.apply_refresh_health_action(id, &failure, Some(claim), deadline)
+                            .await?;
+                    }
+                    return Ok(DistributedRefreshDecision::Replay(
+                        failure.into_shared_failure_wave(),
+                    ));
+                }
+                RedisRefreshBegin::Succeeded {
+                    generation,
+                    storage_revision,
+                } => {
+                    return Ok(DistributedRefreshDecision::Succeeded {
+                        generation,
+                        storage_revision,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn complete_distributed_refresh_failure_until(
+        &self,
+        lease: &RedisRefreshLease,
+        failure: &RefreshFailure,
+        leader_can_claim_health: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<RefreshFailure> {
+        let redis = self.redis_store.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                failure.send_committed,
+            ))
+        })?;
+        let committed = tokio::time::timeout_at(
+            deadline,
+            redis.complete_token_refresh_failure(
+                lease,
+                &refresh_failure_to_redis(failure),
+                leader_can_claim_health,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Timeout,
+                None,
+                None,
+                failure.send_committed,
+            ))
+        })?
+        .map_err(|_| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                failure.send_committed,
+            ))
+        })?
+        .ok_or_else(|| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                failure.send_committed,
+            ))
+        })?;
+        let committed_failure = refresh_failure_from_redis(&committed.outcome.failure);
+        if let Some(claim) = committed.health_claim.as_ref() {
+            self.apply_refresh_health_action(
+                lease.credential_id,
+                &committed_failure,
+                Some(claim),
+                deadline,
+            )
+            .await?;
+        }
+        Ok(committed_failure.into_shared_failure_wave())
+    }
+
+    async fn complete_distributed_refresh_success_until(
+        &self,
+        lease: &RedisRefreshLease,
+        storage_revision: u64,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        let redis = self.redis_store.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                true,
+            ))
+        })?;
+        let committed = tokio::time::timeout_at(
+            deadline,
+            redis.complete_token_refresh_success(lease, storage_revision),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Timeout,
+                None,
+                None,
+                true,
+            ))
+        })?
+        .map_err(|_| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                true,
+            ))
+        })?;
+        if !committed {
+            return Err(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                true,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn complete_or_cancel_distributed_refresh_success_until(
+        &self,
+        lease: &RedisRefreshLease,
+        storage_revision: u64,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        if self.postgres_store.is_some() {
+            return self
+                .complete_distributed_refresh_success_until(lease, storage_revision, deadline)
+                .await;
+        }
+
+        let redis = self.redis_store.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                true,
+            ))
+        })?;
+        let cancelled = tokio::time::timeout_at(deadline, redis.cancel_token_refresh(lease))
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Timeout,
+                    None,
+                    None,
+                    true,
+                ))
+            })?
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Coordination,
+                    None,
+                    None,
+                    true,
+                ))
+            })?;
+        if !cancelled {
+            return Err(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                true,
+            )
+            .into());
+        }
+        tracing::debug!(
+            credential_id = lease.credential_id,
+            refresh_generation = lease.generation,
+            "Redis Token 刷新成功仅更新本进程内存；无 PgSQL 权威存储时取消 lease，避免发布不可复用的跨实例 success outcome"
+        );
+        Ok(())
     }
 
     fn local_global_capacity_state(&self) -> SchedulerGlobalCapacityState {
@@ -2040,6 +3718,64 @@ impl MultiTokenManager {
             return true;
         }
         false
+    }
+
+    /// Reserve capacity owned by this process before awaiting Redis.
+    ///
+    /// Redis remains authoritative for cross-instance capacity. Remote leases in the local
+    /// snapshot may be stale, so this provisional gate only counts locally owned leases. This
+    /// still prevents same-process contenders from stampeding the same Redis candidate.
+    fn acquire_provisional_local_in_flight_slot_with_id(
+        &self,
+        id: u64,
+        lease_id: u64,
+        now: Instant,
+        max_concurrent_requests: u32,
+        global_max_concurrent_requests: u32,
+        request_weight_units: u32,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let locally_owned_global_in_flight = entries
+            .iter()
+            .flat_map(|entry| entry.in_flight_leases.iter())
+            .filter(|lease| lease.locally_owned)
+            .fold(0u32, |sum, lease| sum.saturating_add(lease.weight_units));
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        let locally_owned_credential_in_flight = entry
+            .in_flight_leases
+            .iter()
+            .filter(|lease| lease.locally_owned)
+            .fold(0u32, |sum, lease| sum.saturating_add(lease.weight_units));
+        let effective_max_concurrent_requests =
+            effective_max_concurrent_requests(entry, max_concurrent_requests);
+        let mut lease_weight_units =
+            effective_weight_for_limit(request_weight_units, effective_max_concurrent_requests);
+        lease_weight_units =
+            effective_weight_for_limit(lease_weight_units, global_max_concurrent_requests);
+        if global_max_concurrent_requests > 0
+            && locally_owned_global_in_flight.saturating_add(lease_weight_units)
+                > global_max_concurrent_requests
+        {
+            return false;
+        }
+        if effective_max_concurrent_requests > 0
+            && locally_owned_credential_in_flight.saturating_add(lease_weight_units)
+                > effective_max_concurrent_requests
+        {
+            return false;
+        }
+        entry.in_flight_requests = entry.in_flight_requests.saturating_add(lease_weight_units);
+        entry.in_flight_leases.push(InFlightLease {
+            id: lease_id,
+            acquired_at: now,
+            last_seen_at: now,
+            kind: InFlightKind::Api,
+            weight_units: lease_weight_units,
+            locally_owned: true,
+        });
+        true
     }
 
     fn try_enter_local_dispatch_queue(&self, max_queued: u32) -> bool {
@@ -2157,7 +3893,6 @@ impl MultiTokenManager {
                 entry.rate_limit_available_at = None;
             }
         }
-        self.invalidate_local_pool_route_state_cache();
         let Some(redis) = &self.redis_store else {
             return;
         };
@@ -2166,6 +3901,25 @@ impl MultiTokenManager {
             redis.clear_rate_limit(id).await?;
             Ok(())
         });
+    }
+
+    fn apply_rate_limit_available_at_for_credential(&self, id: u64, available_at: Instant) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+            entry.rate_limit_available_at = Some(
+                entry
+                    .rate_limit_available_at
+                    .map_or(available_at, |current| current.max(available_at)),
+            );
+        }
+    }
+
+    fn instant_from_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> Option<Instant> {
+        let delta_ms = target_ms.saturating_sub(now_ms);
+        if delta_ms <= 0 {
+            return None;
+        }
+        Some(now + StdDuration::from_millis(delta_ms as u64))
     }
 
     fn mark_rate_limited_at(&self, id: u64, now: Instant) -> anyhow::Result<()> {
@@ -2187,12 +3941,93 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    async fn acquire_in_flight_slot(
+    async fn reserve_scheduler_selection_for_request(
         &self,
         id: u64,
         request_weight_units: u32,
-    ) -> anyhow::Result<Option<InFlightLeaseGuard>> {
-        self.cleanup_expired_in_flight_leases_local_first();
+    ) -> anyhow::Result<SchedulerRedisSelectionAdmission> {
+        let now = Instant::now();
+        let now_ms = Utc::now().timestamp_millis();
+        let rpm = {
+            let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| effective_rpm(entry, global_rpm))
+                .unwrap_or(global_rpm)
+        };
+        if rpm == 0 || self.redis_store.is_none() {
+            return Ok(SchedulerRedisSelectionAdmission::NotRequired);
+        }
+
+        let Some(redis) = &self.redis_store else {
+            return Ok(SchedulerRedisSelectionAdmission::NotRequired);
+        };
+        let redis = redis.clone();
+        let response = match self
+            .await_scheduler_redis_hot_outcome("原子记录 Redis 调度选中次数", || {}, async move {
+                redis
+                    .try_record_scheduler_selection(id, rpm, request_weight_units)
+                    .await
+            })
+            .await
+        {
+            SchedulerRedisHotOutcome::Completed(response) => response,
+            SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {
+                return Err(SchedulerRedisUnavailableError {
+                    retry_after_secs: 1,
+                    local_overloaded: true,
+                }
+                .into());
+            }
+            SchedulerRedisHotOutcome::Skipped | SchedulerRedisHotOutcome::Failed { .. } => {
+                return Err(SchedulerRedisUnavailableError {
+                    retry_after_secs: self.scheduler_redis_retry_after_secs(),
+                    local_overloaded: false,
+                }
+                .into());
+            }
+        };
+
+        match response {
+            SchedulerSelectionReservation::Recorded {
+                rate_limit_available_at_ms,
+                ..
+            } => {
+                if let Some(available_at_ms) = rate_limit_available_at_ms
+                    .and_then(|until_ms| Self::instant_from_epoch_ms(until_ms, now_ms, now))
+                {
+                    self.apply_rate_limit_available_at_for_credential(id, available_at_ms);
+                }
+                Ok(SchedulerRedisSelectionAdmission::Recorded {
+                    rate_limit_available_at: rate_limit_available_at_ms
+                        .and_then(|until_ms| Self::instant_from_epoch_ms(until_ms, now_ms, now)),
+                })
+            }
+            SchedulerSelectionReservation::RateLimited {
+                retry_after_ms,
+                rate_limit_available_at_ms,
+            } => {
+                let available_at =
+                    Self::instant_from_epoch_ms(rate_limit_available_at_ms, now_ms, now)
+                        .unwrap_or(now + StdDuration::from_millis(retry_after_ms.max(1)));
+                self.apply_rate_limit_available_at_for_credential(id, available_at);
+                Ok(SchedulerRedisSelectionAdmission::RateLimited(
+                    SchedulerRedisRateLimitWait {
+                        retry_after: StdDuration::from_millis(retry_after_ms.max(1)),
+                        available_at,
+                    },
+                ))
+            }
+        }
+    }
+
+    fn prepare_in_flight_slot(
+        &self,
+        id: u64,
+        request_weight_units: u32,
+    ) -> Option<PreparedInFlightSlot> {
         let max_concurrent_requests = self.max_concurrent_requests();
         let effective_max_concurrent_requests =
             self.effective_max_concurrent_requests_for_id(id, max_concurrent_requests);
@@ -2200,122 +4035,36 @@ impl MultiTokenManager {
         let now = Instant::now();
         let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let max_age = self.in_flight_lease_max_age();
-            let redis_acquire = self
-                .await_scheduler_redis_hot_outcome("占用 Redis 凭据并发槽", async move {
-                    redis
-                        .acquire_dispatch_lease(
-                            id,
-                            lease_id,
-                            effective_max_concurrent_requests,
-                            global_max_concurrent_requests,
-                            request_weight_units,
-                            max_age,
-                            InFlightKind::Api.as_str(),
-                        )
-                        .await
-                })
-                .await;
-            match redis_acquire {
-                SchedulerRedisHotOutcome::Completed(Some(_count)) => {
-                    if self.acquire_local_in_flight_slot_with_id(
-                        id,
-                        lease_id,
-                        now,
-                        max_concurrent_requests,
-                        global_max_concurrent_requests,
-                        request_weight_units,
-                    ) {
-                        self.invalidate_local_pool_route_state_cache();
-                        return Ok(Some(InFlightLeaseGuard::new(
-                            self.entries.clone(),
-                            self.redis_store.clone(),
-                            self.redis_store
-                                .is_some()
-                                .then(|| self.released_in_flight_lease_tombstones.clone()),
-                            self.in_flight_notify.clone(),
-                            self.local_pool_route_state_cache.clone(),
-                            id,
-                            lease_id,
-                            request_weight_units,
-                            false,
-                        )));
-                    }
-                    if let Some(redis) = &self.redis_store {
-                        let redis = redis.clone();
-                        let fallback_redis = redis.clone();
-                        let admitted = spawn_critical_storage_task(
-                            "释放本地竞争失败的 Redis 并发 lease",
-                            async move {
-                                release_redis_in_flight_lease_and_wakeup(
-                                    redis, id, lease_id, false, 2,
-                                )
-                                .await
-                            },
-                        );
-                        if !admitted {
-                            release_redis_in_flight_lease_and_wakeup(
-                                fallback_redis,
-                                id,
-                                lease_id,
-                                false,
-                                2,
-                            )
-                            .await
-                            .map_err(|err| {
-                                anyhow::anyhow!("释放本地竞争失败的 Redis 并发 lease 失败: {}", err)
-                            })?;
-                        }
-                    }
-                    return Ok(None);
-                }
-                SchedulerRedisHotOutcome::Completed(None) => return Ok(None),
-                SchedulerRedisHotOutcome::Failed => {
-                    record_released_in_flight_lease_tombstone(
-                        &self.released_in_flight_lease_tombstones,
-                        id,
-                        lease_id,
-                    );
-                    let redis = self
-                        .redis_store
-                        .as_ref()
-                        .expect("Redis store exists")
-                        .clone();
-                    let fallback_redis = redis.clone();
-                    let admitted = spawn_critical_storage_task(
-                        "清理结果不确定的 Redis 并发 lease",
-                        async move {
-                            release_redis_in_flight_lease_and_wakeup(redis, id, lease_id, true, 2)
-                                .await
-                        },
-                    );
-                    if !admitted {
-                        release_redis_in_flight_lease_and_wakeup(
-                            fallback_redis,
-                            id,
-                            lease_id,
-                            true,
-                            2,
-                        )
-                        .await
-                        .map_err(|err| {
-                            anyhow::anyhow!("清理结果不确定的 Redis 并发 lease 失败: {}", err)
-                        })?;
-                    }
-                    anyhow::bail!(
-                        "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
-                        self.scheduler_redis_retry_after_secs()
-                    );
-                }
-                SchedulerRedisHotOutcome::Skipped => {
-                    anyhow::bail!(
-                        "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
-                        self.scheduler_redis_retry_after_secs()
-                    );
-                }
+        if self.redis_store.is_some() {
+            let release_dispatcher = self.scheduler_redis_release_dispatcher.as_ref()?.clone();
+            let release_reservation = release_dispatcher.try_reserve()?;
+            if !self.acquire_provisional_local_in_flight_slot_with_id(
+                id,
+                lease_id,
+                now,
+                max_concurrent_requests,
+                global_max_concurrent_requests,
+                request_weight_units,
+            ) {
+                return None;
             }
+            return Some(PreparedInFlightSlot::Redis {
+                guard: InFlightLeaseGuard::new(
+                    self.entries.clone(),
+                    self.redis_store.clone(),
+                    Some(release_dispatcher),
+                    Some(release_reservation),
+                    Some(self.released_in_flight_lease_tombstones.clone()),
+                    self.capacity_signal.clone(),
+                    id,
+                    lease_id,
+                    request_weight_units,
+                ),
+                effective_max_concurrent_requests,
+                global_max_concurrent_requests,
+                request_weight_units,
+                max_age: self.in_flight_lease_max_age(),
+            });
         }
 
         if self.acquire_local_in_flight_slot_with_id(
@@ -2326,20 +4075,129 @@ impl MultiTokenManager {
             global_max_concurrent_requests,
             request_weight_units,
         ) {
-            self.invalidate_local_pool_route_state_cache();
-            return Ok(Some(InFlightLeaseGuard::new(
+            return Some(PreparedInFlightSlot::Local(InFlightLeaseGuard::new(
                 self.entries.clone(),
                 None,
                 None,
-                self.in_flight_notify.clone(),
-                self.local_pool_route_state_cache.clone(),
+                None,
+                None,
+                self.capacity_signal.clone(),
                 id,
                 lease_id,
                 request_weight_units,
-                false,
             )));
         }
-        Ok(None)
+        None
+    }
+
+    async fn confirm_prepared_in_flight_slot(
+        &self,
+        prepared: PreparedInFlightSlot,
+    ) -> anyhow::Result<Option<InFlightLeaseGuard>> {
+        let (
+            mut guard,
+            effective_max_concurrent_requests,
+            global_max_concurrent_requests,
+            request_weight_units,
+            max_age,
+        ) = match prepared {
+            PreparedInFlightSlot::Local(guard) => return Ok(Some(guard)),
+            PreparedInFlightSlot::Redis {
+                guard,
+                effective_max_concurrent_requests,
+                global_max_concurrent_requests,
+                request_weight_units,
+                max_age,
+            } => (
+                guard,
+                effective_max_concurrent_requests,
+                global_max_concurrent_requests,
+                request_weight_units,
+                max_age,
+            ),
+        };
+        let redis = self
+            .redis_store
+            .as_ref()
+            .expect("prepared Redis lease requires a Redis store")
+            .clone();
+        let credential_id = guard.credential_id();
+        let lease_id = guard.id();
+        let redis_acquire = self
+            .await_scheduler_redis_hot_outcome(
+                "占用 Redis 凭据并发槽",
+                || guard.arm_redis_commit_unknown(),
+                async move {
+                    redis
+                        .acquire_dispatch_lease(
+                            credential_id,
+                            lease_id,
+                            effective_max_concurrent_requests,
+                            global_max_concurrent_requests,
+                            request_weight_units,
+                            max_age,
+                            InFlightKind::Api.as_str(),
+                        )
+                        .await
+                },
+            )
+            .await;
+        match redis_acquire {
+            SchedulerRedisHotOutcome::Completed(Some(_count)) => {
+                guard.configure_redis_touch_interval(max_age);
+                guard.confirm_redis_acquired();
+                Ok(Some(guard))
+            }
+            SchedulerRedisHotOutcome::Completed(None) => {
+                guard.confirm_redis_not_acquired();
+                drop(guard);
+                Ok(None)
+            }
+            SchedulerRedisHotOutcome::Failed { commit_unknown } => {
+                if !commit_unknown {
+                    guard.confirm_redis_not_acquired();
+                }
+                let retry_after_secs = self.scheduler_redis_retry_after_secs();
+                drop(guard);
+                Err(SchedulerRedisUnavailableError {
+                    retry_after_secs,
+                    local_overloaded: false,
+                }
+                .into())
+            }
+            SchedulerRedisHotOutcome::Skipped => {
+                let retry_after_secs = self.scheduler_redis_retry_after_secs();
+                guard.confirm_redis_not_acquired();
+                drop(guard);
+                Err(SchedulerRedisUnavailableError {
+                    retry_after_secs,
+                    local_overloaded: false,
+                }
+                .into())
+            }
+            SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {
+                guard.confirm_redis_not_acquired();
+                drop(guard);
+                Err(SchedulerRedisUnavailableError {
+                    retry_after_secs: 1,
+                    local_overloaded: true,
+                }
+                .into())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn acquire_in_flight_slot(
+        &self,
+        id: u64,
+        request_weight_units: u32,
+    ) -> anyhow::Result<Option<InFlightLeaseGuard>> {
+        self.cleanup_expired_in_flight_leases_local_first();
+        let Some(prepared) = self.prepare_in_flight_slot(id, request_weight_units) else {
+            return Ok(None);
+        };
+        self.confirm_prepared_in_flight_slot(prepared).await
     }
 
     #[cfg(test)]
@@ -2356,17 +4214,16 @@ impl MultiTokenManager {
             global_max_concurrent_requests,
             1,
         ) {
-            self.invalidate_local_pool_route_state_cache();
             return Some(InFlightLeaseGuard::new(
                 self.entries.clone(),
                 None,
                 None,
-                self.in_flight_notify.clone(),
-                self.local_pool_route_state_cache.clone(),
+                None,
+                None,
+                self.capacity_signal.clone(),
                 id,
                 lease_id,
                 1,
-                false,
             ));
         }
         None
@@ -2473,6 +4330,7 @@ impl MultiTokenManager {
             return;
         };
         let redis = redis.clone();
+        let source_instance_id = self.scheduler_instance_id.clone();
         let ids: Vec<u64> = {
             let entries = self.entries.lock();
             entries.iter().map(|entry| entry.id).collect()
@@ -2485,6 +4343,7 @@ impl MultiTokenManager {
                 let payload = serde_json::json!({
                     "kind": "dispatch_wakeup",
                     "removed": removed,
+                    "sourceInstanceId": source_instance_id,
                     "changedAt": Utc::now().to_rfc3339(),
                 })
                 .to_string();
@@ -2590,6 +4449,7 @@ impl MultiTokenManager {
         &self,
         wait_for: Option<StdDuration>,
         max_wait_remaining: Option<StdDuration>,
+        capacity_waiter: &mut CapacityWaiter,
     ) {
         let fallback = if self.redis_store.is_some() {
             StdDuration::from_secs(1)
@@ -2603,10 +4463,30 @@ impl MultiTokenManager {
         if wakeup.is_zero() {
             return;
         }
-        let _ = tokio::time::timeout(wakeup, self.in_flight_notify.notified()).await;
+        let _ = tokio::time::timeout(wakeup, capacity_waiter.wait_for_change()).await;
         if self.redis_store.is_some() {
-            if let Err(err) = self.refresh_scheduler_state_from_redis_force() {
+            if let Err(err) = self.refresh_scheduler_state_from_redis() {
                 tracing::debug!("调度等待唤醒后同步 Redis 并发状态失败: {}", err);
+            }
+        }
+    }
+
+    async fn sleep_for_scheduler_redis_recovery(
+        &self,
+        wait_for: StdDuration,
+        max_wait_remaining: Option<StdDuration>,
+    ) {
+        let mut wakeup = wait_for;
+        if let Some(remaining) = max_wait_remaining {
+            wakeup = wakeup.min(remaining);
+        }
+        if wakeup.is_zero() {
+            return;
+        }
+        tokio::time::sleep(wakeup).await;
+        if self.redis_store.is_some() {
+            if let Err(err) = self.refresh_scheduler_state_from_redis() {
+                tracing::debug!("Redis 调度协调恢复等待后同步并发状态失败: {}", err);
             }
         }
     }
@@ -2618,71 +4498,140 @@ impl MultiTokenManager {
         let Some(guard) = queue_guard.as_mut() else {
             return Ok(());
         };
-        if let Err(err) = guard.renew_if_needed().await {
-            self.mark_scheduler_redis_degraded("续期 Redis 调度排队 lease", &err);
-            anyhow::bail!(
+        if self.redis_store.is_none() || !guard.redis_renewal_is_due() {
+            return Ok(());
+        }
+        match self
+            .await_scheduler_redis_hot_outcome(
+                "续期 Redis 调度排队 lease",
+                || {},
+                guard.renew_if_needed(),
+            )
+            .await
+        {
+            SchedulerRedisHotOutcome::Completed(()) => Ok(()),
+            SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {
+                anyhow::bail!("本地账号调度容量暂不可用（本地 scheduler admission 已饱和）")
+            }
+            SchedulerRedisHotOutcome::Skipped => anyhow::bail!(
                 "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
                 self.scheduler_redis_retry_after_secs()
-            );
+            ),
+            SchedulerRedisHotOutcome::Failed { .. } => anyhow::bail!(
+                "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
+                self.scheduler_redis_retry_after_secs()
+            ),
         }
-        Ok(())
     }
 
-    fn try_enter_dispatch_queue(&self) -> anyhow::Result<Option<DispatchQueueGuard>> {
+    fn try_enter_dispatch_queue(
+        &self,
+        max_wait: Option<StdDuration>,
+    ) -> anyhow::Result<Option<DispatchQueueGuard>> {
         let max_queued = self.max_queued_requests();
         if !self.try_enter_local_dispatch_queue(max_queued) {
             return Ok(None);
         }
-        self.invalidate_local_pool_route_state_cache();
-        let mut redis_lease_id = None;
-        let redis_lease_ttl_secs = self
-            .config
-            .lock()
-            .credential_dispatch_max_wait_secs
-            .saturating_add(60)
-            .max(60);
+        let lease_policy = dispatch_queue_lease_policy(max_wait);
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
-            let cleanup_redis = redis.clone();
             let lease_id = uuid::Uuid::new_v4().to_string();
             let acquire_lease_id = lease_id.clone();
-            match self.block_on_scheduler_redis_hot_outcome("占用 Redis 调度排队名额", async move {
-                redis
-                    .try_enter_dispatch_queue(&acquire_lease_id, max_queued, redis_lease_ttl_secs)
-                    .await
-            }) {
+            let Some(release_dispatcher) =
+                self.scheduler_redis_release_dispatcher.as_ref().cloned()
+            else {
+                self.queued_requests.fetch_sub(1, Ordering::AcqRel);
+                anyhow::bail!("本地账号调度容量暂不可用（release reconciliation 未初始化）");
+            };
+            let Some(release_reservation) = release_dispatcher.try_reserve() else {
+                self.queued_requests.fetch_sub(1, Ordering::AcqRel);
+                anyhow::bail!("本地账号调度容量暂不可用（release reconciliation 已饱和）");
+            };
+            let mut guard = DispatchQueueGuard::new(
+                self.redis_store.clone(),
+                Some(release_dispatcher),
+                Some(release_reservation),
+                self.queued_requests.clone(),
+                Some(lease_id),
+                lease_policy.ttl_secs,
+                lease_policy.renewal_required,
+            );
+            match self.block_on_scheduler_redis_hot_outcome(
+                "占用 Redis 调度排队名额",
+                || guard.arm_redis_commit_unknown(),
+                async move {
+                    redis
+                        .try_enter_dispatch_queue(
+                            &acquire_lease_id,
+                            max_queued,
+                            lease_policy.ttl_secs,
+                        )
+                        .await
+                },
+            ) {
                 SchedulerRedisHotOutcome::Completed(true) => {
-                    redis_lease_id = Some(lease_id);
+                    guard.confirm_redis_acquired();
+                    return Ok(Some(guard));
                 }
                 SchedulerRedisHotOutcome::Completed(false) => {
-                    self.queued_requests.fetch_sub(1, Ordering::AcqRel);
+                    guard.confirm_redis_not_acquired();
+                    drop(guard);
                     return Ok(None);
                 }
-                SchedulerRedisHotOutcome::Failed => {
-                    self.queued_requests.fetch_sub(1, Ordering::AcqRel);
-                    release_redis_dispatch_queue_lease_reliably(cleanup_redis, lease_id);
+                SchedulerRedisHotOutcome::Failed { commit_unknown } => {
+                    if !commit_unknown {
+                        guard.confirm_redis_not_acquired();
+                    }
+                    drop(guard);
                     anyhow::bail!(
                         "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
                         self.scheduler_redis_retry_after_secs()
                     );
                 }
                 SchedulerRedisHotOutcome::Skipped => {
-                    self.queued_requests.fetch_sub(1, Ordering::AcqRel);
+                    guard.confirm_redis_not_acquired();
+                    drop(guard);
                     anyhow::bail!(
                         "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
                         self.scheduler_redis_retry_after_secs()
                     );
                 }
+                SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {
+                    guard.confirm_redis_not_acquired();
+                    drop(guard);
+                    anyhow::bail!("本地账号调度容量暂不可用（本地 scheduler admission 已饱和）");
+                }
             }
         }
         Ok(Some(DispatchQueueGuard::new(
-            self.redis_store.clone(),
+            None,
+            None,
+            None,
             self.queued_requests.clone(),
-            self.in_flight_notify.clone(),
-            self.local_pool_route_state_cache.clone(),
-            redis_lease_id,
-            redis_lease_ttl_secs,
+            None,
+            lease_policy.ttl_secs,
+            lease_policy.renewal_required,
         )))
+    }
+
+    fn try_enter_local_only_dispatch_queue(
+        &self,
+        max_wait: Option<StdDuration>,
+    ) -> Option<DispatchQueueGuard> {
+        let max_queued = self.max_queued_requests();
+        if !self.try_enter_local_dispatch_queue(max_queued) {
+            return None;
+        }
+        let lease_policy = dispatch_queue_lease_policy(max_wait);
+        Some(DispatchQueueGuard::new(
+            None,
+            None,
+            None,
+            self.queued_requests.clone(),
+            None,
+            lease_policy.ttl_secs,
+            lease_policy.renewal_required,
+        ))
     }
 
     fn global_capacity_state(&self) -> SchedulerGlobalCapacityState {
@@ -2699,22 +4648,22 @@ impl MultiTokenManager {
 
     fn dispatch_wait_exceeded(
         &self,
-        acquire_mode: AcquireMode,
+        max_wait: Option<StdDuration>,
         started_at: Instant,
         now: Instant,
     ) -> Option<(StdDuration, StdDuration)> {
-        let max_wait = self.dispatch_max_wait(acquire_mode)?;
+        let max_wait = max_wait?;
         let waited = now.saturating_duration_since(started_at);
         (waited >= max_wait).then_some((waited, max_wait))
     }
 
     fn dispatch_wait_remaining(
         &self,
-        acquire_mode: AcquireMode,
+        max_wait: Option<StdDuration>,
         started_at: Instant,
         now: Instant,
     ) -> Option<StdDuration> {
-        let max_wait = self.dispatch_max_wait(acquire_mode)?;
+        let max_wait = max_wait?;
         Some(max_wait.saturating_sub(now.saturating_duration_since(started_at)))
     }
 
@@ -2772,6 +4721,29 @@ impl MultiTokenManager {
                     global_rpm,
                     1,
                 )
+        })
+    }
+
+    fn exclude_credentials_requiring_refresh(&self, excluded_ids: &mut HashSet<u64>) -> usize {
+        let entries = self.entries.lock();
+        let before = excluded_ids.len();
+        for entry in entries.iter() {
+            if !entry.credentials.is_api_key_credential() && is_token_expired(&entry.credentials) {
+                excluded_ids.insert(entry.id);
+            }
+        }
+        excluded_ids.len().saturating_sub(before)
+    }
+
+    fn has_usable_credential_excluding_from_current_state(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> bool {
+        let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
+        entries.iter().any(|entry| {
+            credential_is_dispatch_candidate(&proxy_resources, entry, model, excluded_ids)
         })
     }
 
@@ -2888,16 +4860,10 @@ impl MultiTokenManager {
 
     fn get_bound_credential(
         &self,
-        session_id: &str,
+        bound_id: u64,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
-        request_weight_units: u32,
     ) -> Option<(u64, KiroCredentials)> {
-        if let Err(err) = self.refresh_scheduler_state_from_redis() {
-            tracing::warn!("读取会话绑定前同步 Redis 调度状态失败: {}", err);
-        }
-        let bound_id = self.bound_credential_id(session_id)?;
-
         if excluded_ids.contains(&bound_id) {
             return None;
         }
@@ -2905,24 +4871,90 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
-        let config = self.config.lock().clone();
-        let max_concurrent_requests = config.credential_max_concurrent_requests;
-        let global_rpm = config.credential_rpm.unwrap_or(0);
+        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
         entries
             .iter()
             .find(|e| {
                 e.id == bound_id
-                    && credential_is_dispatchable(
+                    && credential_is_temporarily_available(
                         &proxy_resources,
                         e,
                         model,
                         now,
-                        max_concurrent_requests,
                         global_rpm,
-                        request_weight_units,
                     )
             })
             .map(|e| (e.id, e.credentials.clone()))
+    }
+
+    fn bound_credential_is_capacity_blocked(
+        &self,
+        bound_id: u64,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        request_weight_units: u32,
+    ) -> bool {
+        if excluded_ids.contains(&bound_id) {
+            return false;
+        }
+
+        let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
+        let config = self.config.lock();
+        let Some(entry) = entries.iter().find(|entry| entry.id == bound_id) else {
+            return false;
+        };
+        if !credential_is_usable_for_model(entry, model)
+            || !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
+        {
+            return false;
+        }
+        let now = Instant::now();
+        let global_rpm = config.credential_rpm.unwrap_or(0);
+        if entry_cooldown_remaining(entry, model, now).is_some()
+            || entry_rate_limit_remaining(entry, global_rpm, now).is_some()
+        {
+            return false;
+        }
+
+        let effective_max =
+            effective_max_concurrent_requests(entry, config.credential_max_concurrent_requests);
+        let lease_weight_units = effective_weight_for_limit(
+            effective_weight_for_limit(request_weight_units, effective_max),
+            config.dispatch_global_max_concurrent_requests,
+        );
+        let global_in_flight = entries
+            .iter()
+            .map(|entry| entry.in_flight_requests)
+            .sum::<u32>();
+        !entry_has_concurrency_capacity(
+            entry,
+            config.credential_max_concurrent_requests,
+            lease_weight_units,
+        ) || !global_has_concurrency_capacity(
+            global_in_flight,
+            config.dispatch_global_max_concurrent_requests,
+            lease_weight_units,
+        )
+    }
+
+    async fn bound_credential_id_for_request(&self, session_id: &str) -> Option<u64> {
+        #[cfg(test)]
+        self.request_binding_snapshot_reads
+            .fetch_add(1, Ordering::AcqRel);
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            if let Some(binding) = self
+                .await_scheduler_redis_affinity("读取 Redis 会话绑定", async move {
+                    redis.get_session_binding(&session_id_owned).await
+                })
+                .await
+            {
+                cache_sticky_redis_binding(&self.session_bindings, session_id, binding);
+            }
+        }
+        sticky_bound_credential_id(&self.session_bindings, session_id)
     }
 
     fn bound_credential_id(&self, session_id: &str) -> Option<u64> {
@@ -2930,7 +4962,7 @@ impl MultiTokenManager {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
             if let Some(binding) = self
-                .block_on_scheduler_redis_hot("读取 Redis 会话绑定", async move {
+                .block_on_scheduler_redis_affinity("读取 Redis 会话绑定", async move {
                     redis.get_session_binding(&session_id_owned).await
                 })
             {
@@ -2940,23 +4972,15 @@ impl MultiTokenManager {
         sticky_bound_credential_id(&self.session_bindings, session_id)
     }
 
-    fn bound_credential_exists_but_unusable(&self, session_id: &str, model: Option<&str>) -> bool {
-        if let Err(err) = self.refresh_scheduler_state_from_redis() {
-            tracing::warn!("检查会话绑定可用性前同步 Redis 调度状态失败: {}", err);
-        }
-        let Some(bound_id) = self.bound_credential_id(session_id) else {
-            return false;
-        };
-
-        let entries = self.entries.lock();
-        let proxy_resources = self.proxy_resources.lock();
-        let now = Instant::now();
-        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
-        entries.iter().find(|e| e.id == bound_id).is_none_or(|e| {
-            !credential_is_temporarily_available(&proxy_resources, e, model, now, global_rpm)
-        })
+    fn bound_credential_is_permanently_unavailable(&self, bound_id: u64) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == bound_id)
+            .is_none_or(|entry| entry.disabled)
     }
 
+    #[cfg(test)]
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -2967,7 +4991,7 @@ impl MultiTokenManager {
                 soft_failure_count: 0,
             };
             if let Some(actual) =
-                self.block_on_scheduler_redis_hot("原子写入 Redis 会话绑定", async move {
+                self.block_on_scheduler_redis_affinity("原子写入 Redis 会话绑定", async move {
                     redis
                         .set_session_binding(
                             &session_id_owned,
@@ -2984,16 +5008,32 @@ impl MultiTokenManager {
         bind_sticky_session_to_credential(&self.session_bindings, session_id, credential_id);
     }
 
-    /// 清理指定会话的粘性绑定。
-    pub fn unbind_session(&self, session_id: &str) {
+    async fn bind_session_to_credential_for_request(&self, session_id: &str, credential_id: u64) {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
-            let _ = self.block_on_scheduler_redis_hot("删除 Redis 会话绑定", async move {
-                redis.delete_session_binding(&session_id_owned).await
-            });
+            let binding = SchedulerSessionBinding {
+                credential_id,
+                last_used_at: Utc::now(),
+                soft_failure_count: 0,
+            };
+            if let Some(actual) = self
+                .await_scheduler_redis_affinity("原子写入 Redis 会话绑定", async move {
+                    redis
+                        .set_session_binding(
+                            &session_id_owned,
+                            &binding,
+                            SESSION_BINDING_TTL_SECS as usize,
+                        )
+                        .await
+                })
+                .await
+            {
+                cache_sticky_redis_binding(&self.session_bindings, session_id, Some(actual));
+                return;
+            }
         }
-        unbind_sticky_session(&self.session_bindings, session_id);
+        bind_sticky_session_to_credential(&self.session_bindings, session_id, credential_id);
     }
 
     /// 仅当指定会话当前绑定到该凭据时清理绑定。
@@ -3002,7 +5042,7 @@ impl MultiTokenManager {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
             if let Some(deleted) =
-                self.block_on_scheduler_redis_hot("按凭据删除 Redis 会话绑定", async move {
+                self.block_on_scheduler_redis_affinity("按凭据删除 Redis 会话绑定", async move {
                     redis
                         .delete_session_binding_if_bound_to(&session_id_owned, credential_id)
                         .await
@@ -3027,7 +5067,7 @@ impl MultiTokenManager {
     pub fn unbind_sessions_for_credential(&self, credential_id: u64) {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
-            let _ = self.block_on_scheduler_redis_hot("删除 Redis 凭据会话绑定", async move {
+            let _ = self.block_on_scheduler_redis_affinity("删除 Redis 凭据会话绑定", async move {
                 redis.delete_sessions_for_credential(credential_id).await?;
                 Ok(())
             });
@@ -3041,7 +5081,7 @@ impl MultiTokenManager {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
             if let Some(binding) =
-                self.block_on_scheduler_redis_hot("原子记录 Redis 会话软失败", async move {
+                self.block_on_scheduler_redis_affinity("原子记录 Redis 会话软失败", async move {
                     redis
                         .record_session_soft_failure_with_state(
                             &session_id_owned,
@@ -3067,7 +5107,7 @@ impl MultiTokenManager {
             let redis = redis.clone();
             let session_id_owned = session_id.to_string();
             if let Some(binding) =
-                self.block_on_scheduler_redis_hot("原子清理 Redis 会话软失败", async move {
+                self.block_on_scheduler_redis_affinity("原子清理 Redis 会话软失败", async move {
                     redis
                         .clear_session_soft_failure_with_state(
                             &session_id_owned,
@@ -3090,7 +5130,8 @@ impl MultiTokenManager {
     /// 确保整个 API 调用过程中使用一致的凭据信息
     ///
     /// 如果 Token 过期或即将过期，会自动刷新
-    /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
+    /// 只有明确的 400 invalid_grant 会永久禁用凭据；credential auth 与 429 进入有限
+    /// 冷却，传输、上游、解析及内部协调失败只在当前请求中排除，不改变凭据健康。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -3119,6 +5160,7 @@ impl MultiTokenManager {
     /// 获取 API 调用上下文，优先保持同一会话使用同一个凭据。
     ///
     /// `excluded_ids` 只作用于本次请求，用于 sticky-aware retry 的临时 fallback。
+    #[cfg(test)]
     pub async fn acquire_context_for_session(
         &self,
         model: Option<&str>,
@@ -3140,6 +5182,7 @@ impl MultiTokenManager {
     /// `FailFastOnCapacity` 仅用于外部备用池预检：如果无法立即拿到本地凭据并发
     /// lease，不进入本地等待队列，让上层可以直接路由到外部池。默认调用仍应使用
     /// [`Self::acquire_context_for_session`]，保持原有等待/排队语义。
+    #[cfg(test)]
     pub async fn acquire_context_for_session_with_mode(
         &self,
         model: Option<&str>,
@@ -3148,10 +5191,37 @@ impl MultiTokenManager {
         acquire_mode: AcquireMode,
         request_weight_units: u32,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session_with_mode_and_auxiliary_budget(
+            model,
+            session_id,
+            excluded_ids,
+            acquire_mode,
+            request_weight_units,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn acquire_context_for_session_with_mode_and_auxiliary_budget(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        acquire_mode: AcquireMode,
+        request_weight_units: u32,
+        auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+    ) -> anyhow::Result<CallContext> {
         let request_weight_units = normalize_capacity_weight_units(request_weight_units);
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum DispatchWaitReason {
+            TemporarilyUnavailable,
+            CapacityFull,
+            RpmLimited,
+        }
         enum AcquireDecision {
             Selected(u64, KiroCredentials, bool, bool),
             WaitForDispatch {
+                reason: DispatchWaitReason,
                 available: usize,
                 total: usize,
                 global_credential_max_concurrent_requests: u32,
@@ -3164,13 +5234,64 @@ impl MultiTokenManager {
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
         let dispatch_wait_started_at = Instant::now();
+        // One request uses one stable queue deadline. Runtime config updates apply to later
+        // requests instead of changing an already-admitted Redis lease lifetime mid-wait.
+        let dispatch_max_wait = self.dispatch_max_wait(acquire_mode);
         let mut queue_guard: Option<DispatchQueueGuard> = None;
         let mut local_excluded_ids = excluded_ids.clone();
         let mut slot_race_excluded_count = 0usize;
+        let mut sticky_bound_release_grace_waited = false;
+        let mut auxiliary_refresh_error: Option<anyhow::Error> = None;
+        let mut health_neutral_refresh_error: Option<anyhow::Error> = None;
+        let request_bound_id = match session_id {
+            Some(session_id) => self.bound_credential_id_for_request(session_id).await,
+            None => None,
+        };
 
         loop {
+            let mut capacity_waiter = self.capacity_signal.register();
+
             self.refresh_scheduler_state_from_redis()?;
             self.cleanup_expired_in_flight_leases_local_first();
+            if auxiliary_refresh_error.is_none()
+                && auxiliary_attempt_budget
+                    .as_ref()
+                    .is_some_and(|budget| budget.available_attempts() == 0)
+            {
+                let budget = auxiliary_attempt_budget
+                    .as_ref()
+                    .expect("checked auxiliary attempt budget");
+                let snapshot = budget.snapshot();
+                auxiliary_refresh_error = Some(
+                    AuxiliaryAttemptBudgetExhausted {
+                        kind: AuxiliaryAttemptKind::TokenRefresh,
+                        max_attempts: snapshot.max_attempts,
+                        consumed: snapshot.consumed,
+                    }
+                    .into(),
+                );
+                let excluded = self.exclude_credentials_requiring_refresh(&mut local_excluded_ids);
+                tracing::debug!(
+                    excluded_refresh_credentials = excluded,
+                    "request auxiliary budget is exhausted; scanning only credentials that do not require refresh"
+                );
+            }
+            if auxiliary_refresh_error.is_some()
+                && !self
+                    .has_usable_credential_excluding_from_current_state(model, &local_excluded_ids)
+            {
+                return Err(auxiliary_refresh_error
+                    .take()
+                    .expect("checked auxiliary refresh error"));
+            }
+            if health_neutral_refresh_error.is_some()
+                && !self
+                    .has_usable_credential_excluding_from_current_state(model, &local_excluded_ids)
+            {
+                return Err(health_neutral_refresh_error
+                    .take()
+                    .expect("checked health-neutral refresh error"));
+            }
             if attempt_count >= max_attempts {
                 anyhow::bail!(
                     "所有账号均无法获取有效 Token（可用: {}/{}）",
@@ -3178,17 +5299,61 @@ impl MultiTokenManager {
                     total
                 );
             }
+            if let Some(bound_id) = request_bound_id {
+                if !sticky_bound_release_grace_waited
+                    && matches!(acquire_mode, AcquireMode::FailFastOnCapacityWaitForRedis(_))
+                    && self.bound_credential_is_capacity_blocked(
+                        bound_id,
+                        model,
+                        &local_excluded_ids,
+                        request_weight_units,
+                    )
+                {
+                    sticky_bound_release_grace_waited = true;
+                    let now = Instant::now();
+                    if self
+                        .dispatch_wait_exceeded(dispatch_max_wait, dispatch_wait_started_at, now)
+                        .is_none()
+                    {
+                        let grace = self
+                            .dispatch_wait_remaining(
+                                dispatch_max_wait,
+                                dispatch_wait_started_at,
+                                now,
+                            )
+                            .map(|remaining| remaining.min(STICKY_BOUND_RELEASE_PROPAGATION_GRACE))
+                            .unwrap_or(STICKY_BOUND_RELEASE_PROPAGATION_GRACE);
+                        if !grace.is_zero() {
+                            tracing::debug!(
+                                credential_id = bound_id,
+                                grace_ms = grace.as_millis() as u64,
+                                "sticky 绑定账号当前仅受容量占用阻塞，短暂等待跨实例 Redis release 可见后重试原绑定"
+                            );
+                            self.sleep_for_scheduler_redis_recovery(
+                                grace,
+                                self.dispatch_wait_remaining(
+                                    dispatch_max_wait,
+                                    dispatch_wait_started_at,
+                                    now,
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                }
+            }
 
+            let selection_reservation_guard = self.selection_reservation_gate.lock();
             let decision = {
-                let existing_bound_id = session_id.and_then(|sid| self.bound_credential_id(sid));
-                let bound_hit = session_id.and_then(|sid| {
-                    self.get_bound_credential(sid, model, &local_excluded_ids, request_weight_units)
+                let bound_hit = request_bound_id.and_then(|bound_id| {
+                    self.get_bound_credential(bound_id, model, &local_excluded_ids)
                 });
 
                 if let Some(hit) = bound_hit {
                     AcquireDecision::Selected(hit.0, hit.1, true, false)
                 } else {
-                    let fallback_from_sticky = existing_bound_id.is_some();
+                    let fallback_from_sticky = request_bound_id.is_some();
                     {
                         // 根据负载均衡策略选择；priority 模式也会在同优先级账号之间优先低并发。
                         let mut best = self.select_next_credential_excluding(
@@ -3399,10 +5564,19 @@ impl MultiTokenManager {
                                     global_has_capacity,
                                     request_weight_units,
                                 );
+                                let rate_limit_blocked = rate_limit_blocked_count(
+                                    &entries,
+                                    &proxy_resources,
+                                    model,
+                                    &local_excluded_ids,
+                                    now,
+                                    global_rpm,
+                                );
                                 if concurrency_blocked > 0
                                     && concurrency_blocked >= dispatch_candidate_count
                                 {
                                     AcquireDecision::WaitForDispatch {
+                                        reason: DispatchWaitReason::CapacityFull,
                                         available,
                                         total,
                                         global_credential_max_concurrent_requests:
@@ -3411,8 +5585,22 @@ impl MultiTokenManager {
                                             effective_concurrency_range,
                                         wait_for: None,
                                     }
+                                } else if rate_limit_blocked > 0
+                                    && rate_limit_blocked >= dispatch_candidate_count
+                                {
+                                    AcquireDecision::WaitForDispatch {
+                                        reason: DispatchWaitReason::RpmLimited,
+                                        available,
+                                        total,
+                                        global_credential_max_concurrent_requests:
+                                            max_concurrent_requests,
+                                        effective_credential_max_concurrent_requests:
+                                            effective_concurrency_range,
+                                        wait_for,
+                                    }
                                 } else {
                                     AcquireDecision::WaitForDispatch {
+                                        reason: DispatchWaitReason::TemporarilyUnavailable,
                                         available,
                                         total,
                                         global_credential_max_concurrent_requests:
@@ -3429,12 +5617,20 @@ impl MultiTokenManager {
                     }
                 }
             };
+            let prepared_slot = match &decision {
+                AcquireDecision::Selected(id, _, _, _) => {
+                    self.prepare_in_flight_slot(*id, request_weight_units)
+                }
+                AcquireDecision::WaitForDispatch { .. } => None,
+            };
+            drop(selection_reservation_guard);
 
             let (id, credentials, sticky_bound, fallback_from_sticky) = match decision {
                 AcquireDecision::Selected(id, credentials, sticky_bound, fallback_from_sticky) => {
                     (id, credentials, sticky_bound, fallback_from_sticky)
                 }
                 AcquireDecision::WaitForDispatch {
+                    reason,
                     available,
                     total,
                     global_credential_max_concurrent_requests,
@@ -3446,17 +5642,26 @@ impl MultiTokenManager {
                             .map(|duration| duration.as_secs().saturating_add(1))
                             .unwrap_or(1)
                             .max(1);
-                        anyhow::bail!(
-                            "本地账号调度容量暂不可用（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
-                            available,
-                            total,
-                            global_credential_max_concurrent_requests,
-                            effective_credential_max_concurrent_requests,
-                            retry_after_secs
-                        );
+                        if reason == DispatchWaitReason::RpmLimited {
+                            anyhow::bail!(
+                                "本地账号调度容量暂不可用（凭据 RPM 限制，可用: {}/{}, 临时可调度: 0, retry_after_secs={}）",
+                                available,
+                                total,
+                                retry_after_secs
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "本地账号调度容量暂不可用（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
+                                available,
+                                total,
+                                global_credential_max_concurrent_requests,
+                                effective_credential_max_concurrent_requests,
+                                retry_after_secs
+                            );
+                        }
                     }
                     if queue_guard.is_none() {
-                        queue_guard = self.try_enter_dispatch_queue()?;
+                        queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait)?;
                         if queue_guard.is_none() {
                             anyhow::bail!(
                                 "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -3469,23 +5674,37 @@ impl MultiTokenManager {
                     let retry_after_secs = wait_for
                         .map(|duration| duration.as_secs().saturating_add(1))
                         .unwrap_or(0);
-                    if let Some((waited, max_wait)) =
-                        self.dispatch_wait_exceeded(acquire_mode, dispatch_wait_started_at, now)
-                    {
-                        anyhow::bail!(
-                            "账号调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
-                            available,
-                            total,
-                            global_credential_max_concurrent_requests,
-                            effective_credential_max_concurrent_requests,
-                            waited.as_secs(),
-                            max_wait.as_secs(),
-                            retry_after_secs.max(1)
-                        );
+                    if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
+                        dispatch_max_wait,
+                        dispatch_wait_started_at,
+                        now,
+                    ) {
+                        if reason == DispatchWaitReason::RpmLimited {
+                            anyhow::bail!(
+                                "账号调度排队等待超时（凭据 RPM 限制，可用: {}/{}, 临时可调度: 0, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
+                                available,
+                                total,
+                                waited.as_secs(),
+                                max_wait.as_secs(),
+                                retry_after_secs.max(1)
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "账号调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
+                                available,
+                                total,
+                                global_credential_max_concurrent_requests,
+                                effective_credential_max_concurrent_requests,
+                                waited.as_secs(),
+                                max_wait.as_secs(),
+                                retry_after_secs.max(1)
+                            );
+                        }
                     }
                     tracing::debug!(
                         available,
                         total,
+                        ?reason,
                         global_credential_max_concurrent_requests,
                         effective_credential_max_concurrent_requests,
                         retry_after_secs,
@@ -3495,17 +5714,148 @@ impl MultiTokenManager {
                         .await?;
                     self.wait_for_dispatch_capacity(
                         wait_for,
-                        self.dispatch_wait_remaining(acquire_mode, dispatch_wait_started_at, now),
+                        self.dispatch_wait_remaining(
+                            dispatch_max_wait,
+                            dispatch_wait_started_at,
+                            now,
+                        ),
+                        &mut capacity_waiter,
                     )
                     .await;
                     continue;
                 }
             };
 
-            let Some(in_flight_lease) = self
-                .acquire_in_flight_slot(id, request_weight_units)
-                .await?
-            else {
+            let in_flight_lease = match prepared_slot {
+                Some(prepared) => match self.confirm_prepared_in_flight_slot(prepared).await {
+                    Ok(lease) => lease,
+                    Err(err) => {
+                        let scheduler_redis_wait = err
+                            .downcast_ref::<SchedulerRedisUnavailableError>()
+                            .map(|err| (err.retry_after_secs, err.local_overloaded));
+                        let Some((retry_after_secs, local_overloaded)) = scheduler_redis_wait
+                        else {
+                            return Err(err);
+                        };
+                        if queue_guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.has_redis_lease())
+                        {
+                            drop(queue_guard.take());
+                            return Err(err);
+                        }
+                        if acquire_mode.is_redis_degraded_fail_fast() {
+                            return Err(err);
+                        }
+                        if queue_guard.is_none() {
+                            queue_guard =
+                                self.try_enter_local_only_dispatch_queue(dispatch_max_wait);
+                            if queue_guard.is_none() {
+                                anyhow::bail!(
+                                    "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
+                                    self.max_queued_requests(),
+                                    self.global_max_concurrent_requests()
+                                );
+                            }
+                        }
+                        let now = Instant::now();
+                        if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
+                            dispatch_max_wait,
+                            dispatch_wait_started_at,
+                            now,
+                        ) {
+                            anyhow::bail!(
+                                "账号调度排队等待超时（Redis 调度协调状态不可用，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
+                                waited.as_secs(),
+                                max_wait.as_secs(),
+                                retry_after_secs.max(1)
+                            );
+                        }
+                        let wait_for = if local_overloaded {
+                            StdDuration::from_millis(100)
+                        } else {
+                            StdDuration::from_secs(retry_after_secs.clamp(1, 30))
+                        };
+                        tracing::debug!(
+                            credential_id = id,
+                            retry_after_secs,
+                            local_overloaded,
+                            "Redis 调度协调暂不可用，普通本地请求进入本进程有界等待而不是快速失败"
+                        );
+                        self.sleep_for_scheduler_redis_recovery(
+                            wait_for,
+                            self.dispatch_wait_remaining(
+                                dispatch_max_wait,
+                                dispatch_wait_started_at,
+                                now,
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let Some(in_flight_lease) = in_flight_lease else {
+                if sticky_bound {
+                    if !sticky_bound_release_grace_waited
+                        && matches!(acquire_mode, AcquireMode::FailFastOnCapacityWaitForRedis(_))
+                    {
+                        sticky_bound_release_grace_waited = true;
+                        let now = Instant::now();
+                        if self
+                            .dispatch_wait_exceeded(
+                                dispatch_max_wait,
+                                dispatch_wait_started_at,
+                                now,
+                            )
+                            .is_none()
+                        {
+                            let grace = self
+                                .dispatch_wait_remaining(
+                                    dispatch_max_wait,
+                                    dispatch_wait_started_at,
+                                    now,
+                                )
+                                .map(|remaining| {
+                                    remaining.min(STICKY_BOUND_RELEASE_PROPAGATION_GRACE)
+                                })
+                                .unwrap_or(STICKY_BOUND_RELEASE_PROPAGATION_GRACE);
+                            if !grace.is_zero() {
+                                tracing::debug!(
+                                    credential_id = id,
+                                    grace_ms = grace.as_millis() as u64,
+                                    "sticky 绑定账号并发槽暂满，短暂等待跨实例 Redis release 可见后重试原绑定"
+                                );
+                                self.sleep_for_scheduler_redis_recovery(
+                                    grace,
+                                    self.dispatch_wait_remaining(
+                                        dispatch_max_wait,
+                                        dispatch_wait_started_at,
+                                        now,
+                                    ),
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                    }
+                    if self.has_alternate_usable_credential_from_current_state(
+                        model,
+                        &local_excluded_ids,
+                        id,
+                    ) {
+                        local_excluded_ids.insert(id);
+                        attempt_count += 1;
+                        slot_race_excluded_count += 1;
+                        tracing::debug!(
+                            credential_id = id,
+                            excluded_count = local_excluded_ids.len(),
+                            "sticky 绑定账号并发槽已满，本次请求保留原绑定并临时重选"
+                        );
+                        continue;
+                    }
+                }
                 if acquire_mode.is_fail_fast() {
                     local_excluded_ids.insert(id);
                     attempt_count += 1;
@@ -3518,7 +5868,7 @@ impl MultiTokenManager {
                     continue;
                 }
                 if queue_guard.is_none() {
-                    queue_guard = self.try_enter_dispatch_queue()?;
+                    queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait)?;
                     if queue_guard.is_none() {
                         anyhow::bail!(
                             "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -3529,7 +5879,7 @@ impl MultiTokenManager {
                 }
                 let now = Instant::now();
                 if let Some((waited, max_wait)) =
-                    self.dispatch_wait_exceeded(acquire_mode, dispatch_wait_started_at, now)
+                    self.dispatch_wait_exceeded(dispatch_max_wait, dispatch_wait_started_at, now)
                 {
                     let global_credential_max_concurrent_requests = self.max_concurrent_requests();
                     let effective_credential_max_concurrent_requests = {
@@ -3563,30 +5913,180 @@ impl MultiTokenManager {
                     .await?;
                 self.wait_for_dispatch_capacity(
                     None,
-                    self.dispatch_wait_remaining(acquire_mode, dispatch_wait_started_at, now),
+                    self.dispatch_wait_remaining(dispatch_max_wait, dispatch_wait_started_at, now),
+                    &mut capacity_waiter,
                 )
                 .await;
                 continue;
             };
+            capacity_waiter.finish_acquired();
             drop(queue_guard.take());
 
             // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials, true).await {
+            match self
+                .try_ensure_token_with_auxiliary_budget(
+                    id,
+                    &credentials,
+                    true,
+                    auxiliary_attempt_budget.clone(),
+                )
+                .await
+            {
                 Ok(ctx) => {
-                    self.record_scheduler_selection(ctx.id, request_weight_units);
-                    if let Err(err) = self.mark_rate_limited_at(ctx.id, Instant::now()) {
-                        drop(in_flight_lease);
-                        return Err(err);
+                    let selection_admission = match self
+                        .reserve_scheduler_selection_for_request(ctx.id, request_weight_units)
+                        .await
+                    {
+                        Ok(admission) => admission,
+                        Err(err) => {
+                            drop(in_flight_lease);
+                            let Some(redis_error) =
+                                err.downcast_ref::<SchedulerRedisUnavailableError>()
+                            else {
+                                return Err(err);
+                            };
+                            if queue_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.has_redis_lease())
+                            {
+                                drop(queue_guard.take());
+                                return Err(err);
+                            }
+                            if acquire_mode.is_redis_degraded_fail_fast() {
+                                return Err(err);
+                            }
+                            if queue_guard.is_none() {
+                                queue_guard =
+                                    self.try_enter_local_only_dispatch_queue(dispatch_max_wait);
+                                if queue_guard.is_none() {
+                                    anyhow::bail!(
+                                        "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
+                                        self.max_queued_requests(),
+                                        self.global_max_concurrent_requests()
+                                    );
+                                }
+                            }
+                            let now = Instant::now();
+                            if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
+                                dispatch_max_wait,
+                                dispatch_wait_started_at,
+                                now,
+                            ) {
+                                anyhow::bail!(
+                                    "账号调度排队等待超时（Redis 调度协调状态不可用，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
+                                    waited.as_secs(),
+                                    max_wait.as_secs(),
+                                    redis_error.retry_after_secs.max(1)
+                                );
+                            }
+                            let wait_for = if redis_error.local_overloaded {
+                                StdDuration::from_millis(100)
+                            } else {
+                                StdDuration::from_secs(redis_error.retry_after_secs.clamp(1, 30))
+                            };
+                            tracing::debug!(
+                                credential_id = id,
+                                retry_after_secs = redis_error.retry_after_secs,
+                                local_overloaded = redis_error.local_overloaded,
+                                "Redis 调度协调暂不可用，普通本地请求进入本进程有界等待而不是快速失败"
+                            );
+                            self.sleep_for_scheduler_redis_recovery(
+                                wait_for,
+                                self.dispatch_wait_remaining(
+                                    dispatch_max_wait,
+                                    dispatch_wait_started_at,
+                                    now,
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+                    match selection_admission {
+                        SchedulerRedisSelectionAdmission::NotRequired => {
+                            self.record_scheduler_selection(ctx.id, request_weight_units, true);
+                            if let Err(err) = self.mark_rate_limited_at(ctx.id, Instant::now()) {
+                                drop(in_flight_lease);
+                                return Err(err);
+                            }
+                        }
+                        SchedulerRedisSelectionAdmission::Recorded {
+                            rate_limit_available_at,
+                        } => {
+                            self.record_scheduler_selection(ctx.id, request_weight_units, false);
+                            if rate_limit_available_at.is_none() {
+                                if let Err(err) = self.mark_rate_limited_at(ctx.id, Instant::now())
+                                {
+                                    drop(in_flight_lease);
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        SchedulerRedisSelectionAdmission::RateLimited(wait) => {
+                            drop(in_flight_lease);
+                            if acquire_mode.is_fail_fast() {
+                                anyhow::bail!(
+                                    "本地账号调度容量暂不可用（凭据 RPM 限制，retry_after_secs={}）",
+                                    wait.retry_after.as_secs().saturating_add(1).max(1)
+                                );
+                            }
+                            if queue_guard.is_none() {
+                                queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait)?;
+                                if queue_guard.is_none() {
+                                    anyhow::bail!(
+                                        "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
+                                        self.max_queued_requests(),
+                                        self.global_max_concurrent_requests()
+                                    );
+                                }
+                            }
+                            let now = Instant::now();
+                            if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
+                                dispatch_max_wait,
+                                dispatch_wait_started_at,
+                                now,
+                            ) {
+                                anyhow::bail!(
+                                    "账号调度排队等待超时（凭据 RPM 限制，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
+                                    waited.as_secs(),
+                                    max_wait.as_secs(),
+                                    wait.retry_after.as_secs().saturating_add(1)
+                                );
+                            }
+                            tracing::debug!(
+                                credential_id = id,
+                                retry_after_secs = wait.retry_after.as_secs().saturating_add(1),
+                                rate_limit_available_in_ms =
+                                    wait.available_at.saturating_duration_since(now).as_millis()
+                                        as u64,
+                                "Redis 凭据 RPM 暂不可用，进入本进程等待"
+                            );
+                            self.renew_dispatch_queue_lease_if_needed(&mut queue_guard)
+                                .await?;
+                            self.wait_for_dispatch_capacity(
+                                Some(wait.retry_after),
+                                self.dispatch_wait_remaining(
+                                    dispatch_max_wait,
+                                    dispatch_wait_started_at,
+                                    now,
+                                ),
+                                &mut capacity_waiter,
+                            )
+                            .await;
+                            continue;
+                        }
                     }
                     if let Some(sid) = session_id {
-                        if self.bound_credential_exists_but_unusable(sid, model) {
-                            self.unbind_session(sid);
-                        }
-                        let should_bind = self
-                            .bound_credential_id(sid)
-                            .is_none_or(|bound_id| bound_id == ctx.id);
+                        let should_bind = match request_bound_id {
+                            None => true,
+                            Some(bound_id) if bound_id == ctx.id => true,
+                            Some(bound_id) => {
+                                self.bound_credential_is_permanently_unavailable(bound_id)
+                            }
+                        };
                         if should_bind {
-                            self.bind_session_to_credential(sid, ctx.id);
+                            self.bind_session_to_credential_for_request(sid, ctx.id)
+                                .await;
                         }
                     }
                     return Ok(CallContext {
@@ -3597,20 +6097,92 @@ impl MultiTokenManager {
                     });
                 }
                 Err(e) => {
-                    // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                        self.report_refresh_token_invalid(id)
+                    if e.downcast_ref::<AuxiliaryAttemptBudgetExhausted>()
+                        .is_some()
+                        || e.downcast_ref::<AuxiliaryConcurrencySaturated>().is_some()
+                        || e.downcast_ref::<TokenRefreshAdmissionRejected>().is_some()
+                    {
+                        drop(in_flight_lease);
+                        attempt_count += 1;
+                        let excluded =
+                            self.exclude_credentials_requiring_refresh(&mut local_excluded_ids);
+                        tracing::warn!(
+                            credential_id = id,
+                            excluded_refresh_credentials = excluded,
+                            "auxiliary refresh admission rejected; credential health is unchanged and this request will scan only ready-token/API-key candidates"
+                        );
+                        auxiliary_refresh_error = Some(e);
+                        continue;
+                    }
+                    let failure =
+                        e.downcast_ref::<RefreshFailure>()
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                RefreshFailure::new(
+                                    RefreshFailureStage::Internal,
+                                    RefreshFailureKind::Internal,
+                                    None,
+                                    None,
+                                    false,
+                                )
+                            });
+                    tracing::warn!(
+                        credential_id = id,
+                        refresh_stage = failure.stage.as_str(),
+                        refresh_kind = failure.kind.as_str(),
+                        upstream_status = ?failure.status,
+                        retry_after_ms = ?failure
+                            .retry_after
+                            .map(|duration| duration.as_millis() as u64),
+                        send_committed = failure.send_committed,
+                        shared_failure_wave = failure.shared_failure_wave,
+                        "token refresh failed"
+                    );
+                    let has_available = if failure.shared_failure_wave {
+                        // The leader owns the credential-health mutation for this wave. A waiter
+                        // only excludes this credential from its own request; repeating an auth
+                        // cooldown, invalid-grant disable, or Retry-After here would turn caller
+                        // concurrency into health-state amplification.
+                        local_excluded_ids.insert(id);
+                        health_neutral_refresh_error = Some(failure.into());
+                        self.entries.lock().iter().any(|entry| !entry.disabled)
                     } else {
-                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                        self.report_transient_failure_kind(
-                            id,
-                            model,
-                            TransientFailureKind::Auth,
-                            None,
-                            format!("token_refresh_failure {}", e),
-                        )?;
-                        self.report_refresh_failure(id)
+                        match failure.kind {
+                            RefreshFailureKind::InvalidGrant => {
+                                self.report_refresh_token_invalid(id)
+                            }
+                            RefreshFailureKind::CredentialAuth => self
+                                .report_transient_failure_kind(
+                                    id,
+                                    None,
+                                    TransientFailureKind::Auth,
+                                    failure.retry_after,
+                                    format!(
+                                        "token_refresh_{}",
+                                        RefreshFailureKind::CredentialAuth.as_str()
+                                    ),
+                                )?,
+                            RefreshFailureKind::RateLimited => self.report_transient_failure_kind(
+                                id,
+                                None,
+                                TransientFailureKind::RateLimit,
+                                failure.retry_after,
+                                format!(
+                                    "token_refresh_{}",
+                                    RefreshFailureKind::RateLimited.as_str()
+                                ),
+                            )?,
+                            _ => {
+                                // Infrastructure, upstream availability, transport, and response
+                                // integrity failures do not describe credential health. Exclude
+                                // this credential only for the current request so it cannot be
+                                // retried in a tight loop, while leaving global health and
+                                // persisted failure counts unchanged for natural recovery.
+                                local_excluded_ids.insert(id);
+                                health_neutral_refresh_error = Some(failure.into());
+                                self.entries.lock().iter().any(|entry| !entry.disabled)
+                            }
+                        }
                     };
                     drop(in_flight_lease);
                     attempt_count += 1;
@@ -3659,25 +6231,67 @@ impl MultiTokenManager {
         id: u64,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<KiroCredentials> {
-        let store = self
-            .postgres_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("跨实例 Token 刷新等待需要 PgSQL"))?;
+        let Some(store) = self.postgres_store.as_ref() else {
+            let entries = self.entries.lock();
+            return entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| {
+                    anyhow::Error::new(RefreshFailure::new(
+                        RefreshFailureStage::Internal,
+                        RefreshFailureKind::Internal,
+                        None,
+                        None,
+                        false,
+                    ))
+                });
+        };
         let (credentials, runtime_states) = credential_pgsql_sync_until(
             "等待跨实例刷新时读取 PgSQL 权威凭据",
             deadline,
             store.load_credentials_with_runtime_state(),
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            let kind = if tokio::time::Instant::now() >= deadline {
+                RefreshFailureKind::Timeout
+            } else {
+                RefreshFailureKind::Coordination
+            };
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                kind,
+                None,
+                None,
+                false,
+            ))
+        })?;
         let latest = credentials
             .into_iter()
             .find(|credential| credential.id == Some(id))
-            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
+            .ok_or_else(|| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Coordination,
+                    None,
+                    None,
+                    false,
+                ))
+            })?;
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
             .find(|entry| entry.id == id)
-            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            .ok_or_else(|| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Internal,
+                    RefreshFailureKind::Internal,
+                    None,
+                    None,
+                    false,
+                ))
+            })?;
         if latest.storage_revision >= entry.credentials.storage_revision {
             entry.credentials = latest;
             Self::recompute_entry_disabled(entry);
@@ -3694,21 +6308,58 @@ impl MultiTokenManager {
         credentials: &KiroCredentials,
         update_refresh_health: bool,
     ) -> anyhow::Result<CallContext> {
-        self.try_ensure_token_with_budgets(
+        self.try_ensure_token_with_budgets_and_auxiliary_budget(
             id,
             credentials,
             update_refresh_health,
             TokenRefreshBudgets::default(),
+            None,
         )
         .await
     }
 
+    async fn try_ensure_token_with_auxiliary_budget(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        update_refresh_health: bool,
+        auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+    ) -> anyhow::Result<CallContext> {
+        self.try_ensure_token_with_budgets_and_auxiliary_budget(
+            id,
+            credentials,
+            update_refresh_health,
+            TokenRefreshBudgets::default(),
+            auxiliary_attempt_budget,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn try_ensure_token_with_budgets(
         &self,
         id: u64,
         credentials: &KiroCredentials,
         update_refresh_health: bool,
         budgets: TokenRefreshBudgets,
+    ) -> anyhow::Result<CallContext> {
+        self.try_ensure_token_with_budgets_and_auxiliary_budget(
+            id,
+            credentials,
+            update_refresh_health,
+            budgets,
+            None,
+        )
+        .await
+    }
+
+    async fn try_ensure_token_with_budgets_and_auxiliary_budget(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        update_refresh_health: bool,
+        budgets: TokenRefreshBudgets,
+        auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -3727,15 +6378,19 @@ impl MultiTokenManager {
             });
         }
 
-        // 第一次检查（无锁）：快速判断是否需要刷新
-        let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
+        // `is_token_expired` includes a five-minute safety margin. Using the wider ten-minute
+        // "expiring soon" window here makes a freshly issued short-lived token immediately
+        // refreshable again, so lock waiters serialize duplicate refresh sends instead of
+        // coalescing behind the first successful refresh.
+        let needs_refresh = is_token_expired(credentials);
         let deadlines = budgets.deadlines()?;
 
         let creds = if needs_refresh {
             // 同一凭据只允许一个刷新任务；不同凭据互不阻塞。
-            let refresh_lock = self.refresh_lock_for_credential(id);
+            let refresh_state = self.refresh_state_for_credential(id);
             let _guard =
-                acquire_refresh_lock_until(&refresh_lock, deadlines.coordination, id).await?;
+                acquire_refresh_lock_until(&refresh_state.gate, deadlines.coordination, id).await?;
+            let refresh_reset_generation = refresh_state.generation();
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -3747,155 +6402,390 @@ impl MultiTokenManager {
                     .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
             };
 
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                let mut redis_refresh_lock: Option<RedisRefreshLockGuard> = None;
-                let mut refreshed_by_peer = None;
-                if let Some(redis) = &self.redis_store {
-                    let redis_for_lock = redis.clone();
-                    let lock_timeout =
-                        refresh_step_timeout(deadlines.coordination, REFRESH_REDIS_LOCK_OP_TIMEOUT)
-                            .ok_or_else(|| anyhow::anyhow!("等待 Token 刷新协调超时"))?;
-                    match tokio::time::timeout(
-                        lock_timeout,
-                        redis_for_lock.acquire_refresh_lock(id, TOKEN_REFRESH_REDIS_LOCK_TTL_SECS),
+            if is_token_expired(&current_creds) {
+                let current_creds_for_proxy = self
+                    .resolve_proxy_for_credential(current_creds.clone())
+                    .map_err(|_| {
+                        anyhow::Error::new(RefreshFailure::new(
+                            RefreshFailureStage::Validation,
+                            RefreshFailureKind::InvalidConfiguration,
+                            None,
+                            None,
+                            false,
+                        ))
+                    })?;
+                let effective_proxy = current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
+                let refresh_identity = {
+                    let config = self.config.lock();
+                    RefreshAttemptIdentity::from_refresh_request(
+                        &current_creds_for_proxy,
+                        &config,
+                        effective_proxy.as_ref(),
                     )
-                    .await
+                };
+                if let Some(failure) = refresh_state.replay_failure(
+                    &refresh_identity,
+                    Instant::now(),
+                    update_refresh_health,
+                ) {
+                    tracing::debug!(
+                        credential_id = id,
+                        refresh_stage = failure.stage.as_str(),
+                        refresh_kind = failure.kind.as_str(),
+                        "coalesced token refresh caller reused the current typed failure wave"
+                    );
+                    if update_refresh_health
+                        && !failure.shared_failure_wave
+                        && refresh_failure_requires_health_action(&failure)
                     {
-                        Ok(Ok(Some(lock_token))) => {
-                            redis_refresh_lock =
-                                Some(RedisRefreshLockGuard::new(redis_for_lock, id, lock_token));
-                        }
-                        Ok(Ok(None)) => {
-                            tracing::debug!(
-                                credential_id = id,
-                                "其他实例正在刷新 Token，等待 PgSQL 凭据同步"
-                            );
-                            loop {
-                                let now = tokio::time::Instant::now();
-                                if now >= deadlines.coordination {
-                                    anyhow::bail!("等待其他实例刷新 Token 超时");
-                                }
-                                tokio::time::sleep_until(
-                                    (now + StdDuration::from_millis(500))
-                                        .min(deadlines.coordination),
+                        self.apply_refresh_health_action(id, &failure, None, deadlines.total)
+                            .await?;
+                        return Err(failure.into_shared_failure_wave().into());
+                    }
+                    return Err(failure.into());
+                }
+                let mut redis_refresh_lease: Option<RedisRefreshLease> = None;
+                let send_started = Arc::new(AtomicBool::new(false));
+                let persisted_storage_revision = Arc::new(AtomicU64::new(0));
+                let mut redis_lease_drop_guard = None;
+                let mut refreshed_by_peer = None;
+                if self.redis_store.is_some() {
+                    match self
+                        .begin_distributed_refresh_until(
+                            id,
+                            refresh_identity,
+                            update_refresh_health,
+                            deadlines.coordination,
+                        )
+                        .await?
+                    {
+                        DistributedRefreshDecision::Leader(lease) => {
+                            redis_lease_drop_guard = self.redis_store.as_ref().map(|redis| {
+                                RedisRefreshLeaseDropGuard::new(
+                                    redis.clone(),
+                                    self.postgres_store.clone(),
+                                    lease.clone(),
+                                    send_started.clone(),
+                                    persisted_storage_revision.clone(),
+                                    current_creds.access_token.clone(),
                                 )
-                                .await;
-                                let latest = match self
-                                    .reload_credential_for_refresh_until(id, deadlines.coordination)
-                                    .await
-                                {
-                                    Ok(latest) => latest,
-                                    Err(err)
-                                        if tokio::time::Instant::now() < deadlines.coordination =>
-                                    {
-                                        tracing::warn!(
-                                            credential_id = id,
-                                            "等待跨实例刷新时读取 PgSQL 失败，将在总期限内重试: {}",
-                                            err
-                                        );
-                                        continue;
-                                    }
-                                    Err(err) => return Err(err),
-                                };
-                                if !is_token_expired(&latest) && !is_token_expiring_soon(&latest) {
-                                    tracing::debug!(
-                                        credential_id = id,
-                                        "Token 已由其他实例刷新，跳过本实例刷新"
-                                    );
-                                    refreshed_by_peer = Some(latest);
-                                    break;
-                                }
+                            });
+                            redis_refresh_lease = Some(lease);
+                        }
+                        DistributedRefreshDecision::Replay(failure) => {
+                            return Err(failure.into());
+                        }
+                        DistributedRefreshDecision::Succeeded {
+                            generation,
+                            storage_revision,
+                        } => {
+                            let latest = self
+                                .reload_credential_for_refresh_until(id, deadlines.coordination)
+                                .await?;
+                            let token_changed = latest.access_token != current_creds.access_token;
+                            if latest.storage_revision < storage_revision
+                                || storage_revision == 0
+                                || is_token_expired(&latest)
+                                || !token_changed
+                            {
+                                tracing::warn!(
+                                    credential_id = id,
+                                    refresh_generation = generation,
+                                    announced_storage_revision = storage_revision,
+                                    authoritative_storage_revision = latest.storage_revision,
+                                    token_changed,
+                                    "Redis refresh success did not match the PostgreSQL authority"
+                                );
+                                return Err(RefreshFailure::new(
+                                    RefreshFailureStage::Coordination,
+                                    RefreshFailureKind::Coordination,
+                                    None,
+                                    None,
+                                    false,
+                                )
+                                .into());
                             }
+                            refreshed_by_peer = Some(latest);
                         }
-                        Ok(Err(err)) => {
-                            anyhow::bail!("获取 Redis Token 刷新锁失败: {}", err);
-                        }
-                        Err(_) => anyhow::bail!(
-                            "获取 Redis Token 刷新锁超过 {}ms",
-                            REFRESH_REDIS_LOCK_OP_TIMEOUT.as_millis()
-                        ),
                     }
                 }
 
                 if let Some(latest) = refreshed_by_peer {
+                    refresh_state.clear_failure();
                     latest
                 } else {
+                    let (refresh_source, refresh_source_for_proxy, refresh_effective_proxy) =
+                        if let Some(lease) = redis_refresh_lease.as_ref() {
+                            let authoritative = self
+                                .reload_credential_for_refresh_until(id, deadlines.coordination)
+                                .await?;
+                            Self::ensure_refresh_state_generation(
+                                &refresh_state,
+                                refresh_reset_generation,
+                                false,
+                            )?;
+                            let authoritative_for_proxy = self
+                                .resolve_proxy_for_credential(authoritative.clone())
+                                .map_err(|_| {
+                                    anyhow::Error::new(RefreshFailure::new(
+                                        RefreshFailureStage::Validation,
+                                        RefreshFailureKind::InvalidConfiguration,
+                                        None,
+                                        None,
+                                        false,
+                                    ))
+                                })?;
+                            let authoritative_proxy =
+                                authoritative_for_proxy.effective_proxy(self.proxy.as_ref());
+                            let authoritative_identity = {
+                                let config = self.config.lock();
+                                RefreshAttemptIdentity::from_refresh_request(
+                                    &authoritative_for_proxy,
+                                    &config,
+                                    authoritative_proxy.as_ref(),
+                                )
+                            };
+                            if lease.identity != authoritative_identity.0 {
+                                let failure = RefreshFailure::new(
+                                    RefreshFailureStage::Coordination,
+                                    RefreshFailureKind::Coordination,
+                                    None,
+                                    None,
+                                    false,
+                                );
+                                let failure = self
+                                    .complete_distributed_refresh_failure_until(
+                                        lease,
+                                        &failure,
+                                        false,
+                                        deadlines.total,
+                                    )
+                                    .await?;
+                                if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                                    guard.disarm();
+                                }
+                                return Err(failure.into());
+                            }
+                            (authoritative, authoritative_for_proxy, authoritative_proxy)
+                        } else {
+                            (
+                                current_creds.clone(),
+                                current_creds_for_proxy.clone(),
+                                effective_proxy.clone(),
+                            )
+                        };
+                    let mut cancellation_guard = RefreshFailureWaveDropGuard::new(
+                        refresh_state.clone(),
+                        refresh_identity,
+                        refresh_reset_generation,
+                        send_started.clone(),
+                    );
                     let refreshed_and_persisted = async {
-                        let current_creds_for_proxy =
-                            self.resolve_proxy_for_credential(current_creds.clone())?;
-                        let effective_proxy =
-                            current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
+                        // Validate the final refresh source after any Redis/PostgreSQL authority
+                        // reload, but before constructing an HTTP client or consuming admission.
+                        // Invalid local configuration is health-neutral and must not create
+                        // avoidable client-cache/RPM/concurrency pressure during a failure wave.
+                        validate_refresh_token(&refresh_source_for_proxy)?;
                         let config = self.runtime_config();
-                        let mut new_creds = refresh_token_until(
-                            &current_creds_for_proxy,
+                        let admission = RefreshSendAdmission::new_with_send_started_marker(
+                            auxiliary_attempt_budget.clone(),
+                            self.auxiliary_concurrency_controller(),
+                            self.auxiliary_runtime.token_refresh_admission_controller(),
+                            send_started.clone(),
+                        );
+                        let client = self
+                            .refresh_http_client(
+                                config.tls_backend,
+                                refresh_effective_proxy.as_ref(),
+                            )
+                            .await
+                            .map_err(|_| {
+                                anyhow::Error::new(RefreshFailure::new(
+                                    RefreshFailureStage::Internal,
+                                    RefreshFailureKind::Internal,
+                                    None,
+                                    None,
+                                    false,
+                                ))
+                            })?;
+                        let refresh_result = refresh_token_until(
+                            &refresh_source_for_proxy,
                             &config,
-                            effective_proxy.as_ref(),
+                            client,
+                            Some(admission),
                             deadlines.work,
                             "Token 刷新上游阶段",
                         )
-                        .await?;
-                        new_creds.proxy_url = current_creds.proxy_url.clone();
-                        new_creds.proxy_username = current_creds.proxy_username.clone();
-                        new_creds.proxy_password = current_creds.proxy_password.clone();
-                        new_creds.proxy_resource_id = current_creds.proxy_resource_id;
+                        .await;
+                        let mut new_creds = refresh_result?;
+                        Self::ensure_refresh_state_generation(
+                            &refresh_state,
+                            refresh_reset_generation,
+                            true,
+                        )?;
+                        new_creds.proxy_url = refresh_source.proxy_url.clone();
+                        new_creds.proxy_username = refresh_source.proxy_username.clone();
+                        new_creds.proxy_password = refresh_source.proxy_password.clone();
+                        new_creds.proxy_resource_id = refresh_source.proxy_resource_id;
 
-                        if is_token_expired(&new_creds) {
-                            anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+                        if is_token_expired(&new_creds)
+                            || new_creds.access_token == refresh_source.access_token
+                        {
+                            return Err(RefreshFailure::new(
+                                RefreshFailureStage::ResponseValidate,
+                                RefreshFailureKind::MissingToken,
+                                Some(200),
+                                None,
+                                true,
+                            )
+                            .into());
                         }
 
                         new_creds = self
                             .persist_refreshed_credential_fields(
                                 id,
-                                &current_creds,
+                                &refresh_source,
                                 new_creds,
                                 true,
+                                None,
                                 deadlines.work,
                                 deadlines.total,
                             )
-                            .await?;
-
-                        {
-                            let mut entries = self.entries.lock();
-                            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                                Self::merge_refresh_fields(&mut entry.credentials, &new_creds);
-                            }
-                        }
-
-                        if let Some(redis) = &self.redis_store {
-                            let payload = serde_json::json!({
-                                "kind": "credentials_changed",
-                                "reason": "token_refreshed",
-                                "changedAt": Utc::now().to_rfc3339(),
-                            })
-                            .to_string();
-                            match tokio::time::timeout_at(
-                                deadlines.total,
-                                redis.publish_credentials_changed(payload),
-                            )
                             .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(err)) => tracing::warn!(
-                                    credential_id = id,
-                                    "发布 Token 刷新通知失败，其他实例将通过定时同步恢复: {}",
-                                    err
-                                ),
-                                Err(_) => tracing::warn!(
-                                    credential_id = id,
-                                    "发布 Token 刷新通知超过总期限，其他实例将通过定时同步恢复"
-                                ),
-                            }
-                        }
+                            .map_err(|_| {
+                                anyhow::Error::new(RefreshFailure::new(
+                                    RefreshFailureStage::Persistence,
+                                    RefreshFailureKind::Persistence,
+                                    None,
+                                    None,
+                                    true,
+                                ))
+                            })?;
+                        persisted_storage_revision
+                            .store(new_creds.storage_revision, Ordering::Release);
                         Ok::<KiroCredentials, anyhow::Error>(new_creds)
                     }
                     .await;
-                    if let Some(redis_refresh_lock) = redis_refresh_lock {
-                        redis_refresh_lock.release().await;
+                    if redis_refresh_lease.is_some() {
+                        cancellation_guard.disarm();
                     }
-                    refreshed_and_persisted?
+                    let refreshed = match (redis_refresh_lease.as_ref(), refreshed_and_persisted) {
+                        (Some(lease), Ok(refreshed)) => {
+                            Self::ensure_refresh_state_generation(
+                                &refresh_state,
+                                refresh_reset_generation,
+                                true,
+                            )?;
+                            self.complete_or_cancel_distributed_refresh_success_until(
+                                lease,
+                                refreshed.storage_revision,
+                                deadlines.total,
+                            )
+                            .await?;
+                            if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                                guard.disarm();
+                            }
+                            refreshed
+                        }
+                        (Some(lease), Err(error)) => {
+                            let synthetic_failure = RefreshFailure::new(
+                                RefreshFailureStage::Coordination,
+                                RefreshFailureKind::Coordination,
+                                None,
+                                None,
+                                false,
+                            );
+                            let failure = error
+                                .downcast_ref::<RefreshFailure>()
+                                .unwrap_or(&synthetic_failure);
+                            let shared = self
+                                .complete_distributed_refresh_failure_until(
+                                    lease,
+                                    failure,
+                                    update_refresh_health,
+                                    deadlines.total,
+                                )
+                                .await?;
+                            if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                                guard.disarm();
+                            }
+                            if error.downcast_ref::<RefreshFailure>().is_some() {
+                                return Err(shared.into());
+                            }
+                            return Err(error);
+                        }
+                        (None, Ok(refreshed)) => refreshed,
+                        (None, Err(error)) => {
+                            if let Some(failure) = error.downcast_ref::<RefreshFailure>() {
+                                refresh_state.record_failure(
+                                    refresh_identity,
+                                    failure,
+                                    Instant::now(),
+                                    update_refresh_health,
+                                );
+                                cancellation_guard.disarm();
+                                if update_refresh_health
+                                    && refresh_failure_requires_health_action(failure)
+                                {
+                                    self.apply_refresh_health_action(
+                                        id,
+                                        failure,
+                                        None,
+                                        deadlines.total,
+                                    )
+                                    .await?;
+                                    return Err(failure.clone().into_shared_failure_wave().into());
+                                }
+                            }
+                            if !send_started.load(Ordering::Acquire) {
+                                cancellation_guard.disarm();
+                            }
+                            return Err(error);
+                        }
+                    };
+                    Self::ensure_refresh_state_generation(
+                        &refresh_state,
+                        refresh_reset_generation,
+                        true,
+                    )?;
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                            Self::merge_refresh_fields(&mut entry.credentials, &refreshed);
+                        }
+                    }
+                    if let Some(redis) = &self.redis_store {
+                        let payload = serde_json::json!({
+                            "kind": "credentials_changed",
+                            "reason": "token_refreshed",
+                            "changedAt": Utc::now().to_rfc3339(),
+                        })
+                        .to_string();
+                        match tokio::time::timeout_at(
+                            deadlines.total,
+                            redis.publish_credentials_changed(payload),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => tracing::warn!(
+                                credential_id = id,
+                                "发布 Token 刷新通知失败，其他实例将通过定时同步恢复: {}",
+                                err
+                            ),
+                            Err(_) => tracing::warn!(
+                                credential_id = id,
+                                "发布 Token 刷新通知超过总期限，其他实例将通过定时同步恢复"
+                            ),
+                        }
+                    }
+                    cancellation_guard.disarm();
+                    refresh_state.clear_failure();
+                    refreshed
                 }
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
+                refresh_state.clear_failure();
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
                 current_creds
             }
@@ -4173,6 +7063,7 @@ impl MultiTokenManager {
         expected_credentials: &KiroCredentials,
         refreshed_credentials: KiroCredentials,
         accept_fresh_conflict: bool,
+        rejected_access_token: Option<&str>,
         work_deadline: tokio::time::Instant,
         reconciliation_deadline: tokio::time::Instant,
     ) -> anyhow::Result<KiroCredentials> {
@@ -4239,7 +7130,9 @@ impl MultiTokenManager {
             } if Self::refresh_fields_match(&current, &patch)
                 || (accept_fresh_conflict
                     && !is_token_expired(&current)
-                    && !is_token_expiring_soon(&current)) =>
+                    && rejected_access_token.is_none_or(|rejected| {
+                        current.access_token.as_deref() != Some(rejected)
+                    })) =>
             {
                 tracing::debug!(
                     credential_id = id,
@@ -4269,7 +7162,7 @@ impl MultiTokenManager {
             .and_then(DisabledReason::from_str);
         let next_reason = persisted_reason
             .or_else(|| entry.credentials.disabled.then_some(DisabledReason::Manual));
-        let next_disabled = entry.runtime_persistence_degraded || next_reason.is_some();
+        let next_disabled = entry.runtime_persistence_quarantined || next_reason.is_some();
         let changed = entry.failure_count != state.failure_count
             || entry.refresh_failure_count != state.refresh_failure_count
             || entry.warmup_remaining != state.warmup_remaining
@@ -4290,7 +7183,7 @@ impl MultiTokenManager {
         if entry.credentials.disabled && entry.disabled_reason.is_none() {
             entry.disabled_reason = Some(DisabledReason::Manual);
         }
-        entry.disabled = entry.runtime_persistence_degraded
+        entry.disabled = entry.runtime_persistence_quarantined
             || entry.credentials.disabled
             || entry.disabled_reason.is_some();
     }
@@ -4401,6 +7294,7 @@ impl MultiTokenManager {
             let saved = Self::merge_credential_update(base, requested, &current)?;
             entry.credentials = saved.clone();
             Self::recompute_entry_disabled(entry);
+            self.invalidate_model_capability_cohorts();
             return Ok(saved);
         };
 
@@ -4411,6 +7305,7 @@ impl MultiTokenManager {
                 Self::recompute_entry_disabled(entry);
             }
         }
+        self.invalidate_model_capability_cohorts();
         Ok(saved)
     }
 
@@ -4476,6 +7371,7 @@ impl MultiTokenManager {
             }
             entry.credentials = saved.clone();
             Self::recompute_entry_disabled(entry);
+            self.invalidate_model_capability_cohorts();
             return Ok(saved);
         };
         if self.has_pending_runtime_mutations(id)
@@ -4592,6 +7488,7 @@ impl MultiTokenManager {
                 }
             }
         }
+        self.invalidate_model_capability_cohorts();
         Ok(saved)
     }
 
@@ -4649,7 +7546,7 @@ impl MultiTokenManager {
         if entries.len() != before_len {
             changed = true;
         }
-        self.retain_refresh_locks_for_ids(&non_deleted_ids);
+        self.retain_refresh_states_for_ids(&non_deleted_ids);
         let existing_ids: HashSet<u64> = entries.iter().map(|entry| entry.id).collect();
         for entry in entries.iter_mut() {
             if let Some(credential) = by_id.get(&entry.id) {
@@ -4715,6 +7612,7 @@ impl MultiTokenManager {
                 runtime_revision: 0,
                 runtime_generation: 0,
                 runtime_persistence_degraded: false,
+                runtime_persistence_quarantined: false,
                 success_count: 0,
                 total_selection_count: 0,
                 last_used_at: None,
@@ -4747,7 +7645,9 @@ impl MultiTokenManager {
         }
         if changed {
             self.select_highest_priority();
-            self.invalidate_local_pool_route_state_cache();
+        }
+        if changed || proxy_changed {
+            self.invalidate_model_capability_cohorts();
         }
         Ok(changed || proxy_changed)
     }
@@ -4779,18 +7679,19 @@ impl MultiTokenManager {
         if changed {
             *current = next;
             tracing::info!("已重新加载 {} 个代理资源", current.len());
-            self.invalidate_local_pool_route_state_cache();
+        }
+        drop(current);
+        if changed {
+            self.invalidate_model_capability_cohorts();
         }
         Ok(changed)
     }
 
     fn publish_runtime_config_changed(&self, version: Option<i64>, reason: &str) {
-        self.invalidate_local_pool_route_state_cache();
         publish_redis_runtime_config_changed(self.redis_store.as_ref(), version, reason);
     }
 
     fn publish_credentials_changed(&self, reason: &str) {
-        self.invalidate_local_pool_route_state_cache();
         publish_redis_credentials_changed(
             self.postgres_store.as_ref(),
             self.redis_store.as_ref(),
@@ -4803,7 +7704,36 @@ impl MultiTokenManager {
     }
 
     pub(crate) fn notify_dispatch_state_changed(&self) {
-        self.in_flight_notify.notify_waiters();
+        self.capacity_signal.notify_state_changed();
+    }
+
+    pub(crate) fn notify_remote_dispatch_state_changed(&self, payload: &str) -> bool {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(payload) else {
+            tracing::debug!("忽略无法解析的 Redis dispatch wakeup");
+            return false;
+        };
+        if event
+            .get("sourceInstanceId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|source| source == self.scheduler_instance_id.as_ref())
+        {
+            return false;
+        }
+
+        if let Some(credential_id) = event
+            .get("credentialId")
+            .and_then(serde_json::Value::as_u64)
+        {
+            self.scheduler_redis_dirty_credential_ids
+                .lock()
+                .insert(credential_id);
+        } else {
+            self.scheduler_redis_full_sync_requested
+                .fetch_add(1, Ordering::AcqRel);
+            *self.last_scheduler_redis_sync_at.lock() = None;
+        }
+        self.refresh_scheduler_state_from_redis_best_effort();
+        true
     }
 
     /// 从 PgSQL 加载统计数据并应用到当前条目。
@@ -5038,21 +7968,27 @@ impl MultiTokenManager {
             return false;
         };
         let operation_id = mutation.operation_id();
-        let over_soft_budget = {
+        let mutation_requires_quarantine = mutation.requires_dispatch_quarantine();
+        let (over_soft_budget, requires_quarantine) = {
             let mut pending = self.pending_runtime_mutations.lock();
             if pending.values().any(|queue| {
                 queue
                     .iter()
                     .any(|queued| queued.operation_id() == operation_id)
             }) {
-                false
+                let requires_quarantine = pending.get(&id).is_some_and(|queue| {
+                    queue.iter().any(|item| item.requires_dispatch_quarantine())
+                });
+                (false, requires_quarantine)
             } else {
                 let total = pending.values().map(VecDeque::len).sum::<usize>();
                 let queue = pending.entry(id).or_default();
                 let over_soft_budget = total >= SOFT_PENDING_RUNTIME_MUTATIONS_TOTAL
                     || queue.len() >= SOFT_PENDING_RUNTIME_MUTATIONS_PER_CREDENTIAL;
+                let requires_quarantine = mutation_requires_quarantine
+                    || queue.iter().any(|item| item.requires_dispatch_quarantine());
                 queue.push_back(mutation);
-                over_soft_budget
+                (over_soft_budget, requires_quarantine)
             }
         };
         if over_soft_budget {
@@ -5064,14 +8000,14 @@ impl MultiTokenManager {
                 credential_id = id,
                 %operation_id,
                 overflow,
-                "PgSQL 凭据运行态 FIFO 超过软预算；为避免丢失已在途结果仍保留 mutation，新请求继续隔离"
+                "PgSQL 凭据运行态 FIFO 超过软预算；为避免丢失已在途结果仍保留 mutation，仅含调度状态转换的队列继续隔离"
             );
         }
         entries[entry_index].runtime_persistence_degraded = true;
-        entries[entry_index].disabled = true;
+        entries[entry_index].runtime_persistence_quarantined = requires_quarantine;
+        Self::recompute_entry_disabled(&mut entries[entry_index]);
         drop(entries);
         self.mark_stats_dirty();
-        self.invalidate_local_pool_route_state_cache();
         true
     }
 
@@ -5110,6 +8046,7 @@ impl MultiTokenManager {
                     credential_disabled: Some(result.credential_disabled),
                     applied: result.applied,
                 }),
+            #[cfg(test)]
             PendingCredentialRuntimeMutation::RefreshFailure {
                 operation_id,
                 expected_generation,
@@ -5262,9 +8199,10 @@ impl MultiTokenManager {
                 }
                 round_succeeded = true;
                 persisted_any = true;
-                let queue_empty = {
+                let (queue_empty, requires_quarantine) = {
                     let mut pending = self.pending_runtime_mutations.lock();
                     let mut queue_empty = false;
+                    let mut requires_quarantine = false;
                     if let Some(queue) = pending.get_mut(&id) {
                         if queue
                             .front()
@@ -5273,22 +8211,21 @@ impl MultiTokenManager {
                             queue.pop_front();
                         }
                         queue_empty = queue.is_empty();
+                        requires_quarantine =
+                            queue.iter().any(|item| item.requires_dispatch_quarantine());
                     }
                     if queue_empty {
                         pending.remove(&id);
                     }
-                    queue_empty
+                    (queue_empty, requires_quarantine)
                 };
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
                         entry.runtime_persistence_degraded = !queue_empty;
+                        entry.runtime_persistence_quarantined = requires_quarantine;
                         Self::apply_persisted_runtime_mutation_to_entry(entry, &persisted);
-                        if entry.runtime_persistence_degraded {
-                            entry.disabled = true;
-                        } else {
-                            Self::recompute_entry_disabled(entry);
-                        }
+                        Self::recompute_entry_disabled(entry);
                     }
                 }
                 recovered_any |= queue_empty;
@@ -5302,7 +8239,7 @@ impl MultiTokenManager {
         }
         if recovered_any {
             self.select_highest_priority();
-            self.invalidate_local_pool_route_state_cache();
+            self.invalidate_model_capability_cohorts();
             self.notify_dispatch_state_changed();
             self.publish_credentials_changed("credential_runtime_persistence_recovered");
         }
@@ -5493,12 +8430,7 @@ impl MultiTokenManager {
                             Self::apply_runtime_mutation_result_to_entry(entry, &result);
                             entry.disabled
                         };
-                        let mut pending = self.pending_stats_deltas.lock();
-                        let entry = pending.entry(id).or_default();
-                        entry.success_delta = entry.success_delta.saturating_add(1);
-                        entry.last_used_at = Some(last_used_at.to_string());
-                        drop(pending);
-                        self.mark_stats_dirty();
+                        self.record_success_stats_delta(id, last_used_at);
                         return disabled;
                     }
                     Err(err) => {
@@ -5520,18 +8452,21 @@ impl MultiTokenManager {
             }
         }
 
-        {
-            let mut pending = self.pending_stats_deltas.lock();
-            let entry = pending.entry(id).or_default();
-            entry.success_delta = entry.success_delta.saturating_add(1);
-            entry.last_used_at = Some(last_used_at.to_string());
-        }
-        self.mark_stats_dirty();
+        self.record_success_stats_delta(id, last_used_at);
         self.entries
             .lock()
             .iter()
             .find(|entry| entry.id == id)
             .is_some_and(|entry| entry.disabled)
+    }
+
+    fn record_success_stats_delta(&self, id: u64, last_used_at: &str) {
+        let mut pending = self.pending_stats_deltas.lock();
+        let entry = pending.entry(id).or_default();
+        entry.success_delta = entry.success_delta.saturating_add(1);
+        entry.last_used_at = Some(last_used_at.to_string());
+        drop(pending);
+        self.mark_stats_dirty();
     }
 
     fn persist_disabled_state(
@@ -5807,15 +8742,19 @@ impl MultiTokenManager {
     }
 
     fn refresh_scheduler_state_from_redis(&self) -> anyhow::Result<()> {
-        if self.redis_store.is_none() {
+        let Some(redis) = &self.redis_store else {
             return Ok(());
-        }
-        if !self.scheduler_redis_hot_path_allowed() {
-            return Ok(());
-        }
+        };
 
         let now = Instant::now();
-        {
+        let targeted_dirty = !self.scheduler_redis_dirty_credential_ids.lock().is_empty();
+        let full_sync_dirty = self
+            .scheduler_redis_full_sync_requested
+            .load(Ordering::Acquire)
+            != self
+                .scheduler_redis_full_sync_applied
+                .load(Ordering::Acquire);
+        if !targeted_dirty && !full_sync_dirty {
             let mut last_sync_at = self.last_scheduler_redis_sync_at.lock();
             if last_sync_at.is_some_and(|last| {
                 now.saturating_duration_since(last) < SCHEDULER_REDIS_SYNC_MIN_INTERVAL
@@ -5823,24 +8762,22 @@ impl MultiTokenManager {
                 return Ok(());
             }
             *last_sync_at = Some(now);
-        }
-
-        let Some(redis) = &self.redis_store else {
-            return Ok(());
-        };
-        let ids: Vec<u64> = {
-            let entries = self.entries.lock();
-            entries.iter().map(|entry| entry.id).collect()
-        };
-        if ids.is_empty() {
-            return Ok(());
+            self.scheduler_redis_full_sync_requested
+                .fetch_add(1, Ordering::AcqRel);
         }
 
         if self
             .scheduler_redis_sync_in_flight
-            .swap(true, Ordering::AcqRel)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             return Ok(());
+        }
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.scheduler_redis_sync_in_flight
+                .store(false, Ordering::Release);
+            return self.refresh_scheduler_state_from_redis_force();
         }
 
         let redis = redis.clone();
@@ -5853,54 +8790,135 @@ impl MultiTokenManager {
                     .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
             )
         };
-        let local_pool_route_state_cache = self.local_pool_route_state_cache.clone();
         let sync_in_flight = self.scheduler_redis_sync_in_flight.clone();
+        let full_sync_requested = self.scheduler_redis_full_sync_requested.clone();
+        let full_sync_applied = self.scheduler_redis_full_sync_applied.clone();
+        let dirty_credential_ids = self.scheduler_redis_dirty_credential_ids.clone();
+        let last_sync_at = self.last_scheduler_redis_sync_at.clone();
+        let capacity_signal = self.capacity_signal.clone();
         let released_lease_tombstones = self.released_in_flight_lease_tombstones.clone();
+        let breaker = self.scheduler_redis_snapshot_breaker.clone();
 
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                let result = tokio::time::timeout(
-                    SCHEDULER_REDIS_HOT_OP_TIMEOUT,
-                    redis.scheduler_state_for_credentials(&ids),
-                )
-                .await;
-                match result {
-                    Ok(Ok(mut states)) => {
-                        filter_released_in_flight_leases_from_scheduler_states(
-                            &released_lease_tombstones,
-                            &mut states,
-                        );
-                        apply_redis_scheduler_states_with_global_rpm(
-                            &entries,
-                            config_rpm,
-                            in_flight_max_age,
-                            states,
-                        );
-                        local_pool_route_state_cache.lock().clear();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SCHEDULER_REDIS_REMOTE_SYNC_DEBOUNCE).await;
+                let target_full_generation = full_sync_requested.load(Ordering::Acquire);
+                let full_sync = target_full_generation != full_sync_applied.load(Ordering::Acquire);
+                let ids = if full_sync {
+                    dirty_credential_ids.lock().clear();
+                    entries
+                        .lock()
+                        .iter()
+                        .map(|entry| entry.id)
+                        .collect::<Vec<_>>()
+                } else {
+                    dirty_credential_ids.lock().drain().collect::<Vec<_>>()
+                };
+
+                if ids.is_empty() {
+                    if full_sync {
+                        full_sync_applied.store(target_full_generation, Ordering::Release);
+                        *last_sync_at.lock() = Some(Instant::now());
                     }
-                    Ok(Err(err)) => {
-                        tracing::debug!(
-                            operation = "从 Redis 后台同步调度运行态",
-                            "Redis 调度状态后台同步失败，沿用本地调度缓存: {}",
-                            err
-                        );
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            operation = "从 Redis 后台同步调度运行态",
-                            timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
-                            "Redis 调度状态后台同步未在预算内完成，沿用本地调度缓存"
-                        );
+                } else {
+                    let result = Self::execute_scheduler_redis_operation(
+                        breaker.clone(),
+                        SCHEDULER_REDIS_SNAPSHOT_OP_TIMEOUT,
+                        if full_sync {
+                            "从 Redis 后台全量同步调度运行态"
+                        } else {
+                            "从 Redis 后台定点同步调度运行态"
+                        },
+                        || {},
+                        redis.scheduler_state_for_credentials(&ids),
+                    )
+                    .await;
+                    match result {
+                        SchedulerRedisExecutionOutcome::Completed(mut states) => {
+                            filter_released_in_flight_leases_from_scheduler_states(
+                                &released_lease_tombstones,
+                                &mut states,
+                            );
+                            if full_sync {
+                                apply_redis_scheduler_states_with_global_rpm(
+                                    &entries,
+                                    config_rpm,
+                                    in_flight_max_age,
+                                    states,
+                                );
+                                full_sync_applied.store(target_full_generation, Ordering::Release);
+                                *last_sync_at.lock() = Some(Instant::now());
+                            } else {
+                                apply_redis_scheduler_states_for_ids_with_global_rpm(
+                                    &entries,
+                                    config_rpm,
+                                    in_flight_max_age,
+                                    states,
+                                );
+                            }
+                            capacity_signal.notify_state_changed();
+                        }
+                        SchedulerRedisExecutionOutcome::NotStarted(reason) => {
+                            if full_sync {
+                                *last_sync_at.lock() = None;
+                            } else {
+                                dirty_credential_ids.lock().extend(ids.iter().copied());
+                            }
+                            tracing::debug!(
+                                operation = "从 Redis 后台同步调度运行态",
+                                ?reason,
+                                "Redis 调度状态后台同步未准入，沿用本地调度缓存"
+                            );
+                            let delay = breaker.retry_after().unwrap_or_else(|| {
+                                SCHEDULER_REDIS_SYNC_MIN_INTERVAL
+                                    .saturating_mul(2)
+                                    .min(SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX)
+                            });
+                            tokio::time::sleep(delay).await;
+                        }
+                        SchedulerRedisExecutionOutcome::Failed { .. } => {
+                            if full_sync {
+                                *last_sync_at.lock() = None;
+                            } else {
+                                dirty_credential_ids.lock().extend(ids.iter().copied());
+                            }
+                            tracing::debug!(
+                                operation = "从 Redis 后台同步调度运行态",
+                                timeout_ms = SCHEDULER_REDIS_SNAPSHOT_OP_TIMEOUT.as_millis() as u64,
+                                "Redis 调度状态后台同步失败，沿用本地调度缓存"
+                            );
+                            let delay = breaker.retry_after().unwrap_or_else(|| {
+                                SCHEDULER_REDIS_SYNC_MIN_INTERVAL
+                                    .saturating_mul(2)
+                                    .min(SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX)
+                            });
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
-                sync_in_flight.store(false, Ordering::Release);
-            });
-            return Ok(());
-        }
 
-        self.scheduler_redis_sync_in_flight
-            .store(false, Ordering::Release);
-        self.refresh_scheduler_state_from_redis_force()
+                let still_dirty = full_sync_requested.load(Ordering::Acquire)
+                    != full_sync_applied.load(Ordering::Acquire)
+                    || !dirty_credential_ids.lock().is_empty();
+                if still_dirty {
+                    continue;
+                }
+
+                sync_in_flight.store(false, Ordering::Release);
+                let raced_dirty = full_sync_requested.load(Ordering::Acquire)
+                    != full_sync_applied.load(Ordering::Acquire)
+                    || !dirty_credential_ids.lock().is_empty();
+                if raced_dirty
+                    && sync_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+        });
+        Ok(())
     }
 
     fn refresh_scheduler_state_from_redis_force(&self) -> anyhow::Result<()> {
@@ -5923,6 +8941,13 @@ impl MultiTokenManager {
         {
             self.apply_scheduler_states(states);
             *self.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
+            let requested = self
+                .scheduler_redis_full_sync_requested
+                .load(Ordering::Acquire);
+            self.scheduler_redis_full_sync_applied
+                .store(requested, Ordering::Release);
+            self.scheduler_redis_dirty_credential_ids.lock().clear();
+            self.capacity_signal.notify_state_changed();
         }
         Ok(())
     }
@@ -5976,7 +9001,6 @@ impl MultiTokenManager {
             &mut states,
         );
         apply_redis_scheduler_states(&self.entries, &self.config, states);
-        self.invalidate_local_pool_route_state_cache();
     }
 
     fn apply_scheduler_states_for_ids(&self, mut states: HashMap<u64, SchedulerCredentialState>) {
@@ -5985,10 +9009,14 @@ impl MultiTokenManager {
             &mut states,
         );
         apply_redis_scheduler_states_for_ids(&self.entries, &self.config, states);
-        self.invalidate_local_pool_route_state_cache();
     }
 
-    fn record_scheduler_selection(&self, id: u64, request_weight_units: u32) {
+    fn record_scheduler_selection(
+        &self,
+        id: u64,
+        request_weight_units: u32,
+        record_in_redis: bool,
+    ) {
         let request_weight_units = normalize_capacity_weight_units(request_weight_units);
         let now = Instant::now();
         {
@@ -5997,23 +9025,25 @@ impl MultiTokenManager {
                 record_local_selection(entry, now, request_weight_units);
             }
         }
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
-            let rpm = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .find(|entry| entry.id == id)
-                    .map(|entry| effective_rpm(entry, global_rpm))
-                    .unwrap_or(global_rpm)
-            };
-            spawn_best_effort_storage_task("记录 Redis 调度选中次数", async move {
-                redis
-                    .record_scheduler_selection(id, rpm, request_weight_units)
-                    .await?;
-                Ok(())
-            });
+        if record_in_redis {
+            if let Some(redis) = &self.redis_store {
+                let redis = redis.clone();
+                let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+                let rpm = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|entry| entry.id == id)
+                        .map(|entry| effective_rpm(entry, global_rpm))
+                        .unwrap_or(global_rpm)
+                };
+                spawn_best_effort_storage_task("记录 Redis 调度选中次数", async move {
+                    redis
+                        .record_scheduler_selection(id, rpm, request_weight_units)
+                        .await?;
+                    Ok(())
+                });
+            }
         }
         let mut pending = self.pending_stats_deltas.lock();
         let entry = pending.entry(id).or_default();
@@ -6023,7 +9053,6 @@ impl MultiTokenManager {
 
     fn clear_scheduler_state_for_credential(&self, id: u64, clear_in_flight: bool) {
         clear_scheduler_state_for_credential_local(&self.entries, id, clear_in_flight);
-        self.invalidate_local_pool_route_state_cache();
         clear_scheduler_state_for_credential_redis(self.redis_store.as_ref(), id, clear_in_flight);
     }
 
@@ -6044,7 +9073,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         latency: Option<StdDuration>,
     ) {
-        let mut persisted_success: Option<(u64, String)> = None;
+        let mut success: Option<(u64, String, bool)> = None;
         let alpha = self
             .config
             .lock()
@@ -6053,6 +9082,11 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                let runtime_state_changed = entry.failure_count > 0
+                    || entry.refresh_failure_count > 0
+                    || entry.warmup_remaining > 0
+                    || entry.runtime_persistence_degraded
+                    || entry.disabled;
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 let expected_generation = entry.runtime_generation;
@@ -6077,7 +9111,7 @@ impl MultiTokenManager {
                         );
                     }
                 }
-                persisted_success = Some((expected_generation, now));
+                success = Some((expected_generation, now, runtime_state_changed));
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -6085,10 +9119,15 @@ impl MultiTokenManager {
                 );
             }
         }
-        let disabled = if let Some((expected_generation, last_used_at)) = persisted_success {
-            self.persist_success_state(id, expected_generation, &last_used_at)
-        } else {
-            false
+        let disabled = match success {
+            Some((expected_generation, last_used_at, true)) => {
+                self.persist_success_state(id, expected_generation, &last_used_at)
+            }
+            Some((_, last_used_at, false)) => {
+                self.record_success_stats_delta(id, &last_used_at);
+                false
+            }
+            None => false,
         };
         if disabled {
             self.select_highest_priority();
@@ -6279,7 +9318,6 @@ impl MultiTokenManager {
             );
         }
 
-        self.invalidate_local_pool_route_state_cache();
         let has_alternate = {
             let entries = self.entries.lock();
             let proxy_resources = self.proxy_resources.lock();
@@ -6375,7 +9413,7 @@ impl MultiTokenManager {
                         tracing::warn!(
                             credential_id = id,
                             %operation_id,
-                            "{}；本次先更新本地并隔离凭据，等待 PgSQL 恢复后重放",
+                            "{}；本次先更新本地失败计数，等待 PgSQL 恢复后按 FIFO 重放",
                             err
                         );
                         None
@@ -6454,6 +9492,7 @@ impl MultiTokenManager {
         };
         if auto_disabled {
             self.publish_credentials_changed("credential_failure_reported");
+            self.invalidate_model_capability_cohorts();
         }
         self.notify_dispatch_state_changed();
         result
@@ -6531,6 +9570,7 @@ impl MultiTokenManager {
             }),
         );
         self.publish_credentials_changed("credential_quota_exhausted");
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         result
     }
@@ -6638,6 +9678,7 @@ impl MultiTokenManager {
             }),
         );
         self.publish_credentials_changed("credential_risk_controlled");
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         result
     }
@@ -6646,6 +9687,7 @@ impl MultiTokenManager {
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
+    #[cfg(test)]
     pub fn report_refresh_failure(&self, id: u64) -> bool {
         let expected_generation = {
             let entries = self.entries.lock();
@@ -6692,7 +9734,7 @@ impl MultiTokenManager {
                         tracing::warn!(
                             credential_id = id,
                             %operation_id,
-                            "{}；本次先更新本地并隔离凭据，等待 PgSQL 恢复后重放",
+                            "{}；本次先更新本地刷新失败计数，等待 PgSQL 恢复后按 FIFO 重放",
                             err
                         );
                         None
@@ -6773,6 +9815,7 @@ impl MultiTokenManager {
         };
         if auto_disabled {
             self.publish_credentials_changed("credential_refresh_failure_reported");
+            self.invalidate_model_capability_cohorts();
         }
         self.notify_dispatch_state_changed();
         result
@@ -6848,6 +9891,7 @@ impl MultiTokenManager {
             }),
         );
         self.publish_credentials_changed("credential_refresh_token_invalid");
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         result
     }
@@ -6881,6 +9925,121 @@ impl MultiTokenManager {
     // ========================================================================
     // Admin API 方法
     // ========================================================================
+
+    /// Return the stable local credential cohort that can participate in model dispatch.
+    ///
+    /// This is a deliberately small, storage-free snapshot for validating a previously observed
+    /// model-capability contract. It does not refresh tokens, synchronize Redis/PgSQL state, hash
+    /// credentials, or inspect transient cooldown/RPM/concurrency state. Transient availability
+    /// must not make an upstream schema appear and disappear between retries.
+    pub(crate) fn local_model_capability_cohorts(&self) -> Arc<Vec<KiroModelCapabilityCohort>> {
+        let generation = self
+            .model_capability_cohort_generation
+            .load(Ordering::Acquire);
+        let mut cache = self.model_capability_cohort_cache.lock();
+        if cache.generation == generation {
+            return cache.cohorts.clone();
+        }
+        let config = self.config.lock().clone();
+        let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
+        let mut cohorts = BTreeMap::<KiroModelCapabilityCohortKey, Vec<u64>>::new();
+        for entry in entries.iter().filter(|entry| {
+            !entry.disabled
+                && credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
+        }) {
+            let credentials = &entry.credentials;
+            let normalize = |value: Option<&str>, fallback: &str| {
+                value
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(fallback)
+                    .to_ascii_lowercase()
+            };
+            let mut supported_models = credentials
+                .supported_models
+                .iter()
+                .map(|model| model.trim().to_ascii_lowercase())
+                .filter(|model| !model.is_empty())
+                .collect::<Vec<_>>();
+            supported_models.sort_unstable();
+            supported_models.dedup();
+            let key = KiroModelCapabilityCohortKey {
+                endpoint_family: normalize(
+                    credentials.endpoint.as_deref(),
+                    &config.default_endpoint,
+                ),
+                auth_method: if credentials.is_api_key_credential() {
+                    "api_key".to_string()
+                } else {
+                    normalize(credentials.auth_method.as_deref(), "unknown")
+                },
+                provider: normalize(credentials.provider.as_deref(), "unknown"),
+                effective_auth_region: credentials
+                    .effective_auth_region(&config)
+                    .trim()
+                    .to_ascii_lowercase(),
+                effective_api_region: credentials
+                    .effective_api_region(&config)
+                    .trim()
+                    .to_ascii_lowercase(),
+                subscription_class: normalize(credentials.subscription_title.as_deref(), "unknown"),
+                supported_models,
+            };
+            cohorts.entry(key).or_default().push(entry.id);
+        }
+        let cohorts = cohorts
+            .into_iter()
+            .map(|(key, mut credential_ids)| {
+                credential_ids.sort_unstable();
+                KiroModelCapabilityCohort {
+                    key,
+                    credential_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        cache.generation = generation;
+        cache.cohorts = Arc::new(cohorts);
+        cache.keys = Arc::new(
+            cache
+                .cohorts
+                .iter()
+                .map(|cohort| cohort.key.clone())
+                .collect(),
+        );
+        #[cfg(test)]
+        {
+            cache.rebuilds = cache.rebuilds.saturating_add(1);
+        }
+        cache.cohorts.clone()
+    }
+
+    pub(crate) fn local_model_capability_cohort_keys(
+        &self,
+    ) -> Arc<Vec<KiroModelCapabilityCohortKey>> {
+        let generation = self
+            .model_capability_cohort_generation
+            .load(Ordering::Acquire);
+        {
+            let cache = self.model_capability_cohort_cache.lock();
+            if cache.generation == generation {
+                return cache.keys.clone();
+            }
+        }
+        // Populate or refresh both Arc snapshots through the single cold rebuild path.
+        let _ = self.local_model_capability_cohorts();
+        self.model_capability_cohort_cache.lock().keys.clone()
+    }
+
+    fn invalidate_model_capability_cohorts(&self) {
+        self.model_capability_cohort_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_capability_cohort_rebuilds(&self) -> u64 {
+        self.model_capability_cohort_cache.lock().rebuilds
+    }
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
@@ -7147,6 +10306,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
         }
+        self.invalidate_refresh_state_for_credential(id);
         let persisted = self.persist_runtime_patch_value(
             id,
             CredentialRuntimeStatePatch {
@@ -7192,6 +10352,7 @@ impl MultiTokenManager {
             self.clear_scheduler_state_for_credential(id, false);
             self.select_highest_priority();
         }
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_disabled_updated");
         Ok(())
@@ -7392,6 +10553,8 @@ impl MultiTokenManager {
             }
         }
 
+        self.invalidate_refresh_state_for_credential(id);
+
         if reset_runtime_state {
             self.persist_credential_update_with_runtime_patch(
                 &base,
@@ -7456,6 +10619,7 @@ impl MultiTokenManager {
                 anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
         }
+        self.invalidate_refresh_state_for_credential(id);
         let persisted = self.persist_runtime_patch_value(
             id,
             CredentialRuntimeStatePatch {
@@ -7491,6 +10655,7 @@ impl MultiTokenManager {
         }
         self.select_highest_priority();
         self.clear_scheduler_state_for_credential(id, false);
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_reset_and_enabled");
         Ok(())
@@ -7598,7 +10763,16 @@ impl MultiTokenManager {
         let credentials = self.resolve_proxy_for_credential(credentials)?;
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let config = self.runtime_config();
-        let refreshed = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
+        let admission = RefreshSendAdmission::new(
+            None,
+            self.auxiliary_concurrency_controller(),
+            self.auxiliary_runtime.token_refresh_admission_controller(),
+        );
+        let client = self
+            .refresh_http_client(config.tls_backend, effective_proxy.as_ref())
+            .await?;
+        let refreshed =
+            refresh_token_with_client(&credentials, &config, client, Some(admission)).await?;
         let refreshed = Self::preserve_proxy_fields(refreshed, &source_credentials);
         self.token_context_from_credentials_until(
             EXTERNAL_CREDENTIAL_CONTEXT_ID,
@@ -7722,7 +10896,15 @@ impl MultiTokenManager {
             let new_cred_for_proxy = self.resolve_proxy_for_credential(new_cred.clone())?;
             let effective_proxy = new_cred_for_proxy.effective_proxy(self.proxy.as_ref());
             let config = self.runtime_config();
-            refresh_token(&new_cred_for_proxy, &config, effective_proxy.as_ref()).await?
+            let admission = RefreshSendAdmission::new(
+                None,
+                self.auxiliary_concurrency_controller(),
+                self.auxiliary_runtime.token_refresh_admission_controller(),
+            );
+            let client = self
+                .refresh_http_client(config.tls_backend, effective_proxy.as_ref())
+                .await?;
+            refresh_token_with_client(&new_cred_for_proxy, &config, client, Some(admission)).await?
         };
 
         // 4. 保留用户输入的元数据
@@ -7825,6 +11007,7 @@ impl MultiTokenManager {
                 runtime_revision: persisted_state.map_or(0, |state| state.revision),
                 runtime_generation: persisted_state.map_or(0, |state| state.generation),
                 runtime_persistence_degraded: false,
+                runtime_persistence_quarantined: false,
                 disabled: persisted_disabled,
                 disabled_reason: persisted_reason,
                 success_count: 0,
@@ -7848,6 +11031,7 @@ impl MultiTokenManager {
         if self.postgres_store.is_none() {
             self.persist_credentials()?;
         }
+        self.invalidate_model_capability_cohorts();
         self.publish_credentials_changed("credential_added");
         self.notify_dispatch_state_changed();
 
@@ -7943,8 +11127,9 @@ impl MultiTokenManager {
         }
 
         // 行级软删除，并清理该凭据的统计/运行态残留。成功后再更新本进程快照。
-        let refresh_lock = self.refresh_lock_for_credential(id);
-        let _refresh_guard = refresh_lock
+        let refresh_state = self.refresh_state_for_credential(id);
+        let _refresh_guard = refresh_state
+            .gate
             .try_lock()
             .map_err(|_| anyhow::anyhow!("凭据 #{} 正在刷新 Token，请稍后再删除", id))?;
         self.delete_persisted_credential_state(id)?;
@@ -7964,7 +11149,8 @@ impl MultiTokenManager {
         }
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, true);
-        self.remove_refresh_lock_for_credential(id);
+        self.remove_refresh_state_for_credential(id);
+        self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
@@ -7992,6 +11178,462 @@ impl MultiTokenManager {
             .await
     }
 
+    fn automatic_recovery_context_is_current(
+        credentials: &KiroCredentials,
+        expected_access_token: &str,
+        expected_storage_revision: u64,
+    ) -> anyhow::Result<bool> {
+        if credentials.storage_revision < expected_storage_revision {
+            return Err(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                false,
+            )
+            .into());
+        }
+        Ok(credentials.access_token.as_deref() == Some(expected_access_token))
+    }
+
+    /// Conditionally recover an access token rejected by an inference or MCP request.
+    ///
+    /// Unlike the Admin force-refresh API, this request-path operation is tied to the exact
+    /// access-token generation observed by the failed call and consumes that request's auxiliary
+    /// attempt budget. Concurrent callers share the same typed positive or negative result.
+    pub(crate) async fn recover_invalid_access_token_for(
+        &self,
+        id: u64,
+        expected_access_token: &str,
+        expected_storage_revision: u64,
+        auxiliary_attempt_budget: Arc<AuxiliaryAttemptBudget>,
+    ) -> anyhow::Result<AutomaticTokenRecoveryOutcome> {
+        let initial_credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        if !Self::automatic_recovery_context_is_current(
+            &initial_credentials,
+            expected_access_token,
+            expected_storage_revision,
+        )? {
+            return Ok(AutomaticTokenRecoveryOutcome::CredentialChanged);
+        }
+        auxiliary_attempt_budget.ensure_available(AuxiliaryAttemptKind::TokenRefresh)?;
+
+        let deadlines = TokenRefreshBudgets::default().deadlines()?;
+        let refresh_state = self.refresh_state_for_credential(id);
+        let _guard =
+            acquire_refresh_lock_until(&refresh_state.gate, deadlines.coordination, id).await?;
+        let refresh_reset_generation = refresh_state.generation();
+
+        // The failed request can wait behind another refresh or an Admin credential update. Only
+        // the exact token generation that produced the upstream auth error may initiate a send.
+        let locked_credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        if !Self::automatic_recovery_context_is_current(
+            &locked_credentials,
+            expected_access_token,
+            expected_storage_revision,
+        )? {
+            refresh_state.clear_failure();
+            return Ok(AutomaticTokenRecoveryOutcome::CredentialChanged);
+        }
+        auxiliary_attempt_budget.ensure_available(AuxiliaryAttemptKind::TokenRefresh)?;
+
+        let credentials_for_proxy = self
+            .resolve_proxy_for_credential(locked_credentials.clone())
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Validation,
+                    RefreshFailureKind::InvalidConfiguration,
+                    None,
+                    None,
+                    false,
+                ))
+            })?;
+        let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
+        let refresh_identity = {
+            let config = self.config.lock();
+            RefreshAttemptIdentity::from_automatic_recovery_request(
+                &credentials_for_proxy,
+                expected_access_token,
+                &config,
+                effective_proxy.as_ref(),
+            )
+        };
+        if let Some(failure) = refresh_state.replay_failure(&refresh_identity, Instant::now(), true)
+        {
+            tracing::debug!(
+                credential_id = id,
+                refresh_stage = failure.stage.as_str(),
+                refresh_kind = failure.kind.as_str(),
+                "automatic auth recovery reused the current typed failure wave"
+            );
+            if !failure.shared_failure_wave && refresh_failure_requires_health_action(&failure) {
+                self.apply_refresh_health_action(id, &failure, None, deadlines.total)
+                    .await?;
+            }
+            return Err(failure.into_shared_failure_wave().into());
+        }
+
+        let mut redis_refresh_lease = None;
+        let send_started = Arc::new(AtomicBool::new(false));
+        let persisted_storage_revision = Arc::new(AtomicU64::new(0));
+        let mut redis_lease_drop_guard = None;
+        let mut refresh_source = locked_credentials;
+        let mut refresh_source_for_proxy = credentials_for_proxy;
+        let mut refresh_effective_proxy = effective_proxy;
+        if self.redis_store.is_some() {
+            match self
+                .begin_distributed_refresh_until(id, refresh_identity, true, deadlines.coordination)
+                .await?
+            {
+                DistributedRefreshDecision::Replay(failure) => return Err(failure.into()),
+                DistributedRefreshDecision::Succeeded {
+                    generation,
+                    storage_revision,
+                } => {
+                    let latest = self
+                        .reload_credential_for_refresh_until(id, deadlines.coordination)
+                        .await?;
+                    let token_changed =
+                        latest.access_token.as_deref() != Some(expected_access_token);
+                    if storage_revision == 0
+                        || latest.storage_revision < storage_revision
+                        || is_token_expired(&latest)
+                        || !token_changed
+                    {
+                        tracing::warn!(
+                            credential_id = id,
+                            refresh_generation = generation,
+                            announced_storage_revision = storage_revision,
+                            authoritative_storage_revision = latest.storage_revision,
+                            token_changed,
+                            "Automatic recovery Redis success failed PostgreSQL authority checks"
+                        );
+                        return Err(RefreshFailure::new(
+                            RefreshFailureStage::Coordination,
+                            RefreshFailureKind::Coordination,
+                            None,
+                            None,
+                            false,
+                        )
+                        .into());
+                    }
+                    {
+                        let mut entries = self.entries.lock();
+                        let entry = entries
+                            .iter_mut()
+                            .find(|entry| entry.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+                        Self::merge_refresh_fields(&mut entry.credentials, &latest);
+                    }
+                    refresh_state.clear_failure();
+                    return Ok(AutomaticTokenRecoveryOutcome::CredentialChanged);
+                }
+                DistributedRefreshDecision::Leader(lease) => {
+                    redis_lease_drop_guard = self.redis_store.as_ref().map(|redis| {
+                        RedisRefreshLeaseDropGuard::new(
+                            redis.clone(),
+                            self.postgres_store.clone(),
+                            lease.clone(),
+                            send_started.clone(),
+                            persisted_storage_revision.clone(),
+                            Some(expected_access_token.to_string()),
+                        )
+                    });
+                    let authoritative = self
+                        .reload_credential_for_refresh_until(id, deadlines.coordination)
+                        .await?;
+                    if !Self::automatic_recovery_context_is_current(
+                        &authoritative,
+                        expected_access_token,
+                        expected_storage_revision,
+                    )? {
+                        let failure = RefreshFailure::new(
+                            RefreshFailureStage::Coordination,
+                            RefreshFailureKind::Coordination,
+                            None,
+                            None,
+                            false,
+                        );
+                        let failure = self
+                            .complete_distributed_refresh_failure_until(
+                                &lease,
+                                &failure,
+                                false,
+                                deadlines.total,
+                            )
+                            .await?;
+                        if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                            guard.disarm();
+                        }
+                        return Err(failure.into());
+                    }
+                    let authoritative_for_proxy = self
+                        .resolve_proxy_for_credential(authoritative.clone())
+                        .map_err(|_| {
+                            anyhow::Error::new(RefreshFailure::new(
+                                RefreshFailureStage::Validation,
+                                RefreshFailureKind::InvalidConfiguration,
+                                None,
+                                None,
+                                false,
+                            ))
+                        })?;
+                    let authoritative_proxy =
+                        authoritative_for_proxy.effective_proxy(self.proxy.as_ref());
+                    let authoritative_identity = {
+                        let config = self.config.lock();
+                        RefreshAttemptIdentity::from_automatic_recovery_request(
+                            &authoritative_for_proxy,
+                            expected_access_token,
+                            &config,
+                            authoritative_proxy.as_ref(),
+                        )
+                    };
+                    if authoritative_identity.0 != lease.identity {
+                        let failure = RefreshFailure::new(
+                            RefreshFailureStage::Coordination,
+                            RefreshFailureKind::Coordination,
+                            None,
+                            None,
+                            false,
+                        );
+                        let failure = self
+                            .complete_distributed_refresh_failure_until(
+                                &lease,
+                                &failure,
+                                false,
+                                deadlines.total,
+                            )
+                            .await?;
+                        if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                            guard.disarm();
+                        }
+                        return Err(failure.into());
+                    }
+                    refresh_source = authoritative;
+                    refresh_source_for_proxy = authoritative_for_proxy;
+                    refresh_effective_proxy = authoritative_proxy;
+                    redis_refresh_lease = Some(lease);
+                }
+            }
+        }
+
+        Self::ensure_refresh_state_generation(&refresh_state, refresh_reset_generation, false)?;
+        auxiliary_attempt_budget.ensure_available(AuxiliaryAttemptKind::TokenRefresh)?;
+        let config = self.runtime_config();
+        let admission = RefreshSendAdmission::new_with_send_started_marker(
+            Some(auxiliary_attempt_budget),
+            self.auxiliary_concurrency_controller(),
+            self.auxiliary_runtime.token_refresh_admission_controller(),
+            send_started.clone(),
+        );
+        let mut cancellation_guard = RefreshFailureWaveDropGuard::new(
+            refresh_state.clone(),
+            refresh_identity,
+            refresh_reset_generation,
+            send_started.clone(),
+        );
+        let client = self
+            .refresh_http_client(config.tls_backend, refresh_effective_proxy.as_ref())
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Internal,
+                    RefreshFailureKind::Internal,
+                    None,
+                    None,
+                    false,
+                ))
+            })?;
+        let refresh_result = refresh_token_until(
+            &refresh_source_for_proxy,
+            &config,
+            client,
+            Some(admission),
+            deadlines.work,
+            "automatic auth recovery upstream stage",
+        )
+        .await;
+        if redis_refresh_lease.is_some() {
+            cancellation_guard.disarm();
+        }
+
+        let mut new_credentials = match refresh_result {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                if let Some(lease) = redis_refresh_lease.as_ref() {
+                    let synthetic_failure = RefreshFailure::new(
+                        RefreshFailureStage::Coordination,
+                        RefreshFailureKind::Coordination,
+                        None,
+                        None,
+                        false,
+                    );
+                    let failure = error
+                        .downcast_ref::<RefreshFailure>()
+                        .unwrap_or(&synthetic_failure);
+                    let shared = self
+                        .complete_distributed_refresh_failure_until(
+                            lease,
+                            failure,
+                            true,
+                            deadlines.total,
+                        )
+                        .await?;
+                    if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                        guard.disarm();
+                    }
+                    if error.downcast_ref::<RefreshFailure>().is_some() {
+                        return Err(shared.into());
+                    }
+                } else if let Some(failure) = error.downcast_ref::<RefreshFailure>() {
+                    refresh_state.record_failure(refresh_identity, failure, Instant::now(), true);
+                    cancellation_guard.disarm();
+                    if refresh_failure_requires_health_action(failure) {
+                        self.apply_refresh_health_action(id, failure, None, deadlines.total)
+                            .await?;
+                        return Err(failure.clone().into_shared_failure_wave().into());
+                    }
+                }
+                if !send_started.load(Ordering::Acquire) {
+                    cancellation_guard.disarm();
+                }
+                return Err(error);
+            }
+        };
+        Self::ensure_refresh_state_generation(&refresh_state, refresh_reset_generation, true)?;
+        new_credentials.proxy_url = refresh_source.proxy_url.clone();
+        new_credentials.proxy_username = refresh_source.proxy_username.clone();
+        new_credentials.proxy_password = refresh_source.proxy_password.clone();
+        new_credentials.proxy_resource_id = refresh_source.proxy_resource_id;
+        if is_token_expired(&new_credentials)
+            || new_credentials.access_token.as_deref() == Some(expected_access_token)
+        {
+            let failure = RefreshFailure::new(
+                RefreshFailureStage::ResponseValidate,
+                RefreshFailureKind::MissingToken,
+                Some(200),
+                None,
+                true,
+            );
+            if let Some(lease) = redis_refresh_lease.as_ref() {
+                let shared = self
+                    .complete_distributed_refresh_failure_until(
+                        lease,
+                        &failure,
+                        false,
+                        deadlines.total,
+                    )
+                    .await?;
+                if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                    guard.disarm();
+                }
+                return Err(shared.into());
+            }
+            refresh_state.record_failure(refresh_identity, &failure, Instant::now(), true);
+            cancellation_guard.disarm();
+            return Err(failure.into());
+        }
+        new_credentials = self
+            .persist_refreshed_credential_fields(
+                id,
+                &refresh_source,
+                new_credentials,
+                true,
+                Some(expected_access_token),
+                deadlines.work,
+                deadlines.total,
+            )
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Persistence,
+                    RefreshFailureKind::Persistence,
+                    None,
+                    None,
+                    true,
+                ))
+            })?;
+        persisted_storage_revision.store(new_credentials.storage_revision, Ordering::Release);
+        if new_credentials.access_token.as_deref() == Some(expected_access_token) {
+            persisted_storage_revision.store(0, Ordering::Release);
+            let failure = RefreshFailure::new(
+                RefreshFailureStage::Persistence,
+                RefreshFailureKind::Persistence,
+                None,
+                None,
+                true,
+            );
+            if let Some(lease) = redis_refresh_lease.as_ref() {
+                let shared = self
+                    .complete_distributed_refresh_failure_until(
+                        lease,
+                        &failure,
+                        false,
+                        deadlines.total,
+                    )
+                    .await?;
+                if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                    guard.disarm();
+                }
+                return Err(shared.into());
+            }
+            refresh_state.record_failure(refresh_identity, &failure, Instant::now(), true);
+            cancellation_guard.disarm();
+            return Err(failure.into());
+        }
+        Self::ensure_refresh_state_generation(&refresh_state, refresh_reset_generation, true)?;
+        if let Some(lease) = redis_refresh_lease.as_ref() {
+            self.complete_or_cancel_distributed_refresh_success_until(
+                lease,
+                new_credentials.storage_revision,
+                deadlines.total,
+            )
+            .await?;
+            if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                guard.disarm();
+            }
+        }
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            Self::merge_refresh_fields(&mut entry.credentials, &new_credentials);
+        }
+        if let Some(redis) = &self.redis_store {
+            let payload = serde_json::json!({
+                "kind": "credentials_changed",
+                "reason": "token_refreshed",
+                "changedAt": Utc::now().to_rfc3339(),
+            })
+            .to_string();
+            let _ = tokio::time::timeout_at(
+                deadlines.total,
+                redis.publish_credentials_changed(payload),
+            )
+            .await;
+        }
+        cancellation_guard.disarm();
+        refresh_state.clear_failure();
+        Ok(AutomaticTokenRecoveryOutcome::Refreshed)
+    }
+
     async fn force_refresh_token_for_with_budgets(
         &self,
         id: u64,
@@ -8002,8 +11644,9 @@ impl MultiTokenManager {
         }
         let deadlines = budgets.deadlines()?;
         // 获取该凭据的刷新锁，防止同一账号并发刷新。
-        let refresh_lock = self.refresh_lock_for_credential(id);
-        let _guard = acquire_refresh_lock_until(&refresh_lock, deadlines.coordination, id).await?;
+        let refresh_state = self.refresh_state_for_credential(id);
+        let _guard =
+            acquire_refresh_lock_until(&refresh_state.gate, deadlines.coordination, id).await?;
         let mut redis_refresh_lock: Option<RedisRefreshLockGuard> = None;
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -8029,17 +11672,37 @@ impl MultiTokenManager {
                         )
                         .await;
                     }
-                    Ok(Err(err)) => {
-                        anyhow::bail!("强制刷新时获取 Redis Token 刷新锁失败: {}", err);
+                    Ok(Err(_)) => {
+                        return Err(RefreshFailure::new(
+                            RefreshFailureStage::Coordination,
+                            RefreshFailureKind::Coordination,
+                            None,
+                            None,
+                            false,
+                        )
+                        .into());
                     }
-                    Err(_) => anyhow::bail!(
-                        "强制刷新时获取 Redis Token 刷新锁超过 {}ms",
-                        REFRESH_REDIS_LOCK_OP_TIMEOUT.as_millis()
-                    ),
+                    Err(_) => {
+                        return Err(RefreshFailure::new(
+                            RefreshFailureStage::Coordination,
+                            RefreshFailureKind::Timeout,
+                            None,
+                            None,
+                            false,
+                        )
+                        .into());
+                    }
                 }
             }
             if redis_refresh_lock.is_none() {
-                anyhow::bail!("其他实例正在刷新凭据 #{}，请稍后再试", id);
+                return Err(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Timeout,
+                    None,
+                    None,
+                    false,
+                )
+                .into());
             }
         }
 
@@ -8058,16 +11721,43 @@ impl MultiTokenManager {
                     let effective_proxy =
                         credentials_for_proxy.effective_proxy(self.proxy.as_ref());
                     let config = self.runtime_config();
+                    let admission = RefreshSendAdmission::new(
+                        None,
+                        self.auxiliary_concurrency_controller(),
+                        self.auxiliary_runtime.token_refresh_admission_controller(),
+                    );
+                    let client = self
+                        .refresh_http_client(config.tls_backend, effective_proxy.as_ref())
+                        .await
+                        .map_err(|_| {
+                            anyhow::Error::new(RefreshFailure::new(
+                                RefreshFailureStage::Internal,
+                                RefreshFailureKind::Internal,
+                                None,
+                                None,
+                                false,
+                            ))
+                        })?;
                     refresh_token_until(
                         &credentials_for_proxy,
                         &config,
-                        effective_proxy.as_ref(),
+                        client,
+                        Some(admission),
                         deadlines.work,
                         "强制刷新 Token 上游阶段",
                     )
                     .await?
                 }
-                Err(err) => return Err(err),
+                Err(_) => {
+                    return Err(RefreshFailure::new(
+                        RefreshFailureStage::Validation,
+                        RefreshFailureKind::InvalidConfiguration,
+                        None,
+                        None,
+                        false,
+                    )
+                    .into());
+                }
             };
             new_creds.proxy_url = credentials.proxy_url.clone();
             new_creds.proxy_username = credentials.proxy_username.clone();
@@ -8081,11 +11771,20 @@ impl MultiTokenManager {
                     &credentials,
                     new_creds,
                     false,
+                    None,
                     deadlines.work,
                     deadlines.total,
                 )
                 .await
-                .map_err(|err| anyhow::anyhow!("强制刷新 Token 后写入 PgSQL 失败: {}", err))?;
+                .map_err(|_| {
+                    anyhow::Error::new(RefreshFailure::new(
+                        RefreshFailureStage::Persistence,
+                        RefreshFailureKind::Persistence,
+                        None,
+                        None,
+                        true,
+                    ))
+                })?;
 
             let expected_generation = {
                 let mut entries = self.entries.lock();
@@ -8107,7 +11806,6 @@ impl MultiTokenManager {
                 deadlines.total,
             )
             .await;
-            self.invalidate_local_pool_route_state_cache();
 
             if let Some(store) = &self.postgres_store {
                 let store = store.clone();
@@ -8156,6 +11854,7 @@ impl MultiTokenManager {
             redis_refresh_lock.release().await;
         }
         refresh_and_publish_result?;
+        refresh_state.clear_failure();
 
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())

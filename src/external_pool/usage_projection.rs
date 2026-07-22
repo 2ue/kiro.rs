@@ -29,6 +29,63 @@ pub(super) struct ExternalUsageProjectionContext {
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
+#[derive(Clone)]
+pub(super) struct ExternalUsageProjectionTemplate {
+    uplift_percent: u32,
+    output_uplift_min_tokens: i32,
+    output_uplift_percent: u32,
+    raw_input_tokens: i32,
+    cache_state_enabled: bool,
+    model: String,
+    simulated_usage: Option<CacheSimulation>,
+    reported_policy: Option<ReportedCacheUsagePolicy>,
+    scope: Option<PromptCacheScope>,
+    prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_profile: Option<PromptCacheProfile>,
+    kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
+    prompt_cache_target_read_ratio: f64,
+    prompt_cache_bounds: PromptCacheBounds,
+    prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
+    prompt_cache_creation_control: PromptCacheCreationControlConfig,
+}
+
+impl ExternalUsageProjectionTemplate {
+    fn matches_config(
+        &self,
+        uplift_percent: u32,
+        output_uplift_min_tokens: i32,
+        output_uplift_percent: u32,
+    ) -> bool {
+        self.uplift_percent == uplift_percent
+            && self.output_uplift_min_tokens == output_uplift_min_tokens.max(0)
+            && self.output_uplift_percent == output_uplift_percent.min(200)
+    }
+
+    fn context_for_pool(&self, pool: &ExternalPool) -> ExternalUsageProjectionContext {
+        ExternalUsageProjectionContext {
+            mode: pool.usage_projection_mode,
+            raw_input_tokens: self.raw_input_tokens,
+            cache_state_enabled: self.cache_state_enabled,
+            credential_key: Some(format!("external_pool:{}", pool.id)),
+            model: self.model.clone(),
+            simulated_usage: self.simulated_usage,
+            reported_policy: self.reported_policy.clone(),
+            scope: self.scope.clone(),
+            prompt_cache: self.prompt_cache.clone(),
+            prompt_cache_profile: self.prompt_cache_profile.clone(),
+            kiro_rs_tool_prompt_cache_plan: self.kiro_rs_tool_prompt_cache_plan.clone(),
+            prompt_cache_target_read_ratio: self.prompt_cache_target_read_ratio,
+            prompt_cache_bounds: self.prompt_cache_bounds,
+            prompt_cache_creation_controller: self.prompt_cache_creation_controller.clone(),
+            prompt_cache_creation_control: self.prompt_cache_creation_control,
+            uplift_percent: self.uplift_percent,
+            output_uplift_min_tokens: self.output_uplift_min_tokens,
+            output_uplift_percent: self.output_uplift_percent,
+            state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
+        }
+    }
+}
+
 pub(super) fn build_context(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -39,13 +96,53 @@ pub(super) fn build_context(
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
+    let cached = route
+        .preparation_cache
+        .usage_projection_template
+        .get_or_init(|| {
+            route.preparation_cache.record_usage_projection_build();
+            build_template(
+                route,
+                uplift_percent,
+                output_uplift_min_tokens,
+                output_uplift_percent,
+            )
+            .map(Arc::new)
+        });
+    let template = match cached {
+        Some(template)
+            if template.matches_config(
+                uplift_percent,
+                output_uplift_min_tokens,
+                output_uplift_percent,
+            ) =>
+        {
+            template.clone()
+        }
+        Some(_) => Arc::new(build_template(
+            route,
+            uplift_percent,
+            output_uplift_min_tokens,
+            output_uplift_percent,
+        )?),
+        None => return None,
+    };
+    Some(template.context_for_pool(pool))
+}
+
+fn build_template(
+    route: &ExternalRouteRequest,
+    uplift_percent: u32,
+    output_uplift_min_tokens: i32,
+    output_uplift_percent: u32,
+) -> Option<ExternalUsageProjectionTemplate> {
     let stream = route.is_stream();
     let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
     if !stream && reported_usage.skip_non_stream_usage_projection {
         return None;
     }
     if !reported_usage.enabled
-        && route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
+        && route.prompt_cache_strategy_type == PromptCacheStrategyType::CurrentHighCache
     {
         return None;
     }
@@ -54,11 +151,11 @@ pub(super) fn build_context(
     let payload = if let Some(payload) = route.payload() {
         payload
     } else {
-        raw_projection_payload = serde_json::from_slice::<MessagesRequest>(&route.raw_body).ok()?;
+        raw_projection_payload = external_route_raw_projection_payload(route)?;
         if raw_projection_payload.model.trim().is_empty() {
             return None;
         }
-        &raw_projection_payload
+        raw_projection_payload.as_ref()
     };
 
     let model = route
@@ -159,16 +256,18 @@ pub(super) fn build_context(
                     ^ fastrand::u64(..),
             )
         }
-        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
-            ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..))
-        }
+        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => reported_usage
+            .enabled
+            .then(|| ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..)))
+            .flatten(),
         PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool => None,
     };
-    Some(ExternalUsageProjectionContext {
-        mode: pool.usage_projection_mode,
+    Some(ExternalUsageProjectionTemplate {
+        uplift_percent,
+        output_uplift_min_tokens: output_uplift_min_tokens.max(0),
+        output_uplift_percent: output_uplift_percent.min(200),
         raw_input_tokens,
         cache_state_enabled,
-        credential_key: Some(format!("external_pool:{}", pool.id)),
         model,
         simulated_usage,
         reported_policy,
@@ -180,10 +279,6 @@ pub(super) fn build_context(
         prompt_cache_bounds: route.prompt_cache_bounds,
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
         prompt_cache_creation_control: route.prompt_cache_creation_control,
-        uplift_percent,
-        output_uplift_min_tokens: output_uplift_min_tokens.max(0),
-        output_uplift_percent: output_uplift_percent.min(200),
-        state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
     })
 }
 

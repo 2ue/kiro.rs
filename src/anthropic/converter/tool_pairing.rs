@@ -5,6 +5,71 @@ use crate::kiro::model::requests::tool::ToolResult;
 
 use super::ProxyWarnings;
 
+/// Cleans historical tool results without copying rejected result content into ordinary text.
+pub(super) fn sanitize_history_tool_results(history: &mut [Message], warnings: &mut ProxyWarnings) {
+    use std::collections::HashSet;
+
+    for idx in 0..history.len() {
+        let valid_ids = if idx > 0 {
+            match &history[idx - 1] {
+                Message::Assistant(assistant) => assistant
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .map(|tool_uses| {
+                        tool_uses
+                            .iter()
+                            .map(|tool_use| tool_use.tool_use_id.clone())
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default(),
+                Message::User(_) => HashSet::new(),
+            }
+        } else {
+            HashSet::new()
+        };
+
+        let Message::User(user) = &mut history[idx] else {
+            continue;
+        };
+        let results = &mut user
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        if results.is_empty() {
+            continue;
+        }
+
+        let original_len = results.len();
+        let mut seen = HashSet::new();
+        results.retain(|result| {
+            if !valid_ids.contains(&result.tool_use_id) {
+                warnings.orphan_tool_results = warnings.orphan_tool_results.saturating_add(1);
+                tracing::warn!(
+                    "历史 tool_result 不属于紧邻的 assistant tool_use，已安全丢弃：tool_use_id={}",
+                    result.tool_use_id
+                );
+                return false;
+            }
+            if !seen.insert(result.tool_use_id.clone()) {
+                warnings.duplicate_tool_results = warnings.duplicate_tool_results.saturating_add(1);
+                tracing::warn!(
+                    "历史中重复的结构化 tool_result 已安全丢弃，仅保留第一条：tool_use_id={}",
+                    result.tool_use_id
+                );
+                return false;
+            }
+            true
+        });
+        if results.is_empty()
+            && original_len > 0
+            && user.user_input_message.content.trim().is_empty()
+        {
+            user.user_input_message.content = super::EMPTY_USER_CONTENT_PLACEHOLDER.to_string();
+        }
+    }
+}
+
 /// 验证并过滤 tool_use/tool_result 配对
 ///
 /// 收集所有 tool_use_id，验证 tool_result 是否匹配
@@ -15,16 +80,12 @@ use super::ProxyWarnings;
 /// * `tool_results` - 当前消息中的 tool_result 列表
 ///
 /// # Returns
-/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合, 被保留为文本的孤立 tool_result)
+/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合)
 pub(super) fn validate_tool_pairing(
     history: &[Message],
     tool_results: &[ToolResult],
     warnings: &mut ProxyWarnings,
-) -> (
-    Vec<ToolResult>,
-    std::collections::HashSet<String>,
-    Vec<String>,
-) {
+) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
     use std::collections::HashSet;
 
     let mut all_tool_use_ids = HashSet::new();
@@ -80,7 +141,6 @@ pub(super) fn validate_tool_pairing(
     }
 
     let mut filtered_results = Vec::new();
-    let mut orphan_tool_result_texts = Vec::new();
     let mut seen_current_results = HashSet::new();
 
     for result in tool_results {
@@ -93,37 +153,25 @@ pub(super) fn validate_tool_pairing(
             current_paired_tool_use_ids.insert(result.tool_use_id.clone());
         } else if current_tool_use_ids.contains(&result.tool_use_id) {
             // 当前消息中同一个 tool_use_id 多次返回，仅保留第一条结构化结果。
-            warnings.duplicate_tool_results += 1;
-            if let Some(text) = kiro_tool_result_to_text(result) {
-                warnings.duplicate_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!("[duplicate output]\n{}", text));
-            }
+            warnings.duplicate_tool_results = warnings.duplicate_tool_results.saturating_add(1);
             tracing::warn!(
-                "跳过重复的当前结构化 tool_result，并在兼容模式下转为普通文本：tool_use_id={}",
+                "跳过重复的当前结构化 tool_result，仅保留第一条：tool_use_id={}",
                 result.tool_use_id
             );
         } else if history_tool_result_ids.contains(&result.tool_use_id)
             || all_tool_use_ids.contains(&result.tool_use_id)
         {
             // 不属于最后一条 assistant 的 tool_result 不能作为当前结构化结果继续发送。
-            warnings.orphan_tool_results += 1;
-            if let Some(text) = kiro_tool_result_to_text(result) {
-                warnings.orphan_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!("[previous output]\n{}", text));
-            }
+            warnings.orphan_tool_results = warnings.orphan_tool_results.saturating_add(1);
             tracing::warn!(
-                "tool_result 不属于最后一条 assistant tool_use，已从 tool_results 移除并在兼容模式下转为普通文本，tool_use_id={}",
+                "tool_result 不属于最后一条 assistant tool_use，已安全丢弃：tool_use_id={}",
                 result.tool_use_id
             );
         } else {
             // 孤立 tool_result - 找不到对应的 tool_use
-            warnings.orphan_tool_results += 1;
-            if let Some(text) = kiro_tool_result_to_text(result) {
-                warnings.orphan_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!("[previous output]\n{}", text));
-            }
+            warnings.orphan_tool_results = warnings.orphan_tool_results.saturating_add(1);
             tracing::warn!(
-                "孤立的 tool_result 找不到对应 tool_use，已从 tool_results 移除并在兼容模式下转为普通文本，tool_use_id={}",
+                "孤立的 tool_result 找不到对应 tool_use，已安全丢弃：tool_use_id={}",
                 result.tool_use_id
             );
         }
@@ -140,45 +188,14 @@ pub(super) fn validate_tool_pairing(
 
     // 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
     for orphaned_id in &unpaired_tool_use_ids {
-        warnings.orphan_tool_uses += 1;
+        warnings.orphan_tool_uses = warnings.orphan_tool_uses.saturating_add(1);
         tracing::warn!(
             "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
             orphaned_id
         );
     }
 
-    (
-        filtered_results,
-        unpaired_tool_use_ids,
-        orphan_tool_result_texts,
-    )
-}
-
-pub(super) fn kiro_tool_result_to_text(result: &ToolResult) -> Option<String> {
-    let mut parts = Vec::new();
-    for item in &result.content {
-        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
-            if !text.is_empty() {
-                parts.push(text.to_string());
-            }
-        } else if !item.is_empty() {
-            parts.push(serde_json::Value::Object(item.clone()).to_string());
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("\n"))
-}
-
-pub(super) fn append_orphan_tool_result_texts(content: &mut String, texts: &[String]) {
-    if texts.is_empty() {
-        return;
-    }
-    let suffix = texts.join("\n\n");
-    if content.trim().is_empty() {
-        *content = suffix;
-    } else {
-        content.push_str("\n\n");
-        content.push_str(&suffix);
-    }
+    (filtered_results, unpaired_tool_use_ids)
 }
 
 /// 从历史消息中移除孤立的 tool_use

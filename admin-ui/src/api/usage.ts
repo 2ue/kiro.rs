@@ -4,7 +4,6 @@ import type {
   AdminAuditLogPage,
   AdminAuditLogPageQuery,
   ManualModelResponse,
-  SuccessResponse,
   ModelCapabilitiesStatus,
   ModelPricingStatus,
   UpsertManualModelRequest,
@@ -78,8 +77,8 @@ export async function getUsageDashboard(timezone = 'Asia/Shanghai'): Promise<Usa
   return data
 }
 
-export async function clearUsageRecords(): Promise<SuccessResponse> {
-  const { data } = await api.post<SuccessResponse>('/usage-records/clear')
+export async function clearUsageRecords(): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/clear')
   return data
 }
 
@@ -100,6 +99,11 @@ export async function getUsageCleanupStatus(): Promise<UsageCleanupStatusRespons
 
 export async function cancelUsageCleanup(): Promise<UsageCleanupStatusResponse> {
   const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/cleanup/cancel')
+  return data
+}
+
+export async function resumeUsageCleanup(jobId: string): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/cleanup/resume', { jobId })
   return data
 }
 

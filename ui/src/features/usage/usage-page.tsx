@@ -32,7 +32,8 @@ import {
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
 import { getCredentialList, getExternalPools } from '@/api/credentials'
-import { formatDate, formatCompact, formatNumber, formatPercent, formatUsdFixed2, ratio } from '@/lib/format'
+import { formatDate, formatCompact, formatNumber, formatPercent, formatUsdCsv, formatUsdFixed2, ratio } from '@/lib/format'
+import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { CredentialListItem, ExternalPool, UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageRecordsQuery, UsageRouteKindFilter, UsageSource, UsageSeriesPoint } from '@/types/api'
 import {
@@ -82,6 +83,7 @@ import {
 import { UsageDetailModal } from './usage-detail-modal'
 import { UsageCleanupModal } from './usage-cleanup-modal'
 import { UsageCostInline, usageRecordCostModel } from './usage-billing'
+import { RequestApiKeyIdDisplay } from './request-api-key-id'
 
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
@@ -217,6 +219,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
   const headers = [
     'created_at',
     'request_id',
+    'request_api_key_id',
     'conversation_id',
     'status',
     'stream',
@@ -248,6 +251,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
   const rows = records.map((record) => [
     record.createdAt,
     record.id,
+    normalizeRequestApiKeyId(record.requestApiKeyId),
     record.conversationId,
     record.status,
     record.stream ? 'stream' : 'non_stream',
@@ -267,8 +271,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.outputTokens,
     record.cacheReadInputTokens,
     record.cacheCreationInputTokens,
-    record.estimatedCostUsd,
-    record.originalCostUsd,
+    formatUsdCsv(record.estimatedCostUsd),
+    formatUsdCsv(record.originalCostUsd),
     record.kiroMeteringUsage,
     record.pricingModel,
     record.durationMs,
@@ -573,6 +577,7 @@ function RecordsView({
   const [page, setPage] = useState(1)
   const [q, setQ] = useState('')
   const [requestId, setRequestId] = useState('')
+  const [requestApiKeyId, setRequestApiKeyId] = useState('')
   const [model, setModel] = useState('')
   const [endpoint, setEndpoint] = useState('')
   const [conversationId, setConversationId] = useState('')
@@ -591,6 +596,7 @@ function RecordsView({
   // 文本筛选项防抖,避免每次按键都触发查询(展示值即时,查询用防抖值)
   const qD = useDebouncedValue(q)
   const requestIdD = useDebouncedValue(requestId)
+  const requestApiKeyIdD = useDebouncedValue(requestApiKeyId)
   const modelD = useDebouncedValue(model)
   const endpointD = useDebouncedValue(endpoint)
   const conversationIdD = useDebouncedValue(conversationId)
@@ -600,15 +606,19 @@ function RecordsView({
   const untilD = useDebouncedValue(until)
   const hasAdvancedFilters =
     !!q.trim() || status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
-    !!endpoint.trim() || !!conversationId.trim() || routeSelection !== 'all' || !!minCacheRead.trim()
+    !!endpoint.trim() || !!conversationId.trim() || !!requestApiKeyId.trim() ||
+    routeSelection !== 'all' || !!minCacheRead.trim()
   const showAdvancedFilters = advancedOpen || hasAdvancedFilters
   const selectedRouteTarget = useMemo(() => parseRouteSelection(routeSelection), [routeSelection])
+  const normalizedRequestApiKeyId = normalizeRequestApiKeyId(requestApiKeyIdD)
+  const requestApiKeyIdInvalid = Boolean(requestApiKeyId.trim() && !normalizeRequestApiKeyId(requestApiKeyId))
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page, limit: PAGE_SIZE }
     const qValue = qD.trim()
     const requestIdInput = requestIdD.trim()
     const requestIdValue = extractRequestId(requestIdInput) || requestIdInput || extractRequestId(qValue)
+    if (normalizedRequestApiKeyId) next.requestApiKeyId = normalizedRequestApiKeyId
     if (requestIdValue) {
       next.requestId = requestIdValue
       return next
@@ -641,6 +651,7 @@ function RecordsView({
     page,
     qD,
     requestIdD,
+    normalizedRequestApiKeyId,
     routeKind,
     selectedRouteTarget,
     sinceD,
@@ -659,12 +670,13 @@ function RecordsView({
   )
   const hasFilters =
     routeKind !== '__all__' || status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
-    !!q.trim() || !!requestId.trim() || !!model.trim() || !!endpoint.trim() || !!conversationId.trim() ||
+    !!q.trim() || !!requestId.trim() || !!requestApiKeyId.trim() || !!model.trim() ||
+    !!endpoint.trim() || !!conversationId.trim() ||
     routeSelection !== 'all' || !!minCacheRead.trim() ||
     !!minFirstTokenLatencyMs.trim() || !!since.trim() || !!until.trim()
 
   const clearFilters = () => {
-    setQ(''); setRequestId(''); setModel(''); setEndpoint(''); setConversationId('')
+    setQ(''); setRequestId(''); setRequestApiKeyId(''); setModel(''); setEndpoint(''); setConversationId('')
     setRouteSelection('all'); setRouteKind('__all__'); setStatus('__all__'); setSource('__all__')
     setStreamMode('all'); setMinCacheRead(''); setMinFirstTokenLatencyMs(''); setSince(''); setUntil('')
   }
@@ -840,6 +852,21 @@ function RecordsView({
                       className="h-8 font-mono text-xs"
                     />
                   </FilterField>
+                  <FilterField label="请求渠道 ID">
+                    <div>
+                      <Input
+                        placeholder="完整 64 位 SHA-256 digest"
+                        value={requestApiKeyId}
+                        maxLength={64}
+                        aria-invalid={requestApiKeyIdInvalid}
+                        onChange={(e) => { setRequestApiKeyId(e.target.value); setPage(1) }}
+                        className="h-8 font-mono text-xs"
+                      />
+                      {requestApiKeyIdInvalid && (
+                        <div className="mt-1 text-[0.68rem] text-destructive">无效值不会发送；请复制完整渠道 ID</div>
+                      )}
+                    </div>
+                  </FilterField>
                   <FilterField label="最小缓存读取 token">
                     <Input
                       placeholder="如 10000"
@@ -969,6 +996,10 @@ function RecordsView({
                             title={record.id}
                           >
                             请求 {record.id}
+                          </div>
+                          <div className="mt-1 flex max-w-[180px] items-center gap-1 text-[0.62rem] text-muted-foreground/70">
+                            <span className="shrink-0">渠道</span>
+                            <RequestApiKeyIdDisplay value={record.requestApiKeyId} />
                           </div>
                         </TableCell>
                         {/* 模型 / 入口 */}

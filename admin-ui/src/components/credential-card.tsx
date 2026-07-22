@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { formatUsd } from '@/lib/format'
 import {
   useSetDisabled,
   useSetPriority,
@@ -92,16 +93,6 @@ function formatDateTime(value: string | null): string {
     minute: '2-digit',
     second: '2-digit',
   })
-}
-
-function formatUsd(value: number): string {
-  if (!Number.isFinite(value)) return '-'
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: value >= 1 ? 2 : 6,
-    maximumFractionDigits: value >= 1 ? 2 : 6,
-  }).format(value)
 }
 
 function formatMeteringUsage(value: number): string {

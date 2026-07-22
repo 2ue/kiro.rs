@@ -44,8 +44,8 @@ pub enum MaintenanceCommand {
     Migrate,
     /// 低峰期并发补齐 usage/rollup 相关索引
     UsageIndexes,
-    /// 显式回填旧 usage 成本字段；大表环境可能耗时，应在低峰期运行
+    /// 显式回填旧 usage 成本字段；必须先停止并排空所有网关实例
     UsageLegacyCostBackfill,
-    /// 显式压缩历史 usage rollup 小桶到小时桶；大表环境可能耗时
+    /// 显式压缩历史 usage rollup 小桶到小时桶；必须先停止并排空所有网关实例
     UsageRollupCompression,
 }

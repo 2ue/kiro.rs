@@ -20,6 +20,7 @@ import { Input } from '@/components/ui/input'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useUsageDashboard } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
+import { formatUsd } from '@/lib/format'
 import type {
   UsageBreakdownItem,
   UsageDashboardWindow,
@@ -72,17 +73,6 @@ function formatNumber(value: number | undefined | null): string {
 function formatPercent(value: number | undefined | null): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '-'
   return `${((value as number) * 100).toFixed(1)}%`
-}
-
-function formatUsd(value: number | undefined | null): string {
-  if (!Number.isFinite(value ?? Number.NaN)) return '-'
-  const number = value as number
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: number >= 1 ? 2 : 6,
-    maximumFractionDigits: number >= 1 ? 2 : 6,
-  }).format(number)
 }
 
 function formatDate(value?: string): string {

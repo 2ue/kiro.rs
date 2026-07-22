@@ -10,10 +10,28 @@
 error: unknown command '.../symbols.o'
 ```
 
-使用系统编译器运行：
+使用系统编译器，并通过 scoped runner 构建仓库外冻结二进制。不要使用 `cargo run`：它会把运行和构建生命周期重新绑定到 Cargo target。
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test --bin kiro_loadtest
+candidate_root="$(mktemp -d "${TMPDIR:-/tmp}/kiro-loadtest-bin.XXXXXX")"
+artifact_root="$(mktemp -d "${TMPDIR:-/tmp}/kiro-loadtest-artifacts.XXXXXX")"
+cleanup_loadtest() {
+  rc=$?
+  trap - EXIT INT TERM HUP
+  rm -rf -- "$candidate_root" "$artifact_root"
+  exit "$rc"
+}
+trap cleanup_loadtest EXIT INT TERM HUP
+mkdir -p "$artifact_root/reports"
+
+KIRO_FROZEN_LOADTEST="$candidate_root/kiro_loadtest" \
+CC=/usr/bin/cc \
+CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
+  feature/tests/run-cargo-scoped.sh loadtest-binary -- \
+  bash -lc 'cargo +1.92.0 build --release --bin kiro_loadtest && install -m 755 "$CARGO_TARGET_DIR/release/kiro_loadtest" "$KIRO_FROZEN_LOADTEST"'
+export KIRO_LOADTEST_BINARY="$candidate_root/kiro_loadtest"
+export KIRO_VALIDATION_ARTIFACT_DIR="$artifact_root"
+shasum -a 256 "$KIRO_LOADTEST_BINARY"
 ```
 
 ## 基础 smoke test
@@ -21,24 +39,22 @@ CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test -
 启动内置 fake server，并直接对 fake server 发 5 个流式请求：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --base-url http://127.0.0.1:19080 \
   --route /v1/messages \
   --requests 5 \
   --concurrency 2 \
   --scenario normal-stream \
-  --report target/loadtest/smoke.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/smoke.json"
 ```
 
 ## 测本地代理
 
-优先使用隔离测试代理，例如 `19022`。只有在明确要验证日常开发服务时，才把 `base-url` 改成 `9022`。
+只使用隔离测试代理，例如 `19022`。`9022` 是受保护的现有服务端口，验证脚本和本说明均禁止将负载发送到该端口。
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
@@ -46,14 +62,13 @@ cargo run --bin kiro_loadtest -- \
   --concurrency 10 \
   --scenario normal-stream \
   --auth-key admin123 \
-  --report target/loadtest/local-cc.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/local-cc.json"
 ```
 
 ## thinking 测试
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
@@ -62,7 +77,7 @@ cargo run --bin kiro_loadtest -- \
   --scenario normal-stream \
   --thinking true \
   --auth-key admin123 \
-  --report target/loadtest/thinking.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/thinking.json"
 ```
 
 验收重点：
@@ -74,8 +89,7 @@ cargo run --bin kiro_loadtest -- \
 ## tool-use 测试
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
@@ -84,7 +98,7 @@ cargo run --bin kiro_loadtest -- \
   --scenario normal-stream \
   --tool-use true \
   --auth-key admin123 \
-  --report target/loadtest/tool-use.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/tool-use.json"
 ```
 
 ## `/dfcache/*` 测试
@@ -92,29 +106,27 @@ cargo run --bin kiro_loadtest -- \
 已配置路由：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --dfcache-route /dfcache/cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
   --scenario normal-stream \
   --auth-key admin123 \
-  --report target/loadtest/dfcache-configured.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/dfcache-configured.json"
 ```
 
 未配置路由应返回错误，并且报告中应出现非 2xx 状态：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --dfcache-route /dfcache/not-configured/v1/messages \
   --requests 5 \
   --concurrency 1 \
   --scenario normal-stream \
   --auth-key admin123 \
-  --report target/loadtest/dfcache-missing.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/dfcache-missing.json"
 ```
 
 ## 异常场景 fake server
@@ -122,8 +134,7 @@ cargo run --bin kiro_loadtest -- \
 只启动 fake server：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario slow-thinking-then-text
@@ -154,8 +165,7 @@ cargo run --bin kiro_loadtest -- \
 `mixed-chaos` 用于极端组合：同一轮请求中混合 429、500、3/10/22 秒分层慢首字、长流式占用、随机慢首字和正常响应，适合验证错误冷却、恢复、连接释放、资源回落和高并发下的排队行为。
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario long-stream \
@@ -167,8 +177,7 @@ cargo run --bin kiro_loadtest -- \
 随机慢首字：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario random-slow-first-byte \
@@ -178,8 +187,7 @@ cargo run --bin kiro_loadtest -- \
 密集慢首字：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario dense-slow-first-byte \
@@ -189,8 +197,7 @@ cargo run --bin kiro_loadtest -- \
 分层慢首字，固定覆盖 3 秒、10 秒、22 秒：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario tiered-slow-first-byte
@@ -199,8 +206,7 @@ cargo run --bin kiro_loadtest -- \
 混合异常：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario mixed-chaos \
@@ -226,8 +232,7 @@ cargo run --bin kiro_loadtest -- \
 长文本 history：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -238,14 +243,13 @@ cargo run --bin kiro_loadtest -- \
   --long-context-chars 600000 \
   --long-context-messages 30 \
   --target-pid <proxy-pid> \
-  --report target/loadtest/payload-text-history.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-text-history.json"
 ```
 
 大 tool_result，并叠加高首字延迟：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -258,14 +262,13 @@ cargo run --bin kiro_loadtest -- \
   --tool-result-chars 200000 \
   --tool-result-count 6 \
   --target-pid <proxy-pid> \
-  --report target/loadtest/payload-large-tool-results-slow-ttfb.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-large-tool-results-slow-ttfb.json"
 ```
 
 深层 tool input：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -275,14 +278,13 @@ cargo run --bin kiro_loadtest -- \
   --payload-case deep-tool-input \
   --tool-input-depth 80 \
   --target-pid <proxy-pid> \
-  --report target/loadtest/payload-deep-tool-input.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-deep-tool-input.json"
 ```
 
 多工具 schema：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -294,14 +296,13 @@ cargo run --bin kiro_loadtest -- \
   --tool-input-depth 10 \
   --cache-control true \
   --target-pid <proxy-pid> \
-  --report target/loadtest/payload-many-tools.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-many-tools.json"
 ```
 
 混合最坏形状，并叠加长流式占用：
 
 ```bash
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -323,7 +324,7 @@ cargo run --bin kiro_loadtest -- \
   --tool-input-depth 64 \
   --tool-count 120 \
   --target-pid <proxy-pid> \
-  --report target/loadtest/payload-mixed-long-stream.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-mixed-long-stream.json"
 ```
 
 报告的 `requestProfile` 会记录实际生效的请求形状参数。对比 payload guard 开/关时，优先看 `cpuPercent.peak/end`、`memory.peak/end`、`fileDescriptors.peak/end`、`ttfbMs.p95/p99` 和 `totalLatencyMs.p95/p99`。
@@ -334,15 +335,14 @@ cargo run --bin kiro_loadtest -- \
 
 ```bash
 KIRO_LOADTEST_ALLOW_REAL_UPSTREAM=1 \
-CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
-cargo run --bin kiro_loadtest -- \
+"$KIRO_LOADTEST_BINARY" \
   --real-upstream true \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
   --auth-key admin123 \
-  --report target/loadtest/real-upstream.json
+  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/real-upstream.json"
 ```
 
 不要在没有明确目的时增加并发。真实上游测试优先从低并发开始。

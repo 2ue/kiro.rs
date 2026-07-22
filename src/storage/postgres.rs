@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Timelike, Utc};
@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
     Connection, PgPool, Postgres, QueryBuilder, Row, Transaction,
-    postgres::{PgPoolOptions, PgRow},
+    postgres::{PgConnection, PgPoolOptions, PgRow},
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::anthropic::model_capabilities::KiroReasoningFieldPath;
 use crate::anthropic::model_capabilities::{
-    MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
+    KiroReasoningFieldCapability, MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
 };
 use crate::anthropic::pricing::{
     MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
@@ -28,10 +30,11 @@ use crate::anthropic::usage::{
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
-    ExternalPoolModelMappingMode, ExternalPoolRawModelMode, ExternalPoolRequestBodyMode,
-    ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest, mask_external_pool_key,
-    normalize_external_pool_model_mapping_rules,
+    ExternalPoolEligibility, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
+    ExternalPoolRequestBodyMode, ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest,
+    mask_external_pool_key, normalize_external_pool_model_mapping_rules,
 };
+use crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::{Config, ExternalPoolStreamResponseMode, ModelMappingRule};
 use crate::model::model_support::normalize_supported_models;
@@ -49,9 +52,27 @@ SELECT credential_id, failure_count, refresh_failure_count,
 FROM credential_runtime_state
 "#;
 
+const EXTERNAL_POOL_SELECT_SQL: &str = r#"
+SELECT id, name, base_url, api_key, auth_type, enabled, priority,
+       max_concurrent_requests, usage_projection_mode, stream_response_mode,
+       request_body_mode, raw_model_mode, auto_disable_policy,
+       auto_disabled, auto_disabled_reason, auto_disabled_at,
+       auto_disabled_until, auto_disabled_last_error, preserve_path,
+       normalize_model_version_dots, model_mapping_mode,
+       model_mapping_require_match, model_mapping_rules, supported_models, notes,
+       revision, created_at, updated_at
+FROM external_upstream_pools
+WHERE deleted_at IS NULL
+ORDER BY priority ASC, id ASC
+"#;
+
 const CREDENTIAL_ID_SEQUENCE_LOCK_ID: i64 = 4_950_531_234_002;
 const POSTGRES_MIGRATION_LOCK_ID: i64 = 4_950_531_234_001;
+const USAGE_CLEANUP_COMMIT_LOCK_ID: i64 = 4_950_531_234_003;
+const USAGE_OFFLINE_MAINTENANCE_LOCK_ID: i64 = 4_950_531_234_004;
+const USAGE_RECORD_COMMIT_LOCK_DOMAIN: i64 = 0x0055_5341_4745_4944;
 const USAGE_INDEX_STARTUP_MAX_BYTES: i64 = 64 * 1024 * 1024;
+const USAGE_SOFT_DELETE_WATERMARK_SCOPE: &str = "soft_delete_created_at";
 
 struct UsageIndexDefinition {
     table: &'static str,
@@ -102,6 +123,11 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
     },
     UsageIndexDefinition {
         table: "usage_records",
+        name: "idx_usage_records_request_api_key_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_request_api_key_created ON usage_records ((data->>'requestApiKeyId'), created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
         name: "idx_usage_records_deleted_at",
         sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_deleted_at ON usage_records (deleted_at ASC, id ASC) WHERE deleted_at IS NOT NULL",
     },
@@ -129,6 +155,11 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
         table: "usage_duration_rollup_time_buckets",
         name: "idx_usage_duration_rollup_time_bucket",
         sql: "CREATE INDEX IF NOT EXISTS idx_usage_duration_rollup_time_bucket ON usage_duration_rollup_time_buckets (bucket_start, duration_ms)",
+    },
+    UsageIndexDefinition {
+        table: "usage_duration_rollup_time_buckets",
+        name: "idx_usage_duration_rollup_positive_max",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_duration_rollup_positive_max ON usage_duration_rollup_time_buckets (duration_ms DESC) WHERE requests > 0",
     },
     UsageIndexDefinition {
         table: "usage_credential_cost_summary",
@@ -286,6 +317,89 @@ pub struct PostgresStore {
     test_schema: Option<String>,
 }
 
+pub struct PostgresUsageLifecycleGuard {
+    connection: Option<PgConnection>,
+    exclusive: bool,
+}
+
+impl PostgresUsageLifecycleGuard {
+    pub async fn acquire_service(config: &Config) -> anyhow::Result<Self> {
+        Self::acquire(config, false).await
+    }
+
+    pub async fn acquire_offline_maintenance(config: &Config) -> anyhow::Result<Self> {
+        Self::acquire(config, true).await
+    }
+
+    async fn acquire(config: &Config, exclusive: bool) -> anyhow::Result<Self> {
+        let url = config
+            .postgres
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
+        let mut connection = PgConnection::connect(url).await?;
+        let lock_sql = if exclusive {
+            "SELECT pg_try_advisory_lock($1)"
+        } else {
+            "SELECT pg_try_advisory_lock_shared($1)"
+        };
+        let acquired: bool = sqlx::query_scalar(lock_sql)
+            .bind(USAGE_OFFLINE_MAINTENANCE_LOCK_ID)
+            .fetch_one(&mut connection)
+            .await?;
+        if !acquired {
+            connection.close().await?;
+            if exclusive {
+                anyhow::bail!(
+                    "usage maintenance requires every gateway instance to be stopped and its usage writer drained; an active current-version service still holds the PostgreSQL runtime fence"
+                );
+            }
+            anyhow::bail!(
+                "the gateway cannot start while offline usage maintenance holds the PostgreSQL runtime fence"
+            );
+        }
+        Ok(Self {
+            connection: Some(connection),
+            exclusive,
+        })
+    }
+
+    pub async fn release(mut self) -> anyhow::Result<()> {
+        let Some(mut connection) = self.connection.take() else {
+            return Ok(());
+        };
+        let unlock_sql = if self.exclusive {
+            "SELECT pg_advisory_unlock($1)"
+        } else {
+            "SELECT pg_advisory_unlock_shared($1)"
+        };
+        let unlock_result = sqlx::query_scalar(unlock_sql)
+            .bind(USAGE_OFFLINE_MAINTENANCE_LOCK_ID)
+            .fetch_one(&mut connection)
+            .await;
+        let close_result = connection.close().await;
+        let unlocked: bool = unlock_result?;
+        close_result?;
+        if !unlocked {
+            anyhow::bail!("PostgreSQL usage lifecycle fence was not held during release");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PostgresUsageLifecycleGuard {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = connection.close_hard().await;
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 fn postgres_drop_schema_error_is_retryable(error: &sqlx::Error) -> bool {
     error.as_database_error().is_some_and(|database_error| {
@@ -297,6 +411,11 @@ fn postgres_drop_schema_error_is_retryable(error: &sqlx::Error) -> bool {
 
 impl PostgresStore {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
+        if config.postgres.compress_usage_rollups_on_start {
+            anyhow::bail!(
+                "postgres.compressUsageRollupsOnStart is no longer supported because online compression can drop blocked usage writes; stop and drain every service instance, then run `maintenance usage-rollup-compression`"
+            );
+        }
         let url = config
             .postgres
             .url
@@ -312,9 +431,7 @@ impl PostgresStore {
             test_schema: None,
         };
         if config.postgres.migrate_on_start {
-            store
-                .migrate_with_options(config.postgres.compress_usage_rollups_on_start)
-                .await?;
+            store.migrate_with_options(false).await?;
         }
         Ok(store)
     }
@@ -355,6 +472,41 @@ impl PostgresStore {
         Ok(store)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn connect_test_peer(
+        config: &Config,
+        owner: &PostgresStore,
+    ) -> anyhow::Result<Self> {
+        let url = config
+            .postgres
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
+        let schema = owner
+            .test_schema
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL test peer requires a test schema owner"))?
+            .clone();
+        let schema_for_connect = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(config.postgres.max_connections.max(1))
+            .after_connect(move |conn, _meta| {
+                let schema = schema_for_connect.clone();
+                Box::pin(async move {
+                    sqlx::query(&format!(r#"SET search_path TO "{}""#, schema))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await?;
+        Ok(Self {
+            pool,
+            test_schema: None,
+        })
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -392,77 +544,98 @@ impl PostgresStore {
             .await?;
 
         let migration_result = async {
-            sqlx::query(
-                r#"
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version TEXT PRIMARY KEY,
-                    checksum TEXT NOT NULL,
-                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            let mut tx = conn.begin().await?;
+            let startup_result = async {
+                sqlx::query(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version TEXT PRIMARY KEY,
+                        checksum TEXT NOT NULL,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    "#,
                 )
-                "#,
-            )
-            .execute(&mut *conn)
-            .await?;
+                .execute(&mut *tx)
+                .await?;
 
-            // Keep the default startup path bounded: schema expansion, small authority-table
-            // repair, and explicitly versioned non-usage migrations only. Historical
-            // usage_records backfills and rollup rebuilds must stay behind explicit
-            // maintenance commands, otherwise a normal docker compose upgrade can block on
-            // multi-GB production usage history before the service becomes available.
-            execute_sql_statements(&mut conn, SCHEMA_SQL).await?;
-            ensure_usage_indexes_if_startup_safe(&mut conn).await?;
-            repair_active_credential_hashes(&mut conn).await?;
-            run_versioned_migration(
-                &mut conn,
-                "credential-storage-revision-v1",
-                CREDENTIAL_STORAGE_REVISION_SQL,
-            )
-            .await?;
-            run_versioned_migration(
-                &mut conn,
-                "credential-runtime-revision-v1",
-                CREDENTIAL_RUNTIME_REVISION_SQL,
-            )
-            .await?;
-            run_versioned_migration(
-                &mut conn,
-                "credential-runtime-generation-v1",
-                CREDENTIAL_RUNTIME_GENERATION_SQL,
-            )
-            .await?;
-            run_versioned_migration(
-                &mut conn,
-                "credential-runtime-mutation-cleanup-v1",
-                CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL,
-            )
-            .await?;
-            run_versioned_migration(
-                &mut conn,
-                "credential-stats-delta-batches-v1",
-                CREDENTIAL_STATS_DELTA_BATCH_SQL,
-            )
-            .await?;
+                // Keep the default startup path bounded: schema expansion, small authority-table
+                // repair, and explicitly versioned non-usage migrations only. Historical
+                // usage_records backfills and rollup rebuilds must stay behind explicit
+                // maintenance commands, otherwise a normal docker compose upgrade can block on
+                // multi-GB production usage history before the service becomes available.
+                execute_sql_statements_in_tx(&mut tx, SCHEMA_SQL).await?;
+                ensure_usage_indexes_if_startup_safe(&mut tx).await?;
+                repair_active_credential_hashes_in_tx(&mut tx).await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "credential-storage-revision-v1",
+                    CREDENTIAL_STORAGE_REVISION_SQL,
+                )
+                .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "credential-runtime-revision-v1",
+                    CREDENTIAL_RUNTIME_REVISION_SQL,
+                )
+                .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "credential-runtime-generation-v1",
+                    CREDENTIAL_RUNTIME_GENERATION_SQL,
+                )
+                .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "credential-runtime-mutation-cleanup-v1",
+                    CREDENTIAL_RUNTIME_MUTATION_CLEANUP_SQL,
+                )
+                .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "credential-stats-delta-batches-v1",
+                    CREDENTIAL_STATS_DELTA_BATCH_SQL,
+                )
+                .await?;
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO schema_migrations (version, checksum, applied_at)
+                    VALUES ('inline-schema', $1, now())
+                    ON CONFLICT (version) DO UPDATE
+                    SET checksum = EXCLUDED.checksum,
+                        applied_at = now()
+                    WHERE schema_migrations.checksum IS DISTINCT FROM EXCLUDED.checksum
+                    "#,
+                )
+                .bind(sha256_hex(SCHEMA_SQL))
+                .execute(&mut *tx)
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            match startup_result {
+                Ok(()) => tx.commit().await?,
+                Err(error) => {
+                    if let Err(rollback_error) = tx.rollback().await {
+                        anyhow::bail!(
+                            "startup migration failed: {error:#}; rollback failed: {rollback_error}"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+
+            // Compression is an explicit, potentially large maintenance operation. Keep it out
+            // of the bounded default startup transaction while retaining the session lock.
             if compress_usage_rollups {
-                run_versioned_migration(
+                run_usage_exclusive_versioned_migration(
                     &mut conn,
                     "usage-rollup-hour-bucket-compression-v1",
                     USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL,
                 )
                 .await?;
             }
-
-            sqlx::query(
-                r#"
-                INSERT INTO schema_migrations (version, checksum, applied_at)
-                VALUES ('inline-schema', $1, now())
-                ON CONFLICT (version) DO UPDATE
-                SET checksum = EXCLUDED.checksum,
-                    applied_at = now()
-                "#,
-            )
-            .bind(sha256_hex(SCHEMA_SQL))
-            .execute(&mut *conn)
-            .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -529,7 +702,7 @@ impl PostgresStore {
             .execute(&mut *conn)
             .await?;
             execute_sql_statements(&mut conn, SCHEMA_SQL).await?;
-            run_versioned_migration(
+            run_usage_exclusive_versioned_migration(
                 &mut conn,
                 "usage-legacy-cost-field-backfill-v1",
                 USAGE_LEGACY_COST_FIELD_BACKFILL_SQL,
@@ -614,16 +787,57 @@ impl PostgresStore {
         &self,
         mask_secrets: bool,
     ) -> anyhow::Result<Vec<ExternalPool>> {
+        let rows = sqlx::query(EXTERNAL_POOL_SELECT_SQL)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| external_pool_from_row(row, mask_secrets))
+            .collect()
+    }
+
+    /// Loads only rows that can be decoded without compatibility defaults.
+    /// A malformed pool is isolated from healthy pools and cannot authorize dispatch.
+    pub async fn list_dispatchable_external_pools(&self) -> anyhow::Result<Vec<ExternalPool>> {
+        let rows = sqlx::query(EXTERNAL_POOL_SELECT_SQL)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut pools = Vec::with_capacity(rows.len());
+        let mut invalid_pool_ids = Vec::new();
+        let mut invalid_rows = 0usize;
+        for row in rows {
+            let pool_id = row.try_get::<i64, _>("id").ok();
+            match external_pool_from_row_with_policy(row, false, true) {
+                Ok(pool) => pools.push(pool),
+                Err(_) => {
+                    invalid_rows = invalid_rows.saturating_add(1);
+                    if invalid_pool_ids.len() < 16 {
+                        invalid_pool_ids.extend(pool_id);
+                    }
+                }
+            }
+        }
+        if invalid_rows > 0 {
+            tracing::debug!(
+                invalid_rows,
+                invalid_pool_ids = ?invalid_pool_ids,
+                "外部池持久化配置无法安全解析，调度资格按池 fail closed"
+            );
+        }
+        Ok(pools)
+    }
+
+    pub async fn list_external_pool_eligibility(
+        &self,
+    ) -> anyhow::Result<Vec<ExternalPoolEligibility>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-                   max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                   request_body_mode, raw_model_mode, auto_disable_policy,
-                   auto_disabled, auto_disabled_reason, auto_disabled_at,
-                   auto_disabled_until, auto_disabled_last_error, preserve_path,
-                   normalize_model_version_dots, model_mapping_mode,
-                   model_mapping_require_match, model_mapping_rules, supported_models, notes,
-                   created_at, updated_at
+            SELECT id, revision, enabled, base_url,
+                   (btrim(api_key) <> '') AS api_key_present,
+                   auth_type, max_concurrent_requests, usage_projection_mode,
+                   stream_response_mode, request_body_mode, raw_model_mode,
+                   auto_disable_policy, model_mapping_mode,
+                   model_mapping_require_match, model_mapping_rules,
+                   auto_disabled, auto_disabled_until, supported_models
             FROM external_upstream_pools
             WHERE deleted_at IS NULL
             ORDER BY priority ASC, id ASC
@@ -631,9 +845,34 @@ impl PostgresStore {
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| external_pool_from_row(row, mask_secrets))
-            .collect()
+        let mut eligibility = Vec::with_capacity(rows.len());
+        let mut invalid_pool_ids = Vec::new();
+        let mut invalid_reasons = Vec::new();
+        let mut invalid_rows = 0usize;
+        for row in rows {
+            let pool_id = row.try_get::<i64, _>("id").ok();
+            match external_pool_eligibility_from_row(&row) {
+                Ok(pool) => eligibility.push(pool),
+                Err(err) => {
+                    invalid_rows = invalid_rows.saturating_add(1);
+                    if invalid_pool_ids.len() < 16 {
+                        invalid_pool_ids.extend(pool_id);
+                    }
+                    if invalid_reasons.len() < 4 {
+                        invalid_reasons.push(err.to_string());
+                    }
+                }
+            }
+        }
+        if invalid_rows > 0 {
+            tracing::warn!(
+                invalid_rows,
+                invalid_pool_ids = ?invalid_pool_ids,
+                invalid_reasons = ?invalid_reasons,
+                "外部池静态资格配置无法安全解析，按池 fail closed"
+            );
+        }
+        Ok(eligibility)
     }
 
     pub async fn get_external_pool(
@@ -650,7 +889,7 @@ impl PostgresStore {
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
                    normalize_model_version_dots, model_mapping_mode,
                    model_mapping_require_match, model_mapping_rules, supported_models, notes,
-                   created_at, updated_at
+                   revision, created_at, updated_at
             FROM external_upstream_pools
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -662,9 +901,61 @@ impl PostgresStore {
             .transpose()
     }
 
+    /// Defines the request's dispatch linearization point after request preparation and before
+    /// attempt reservation/HTTP send. A mutation committed after this query does not revoke an
+    /// already-started dispatch; callers must not hold a PostgreSQL lock across upstream I/O.
+    pub async fn external_pool_dispatch_revision_matches(
+        &self,
+        id: u64,
+        expected_revision: u64,
+    ) -> anyhow::Result<bool> {
+        let matches: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM external_upstream_pools
+                WHERE id = $1
+                  AND revision = $2
+                  AND deleted_at IS NULL
+                  AND enabled = true
+                  AND (
+                      auto_disabled = false
+                      OR (auto_disabled_until IS NOT NULL AND auto_disabled_until <= now())
+                  )
+            )
+            "#,
+        )
+        .bind(id as i64)
+        .bind(
+            i64::try_from(expected_revision)
+                .map_err(|_| anyhow::anyhow!("外部池 revision 超出 PgSQL BIGINT 范围"))?,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(matches)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn create_external_pool(
         &self,
         request: CreateExternalPoolRequest,
+    ) -> anyhow::Result<ExternalPool> {
+        self.create_external_pool_with_secret_policy(request, true)
+            .await
+    }
+
+    pub(crate) async fn create_external_pool_unmasked(
+        &self,
+        request: CreateExternalPoolRequest,
+    ) -> anyhow::Result<ExternalPool> {
+        self.create_external_pool_with_secret_policy(request, false)
+            .await
+    }
+
+    async fn create_external_pool_with_secret_policy(
+        &self,
+        request: CreateExternalPoolRequest,
+        mask_secrets: bool,
     ) -> anyhow::Result<ExternalPool> {
         validate_external_pool_input(
             &request.name,
@@ -693,7 +984,7 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models, notes,
-                      created_at, updated_at
+                      revision, created_at, updated_at
             "#,
         )
         .bind(request.name.trim())
@@ -717,13 +1008,33 @@ impl PostgresStore {
         .bind(request.notes.map(|notes| notes.trim().to_string()))
         .fetch_one(&self.pool)
         .await?;
-        external_pool_from_row(row, true)
+        external_pool_from_row(row, mask_secrets)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn update_external_pool(
         &self,
         id: u64,
         request: UpdateExternalPoolRequest,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        self.update_external_pool_with_secret_policy(id, request, true)
+            .await
+    }
+
+    pub(crate) async fn update_external_pool_unmasked(
+        &self,
+        id: u64,
+        request: UpdateExternalPoolRequest,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        self.update_external_pool_with_secret_policy(id, request, false)
+            .await
+    }
+
+    async fn update_external_pool_with_secret_policy(
+        &self,
+        id: u64,
+        request: UpdateExternalPoolRequest,
+        mask_secrets: bool,
     ) -> anyhow::Result<Option<ExternalPool>> {
         let Some(current) = self.get_external_pool(id, false).await? else {
             return Ok(None);
@@ -803,6 +1114,7 @@ impl PostgresStore {
                 model_mapping_rules = $18,
                 supported_models = $19,
                 notes = $20,
+                revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
@@ -812,7 +1124,7 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models, notes,
-                      created_at, updated_at
+                      revision, created_at, updated_at
             "#,
         )
         .bind(id as i64)
@@ -837,47 +1149,39 @@ impl PostgresStore {
         .bind(notes)
         .fetch_one(&self.pool)
         .await?;
-        Ok(Some(external_pool_from_row(row, true)?))
+        Ok(Some(external_pool_from_row(row, mask_secrets)?))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn set_external_pool_enabled(
         &self,
         id: u64,
         enabled: bool,
     ) -> anyhow::Result<Option<ExternalPool>> {
-        let row = sqlx::query(
-            r#"
-            UPDATE external_upstream_pools
-            SET enabled = $2, updated_at = now()
-            WHERE id = $1 AND deleted_at IS NULL
-            RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy,
-                      auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path,
-                      normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
-                      created_at, updated_at
-            "#,
-        )
-        .bind(id as i64)
-        .bind(enabled)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| external_pool_from_row(row, true)).transpose()
+        self.set_external_pool_enabled_with_secret_policy(id, enabled, true)
+            .await
     }
 
-    pub async fn set_external_pool_supported_models(
+    pub(crate) async fn set_external_pool_enabled_unmasked(
         &self,
         id: u64,
-        supported_models: Vec<String>,
+        enabled: bool,
     ) -> anyhow::Result<Option<ExternalPool>> {
-        let supported_models = normalize_supported_models(supported_models);
-        let supported_models_value = serde_json::to_value(&supported_models)?;
+        self.set_external_pool_enabled_with_secret_policy(id, enabled, false)
+            .await
+    }
+
+    async fn set_external_pool_enabled_with_secret_policy(
+        &self,
+        id: u64,
+        enabled: bool,
+        mask_secrets: bool,
+    ) -> anyhow::Result<Option<ExternalPool>> {
         let row = sqlx::query(
             r#"
             UPDATE external_upstream_pools
-            SET supported_models = $2,
+            SET enabled = $2,
+                revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
@@ -887,19 +1191,72 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models, notes,
-                      created_at, updated_at
+                      revision, created_at, updated_at
+            "#,
+        )
+        .bind(id as i64)
+        .bind(enabled)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| external_pool_from_row(row, mask_secrets))
+            .transpose()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn set_external_pool_supported_models(
+        &self,
+        id: u64,
+        supported_models: Vec<String>,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        self.set_external_pool_supported_models_with_secret_policy(id, supported_models, true)
+            .await
+    }
+
+    pub(crate) async fn set_external_pool_supported_models_unmasked(
+        &self,
+        id: u64,
+        supported_models: Vec<String>,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        self.set_external_pool_supported_models_with_secret_policy(id, supported_models, false)
+            .await
+    }
+
+    async fn set_external_pool_supported_models_with_secret_policy(
+        &self,
+        id: u64,
+        supported_models: Vec<String>,
+        mask_secrets: bool,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        let supported_models = normalize_supported_models(supported_models);
+        let supported_models_value = serde_json::to_value(&supported_models)?;
+        let row = sqlx::query(
+            r#"
+            UPDATE external_upstream_pools
+            SET supported_models = $2,
+                revision = revision + 1,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
+                      max_concurrent_requests, usage_projection_mode, stream_response_mode,
+                      request_body_mode, raw_model_mode, auto_disable_policy,
+                      auto_disabled, auto_disabled_reason, auto_disabled_at,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      normalize_model_version_dots, model_mapping_mode,
+                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                      revision, created_at, updated_at
             "#,
         )
         .bind(id as i64)
         .bind(supported_models_value)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| external_pool_from_row(row, true)).transpose()
+        row.map(|row| external_pool_from_row(row, mask_secrets))
+            .transpose()
     }
 
     pub async fn soft_delete_external_pool(&self, id: u64) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE external_upstream_pools SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
+            "UPDATE external_upstream_pools SET deleted_at = now(), revision = revision + 1, updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id as i64)
         .execute(&self.pool)
@@ -907,9 +1264,27 @@ impl PostgresStore {
         Ok(result.rows_affected() > 0)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn clear_external_pool_auto_disabled(
         &self,
         id: u64,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        self.clear_external_pool_auto_disabled_with_secret_policy(id, true)
+            .await
+    }
+
+    pub(crate) async fn clear_external_pool_auto_disabled_unmasked(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        self.clear_external_pool_auto_disabled_with_secret_policy(id, false)
+            .await
+    }
+
+    async fn clear_external_pool_auto_disabled_with_secret_policy(
+        &self,
+        id: u64,
+        mask_secrets: bool,
     ) -> anyhow::Result<Option<ExternalPool>> {
         let row = sqlx::query(
             r#"
@@ -919,6 +1294,7 @@ impl PostgresStore {
                 auto_disabled_at = NULL,
                 auto_disabled_until = NULL,
                 auto_disabled_last_error = NULL,
+                revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
@@ -928,15 +1304,17 @@ impl PostgresStore {
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
                       model_mapping_require_match, model_mapping_rules, supported_models, notes,
-                      created_at, updated_at
+                      revision, created_at, updated_at
             "#,
         )
         .bind(id as i64)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| external_pool_from_row(row, true)).transpose()
+        row.map(|row| external_pool_from_row(row, mask_secrets))
+            .transpose()
     }
 
+    #[cfg(test)]
     pub async fn auto_disable_external_pool(
         &self,
         id: u64,
@@ -944,12 +1322,35 @@ impl PostgresStore {
         last_error: &str,
         duration_secs: u64,
     ) -> anyhow::Result<()> {
+        let Some(pool) = self.get_external_pool(id, true).await? else {
+            return Ok(());
+        };
+        let _ = self
+            .auto_disable_external_pool_if_unchanged(
+                id,
+                pool.revision,
+                reason,
+                last_error,
+                duration_secs,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn auto_disable_external_pool_if_unchanged(
+        &self,
+        id: u64,
+        expected_revision: u64,
+        reason: &str,
+        last_error: &str,
+        duration_secs: u64,
+    ) -> anyhow::Result<bool> {
         let until = if duration_secs == 0 {
             None
         } else {
             Some(Utc::now() + chrono::Duration::seconds(duration_secs as i64))
         };
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE external_upstream_pools
             SET auto_disabled = true,
@@ -957,17 +1358,28 @@ impl PostgresStore {
                 auto_disabled_at = now(),
                 auto_disabled_until = $3,
                 auto_disabled_last_error = $4,
+                revision = revision + 1,
                 updated_at = now()
-            WHERE id = $1 AND deleted_at IS NULL
+            WHERE id = $1
+              AND revision = $5
+              AND deleted_at IS NULL
+              AND (
+                  auto_disabled = false
+                  OR (auto_disabled_until IS NOT NULL AND auto_disabled_until <= now())
+              )
             "#,
         )
         .bind(id as i64)
         .bind(reason)
         .bind(until)
         .bind(last_error)
+        .bind(
+            i64::try_from(expected_revision)
+                .map_err(|_| anyhow::anyhow!("外部池 revision 超出 PgSQL BIGINT 范围"))?,
+        )
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn load_credentials(&self) -> anyhow::Result<Vec<KiroCredentials>> {
@@ -1557,35 +1969,39 @@ impl PostgresStore {
             r#"
             UPDATE credentials
             SET refresh_token_hash = CASE
-                    WHEN $10::text IS NULL THEN credentials.refresh_token_hash
-                    ELSE $11::text
+                    WHEN $11::text IS NULL THEN credentials.refresh_token_hash
+                    ELSE $12::text
                 END,
                 data = credentials.data
-                    || CASE WHEN $9::text IS NULL
-                        THEN '{}'::jsonb
-                        ELSE jsonb_build_object('accessToken', $9::text)
-                    END
                     || CASE WHEN $10::text IS NULL
                         THEN '{}'::jsonb
-                        ELSE jsonb_build_object('refreshToken', $10::text)
+                        ELSE jsonb_build_object('accessToken', $10::text)
                     END
-                    || CASE WHEN $12::text IS NULL
+                    || CASE WHEN $11::text IS NULL
                         THEN '{}'::jsonb
-                        ELSE jsonb_build_object('profileArn', $12::text)
+                        ELSE jsonb_build_object('refreshToken', $11::text)
                     END
                     || CASE WHEN $13::text IS NULL
                         THEN '{}'::jsonb
-                        ELSE jsonb_build_object('expiresAt', $13::text)
+                        ELSE jsonb_build_object('profileArn', $13::text)
                     END
                     || CASE WHEN $14::text IS NULL
                         THEN '{}'::jsonb
-                        ELSE jsonb_build_object('scopes', $14::text)
+                        ELSE jsonb_build_object('expiresAt', $14::text)
+                    END
+                    || CASE WHEN $15::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('scopes', $15::text)
                     END,
                 updated_at = now(),
                 revision = credentials.revision + 1
             WHERE id = $1
               AND deleted_at IS NULL
               AND refresh_token_hash = $2
+              AND (
+                  COALESCE(data->>'accessToken', data->>'access_token')
+                  IS NOT DISTINCT FROM $9::text
+              )
               AND (
                   CASE regexp_replace(
                       lower(COALESCE(data->>'authMethod', data->>'auth_method')),
@@ -1635,6 +2051,7 @@ impl PostgresStore {
         .bind(&expected.client_secret)
         .bind(&expected.token_endpoint)
         .bind(&expected.scopes)
+        .bind(&expected.access_token)
         .bind(&patch.access_token)
         .bind(&patch.refresh_token)
         .bind(&new_refresh_token_hash)
@@ -2708,6 +3125,7 @@ impl PostgresStore {
             .state)
     }
 
+    #[cfg(test)]
     pub async fn record_credential_refresh_failure_at_generation(
         &self,
         credential_id: u64,
@@ -3341,14 +3759,21 @@ impl PostgresStore {
         sqlx::query(
             r#"
             INSERT INTO model_capabilities_sync_status (
-                id, source, last_synced_at, last_error, model_count, updated_at
+                id, source, last_synced_at, last_error, model_count,
+                reasoning_fields, reasoning_cohort_keys, reasoning_cohort_complete,
+                reasoning_contract_version, reasoning_invalid_models, updated_at
             )
-            VALUES ('default', $1, $2, $3, $4, now())
+            VALUES ('default', $1, $2, $3, $4, $5, $6, $7, $8, $9, now())
             ON CONFLICT (id) DO UPDATE
             SET source = EXCLUDED.source,
                 last_synced_at = EXCLUDED.last_synced_at,
                 last_error = EXCLUDED.last_error,
                 model_count = EXCLUDED.model_count,
+                reasoning_fields = EXCLUDED.reasoning_fields,
+                reasoning_cohort_keys = EXCLUDED.reasoning_cohort_keys,
+                reasoning_cohort_complete = EXCLUDED.reasoning_cohort_complete,
+                reasoning_contract_version = EXCLUDED.reasoning_contract_version,
+                reasoning_invalid_models = EXCLUDED.reasoning_invalid_models,
                 updated_at = now()
             "#,
         )
@@ -3356,6 +3781,13 @@ impl PostgresStore {
         .bind(&status.last_synced_at)
         .bind(&status.last_error)
         .bind(status.model_count as i32)
+        .bind(serde_json::to_value(&status.reasoning_fields)?)
+        .bind(serde_json::to_value(
+            &status.reasoning_capability_cohort_keys,
+        )?)
+        .bind(status.reasoning_capability_cohort_complete)
+        .bind(status.reasoning_capability_contract_version as i32)
+        .bind(serde_json::to_value(&status.reasoning_invalid_models)?)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -3382,27 +3814,57 @@ impl PostgresStore {
 
         let status_row = sqlx::query(
             r#"
-            SELECT source, last_synced_at, last_error
+            SELECT source, last_synced_at, last_error, reasoning_fields,
+                   reasoning_cohort_keys, reasoning_cohort_complete,
+                   reasoning_contract_version, reasoning_invalid_models
             FROM model_capabilities_sync_status
             WHERE id = 'default'
             "#,
         )
         .fetch_optional(&self.pool)
         .await?;
-        let (source, last_synced_at, last_error): (String, Option<String>, Option<String>) =
-            if let Some(row) = status_row {
-                (
-                    row.try_get("source")?,
-                    row.try_get("last_synced_at")?,
-                    row.try_get("last_error")?,
-                )
-            } else {
-                (
-                    rows[0].try_get("source")?,
-                    rows[0].try_get("last_synced_at")?,
-                    rows[0].try_get("last_error")?,
-                )
-            };
+        let (
+            source,
+            last_synced_at,
+            last_error,
+            reasoning_fields,
+            reasoning_capability_cohort_keys,
+            reasoning_capability_cohort_complete,
+            reasoning_capability_contract_version,
+            reasoning_invalid_models,
+        ): (
+            String,
+            Option<String>,
+            Option<String>,
+            BTreeMap<String, KiroReasoningFieldCapability>,
+            Vec<KiroModelCapabilityCohortKey>,
+            bool,
+            u32,
+            Vec<String>,
+        ) = if let Some(row) = status_row {
+            (
+                row.try_get("source")?,
+                row.try_get("last_synced_at")?,
+                row.try_get("last_error")?,
+                serde_json::from_value(row.try_get("reasoning_fields")?).unwrap_or_default(),
+                serde_json::from_value(row.try_get("reasoning_cohort_keys")?).unwrap_or_default(),
+                row.try_get("reasoning_cohort_complete")?,
+                row.try_get::<i32, _>("reasoning_contract_version")?.max(0) as u32,
+                serde_json::from_value(row.try_get("reasoning_invalid_models")?)
+                    .unwrap_or_default(),
+            )
+        } else {
+            (
+                rows[0].try_get("source")?,
+                rows[0].try_get("last_synced_at")?,
+                rows[0].try_get("last_error")?,
+                std::collections::BTreeMap::new(),
+                Vec::new(),
+                false,
+                0,
+                Vec::new(),
+            )
+        };
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
             models.push(ModelCapabilityItem {
@@ -3424,6 +3886,11 @@ impl PostgresStore {
             last_synced_at,
             last_error,
             models,
+            reasoning_fields,
+            reasoning_capability_cohort_keys,
+            reasoning_capability_cohort_complete,
+            reasoning_capability_contract_version,
+            reasoning_invalid_models,
         }))
     }
 
@@ -3462,6 +3929,13 @@ impl PostgresStore {
         .bind(item.supports_prompt_caching)
         .bind(&item.supported_input_types)
         .bind(item.source.as_deref().unwrap_or(MANUAL_SOURCE))
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE model_capabilities_sync_status SET reasoning_fields = reasoning_fields - $1, updated_at = now() WHERE id = 'default'",
+        )
+        .bind(&item.model)
         .execute(&mut *tx)
         .await?;
 
@@ -3639,7 +4113,7 @@ async fn execute_sql_statements(
 }
 
 async fn usage_index_exists(
-    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    tx: &mut Transaction<'_, Postgres>,
     definition: &UsageIndexDefinition,
 ) -> anyhow::Result<bool> {
     let exists: bool = sqlx::query_scalar(
@@ -3655,37 +4129,37 @@ async fn usage_index_exists(
     )
     .bind(definition.table)
     .bind(definition.name)
-    .fetch_one(&mut **conn)
+    .fetch_one(&mut **tx)
     .await?;
     Ok(exists)
 }
 
 async fn relation_size_bytes(
-    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    tx: &mut Transaction<'_, Postgres>,
     table: &str,
 ) -> anyhow::Result<i64> {
     let size: i64 = sqlx::query_scalar("SELECT pg_total_relation_size($1::regclass)::bigint")
         .bind(table)
-        .fetch_one(&mut **conn)
+        .fetch_one(&mut **tx)
         .await?;
     Ok(size)
 }
 
 async fn ensure_usage_indexes_if_startup_safe(
-    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
     let mut skipped = Vec::new();
     let mut sizes = HashMap::new();
 
     for definition in USAGE_INDEX_DEFINITIONS {
-        if usage_index_exists(conn, definition).await? {
+        if usage_index_exists(tx, definition).await? {
             continue;
         }
 
         let table_size = if let Some(size) = sizes.get(definition.table) {
             *size
         } else {
-            let size = relation_size_bytes(conn, definition.table).await?;
+            let size = relation_size_bytes(tx, definition.table).await?;
             sizes.insert(definition.table, size);
             size
         };
@@ -3698,7 +4172,7 @@ async fn ensure_usage_indexes_if_startup_safe(
             continue;
         }
 
-        sqlx::query(definition.sql).execute(&mut **conn).await?;
+        sqlx::query(definition.sql).execute(&mut **tx).await?;
     }
 
     if !skipped.is_empty() {
@@ -3712,8 +4186,20 @@ async fn ensure_usage_indexes_if_startup_safe(
     Ok(())
 }
 
-async fn run_versioned_migration(
+async fn run_usage_exclusive_versioned_migration(
     conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    version: &str,
+    sql: &str,
+) -> anyhow::Result<()> {
+    let mut tx = conn.begin().await?;
+    acquire_usage_cleanup_commit_guard(&mut tx).await?;
+    run_versioned_migration_in_tx(&mut tx, version, sql).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn run_versioned_migration_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
     version: &str,
     sql: &str,
 ) -> anyhow::Result<()> {
@@ -3721,7 +4207,7 @@ async fn run_versioned_migration(
     let applied_checksum: Option<String> =
         sqlx::query_scalar("SELECT checksum FROM schema_migrations WHERE version = $1")
             .bind(version)
-            .fetch_optional(&mut **conn)
+            .fetch_optional(&mut **tx)
             .await?;
     if let Some(applied_checksum) = applied_checksum {
         if applied_checksum != checksum {
@@ -3730,8 +4216,7 @@ async fn run_versioned_migration(
         return Ok(());
     }
 
-    let mut tx = conn.begin().await?;
-    execute_sql_statements_in_tx(&mut tx, sql).await?;
+    execute_sql_statements_in_tx(tx, sql).await?;
     sqlx::query(
         r#"
         INSERT INTO schema_migrations (version, checksum, applied_at)
@@ -3740,9 +4225,8 @@ async fn run_versioned_migration(
     )
     .bind(version)
     .bind(checksum)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -3759,10 +4243,9 @@ async fn execute_sql_statements_in_tx(
     Ok(())
 }
 
-async fn repair_active_credential_hashes(
-    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+async fn repair_active_credential_hashes_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
-    let mut tx = conn.begin().await?;
     let rows = sqlx::query(
         r#"
         SELECT id, api_key_hash, refresh_token_hash, data
@@ -3782,7 +4265,7 @@ async fn repair_active_credential_hashes(
         FOR UPDATE
         "#,
     )
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
 
     for row in rows {
@@ -3813,7 +4296,7 @@ async fn repair_active_credential_hashes(
             )
             .bind(credential_id)
             .bind(api_key_hash)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
             if let Some(conflicting_id) = conflicting_id {
                 anyhow::bail!(
@@ -3839,7 +4322,7 @@ async fn repair_active_credential_hashes(
             )
             .bind(credential_id)
             .bind(refresh_token_hash)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
             if let Some(conflicting_id) = conflicting_id {
                 anyhow::bail!(
@@ -3863,12 +4346,10 @@ async fn repair_active_credential_hashes(
         .bind(auth_kind)
         .bind(api_key_hash)
         .bind(refresh_token_hash)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(duplicate_credential_message)?;
     }
-
-    tx.commit().await?;
     Ok(())
 }
 
@@ -3917,6 +4398,7 @@ pub enum CredentialWithRuntimePatchCasOutcome {
 #[derive(Clone, PartialEq, Eq)]
 pub struct CredentialRefreshExpectedContext {
     refresh_token_hash: String,
+    access_token: Option<String>,
     auth_method: Option<String>,
     provider: Option<String>,
     client_id: Option<String>,
@@ -3936,6 +4418,7 @@ impl CredentialRefreshExpectedContext {
             .ok_or_else(|| anyhow::anyhow!("凭据 refreshToken CAS 缺少原 refreshToken"))?;
         Ok(Self {
             refresh_token_hash: sha256_hex(refresh_token),
+            access_token: credentials.access_token,
             auth_method: credentials.auth_method,
             provider: credentials.provider,
             client_id: credentials.client_id,
@@ -4066,9 +4549,363 @@ pub struct UsageCleanupPreview {
     pub newest_created_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageCleanupBatchResult {
+    pub processed_rows: u64,
+    /// `None` means a full batch was processed and no completion probe was needed.
+    /// A short or empty batch always carries an explicit existence-probe result.
+    pub has_remaining: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageCleanupJobRow {
+    pub job_id: String,
+    pub mode: String,
+    pub cutoff_at: DateTime<Utc>,
+    pub batch_size: usize,
+    pub max_batches: usize,
+    pub pause_ms_between_batches: u64,
+    pub status: String,
+    pub phase: String,
+    pub matched_rows: Option<u64>,
+    pub remaining_rows: Option<u64>,
+    pub processed_rows: u64,
+    pub last_batch_rows: u64,
+    pub batches: usize,
+    pub cancel_requested: bool,
+    pub stop_reason: Option<String>,
+    pub last_error: Option<String>,
+    pub redis_deleted_keys: usize,
+    pub redis_delete_commands: usize,
+    pub redis_max_command_keys: usize,
+    pub redis_scan_passes: usize,
+    pub redis_used_del_fallback: bool,
+    pub redis_pass_limit_reached: bool,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub lease_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewUsageCleanupJob<'a> {
+    pub job_id: &'a str,
+    pub mode: &'a str,
+    pub cutoff_at: DateTime<Utc>,
+    pub batch_size: usize,
+    pub max_batches: usize,
+    pub pause_ms_between_batches: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageCleanupJobProgress<'a> {
+    pub job_id: &'a str,
+    pub worker_id: &'a str,
+    pub status: &'a str,
+    pub phase: &'a str,
+    pub processed_rows: u64,
+    pub last_batch_rows: u64,
+    pub batches: usize,
+    pub remaining_rows: Option<u64>,
+    pub stop_reason: Option<&'a str>,
+    pub last_error: Option<&'a str>,
+    pub redis_deleted_keys: usize,
+    pub redis_delete_commands: usize,
+    pub redis_max_command_keys: usize,
+    pub redis_scan_passes: usize,
+    pub redis_used_del_fallback: bool,
+    pub redis_pass_limit_reached: bool,
+    pub finished: bool,
+}
+
 impl PostgresUsageStore {
     pub fn new(store: Arc<PostgresStore>) -> Self {
         Self { store }
+    }
+
+    pub async fn create_cleanup_job(&self, job: NewUsageCleanupJob<'_>) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO usage_cleanup_jobs (
+                job_id, mode, cutoff_at, batch_size, max_batches,
+                pause_ms_between_batches, status, phase, started_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, 'queued', 'postgres', now(), now())
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(job.job_id)
+        .bind(job.mode)
+        .bind(job.cutoff_at)
+        .bind(usize_to_i64(job.batch_size))
+        .bind(usize_to_i64(job.max_batches))
+        .bind(u64_to_i64(job.pause_ms_between_batches))
+        .execute(self.store.pool())
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn latest_cleanup_job(&self) -> anyhow::Result<Option<UsageCleanupJobRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT job_id, mode, cutoff_at, batch_size, max_batches,
+                   pause_ms_between_batches, status, phase, matched_rows,
+                   remaining_rows, processed_rows, last_batch_rows, batches,
+                   cancel_requested, stop_reason, last_error, redis_deleted_keys,
+                   redis_delete_commands, redis_max_command_keys, redis_scan_passes,
+                   redis_used_del_fallback, redis_pass_limit_reached,
+                   started_at, updated_at, finished_at,
+                   lease_until
+            FROM usage_cleanup_jobs
+            ORDER BY started_at DESC, job_id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(usage_cleanup_job_from_row).transpose()
+    }
+
+    pub async fn cleanup_job(&self, job_id: &str) -> anyhow::Result<Option<UsageCleanupJobRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT job_id, mode, cutoff_at, batch_size, max_batches,
+                   pause_ms_between_batches, status, phase, matched_rows,
+                   remaining_rows, processed_rows, last_batch_rows, batches,
+                   cancel_requested, stop_reason, last_error, redis_deleted_keys,
+                   redis_delete_commands, redis_max_command_keys, redis_scan_passes,
+                   redis_used_del_fallback, redis_pass_limit_reached,
+                   started_at, updated_at, finished_at,
+                   lease_until
+            FROM usage_cleanup_jobs
+            WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(usage_cleanup_job_from_row).transpose()
+    }
+
+    pub async fn recoverable_cleanup_job(&self) -> anyhow::Result<Option<UsageCleanupJobRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT job_id, mode, cutoff_at, batch_size, max_batches,
+                   pause_ms_between_batches, status, phase, matched_rows,
+                   remaining_rows, processed_rows, last_batch_rows, batches,
+                   cancel_requested, stop_reason, last_error, redis_deleted_keys,
+                   redis_delete_commands, redis_max_command_keys, redis_scan_passes,
+                   redis_used_del_fallback, redis_pass_limit_reached,
+                   started_at, updated_at, finished_at,
+                   lease_until
+            FROM usage_cleanup_jobs
+            WHERE status = 'queued'
+               OR (
+                    status = 'running'
+                    AND (lease_until IS NULL OR lease_until < now())
+               )
+            ORDER BY started_at ASC, job_id ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(usage_cleanup_job_from_row).transpose()
+    }
+
+    pub async fn claim_cleanup_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        lease_secs: u64,
+    ) -> anyhow::Result<Option<UsageCleanupJobRow>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE usage_cleanup_jobs
+            SET status = 'running',
+                lease_owner = $2,
+                lease_until = now() + ($3::bigint * interval '1 second'),
+                updated_at = now()
+            WHERE job_id = $1
+              AND (
+                    status = 'queued'
+                    OR (status = 'running' AND (lease_until IS NULL OR lease_until < now()))
+              )
+            RETURNING job_id, mode, cutoff_at, batch_size, max_batches,
+                      pause_ms_between_batches, status, phase, matched_rows,
+                      remaining_rows, processed_rows, last_batch_rows, batches,
+                      cancel_requested, stop_reason, last_error, redis_deleted_keys,
+                      redis_delete_commands, redis_max_command_keys, redis_scan_passes,
+                      redis_used_del_fallback, redis_pass_limit_reached,
+                      started_at, updated_at, finished_at,
+                      lease_until
+            "#,
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .bind(u64_to_i64(lease_secs.max(1)))
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(usage_cleanup_job_from_row).transpose()
+    }
+
+    pub async fn update_cleanup_job_progress(
+        &self,
+        progress: UsageCleanupJobProgress<'_>,
+        lease_secs: u64,
+    ) -> anyhow::Result<Option<bool>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE usage_cleanup_jobs
+            SET status = $3,
+                phase = $4,
+                processed_rows = $5,
+                last_batch_rows = $6,
+                batches = $7,
+                remaining_rows = $8,
+                matched_rows = CASE
+                    WHEN $17 AND $8::bigint = 0 THEN COALESCE(matched_rows, $5)
+                    ELSE matched_rows
+                END,
+                stop_reason = $9,
+                last_error = $10,
+                redis_deleted_keys = $11,
+                redis_delete_commands = $12,
+                redis_max_command_keys = $13,
+                redis_scan_passes = $14,
+                redis_used_del_fallback = $15,
+                redis_pass_limit_reached = $16,
+                lease_until = CASE
+                    WHEN $17 THEN NULL
+                    ELSE now() + ($18::bigint * interval '1 second')
+                END,
+                lease_owner = CASE WHEN $17 THEN NULL ELSE lease_owner END,
+                finished_at = CASE WHEN $17 THEN now() ELSE NULL END,
+                updated_at = now()
+            WHERE job_id = $1
+              AND lease_owner = $2
+            RETURNING cancel_requested
+            "#,
+        )
+        .bind(progress.job_id)
+        .bind(progress.worker_id)
+        .bind(progress.status)
+        .bind(progress.phase)
+        .bind(u64_to_i64(progress.processed_rows))
+        .bind(u64_to_i64(progress.last_batch_rows))
+        .bind(usize_to_i64(progress.batches))
+        .bind(progress.remaining_rows.map(u64_to_i64))
+        .bind(progress.stop_reason)
+        .bind(progress.last_error)
+        .bind(usize_to_i64(progress.redis_deleted_keys))
+        .bind(usize_to_i64(progress.redis_delete_commands))
+        .bind(usize_to_i64(progress.redis_max_command_keys))
+        .bind(usize_to_i64(progress.redis_scan_passes))
+        .bind(progress.redis_used_del_fallback)
+        .bind(progress.redis_pass_limit_reached)
+        .bind(progress.finished)
+        .bind(u64_to_i64(lease_secs.max(1)))
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(|row| row.try_get("cancel_requested"))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn renew_cleanup_job_lease(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        lease_secs: u64,
+    ) -> anyhow::Result<Option<bool>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE usage_cleanup_jobs
+            SET lease_until = now() + ($3::bigint * interval '1 second'),
+                updated_at = now()
+            WHERE job_id = $1
+              AND lease_owner = $2
+              AND status = 'running'
+            RETURNING cancel_requested
+            "#,
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .bind(u64_to_i64(lease_secs.max(1)))
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(|row| row.try_get("cancel_requested"))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub async fn request_cleanup_cancel(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<UsageCleanupJobRow>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE usage_cleanup_jobs
+            SET cancel_requested = true,
+                status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+                stop_reason = CASE
+                    WHEN status = 'queued' THEN 'cancel_requested_before_start'
+                    ELSE stop_reason
+                END,
+                finished_at = CASE WHEN status = 'queued' THEN now() ELSE finished_at END,
+                lease_owner = CASE WHEN status = 'queued' THEN NULL ELSE lease_owner END,
+                lease_until = CASE WHEN status = 'queued' THEN NULL ELSE lease_until END,
+                updated_at = now()
+            WHERE job_id = $1
+              AND status IN ('queued', 'running')
+            RETURNING job_id, mode, cutoff_at, batch_size, max_batches,
+                      pause_ms_between_batches, status, phase, matched_rows,
+                      remaining_rows, processed_rows, last_batch_rows, batches,
+                      cancel_requested, stop_reason, last_error, redis_deleted_keys,
+                      redis_delete_commands, redis_max_command_keys, redis_scan_passes,
+                      redis_used_del_fallback, redis_pass_limit_reached,
+                      started_at, updated_at, finished_at,
+                      lease_until
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(usage_cleanup_job_from_row).transpose()
+    }
+
+    pub async fn requeue_cleanup_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<UsageCleanupJobRow>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE usage_cleanup_jobs
+            SET status = 'queued',
+                cancel_requested = false,
+                stop_reason = NULL,
+                last_error = NULL,
+                redis_pass_limit_reached = false,
+                finished_at = NULL,
+                lease_owner = NULL,
+                lease_until = NULL,
+                updated_at = now()
+            WHERE job_id = $1
+              AND status IN ('failed', 'cancelled', 'paused')
+            RETURNING job_id, mode, cutoff_at, batch_size, max_batches,
+                      pause_ms_between_batches, status, phase, matched_rows,
+                      remaining_rows, processed_rows, last_batch_rows, batches,
+                      cancel_requested, stop_reason, last_error, redis_deleted_keys,
+                      redis_delete_commands, redis_max_command_keys, redis_scan_passes,
+                      redis_used_del_fallback, redis_pass_limit_reached,
+                      started_at, updated_at, finished_at,
+                      lease_until
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(self.store.pool())
+        .await?;
+        row.map(usage_cleanup_job_from_row).transpose()
     }
 
     #[cfg(test)]
@@ -4086,30 +4923,43 @@ impl PostgresUsageStore {
         for record in records {
             records_by_id.insert(record.id.clone(), record);
         }
-        let records: Vec<UsageRecord> = records_by_id.into_values().collect();
+        let mut records: Vec<UsageRecord> = records_by_id.into_values().collect();
+        records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
         let mut tx = self.store.pool().begin().await?;
-        let old_rows = sqlx::query("SELECT id, data FROM usage_records WHERE id = ANY($1)")
-            .bind(&ids)
-            .fetch_all(&mut *tx)
-            .await?;
+        acquire_usage_writer_commit_guard(&mut tx).await?;
+        acquire_usage_record_commit_guards(&mut tx, &ids).await?;
+        let old_rows = sqlx::query(
+            r#"
+            SELECT id, data
+            FROM usage_records
+            WHERE id = ANY($1)
+              AND deleted_at IS NULL
+              AND rollup_active
+            ORDER BY id
+            FOR UPDATE
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
         let mut old_records: HashMap<String, UsageRecord> = HashMap::with_capacity(old_rows.len());
         for row in old_rows {
             let id: String = row.try_get("id")?;
             let value: serde_json::Value = row.try_get("data")?;
-            old_records.insert(id, serde_json::from_value(value)?);
-        }
-
-        for record in &records {
-            upsert_usage_record_in_tx(&mut tx, record).await?;
+            let mut record: UsageRecord = serde_json::from_value(value)?;
+            apply_usage_record_legacy_cost_compatibility(&mut record);
+            old_records.insert(id, record);
         }
 
         let mut rollups = UsageRollupBatchDelta::default();
-        for old_record in old_records.values() {
-            rollups.add_record(old_record, -1);
-        }
         for record in &records {
-            rollups.add_record(record, 1);
+            if upsert_usage_record_in_tx(&mut tx, record).await? {
+                if let Some(old_record) = old_records.get(&record.id) {
+                    rollups.add_record(old_record, -1);
+                }
+                rollups.add_record(record, 1);
+            }
         }
         rollups.apply(&mut tx).await?;
         tx.commit().await?;
@@ -4169,13 +5019,6 @@ impl PostgresUsageStore {
         })
     }
 
-    pub async fn clear(&self) -> anyhow::Result<()> {
-        sqlx::query("UPDATE usage_records SET deleted_at = now(), updated_at = now() WHERE deleted_at IS NULL")
-            .execute(self.store.pool())
-            .await?;
-        Ok(())
-    }
-
     pub async fn preview_soft_delete_cleanup(
         &self,
         cutoff: DateTime<Utc>,
@@ -4218,59 +5061,238 @@ impl PostgresUsageStore {
         cleanup_preview_from_row(row)
     }
 
+    pub async fn advance_soft_delete_cleanup_watermark(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<DateTime<Utc>> {
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_cleanup_transaction(&mut tx).await?;
+        acquire_usage_cleanup_commit_guard(&mut tx).await?;
+        let effective_cutoff = sqlx::query_scalar(
+            r#"
+            WITH advanced AS (
+                INSERT INTO usage_cleanup_watermarks (scope, cutoff_at, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (scope) DO UPDATE
+                SET cutoff_at = EXCLUDED.cutoff_at,
+                    updated_at = now()
+                WHERE EXCLUDED.cutoff_at > usage_cleanup_watermarks.cutoff_at
+                RETURNING cutoff_at
+            )
+            SELECT COALESCE(
+                (SELECT cutoff_at FROM advanced),
+                (SELECT cutoff_at FROM usage_cleanup_watermarks WHERE scope = $1)
+            )
+            "#,
+        )
+        .bind(USAGE_SOFT_DELETE_WATERMARK_SCOPE)
+        .bind(cutoff)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(effective_cutoff)
+    }
+
+    pub async fn soft_delete_cleanup_watermark(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
+        sqlx::query_scalar("SELECT cutoff_at FROM usage_cleanup_watermarks WHERE scope = $1")
+            .bind(USAGE_SOFT_DELETE_WATERMARK_SCOPE)
+            .fetch_optional(self.store.pool())
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn soft_delete_cleanup_batch(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: usize,
-    ) -> anyhow::Result<u64> {
-        let result = sqlx::query(
+    ) -> anyhow::Result<UsageCleanupBatchResult> {
+        if let Err(err) = self.advance_soft_delete_cleanup_watermark(cutoff).await {
+            if is_postgres_lock_timeout_error(&err) {
+                return Ok(UsageCleanupBatchResult {
+                    processed_rows: 0,
+                    has_remaining: Some(true),
+                });
+            }
+            return Err(err);
+        }
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_cleanup_transaction(&mut tx).await?;
+        if !try_acquire_usage_cleanup_commit_guard(&mut tx).await? {
+            tx.rollback().await?;
+            return Ok(UsageCleanupBatchResult {
+                processed_rows: 0,
+                has_remaining: Some(true),
+            });
+        }
+        let victim_rows = sqlx::query(
             r#"
             WITH victims AS (
-                SELECT id
+                SELECT id, data, rollup_active
                 FROM usage_records
                 WHERE deleted_at IS NULL
                   AND created_at < $1
                 ORDER BY created_at ASC, id ASC
                 LIMIT $2
+                FOR UPDATE SKIP LOCKED
             )
             UPDATE usage_records AS u
-            SET deleted_at = now(), updated_at = now()
+            SET deleted_at = now(), rollup_active = false, updated_at = now()
             FROM victims AS v
             WHERE u.id = v.id
+            RETURNING v.data, v.rollup_active
             "#,
         )
         .bind(cutoff)
         .bind(usize_to_i64(batch_size))
-        .execute(self.store.pool())
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        let processed_rows = victim_rows.len() as u64;
+        let mut rollups = UsageRollupBatchDelta::default();
+        for row in victim_rows {
+            if row.try_get::<bool, _>("rollup_active")? {
+                let value: serde_json::Value = row.try_get("data")?;
+                let mut record: UsageRecord = serde_json::from_value(value)?;
+                apply_usage_record_legacy_cost_compatibility(&mut record);
+                rollups.add_record(&record, -1);
+            }
+        }
+        rollups.apply(&mut tx).await?;
+        let has_remaining = if processed_rows < batch_size as u64 {
+            Some(
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM usage_records
+                        WHERE deleted_at IS NULL
+                          AND created_at < $1
+                    )
+                    "#,
+                )
+                .bind(cutoff)
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(UsageCleanupBatchResult {
+            processed_rows,
+            has_remaining,
+        })
+    }
+
+    pub async fn soft_delete_cleanup_has_remaining(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM usage_records
+                WHERE deleted_at IS NULL
+                  AND created_at < $1
+            )
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_one(self.store.pool())
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn hard_delete_cleanup_batch(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: usize,
-    ) -> anyhow::Result<u64> {
-        let result = sqlx::query(
+    ) -> anyhow::Result<UsageCleanupBatchResult> {
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_cleanup_transaction(&mut tx).await?;
+        if !try_acquire_usage_cleanup_commit_guard(&mut tx).await? {
+            tx.rollback().await?;
+            return Ok(UsageCleanupBatchResult {
+                processed_rows: 0,
+                has_remaining: Some(true),
+            });
+        }
+        let victim_rows = sqlx::query(
             r#"
             WITH victims AS (
-                SELECT id
+                SELECT id, data, rollup_active
                 FROM usage_records
                 WHERE deleted_at IS NOT NULL
                   AND deleted_at < $1
                 ORDER BY deleted_at ASC, id ASC
                 LIMIT $2
+                FOR UPDATE SKIP LOCKED
             )
             DELETE FROM usage_records AS u
             USING victims AS v
             WHERE u.id = v.id
+            RETURNING v.data, v.rollup_active
             "#,
         )
         .bind(cutoff)
         .bind(usize_to_i64(batch_size))
-        .execute(self.store.pool())
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        let processed_rows = victim_rows.len() as u64;
+        let mut rollups = UsageRollupBatchDelta::default();
+        for row in victim_rows {
+            if row.try_get::<bool, _>("rollup_active")? {
+                let value: serde_json::Value = row.try_get("data")?;
+                let mut record: UsageRecord = serde_json::from_value(value)?;
+                apply_usage_record_legacy_cost_compatibility(&mut record);
+                rollups.add_record(&record, -1);
+            }
+        }
+        rollups.apply(&mut tx).await?;
+        let has_remaining = if processed_rows < batch_size as u64 {
+            Some(
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM usage_records
+                        WHERE deleted_at IS NOT NULL
+                          AND deleted_at < $1
+                    )
+                    "#,
+                )
+                .bind(cutoff)
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(UsageCleanupBatchResult {
+            processed_rows,
+            has_remaining,
+        })
+    }
+
+    pub async fn hard_delete_cleanup_has_remaining(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM usage_records
+                WHERE deleted_at IS NOT NULL
+                  AND deleted_at < $1
+            )
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_one(self.store.pool())
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn summary(&self, high_cache_threshold: i32) -> anyhow::Result<UsageSummary> {
@@ -4421,23 +5443,11 @@ impl PostgresUsageStore {
         let mut windows = self
             .dashboard_windows(&window_specs, high_cache_threshold)
             .await?;
-        let window_totals: HashMap<String, usize> = windows
-            .iter()
-            .map(|window| (window.key.clone(), window.summary.total_requests))
-            .collect();
         let mut status_breakdown = self
-            .dashboard_breakdown(
-                &window_specs,
-                &window_totals,
-                DashboardBreakdownColumn::Status,
-            )
+            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::Status)
             .await?;
         let mut usage_source_breakdown = self
-            .dashboard_breakdown(
-                &window_specs,
-                &window_totals,
-                DashboardBreakdownColumn::UsageSource,
-            )
+            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::UsageSource)
             .await?;
         let mut external_pool_billing_by_pool = self
             .dashboard_external_pool_billing_by_pool(&window_specs)
@@ -4551,16 +5561,11 @@ impl PostgresUsageStore {
         let (timezone, offset) = usage_dashboard_timezone(timezone);
         let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
         let specs = [window_spec.clone()];
-        let windows = self.dashboard_windows(&specs, 0).await?;
-        let totals: HashMap<String, usize> = windows
-            .iter()
-            .map(|window| (window.key.clone(), window.summary.total_requests))
-            .collect();
         let mut status_breakdown = self
-            .dashboard_breakdown(&specs, &totals, DashboardBreakdownColumn::Status)
+            .dashboard_breakdown(&specs, DashboardBreakdownColumn::Status)
             .await?;
         let mut usage_source_breakdown = self
-            .dashboard_breakdown(&specs, &totals, DashboardBreakdownColumn::UsageSource)
+            .dashboard_breakdown(&specs, DashboardBreakdownColumn::UsageSource)
             .await?;
         Ok((
             now.to_rfc3339(),
@@ -4604,6 +5609,7 @@ impl PostgresUsageStore {
 
         let mut builder = QueryBuilder::<Postgres>::new("");
         push_dashboard_windows_cte(&mut builder, specs);
+        push_dashboard_global_segments_cte(&mut builder);
         builder.push(
             r#"
             , rollup AS (
@@ -4612,91 +5618,146 @@ impl PostgresUsageStore {
                 w.label,
                 w.from_at,
                 w.to_at,
-                COALESCE(SUM(b.requests), 0)::bigint AS total_requests,
-                COALESCE(SUM(b.success_requests), 0)::bigint AS success_requests,
-                COALESCE(SUM(b.error_requests), 0)::bigint AS error_requests,
-                COALESCE(SUM(b.stream_requests), 0)::bigint AS stream_requests,
-                COALESCE(SUM(b.non_stream_requests), 0)::bigint AS non_stream_requests,
-                COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
-                COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(b.total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
-                COALESCE(SUM(b.total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
-                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(SUM(s.requests), 0)::bigint AS total_requests,
+                COALESCE(SUM(s.success_requests), 0)::bigint AS success_requests,
+                COALESCE(SUM(s.error_requests), 0)::bigint AS error_requests,
+                COALESCE(SUM(s.stream_requests), 0)::bigint AS stream_requests,
+                COALESCE(SUM(s.non_stream_requests), 0)::bigint AS non_stream_requests,
+                COALESCE(SUM(s.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(s.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(s.total_output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(s.total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+                COALESCE(SUM(s.total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+                COALESCE(SUM(s.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
-                        THEN b.total_original_cost_usd
-                        ELSE COALESCE(b.total_estimated_cost_usd, 0)
+                        WHEN COALESCE(s.total_original_cost_usd, 0) <> 0
+                        THEN s.total_original_cost_usd
+                        ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(b.priced_requests), 0)::bigint AS priced_requests,
-                COALESCE(SUM(b.unpriced_requests), 0)::bigint AS unpriced_requests,
+                COALESCE(SUM(s.priced_requests), 0)::bigint AS priced_requests,
+                COALESCE(SUM(s.unpriced_requests), 0)::bigint AS unpriced_requests,
                 CASE
-                    WHEN COALESCE(SUM(b.duration_ms_count), 0) > 0
-                    THEN COALESCE(SUM(b.duration_ms_sum), 0)::double precision
-                         / SUM(b.duration_ms_count)::double precision
+                    WHEN COALESCE(SUM(s.duration_ms_count), 0) > 0
+                    THEN COALESCE(SUM(s.duration_ms_sum), 0)::double precision
+                         / SUM(s.duration_ms_count)::double precision
                     ELSE 0
                 END AS average_duration_ms,
-                COALESCE(MAX(b.duration_ms_max), 0)::bigint AS p95_duration_ms,
-                COALESCE(SUM(b.sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
-                COALESCE(SUM(b.fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
-                COALESCE(SUM(b.simulated_requests), 0)::bigint AS simulated_requests,
-                COALESCE(SUM(b.upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
-                COALESCE(SUM(b.external_pool_requests), 0)::bigint AS external_pool_requests,
-                COALESCE(SUM(b.external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
-                COALESCE(SUM(b.external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
-                COALESCE(SUM(b.external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
-                COALESCE(SUM(b.external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
+                COALESCE(SUM(s.sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
+                COALESCE(SUM(s.fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
+                COALESCE(SUM(s.simulated_requests), 0)::bigint AS simulated_requests,
+                COALESCE(SUM(s.upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
+                COALESCE(SUM(s.external_pool_requests), 0)::bigint AS external_pool_requests,
+                COALESCE(SUM(s.external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
+                COALESCE(SUM(s.external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
+                COALESCE(SUM(s.external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
+                COALESCE(SUM(s.external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.external_pool_shaped_cost_usd, 0) <> 0
-                        THEN b.external_pool_shaped_cost_usd
-                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.external_pool_shaped_cost_usd, 0) <> 0
+                        THEN s.external_pool_shaped_cost_usd
+                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
                     END
                 ), 0)::double precision AS external_pool_shaped_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.external_pool_uplifted_cost_usd, 0) <> 0
-                        THEN b.external_pool_uplifted_cost_usd
-                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.external_pool_uplifted_cost_usd, 0) <> 0
+                        THEN s.external_pool_uplifted_cost_usd
+                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
                     END
                 ), 0)::double precision AS external_pool_uplifted_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.external_pool_profit_usd, 0) <> 0
-                        THEN b.external_pool_profit_usd
-                        WHEN COALESCE(b.external_pool_reported_cost_usd, 0) <> 0
-                          OR COALESCE(b.external_pool_raw_cost_usd, 0) <> 0
-                        THEN COALESCE(b.external_pool_reported_cost_usd, 0) - COALESCE(b.external_pool_raw_cost_usd, 0)
+                        WHEN COALESCE(s.external_pool_profit_usd, 0) <> 0
+                        THEN s.external_pool_profit_usd
+                        WHEN COALESCE(s.external_pool_reported_cost_usd, 0) <> 0
+                          OR COALESCE(s.external_pool_raw_cost_usd, 0) <> 0
+                        THEN COALESCE(s.external_pool_reported_cost_usd, 0) - COALESCE(s.external_pool_raw_cost_usd, 0)
                         ELSE 0
                     END
                 ), 0)::double precision AS external_pool_profit_usd,
-                COALESCE(SUM(b.external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
-                COALESCE(SUM(b.external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
-                COALESCE(SUM(b.external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd
-            FROM windows w
-            LEFT JOIN usage_rollup_time_buckets b
-                ON b.dimension = 'global'
-                AND b.dimension_key = 'all'
-                AND b.bucket_start >= w.from_at
-                AND b.bucket_start < w.to_at
+                COALESCE(SUM(s.external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
+                COALESCE(SUM(s.external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
+                COALESCE(SUM(s.external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd
+            FROM window_bounds w
+            LEFT JOIN dashboard_global_segments s ON s.window_key = w.key
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
-            ), high_cache AS (
+            ), high_cache_segments AS (
             SELECT
-                w.key,
-                COALESCE(SUM(c.requests), 0)::bigint AS high_cache_requests
-            FROM windows w
-            LEFT JOIN usage_cache_read_rollup_time_buckets c
-                ON c.bucket_start >= w.from_at
-                AND c.bucket_start < w.to_at
-                AND c.cache_read_input_tokens >=
+                w.key AS window_key,
+                c.requests
+            FROM window_bounds w
+            JOIN usage_cache_read_rollup_time_buckets c
+              ON c.bucket_start >= w.full_from_at
+             AND c.bucket_start < w.full_to_at
+             AND c.cache_read_input_tokens >=
             "#,
         );
         builder.push_bind(high_cache_threshold);
         builder.push(
             r#"
-            GROUP BY w.key
+            UNION ALL
+            SELECT
+                r.window_key,
+                COUNT(*)::bigint AS requests
+            FROM window_boundary_records r
+            WHERE GREATEST(r.cache_read_input_tokens, 0) >=
+            "#,
+        );
+        builder.push_bind(high_cache_threshold);
+        builder.push(
+            r#"
+            GROUP BY r.window_key
+            ), high_cache AS (
+            SELECT
+                window_key AS key,
+                COALESCE(SUM(requests), 0)::bigint AS high_cache_requests
+            FROM high_cache_segments
+            GROUP BY window_key
+            ), duration_count_segments AS (
+            SELECT
+                w.key AS window_key,
+                d.duration_ms,
+                d.requests
+            FROM window_bounds w
+            JOIN usage_duration_rollup_time_buckets d
+              ON d.bucket_start >= w.full_from_at
+             AND d.bucket_start < w.full_to_at
+            UNION ALL
+            SELECT
+                r.window_key,
+                LEAST(r.dashboard_duration_ms, 2147483647)::bigint AS duration_ms,
+                COUNT(*)::bigint AS requests
+            FROM window_boundary_records r
+            GROUP BY r.window_key, LEAST(r.dashboard_duration_ms, 2147483647)
+            ), duration_counts AS (
+            SELECT
+                window_key AS key,
+                duration_ms,
+                SUM(requests)::numeric AS requests
+            FROM duration_count_segments
+            GROUP BY window_key, duration_ms
+            HAVING SUM(requests) > 0
+            ), duration_ranked AS (
+            SELECT
+                key,
+                duration_ms,
+                SUM(requests) OVER (
+                    PARTITION BY key
+                    ORDER BY duration_ms
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS cumulative_requests,
+                SUM(requests) OVER (PARTITION BY key) AS total_requests
+            FROM duration_counts
+            ), duration_p95 AS (
+            SELECT
+                key,
+                MIN(duration_ms)::bigint AS p95_duration_ms
+            FROM duration_ranked
+            WHERE cumulative_requests::numeric * 100::numeric
+                >= total_requests::numeric * 95::numeric
+            GROUP BY key
             )
             SELECT
                 r.key,
@@ -4719,7 +5780,7 @@ impl PostgresUsageStore {
                 r.priced_requests,
                 r.unpriced_requests,
                 r.average_duration_ms,
-                r.p95_duration_ms,
+                COALESCE(p.p95_duration_ms, 0)::bigint AS p95_duration_ms,
                 r.sticky_bound_requests,
                 r.fallback_from_sticky_requests,
                 r.simulated_requests,
@@ -4737,7 +5798,8 @@ impl PostgresUsageStore {
                 r.external_pool_cost_floor_delta_usd
             FROM rollup r
             LEFT JOIN high_cache h ON h.key = r.key
-            JOIN windows w ON w.key = r.key
+            LEFT JOIN duration_p95 p ON p.key = r.key
+            JOIN window_bounds w ON w.key = r.key
             ORDER BY w.ord
             "#,
         );
@@ -4751,7 +5813,6 @@ impl PostgresUsageStore {
     async fn dashboard_breakdown(
         &self,
         specs: &[UsageDashboardWindowSpec],
-        totals: &HashMap<String, usize>,
         column: DashboardBreakdownColumn,
     ) -> anyhow::Result<HashMap<String, Vec<UsageBreakdownItem>>> {
         if specs.is_empty() {
@@ -4762,23 +5823,61 @@ impl PostgresUsageStore {
         let mut builder = QueryBuilder::<Postgres>::new("");
         push_dashboard_windows_cte(&mut builder, specs);
         builder.push(
-            r#"SELECT w.key AS window_key,
+            r#", breakdown_count_segments AS (
+            SELECT
+                   w.key AS window_key,
                    b.dimension_key AS item_key,
-                   SUM(b.requests)::bigint AS requests
-            FROM windows w
+                   b.requests
+            FROM window_bounds w
             JOIN usage_rollup_time_buckets b
               ON b.dimension = "#,
         );
         builder.push_bind(item_dimension);
         builder.push(
             r#"
-             AND b.bucket_start >= w.from_at
-             AND b.bucket_start < w.to_at
-            GROUP BY w.key, w.ord, b.dimension_key
-            HAVING SUM(b.requests) > 0
+             AND b.bucket_start >= w.full_from_at
+             AND b.bucket_start < w.full_to_at
+            UNION ALL
+            SELECT
+                r.window_key,
             "#,
         );
-        builder.push(" ORDER BY w.ord, requests DESC, item_key");
+        builder.push(column.detail_column());
+        builder.push(
+            r#" AS item_key,
+                COUNT(*)::bigint AS requests
+            FROM window_boundary_records r
+            GROUP BY r.window_key, "#,
+        );
+        builder.push(column.detail_column());
+        builder.push(
+            r#"
+            ), breakdown_counts AS (
+            SELECT
+                window_key,
+                item_key,
+                SUM(requests)::bigint AS requests
+            FROM breakdown_count_segments
+            GROUP BY window_key, item_key
+            ), breakdown_totals AS (
+            SELECT
+                window_key,
+                SUM(requests)::bigint AS total_requests
+            FROM breakdown_counts
+            GROUP BY window_key
+            )
+            SELECT
+                c.window_key,
+                c.item_key,
+                c.requests,
+                COALESCE(t.total_requests, 0)::bigint AS total_requests
+            FROM breakdown_counts c
+            JOIN breakdown_totals t ON t.window_key = c.window_key
+            JOIN window_bounds w ON w.key = c.window_key
+            WHERE c.requests > 0
+            ORDER BY w.ord, c.requests DESC, c.item_key
+            "#,
+        );
 
         let rows = builder.build().fetch_all(self.store.pool()).await?;
         let mut grouped: HashMap<String, Vec<UsageBreakdownItem>> = HashMap::new();
@@ -4786,7 +5885,7 @@ impl PostgresUsageStore {
             let window_key: String = row.try_get("window_key")?;
             let item_key: String = row.try_get("item_key")?;
             let requests = row_i64_to_usize(&row, "requests")?;
-            let total_requests = totals.get(&window_key).copied().unwrap_or_default();
+            let total_requests = row_i64_to_usize(&row, "total_requests")?;
             grouped
                 .entry(window_key)
                 .or_default()
@@ -4810,6 +5909,7 @@ impl PostgresUsageStore {
 
         let mut builder = QueryBuilder::<Postgres>::new("");
         push_dashboard_windows_cte(&mut builder, specs);
+        push_dashboard_global_segments_cte(&mut builder);
         builder.push(
             r#"
             SELECT
@@ -4817,26 +5917,22 @@ impl PostgresUsageStore {
                 w.label,
                 w.from_at,
                 w.to_at,
-                COALESCE(SUM(b.requests), 0)::bigint AS requests,
-                COALESCE(SUM(b.success_requests), 0)::bigint AS success_requests,
-                COALESCE(SUM(b.error_requests), 0)::bigint AS error_requests,
-                COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
-                COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(SUM(s.requests), 0)::bigint AS requests,
+                COALESCE(SUM(s.success_requests), 0)::bigint AS success_requests,
+                COALESCE(SUM(s.error_requests), 0)::bigint AS error_requests,
+                COALESCE(SUM(s.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(s.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(s.total_output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(s.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
-                        THEN b.total_original_cost_usd
-                        ELSE COALESCE(b.total_estimated_cost_usd, 0)
+                        WHEN COALESCE(s.total_original_cost_usd, 0) <> 0
+                        THEN s.total_original_cost_usd
+                        ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd
-            FROM windows w
-            LEFT JOIN usage_rollup_time_buckets b
-                ON b.dimension = 'global'
-                AND b.dimension_key = 'all'
-                AND b.bucket_start >= w.from_at
-                AND b.bucket_start < w.to_at
+            FROM window_bounds w
+            LEFT JOIN dashboard_global_segments s ON s.window_key = w.key
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
             ORDER BY w.ord
             "#,
@@ -4857,51 +5953,49 @@ impl PostgresUsageStore {
 
         let mut builder = QueryBuilder::<Postgres>::new("");
         push_dashboard_windows_cte(&mut builder, specs);
+        push_dashboard_external_pool_segments_cte(&mut builder);
         builder.push(
             r#"
             SELECT
                 w.key AS window_key,
-                b.dimension_key AS pool_id,
-                NULLIF(MAX(b.dimension_label), '') AS pool_name,
-                COALESCE(SUM(b.external_pool_requests), 0)::bigint AS requests,
-                COALESCE(SUM(b.external_pool_priced_requests), 0)::bigint AS priced_requests,
-                COALESCE(SUM(b.external_pool_unpriced_requests), 0)::bigint AS unpriced_requests,
-                COALESCE(SUM(b.external_pool_cost_floor_applied_requests), 0)::bigint AS cost_floor_applied_requests,
-                COALESCE(SUM(b.external_pool_raw_cost_usd), 0)::double precision AS raw_cost_usd,
+                s.pool_id,
+                NULLIF(MAX(s.pool_name), '') AS pool_name,
+                COALESCE(SUM(s.external_pool_requests), 0)::bigint AS requests,
+                COALESCE(SUM(s.external_pool_priced_requests), 0)::bigint AS priced_requests,
+                COALESCE(SUM(s.external_pool_unpriced_requests), 0)::bigint AS unpriced_requests,
+                COALESCE(SUM(s.external_pool_cost_floor_applied_requests), 0)::bigint AS cost_floor_applied_requests,
+                COALESCE(SUM(s.external_pool_raw_cost_usd), 0)::double precision AS raw_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.external_pool_shaped_cost_usd, 0) <> 0
-                        THEN b.external_pool_shaped_cost_usd
-                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.external_pool_shaped_cost_usd, 0) <> 0
+                        THEN s.external_pool_shaped_cost_usd
+                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
                     END
                 ), 0)::double precision AS shaped_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.external_pool_uplifted_cost_usd, 0) <> 0
-                        THEN b.external_pool_uplifted_cost_usd
-                        ELSE COALESCE(b.external_pool_reported_cost_usd, 0)
+                        WHEN COALESCE(s.external_pool_uplifted_cost_usd, 0) <> 0
+                        THEN s.external_pool_uplifted_cost_usd
+                        ELSE COALESCE(s.external_pool_reported_cost_usd, 0)
                     END
                 ), 0)::double precision AS uplifted_cost_usd,
                 COALESCE(SUM(
                     CASE
-                        WHEN COALESCE(b.external_pool_profit_usd, 0) <> 0
-                        THEN b.external_pool_profit_usd
-                        WHEN COALESCE(b.external_pool_reported_cost_usd, 0) <> 0
-                          OR COALESCE(b.external_pool_raw_cost_usd, 0) <> 0
-                        THEN COALESCE(b.external_pool_reported_cost_usd, 0) - COALESCE(b.external_pool_raw_cost_usd, 0)
+                        WHEN COALESCE(s.external_pool_profit_usd, 0) <> 0
+                        THEN s.external_pool_profit_usd
+                        WHEN COALESCE(s.external_pool_reported_cost_usd, 0) <> 0
+                          OR COALESCE(s.external_pool_raw_cost_usd, 0) <> 0
+                        THEN COALESCE(s.external_pool_reported_cost_usd, 0) - COALESCE(s.external_pool_raw_cost_usd, 0)
                         ELSE 0
                     END
                 ), 0)::double precision AS profit_usd,
-                COALESCE(SUM(b.external_pool_reported_cost_usd), 0)::double precision AS reported_cost_usd,
-                COALESCE(SUM(b.external_pool_billable_cost_usd), 0)::double precision AS billable_cost_usd,
-                COALESCE(SUM(b.external_pool_cost_floor_delta_usd), 0)::double precision AS cost_floor_delta_usd
-            FROM windows w
-            JOIN usage_rollup_time_buckets b
-              ON b.dimension = 'external_pool'
-             AND b.bucket_start >= w.from_at
-             AND b.bucket_start < w.to_at
-            GROUP BY w.key, w.ord, b.dimension_key
-            HAVING COALESCE(SUM(b.external_pool_requests), 0) > 0
+                COALESCE(SUM(s.external_pool_reported_cost_usd), 0)::double precision AS reported_cost_usd,
+                COALESCE(SUM(s.external_pool_billable_cost_usd), 0)::double precision AS billable_cost_usd,
+                COALESCE(SUM(s.external_pool_cost_floor_delta_usd), 0)::double precision AS cost_floor_delta_usd
+            FROM window_bounds w
+            JOIN dashboard_external_pool_segments s ON s.window_key = w.key
+            GROUP BY w.key, w.ord, s.pool_id
+            HAVING COALESCE(SUM(s.external_pool_requests), 0) > 0
             ORDER BY w.ord, uplifted_cost_usd DESC, requests DESC, pool_id
             "#,
         );
@@ -5171,12 +6265,12 @@ fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
 async fn upsert_usage_record_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     record: &UsageRecord,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let value = serde_json::to_value(record)?;
     let created_at = chrono::DateTime::parse_from_rfc3339(&record.created_at)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
-    sqlx::query(
+    let applied = sqlx::query(
         r#"
         INSERT INTO usage_records (
             id, created_at, endpoint, stream, model, conversation_id, credential_id,
@@ -5187,10 +6281,17 @@ async fn upsert_usage_record_in_tx(
             pricing_available, pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
             error_type, error_message, error_detail, data
         )
-        VALUES (
+        SELECT
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
+        WHERE $2 >= COALESCE(
+            (
+                SELECT cutoff_at
+                FROM usage_cleanup_watermarks
+                WHERE scope = 'soft_delete_created_at'
+            ),
+            '-infinity'::timestamptz
         )
         ON CONFLICT (id) DO UPDATE
         SET created_at = EXCLUDED.created_at,
@@ -5223,8 +6324,10 @@ async fn upsert_usage_record_in_tx(
             error_message = EXCLUDED.error_message,
             error_detail = EXCLUDED.error_detail,
             data = EXCLUDED.data,
-            deleted_at = NULL,
             updated_at = now()
+        WHERE usage_records.deleted_at IS NULL
+          AND usage_records.rollup_active
+        RETURNING id
         "#,
     )
     .bind(&record.id)
@@ -5250,7 +6353,7 @@ async fn upsert_usage_record_in_tx(
     .bind(record.kiro_metering_usage)
     .bind(record.pricing_available)
     .bind(&record.pricing_model)
-    .bind(record.duration_ms as i64)
+    .bind(u64_to_i64(record.duration_ms))
     .bind(record.simulated)
     .bind(record.sticky_bound)
     .bind(record.fallback_from_sticky)
@@ -5258,9 +6361,9 @@ async fn upsert_usage_record_in_tx(
     .bind(&record.error_message)
     .bind(&record.error_detail)
     .bind(value)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    Ok(())
+    Ok(applied.is_some())
 }
 
 fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
@@ -5269,6 +6372,125 @@ fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
         matched_rows,
         oldest_created_at: row.try_get("oldest_created_at")?,
         newest_created_at: row.try_get("newest_created_at")?,
+    })
+}
+
+async fn configure_usage_cleanup_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    sqlx::query("SET LOCAL lock_timeout = '250ms'")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn acquire_usage_writer_commit_guard(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+        .bind(USAGE_CLEANUP_COMMIT_LOCK_ID)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn usage_record_commit_lock_id(id: &str) -> i64 {
+    let digest = Sha256::digest(id.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(bytes) ^ USAGE_RECORD_COMMIT_LOCK_DOMAIN
+}
+
+async fn acquire_usage_record_commit_guards(
+    tx: &mut Transaction<'_, Postgres>,
+    ids: &[String],
+) -> anyhow::Result<()> {
+    let mut lock_ids = ids
+        .iter()
+        .map(|id| usage_record_commit_lock_id(id))
+        .collect::<Vec<_>>();
+    lock_ids.sort_unstable();
+    lock_ids.dedup();
+    sqlx::query(
+        r#"
+        SELECT pg_advisory_xact_lock(lock_id)
+        FROM unnest($1::bigint[]) AS locks(lock_id)
+        ORDER BY lock_id
+        "#,
+    )
+    .bind(&lock_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn acquire_usage_cleanup_commit_guard(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(USAGE_CLEANUP_COMMIT_LOCK_ID)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn try_acquire_usage_cleanup_commit_guard(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<bool> {
+    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(USAGE_CLEANUP_COMMIT_LOCK_ID)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(Into::into)
+}
+
+fn is_postgres_lock_timeout_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("lock timeout")
+            || message.contains("canceling statement due to lock timeout")
+    })
+}
+
+fn usage_cleanup_job_from_row(row: PgRow) -> anyhow::Result<UsageCleanupJobRow> {
+    let optional_u64 = |column: &str| -> anyhow::Result<Option<u64>> {
+        let value: Option<i64> = row.try_get(column)?;
+        Ok(value.map(|value| value.max(0) as u64))
+    };
+    let nonnegative_int = |column: &str| -> anyhow::Result<usize> {
+        let value: i32 = row.try_get(column)?;
+        Ok(value.max(0) as usize)
+    };
+    Ok(UsageCleanupJobRow {
+        job_id: row.try_get("job_id")?,
+        mode: row.try_get("mode")?,
+        cutoff_at: row.try_get("cutoff_at")?,
+        batch_size: nonnegative_int("batch_size")?,
+        max_batches: nonnegative_int("max_batches")?,
+        pause_ms_between_batches: row_i64_to_u64(&row, "pause_ms_between_batches")?,
+        status: row.try_get("status")?,
+        phase: row.try_get("phase")?,
+        matched_rows: optional_u64("matched_rows")?,
+        remaining_rows: optional_u64("remaining_rows")?,
+        processed_rows: row_i64_to_u64(&row, "processed_rows")?,
+        last_batch_rows: row_i64_to_u64(&row, "last_batch_rows")?,
+        batches: nonnegative_int("batches")?,
+        cancel_requested: row.try_get("cancel_requested")?,
+        stop_reason: row.try_get("stop_reason")?,
+        last_error: row.try_get("last_error")?,
+        redis_deleted_keys: row_i64_to_u64(&row, "redis_deleted_keys")? as usize,
+        redis_delete_commands: row_i64_to_u64(&row, "redis_delete_commands")? as usize,
+        redis_max_command_keys: nonnegative_int("redis_max_command_keys")?,
+        redis_scan_passes: nonnegative_int("redis_scan_passes")?,
+        redis_used_del_fallback: row.try_get("redis_used_del_fallback")?,
+        redis_pass_limit_reached: row.try_get("redis_pass_limit_reached")?,
+        started_at: row.try_get("started_at")?,
+        updated_at: row.try_get("updated_at")?,
+        finished_at: row.try_get("finished_at")?,
+        lease_until: row.try_get("lease_until")?,
     })
 }
 
@@ -5477,11 +6699,13 @@ struct UsageRollupBatchDelta {
     cache_read_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
     duration_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
     credential_summaries: HashMap<u64, CredentialUsageSummaryDelta>,
+    has_negative: bool,
 }
 
 impl UsageRollupBatchDelta {
     fn add_record(&mut self, record: &UsageRecord, direction: i64) {
         let direction = if direction < 0 { -1 } else { 1 };
+        self.has_negative |= direction < 0;
         let metrics = UsageRollupMetrics::from_record(record, direction);
         let created_at = parse_usage_created_at(record);
         let bucket_start = usage_rollup_bucket_start(created_at);
@@ -5521,7 +6745,65 @@ impl UsageRollupBatchDelta {
     }
 
     async fn apply(self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
-        for ((dimension, key), aggregate) in self.totals {
+        let UsageRollupBatchDelta {
+            totals,
+            time_buckets,
+            cache_read_totals,
+            cache_read_time_buckets,
+            duration_time_buckets,
+            credential_summaries,
+            has_negative,
+        } = self;
+
+        // Every writer touches shared global/status/model rollup rows. HashMap
+        // iteration order differs across processes, so using it directly creates
+        // a cross-instance row-lock inversion even for one-record batches.
+        let mut totals = totals.into_iter().collect::<Vec<_>>();
+        totals.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut time_buckets = time_buckets.into_iter().collect::<Vec<_>>();
+        time_buckets.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut cache_read_totals = cache_read_totals.into_iter().collect::<Vec<_>>();
+        cache_read_totals.sort_unstable_by_key(|(cache_read, _)| *cache_read);
+        let mut cache_read_time_buckets = cache_read_time_buckets.into_iter().collect::<Vec<_>>();
+        cache_read_time_buckets.sort_unstable_by_key(|(key, _)| *key);
+        let mut duration_time_buckets = duration_time_buckets.into_iter().collect::<Vec<_>>();
+        duration_time_buckets.sort_unstable_by_key(|(key, _)| *key);
+        let mut credential_summaries = credential_summaries.into_iter().collect::<Vec<_>>();
+        credential_summaries.sort_unstable_by_key(|(credential_id, _)| *credential_id);
+
+        let (affected_total_dimensions, affected_total_keys): (Vec<_>, Vec<_>) = totals
+            .iter()
+            .map(|((dimension, key), _)| ((*dimension).to_string(), key.clone()))
+            .unzip();
+        let (affected_time_buckets, affected_time_dimensions, affected_time_keys) = time_buckets
+            .iter()
+            .fold((Vec::new(), Vec::new(), Vec::new()), |mut out, entry| {
+                out.0.push((entry.0).0);
+                out.1.push((entry.0).1.to_string());
+                out.2.push((entry.0).2.clone());
+                out
+            });
+        let affected_credentials = credential_summaries
+            .iter()
+            .map(|(credential_id, _)| *credential_id as i64)
+            .collect::<Vec<_>>();
+        let affected_cache_reads = cache_read_totals
+            .iter()
+            .map(|(cache_read, _)| *cache_read)
+            .collect::<Vec<_>>();
+        let mut affected_cache_buckets = cache_read_time_buckets
+            .iter()
+            .map(|((bucket_start, _), _)| *bucket_start)
+            .collect::<Vec<_>>();
+        affected_cache_buckets.sort_unstable();
+        affected_cache_buckets.dedup();
+        let mut affected_duration_buckets = duration_time_buckets
+            .iter()
+            .map(|((bucket_start, _), _)| *bucket_start)
+            .collect::<Vec<_>>();
+        affected_duration_buckets.sort_unstable();
+        affected_duration_buckets.dedup();
+        for ((dimension, key), aggregate) in totals {
             let dimension = UsageRollupDimension {
                 dimension,
                 key,
@@ -5530,7 +6812,7 @@ impl UsageRollupBatchDelta {
             };
             upsert_usage_rollup_total(tx, &dimension, aggregate.metrics).await?;
         }
-        for ((bucket_start, dimension, key), aggregate) in self.time_buckets {
+        for ((bucket_start, dimension, key), aggregate) in time_buckets {
             let dimension = UsageRollupDimension {
                 dimension,
                 key,
@@ -5540,17 +6822,32 @@ impl UsageRollupBatchDelta {
             upsert_usage_rollup_time_bucket(tx, bucket_start, &dimension, aggregate.metrics)
                 .await?;
         }
-        for (cache_read, requests) in self.cache_read_totals {
+        for (cache_read, requests) in cache_read_totals {
             upsert_usage_cache_read_total(tx, cache_read, requests).await?;
         }
-        for ((bucket_start, cache_read), requests) in self.cache_read_time_buckets {
+        for ((bucket_start, cache_read), requests) in cache_read_time_buckets {
             upsert_usage_cache_read_time_bucket(tx, bucket_start, cache_read, requests).await?;
         }
-        for ((bucket_start, duration_ms), requests) in self.duration_time_buckets {
+        for ((bucket_start, duration_ms), requests) in duration_time_buckets {
             upsert_usage_duration_time_bucket(tx, bucket_start, duration_ms, requests).await?;
         }
-        for (credential_id, delta) in self.credential_summaries {
+        for (credential_id, delta) in credential_summaries {
             upsert_credential_usage_summary_delta(tx, credential_id, delta).await?;
+        }
+        if has_negative {
+            reconcile_usage_rollups_after_negative_delta(
+                tx,
+                &affected_total_dimensions,
+                &affected_total_keys,
+                &affected_time_buckets,
+                &affected_time_dimensions,
+                &affected_time_keys,
+                &affected_credentials,
+                &affected_cache_reads,
+                &affected_cache_buckets,
+                &affected_duration_buckets,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -5727,7 +7024,10 @@ async fn upsert_usage_rollup_total(
             external_pool_cost_floor_delta_usd = usage_rollup_totals.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
             duration_ms_sum = usage_rollup_totals.duration_ms_sum + EXCLUDED.duration_ms_sum,
             duration_ms_count = usage_rollup_totals.duration_ms_count + EXCLUDED.duration_ms_count,
-            duration_ms_max = GREATEST(usage_rollup_totals.duration_ms_max, EXCLUDED.duration_ms_max),
+            duration_ms_max = CASE
+                WHEN usage_rollup_totals.duration_ms_count + EXCLUDED.duration_ms_count <= 0 THEN 0
+                ELSE GREATEST(usage_rollup_totals.duration_ms_max, EXCLUDED.duration_ms_max)
+            END,
             updated_at = now()
         "#,
     )
@@ -5845,7 +7145,10 @@ async fn upsert_usage_rollup_time_bucket(
             external_pool_cost_floor_delta_usd = usage_rollup_time_buckets.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
             duration_ms_sum = usage_rollup_time_buckets.duration_ms_sum + EXCLUDED.duration_ms_sum,
             duration_ms_count = usage_rollup_time_buckets.duration_ms_count + EXCLUDED.duration_ms_count,
-            duration_ms_max = GREATEST(usage_rollup_time_buckets.duration_ms_max, EXCLUDED.duration_ms_max),
+            duration_ms_max = CASE
+                WHEN usage_rollup_time_buckets.duration_ms_count + EXCLUDED.duration_ms_count <= 0 THEN 0
+                ELSE GREATEST(usage_rollup_time_buckets.duration_ms_max, EXCLUDED.duration_ms_max)
+            END,
             updated_at = now()
         "#,
     )
@@ -5965,6 +7268,147 @@ async fn upsert_usage_duration_time_bucket(
     Ok(())
 }
 
+async fn reconcile_usage_rollups_after_negative_delta(
+    tx: &mut Transaction<'_, Postgres>,
+    affected_total_dimensions: &[String],
+    affected_total_keys: &[String],
+    affected_time_buckets: &[DateTime<Utc>],
+    affected_time_dimensions: &[String],
+    affected_time_keys: &[String],
+    affected_credentials: &[i64],
+    affected_cache_reads: &[i32],
+    affected_cache_buckets: &[DateTime<Utc>],
+    affected_duration_buckets: &[DateTime<Utc>],
+) -> anyhow::Result<()> {
+    if !affected_total_dimensions.is_empty() {
+        sqlx::query(
+            r#"
+            DELETE FROM usage_rollup_totals AS rollup
+            USING unnest($1::text[], $2::text[]) AS affected(dimension, dimension_key)
+            WHERE rollup.dimension = affected.dimension
+              AND rollup.dimension_key = affected.dimension_key
+              AND rollup.requests <= 0
+            "#,
+        )
+        .bind(affected_total_dimensions)
+        .bind(affected_total_keys)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if !affected_time_buckets.is_empty() {
+        sqlx::query(
+            r#"
+            DELETE FROM usage_rollup_time_buckets AS rollup
+            USING unnest($1::timestamptz[], $2::text[], $3::text[])
+                AS affected(bucket_start, dimension, dimension_key)
+            WHERE rollup.bucket_start = affected.bucket_start
+              AND rollup.dimension = affected.dimension
+              AND rollup.dimension_key = affected.dimension_key
+              AND rollup.requests <= 0
+            "#,
+        )
+        .bind(affected_time_buckets)
+        .bind(affected_time_dimensions)
+        .bind(affected_time_keys)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if !affected_credentials.is_empty() {
+        sqlx::query(
+            r#"
+            DELETE FROM usage_credential_cost_summary
+            WHERE credential_id = ANY($1)
+              AND requests <= 0
+            "#,
+        )
+        .bind(affected_credentials)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if !affected_cache_reads.is_empty() {
+        sqlx::query(
+            r#"
+            DELETE FROM usage_cache_read_totals
+            WHERE cache_read_input_tokens = ANY($1)
+              AND requests <= 0
+            "#,
+        )
+        .bind(affected_cache_reads)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if !affected_cache_buckets.is_empty() {
+        sqlx::query(
+            r#"
+            DELETE FROM usage_cache_read_rollup_time_buckets
+            WHERE bucket_start = ANY($1)
+              AND requests <= 0
+            "#,
+        )
+        .bind(affected_cache_buckets)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if affected_duration_buckets.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        DELETE FROM usage_duration_rollup_time_buckets
+        WHERE bucket_start = ANY($1)
+          AND requests <= 0
+        "#,
+    )
+    .bind(affected_duration_buckets)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        WITH affected AS (
+            SELECT unnest($1::timestamptz[]) AS bucket_start
+        ), maxima AS (
+            SELECT
+                affected.bucket_start,
+                COALESCE(MAX(duration.duration_ms), 0)::bigint AS duration_ms_max
+            FROM affected
+            LEFT JOIN usage_duration_rollup_time_buckets AS duration
+              ON duration.bucket_start = affected.bucket_start
+             AND duration.requests > 0
+            GROUP BY affected.bucket_start
+        )
+        UPDATE usage_rollup_time_buckets AS rollup
+        SET duration_ms_max = maxima.duration_ms_max,
+            updated_at = now()
+        FROM maxima
+        WHERE rollup.bucket_start = maxima.bucket_start
+          AND rollup.dimension = 'global'
+          AND rollup.dimension_key = 'all'
+        "#,
+    )
+    .bind(affected_duration_buckets)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE usage_rollup_totals
+        SET duration_ms_max = COALESCE((
+                SELECT duration_ms::bigint
+                FROM usage_duration_rollup_time_buckets
+                WHERE requests > 0
+                ORDER BY duration_ms DESC
+                LIMIT 1
+            ), 0),
+            updated_at = now()
+        WHERE dimension = 'global'
+          AND dimension_key = 'all'
+        "#,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn upsert_credential_usage_summary_delta(
     tx: &mut Transaction<'_, Postgres>,
     credential_id: u64,
@@ -6052,6 +7496,13 @@ impl DashboardBreakdownColumn {
             Self::UsageSource => usage_source_label(value),
         }
     }
+
+    fn detail_column(self) -> &'static str {
+        match self {
+            Self::Status => "r.status",
+            Self::UsageSource => "r.usage_source",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6109,6 +7560,7 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "endpoint",
             "model",
             "conversation_id",
+            "data->>'requestApiKeyId'",
             "credential_label",
             "status",
             "usage_source",
@@ -6148,6 +7600,15 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
     if let Some(conversation_id) = &query.conversation_id {
         builder.push(" AND conversation_id = ");
         builder.push_bind(conversation_id.clone());
+    }
+    if let Some(request_api_key_id) = query
+        .request_api_key_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|request_api_key_id| !request_api_key_id.is_empty())
+    {
+        builder.push(" AND data->>'requestApiKeyId' = ");
+        builder.push_bind(request_api_key_id.to_string());
     }
     if let Some(credential_id) = query.credential_id {
         builder.push(" AND credential_id = ");
@@ -6226,7 +7687,412 @@ fn push_dashboard_windows_cte(
         builder.push_bind(usize_to_i64(index));
         builder.push("::bigint)");
     }
-    builder.push(") ");
+    builder.push(
+        r#"), window_utc_hours AS (
+        SELECT
+            w.*,
+            date_trunc('hour', w.from_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                AS from_hour_utc,
+            date_trunc('hour', w.to_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                AS to_hour_utc
+        FROM windows w
+        ), window_bounds AS (
+        SELECT
+            h.*,
+            CASE
+                WHEN h.from_at = h.from_hour_utc THEN h.from_at
+                ELSE h.from_hour_utc + interval '1 hour'
+            END AS full_from_at,
+            h.to_hour_utc AS full_to_at
+        FROM window_utc_hours h
+        ), window_boundary_ranges AS (
+        SELECT
+            w.key,
+            w.ord,
+            w.from_hour_utc AS boundary_hour,
+            w.from_at AS boundary_from_at,
+            LEAST(w.to_at, w.full_from_at) AS boundary_to_at
+        FROM window_bounds w
+        WHERE w.from_at < LEAST(w.to_at, w.full_from_at)
+
+        UNION ALL
+
+        SELECT
+            w.key,
+            w.ord,
+            w.to_hour_utc AS boundary_hour,
+            GREATEST(w.from_at, w.full_to_at) AS boundary_from_at,
+            w.to_at AS boundary_to_at
+        FROM window_bounds w
+        WHERE GREATEST(w.from_at, w.full_to_at) < w.to_at
+          AND GREATEST(w.from_at, w.full_to_at)
+              >= LEAST(w.to_at, w.full_from_at)
+        ), window_boundary_record_values AS (
+        SELECT
+            ranges.key AS window_key,
+            ranges.ord AS window_ord,
+            ranges.boundary_hour,
+            records.status,
+            records.usage_source,
+            records.stream,
+            records.total_input_tokens,
+            records.billable_input_tokens,
+            records.output_tokens,
+            records.cache_read_input_tokens,
+            records.cache_creation_input_tokens,
+            records.estimated_cost_usd,
+            records.original_cost_usd,
+            records.pricing_available,
+            records.simulated,
+            records.sticky_bound,
+            records.fallback_from_sticky,
+            records.data->>'externalPoolId' AS dashboard_external_pool_id,
+            NULLIF(BTRIM(records.data->>'externalPoolName'), '')
+                AS dashboard_external_pool_name,
+            CASE
+                WHEN jsonb_typeof(records.data->'durationMs') = 'number'
+                 AND records.data->>'durationMs' ~ '^[0-9]+$'
+                THEN LEAST(
+                    (records.data->>'durationMs')::numeric,
+                    9223372036854775807::numeric
+                )::bigint
+                ELSE GREATEST(records.duration_ms, 0)
+            END AS dashboard_duration_ms,
+            records.data->>'routeKind' = 'external_pool' AS dashboard_external_pool,
+            jsonb_typeof(records.data->'externalPoolBilling') = 'object'
+                AS dashboard_external_billing_present,
+            COALESCE(
+                records.data #> '{externalPoolBilling,pricingAvailable}' = 'true'::jsonb,
+                false
+            ) AS dashboard_external_pricing_available,
+            COALESCE(
+                records.data #> '{externalPoolBilling,costFloorApplied}' = 'true'::jsonb,
+                false
+            ) AS dashboard_external_cost_floor_applied,
+            CASE
+                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawCostUsd}') = 'number'
+                THEN (records.data #>> '{externalPoolBilling,rawCostUsd}')::double precision
+                ELSE 0::double precision
+            END AS dashboard_external_raw_cost_usd,
+            CASE
+                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,shapedCostUsd}') = 'number'
+                THEN (records.data #>> '{externalPoolBilling,shapedCostUsd}')::double precision
+                ELSE 0::double precision
+            END AS dashboard_external_shaped_cost_usd,
+            CASE
+                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,upliftedCostUsd}') = 'number'
+                THEN (records.data #>> '{externalPoolBilling,upliftedCostUsd}')::double precision
+                ELSE 0::double precision
+            END AS dashboard_external_uplifted_cost_usd,
+            CASE
+                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedCostUsd}') = 'number'
+                THEN (records.data #>> '{externalPoolBilling,reportedCostUsd}')::double precision
+                ELSE 0::double precision
+            END AS dashboard_external_reported_cost_usd,
+            CASE
+                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,billableCostUsd}') = 'number'
+                THEN (records.data #>> '{externalPoolBilling,billableCostUsd}')::double precision
+                ELSE 0::double precision
+            END AS dashboard_external_billable_cost_usd,
+            CASE
+                WHEN jsonb_typeof(records.data #> '{externalPoolBilling,costFloorDeltaUsd}') = 'number'
+                THEN (records.data #>> '{externalPoolBilling,costFloorDeltaUsd}')::double precision
+                ELSE 0::double precision
+            END AS dashboard_external_cost_floor_delta_usd
+        FROM window_boundary_ranges ranges
+        JOIN usage_records records
+          ON records.created_at >= ranges.boundary_from_at
+         AND records.created_at < ranges.boundary_to_at
+         AND records.deleted_at IS NULL
+         AND records.rollup_active
+        ), window_boundary_records AS (
+        SELECT
+            detail_values.*,
+            CASE
+                WHEN detail_values.dashboard_external_pricing_available
+                 AND detail_values.dashboard_external_shaped_cost_usd = 0
+                 AND detail_values.dashboard_external_reported_cost_usd > 0
+                THEN detail_values.dashboard_external_reported_cost_usd
+                ELSE detail_values.dashboard_external_shaped_cost_usd
+            END AS dashboard_external_effective_shaped_cost_usd,
+            CASE
+                WHEN detail_values.dashboard_external_pricing_available
+                 AND detail_values.dashboard_external_uplifted_cost_usd = 0
+                 AND detail_values.dashboard_external_reported_cost_usd > 0
+                THEN detail_values.dashboard_external_reported_cost_usd
+                ELSE detail_values.dashboard_external_uplifted_cost_usd
+            END AS dashboard_external_effective_uplifted_cost_usd
+        FROM window_boundary_record_values detail_values
+        ) "#,
+    );
+}
+
+fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) {
+    builder.push(
+        r#", dashboard_global_segment_rows AS (
+        SELECT
+            w.key AS window_key,
+            date_trunc('hour', buckets.bucket_start AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                AS segment_hour,
+            buckets.requests,
+            buckets.success_requests,
+            buckets.error_requests,
+            buckets.stream_requests,
+            buckets.non_stream_requests,
+            buckets.total_input_tokens,
+            buckets.billable_input_tokens,
+            buckets.total_output_tokens,
+            buckets.total_cache_read_input_tokens,
+            buckets.total_cache_creation_input_tokens,
+            buckets.total_estimated_cost_usd,
+            buckets.total_original_cost_usd,
+            buckets.priced_requests,
+            buckets.unpriced_requests,
+            buckets.sticky_bound_requests,
+            buckets.fallback_from_sticky_requests,
+            buckets.simulated_requests,
+            buckets.upstream_metadata_requests,
+            buckets.external_pool_requests,
+            buckets.external_pool_priced_requests,
+            buckets.external_pool_unpriced_requests,
+            buckets.external_pool_cost_floor_applied_requests,
+            buckets.external_pool_raw_cost_usd,
+            buckets.external_pool_shaped_cost_usd,
+            buckets.external_pool_uplifted_cost_usd,
+            buckets.external_pool_profit_usd,
+            buckets.external_pool_reported_cost_usd,
+            buckets.external_pool_billable_cost_usd,
+            buckets.external_pool_cost_floor_delta_usd,
+            buckets.duration_ms_sum::numeric AS duration_ms_sum,
+            buckets.duration_ms_count
+        FROM window_bounds w
+        JOIN usage_rollup_time_buckets buckets
+          ON buckets.dimension = 'global'
+         AND buckets.dimension_key = 'all'
+         AND buckets.bucket_start >= w.full_from_at
+         AND buckets.bucket_start < w.full_to_at
+
+        UNION ALL
+
+        SELECT
+            records.window_key,
+            records.boundary_hour AS segment_hour,
+            COUNT(*)::bigint AS requests,
+            COUNT(*) FILTER (WHERE records.status = 'success')::bigint AS success_requests,
+            COUNT(*) FILTER (WHERE records.status <> 'success')::bigint AS error_requests,
+            COUNT(*) FILTER (WHERE records.stream)::bigint AS stream_requests,
+            COUNT(*) FILTER (WHERE NOT records.stream)::bigint AS non_stream_requests,
+            COALESCE(SUM(records.total_input_tokens), 0)::bigint AS total_input_tokens,
+            COALESCE(SUM(records.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+            COALESCE(SUM(records.output_tokens), 0)::bigint AS total_output_tokens,
+            COALESCE(SUM(records.cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+            COALESCE(SUM(records.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+            COALESCE(SUM(records.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+            COALESCE(SUM(records.original_cost_usd), 0)::double precision AS total_original_cost_usd,
+            COUNT(*) FILTER (WHERE records.pricing_available)::bigint AS priced_requests,
+            COUNT(*) FILTER (WHERE NOT records.pricing_available)::bigint AS unpriced_requests,
+            COUNT(*) FILTER (WHERE records.sticky_bound)::bigint AS sticky_bound_requests,
+            COUNT(*) FILTER (WHERE records.fallback_from_sticky)::bigint AS fallback_from_sticky_requests,
+            COUNT(*) FILTER (WHERE records.simulated)::bigint AS simulated_requests,
+            COUNT(*) FILTER (WHERE records.usage_source = 'upstream_metadata')::bigint
+                AS upstream_metadata_requests,
+            COUNT(*) FILTER (WHERE records.dashboard_external_pool)::bigint
+                AS external_pool_requests,
+            COUNT(*) FILTER (
+                WHERE records.dashboard_external_pool
+                  AND records.dashboard_external_billing_present
+                  AND records.dashboard_external_pricing_available
+            )::bigint AS external_pool_priced_requests,
+            COUNT(*) FILTER (
+                WHERE records.dashboard_external_pool
+                  AND NOT (
+                      records.dashboard_external_billing_present
+                      AND records.dashboard_external_pricing_available
+                  )
+            )::bigint AS external_pool_unpriced_requests,
+            COUNT(*) FILTER (
+                WHERE records.dashboard_external_billing_present
+                  AND records.dashboard_external_cost_floor_applied
+            )::bigint AS external_pool_cost_floor_applied_requests,
+            COALESCE(SUM(records.dashboard_external_raw_cost_usd), 0)::double precision
+                AS external_pool_raw_cost_usd,
+            COALESCE(SUM(records.dashboard_external_effective_shaped_cost_usd), 0)::double precision
+                AS external_pool_shaped_cost_usd,
+            COALESCE(SUM(records.dashboard_external_effective_uplifted_cost_usd), 0)::double precision
+                AS external_pool_uplifted_cost_usd,
+            COALESCE(SUM(
+                records.dashboard_external_effective_uplifted_cost_usd
+                - records.dashboard_external_raw_cost_usd
+            ), 0)::double precision AS external_pool_profit_usd,
+            COALESCE(SUM(records.dashboard_external_reported_cost_usd), 0)::double precision
+                AS external_pool_reported_cost_usd,
+            COALESCE(SUM(records.dashboard_external_billable_cost_usd), 0)::double precision
+                AS external_pool_billable_cost_usd,
+            COALESCE(SUM(records.dashboard_external_cost_floor_delta_usd), 0)::double precision
+                AS external_pool_cost_floor_delta_usd,
+            COALESCE(SUM(records.dashboard_duration_ms::numeric), 0)::numeric AS duration_ms_sum,
+            COUNT(*)::bigint AS duration_ms_count
+        FROM window_boundary_records records
+        GROUP BY records.window_key, records.boundary_hour
+        ), dashboard_global_segments AS (
+        SELECT
+            segment_rows.window_key,
+            segment_rows.segment_hour,
+            SUM(segment_rows.requests)::bigint AS requests,
+            SUM(segment_rows.success_requests)::bigint AS success_requests,
+            SUM(segment_rows.error_requests)::bigint AS error_requests,
+            SUM(segment_rows.stream_requests)::bigint AS stream_requests,
+            SUM(segment_rows.non_stream_requests)::bigint AS non_stream_requests,
+            SUM(segment_rows.total_input_tokens)::bigint AS total_input_tokens,
+            SUM(segment_rows.billable_input_tokens)::bigint AS billable_input_tokens,
+            SUM(segment_rows.total_output_tokens)::bigint AS total_output_tokens,
+            SUM(segment_rows.total_cache_read_input_tokens)::bigint AS total_cache_read_input_tokens,
+            SUM(segment_rows.total_cache_creation_input_tokens)::bigint
+                AS total_cache_creation_input_tokens,
+            SUM(segment_rows.total_estimated_cost_usd)::double precision
+                AS total_estimated_cost_usd,
+            SUM(segment_rows.total_original_cost_usd)::double precision
+                AS total_original_cost_usd,
+            SUM(segment_rows.priced_requests)::bigint AS priced_requests,
+            SUM(segment_rows.unpriced_requests)::bigint AS unpriced_requests,
+            SUM(segment_rows.sticky_bound_requests)::bigint AS sticky_bound_requests,
+            SUM(segment_rows.fallback_from_sticky_requests)::bigint
+                AS fallback_from_sticky_requests,
+            SUM(segment_rows.simulated_requests)::bigint AS simulated_requests,
+            SUM(segment_rows.upstream_metadata_requests)::bigint AS upstream_metadata_requests,
+            SUM(segment_rows.external_pool_requests)::bigint AS external_pool_requests,
+            SUM(segment_rows.external_pool_priced_requests)::bigint
+                AS external_pool_priced_requests,
+            SUM(segment_rows.external_pool_unpriced_requests)::bigint
+                AS external_pool_unpriced_requests,
+            SUM(segment_rows.external_pool_cost_floor_applied_requests)::bigint
+                AS external_pool_cost_floor_applied_requests,
+            SUM(segment_rows.external_pool_raw_cost_usd)::double precision
+                AS external_pool_raw_cost_usd,
+            SUM(segment_rows.external_pool_shaped_cost_usd)::double precision
+                AS external_pool_shaped_cost_usd,
+            SUM(segment_rows.external_pool_uplifted_cost_usd)::double precision
+                AS external_pool_uplifted_cost_usd,
+            SUM(segment_rows.external_pool_profit_usd)::double precision
+                AS external_pool_profit_usd,
+            SUM(segment_rows.external_pool_reported_cost_usd)::double precision
+                AS external_pool_reported_cost_usd,
+            SUM(segment_rows.external_pool_billable_cost_usd)::double precision
+                AS external_pool_billable_cost_usd,
+            SUM(segment_rows.external_pool_cost_floor_delta_usd)::double precision
+                AS external_pool_cost_floor_delta_usd,
+            SUM(segment_rows.duration_ms_sum)::numeric AS duration_ms_sum,
+            SUM(segment_rows.duration_ms_count)::bigint AS duration_ms_count
+        FROM dashboard_global_segment_rows segment_rows
+        GROUP BY segment_rows.window_key, segment_rows.segment_hour
+        ) "#,
+    );
+}
+
+fn push_dashboard_external_pool_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) {
+    builder.push(
+        r#", dashboard_external_pool_segment_rows AS (
+        SELECT
+            w.key AS window_key,
+            date_trunc('hour', buckets.bucket_start AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                AS segment_hour,
+            buckets.dimension_key AS pool_id,
+            buckets.dimension_label AS pool_name,
+            buckets.external_pool_requests,
+            buckets.external_pool_priced_requests,
+            buckets.external_pool_unpriced_requests,
+            buckets.external_pool_cost_floor_applied_requests,
+            buckets.external_pool_raw_cost_usd,
+            buckets.external_pool_shaped_cost_usd,
+            buckets.external_pool_uplifted_cost_usd,
+            buckets.external_pool_profit_usd,
+            buckets.external_pool_reported_cost_usd,
+            buckets.external_pool_billable_cost_usd,
+            buckets.external_pool_cost_floor_delta_usd
+        FROM window_bounds w
+        JOIN usage_rollup_time_buckets buckets
+          ON buckets.dimension = 'external_pool'
+         AND buckets.bucket_start >= w.full_from_at
+         AND buckets.bucket_start < w.full_to_at
+
+        UNION ALL
+
+        SELECT
+            records.window_key,
+            records.boundary_hour AS segment_hour,
+            records.dashboard_external_pool_id AS pool_id,
+            MAX(records.dashboard_external_pool_name) AS pool_name,
+            COUNT(*) FILTER (WHERE records.dashboard_external_pool)::bigint
+                AS external_pool_requests,
+            COUNT(*) FILTER (
+                WHERE records.dashboard_external_pool
+                  AND records.dashboard_external_billing_present
+                  AND records.dashboard_external_pricing_available
+            )::bigint AS external_pool_priced_requests,
+            COUNT(*) FILTER (
+                WHERE records.dashboard_external_pool
+                  AND NOT (
+                      records.dashboard_external_billing_present
+                      AND records.dashboard_external_pricing_available
+                  )
+            )::bigint AS external_pool_unpriced_requests,
+            COUNT(*) FILTER (
+                WHERE records.dashboard_external_billing_present
+                  AND records.dashboard_external_cost_floor_applied
+            )::bigint AS external_pool_cost_floor_applied_requests,
+            COALESCE(SUM(records.dashboard_external_raw_cost_usd), 0)::double precision
+                AS external_pool_raw_cost_usd,
+            COALESCE(SUM(records.dashboard_external_effective_shaped_cost_usd), 0)::double precision
+                AS external_pool_shaped_cost_usd,
+            COALESCE(SUM(records.dashboard_external_effective_uplifted_cost_usd), 0)::double precision
+                AS external_pool_uplifted_cost_usd,
+            COALESCE(SUM(
+                records.dashboard_external_effective_uplifted_cost_usd
+                - records.dashboard_external_raw_cost_usd
+            ), 0)::double precision AS external_pool_profit_usd,
+            COALESCE(SUM(records.dashboard_external_reported_cost_usd), 0)::double precision
+                AS external_pool_reported_cost_usd,
+            COALESCE(SUM(records.dashboard_external_billable_cost_usd), 0)::double precision
+                AS external_pool_billable_cost_usd,
+            COALESCE(SUM(records.dashboard_external_cost_floor_delta_usd), 0)::double precision
+                AS external_pool_cost_floor_delta_usd
+        FROM window_boundary_records records
+        WHERE records.dashboard_external_pool_id ~ '^[0-9]+$'
+        GROUP BY
+            records.window_key,
+            records.boundary_hour,
+            records.dashboard_external_pool_id
+        ), dashboard_external_pool_segments AS (
+        SELECT
+            segment_rows.window_key,
+            segment_rows.segment_hour,
+            segment_rows.pool_id,
+            MAX(segment_rows.pool_name) AS pool_name,
+            SUM(segment_rows.external_pool_requests)::bigint AS external_pool_requests,
+            SUM(segment_rows.external_pool_priced_requests)::bigint
+                AS external_pool_priced_requests,
+            SUM(segment_rows.external_pool_unpriced_requests)::bigint
+                AS external_pool_unpriced_requests,
+            SUM(segment_rows.external_pool_cost_floor_applied_requests)::bigint
+                AS external_pool_cost_floor_applied_requests,
+            SUM(segment_rows.external_pool_raw_cost_usd)::double precision
+                AS external_pool_raw_cost_usd,
+            SUM(segment_rows.external_pool_shaped_cost_usd)::double precision
+                AS external_pool_shaped_cost_usd,
+            SUM(segment_rows.external_pool_uplifted_cost_usd)::double precision
+                AS external_pool_uplifted_cost_usd,
+            SUM(segment_rows.external_pool_profit_usd)::double precision
+                AS external_pool_profit_usd,
+            SUM(segment_rows.external_pool_reported_cost_usd)::double precision
+                AS external_pool_reported_cost_usd,
+            SUM(segment_rows.external_pool_billable_cost_usd)::double precision
+                AS external_pool_billable_cost_usd,
+            SUM(segment_rows.external_pool_cost_floor_delta_usd)::double precision
+                AS external_pool_cost_floor_delta_usd
+        FROM dashboard_external_pool_segment_rows segment_rows
+        GROUP BY segment_rows.window_key, segment_rows.segment_hour, segment_rows.pool_id
+        ) "#,
+    );
 }
 
 fn row_i64_to_usize(row: &PgRow, column: &str) -> anyhow::Result<usize> {
@@ -6405,48 +8271,241 @@ fn runtime_state_from_row(row: &PgRow) -> anyhow::Result<CredentialRuntimeStateR
     })
 }
 
+fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoolEligibility> {
+    let revision: i64 = row.try_get("revision")?;
+    if revision <= 0 {
+        anyhow::bail!("revision 必须为正数");
+    }
+    let base_url: String = row.try_get("base_url")?;
+    let parsed_base_url =
+        url::Url::parse(base_url.trim()).map_err(|_| anyhow::anyhow!("base_url 不是有效 URL"))?;
+    if !matches!(parsed_base_url.scheme(), "http" | "https") {
+        anyhow::bail!("base_url scheme 必须是 http 或 https");
+    }
+    if parsed_base_url.host_str().is_none() {
+        anyhow::bail!("base_url 必须包含 host");
+    }
+    if !row.try_get::<bool, _>("api_key_present")? {
+        anyhow::bail!("api_key 不能为空");
+    }
+    let auth_type: String = row.try_get("auth_type")?;
+    ExternalPoolAuthType::parse_known(&auth_type)
+        .ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?;
+    let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
+    if max_concurrent_requests <= 0 {
+        anyhow::bail!("max_concurrent_requests 必须为正数");
+    }
+    let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
+    ExternalPoolUsageProjectionMode::parse_known(&usage_projection_mode)
+        .ok_or_else(|| anyhow::anyhow!("usage_projection_mode 值无效"))?;
+    let stream_response_mode: Option<String> = row.try_get("stream_response_mode")?;
+    if stream_response_mode
+        .as_deref()
+        .is_some_and(|value| ExternalPoolStreamResponseMode::parse_known(value).is_none())
+    {
+        anyhow::bail!("stream_response_mode 值无效");
+    }
+    let request_body_mode: String = row
+        .try_get("request_body_mode")
+        .map_err(|_| anyhow::anyhow!("request_body_mode 字段类型无效"))?;
+    let request_body_mode = ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
+        .ok_or_else(|| anyhow::anyhow!("request_body_mode 值无效"))?;
+    let raw_model_mode: String = row.try_get("raw_model_mode")?;
+    ExternalPoolRawModelMode::parse_known(&raw_model_mode)
+        .ok_or_else(|| anyhow::anyhow!("raw_model_mode 值无效"))?;
+    let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
+    ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
+        .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?;
+    let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
+    ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
+        .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?;
+    row.try_get::<bool, _>("model_mapping_require_match")?;
+    let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
+    let model_mapping_rules =
+        serde_json::from_value::<Vec<ModelMappingRule>>(model_mapping_rules_value)
+            .map_err(|_| anyhow::anyhow!("model_mapping_rules 必须是有效规则数组"))?;
+    if model_mapping_rules
+        .iter()
+        .any(|rule| rule.source.trim().is_empty() || rule.target.trim().is_empty())
+    {
+        anyhow::bail!("model_mapping_rules 不能包含空 source/target");
+    }
+    let supported_models_value: serde_json::Value = row
+        .try_get("supported_models")
+        .map_err(|_| anyhow::anyhow!("supported_models 字段类型无效"))?;
+    let supported_models = serde_json::from_value::<Vec<String>>(supported_models_value)
+        .map_err(|_| anyhow::anyhow!("supported_models 必须是字符串数组"))?;
+    if supported_models.iter().any(|model| model.trim().is_empty()) {
+        anyhow::bail!("supported_models 不能包含空模型名");
+    }
+    Ok(ExternalPoolEligibility {
+        id: row.try_get::<i64, _>("id")?.max(0) as u64,
+        enabled: row.try_get("enabled")?,
+        request_body_mode,
+        auto_disabled: row.try_get("auto_disabled")?,
+        auto_disabled_until: row.try_get("auto_disabled_until")?,
+        supported_models: Arc::new(
+            normalize_supported_models(supported_models)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        ),
+    })
+}
+
 fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<ExternalPool> {
+    external_pool_from_row_with_policy(row, mask_secrets, false)
+}
+
+fn external_pool_from_row_with_policy(
+    row: PgRow,
+    mask_secrets: bool,
+    strict_dispatch: bool,
+) -> anyhow::Result<ExternalPool> {
     let id: i64 = row.try_get("id")?;
+    let revision: i64 = row.try_get("revision")?;
     let api_key: String = row.try_get("api_key")?;
     let auth_type: String = row.try_get("auth_type")?;
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
-    let stream_response_mode: Option<String> = row.try_get("stream_response_mode").unwrap_or(None);
-    let request_body_mode: String = row
-        .try_get("request_body_mode")
-        .unwrap_or_else(|_| "normalized".to_string());
-    let raw_model_mode: String = row
-        .try_get("raw_model_mode")
-        .unwrap_or_else(|_| "none".to_string());
+    let stream_response_mode: Option<String> = if strict_dispatch {
+        row.try_get("stream_response_mode")?
+    } else {
+        row.try_get("stream_response_mode").unwrap_or(None)
+    };
+    let request_body_mode: String = if strict_dispatch {
+        row.try_get("request_body_mode")?
+    } else {
+        row.try_get("request_body_mode")
+            .unwrap_or_else(|_| "normalized".to_string())
+    };
+    let raw_model_mode: String = if strict_dispatch {
+        row.try_get("raw_model_mode")?
+    } else {
+        row.try_get("raw_model_mode")
+            .unwrap_or_else(|_| "none".to_string())
+    };
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
     let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
-    let model_mapping_rules =
+    let model_mapping_rules = if strict_dispatch {
+        let rules = serde_json::from_value::<Vec<ModelMappingRule>>(model_mapping_rules_value)
+            .map_err(|_| anyhow::anyhow!("model_mapping_rules 必须是有效规则数组"))?;
+        if rules
+            .iter()
+            .any(|rule| rule.source.trim().is_empty() || rule.target.trim().is_empty())
+        {
+            anyhow::bail!("model_mapping_rules 不能包含空 source/target");
+        }
+        rules
+    } else {
         serde_json::from_value::<Vec<ModelMappingRule>>(model_mapping_rules_value)
-            .unwrap_or_default();
-    let supported_models_value: serde_json::Value = row
-        .try_get("supported_models")
-        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
-    let supported_models = normalize_supported_models(
-        serde_json::from_value::<Vec<String>>(supported_models_value).unwrap_or_default(),
-    );
+            .unwrap_or_default()
+    };
+    let supported_models_value: serde_json::Value = if strict_dispatch {
+        row.try_get("supported_models")?
+    } else {
+        row.try_get("supported_models")
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+    };
+    let supported_models = normalize_supported_models(if strict_dispatch {
+        let models = serde_json::from_value::<Vec<String>>(supported_models_value)
+            .map_err(|_| anyhow::anyhow!("supported_models 必须是字符串数组"))?;
+        if models.iter().any(|model| model.trim().is_empty()) {
+            anyhow::bail!("supported_models 不能包含空模型名");
+        }
+        models
+    } else {
+        serde_json::from_value::<Vec<String>>(supported_models_value).unwrap_or_default()
+    });
+
+    let auth_type = if strict_dispatch {
+        ExternalPoolAuthType::parse_known(&auth_type)
+            .ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?
+    } else {
+        ExternalPoolAuthType::parse(&auth_type)
+    };
+    let usage_projection_mode = if strict_dispatch {
+        ExternalPoolUsageProjectionMode::parse_known(&usage_projection_mode)
+            .ok_or_else(|| anyhow::anyhow!("usage_projection_mode 值无效"))?
+    } else {
+        ExternalPoolUsageProjectionMode::parse(&usage_projection_mode)
+    };
+    let stream_response_mode = match stream_response_mode.as_deref() {
+        Some(value) if strict_dispatch => Some(
+            ExternalPoolStreamResponseMode::parse_known(value)
+                .ok_or_else(|| anyhow::anyhow!("stream_response_mode 值无效"))?,
+        ),
+        Some(value) => Some(ExternalPoolStreamResponseMode::parse(value)),
+        None => None,
+    };
+    let request_body_mode = if strict_dispatch {
+        ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
+            .ok_or_else(|| anyhow::anyhow!("request_body_mode 值无效"))?
+    } else {
+        ExternalPoolRequestBodyMode::parse(&request_body_mode)
+    };
+    let raw_model_mode = if strict_dispatch {
+        ExternalPoolRawModelMode::parse_known(&raw_model_mode)
+            .ok_or_else(|| anyhow::anyhow!("raw_model_mode 值无效"))?
+    } else {
+        ExternalPoolRawModelMode::parse(&raw_model_mode)
+    };
+    let auto_disable_policy = if strict_dispatch {
+        ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
+            .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?
+    } else {
+        ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy)
+    };
+    let model_mapping_mode = if strict_dispatch {
+        ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
+            .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?
+    } else {
+        ExternalPoolModelMappingMode::parse(&model_mapping_mode)
+    };
+    let model_mapping_require_match = if strict_dispatch {
+        row.try_get("model_mapping_require_match")?
+    } else {
+        row.try_get("model_mapping_require_match").unwrap_or(false)
+    };
+    if strict_dispatch {
+        if id <= 0 {
+            anyhow::bail!("id 必须为正数");
+        }
+        if revision <= 0 {
+            anyhow::bail!("revision 必须为正数");
+        }
+        if max_concurrent_requests <= 0 {
+            anyhow::bail!("max_concurrent_requests 必须为正数");
+        }
+        if api_key.trim().is_empty() {
+            anyhow::bail!("api_key 不能为空");
+        }
+        let base_url: String = row.try_get("base_url")?;
+        let parsed_base_url = url::Url::parse(base_url.trim())
+            .map_err(|_| anyhow::anyhow!("base_url 不是有效 URL"))?;
+        if !matches!(parsed_base_url.scheme(), "http" | "https") {
+            anyhow::bail!("base_url scheme 必须是 http 或 https");
+        }
+        if parsed_base_url.host_str().is_none() {
+            anyhow::bail!("base_url 必须包含 host");
+        }
+    }
     Ok(ExternalPool {
         id: id.max(0) as u64,
+        revision: revision.max(1) as u64,
         name: row.try_get("name")?,
         base_url: row.try_get("base_url")?,
         api_key: (!mask_secrets).then_some(api_key.clone()),
         masked_api_key: Some(mask_external_pool_key(&api_key)),
-        auth_type: ExternalPoolAuthType::parse(&auth_type),
+        auth_type,
         enabled: row.try_get("enabled")?,
         priority: row.try_get("priority")?,
         max_concurrent_requests: max_concurrent_requests.max(1) as u32,
-        usage_projection_mode: ExternalPoolUsageProjectionMode::parse(&usage_projection_mode),
-        stream_response_mode: stream_response_mode
-            .as_deref()
-            .map(ExternalPoolStreamResponseMode::parse),
-        request_body_mode: ExternalPoolRequestBodyMode::parse(&request_body_mode),
-        raw_model_mode: ExternalPoolRawModelMode::parse(&raw_model_mode),
-        auto_disable_policy: ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy),
+        usage_projection_mode,
+        stream_response_mode,
+        request_body_mode,
+        raw_model_mode,
+        auto_disable_policy,
         auto_disabled: row.try_get("auto_disabled")?,
         auto_disabled_reason: row.try_get("auto_disabled_reason")?,
         auto_disabled_at: row.try_get("auto_disabled_at")?,
@@ -6454,8 +8513,8 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
         auto_disabled_last_error: row.try_get("auto_disabled_last_error")?,
         preserve_path: row.try_get("preserve_path")?,
         normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
-        model_mapping_mode: ExternalPoolModelMappingMode::parse(&model_mapping_mode),
-        model_mapping_require_match: row.try_get("model_mapping_require_match").unwrap_or(false),
+        model_mapping_mode,
+        model_mapping_require_match,
         model_mapping_rules: normalize_external_pool_model_mapping_rules(model_mapping_rules),
         supported_models,
         notes: row.try_get("notes")?,
@@ -6799,6 +8858,10 @@ fn usize_to_i64(value: usize) -> i64 {
     value.min(i64::MAX as usize) as i64
 }
 
+fn u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
 fn usage_status_value(status: UsageRecordStatus) -> &'static str {
     match status {
         UsageRecordStatus::Success => "success",
@@ -6932,6 +8995,7 @@ CREATE INDEX IF NOT EXISTS idx_proxy_resources_active
 
 CREATE TABLE IF NOT EXISTS external_upstream_pools (
     id BIGSERIAL PRIMARY KEY,
+    revision BIGINT NOT NULL DEFAULT 1,
     name TEXT NOT NULL,
     base_url TEXT NOT NULL,
     api_key TEXT NOT NULL,
@@ -6961,6 +9025,9 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ
 );
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS auth_type TEXT NOT NULL DEFAULT 'bearer';
@@ -7171,13 +9238,66 @@ CREATE TABLE IF NOT EXISTS usage_records (
     error_detail TEXT,
     data JSONB NOT NULL,
     deleted_at TIMESTAMPTZ,
+    rollup_active BOOLEAN NOT NULL DEFAULT true,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 ALTER TABLE usage_records
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS rollup_active BOOLEAN NOT NULL DEFAULT true,
     ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS usage_cleanup_watermarks (
+    scope TEXT PRIMARY KEY,
+    cutoff_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS usage_cleanup_jobs (
+    job_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL CHECK (mode IN ('soft_delete', 'hard_delete')),
+    cutoff_at TIMESTAMPTZ NOT NULL,
+    batch_size INTEGER NOT NULL CHECK (batch_size > 0 AND batch_size <= 500),
+    max_batches INTEGER NOT NULL CHECK (max_batches > 0 AND max_batches <= 10000),
+    pause_ms_between_batches BIGINT NOT NULL CHECK (
+        pause_ms_between_batches >= 0 AND pause_ms_between_batches <= 10000
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN ('queued', 'running', 'paused', 'completed', 'cancelled', 'failed')
+    ),
+    phase TEXT NOT NULL DEFAULT 'postgres' CHECK (
+        phase IN ('postgres', 'redis_admin_cache', 'redis_snapshots', 'complete')
+    ),
+    matched_rows BIGINT,
+    remaining_rows BIGINT,
+    processed_rows BIGINT NOT NULL DEFAULT 0,
+    last_batch_rows BIGINT NOT NULL DEFAULT 0,
+    batches INTEGER NOT NULL DEFAULT 0,
+    cancel_requested BOOLEAN NOT NULL DEFAULT false,
+    stop_reason TEXT,
+    last_error TEXT,
+    redis_deleted_keys BIGINT NOT NULL DEFAULT 0,
+    redis_delete_commands BIGINT NOT NULL DEFAULT 0,
+    redis_max_command_keys INTEGER NOT NULL DEFAULT 0,
+    redis_scan_passes INTEGER NOT NULL DEFAULT 0,
+    redis_used_del_fallback BOOLEAN NOT NULL DEFAULT false,
+    redis_pass_limit_reached BOOLEAN NOT NULL DEFAULT false,
+    lease_owner TEXT,
+    lease_until TIMESTAMPTZ,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_cleanup_jobs_single_active
+    ON usage_cleanup_jobs ((1))
+    WHERE status IN ('queued', 'running');
+CREATE INDEX IF NOT EXISTS idx_usage_cleanup_jobs_started
+    ON usage_cleanup_jobs (started_at DESC, job_id DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_cleanup_jobs_recovery
+    ON usage_cleanup_jobs (status, lease_until, started_at)
+    WHERE status IN ('queued', 'running');
 
 CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     dimension TEXT NOT NULL,
@@ -7376,8 +9496,24 @@ CREATE TABLE IF NOT EXISTS model_capabilities_sync_status (
     last_synced_at TEXT,
     last_error TEXT,
     model_count INTEGER NOT NULL DEFAULT 0,
+    reasoning_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+    reasoning_cohort_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+    reasoning_cohort_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    reasoning_contract_version INTEGER NOT NULL DEFAULT 0,
+    reasoning_invalid_models JSONB NOT NULL DEFAULT '[]'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE model_capabilities_sync_status
+    ADD COLUMN IF NOT EXISTS reasoning_fields JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE model_capabilities_sync_status
+    ADD COLUMN IF NOT EXISTS reasoning_cohort_keys JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE model_capabilities_sync_status
+    ADD COLUMN IF NOT EXISTS reasoning_cohort_complete BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE model_capabilities_sync_status
+    ADD COLUMN IF NOT EXISTS reasoning_contract_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE model_capabilities_sync_status
+    ADD COLUMN IF NOT EXISTS reasoning_invalid_models JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
     id BIGSERIAL PRIMARY KEY,
@@ -7668,6 +9804,8 @@ mod tests {
         for statement in [
             "TRUNCATE TABLE admin_audit_logs",
             "TRUNCATE TABLE credential_events",
+            "TRUNCATE TABLE usage_cleanup_jobs",
+            "TRUNCATE TABLE usage_cleanup_watermarks",
             "TRUNCATE TABLE usage_credential_cost_summary",
             "TRUNCATE TABLE usage_duration_rollup_time_buckets",
             "TRUNCATE TABLE usage_cache_read_rollup_time_buckets",
@@ -7704,6 +9842,7 @@ mod tests {
             model_resolution_source: None,
             model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
+            request_api_key_id: Some("request-key-a".to_string()),
             credential_id: Some(7),
             credential_label: Some("alpha@example.com".to_string()),
             status: UsageRecordStatus::Success,
@@ -7754,6 +9893,1305 @@ mod tests {
             payload_breakdown: None,
             payload_guard_report: None,
         }
+    }
+
+    fn fixed_utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("fixed test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    fn dashboard_test_window(
+        key: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> UsageDashboardWindowSpec {
+        UsageDashboardWindowSpec {
+            key: key.to_string(),
+            label: key.to_string(),
+            from,
+            to,
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_cleanup_job_is_persistent_exclusive_and_recoverable() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+
+        assert!(
+            usage_store
+                .create_cleanup_job(NewUsageCleanupJob {
+                    job_id: "cleanup-job-a",
+                    mode: "soft_delete",
+                    cutoff_at: cutoff,
+                    batch_size: 250,
+                    max_batches: 100,
+                    pause_ms_between_batches: 10,
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            !usage_store
+                .create_cleanup_job(NewUsageCleanupJob {
+                    job_id: "cleanup-job-b",
+                    mode: "soft_delete",
+                    cutoff_at: cutoff,
+                    batch_size: 250,
+                    max_batches: 100,
+                    pause_ms_between_batches: 10,
+                })
+                .await
+                .unwrap(),
+            "partial unique index must reject a second active job"
+        );
+
+        let claimed = usage_store
+            .claim_cleanup_job("cleanup-job-a", "worker-a", 30)
+            .await
+            .unwrap()
+            .expect("first worker claims queued job");
+        assert_eq!(claimed.status, "running");
+        assert!(
+            usage_store
+                .claim_cleanup_job("cleanup-job-a", "worker-b", 30)
+                .await
+                .unwrap()
+                .is_none(),
+            "an unexpired lease cannot be stolen"
+        );
+
+        let cancelled = usage_store
+            .request_cleanup_cancel("cleanup-job-a")
+            .await
+            .unwrap()
+            .expect("running job can be cancelled");
+        assert!(cancelled.cancel_requested);
+        assert_eq!(cancelled.status, "running");
+        let cancel_seen = usage_store
+            .update_cleanup_job_progress(
+                UsageCleanupJobProgress {
+                    job_id: "cleanup-job-a",
+                    worker_id: "worker-a",
+                    status: "cancelled",
+                    phase: "postgres",
+                    processed_rows: 17,
+                    last_batch_rows: 0,
+                    batches: 1,
+                    remaining_rows: None,
+                    stop_reason: Some("cancel_requested"),
+                    last_error: None,
+                    redis_deleted_keys: 0,
+                    redis_delete_commands: 0,
+                    redis_max_command_keys: 0,
+                    redis_scan_passes: 8,
+                    redis_used_del_fallback: false,
+                    redis_pass_limit_reached: true,
+                    finished: true,
+                },
+                30,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel_seen, Some(true));
+
+        let requeued = usage_store
+            .requeue_cleanup_job("cleanup-job-a")
+            .await
+            .unwrap()
+            .expect("cancelled job can be requeued idempotently");
+        assert_eq!(requeued.status, "queued");
+        assert_eq!(requeued.processed_rows, 17);
+        assert_eq!(requeued.redis_scan_passes, 8, "scan passes are cumulative");
+        assert!(
+            !requeued.redis_pass_limit_reached,
+            "a retry must get a fresh convergence result"
+        );
+        usage_store
+            .claim_cleanup_job("cleanup-job-a", "worker-b", 30)
+            .await
+            .unwrap()
+            .expect("requeued job can be claimed");
+        sqlx::query(
+            "UPDATE usage_cleanup_jobs SET lease_until = now() - interval '1 second' WHERE job_id = $1",
+        )
+        .bind("cleanup-job-a")
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let recovered = usage_store
+            .claim_cleanup_job("cleanup-job-a", "worker-c", 30)
+            .await
+            .unwrap()
+            .expect("expired worker lease can be recovered");
+        assert_eq!(recovered.processed_rows, 17);
+
+        usage_store
+            .update_cleanup_job_progress(
+                UsageCleanupJobProgress {
+                    job_id: "cleanup-job-a",
+                    worker_id: "worker-c",
+                    status: "completed",
+                    phase: "complete",
+                    processed_rows: 17,
+                    last_batch_rows: 0,
+                    batches: 1,
+                    remaining_rows: Some(0),
+                    stop_reason: Some("no_more_rows"),
+                    last_error: None,
+                    redis_deleted_keys: 321,
+                    redis_delete_commands: 6,
+                    redis_max_command_keys: 64,
+                    redis_scan_passes: 2,
+                    redis_used_del_fallback: false,
+                    redis_pass_limit_reached: false,
+                    finished: true,
+                },
+                30,
+            )
+            .await
+            .unwrap();
+        let completed = usage_store
+            .cleanup_job("cleanup-job-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.matched_rows, Some(17));
+        assert_eq!(completed.remaining_rows, Some(0));
+        assert_eq!(completed.redis_max_command_keys, 64);
+        assert!(completed.finished_at.is_some());
+        assert!(completed.lease_until.is_none());
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_cleanup_supervisor_only_sees_claimable_jobs_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            sqlx::query("TRUNCATE TABLE usage_cleanup_jobs")
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let job_id = format!("cleanup-supervisor-round-{round}");
+            let worker_a = format!("worker-a-{round}");
+            let worker_b = format!("worker-b-{round}");
+            usage_store
+                .create_cleanup_job(NewUsageCleanupJob {
+                    job_id: &job_id,
+                    mode: "soft_delete",
+                    cutoff_at: Utc::now() - chrono::Duration::days(7),
+                    batch_size: 250,
+                    max_batches: 100,
+                    pause_ms_between_batches: 10,
+                })
+                .await
+                .unwrap();
+            usage_store
+                .claim_cleanup_job(&job_id, &worker_a, 30)
+                .await
+                .unwrap()
+                .expect("first worker claims queued job");
+
+            assert!(
+                usage_store
+                    .recoverable_cleanup_job()
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "round {round}: an unexpired running lease is not supervisor-recoverable"
+            );
+
+            sqlx::query(
+                "UPDATE usage_cleanup_jobs SET lease_until = now() - interval '1 second' WHERE job_id = $1",
+            )
+            .bind(&job_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            let recoverable = usage_store
+                .recoverable_cleanup_job()
+                .await
+                .unwrap()
+                .expect("expired running job becomes supervisor-recoverable");
+            assert_eq!(recoverable.job_id, job_id);
+            let reclaimed = usage_store
+                .claim_cleanup_job(&job_id, &worker_b, 30)
+                .await
+                .unwrap()
+                .expect("second worker reclaims expired lease");
+            assert_eq!(reclaimed.status, "running");
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_cleanup_cancel_resume_and_expired_recovery_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            sqlx::query("TRUNCATE TABLE usage_cleanup_jobs")
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let job_id = format!("cleanup-cancel-recovery-round-{round}");
+            let first_worker = format!("cancel-worker-{round}");
+            let expired_worker = format!("expired-worker-{round}");
+            let recovered_worker = format!("recovered-worker-{round}");
+            usage_store
+                .create_cleanup_job(NewUsageCleanupJob {
+                    job_id: &job_id,
+                    mode: "soft_delete",
+                    cutoff_at: Utc::now(),
+                    batch_size: 10,
+                    max_batches: 10,
+                    pause_ms_between_batches: 0,
+                })
+                .await
+                .unwrap();
+            usage_store
+                .claim_cleanup_job(&job_id, &first_worker, 30)
+                .await
+                .unwrap()
+                .expect("queued job is claimed");
+            assert!(
+                usage_store
+                    .request_cleanup_cancel(&job_id)
+                    .await
+                    .unwrap()
+                    .expect("running job accepts cancellation")
+                    .cancel_requested
+            );
+            usage_store
+                .update_cleanup_job_progress(
+                    UsageCleanupJobProgress {
+                        job_id: &job_id,
+                        worker_id: &first_worker,
+                        status: "cancelled",
+                        phase: "postgres",
+                        processed_rows: round as u64,
+                        last_batch_rows: 0,
+                        batches: round,
+                        remaining_rows: None,
+                        stop_reason: Some("cancel_requested"),
+                        last_error: None,
+                        redis_deleted_keys: 0,
+                        redis_delete_commands: 0,
+                        redis_max_command_keys: 0,
+                        redis_scan_passes: 0,
+                        redis_used_del_fallback: false,
+                        redis_pass_limit_reached: false,
+                        finished: true,
+                    },
+                    30,
+                )
+                .await
+                .unwrap()
+                .expect("lease owner persists cancellation");
+            usage_store
+                .requeue_cleanup_job(&job_id)
+                .await
+                .unwrap()
+                .expect("cancelled job resumes");
+            usage_store
+                .claim_cleanup_job(&job_id, &expired_worker, 30)
+                .await
+                .unwrap()
+                .expect("resumed job is claimed");
+            sqlx::query(
+                "UPDATE usage_cleanup_jobs SET lease_until = now() - interval '1 second' WHERE job_id = $1",
+            )
+            .bind(&job_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            let recovered = usage_store
+                .claim_cleanup_job(&job_id, &recovered_worker, 30)
+                .await
+                .unwrap()
+                .expect("expired resumed job is recovered");
+            assert_eq!(recovered.processed_rows, round as u64, "round {round}");
+            assert!(!recovered.cancel_requested, "round {round}");
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_cleanup_batches_are_bounded_idempotent_and_skip_locked() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let old = Utc::now() - chrono::Duration::days(30);
+        let mut records = Vec::new();
+        for index in 0..5 {
+            let mut record = usage_record(&format!("cleanup-row-{index}"), index);
+            record.created_at = (old + chrono::Duration::seconds(index as i64)).to_rfc3339();
+            records.push(record);
+        }
+        usage_store.record_batch(records).await.unwrap();
+
+        let mut blocker = store.pool().begin().await.unwrap();
+        sqlx::query("SELECT id FROM usage_records WHERE id = $1 FOR UPDATE")
+            .bind("cleanup-row-0")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        assert_eq!(
+            usage_store
+                .soft_delete_cleanup_batch(Utc::now(), 2)
+                .await
+                .unwrap()
+                .processed_rows,
+            2,
+            "the batch must skip a locked oldest row instead of waiting on it"
+        );
+        blocker.rollback().await.unwrap();
+
+        for expected in [2, 1, 0] {
+            assert_eq!(
+                usage_store
+                    .soft_delete_cleanup_batch(Utc::now(), 2)
+                    .await
+                    .unwrap()
+                    .processed_rows,
+                expected
+            );
+        }
+        assert_eq!(
+            usage_store
+                .preview_soft_delete_cleanup(Utc::now())
+                .await
+                .unwrap()
+                .matched_rows,
+            0
+        );
+
+        let hard_cutoff = Utc::now() + chrono::Duration::seconds(1);
+        for expected in [2, 2, 1, 0] {
+            assert_eq!(
+                usage_store
+                    .hard_delete_cleanup_batch(hard_cutoff, 2)
+                    .await
+                    .unwrap()
+                    .processed_rows,
+                expected
+            );
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_cleanup_locked_rows_remain_visible_until_release_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let row_id = format!("cleanup-locked-only-round-{round}");
+            let mut record = usage_record(&row_id, round);
+            record.created_at = Utc::now().to_rfc3339();
+            usage_store.record(record).await.unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let soft_cutoff = Utc::now();
+            let mut soft_blocker = store.pool().begin().await.unwrap();
+            sqlx::query("SELECT id FROM usage_records WHERE id = $1 FOR UPDATE")
+                .bind(&row_id)
+                .fetch_one(&mut *soft_blocker)
+                .await
+                .unwrap();
+            for attempt in 0..3 {
+                let result = usage_store
+                    .soft_delete_cleanup_batch(soft_cutoff, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(result.processed_rows, 0, "round {round}, attempt {attempt}");
+                assert_eq!(
+                    result.has_remaining,
+                    Some(true),
+                    "round {round}, attempt {attempt}: a locked matching row must not look complete"
+                );
+            }
+            soft_blocker.rollback().await.unwrap();
+
+            let soft_recovered = usage_store
+                .soft_delete_cleanup_batch(soft_cutoff, 2)
+                .await
+                .unwrap();
+            assert_eq!(soft_recovered.processed_rows, 1, "round {round}");
+            assert_eq!(soft_recovered.has_remaining, Some(false), "round {round}");
+
+            let hard_cutoff = Utc::now() + chrono::Duration::seconds(1);
+            let mut hard_blocker = store.pool().begin().await.unwrap();
+            sqlx::query("SELECT id FROM usage_records WHERE id = $1 FOR UPDATE")
+                .bind(&row_id)
+                .fetch_one(&mut *hard_blocker)
+                .await
+                .unwrap();
+            for attempt in 0..3 {
+                let result = usage_store
+                    .hard_delete_cleanup_batch(hard_cutoff, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(result.processed_rows, 0, "round {round}, attempt {attempt}");
+                assert_eq!(
+                    result.has_remaining,
+                    Some(true),
+                    "round {round}, attempt {attempt}: a locked tombstone must not look complete"
+                );
+            }
+            hard_blocker.rollback().await.unwrap();
+
+            let hard_recovered = usage_store
+                .hard_delete_cleanup_batch(hard_cutoff, 2)
+                .await
+                .unwrap();
+            assert_eq!(hard_recovered.processed_rows, 1, "round {round}");
+            assert_eq!(hard_recovered.has_remaining, Some(false), "round {round}");
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    async fn assert_postgres_usage_cleanup_authorities_empty(
+        store: &PostgresStore,
+        usage_store: &PostgresUsageStore,
+        context: &str,
+    ) {
+        let active_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM usage_records WHERE deleted_at IS NULL",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(active_rows, 0, "{context}: active detail rows");
+
+        let summary = usage_store.summary(500).await.unwrap();
+        assert_eq!(summary.total_requests, 0, "{context}: summary requests");
+        assert_eq!(
+            summary.total_input_tokens, 0,
+            "{context}: summary input tokens"
+        );
+        assert!(
+            summary.total_estimated_cost_usd.abs() < 1e-12,
+            "{context}: summary cost was {}",
+            summary.total_estimated_cost_usd
+        );
+        assert!(
+            usage_store
+                .credential_cost_summary()
+                .await
+                .unwrap()
+                .is_empty(),
+            "{context}: credential cost summary"
+        );
+
+        let dashboard = usage_store.dashboard(Some("UTC"), 500).await.unwrap();
+        for window in dashboard.windows {
+            assert_eq!(
+                window.summary.total_requests, 0,
+                "{context}: dashboard {} requests",
+                window.key
+            );
+            assert!(
+                window.summary.total_estimated_cost_usd.abs() < 1e-12,
+                "{context}: dashboard {} cost was {}",
+                window.key,
+                window.summary.total_estimated_cost_usd
+            );
+        }
+    }
+
+    async fn zero_stored_usage_json_original_cost(store: &PostgresStore, id: &str) {
+        let updated = sqlx::query(
+            r#"
+            UPDATE usage_records
+            SET data = jsonb_set(
+                    data,
+                    '{originalCostUsd}',
+                    to_jsonb(0.0::double precision)
+                ),
+                updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1, "historical fixture row exists");
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_rollup_update_subtracts_legacy_cost_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            clean(&store).await;
+            let local_id = format!("legacy-local-update-round-{round}");
+            let mut old_local = usage_record(&local_id, 800);
+            old_local.estimated_cost_usd = 0.8;
+            old_local.original_cost_usd = 0.8;
+            old_local.duration_ms = 900;
+            usage_store.record(old_local.clone()).await.unwrap();
+            zero_stored_usage_json_original_cost(&store, &local_id).await;
+
+            let mut new_local = usage_record(&local_id, 120);
+            new_local.created_at = old_local.created_at;
+            new_local.estimated_cost_usd = 0.2;
+            new_local.original_cost_usd = 0.2;
+            new_local.duration_ms = 120;
+            usage_store.record(new_local).await.unwrap();
+
+            let local_rollup: (i64, f64, f64, i64) = sqlx::query_as(
+                r#"
+                SELECT requests, total_estimated_cost_usd,
+                       total_original_cost_usd, duration_ms_max
+                FROM usage_rollup_totals
+                WHERE dimension = 'global' AND dimension_key = 'all'
+                "#,
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(local_rollup.0, 1, "local round {round}");
+            assert!((local_rollup.1 - 0.2).abs() < 1e-12, "local round {round}");
+            assert!((local_rollup.2 - 0.2).abs() < 1e-12, "local round {round}");
+            assert_eq!(local_rollup.3, 120, "local round {round}");
+            let local_credential: (i64, f64, f64) = sqlx::query_as(
+                r#"
+                SELECT requests, estimated_cost_usd, original_cost_usd
+                FROM usage_credential_cost_summary
+                WHERE credential_id = 7
+                "#,
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(local_credential.0, 1, "local round {round}");
+            assert!(
+                (local_credential.1 - 0.2).abs() < 1e-12,
+                "local round {round}"
+            );
+            assert!(
+                (local_credential.2 - 0.2).abs() < 1e-12,
+                "local round {round}"
+            );
+
+            clean(&store).await;
+            let external_id = format!("legacy-external-update-round-{round}");
+            let mut old_external = external_usage_record(&external_id, 0.7, 0.8, 0.9);
+            old_external.duration_ms = 800;
+            usage_store.record(old_external.clone()).await.unwrap();
+            zero_stored_usage_json_original_cost(&store, &external_id).await;
+
+            let mut new_external = external_usage_record(&external_id, 0.15, 0.18, 0.2);
+            new_external.created_at = old_external.created_at;
+            new_external.duration_ms = 80;
+            usage_store.record(new_external).await.unwrap();
+
+            let external_rollup: (i64, f64, f64, f64, i64) = sqlx::query_as(
+                r#"
+                SELECT requests, total_estimated_cost_usd, total_original_cost_usd,
+                       external_pool_raw_cost_usd, duration_ms_max
+                FROM usage_rollup_totals
+                WHERE dimension = 'global' AND dimension_key = 'all'
+                "#,
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(external_rollup.0, 1, "external round {round}");
+            assert!(
+                (external_rollup.1 - 0.2).abs() < 1e-12,
+                "external round {round}"
+            );
+            assert!(
+                (external_rollup.2 - 0.15).abs() < 1e-12,
+                "external round {round}"
+            );
+            assert!(
+                (external_rollup.3 - 0.15).abs() < 1e-12,
+                "external round {round}"
+            );
+            assert_eq!(external_rollup.4, 80, "external round {round}");
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_soft_cleanup_removes_rollups_and_costs_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let mut record = usage_record(&format!("cleanup-soft-rollup-round-{round}"), 600);
+            record.created_at = Utc::now().to_rfc3339();
+            usage_store.record(record).await.unwrap();
+            assert_eq!(usage_store.summary(500).await.unwrap().total_requests, 1);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let cutoff = Utc::now();
+            let result = usage_store
+                .soft_delete_cleanup_batch(cutoff, 10)
+                .await
+                .unwrap();
+            assert_eq!(result.processed_rows, 1, "round {round}");
+            assert_eq!(result.has_remaining, Some(false), "round {round}");
+            assert_postgres_usage_cleanup_authorities_empty(
+                &store,
+                &usage_store,
+                &format!("soft round {round}"),
+            )
+            .await;
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_recomputes_global_duration_max_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let old_created_at = Utc::now();
+            let cutoff = old_created_at + chrono::Duration::milliseconds(1);
+            let remaining_created_at = old_created_at + chrono::Duration::milliseconds(2);
+            let mut removed_max = usage_record(&format!("duration-max-round-{round}"), 10);
+            removed_max.created_at = old_created_at.to_rfc3339();
+            removed_max.duration_ms = 900;
+            let mut remaining = usage_record(&format!("duration-remaining-round-{round}"), 20);
+            remaining.created_at = remaining_created_at.to_rfc3339();
+            remaining.duration_ms = 120;
+            usage_store
+                .record_batch(vec![removed_max, remaining])
+                .await
+                .unwrap();
+
+            let total_before: i64 = sqlx::query_scalar(
+                "SELECT duration_ms_max FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            let bucket_before: i64 = sqlx::query_scalar(
+                r#"
+                SELECT duration_ms_max
+                FROM usage_rollup_time_buckets
+                WHERE bucket_start = date_trunc('hour', $1::timestamptz)
+                  AND dimension = 'global'
+                  AND dimension_key = 'all'
+                "#,
+            )
+            .bind(old_created_at)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(total_before, 900, "round {round}");
+            assert_eq!(bucket_before, 900, "round {round}");
+
+            let result = usage_store
+                .soft_delete_cleanup_batch(cutoff, 10)
+                .await
+                .unwrap();
+            assert_eq!(result.processed_rows, 1, "round {round}");
+            let total_after: i64 = sqlx::query_scalar(
+                "SELECT duration_ms_max FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            let bucket_after: i64 = sqlx::query_scalar(
+                r#"
+                SELECT duration_ms_max
+                FROM usage_rollup_time_buckets
+                WHERE bucket_start = date_trunc('hour', $1::timestamptz)
+                  AND dimension = 'global'
+                  AND dimension_key = 'all'
+                "#,
+            )
+            .bind(old_created_at)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(total_after, 120, "round {round}");
+            assert_eq!(bucket_after, 120, "round {round}");
+
+            usage_store
+                .soft_delete_cleanup_batch(
+                    remaining_created_at + chrono::Duration::milliseconds(1),
+                    10,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_hard_cleanup_removes_legacy_rollups_once_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let id = format!("cleanup-hard-legacy-round-{round}");
+            usage_store.record(usage_record(&id, 600)).await.unwrap();
+            sqlx::query(
+                "UPDATE usage_records SET deleted_at = now(), updated_at = now() WHERE id = $1",
+            )
+            .bind(&id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(usage_store.summary(500).await.unwrap().total_requests, 1);
+
+            let result = usage_store
+                .hard_delete_cleanup_batch(Utc::now() + chrono::Duration::seconds(1), 10)
+                .await
+                .unwrap();
+            assert_eq!(result.processed_rows, 1, "round {round}");
+            assert_eq!(result.has_remaining, Some(false), "round {round}");
+            assert_postgres_usage_cleanup_authorities_empty(
+                &store,
+                &usage_store,
+                &format!("hard legacy round {round}"),
+            )
+            .await;
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_rejects_late_replay_but_accepts_newer_records_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let old_id = format!("cleanup-replay-old-round-{round}");
+            let mut old_record = usage_record(&old_id, 600);
+            old_record.created_at = Utc::now().to_rfc3339();
+            usage_store.record(old_record.clone()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let cutoff = Utc::now();
+            usage_store
+                .soft_delete_cleanup_batch(cutoff, 10)
+                .await
+                .unwrap();
+            assert_postgres_usage_cleanup_authorities_empty(
+                &store,
+                &usage_store,
+                &format!("soft before replay round {round}"),
+            )
+            .await;
+
+            usage_store.record(old_record.clone()).await.unwrap();
+            assert_postgres_usage_cleanup_authorities_empty(
+                &store,
+                &usage_store,
+                &format!("soft replay round {round}"),
+            )
+            .await;
+
+            usage_store
+                .hard_delete_cleanup_batch(Utc::now() + chrono::Duration::seconds(1), 10)
+                .await
+                .unwrap();
+            usage_store.record(old_record).await.unwrap();
+            assert_postgres_usage_cleanup_authorities_empty(
+                &store,
+                &usage_store,
+                &format!("hard replay round {round}"),
+            )
+            .await;
+
+            let new_id = format!("cleanup-replay-new-round-{round}");
+            let mut new_record = usage_record(&new_id, 600);
+            new_record.created_at = Utc::now().to_rfc3339();
+            usage_store.record(new_record).await.unwrap();
+            assert_eq!(
+                usage_store.summary(500).await.unwrap().total_requests,
+                1,
+                "round {round}: a record newer than the cleanup cutoff remains valid"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            usage_store
+                .soft_delete_cleanup_batch(Utc::now(), 10)
+                .await
+                .unwrap();
+            usage_store
+                .hard_delete_cleanup_batch(Utc::now() + chrono::Duration::seconds(1), 10)
+                .await
+                .unwrap();
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_is_consistent_with_concurrent_old_writes_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let created_at = Utc::now();
+            let records = (0..32)
+                .map(|index| {
+                    let mut record = usage_record(
+                        &format!("cleanup-concurrent-round-{round}-record-{index}"),
+                        600,
+                    );
+                    record.created_at = created_at.to_rfc3339();
+                    record
+                })
+                .collect::<Vec<_>>();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let cutoff = Utc::now();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+            let writer_store = usage_store.clone();
+            let writer_barrier = barrier.clone();
+            let writer = tokio::spawn(async move {
+                writer_barrier.wait().await;
+                writer_store.record_batch(records).await
+            });
+            let cleanup_store = usage_store.clone();
+            let cleanup_barrier = barrier.clone();
+            let cleanup = tokio::spawn(async move {
+                cleanup_barrier.wait().await;
+                cleanup_store.soft_delete_cleanup_batch(cutoff, 10).await
+            });
+            writer.await.unwrap().unwrap();
+            cleanup.await.unwrap().unwrap();
+
+            loop {
+                let result = usage_store
+                    .soft_delete_cleanup_batch(cutoff, 10)
+                    .await
+                    .unwrap();
+                if result.has_remaining == Some(false) {
+                    break;
+                }
+            }
+            assert_postgres_usage_cleanup_authorities_empty(
+                &store,
+                &usage_store,
+                &format!("concurrent write round {round}"),
+            )
+            .await;
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_cleanup_watermark_waits_for_inflight_usage_commit_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let mut record = usage_record(
+                &format!("cleanup-inflight-commit-round-{round}"),
+                700 + round,
+            );
+            record.created_at = Utc::now().to_rfc3339();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let cutoff = Utc::now();
+
+            let mut writer_tx = store.pool().begin().await.unwrap();
+            acquire_usage_writer_commit_guard(&mut writer_tx)
+                .await
+                .unwrap();
+            assert!(
+                upsert_usage_record_in_tx(&mut writer_tx, &record)
+                    .await
+                    .unwrap()
+            );
+            let mut rollups = UsageRollupBatchDelta::default();
+            rollups.add_record(&record, 1);
+            rollups.apply(&mut writer_tx).await.unwrap();
+
+            let advancing_store = usage_store.clone();
+            let mut advancing = tokio::spawn(async move {
+                advancing_store
+                    .advance_soft_delete_cleanup_watermark(cutoff)
+                    .await
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut advancing)
+                    .await
+                    .is_err(),
+                "round {round}: cleanup watermark advanced before an older usage transaction committed"
+            );
+
+            writer_tx.commit().await.unwrap();
+            assert_eq!(advancing.await.unwrap().unwrap(), cutoff, "round {round}");
+
+            let result = usage_store
+                .soft_delete_cleanup_batch(cutoff, 10)
+                .await
+                .unwrap();
+            assert_eq!(result.processed_rows, 1, "round {round}");
+            assert_eq!(result.has_remaining, Some(false), "round {round}");
+            assert_postgres_usage_cleanup_authorities_empty(
+                &store,
+                &usage_store,
+                &format!("inflight commit round {round}"),
+            )
+            .await;
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_cleanup_batches_return_contention_signal_while_writer_guard_is_held_for_three_rounds()
+     {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let row_id = format!("cleanup-writer-guard-contention-round-{round}");
+            let mut record = usage_record(&row_id, round);
+            record.created_at = Utc::now().to_rfc3339();
+            usage_store.record(record).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let soft_cutoff = Utc::now();
+
+            let mut writer_tx = store.pool().begin().await.unwrap();
+            acquire_usage_writer_commit_guard(&mut writer_tx)
+                .await
+                .unwrap();
+            let started_at = std::time::Instant::now();
+            let soft_contention = usage_store
+                .soft_delete_cleanup_batch(soft_cutoff, 10)
+                .await
+                .unwrap();
+            assert!(
+                started_at.elapsed() < std::time::Duration::from_secs(1),
+                "round {round}: soft cleanup contention must be bounded"
+            );
+            assert_eq!(soft_contention.processed_rows, 0, "round {round}");
+            assert_eq!(soft_contention.has_remaining, Some(true), "round {round}");
+            writer_tx.rollback().await.unwrap();
+
+            let soft_recovered = usage_store
+                .soft_delete_cleanup_batch(soft_cutoff, 10)
+                .await
+                .unwrap();
+            assert_eq!(soft_recovered.processed_rows, 1, "round {round}");
+            assert_eq!(soft_recovered.has_remaining, Some(false), "round {round}");
+
+            let hard_cutoff = Utc::now() + chrono::Duration::seconds(1);
+            let mut writer_tx = store.pool().begin().await.unwrap();
+            acquire_usage_writer_commit_guard(&mut writer_tx)
+                .await
+                .unwrap();
+            let started_at = std::time::Instant::now();
+            let hard_contention = usage_store
+                .hard_delete_cleanup_batch(hard_cutoff, 10)
+                .await
+                .unwrap();
+            assert!(
+                started_at.elapsed() < std::time::Duration::from_millis(250),
+                "round {round}: hard cleanup should use try-lock, got {:?}",
+                started_at.elapsed()
+            );
+            assert_eq!(hard_contention.processed_rows, 0, "round {round}");
+            assert_eq!(hard_contention.has_remaining, Some(true), "round {round}");
+            writer_tx.rollback().await.unwrap();
+
+            let hard_recovered = usage_store
+                .hard_delete_cleanup_batch(hard_cutoff, 10)
+                .await
+                .unwrap();
+            assert_eq!(hard_recovered.processed_rows, 1, "round {round}");
+            assert_eq!(hard_recovered.has_remaining, Some(false), "round {round}");
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_cleanup_watermark_lock_wait_is_bounded_and_recovers() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let cutoff = Utc::now();
+
+        let mut writer_tx = store.pool().begin().await.unwrap();
+        acquire_usage_writer_commit_guard(&mut writer_tx)
+            .await
+            .unwrap();
+        let started_at = std::time::Instant::now();
+        let error = usage_store
+            .advance_soft_delete_cleanup_watermark(cutoff)
+            .await
+            .unwrap_err();
+        let elapsed = started_at.elapsed();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("lock timeout")),
+            "expected a PostgreSQL lock timeout, got: {error:#}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150)
+                && elapsed < std::time::Duration::from_secs(1),
+            "watermark lock wait was not bounded near the 250ms contract: {elapsed:?}"
+        );
+
+        writer_tx.rollback().await.unwrap();
+        assert_eq!(
+            usage_store
+                .advance_soft_delete_cleanup_watermark(cutoff)
+                .await
+                .unwrap(),
+            cutoff
+        );
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_cleanup_prunes_high_cardinality_zero_rollups_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let base = DateTime::parse_from_rfc3339("2026-07-16T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        for round in 0..3 {
+            clean(&store).await;
+            let mut records = Vec::new();
+            for index in 0..48 {
+                let mut record = usage_record(
+                    &format!("zero-rollup-old-round-{round}-record-{index}"),
+                    10_000 + round * 100 + index,
+                );
+                record.created_at =
+                    (base + chrono::Duration::milliseconds(index as i64)).to_rfc3339();
+                record.conversation_id = Some(format!(
+                    "zero-rollup-old-conversation-round-{round}-{index}"
+                ));
+                record.credential_id = Some((10_000 + round * 100 + index) as u64);
+                record.credential_label = Some(format!("old-{round}-{index}@example.test"));
+                record.duration_ms = (1_000 + index) as u64;
+                records.push(record);
+            }
+            let new_id = format!("zero-rollup-new-round-{round}");
+            let new_conversation = format!("zero-rollup-new-conversation-round-{round}");
+            let new_credential = (90_000 + round) as u64;
+            let new_cache_read = 20_000 + round;
+            let new_duration = 222 + round as u64;
+            let mut newer = usage_record(&new_id, new_cache_read);
+            newer.created_at = (base + chrono::Duration::minutes(10)).to_rfc3339();
+            newer.conversation_id = Some(new_conversation.clone());
+            newer.credential_id = Some(new_credential);
+            newer.credential_label = Some(format!("new-{round}@example.test"));
+            newer.duration_ms = new_duration;
+            records.push(newer);
+            usage_store.record_batch(records).await.unwrap();
+
+            let cutoff = base + chrono::Duration::minutes(5);
+            let mut processed = 0;
+            let mut batches = 0;
+            loop {
+                let result = usage_store
+                    .soft_delete_cleanup_batch(cutoff, 7)
+                    .await
+                    .unwrap();
+                processed += result.processed_rows;
+                batches += 1;
+                if result.has_remaining == Some(false) {
+                    break;
+                }
+                assert!(batches < 20, "round {round}: cleanup did not converge");
+            }
+            assert_eq!(processed, 48, "round {round}");
+            assert!(
+                batches > 1,
+                "round {round}: fixture must use multiple batches"
+            );
+
+            for table in [
+                "usage_rollup_totals",
+                "usage_rollup_time_buckets",
+                "usage_credential_cost_summary",
+                "usage_cache_read_totals",
+                "usage_cache_read_rollup_time_buckets",
+                "usage_duration_rollup_time_buckets",
+            ] {
+                let query = format!("SELECT COUNT(*)::bigint FROM {table} WHERE requests <= 0");
+                let zero_rows: i64 = sqlx::query_scalar(&query)
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(zero_rows, 0, "round {round}: {table} retained zero rows");
+            }
+
+            let active_ids: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM usage_records WHERE deleted_at IS NULL ORDER BY id",
+            )
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(active_ids, vec![new_id], "round {round}");
+            let conversation_requests: i64 = sqlx::query_scalar(
+                r#"
+                SELECT requests
+                FROM usage_rollup_totals
+                WHERE dimension = 'conversation' AND dimension_key = $1
+                "#,
+            )
+            .bind(&new_conversation)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(conversation_requests, 1, "round {round}");
+            let conversation_rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)::bigint FROM usage_rollup_totals WHERE dimension = 'conversation'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(conversation_rows, 1, "round {round}");
+            let credential_requests: i64 = sqlx::query_scalar(
+                "SELECT requests FROM usage_credential_cost_summary WHERE credential_id = $1",
+            )
+            .bind(new_credential as i64)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(credential_requests, 1, "round {round}");
+            let credential_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_credential_cost_summary")
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(credential_rows, 1, "round {round}");
+            let cache_requests: i64 = sqlx::query_scalar(
+                "SELECT requests FROM usage_cache_read_totals WHERE cache_read_input_tokens = $1",
+            )
+            .bind(new_cache_read)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(cache_requests, 1, "round {round}");
+            let duration_requests: i64 = sqlx::query_scalar(
+                r#"
+                SELECT requests
+                FROM usage_duration_rollup_time_buckets
+                WHERE bucket_start = date_trunc('hour', $1::timestamptz)
+                  AND duration_ms = $2
+                "#,
+            )
+            .bind(base)
+            .bind(new_duration as i32)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(duration_requests, 1, "round {round}");
+            let global_bucket_requests: i64 = sqlx::query_scalar(
+                r#"
+                SELECT requests
+                FROM usage_rollup_time_buckets
+                WHERE bucket_start = date_trunc('hour', $1::timestamptz)
+                  AND dimension = 'global'
+                  AND dimension_key = 'all'
+                "#,
+            )
+            .bind(base)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(global_bucket_requests, 1, "round {round}");
+        }
+
+        store.drop_test_schema().await.unwrap();
     }
 
     #[test]
@@ -7816,6 +11254,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn postgres_rejects_online_rollup_compression_config_before_connecting() {
+        let mut config = Config::default();
+        config.postgres.compress_usage_rollups_on_start = true;
+        let error = PostgresStore::connect(&config).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("compressUsageRollupsOnStart"));
+        assert!(message.contains("maintenance usage-rollup-compression"));
+        assert!(!message.contains("postgres.url"));
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_lifecycle_fence_requires_offline_maintenance() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let service_a = PostgresUsageLifecycleGuard::acquire_service(&config)
+            .await
+            .unwrap();
+        let service_b = PostgresUsageLifecycleGuard::acquire_service(&config)
+            .await
+            .unwrap();
+        let maintenance_error = PostgresUsageLifecycleGuard::acquire_offline_maintenance(&config)
+            .await
+            .err()
+            .expect("online services must reject offline usage maintenance");
+        assert!(
+            maintenance_error
+                .to_string()
+                .contains("every gateway instance to be stopped")
+        );
+
+        service_a.release().await.unwrap();
+        service_b.release().await.unwrap();
+        let maintenance = PostgresUsageLifecycleGuard::acquire_offline_maintenance(&config)
+            .await
+            .unwrap();
+        let service_error = PostgresUsageLifecycleGuard::acquire_service(&config)
+            .await
+            .err()
+            .expect("offline maintenance must reject service startup");
+        assert!(
+            service_error
+                .to_string()
+                .contains("cannot start while offline usage maintenance")
+        );
+
+        maintenance.release().await.unwrap();
+        PostgresUsageLifecycleGuard::acquire_service(&config)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn usage_legacy_cost_backfill_is_explicit_maintenance_sql() {
         for expected in [
@@ -7829,6 +11325,238 @@ mod tests {
                 "legacy cost backfill maintenance SQL should contain expected statement: {expected}"
             );
         }
+    }
+
+    async fn startup_migration_atomicity_snapshot(store: &PostgresStore) -> serde_json::Value {
+        let columns: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT concat_ws(
+                ':', table_name, ordinal_position::text, column_name, data_type,
+                is_nullable, COALESCE(column_default, '')
+            )
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+            ORDER BY table_name, ordinal_position
+            "#,
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let tables: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT concat_ws(':', table_name, table_type)
+            FROM information_schema.tables
+            WHERE table_schema = current_schema()
+            ORDER BY table_name
+            "#,
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let indexes: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT concat_ws(':', tablename, indexname, indexdef)
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+            ORDER BY tablename, indexname
+            "#,
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let markers: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT concat_ws(':', version, checksum, applied_at::text)
+            FROM schema_migrations
+            ORDER BY version
+            "#,
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let runtime_config: serde_json::Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object('config', config, 'version', version) FROM runtime_config WHERE id = 'current'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let credentials: Vec<serde_json::Value> = sqlx::query_scalar(
+            r#"
+            SELECT jsonb_build_object(
+                'id', id,
+                'priority', priority,
+                'disabled', disabled,
+                'auth_kind', auth_kind,
+                'api_key_hash', api_key_hash,
+                'refresh_token_hash', refresh_token_hash,
+                'data', data,
+                'deleted_at', deleted_at
+            )
+            FROM credentials
+            ORDER BY id
+            "#,
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+
+        serde_json::json!({
+            "columns": columns,
+            "tables": tables,
+            "indexes": indexes,
+            "markers": markers,
+            "runtimeConfig": runtime_config,
+            "credentials": credentials,
+        })
+    }
+
+    #[tokio::test]
+    async fn postgres_startup_migration_checksum_failure_rolls_back_entire_default_chain() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        sqlx::query(
+            r#"
+            INSERT INTO runtime_config (id, config, version)
+            VALUES ('current', '{"fixture":"migration-atomicity"}'::jsonb, 17)
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        store
+            .insert_credential(&KiroCredentials {
+                kiro_api_key: Some("ksk_migration_atomicity_fixture".to_string()),
+                auth_method: Some("api_key".to_string()),
+                priority: 23,
+                email: Some("migration-atomicity@example.test".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for statement in [
+            "DROP TABLE credential_stats_delta_batches",
+            "DROP TABLE credential_runtime_mutations",
+            "ALTER TABLE credentials DROP COLUMN revision",
+            "ALTER TABLE credential_runtime_state DROP COLUMN revision",
+            "ALTER TABLE credential_runtime_state DROP COLUMN generation",
+        ] {
+            sqlx::query(statement).execute(store.pool()).await.unwrap();
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM schema_migrations
+            WHERE version IN (
+                'credential-runtime-revision-v1',
+                'credential-runtime-generation-v1',
+                'credential-runtime-mutation-cleanup-v1',
+                'credential-stats-delta-batches-v1'
+            )
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let updated = sqlx::query(
+            r#"
+            UPDATE schema_migrations
+            SET checksum = 'fixture-corrupt-checksum'
+            WHERE version = 'credential-storage-revision-v1'
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+
+        let before = startup_migration_atomicity_snapshot(&store).await;
+        for attempt in 1..=5 {
+            let error = store.migrate_with_options(false).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("credential-storage-revision-v1 checksum mismatch"),
+                "attempt {attempt} returned unexpected error: {error:#}"
+            );
+            assert_eq!(
+                startup_migration_atomicity_snapshot(&store).await,
+                before,
+                "failed startup migration attempt {attempt} left a partial schema, marker, or business-data mutation"
+            );
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_repeated_startup_migration_preserves_unchanged_inline_marker_time() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let initial: (String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT checksum, applied_at FROM schema_migrations WHERE version = 'inline-schema'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        store.migrate_with_options(false).await.unwrap();
+        let repeated: (String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT checksum, applied_at FROM schema_migrations WHERE version = 'inline-schema'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(repeated, initial);
+
+        sqlx::query(
+            r#"
+            UPDATE schema_migrations
+            SET checksum = 'fixture-stale-inline-checksum',
+                applied_at = now() - interval '1 day'
+            WHERE version = 'inline-schema'
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let stale_applied_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT applied_at FROM schema_migrations WHERE version = 'inline-schema'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+
+        store.migrate_with_options(false).await.unwrap();
+        let repaired: (String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT checksum, applied_at FROM schema_migrations WHERE version = 'inline-schema'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(repaired.0, sha256_hex(SCHEMA_SQL));
+        assert!(repaired.1 > stale_applied_at);
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        store.migrate_with_options(false).await.unwrap();
+        let final_marker: (String, DateTime<Utc>) = sqlx::query_as(
+            "SELECT checksum, applied_at FROM schema_migrations WHERE version = 'inline-schema'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(final_marker, repaired);
+
+        store.drop_test_schema().await.unwrap();
     }
 
     #[test]
@@ -7896,13 +11624,559 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_usage_concurrent_writers_keep_rollup_lock_order_stable() {
+        let Some(mut config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        config.postgres.max_connections = 4;
+
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let left_store = PostgresUsageStore::new(store.clone());
+        let right_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            let ids = vec![format!("missing-id-guard-{round}")];
+            let mut holder = store.pool().begin().await.unwrap();
+            acquire_usage_writer_commit_guard(&mut holder)
+                .await
+                .unwrap();
+            acquire_usage_record_commit_guards(&mut holder, &ids)
+                .await
+                .unwrap();
+
+            let waiting_store = store.clone();
+            let waiting_ids = ids.clone();
+            let waiter = tokio::spawn(async move {
+                let mut tx = waiting_store.pool().begin().await?;
+                acquire_usage_writer_commit_guard(&mut tx).await?;
+                acquire_usage_record_commit_guards(&mut tx, &waiting_ids).await?;
+                tx.commit().await?;
+                Ok::<(), anyhow::Error>(())
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                !waiter.is_finished(),
+                "round {round}: a second writer crossed the missing-ID advisory guard"
+            );
+            holder.commit().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+                .await
+                .expect("missing-ID waiter must recover after commit")
+                .expect("missing-ID waiter task")
+                .expect("missing-ID waiter transaction");
+        }
+
+        for round in 0..64 {
+            let mut left = usage_record(&format!("concurrent-left-{round}"), round);
+            left.conversation_id = Some(format!("left-session-{round}"));
+            let mut right = usage_record(&format!("concurrent-right-{round}"), round + 1);
+            right.conversation_id = Some(format!("right-session-{round}"));
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let left_gate = gate.clone();
+            let right_gate = gate.clone();
+
+            let (left_result, right_result) = tokio::join!(
+                async {
+                    left_gate.wait().await;
+                    left_store.record_batch(vec![left]).await
+                },
+                async {
+                    right_gate.wait().await;
+                    right_store.record_batch(vec![right]).await
+                },
+            );
+            assert!(
+                left_result.is_ok(),
+                "round {round}: left usage writer failed: {left_result:?}"
+            );
+            assert!(
+                right_result.is_ok(),
+                "round {round}: right usage writer failed: {right_result:?}"
+            );
+        }
+
+        for round in 0..32 {
+            let left_records = vec![
+                usage_record("concurrent-shared-a", round),
+                usage_record("concurrent-shared-b", round + 1),
+            ];
+            let right_records = vec![
+                usage_record("concurrent-shared-b", round + 2),
+                usage_record("concurrent-shared-a", round + 3),
+            ];
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let left_gate = gate.clone();
+            let right_gate = gate.clone();
+
+            let (left_result, right_result) = tokio::join!(
+                async {
+                    left_gate.wait().await;
+                    left_store.record_batch(left_records).await
+                },
+                async {
+                    right_gate.wait().await;
+                    right_store.record_batch(right_records).await
+                },
+            );
+            assert!(
+                left_result.is_ok(),
+                "shared round {round}: left usage writer failed: {left_result:?}"
+            );
+            assert!(
+                right_result.is_ok(),
+                "shared round {round}: right usage writer failed: {right_result:?}"
+            );
+        }
+
+        let requests: i64 = sqlx::query_scalar(
+            "SELECT requests FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(requests, 130);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_dashboard_duration_p95_uses_weighted_histogram_and_negative_deltas() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let base = fixed_utc("2026-07-15T10:00:00Z");
+        let specs = [dashboard_test_window(
+            "fixed",
+            base,
+            base + chrono::Duration::hours(2),
+        )];
+
+        let records = (1..=100)
+            .map(|duration_ms| {
+                let mut record = usage_record(&format!("duration-p95-{duration_ms}"), 0);
+                record.created_at = (base
+                    + chrono::Duration::hours(if duration_ms % 2 == 0 { 1 } else { 0 })
+                    + chrono::Duration::seconds(duration_ms as i64))
+                .to_rfc3339();
+                record.duration_ms = duration_ms;
+                record.response_latency_ms = Some(duration_ms);
+                record
+            })
+            .collect::<Vec<_>>();
+        usage_store.record_batch(records).await.unwrap();
+
+        let windows = usage_store.dashboard_windows(&specs, 0).await.unwrap();
+        assert_eq!(windows[0].summary.total_requests, 100);
+        assert_eq!(windows[0].summary.p95_duration_ms, 95);
+        assert!((windows[0].summary.average_duration_ms - 50.5).abs() < f64::EPSILON);
+
+        let mut replacement = usage_record("duration-p95-100", 0);
+        replacement.created_at =
+            (base + chrono::Duration::hours(1) + chrono::Duration::seconds(1)).to_rfc3339();
+        replacement.duration_ms = 1;
+        replacement.response_latency_ms = Some(1);
+        usage_store.record(replacement).await.unwrap();
+        let windows = usage_store.dashboard_windows(&specs, 0).await.unwrap();
+        assert_eq!(windows[0].summary.total_requests, 100);
+        assert_eq!(windows[0].summary.p95_duration_ms, 94);
+
+        clean(&store).await;
+        let weighted = (0..100)
+            .map(|index| {
+                let mut record = usage_record(&format!("duration-weighted-{index}"), 0);
+                record.created_at = (base
+                    + chrono::Duration::hours(if index < 95 { 0 } else { 1 })
+                    + chrono::Duration::seconds(index as i64))
+                .to_rfc3339();
+                record.duration_ms = if index < 95 { 10 } else { 1_000 };
+                record.response_latency_ms = Some(record.duration_ms);
+                record
+            })
+            .collect::<Vec<_>>();
+        usage_store.record_batch(weighted).await.unwrap();
+        let windows = usage_store.dashboard_windows(&specs, 0).await.unwrap();
+        assert_eq!(windows[0].summary.total_requests, 100);
+        assert_eq!(windows[0].summary.p95_duration_ms, 10);
+
+        clean(&store).await;
+        let weighted = (0..100)
+            .map(|index| {
+                let mut record = usage_record(&format!("duration-weighted-tail-{index}"), 0);
+                record.created_at = (base
+                    + chrono::Duration::hours(if index < 94 { 0 } else { 1 })
+                    + chrono::Duration::seconds(index as i64))
+                .to_rfc3339();
+                record.duration_ms = if index < 94 { 10 } else { 1_000 };
+                record.response_latency_ms = Some(record.duration_ms);
+                record
+            })
+            .collect::<Vec<_>>();
+        usage_store.record_batch(weighted).await.unwrap();
+        let windows = usage_store.dashboard_windows(&specs, 0).await.unwrap();
+        assert_eq!(windows[0].summary.total_requests, 100);
+        assert_eq!(windows[0].summary.p95_duration_ms, 1_000);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_dashboard_uses_exact_utc_boundary_population_for_every_window_metric() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let base = fixed_utc("2026-07-15T10:00:00Z");
+
+        let mut before = external_usage_record("dashboard-before", 0.010, 0.006, 0.008);
+        before.created_at = (base + chrono::Duration::minutes(10)).to_rfc3339();
+
+        let mut at_from = external_usage_record("dashboard-at-from", 0.010, 0.006, 0.008);
+        at_from.created_at = (base + chrono::Duration::minutes(15)).to_rfc3339();
+
+        let mut first_boundary = usage_record("dashboard-first-boundary", 2_000);
+        first_boundary.created_at = (base + chrono::Duration::minutes(30)).to_rfc3339();
+        first_boundary.duration_ms = 30;
+
+        let mut before_full_hour = usage_record("dashboard-before-full-hour", 0);
+        before_full_hour.created_at =
+            (base + chrono::Duration::minutes(59) + chrono::Duration::seconds(59)).to_rfc3339();
+        before_full_hour.status = UsageRecordStatus::Error;
+        before_full_hour.usage_source = UsageSource::RequestEstimate;
+        before_full_hour.duration_ms = 40;
+
+        let mut full_hour_start = usage_record("dashboard-full-hour-start", 2_000);
+        full_hour_start.created_at = (base + chrono::Duration::hours(1)).to_rfc3339();
+        full_hour_start.duration_ms = 50;
+
+        let mut full_hour_external =
+            external_usage_record("dashboard-full-hour-external", 0.010, 0.006, 0.008);
+        full_hour_external.created_at =
+            (base + chrono::Duration::hours(1) + chrono::Duration::minutes(30)).to_rfc3339();
+
+        let mut tail_legacy = usage_record("dashboard-tail-legacy", 2_000);
+        tail_legacy.created_at =
+            (base + chrono::Duration::hours(2) + chrono::Duration::minutes(30)).to_rfc3339();
+        tail_legacy.status = UsageRecordStatus::StreamError;
+        tail_legacy.usage_source = UsageSource::ContextEstimate;
+        tail_legacy.estimated_cost_usd = 0.123;
+        tail_legacy.original_cost_usd = 0.0;
+        tail_legacy.duration_ms = 60;
+
+        let mut at_to = external_usage_record("dashboard-at-to", 1.0, 0.5, 0.75);
+        at_to.created_at =
+            (base + chrono::Duration::hours(2) + chrono::Duration::minutes(45)).to_rfc3339();
+
+        usage_store
+            .record_batch(vec![
+                before,
+                at_from,
+                first_boundary,
+                before_full_hour,
+                full_hour_start,
+                full_hour_external,
+                tail_legacy,
+                at_to,
+            ])
+            .await
+            .unwrap();
+
+        let specs = vec![
+            dashboard_test_window(
+                "same-hour",
+                base + chrono::Duration::minutes(15),
+                base + chrono::Duration::minutes(45),
+            ),
+            dashboard_test_window(
+                "cross-hour",
+                base + chrono::Duration::minutes(15),
+                base + chrono::Duration::hours(2) + chrono::Duration::minutes(45),
+            ),
+            dashboard_test_window(
+                "exact-hour",
+                base + chrono::Duration::hours(1),
+                base + chrono::Duration::hours(2),
+            ),
+            dashboard_test_window(
+                "half-hour",
+                base + chrono::Duration::minutes(30),
+                base + chrono::Duration::hours(1) + chrono::Duration::minutes(30),
+            ),
+        ];
+
+        let windows = usage_store.dashboard_windows(&specs, 1_000).await.unwrap();
+        let by_key = windows
+            .iter()
+            .map(|window| (window.key.as_str(), window))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_key["same-hour"].summary.total_requests, 2);
+        assert_eq!(by_key["same-hour"].summary.high_cache_requests, 2);
+        assert_eq!(by_key["same-hour"].summary.p95_duration_ms, 50);
+        assert_eq!(by_key["cross-hour"].summary.total_requests, 6);
+        assert_eq!(by_key["cross-hour"].summary.success_requests, 4);
+        assert_eq!(by_key["cross-hour"].summary.error_requests, 2);
+        assert_eq!(by_key["cross-hour"].summary.high_cache_requests, 5);
+        assert_eq!(by_key["cross-hour"].summary.p95_duration_ms, 60);
+        assert!((by_key["cross-hour"].summary.total_estimated_cost_usd - 0.142).abs() < 1e-12);
+        assert!(
+            (by_key["cross-hour"].summary.total_original_cost_usd - 0.146).abs() < 1e-12,
+            "the boundary detail segment must preserve the legacy hourly original-cost fallback"
+        );
+        assert_eq!(by_key["exact-hour"].summary.total_requests, 2);
+        assert_eq!(by_key["exact-hour"].summary.high_cache_requests, 2);
+        assert_eq!(by_key["half-hour"].summary.total_requests, 3);
+
+        let series = usage_store.dashboard_series(&specs).await.unwrap();
+        let series_by_key = series
+            .iter()
+            .map(|point| (point.key.as_str(), point))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(series_by_key["same-hour"].requests, 2);
+        assert_eq!(series_by_key["cross-hour"].requests, 6);
+        assert_eq!(series_by_key["exact-hour"].requests, 2);
+        assert_eq!(series_by_key["half-hour"].requests, 3);
+
+        let status = usage_store
+            .dashboard_breakdown(&specs, DashboardBreakdownColumn::Status)
+            .await
+            .unwrap();
+        let cross_status = &status["cross-hour"];
+        assert_eq!(
+            cross_status.iter().map(|item| item.requests).sum::<usize>(),
+            6
+        );
+        assert!(
+            cross_status
+                .iter()
+                .all(|item| (item.ratio - item.requests as f64 / 6.0).abs() < f64::EPSILON)
+        );
+
+        let sources = usage_store
+            .dashboard_breakdown(&specs, DashboardBreakdownColumn::UsageSource)
+            .await
+            .unwrap();
+        let cross_sources = &sources["cross-hour"];
+        assert_eq!(
+            cross_sources
+                .iter()
+                .map(|item| item.requests)
+                .sum::<usize>(),
+            6
+        );
+        assert_eq!(
+            cross_sources
+                .iter()
+                .find(|item| item.key == "upstream_metadata")
+                .map(|item| item.requests),
+            Some(2)
+        );
+
+        let billing = usage_store
+            .dashboard_external_pool_billing_by_pool(&specs)
+            .await
+            .unwrap();
+        let cross_billing = &billing["cross-hour"];
+        assert_eq!(cross_billing.len(), 1);
+        assert_eq!(cross_billing[0].pool_id, 42);
+        assert_eq!(cross_billing[0].requests, 2);
+        assert_eq!(cross_billing[0].priced_requests, 2);
+        assert_eq!(cross_billing[0].cost_floor_applied_requests, 2);
+        assert!((cross_billing[0].raw_cost_usd - 0.020).abs() < 1e-12);
+        assert!((cross_billing[0].shaped_cost_usd - 0.012).abs() < 1e-12);
+        assert!((cross_billing[0].uplifted_cost_usd - 0.016).abs() < 1e-12);
+        assert!((cross_billing[0].profit_usd + 0.004).abs() < 1e-12);
+        assert_eq!(
+            by_key["cross-hour"].summary.external_pool_billing.requests,
+            cross_billing[0].requests
+        );
+
+        let (_, half_hour_offset) = usage_dashboard_timezone(Some("UTC+05:30"));
+        let timezone_windows =
+            usage_dashboard_windows(fixed_utc("2026-07-16T00:20:00Z"), half_hour_offset);
+        assert_eq!(
+            timezone_windows
+                .iter()
+                .find(|window| window.key == "today")
+                .unwrap()
+                .from,
+            fixed_utc("2026-07-15T18:30:00Z")
+        );
+
+        let mut moved = usage_record("dashboard-first-boundary", 2_000);
+        moved.created_at = (base - chrono::Duration::hours(1)).to_rfc3339();
+        moved.duration_ms = 30;
+        usage_store.record(moved).await.unwrap();
+        let windows = usage_store.dashboard_windows(&specs, 1_000).await.unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .find(|window| window.key == "cross-hour")
+                .unwrap()
+                .summary
+                .total_requests,
+            5,
+            "same-ID replacement must subtract the old boundary population"
+        );
+
+        let cleanup_cutoff = base + chrono::Duration::hours(1) + chrono::Duration::minutes(1);
+        loop {
+            let result = usage_store
+                .soft_delete_cleanup_batch(cleanup_cutoff, 100)
+                .await
+                .unwrap();
+            if result.has_remaining == Some(false) || result.processed_rows == 0 {
+                break;
+            }
+        }
+        let windows = usage_store.dashboard_windows(&specs, 1_000).await.unwrap();
+        let by_key = windows
+            .iter()
+            .map(|window| (window.key.as_str(), window))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_key["cross-hour"].summary.total_requests, 2);
+        assert_eq!(by_key["exact-hour"].summary.total_requests, 1);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_dashboard_applies_legacy_cost_fallback_after_utc_hour_regrouping() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let base = fixed_utc("2026-07-15T10:00:00Z");
+
+        for (offset_minutes, estimated, original) in
+            [(10, 1.0_f64, 0.0_f64), (40, 2.0_f64, 4.0_f64)]
+        {
+            sqlx::query(
+                r#"
+                INSERT INTO usage_rollup_time_buckets (
+                    bucket_start, dimension, dimension_key, requests,
+                    total_estimated_cost_usd, total_original_cost_usd
+                )
+                VALUES ($1, 'global', 'all', 1, $2, $3)
+                "#,
+            )
+            .bind(base + chrono::Duration::minutes(offset_minutes))
+            .bind(estimated)
+            .bind(original)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        for (offset_minutes, raw, shaped, uplifted, profit, reported) in [
+            (10, 0.5_f64, 0.0_f64, 0.0_f64, 0.0_f64, 1.0_f64),
+            (40, 1.0_f64, 4.0_f64, 6.0_f64, 5.0_f64, 2.0_f64),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO usage_rollup_time_buckets (
+                    bucket_start, dimension, dimension_key, dimension_label,
+                    requests, external_pool_requests, external_pool_priced_requests,
+                    external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
+                    external_pool_uplifted_cost_usd, external_pool_profit_usd,
+                    external_pool_reported_cost_usd, external_pool_billable_cost_usd
+                )
+                VALUES ($1, 'external_pool', '42', 'legacy-pool',
+                        1, 1, 1, $2, $3, $4, $5, $6, $4)
+                "#,
+            )
+            .bind(base + chrono::Duration::minutes(offset_minutes))
+            .bind(raw)
+            .bind(shaped)
+            .bind(uplifted)
+            .bind(profit)
+            .bind(reported)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        let specs = [dashboard_test_window(
+            "fixed",
+            base,
+            base + chrono::Duration::hours(1),
+        )];
+        let windows = usage_store.dashboard_windows(&specs, 0).await.unwrap();
+        assert_eq!(windows[0].summary.total_requests, 2);
+        assert!((windows[0].summary.total_estimated_cost_usd - 3.0).abs() < 1e-12);
+        assert_eq!(
+            windows[0].summary.total_original_cost_usd, 4.0,
+            "fallback must be evaluated after old sub-hour buckets are regrouped"
+        );
+
+        let billing = usage_store
+            .dashboard_external_pool_billing_by_pool(&specs)
+            .await
+            .unwrap();
+        let pool = &billing["fixed"][0];
+        assert_eq!(pool.requests, 2);
+        assert_eq!(pool.raw_cost_usd, 1.5);
+        assert_eq!(pool.shaped_cost_usd, 4.0);
+        assert_eq!(pool.uplifted_cost_usd, 6.0);
+        assert_eq!(pool.profit_usd, 5.0);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_duration_write_and_dashboard_histogram_saturate_without_signed_wrap() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let base = fixed_utc("2026-07-15T10:00:00Z");
+        let mut record = usage_record("duration-u64-max", 0);
+        record.created_at = (base + chrono::Duration::minutes(1)).to_rfc3339();
+        record.duration_ms = u64::MAX;
+        record.response_latency_ms = Some(u64::MAX);
+        usage_store.record(record).await.unwrap();
+
+        let stored_duration: i64 =
+            sqlx::query_scalar("SELECT duration_ms FROM usage_records WHERE id = $1")
+                .bind("duration-u64-max")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored_duration, i64::MAX);
+
+        let specs = [dashboard_test_window(
+            "fixed",
+            base,
+            base + chrono::Duration::hours(1),
+        )];
+        let windows = usage_store.dashboard_windows(&specs, 0).await.unwrap();
+        assert_eq!(windows[0].summary.total_requests, 1);
+        assert_eq!(windows[0].summary.p95_duration_ms, i32::MAX as u64);
+        assert!(windows[0].summary.average_duration_ms > i64::MAX as f64 * 0.99);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_migration_compresses_second_rollup_buckets_to_hours() {
         let Some(config) = test_config() else {
             eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
             return;
         };
 
-        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
         clean(&store).await;
         sqlx::query(
             "DELETE FROM schema_migrations WHERE version = 'usage-rollup-hour-bucket-compression-v1'",
@@ -7981,10 +12255,27 @@ mod tests {
                 .unwrap();
         assert!(default_applied.is_none());
 
-        store
-            .compress_usage_rollups_to_hour_buckets()
+        let mut writer = store.pool().begin().await.unwrap();
+        acquire_usage_writer_commit_guard(&mut writer)
             .await
             .unwrap();
+        let compression_store = store.clone();
+        let compression = tokio::spawn(async move {
+            compression_store
+                .compress_usage_rollups_to_hour_buckets()
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !compression.is_finished(),
+            "rollup compression must wait for an active usage writer"
+        );
+        writer.commit().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), compression)
+            .await
+            .expect("rollup compression must recover after writer commit")
+            .expect("rollup compression task")
+            .expect("rollup compression result");
 
         let row = sqlx::query(
             r#"
@@ -8098,6 +12389,7 @@ mod tests {
             model_resolution_source: Some("exact".to_string()),
             model_resolution_note: None,
             conversation_id: Some(format!("external-session-{}", id)),
+            request_api_key_id: Some("request-key-external".to_string()),
             credential_id: None,
             credential_label: None,
             status: UsageRecordStatus::Success,
@@ -8351,6 +12643,7 @@ mod tests {
         usage_2.status = UsageRecordStatus::Error;
         usage_2.model = "claude-opus-4-5".to_string();
         usage_2.conversation_id = Some("session-b".to_string());
+        usage_2.request_api_key_id = Some("request-key-b".to_string());
         usage_2.estimated_cost_usd = 0.0;
         usage_2.kiro_metering_usage = 0.375;
         usage_2.pricing_available = false;
@@ -8388,6 +12681,15 @@ mod tests {
             .unwrap();
         assert_eq!(error_query.total, 1);
         assert_eq!(error_query.records[0].id, "usage-2");
+        let request_key_query = usage_store
+            .query(UsageRecordQuery {
+                request_api_key_id: Some("request-key-b".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(request_key_query.total, 1);
+        assert_eq!(request_key_query.records[0].id, "usage-2");
 
         let summary = usage_store.summary(15).await.unwrap();
         assert_eq!(summary.total_requests, 2);
@@ -8431,11 +12733,18 @@ mod tests {
         assert!((cost_summary.estimated_cost_usd - 0.001).abs() < f64::EPSILON);
         assert!((cost_summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
 
-        usage_store.clear().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let cleanup_cutoff = Utc::now();
+        let cleanup = usage_store
+            .soft_delete_cleanup_batch(cleanup_cutoff, 10)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.processed_rows, 2);
+        assert_eq!(cleanup.has_remaining, Some(false));
         let cleared_summary = usage_store.summary(15).await.unwrap();
-        assert_eq!(cleared_summary.total_requests, 2);
-        assert_eq!(cleared_summary.success_requests, 1);
-        assert_eq!(cleared_summary.error_requests, 1);
+        assert_eq!(cleared_summary.total_requests, 0);
+        assert_eq!(cleared_summary.success_requests, 0);
+        assert_eq!(cleared_summary.error_requests, 0);
         let cleared_page = usage_store
             .query(UsageRecordQuery {
                 ..Default::default()
@@ -8449,10 +12758,25 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(soft_deleted_count, 2);
-        usage_store
-            .record(usage_record("usage-1", 30))
+        let mut duplicate_after_cleanup = usage_record("usage-1", 30);
+        duplicate_after_cleanup.created_at =
+            (cleanup_cutoff + chrono::Duration::milliseconds(1)).to_rfc3339();
+        usage_store.record(duplicate_after_cleanup).await.unwrap();
+        let duplicate_page = usage_store
+            .query(UsageRecordQuery {
+                ..Default::default()
+            })
             .await
             .unwrap();
+        assert_eq!(
+            duplicate_page.total, 0,
+            "a tombstoned request id must not be revived"
+        );
+
+        let mut new_after_cleanup = usage_record("usage-3", 30);
+        new_after_cleanup.created_at =
+            (cleanup_cutoff + chrono::Duration::milliseconds(1)).to_rfc3339();
+        usage_store.record(new_after_cleanup).await.unwrap();
         let restored = usage_store
             .query(UsageRecordQuery {
                 ..Default::default()
@@ -8460,10 +12784,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restored.total, 1);
-        assert_eq!(restored.records[0].id, "usage-1");
+        assert_eq!(restored.records[0].id, "usage-3");
         let restored_summary = usage_store.summary(15).await.unwrap();
-        assert_eq!(restored_summary.total_requests, 2);
-        assert_eq!(restored_summary.high_cache_requests, 2);
+        assert_eq!(restored_summary.total_requests, 1);
+        assert_eq!(restored_summary.high_cache_requests, 1);
 
         let status = PricingStatus {
             available: true,
@@ -8508,6 +12832,26 @@ mod tests {
                 supported_input_types: vec!["TEXT".to_string(), "IMAGE".to_string()],
                 source: None,
             }],
+            reasoning_fields: BTreeMap::from([(
+                "claude-sonnet-4-9".to_string(),
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::Reasoning,
+                    efforts: vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                    default_effort: Some("high".to_string()),
+                },
+            )]),
+            reasoning_capability_cohort_keys: vec![KiroModelCapabilityCohortKey {
+                endpoint_family: "ide".to_string(),
+                auth_method: "social".to_string(),
+                provider: "builderid".to_string(),
+                effective_auth_region: "us-east-1".to_string(),
+                effective_api_region: "us-east-1".to_string(),
+                subscription_class: "kiro pro".to_string(),
+                supported_models: Vec::new(),
+            }],
+            reasoning_capability_cohort_complete: true,
+            reasoning_capability_contract_version: 1,
+            reasoning_invalid_models: vec!["claude-invalid-test".to_string()],
         };
         store
             .save_model_capabilities_status(&capabilities_status)
@@ -8524,7 +12868,24 @@ mod tests {
             capabilities_status.last_synced_at
         );
         assert_eq!(loaded_capabilities.model_count, 1);
+        assert_eq!(
+            loaded_capabilities.reasoning_capability_cohort_keys,
+            capabilities_status.reasoning_capability_cohort_keys
+        );
+        assert!(loaded_capabilities.reasoning_capability_cohort_complete);
+        assert_eq!(loaded_capabilities.reasoning_capability_contract_version, 1);
+        assert_eq!(
+            loaded_capabilities.reasoning_invalid_models,
+            capabilities_status.reasoning_invalid_models
+        );
         assert_eq!(loaded_capabilities.models[0].model, "claude-sonnet-4-9");
+        assert_eq!(
+            loaded_capabilities
+                .reasoning_fields
+                .get("claude-sonnet-4-9")
+                .map(|capability| capability.path),
+            Some(KiroReasoningFieldPath::Reasoning)
+        );
         assert_eq!(
             loaded_capabilities.models[0].max_input_tokens,
             Some(1_000_000)
@@ -9290,6 +13651,102 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored_access_token.as_deref(), Some("access-new"));
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_refresh_field_cas_fences_non_rotating_refresh_by_access_token_for_five_rounds()
+     {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        for round in 1..=5 {
+            clean(&store).await;
+            let old_access = format!("access-old-{round}");
+            let shared_refresh = format!("refresh-non-rotating-{round}");
+            let inserted = store
+                .insert_credential(&KiroCredentials {
+                    access_token: Some(old_access),
+                    refresh_token: Some(shared_refresh.clone()),
+                    expires_at: Some("2026-07-10T00:00:00Z".to_string()),
+                    auth_method: Some("external_idp".to_string()),
+                    email: Some("before@example.com".to_string()),
+                    priority: 2,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let credential_id = inserted.id.unwrap();
+            let expected = CredentialRefreshExpectedContext::from_credentials(&inserted).unwrap();
+
+            let mut metadata_update = inserted.clone();
+            metadata_update.email = Some(format!("admin-{round}@example.com"));
+            metadata_update.priority = 20 + round;
+            let CredentialUpsertCasOutcome::Applied(metadata_update) =
+                store.upsert_credential(&metadata_update).await.unwrap()
+            else {
+                panic!("round {round}: metadata update must apply");
+            };
+
+            let first_token = format!("access-winner-a-{round}");
+            let second_token = format!("access-winner-b-{round}");
+            let first_patch = CredentialRefreshFieldsPatch {
+                access_token: Some(first_token.clone()),
+                expires_at: Some("2026-07-11T00:00:00Z".to_string()),
+                ..Default::default()
+            };
+            let second_patch = CredentialRefreshFieldsPatch {
+                access_token: Some(second_token.clone()),
+                expires_at: Some("2026-07-11T00:00:01Z".to_string()),
+                ..Default::default()
+            };
+            let (first, second) = tokio::join!(
+                store.update_credential_refresh_fields_cas(credential_id, &expected, &first_patch,),
+                store
+                    .update_credential_refresh_fields_cas(credential_id, &expected, &second_patch,),
+            );
+            let mut applied = Vec::new();
+            let mut conflicts = Vec::new();
+            for outcome in [first.unwrap(), second.unwrap()] {
+                match outcome {
+                    CredentialRefreshFieldsCasOutcome::Applied(current) => applied.push(current),
+                    CredentialRefreshFieldsCasOutcome::Conflict {
+                        current: Some(current),
+                    } => conflicts.push(current),
+                    CredentialRefreshFieldsCasOutcome::Conflict { current: None } => {
+                        panic!("round {round}: credential disappeared")
+                    }
+                }
+            }
+            assert_eq!(applied.len(), 1, "round {round}");
+            assert_eq!(conflicts.len(), 1, "round {round}");
+            let winner = &applied[0];
+            assert!(
+                matches!(
+                    winner.access_token.as_deref(),
+                    Some(value) if value == first_token || value == second_token
+                ),
+                "round {round}"
+            );
+            assert_eq!(
+                conflicts[0].access_token, winner.access_token,
+                "round {round}: loser must observe the authoritative winner"
+            );
+            assert_eq!(
+                winner.refresh_token.as_deref(),
+                Some(shared_refresh.as_str())
+            );
+            assert_eq!(
+                winner.email, metadata_update.email,
+                "round {round}: unrelated Admin metadata must survive"
+            );
+            assert_eq!(winner.priority, metadata_update.priority, "round {round}");
+            assert_eq!(winner.storage_revision, 3, "round {round}");
+        }
 
         store.drop_test_schema().await.unwrap();
     }
@@ -11476,7 +15933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_rolls_up_external_pool_billing_for_large_samples_and_keeps_after_cleanup() {
+    async fn postgres_rolls_up_external_pool_billing_for_large_samples_and_removes_after_cleanup() {
         let Some(config) = test_config() else {
             eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
             return;
@@ -11540,7 +15997,20 @@ mod tests {
         assert!((today.summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
         assert!((today.summary.external_pool_billing.profit_usd - 1.0).abs() < 0.000001);
 
-        usage_store.clear().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let cleanup_cutoff = Utc::now();
+        let mut cleaned = 0;
+        loop {
+            let result = usage_store
+                .soft_delete_cleanup_batch(cleanup_cutoff, 250)
+                .await
+                .unwrap();
+            cleaned += result.processed_rows;
+            if result.has_remaining == Some(false) || result.processed_rows == 0 {
+                break;
+            }
+        }
+        assert_eq!(cleaned, 1000);
         let cleared_page = usage_store
             .query(UsageRecordQuery {
                 ..Default::default()
@@ -11549,9 +16019,17 @@ mod tests {
             .unwrap();
         assert_eq!(cleared_page.total, 0);
         let cleared_summary = usage_store.summary(1_000).await.unwrap();
-        assert_eq!(cleared_summary.external_pool_billing.requests, 1000);
-        assert!((cleared_summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
-        assert!((cleared_summary.external_pool_billing.profit_usd - 1.0).abs() < 0.000001);
+        assert_eq!(cleared_summary.external_pool_billing.requests, 0);
+        assert_eq!(cleared_summary.external_pool_billing.priced_requests, 0);
+        assert!(
+            cleared_summary
+                .external_pool_billing
+                .billable_cost_usd
+                .abs()
+                < 0.000001
+        );
+        assert!(cleared_summary.external_pool_billing.profit_usd.abs() < 0.000001);
+        assert!(cleared_summary.total_estimated_cost_usd.abs() < 0.000001);
 
         store.drop_test_schema().await.unwrap();
     }

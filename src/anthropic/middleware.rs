@@ -335,11 +335,14 @@ impl AppState {
 /// API Key 认证中间件
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match auth::extract_api_key(&request) {
-        Some(key) if state.request_api_keys.contains(&key) => {
+    let identity =
+        auth::extract_api_key(&request).and_then(|key| state.request_api_keys.authenticate(&key));
+    match identity {
+        Some(identity) => {
+            request.extensions_mut().insert(identity);
             let mut response = next.run(request).await;
             if !response.headers().contains_key("request-id") {
                 let request_id = envelope::request_id();
@@ -371,4 +374,130 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Router, routing::get};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    const JSON_413_BODY: &str = r#"{"source":"upstream","kind":"json-413"}"#;
+    const TEXT_413_BODY: &str = "upstream plaintext 413";
+    const UNTYPED_413_BODY: &str = "handler untyped 413";
+
+    fn test_state() -> AppState {
+        AppState::new(
+            Arc::new(RequestApiKeyStore::new(["middleware-413-key"])),
+            true,
+            Arc::new(UsageRecorder::new(10)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.98,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+    }
+
+    async fn json_413() -> Response {
+        Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("x-origin-marker", "json")
+            .body(Body::from(JSON_413_BODY))
+            .unwrap()
+    }
+
+    async fn plaintext_413() -> Response {
+        Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )
+            .header("x-origin-marker", "text")
+            .body(Body::from(TEXT_413_BODY))
+            .unwrap()
+    }
+
+    async fn untyped_413() -> Response {
+        Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("x-origin-marker", "untyped")
+            .body(Body::from(UNTYPED_413_BODY))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_preserves_downstream_413_bodies_for_five_rounds() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/json", get(json_413))
+            .route("/text", get(plaintext_413))
+            .route("/untyped", get(untyped_413))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        for _ in 0..5 {
+            for (path, expected_content_type, expected_marker, expected_body) in [
+                ("/json", Some("application/json"), "json", JSON_413_BODY),
+                (
+                    "/text",
+                    Some("text/plain; charset=utf-8"),
+                    "text",
+                    TEXT_413_BODY,
+                ),
+                ("/untyped", None, "untyped", UNTYPED_413_BODY),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header("x-api-key", "middleware-413-key")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(axum::http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    expected_content_type
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-origin-marker")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected_marker)
+                );
+                let request_id = response
+                    .headers()
+                    .get("request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .expect("middleware must add request-id")
+                    .to_string();
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("anthropic-request-id")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(request_id.as_str())
+                );
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), expected_body.as_bytes());
+            }
+        }
+    }
 }

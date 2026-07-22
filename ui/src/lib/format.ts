@@ -23,11 +23,12 @@ export function formatCompact(value: number | undefined | null): string {
 export function formatUsd(value: number | undefined | null): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '-'
   const num = value as number
+  const fractionDigits = Math.abs(num) >= 1 ? 2 : 6
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency: 'USD',
-    minimumFractionDigits: num >= 1 ? 2 : 6,
-    maximumFractionDigits: num >= 1 ? 2 : 6,
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
   }).format(num)
 }
 
@@ -49,6 +50,11 @@ export function formatUsdDetailed(value: number | undefined | null): string {
     minimumFractionDigits: 8,
     maximumFractionDigits: 8,
   }).format(value as number)
+}
+
+export function formatUsdCsv(value: number | undefined | null): string {
+  if (!Number.isFinite(value ?? Number.NaN)) return ''
+  return (value as number).toFixed(8)
 }
 
 export function formatQuota(value: number | undefined | null): string {

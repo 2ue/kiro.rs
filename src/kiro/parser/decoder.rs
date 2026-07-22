@@ -220,6 +220,25 @@ impl EventStreamDecoder {
         DecodeIter { decoder: self }
     }
 
+    /// Returns the number of bytes that have not formed a complete frame yet.
+    ///
+    /// Callers must check this when the transport reaches EOF. A non-zero value
+    /// means the response ended in the middle of an EventStream frame and must
+    /// not be treated as a successful completion.
+    pub fn pending_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Returns whether EOF can be accepted without discarding a partial frame.
+    pub fn is_clean_eof(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Returns the number of complete frames decoded from this response.
+    pub fn frames_decoded(&self) -> usize {
+        self.frames_decoded
+    }
+
     /// 尝试容错恢复
     ///
     /// 根据错误类型采用不同的恢复策略（参考 kiro-kt 的设计）：
@@ -332,5 +351,7 @@ mod tests {
 
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
+        assert_eq!(decoder.pending_bytes(), 10);
+        assert!(!decoder.is_clean_eof());
     }
 }

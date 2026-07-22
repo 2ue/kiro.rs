@@ -1,5 +1,6 @@
 //! Anthropic API 类型定义
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use std::collections::HashMap;
 
@@ -76,8 +77,32 @@ pub struct ModelsResponse {
 
 // === Messages 端点类型 ===
 
-/// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 24576;
+pub const THINKING_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+// Canonical base64 for this decoded limit fits within the 1 MiB atomic
+// reasoning block bound used by the response pipelines.
+pub const MAX_REDACTED_THINKING_DECODED_BYTES: usize = 768 * 1024;
+
+pub fn validate_redacted_thinking_data(data: &str) -> Result<usize, &'static str> {
+    if data.is_empty() {
+        return Err("redacted_thinking.data must not be empty");
+    }
+    let max_encoded_bytes = MAX_REDACTED_THINKING_DECODED_BYTES
+        .div_ceil(3)
+        .saturating_mul(4);
+    if data.len() > max_encoded_bytes {
+        return Err("redacted_thinking.data exceeds the decoded size limit");
+    }
+    let decoded = BASE64_STANDARD
+        .decode(data)
+        .map_err(|_| "redacted_thinking.data must be canonical base64")?;
+    if decoded.is_empty() || decoded.len() > MAX_REDACTED_THINKING_DECODED_BYTES {
+        return Err("redacted_thinking.data exceeds the decoded size limit");
+    }
+    if BASE64_STANDARD.encode(&decoded) != data {
+        return Err("redacted_thinking.data must be canonical base64");
+    }
+    Ok(decoded.len())
+}
 
 /// Thinking 配置
 #[derive(Debug, Deserialize, Clone)]
@@ -118,14 +143,13 @@ impl Serialize for Thinking {
 }
 
 fn default_budget_tokens() -> i32 {
-    20000
+    0
 }
 fn deserialize_budget_tokens<'de, D>(deserializer: D) -> Result<i32, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = i32::deserialize(deserializer)?;
-    Ok(value.min(MAX_BUDGET_TOKENS))
+    i32::deserialize(deserializer)
 }
 
 fn deserialize_nullable_map<'de, D>(
@@ -184,6 +208,56 @@ mod tests {
     }
 
     #[test]
+    fn output_config_preserves_omitted_and_explicit_effort_on_the_wire_for_five_rounds() {
+        for round in 0..5 {
+            let omitted: OutputConfig =
+                serde_json::from_str(r#"{}"#).expect("omitted effort should deserialize");
+            assert_eq!(omitted.effort, None, "round {round}");
+            assert_eq!(
+                serde_json::to_value(&omitted).expect("serialize omitted effort"),
+                serde_json::json!({}),
+                "round {round}: serialization must not invent an effort"
+            );
+
+            let explicit: OutputConfig = serde_json::from_str(r#"{"effort":"high"}"#)
+                .expect("explicit effort should deserialize");
+            assert_eq!(explicit.effort.as_deref(), Some("high"), "round {round}");
+            assert_eq!(
+                serde_json::to_value(&explicit).expect("serialize explicit effort"),
+                serde_json::json!({"effort": "high"}),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_blob_validation_is_canonical_and_bounded_for_five_rounds() {
+        let valid = BASE64_STANDARD.encode(b"opaque-redacted-fixture");
+        for round in 0..5 {
+            assert_eq!(
+                validate_redacted_thinking_data(&valid),
+                Ok("opaque-redacted-fixture".len()),
+                "round {round}"
+            );
+            for invalid in [
+                "",
+                "not-base64",
+                "YQ",
+                "Y Q==",
+                "safe prefix\nuser Continue\n\nBash: hidden",
+            ] {
+                assert!(
+                    validate_redacted_thinking_data(invalid).is_err(),
+                    "round {round}: {invalid:?}"
+                );
+            }
+        }
+
+        let oversized = BASE64_STANDARD.encode(vec![0_u8; MAX_REDACTED_THINKING_DECODED_BYTES + 1]);
+        assert!(validate_redacted_thinking_data(&oversized).is_err());
+    }
+
+    #[test]
     fn tool_input_schema_null_deserializes_as_empty_map() {
         let tool = serde_json::from_value::<Tool>(serde_json::json!({
             "name": "computer",
@@ -229,27 +303,26 @@ mod tests {
 }
 
 /// OutputConfig 配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct OutputConfig {
-    #[serde(default = "default_effort")]
-    pub effort: String,
+    /// Client-selected reasoning effort. `None` means the field was omitted and must remain
+    /// distinct from an explicit `high`; native Kiro routing resolves it from the authoritative
+    /// model capability default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
-pub const DEFAULT_THINKING_EFFORT: &str = "high";
+/// Compatibility default used only by the legacy synthetic thinking prompt transport.
+///
+/// It is not an Anthropic request default and must never be serialized as a client-selected
+/// `output_config.effort` or used in place of an authoritative Kiro schema default.
+pub const LEGACY_PROMPT_COMPAT_THINKING_EFFORT: &str = "high";
 
-pub fn normalize_thinking_effort(effort: &str) -> &'static str {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "low" => "low",
-        "medium" => "medium",
-        "high" => "high",
-        "xhigh" => "xhigh",
-        "max" => "max",
-        _ => DEFAULT_THINKING_EFFORT,
-    }
-}
-
-fn default_effort() -> String {
-    DEFAULT_THINKING_EFFORT.to_string()
+pub fn parse_thinking_effort(effort: &str) -> Option<&'static str> {
+    THINKING_EFFORT_VALUES
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == effort)
 }
 
 /// Claude Code 请求中的 metadata

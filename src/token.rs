@@ -10,7 +10,7 @@
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
 };
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout};
 use crate::model::config::TlsBackend;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::Value;
@@ -33,6 +33,7 @@ pub struct CountTokensConfig {
 
 /// 全局配置存储
 static COUNT_TOKENS_CONFIG: OnceLock<CountTokensConfig> = OnceLock::new();
+const COUNT_TOKENS_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 
 /// 初始化 count_tokens 配置
 ///
@@ -181,7 +182,10 @@ async fn call_remote_count_tokens(
         return Err(format!("API 返回错误状态: {}", response.status()).into());
     }
 
-    let result: CountTokensResponse = response.json().await?;
+    let body =
+        response_bytes_with_limit_and_body_timeout(response, 300, COUNT_TOKENS_RESPONSE_MAX_BYTES)
+            .await?;
+    let result: CountTokensResponse = serde_json::from_slice(&body)?;
     Ok(result.input_tokens as u64)
 }
 

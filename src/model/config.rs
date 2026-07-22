@@ -3,7 +3,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+use crate::anthropic::inference_attempt_budget::DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS;
+
+pub(crate) const DEFAULT_TOKEN_REFRESH_MAX_RPM: u32 = 60;
+pub(crate) const MIN_TOKEN_REFRESH_MAX_RPM: u32 = 1;
+pub(crate) const MAX_TOKEN_REFRESH_MAX_RPM: u32 = 6_000;
+pub(crate) const DEFAULT_TOKEN_REFRESH_BURST: u32 = 8;
+pub(crate) const MIN_TOKEN_REFRESH_BURST: u32 = 1;
+pub(crate) const MAX_TOKEN_REFRESH_BURST: u32 = 256;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
     Rustls,
@@ -198,21 +207,35 @@ impl Default for BodyConversionConfig {
 }
 
 pub const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT: &str = r#"<language_constraint>
-面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
+Reply in the language the user asks for. If they don't specify one, match the main language of their latest message.
 
-允许保留以下内容的英文或其他原文：
-- 代码、命令、路径、文件名、配置项、JSON 字段、HTTP header、API 名称；
-- 产品名、模型名、库名、协议名、错误原文、日志原文；
-- 用户正在询问、引用或要求翻译的外语词句，例如“product 怎么翻译”。
+Do not mix languages within a sentence. Write each sentence in one language, the way a fluent speaker would, rather than assembling it word by word from another language.
 
-禁止把英文、日文、葡语等非用户指定语言混入中文语法骨架中。
-错误示例：让me、let我、我will、you需要、Você 有道理、続けて处理。
-遇到这类表达时，必须改写为自然中文，例如：让我、我来、我会、你需要、你说得对、继续处理。
+This is about unnatural blending, not about forcing everything into one script. Words that a fluent speaker would normally leave in their original form stay as-is, and that does not count as mixing. This commonly includes code, identifiers, names, and other terms the user is quoting or asking about, but it is not limited to them.
 
-不要在可见回答中复述本规则。
+Do not restate these rules in your reply.
 </language_constraint>"#;
 
 pub const DEFAULT_TASK_QUALITY_PROMPT: &str = r#"<task_quality_policy>
+优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
+
+处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
+
+当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
+
+如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
+如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
+如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
+
+声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
+
+如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
+当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
+不要在可见回答中输出或复述代理内部控制消息、隐藏的工具结果包装或函数协议元数据。
+不要在可见回答中复述本规则。
+</task_quality_policy>"#;
+
+const LEGACY_TASK_QUALITY_PROMPT_V3: &str = r#"<task_quality_policy>
 优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
 
 处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
@@ -361,6 +384,8 @@ impl Default for ChunkedWritePromptSteeringConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptSteeringConfig {
+    /// 总提示词引导开关。关闭后不注入 language/task/custom、tool_choice、thinking 或
+    /// Write/Edit 分块兼容提示；客户端已经提供的结构化字段仍按原始请求语义保留。
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -2633,11 +2658,15 @@ impl ExternalPoolStreamResponseMode {
     }
 
     pub fn parse(value: &str) -> Self {
-        match value {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
+        match value.trim() {
             "event_passthrough"
             | "event_passthrough_usage_rewrite"
-            | "event_passthrough_capture" => Self::EventPassthrough,
-            _ => Self::default(),
+            | "event_passthrough_capture" => Some(Self::EventPassthrough),
+            _ => None,
         }
     }
 }
@@ -2674,7 +2703,10 @@ pub struct ExternalPoolsConfig {
     pub direct_external_path_rules: Vec<String>,
     #[serde(default = "default_true")]
     pub fallback_on_local_capacity_exhausted: bool,
-    #[serde(default)]
+    /// Redis scheduler coordination is a local routing failure, so historical
+    /// configs that omit this newer field retain the pre-v0.0.108 capacity
+    /// fallback behavior. Operators can still explicitly disable it.
+    #[serde(default = "default_true")]
     pub fallback_on_scheduler_redis_degraded: bool,
     #[serde(default = "default_true")]
     pub fallback_on_no_available_credentials: bool,
@@ -2765,7 +2797,7 @@ impl Default for ExternalPoolsConfig {
             direct_external_model_rules: Vec::new(),
             direct_external_path_rules: Vec::new(),
             fallback_on_local_capacity_exhausted: true,
-            fallback_on_scheduler_redis_degraded: false,
+            fallback_on_scheduler_redis_degraded: true,
             fallback_on_no_available_credentials: true,
             fallback_on_local_transient_exhausted: true,
             fallback_on_unsupported_model: false,
@@ -2819,6 +2851,19 @@ impl Default for ExternalPoolsConfig {
     }
 }
 
+impl ExternalPoolsConfig {
+    /// Return a finite external capacity wait even when a legacy or API client
+    /// submits zero. Keeping this bound at runtime prevents a stale config from
+    /// turning a local scheduler outage into an indefinitely queued request.
+    pub fn effective_dispatch_max_wait_secs(&self) -> u64 {
+        if self.external_pool_dispatch_max_wait_secs == 0 {
+            default_external_pool_dispatch_max_wait_secs()
+        } else {
+            self.external_pool_dispatch_max_wait_secs
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresConfig {
@@ -2854,12 +2899,188 @@ pub struct RedisConfig {
     pub key_prefix: String,
 }
 
+impl RedisConfig {
+    fn configured_url(&self) -> Option<&str> {
+        self.url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RedisAuthorityKey {
+    Network { host: String, port: u16 },
+    UnixSocket(String),
+}
+
+fn normalized_redis_authority_host(host: &str) -> String {
+    match host.trim_matches(['[', ']']).to_ascii_lowercase().as_str() {
+        "localhost" | "127.0.0.1" | "::1" => "<loopback>".to_string(),
+        host => host.to_string(),
+    }
+}
+
+fn redis_authority_key(value: &str) -> Result<RedisAuthorityKey, String> {
+    let parsed = url::Url::parse(value).map_err(|_| {
+        "Redis URL must be an absolute redis://, rediss://, or socket URL".to_string()
+    })?;
+    if !matches!(parsed.scheme(), "redis" | "rediss" | "redis+unix" | "unix") {
+        return Err(format!(
+            "Redis URL must use redis://, rediss://, redis+unix://, or unix:// (got {})",
+            parsed.scheme()
+        ));
+    }
+    if let Some(host) = parsed.host_str() {
+        let port = parsed.port().unwrap_or(6379);
+        return Ok(RedisAuthorityKey::Network {
+            host: normalized_redis_authority_host(host),
+            port,
+        });
+    }
+
+    let path = parsed.path().trim();
+    if path.is_empty() || path == "/" {
+        return Err("Redis URL does not identify a network authority or socket path".to_string());
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    Ok(RedisAuthorityKey::UnixSocket(canonical))
+}
+
 impl Default for RedisConfig {
     fn default() -> Self {
         Self {
             url: None,
             key_prefix: default_redis_key_prefix(),
         }
+    }
+}
+
+fn default_observability_redis_config() -> RedisConfig {
+    RedisConfig {
+        url: None,
+        key_prefix: default_observability_redis_key_prefix(),
+    }
+}
+
+const MAX_REQUEST_API_KEY_RPM: u32 = 1_000_000;
+const MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS: u32 = 10_000;
+const MAX_REQUEST_API_KEY_QUEUED_REQUESTS: u32 = 100_000;
+const MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS: u64 = 300_000;
+
+fn default_request_api_key_rpm() -> u32 {
+    300
+}
+
+fn default_request_api_key_max_concurrent_requests() -> u32 {
+    32
+}
+
+fn default_request_api_key_max_queued_requests() -> u32 {
+    64
+}
+
+fn default_request_api_key_queue_timeout_ms() -> u64 {
+    1_000
+}
+
+/// 每个实例、每个已认证下游请求 API Key 的本地 admission 配置。
+///
+/// 该状态不跨实例聚合；部署 N 个实例时，同一 Key 的总准入上限最多可近似放大为 N 倍。
+///
+/// 这是单实例硬限制，不经过 Redis。多实例部署的总上限等于各实例上限之和。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestAdmissionConfig {
+    /// 每个实例内，每个请求 API Key 每分钟最多进入多少个 `/messages` 请求。0 表示禁用 RPM 限制。
+    #[serde(default = "default_request_api_key_rpm")]
+    pub rpm: u32,
+    /// 每个实例内，每个请求 API Key 最多同时持有多少个 `/messages` response body。0 表示禁用并发限制。
+    #[serde(default = "default_request_api_key_max_concurrent_requests")]
+    pub max_concurrent_requests: u32,
+    /// 并发占满时，每个实例内每个请求 API Key 最多排队多少个请求。0 表示禁用排队并立即返回 429。
+    #[serde(default = "default_request_api_key_max_queued_requests")]
+    pub max_queued_requests: u32,
+    /// 排队最长等待毫秒数。0 表示禁用排队并立即返回 429。
+    #[serde(default = "default_request_api_key_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
+}
+
+impl Default for RequestAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            rpm: default_request_api_key_rpm(),
+            max_concurrent_requests: default_request_api_key_max_concurrent_requests(),
+            max_queued_requests: default_request_api_key_max_queued_requests(),
+            queue_timeout_ms: default_request_api_key_queue_timeout_ms(),
+        }
+    }
+}
+
+impl RequestAdmissionConfig {
+    #[cfg(test)]
+    pub fn disabled() -> Self {
+        Self {
+            rpm: 0,
+            max_concurrent_requests: 0,
+            max_queued_requests: 0,
+            queue_timeout_ms: 0,
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        let mut normalized = Self {
+            rpm: self.rpm.min(MAX_REQUEST_API_KEY_RPM),
+            max_concurrent_requests: self
+                .max_concurrent_requests
+                .min(MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS),
+            max_queued_requests: self
+                .max_queued_requests
+                .min(MAX_REQUEST_API_KEY_QUEUED_REQUESTS),
+            queue_timeout_ms: self
+                .queue_timeout_ms
+                .min(MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS),
+        };
+        if normalized.max_concurrent_requests == 0
+            || normalized.max_queued_requests == 0
+            || normalized.queue_timeout_ms == 0
+        {
+            normalized.max_queued_requests = 0;
+            normalized.queue_timeout_ms = 0;
+        }
+        normalized
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.rpm > MAX_REQUEST_API_KEY_RPM {
+            return Err(format!(
+                "requestAdmission.rpm 不能大于 {MAX_REQUEST_API_KEY_RPM}"
+            ));
+        }
+        if self.max_concurrent_requests > MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS {
+            return Err(format!(
+                "requestAdmission.maxConcurrentRequests 不能大于 {MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS}"
+            ));
+        }
+        if self.max_queued_requests > MAX_REQUEST_API_KEY_QUEUED_REQUESTS {
+            return Err(format!(
+                "requestAdmission.maxQueuedRequests 不能大于 {MAX_REQUEST_API_KEY_QUEUED_REQUESTS}"
+            ));
+        }
+        if self.queue_timeout_ms > MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS {
+            return Err(format!(
+                "requestAdmission.queueTimeoutMs 不能大于 {MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn enabled(self) -> bool {
+        // Queue settings only shape concurrency waiting; they are not an
+        // independent admission limit and are canonicalized away when unused.
+        self.rpm > 0 || self.max_concurrent_requests > 0
     }
 }
 
@@ -2881,6 +3102,15 @@ pub struct Config {
     /// Redis 配置。用于运行时缓存、锁和后续跨实例调度状态。
     #[serde(default)]
     pub redis: RedisConfig,
+
+    /// Optional Redis fault domain for usage summaries, statistics, Admin caches, and cleanup.
+    ///
+    /// This endpoint must not resolve to the same Redis network authority as `redis`: logical
+    /// databases and key prefixes still share one Redis event loop and do not isolate scheduler
+    /// latency from observability work. When omitted, observability remains PostgreSQL/local-only
+    /// and must never fall back to the business Redis.
+    #[serde(default = "default_observability_redis_config")]
+    pub observability_redis: RedisConfig,
 
     #[serde(default = "default_host")]
     pub host: String,
@@ -2954,6 +3184,13 @@ pub struct Config {
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
+
+    /// 已认证请求 API Key 的单实例 `/messages` admission 控制。
+    ///
+    /// 缺少整个字段的旧配置采用保守默认值；RPM 与并发均为 0 时关闭准入限制。
+    /// Queue 只修饰并发等待，无独立 enabled 语义，并在无效组合中规范化为 0/0。
+    #[serde(default)]
+    pub request_admission: RequestAdmissionConfig,
 
     /// 单凭据目标请求速率（RPM）。
     ///
@@ -3049,6 +3286,36 @@ pub struct Config {
     #[serde(default = "default_kiro_upstream_stream_retry_max_attempts")]
     pub kiro_upstream_stream_retry_max_attempts: u32,
 
+    /// 单个下游 Messages 请求允许发出的推理上游 HTTP 请求硬上限。
+    ///
+    /// 本地凭据重试、首输出前流重试、payload/cachePoint 重试、外部池 failover
+    /// 和本地 rescue 共享这一预算。该值与账号、外部池数量无关。
+    #[serde(default = "default_inference_upstream_max_attempts")]
+    pub inference_upstream_max_attempts: u32,
+
+    /// 单个下游请求允许发出的辅助上游 HTTP 请求硬上限。
+    ///
+    /// Token refresh 与 enterprise profile discovery 共享该 request-scoped 预算；
+    /// 不计入 inferenceUpstreamMaxAttempts，也不受 prompt steering 开关控制。
+    #[serde(default = "default_auxiliary_upstream_max_attempts")]
+    pub auxiliary_upstream_max_attempts: u32,
+
+    /// 单实例同时执行的辅助上游 HTTP 请求硬上限。
+    ///
+    /// 达到上限时 fail-fast，不进入无界等待队列。该边界独立于普通请求 admission。
+    #[serde(default = "default_auxiliary_upstream_max_concurrent_requests")]
+    pub auxiliary_upstream_max_concurrent_requests: u32,
+
+    /// Token refresh 辅助通道的 RPM 硬上限。
+    ///
+    /// 配置 Redis 时这是跨实例共享上限；未配置 Redis 时是单进程上限。
+    #[serde(default = "default_token_refresh_max_rpm")]
+    pub token_refresh_max_rpm: u32,
+
+    /// Token refresh 通道允许立即消耗的 token bucket 容量。
+    #[serde(default = "default_token_refresh_burst")]
+    pub token_refresh_burst: u32,
+
     /// 上游 eventstream idle timeout 发生在下游提交前时是否允许重试。
     #[serde(default = "default_true")]
     pub kiro_upstream_stream_retry_on_idle_timeout: bool,
@@ -3071,7 +3338,7 @@ pub struct Config {
 
     /// 单次上游调用最多尝试多少个凭据/重试轮次。
     ///
-    /// `0` 表示自动：按当前凭据数量放大，至少覆盖一轮可用凭据；
+    /// `0` 表示自动使用 3 次固定预算，不随凭据池规模增长；
     /// `>0` 表示显式上限，用于限制单次请求在大凭据池下的最长故障转移时间。
     #[serde(default)]
     pub credential_retry_max_attempts: u32,
@@ -3137,8 +3404,8 @@ pub struct Config {
     #[serde(default)]
     pub body_conversion: BodyConversionConfig,
 
-    /// 统一提示词引导配置。默认只对 Claude Code `/cc` 路径注入语言约束和任务质量引导；
-    /// tool_choice、thinking、分块写入等既有提示词开关也由该配置统一约束。
+    /// 提示词引导配置。默认只对 Claude Code `/cc` 路径注入语言约束和任务质量引导。
+    /// `enabled` 是所有代理新增提示内容的总开关；子开关只在总开关开启时进一步细分。
     #[serde(default)]
     pub prompt_steering: PromptSteeringConfig,
 
@@ -3161,7 +3428,9 @@ pub struct Config {
     #[serde(default = "default_payload_guard_mode")]
     pub payload_guard_mode: PayloadGuardMode,
 
-    /// Kiro 上游请求 JSON body 最大字节数。默认使用保守阈值 450 KiB；`0` 表示不限制大小但仍执行协议修复。
+    /// Kiro 上游请求 JSON body 的本地裁剪目标。默认使用保守阈值 450 KiB；
+    /// `0` 表示不按大小整形或裁剪，但仍执行协议修复。该字段不是入站
+    /// hard limit；无法安全裁剪时会记录 `still_oversized` 并由上游裁决。
     #[serde(default = "default_payload_guard_max_bytes")]
     pub payload_guard_max_bytes: usize,
 
@@ -3403,15 +3672,18 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 3;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 7;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
 }
 
 fn default_system_version() -> String {
-    const SYSTEM_VERSIONS: &[&str] = &["darwin#24.6.0", "win32#10.0.22631"];
-    SYSTEM_VERSIONS[fastrand::usize(..SYSTEM_VERSIONS.len())].to_string()
+    match std::env::consts::OS {
+        "macos" => "darwin#24.6.0".to_string(),
+        "windows" => "win32#10.0.22631".to_string(),
+        other => format!("{other}#unknown"),
+    }
 }
 
 fn default_node_version() -> String {
@@ -3492,6 +3764,26 @@ fn default_kiro_upstream_stream_retry_enabled() -> bool {
 
 fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
     2
+}
+
+pub(crate) fn default_inference_upstream_max_attempts() -> u32 {
+    4
+}
+
+pub(crate) fn default_auxiliary_upstream_max_attempts() -> u32 {
+    2
+}
+
+pub(crate) fn default_auxiliary_upstream_max_concurrent_requests() -> u32 {
+    DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
+}
+
+pub(crate) fn default_token_refresh_max_rpm() -> u32 {
+    DEFAULT_TOKEN_REFRESH_MAX_RPM
+}
+
+pub(crate) fn default_token_refresh_burst() -> u32 {
+    DEFAULT_TOKEN_REFRESH_BURST
 }
 
 fn default_credential_in_flight_lease_max_secs() -> u64 {
@@ -3943,6 +4235,10 @@ fn default_redis_key_prefix() -> String {
     "kiro_rs:local".to_string()
 }
 
+fn default_observability_redis_key_prefix() -> String {
+    "kiro_rs:observability".to_string()
+}
+
 fn default_reported_usage_normal_max_multiplier() -> f64 {
     1.1
 }
@@ -4058,6 +4354,7 @@ impl Default for Config {
             runtime_config_migration_version: CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
             postgres: PostgresConfig::default(),
             redis: RedisConfig::default(),
+            observability_redis: default_observability_redis_config(),
             host: default_host(),
             port: default_port(),
             region: default_region(),
@@ -4077,6 +4374,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            request_admission: RequestAdmissionConfig::default(),
             credential_rpm: None,
             credential_max_concurrent_requests: 0,
             credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
@@ -4100,6 +4398,12 @@ impl Default for Config {
             kiro_upstream_stream_retry_enabled: default_kiro_upstream_stream_retry_enabled(),
             kiro_upstream_stream_retry_max_attempts:
                 default_kiro_upstream_stream_retry_max_attempts(),
+            inference_upstream_max_attempts: default_inference_upstream_max_attempts(),
+            auxiliary_upstream_max_attempts: default_auxiliary_upstream_max_attempts(),
+            auxiliary_upstream_max_concurrent_requests:
+                default_auxiliary_upstream_max_concurrent_requests(),
+            token_refresh_max_rpm: default_token_refresh_max_rpm(),
+            token_refresh_burst: default_token_refresh_burst(),
             kiro_upstream_stream_retry_on_idle_timeout: true,
             kiro_upstream_stream_retry_on_read_error: true,
             kiro_upstream_stream_retry_on_status_error: true,
@@ -4250,6 +4554,33 @@ impl Config {
         )
     }
 
+    /// Validate that observability Redis cannot share the scheduler Redis fault domain.
+    ///
+    /// Redis logical databases and key prefixes still execute on the same single-threaded
+    /// server. Treating `redis.url` and `observabilityRedis.url` as different merely because
+    /// their paths or prefixes differ would therefore preserve the scheduler/usage race this
+    /// setting is intended to prevent.
+    pub fn validate_redis_fault_domains(&self) -> Result<(), String> {
+        let Some(observability_url) = self.observability_redis.configured_url() else {
+            return Ok(());
+        };
+        let Some(business_url) = self.redis.configured_url() else {
+            return Err(
+                "observabilityRedis.url requires redis.url so the two Redis fault domains can be validated"
+                    .to_string(),
+            );
+        };
+        let business = redis_authority_key(business_url)?;
+        let observability = redis_authority_key(observability_url)?;
+        if business == observability {
+            return Err(
+                "redis.url and observabilityRedis.url must use distinct Redis authorities; changing DB or keyPrefix is not sufficient"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// 按兼容格式写回客户端调用 API Key。
     ///
     /// 第一个 key 写入历史字段 `apiKey`，其余写入 `apiKeys`，这样旧版本/旧脚本仍能读取主 key。
@@ -4306,7 +4637,7 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 2 {
-            if self.prompt_steering.task_quality.prompt.trim() == LEGACY_TASK_QUALITY_PROMPT_V1 {
+            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V1 {
                 self.prompt_steering.task_quality.prompt =
                     DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
             }
@@ -4314,11 +4645,63 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 3 {
-            if self.prompt_steering.task_quality.prompt.trim() == LEGACY_TASK_QUALITY_PROMPT_V2 {
+            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V2 {
                 self.prompt_steering.task_quality.prompt =
                     DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
             }
             self.runtime_config_migration_version = 3;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 4 {
+            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V3 {
+                self.prompt_steering.task_quality.prompt =
+                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
+            }
+            self.runtime_config_migration_version = 4;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 5 {
+            // v0.0.108 split Redis coordinator failures out of the existing
+            // capacity fallback switch and materialized the new flag as false.
+            // Preserve the broad fallback intent of old external-pool configs
+            // once; an operator can explicitly disable it again after v5.
+            if self.external_pools.external_pools_enabled
+                && self.external_pools.fallback_on_local_capacity_exhausted
+                && self.external_pools.fallback_on_no_available_credentials
+                && self.external_pools.fallback_on_local_transient_exhausted
+                && !self.external_pools.fallback_on_scheduler_redis_degraded
+            {
+                self.external_pools.fallback_on_scheduler_redis_degraded = true;
+            }
+            // An unbounded external capacity wait can amplify a local Redis
+            // outage into permanently queued requests. Zero now migrates to
+            // the documented safe default; runtime also applies this bound.
+            if self.external_pools.external_pool_capacity_mode == ExternalPoolCapacityMode::Wait
+                && self.external_pools.external_pool_dispatch_max_wait_secs == 0
+            {
+                self.external_pools.external_pool_dispatch_max_wait_secs =
+                    default_external_pool_dispatch_max_wait_secs();
+            }
+            self.runtime_config_migration_version = 5;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 6 {
+            // Both frontend defaults could persist the v3 built-in fingerprint prompt after
+            // the original v4 migration had already completed. Replace only the exact built-in
+            // bytes so user-edited prompts remain authoritative.
+            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V3 {
+                self.prompt_steering.task_quality.prompt =
+                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
+            }
+            self.runtime_config_migration_version = 6;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 7 {
+            // Historical rollup compression is an offline maintenance operation. A live
+            // instance can block usage writers long enough for their bounded retries to drop
+            // records, so an old persisted startup toggle must not reactivate that path.
+            self.postgres.compress_usage_rollups_on_start = false;
+            self.runtime_config_migration_version = 7;
             changed = true;
         }
         changed
@@ -4328,19 +4711,34 @@ impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
-            // 配置文件不存在，返回默认配置
-            return Ok(Self {
-                config_path: Some(path.to_path_buf()),
-                ..Self::default()
-            });
+            // 配置文件不存在时仍应用部署环境变量；否则纯环境部署无法启用独立存储故障域。
+            let mut config = Self::default();
+            config.apply_env_overrides();
+            config
+                .validate_redis_fault_domains()
+                .map_err(anyhow::Error::msg)?;
+            config.config_path = Some(path.to_path_buf());
+            return Ok(config);
         }
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
         config.apply_env_overrides();
+        config
+            .validate_redis_fault_domains()
+            .map_err(anyhow::Error::msg)?;
         config.config_path = Some(path.to_path_buf());
         Ok(config)
+    }
+
+    /// Reapply process-owned storage endpoints after loading the persisted runtime config.
+    ///
+    /// Runtime configuration lives in PostgreSQL, while deployment URLs remain process
+    /// authority. Applying these overrides again prevents a stale persisted URL from selecting
+    /// the wrong observability fault domain on restart.
+    pub(crate) fn apply_storage_env_overrides(&mut self) {
+        self.apply_env_overrides();
     }
 
     fn apply_env_overrides(&mut self) {
@@ -4364,6 +4762,16 @@ impl Config {
                 self.redis.url = Some(url);
             }
         }
+        if let Ok(url) = std::env::var("KIRO_RS_OBSERVABILITY_REDIS_URL") {
+            if !url.trim().is_empty() {
+                self.observability_redis.url = Some(url);
+            }
+        }
+        if let Ok(prefix) = std::env::var("KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX") {
+            if !prefix.trim().is_empty() {
+                self.observability_redis.key_prefix = prefix;
+            }
+        }
     }
 
     /// 设置运行时配置路径元数据。数据库加载的配置没有对应文件路径。
@@ -4383,6 +4791,86 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observability_redis_is_optional_and_uses_its_own_prefix() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.observability_redis.url.is_none());
+        assert_eq!(
+            config.observability_redis.key_prefix,
+            "kiro_rs:observability"
+        );
+        assert!(config.validate_redis_fault_domains().is_ok());
+    }
+
+    #[test]
+    fn observability_redis_rejects_the_business_authority_even_with_another_db_or_prefix() {
+        for observability_url in [
+            "redis://cache.internal:6379/0",
+            "redis://cache.internal:6379/15",
+            "rediss://CACHE.INTERNAL:6379/7",
+        ] {
+            let mut config = Config::default();
+            config.redis.url = Some("redis://cache.internal:6379/0".to_string());
+            config.redis.key_prefix = "business".to_string();
+            config.observability_redis.url = Some(observability_url.to_string());
+            config.observability_redis.key_prefix = "observability".to_string();
+
+            let error = config.validate_redis_fault_domains().unwrap_err();
+            assert!(error.contains("distinct Redis authorities"), "{error}");
+        }
+
+        for observability_url in ["redis://localhost:6379/15", "redis://[::1]:6379/15"] {
+            let mut config = Config::default();
+            config.redis.url = Some("redis://127.0.0.1:6379/0".to_string());
+            config.observability_redis.url = Some(observability_url.to_string());
+            assert!(
+                config
+                    .validate_redis_fault_domains()
+                    .unwrap_err()
+                    .contains("distinct Redis authorities")
+            );
+        }
+    }
+
+    #[test]
+    fn observability_redis_accepts_a_distinct_network_authority() {
+        for observability_url in [
+            "redis://cache.internal:6380/0",
+            "redis://metrics.internal:6379/0",
+        ] {
+            let mut config = Config::default();
+            config.redis.url = Some("redis://cache.internal:6379/0".to_string());
+            config.observability_redis.url = Some(observability_url.to_string());
+            assert!(
+                config.validate_redis_fault_domains().is_ok(),
+                "{observability_url} should be a distinct authority"
+            );
+        }
+    }
+
+    #[test]
+    fn observability_redis_requires_a_valid_business_authority() {
+        let mut missing_business = Config::default();
+        missing_business.observability_redis.url =
+            Some("redis://metrics.internal:6379/0".to_string());
+        assert!(
+            missing_business
+                .validate_redis_fault_domains()
+                .unwrap_err()
+                .contains("requires redis.url")
+        );
+
+        let mut invalid_observability = Config::default();
+        invalid_observability.redis.url = Some("redis://cache.internal:6379/0".to_string());
+        invalid_observability.observability_redis.url = Some("not a URL".to_string());
+        assert!(
+            invalid_observability
+                .validate_redis_fault_domains()
+                .unwrap_err()
+                .contains("absolute")
+        );
+    }
 
     #[test]
     fn default_compat_profile_is_claude_code() {
@@ -4614,6 +5102,121 @@ mod tests {
     }
 
     #[test]
+    fn request_admission_has_conservative_defaults_and_explicit_zero_disables() {
+        let fresh = Config::default();
+        assert_eq!(fresh.request_admission, RequestAdmissionConfig::default());
+        assert_eq!(fresh.request_admission.rpm, 300);
+        assert_eq!(fresh.request_admission.max_concurrent_requests, 32);
+        assert_eq!(fresh.request_admission.max_queued_requests, 64);
+        assert_eq!(fresh.request_admission.queue_timeout_ms, 1_000);
+        let serialized = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(serialized["requestAdmission"]["rpm"], 300);
+        assert_eq!(
+            serde_json::from_value::<Config>(serialized)
+                .unwrap()
+                .request_admission,
+            fresh.request_admission
+        );
+
+        let legacy: Config = serde_json::from_str(r#"{"apiKey":"sk-legacy"}"#).unwrap();
+        assert_eq!(legacy.request_admission, RequestAdmissionConfig::default());
+
+        let partial: Config = serde_json::from_str(
+            r#"{
+                "apiKey":"sk-test",
+                "requestAdmission": { "rpm": 0 }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(partial.request_admission.rpm, 0);
+        assert_eq!(partial.request_admission.max_concurrent_requests, 32);
+        assert_eq!(partial.request_admission.max_queued_requests, 64);
+        assert_eq!(partial.request_admission.queue_timeout_ms, 1_000);
+        assert!(partial.request_admission.normalized().enabled());
+
+        let queue_only: Config = serde_json::from_str(
+            r#"{
+                "requestAdmission": {
+                    "rpm": 0,
+                    "maxConcurrentRequests": 0,
+                    "maxQueuedRequests": 64,
+                    "queueTimeoutMs": 1000
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(!queue_only.request_admission.enabled());
+        assert_eq!(
+            queue_only.request_admission.normalized(),
+            RequestAdmissionConfig::disabled()
+        );
+
+        let partial_queue_disabled: Config = serde_json::from_str(
+            r#"{
+                "requestAdmission": {
+                    "rpm": 300,
+                    "maxConcurrentRequests": 32,
+                    "maxQueuedRequests": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            partial_queue_disabled.request_admission.queue_timeout_ms,
+            1_000
+        );
+        assert_eq!(
+            partial_queue_disabled
+                .request_admission
+                .normalized()
+                .queue_timeout_ms,
+            0
+        );
+
+        let disabled: Config = serde_json::from_str(
+            r#"{
+                "apiKey":"sk-test",
+                "requestAdmission": {
+                    "rpm": 0,
+                    "maxConcurrentRequests": 0,
+                    "maxQueuedRequests": 0,
+                    "queueTimeoutMs": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.request_admission,
+            RequestAdmissionConfig::disabled()
+        );
+        assert!(!disabled.request_admission.enabled());
+        assert_eq!(
+            disabled.request_admission.normalized(),
+            disabled.request_admission
+        );
+    }
+
+    #[test]
+    fn request_admission_rejects_admin_values_above_hard_bounds() {
+        let mut config = RequestAdmissionConfig::default();
+        config.rpm = MAX_REQUEST_API_KEY_RPM + 1;
+        assert!(config.validate().is_err());
+        assert_eq!(config.normalized().rpm, MAX_REQUEST_API_KEY_RPM);
+
+        let mut config = RequestAdmissionConfig::default();
+        config.max_concurrent_requests = MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = RequestAdmissionConfig::default();
+        config.max_queued_requests = MAX_REQUEST_API_KEY_QUEUED_REQUESTS + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = RequestAdmissionConfig::default();
+        config.queue_timeout_ms = MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn request_api_keys_merge_and_deduplicate_primary_and_extra_keys() {
         let config: Config = serde_json::from_str(
             r#"{
@@ -4685,6 +5288,10 @@ mod tests {
         .unwrap();
 
         assert!(config.external_pools.external_pools_enabled);
+        assert!(
+            config.external_pools.fallback_on_scheduler_redis_degraded,
+            "a config that predates the dedicated flag must retain legacy capacity fallback"
+        );
         assert_eq!(
             config.external_pools.external_pool_capacity_mode,
             ExternalPoolCapacityMode::FailFast
@@ -4779,6 +5386,58 @@ mod tests {
                 .external_pool_model_unavailable_cooldown_secs,
             7
         );
+    }
+
+    #[test]
+    fn external_pool_scheduler_redis_fallback_preserves_explicit_boolean_values() {
+        let missing: Config = serde_json::from_value(serde_json::json!({
+            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
+            "externalPools": {
+                "externalPoolsEnabled": true
+            }
+        }))
+        .unwrap();
+        assert!(missing.external_pools.fallback_on_scheduler_redis_degraded);
+
+        let explicit_false: Config = serde_json::from_value(serde_json::json!({
+            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
+            "externalPools": {
+                "externalPoolsEnabled": true,
+                "fallbackOnSchedulerRedisDegraded": false
+            }
+        }))
+        .unwrap();
+        assert!(
+            !explicit_false
+                .external_pools
+                .fallback_on_scheduler_redis_degraded
+        );
+
+        let explicit_true: Config = serde_json::from_value(serde_json::json!({
+            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
+            "externalPools": {
+                "externalPoolsEnabled": true,
+                "fallbackOnSchedulerRedisDegraded": true
+            }
+        }))
+        .unwrap();
+        assert!(
+            explicit_true
+                .external_pools
+                .fallback_on_scheduler_redis_degraded
+        );
+    }
+
+    #[test]
+    fn external_pool_capacity_wait_is_always_bounded() {
+        let mut config = ExternalPoolsConfig::default();
+        assert_eq!(config.effective_dispatch_max_wait_secs(), 30);
+
+        config.external_pool_dispatch_max_wait_secs = 0;
+        assert_eq!(config.effective_dispatch_max_wait_secs(), 30);
+
+        config.external_pool_dispatch_max_wait_secs = 7;
+        assert_eq!(config.effective_dispatch_max_wait_secs(), 7);
     }
 
     #[test]
@@ -5903,6 +6562,24 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_migration_disables_online_usage_rollup_compression_once() {
+        let mut config = Config::default();
+        config.runtime_config_migration_version = 6;
+        config.postgres.compress_usage_rollups_on_start = true;
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        assert!(!config.postgres.compress_usage_rollups_on_start);
+
+        config.postgres.compress_usage_rollups_on_start = true;
+        assert!(!config.apply_runtime_config_migrations());
+        assert!(config.postgres.compress_usage_rollups_on_start);
+    }
+
+    #[test]
     fn runtime_config_migration_updates_legacy_default_task_quality_prompt_only() {
         let mut legacy_default = Config::default();
         legacy_default.runtime_config_migration_version = 1;
@@ -5947,6 +6624,235 @@ mod tests {
             custom.prompt_steering.task_quality.prompt,
             "custom task prompt"
         );
+
+        let mut legacy_default_v3 = Config::default();
+        legacy_default_v3.runtime_config_migration_version = 3;
+        legacy_default_v3.prompt_steering.task_quality.prompt =
+            LEGACY_TASK_QUALITY_PROMPT_V3.to_string();
+
+        assert!(legacy_default_v3.apply_runtime_config_migrations());
+        assert_eq!(
+            legacy_default_v3.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        assert_eq!(
+            legacy_default_v3.prompt_steering.task_quality.prompt,
+            DEFAULT_TASK_QUALITY_PROMPT.trim()
+        );
+
+        let mut customized_v3 = Config::default();
+        customized_v3.runtime_config_migration_version = 3;
+        customized_v3.prompt_steering.task_quality.prompt =
+            format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix");
+
+        assert!(customized_v3.apply_runtime_config_migrations());
+        assert_eq!(
+            customized_v3.prompt_steering.task_quality.prompt,
+            format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix")
+        );
+
+        let mut whitespace_customized_v3 = Config::default();
+        whitespace_customized_v3.runtime_config_migration_version = 3;
+        whitespace_customized_v3.prompt_steering.task_quality.prompt =
+            format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}");
+
+        assert!(whitespace_customized_v3.apply_runtime_config_migrations());
+        assert_eq!(
+            whitespace_customized_v3.prompt_steering.task_quality.prompt,
+            format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}")
+        );
+
+        let mut persisted_by_old_ui_at_v5 = Config::default();
+        persisted_by_old_ui_at_v5.runtime_config_migration_version = 5;
+        persisted_by_old_ui_at_v5
+            .prompt_steering
+            .task_quality
+            .prompt = LEGACY_TASK_QUALITY_PROMPT_V3.to_string();
+        assert!(persisted_by_old_ui_at_v5.apply_runtime_config_migrations());
+        assert_eq!(
+            persisted_by_old_ui_at_v5
+                .prompt_steering
+                .task_quality
+                .prompt,
+            DEFAULT_TASK_QUALITY_PROMPT.trim()
+        );
+
+        for custom_prompt in [
+            format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix"),
+            format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}"),
+            "operator custom task prompt".to_string(),
+        ] {
+            let mut customized_at_v5 = Config::default();
+            customized_at_v5.runtime_config_migration_version = 5;
+            customized_at_v5.prompt_steering.task_quality.prompt = custom_prompt.clone();
+            assert!(customized_at_v5.apply_runtime_config_migrations());
+            assert_eq!(
+                customized_at_v5.prompt_steering.task_quality.prompt, custom_prompt,
+                "v6 migration must preserve user-edited prompt bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_master_protocol_capabilities_and_prompt_subtoggles_round_trip_independently() {
+        for round in 0..5 {
+            for mask in 0_u8..128 {
+                let mut config = Config::default();
+                config.prompt_steering.enabled = mask & 1 != 0;
+                config.body_conversion.tool_choice_steering = mask & 2 != 0;
+                config.body_conversion.thinking_prompt_controls = mask & 4 != 0;
+                config.body_conversion.chunked_tool_policy = mask & 8 != 0;
+                config.prompt_steering.tool_choice.enabled = mask & 16 != 0;
+                config.prompt_steering.thinking.enabled = mask & 32 != 0;
+                config.prompt_steering.chunked_write.enabled = mask & 64 != 0;
+
+                let encoded = serde_json::to_string(&config)
+                    .unwrap_or_else(|error| panic!("round {round}, mask {mask}: {error}"));
+                let decoded: Config = serde_json::from_str(&encoded)
+                    .unwrap_or_else(|error| panic!("round {round}, mask {mask}: {error}"));
+
+                assert_eq!(
+                    decoded.prompt_steering.enabled, config.prompt_steering.enabled,
+                    "round {round}, mask {mask}: operator prompt master"
+                );
+                assert_eq!(
+                    decoded.body_conversion.tool_choice_steering,
+                    config.body_conversion.tool_choice_steering,
+                    "round {round}, mask {mask}: structured tool_choice capability"
+                );
+                assert_eq!(
+                    decoded.body_conversion.thinking_prompt_controls,
+                    config.body_conversion.thinking_prompt_controls,
+                    "round {round}, mask {mask}: thinking capability"
+                );
+                assert_eq!(
+                    decoded.body_conversion.chunked_tool_policy,
+                    config.body_conversion.chunked_tool_policy,
+                    "round {round}, mask {mask}: chunked capability"
+                );
+                assert_eq!(
+                    decoded.prompt_steering.tool_choice.enabled,
+                    config.prompt_steering.tool_choice.enabled,
+                    "round {round}, mask {mask}: tool_choice prompt"
+                );
+                assert_eq!(
+                    decoded.prompt_steering.thinking.enabled,
+                    config.prompt_steering.thinking.enabled,
+                    "round {round}, mask {mask}: thinking prompt"
+                );
+                assert_eq!(
+                    decoded.prompt_steering.chunked_write.enabled,
+                    config.prompt_steering.chunked_write.enabled,
+                    "round {round}, mask {mask}: chunked prompt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_config_migration_restores_legacy_scheduler_fallback_intent_once() {
+        for legacy_version in [0, 1, 2, 3, 4] {
+            let mut config = Config::default();
+            config.runtime_config_migration_version = legacy_version;
+            config.external_pools.external_pools_enabled = true;
+            config.external_pools.fallback_on_scheduler_redis_degraded = false;
+
+            assert!(config.apply_runtime_config_migrations());
+            assert_eq!(
+                config.runtime_config_migration_version,
+                CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+            );
+            assert!(
+                config.external_pools.fallback_on_scheduler_redis_degraded,
+                "legacy migration version {legacy_version} must retain broad local fallback intent"
+            );
+
+            config.external_pools.fallback_on_scheduler_redis_degraded = false;
+            assert!(!config.apply_runtime_config_migrations());
+            assert!(
+                !config.external_pools.fallback_on_scheduler_redis_degraded,
+                "an explicit post-migration opt-out must be stable"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_config_migration_does_not_enable_scheduler_fallback_without_legacy_intent() {
+        let mut external_disabled = Config::default();
+        external_disabled.runtime_config_migration_version = 4;
+        external_disabled.external_pools.external_pools_enabled = false;
+        external_disabled
+            .external_pools
+            .fallback_on_scheduler_redis_degraded = false;
+        assert!(external_disabled.apply_runtime_config_migrations());
+        assert!(
+            !external_disabled
+                .external_pools
+                .fallback_on_scheduler_redis_degraded
+        );
+
+        for disable_legacy_fallback in ["capacity", "no_credentials", "transient"] {
+            let mut config = Config::default();
+            config.runtime_config_migration_version = 4;
+            config.external_pools.external_pools_enabled = true;
+            config.external_pools.fallback_on_scheduler_redis_degraded = false;
+            match disable_legacy_fallback {
+                "capacity" => config.external_pools.fallback_on_local_capacity_exhausted = false,
+                "no_credentials" => {
+                    config.external_pools.fallback_on_no_available_credentials = false
+                }
+                "transient" => config.external_pools.fallback_on_local_transient_exhausted = false,
+                _ => unreachable!(),
+            }
+
+            assert!(config.apply_runtime_config_migrations());
+            assert!(
+                !config.external_pools.fallback_on_scheduler_redis_degraded,
+                "partial legacy fallback policy {disable_legacy_fallback} must not be broadened"
+            );
+        }
+
+        let mut explicit_true = Config::default();
+        explicit_true.runtime_config_migration_version = 4;
+        explicit_true.external_pools.external_pools_enabled = true;
+        assert!(explicit_true.apply_runtime_config_migrations());
+        assert!(
+            explicit_true
+                .external_pools
+                .fallback_on_scheduler_redis_degraded
+        );
+    }
+
+    #[test]
+    fn runtime_config_migration_bounds_legacy_unlimited_external_wait() {
+        let mut config = Config::default();
+        config.runtime_config_migration_version = 4;
+        config.external_pools.external_pool_capacity_mode = ExternalPoolCapacityMode::Wait;
+        config.external_pools.external_pool_dispatch_max_wait_secs = 0;
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(
+            config.external_pools.external_pool_dispatch_max_wait_secs,
+            default_external_pool_dispatch_max_wait_secs()
+        );
+        assert_eq!(config.external_pools.effective_dispatch_max_wait_secs(), 30);
+    }
+
+    #[test]
+    fn default_task_quality_prompt_does_not_prime_internal_transcript_fingerprints() {
+        for marker in [
+            "readHash",
+            "editHash",
+            "bashHash",
+            "Tool results:",
+            "Tool results provided",
+            "function_results",
+        ] {
+            assert!(
+                !DEFAULT_TASK_QUALITY_PROMPT.contains(marker),
+                "default prompt must not teach the model internal marker {marker}"
+            );
+        }
     }
 
     #[test]
@@ -6041,6 +6947,14 @@ mod tests {
         let config: Config = serde_json::from_str(&json).unwrap();
 
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
+        assert_eq!(config.inference_upstream_max_attempts, 4);
+        assert_eq!(config.auxiliary_upstream_max_attempts, 2);
+        assert_eq!(
+            config.auxiliary_upstream_max_concurrent_requests,
+            DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
+        );
+        assert_eq!(config.token_refresh_max_rpm, DEFAULT_TOKEN_REFRESH_MAX_RPM);
+        assert_eq!(config.token_refresh_burst, DEFAULT_TOKEN_REFRESH_BURST);
         assert!(!config.weighted_capacity.enabled);
         assert_eq!(config.weighted_capacity.max_units_per_request, 8);
         assert_eq!(config.weighted_capacity.units_for_tokens(1_000_000), 1);
@@ -6104,5 +7018,56 @@ mod tests {
                 .policy_for_path("/na/v1/messages")
                 .enabled
         );
+    }
+
+    #[test]
+    fn inference_attempt_budget_uses_compatible_default_and_preserves_explicit_value() {
+        let historical: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(historical.inference_upstream_max_attempts, 4);
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"inferenceUpstreamMaxAttempts":7}"#).unwrap();
+        assert_eq!(explicit.inference_upstream_max_attempts, 7);
+    }
+
+    #[test]
+    fn auxiliary_focus_limits_default_round_trip_and_ignore_prompt_steering_for_five_rounds() {
+        for _ in 0..5 {
+            let historical: Config = serde_json::from_str("{}").unwrap();
+            assert_eq!(historical.auxiliary_upstream_max_attempts, 2);
+            assert_eq!(
+                historical.auxiliary_upstream_max_concurrent_requests,
+                DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
+            );
+            assert_eq!(
+                historical.token_refresh_max_rpm,
+                DEFAULT_TOKEN_REFRESH_MAX_RPM
+            );
+            assert_eq!(historical.token_refresh_burst, DEFAULT_TOKEN_REFRESH_BURST);
+
+            let explicit: Config = serde_json::from_str(
+                r#"{
+                    "auxiliaryUpstreamMaxAttempts": 7,
+                    "auxiliaryUpstreamMaxConcurrentRequests": 31,
+                    "tokenRefreshMaxRpm": 120,
+                    "tokenRefreshBurst": 16,
+                    "promptSteering": {"enabled": false}
+                }"#,
+            )
+            .unwrap();
+            assert_eq!(explicit.auxiliary_upstream_max_attempts, 7);
+            assert_eq!(explicit.auxiliary_upstream_max_concurrent_requests, 31);
+            assert_eq!(explicit.token_refresh_max_rpm, 120);
+            assert_eq!(explicit.token_refresh_burst, 16);
+            assert!(!explicit.prompt_steering.enabled);
+
+            let round_trip: Config =
+                serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
+            assert_eq!(round_trip.auxiliary_upstream_max_attempts, 7);
+            assert_eq!(round_trip.auxiliary_upstream_max_concurrent_requests, 31);
+            assert_eq!(round_trip.token_refresh_max_rpm, 120);
+            assert_eq!(round_trip.token_refresh_burst, 16);
+            assert!(!round_trip.prompt_steering.enabled);
+        }
     }
 }

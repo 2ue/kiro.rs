@@ -13,6 +13,7 @@ import {
   getUsageRecordsPage,
   getUsageSummary,
   previewUsageCleanup,
+  resumeUsageCleanup,
   startUsageCleanup,
   syncModelPricing,
   syncModelCapabilities,
@@ -59,7 +60,8 @@ export function useClearUsageRecords() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: clearUsageRecords,
-    onSuccess: () => {
+    onSuccess: (status) => {
+      queryClient.setQueryData(['usage-cleanup-status'], status)
       queryClient.invalidateQueries({ queryKey: ['usage-records'] })
       queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
       queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
@@ -72,7 +74,7 @@ export function useUsageCleanupStatus() {
   return useQuery({
     queryKey: ['usage-cleanup-status'],
     queryFn: getUsageCleanupStatus,
-    refetchInterval: (query) => query.state.data?.status === 'running' ? 2000 : 10000,
+    refetchInterval: (query) => ['queued', 'running'].includes(query.state.data?.status || '') ? 2000 : 10000,
   })
 }
 
@@ -81,7 +83,7 @@ export function useRefreshUsageQueriesAfterCleanup(status?: UsageCleanupStatusRe
   const lastInvalidatedKey = useRef<string | null>(null)
 
   useEffect(() => {
-    if (!status?.jobId || status.status === 'idle' || status.status === 'running') return
+    if (!status?.jobId || ['idle', 'queued', 'running'].includes(status.status)) return
     if ((status.processedRows || 0) <= 0) return
 
     const invalidationKey = `${status.jobId}:${status.status}:${status.processedRows}`
@@ -119,6 +121,14 @@ export function useCancelUsageCleanup() {
   return useMutation({
     mutationFn: cancelUsageCleanup,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['usage-cleanup-status'] }),
+  })
+}
+
+export function useResumeUsageCleanup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (jobId: string) => resumeUsageCleanup(jobId),
+    onSuccess: (status) => queryClient.setQueryData(['usage-cleanup-status'], status),
   })
 }
 

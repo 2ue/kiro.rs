@@ -5,13 +5,28 @@
   "redis": {
     "url": "redis://127.0.0.1:26379/0"
   },
+  "observabilityRedis": {
+    "url": null,
+    "keyPrefix": "kiro_rs:observability"
+  },
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "apiKeys": [],
   "adminApiKey": "sk-admin-your-secret-key",
+  "requestAdmission": {
+    "rpm": 300,
+    "maxConcurrentRequests": 32,
+    "maxQueuedRequests": 64,
+    "queueTimeoutMs": 1000
+  },
   "kiroUpstreamResponseTimeoutSecs": 180,
   "credentialRetryMaxAttempts": 0,
+  "inferenceUpstreamMaxAttempts": 4,
+  "auxiliaryUpstreamMaxAttempts": 2,
+  "auxiliaryUpstreamMaxConcurrentRequests": 16,
+  "tokenRefreshMaxRpm": 60,
+  "tokenRefreshBurst": 8,
   "weightedCapacity": {
     "enabled": false,
     "maxUnitsPerRequest": 8,

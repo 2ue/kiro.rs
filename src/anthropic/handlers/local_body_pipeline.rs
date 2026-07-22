@@ -26,6 +26,7 @@ pub(super) fn prepare(
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
+    native_reasoning_capability: KiroReasoningCapabilityState,
 ) -> Result<PreparedLocalKiroBody, Response> {
     let plan = LocalKiroBodyPlan::compatible_with_config(
         runtime_config.initial_payload_guard_config(),
@@ -37,6 +38,7 @@ pub(super) fn prepare(
         runtime_config,
         cache_route,
         model_resolution,
+        native_reasoning_capability,
         plan,
     )
 }
@@ -47,11 +49,16 @@ pub(super) fn prepare_with_plan(
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
+    native_reasoning_capability: KiroReasoningCapabilityState,
     plan: LocalKiroBodyPlan,
 ) -> Result<PreparedLocalKiroBody, Response> {
     debug_assert_eq!(plan.profile.as_str(), "local_credential");
     debug_assert_eq!(plan.conversion, BodyStageState::Enabled);
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
+    let discovered_reasoning_capability = matches!(
+        &native_reasoning_capability,
+        KiroReasoningCapabilityState::Supported(_)
+    );
     let conversion_result = match convert_request_with_resolved_model(
         payload,
         ConverterOptions {
@@ -62,13 +69,13 @@ pub(super) fn prepare_with_plan(
             kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
             kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
             force_visible_thinking: should_force_visible_thinking(payload, runtime_config),
+            native_reasoning_capability,
             prompt_steering: runtime_config.prompt_steering.clone().normalized(),
         },
         model_resolution,
     ) {
         Ok(result) => result,
         Err(e) => {
-            tracing::warn!("请求转换失败: {}", e);
             return Err(conversion_error_response(&e));
         }
     };
@@ -139,6 +146,7 @@ pub(super) fn prepare_with_plan(
         request_body.len(),
         payload_guard_report.as_ref(),
         &conversion_result.warnings,
+        discovered_reasoning_capability,
     );
     if model_resolution.is_remapped() {
         tracing::info!(
@@ -167,15 +175,6 @@ pub(super) fn prepare_with_plan(
         current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
         "Kiro request prepared"
     );
-    tracing::trace!(
-        endpoint = endpoint,
-        requested_model = %payload.model,
-        upstream_model = ?model_resolution.upstream_model,
-        conversation_id = %conversation_id,
-        request_body = %request_body,
-        "Kiro request body"
-    );
-
     let input_tokens = if plan.token_counting.is_enabled() {
         token::count_all_tokens(
             &payload.model,
@@ -190,7 +189,16 @@ pub(super) fn prepare_with_plan(
         .thinking
         .as_ref()
         .map(|t| t.is_enabled())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || payload.output_config.is_some()
+        || kiro_request
+            .additional_model_request_fields
+            .as_ref()
+            .is_some_and(|fields| {
+                fields.output_config.is_some()
+                    || fields.reasoning.is_some()
+                    || fields.thinking.is_some()
+            });
     let warnings_header = if should_expose_proxy_warnings(runtime_config) {
         merge_warning_headers(
             conversion_result.warnings.encode_header(),

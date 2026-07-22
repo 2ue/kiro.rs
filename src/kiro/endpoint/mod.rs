@@ -17,6 +17,150 @@ pub mod ide;
 pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
 
+/// Resolve a local/staging upstream override while preserving endpoint-specific Host headers.
+///
+/// The override changes only the transport destination. Callers must still decorate the request
+/// with the logical AWS/Kiro host derived from the credential region.
+pub(crate) fn configured_upstream_url(config: &Config, suffix: &str) -> Option<String> {
+    let base = config
+        .kiro_upstream_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|base| !base.is_empty())?
+        .trim_end_matches('/');
+    let suffix = suffix.trim_start_matches('/');
+    Some(if suffix.is_empty() {
+        format!("{base}/")
+    } else {
+        format!("{base}/{suffix}")
+    })
+}
+
+/// Detect semantic ASCII object keys without parsing or allocating a JSON value tree.
+///
+/// Endpoint marker fast paths call this only when a raw `"key"` search missed and the
+/// body contains a backslash, so escaped keys such as `"orig\u0069n"` cannot bypass a
+/// required transform. Invalid JSON may produce a conservative marker hit, but the
+/// subsequent real parse still fails closed and returns the original body unchanged.
+pub(super) fn contains_json_object_key(body: &str, targets: &[&str]) -> bool {
+    debug_assert!(targets.iter().all(|target| target.is_ascii()));
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+
+        let string_start = index + 1;
+        let Some(string_end) = json_string_end(bytes, string_start) else {
+            return false;
+        };
+        index = string_end + 1;
+        let mut next = index;
+        while next < bytes.len() && matches!(bytes[next], b' ' | b'\t' | b'\r' | b'\n') {
+            next += 1;
+        }
+        if next < bytes.len()
+            && bytes[next] == b':'
+            && targets.iter().any(|target| {
+                json_string_matches_ascii(&bytes[string_start..string_end], target.as_bytes())
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(super) fn serialize_json_with_capacity(
+    value: &serde_json::Value,
+    minimum_capacity: usize,
+) -> Option<String> {
+    let mut output = Vec::with_capacity(minimum_capacity);
+    serde_json::to_writer(&mut output, value).ok()?;
+    String::from_utf8(output).ok()
+}
+
+fn json_string_end(bytes: &[u8], mut index: usize) -> Option<usize> {
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return Some(index),
+            b'\\' => {
+                index = index.checked_add(2)?;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn json_string_matches_ascii(encoded: &[u8], target: &[u8]) -> bool {
+    let mut input_index = 0;
+    let mut target_index = 0;
+    while input_index < encoded.len() {
+        let semantic = if encoded[input_index] == b'\\' {
+            input_index += 1;
+            let Some(escape) = encoded.get(input_index).copied() else {
+                return false;
+            };
+            input_index += 1;
+            match escape {
+                b'"' | b'\\' | b'/' => escape,
+                b'b' => 0x08,
+                b'f' => 0x0c,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'u' => {
+                    let Some(hex) = encoded.get(input_index..input_index.saturating_add(4)) else {
+                        return false;
+                    };
+                    let Some(codepoint) = decode_json_hex4(hex) else {
+                        return false;
+                    };
+                    input_index += 4;
+                    let Ok(ascii) = u8::try_from(codepoint) else {
+                        return false;
+                    };
+                    if !ascii.is_ascii() {
+                        return false;
+                    }
+                    ascii
+                }
+                _ => return false,
+            }
+        } else {
+            let byte = encoded[input_index];
+            input_index += 1;
+            if !byte.is_ascii() || byte < 0x20 {
+                return false;
+            }
+            byte
+        };
+        if target.get(target_index).copied() != Some(semantic) {
+            return false;
+        }
+        target_index += 1;
+    }
+    target_index == target.len()
+}
+
+fn decode_json_hex4(hex: &[u8]) -> Option<u16> {
+    if hex.len() != 4 {
+        return None;
+    }
+    hex.iter().try_fold(0_u16, |value, byte| {
+        let digit = match byte {
+            b'0'..=b'9' => u16::from(byte - b'0'),
+            b'a'..=b'f' => u16::from(byte - b'a' + 10),
+            b'A'..=b'F' => u16::from(byte - b'A' + 10),
+            _ => return None,
+        };
+        Some((value << 4) | digit)
+    })
+}
+
 /// Kiro 端点
 ///
 /// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
@@ -151,6 +295,44 @@ pub fn default_is_bearer_token_invalid(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escaped_json_object_key_detector_covers_valid_and_adversarial_shapes_for_five_rounds() {
+        let positives = [
+            r#"{"orig\u0069n":"AI_EDITOR"}"#,
+            r#"{"ORIGIN":"other","orig\u0069n":"AI_EDITOR"}"#,
+            r#"{"additionalModelRequest\u0046ields":{}}"#,
+            r#"{"additionalModelRequest\u0046ield\u0073":{}}"#,
+            r#"{"output\u005Fconfig":{}}"#,
+            r#"{"nested":{"orig\u0069n":"AI_EDITOR"}}"#,
+        ];
+        let negatives = [
+            r#"{"text":"orig\u0069n"}"#,
+            r#"{"text":"\"orig\u0069n\": value text"}"#,
+            r#"{"orig\\u0069n":"literal backslash"}"#,
+            r#"{"orig\u006An":"different key"}"#,
+            r#"{"orig\uD800n":"surrogate key"}"#,
+            r#"{"原点":"origin"}"#,
+            r#"{"unterminated":"value}"#,
+            r#"{"bad\u00xz":"value"}"#,
+        ];
+        let targets = ["origin", "additionalModelRequestFields", "output_config"];
+
+        for round in 0..5 {
+            for body in positives {
+                assert!(
+                    contains_json_object_key(body, &targets),
+                    "round {round}: expected semantic key in {body:?}"
+                );
+            }
+            for body in negatives {
+                assert!(
+                    !contains_json_object_key(body, &targets),
+                    "round {round}: must not treat value/text/invalid escape as a target key in {body:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_default_monthly_request_limit_detects_reason() {

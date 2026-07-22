@@ -2,7 +2,7 @@ use crate::anthropic::body_capabilities::{MultimodalStageKind, ParsedAnthropicBo
 
 use super::*;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub(super) struct ParsedAnthropicBodyReport {
     pub(super) thinking_model_name_override: bool,
     pub(super) thinking_trigger_mode: bool,
@@ -27,11 +27,21 @@ pub(super) async fn prepare(
 
     let mut report = ParsedAnthropicBodyReport::default();
 
-    if plan.thinking.model_name_override.is_enabled() {
-        override_thinking_from_model_name(payload);
+    let prompt_additions_enabled = runtime_config.prompt_steering.enabled;
+
+    if prompt_additions_enabled && plan.thinking.model_name_override.is_enabled() {
+        if let Err(message) = override_thinking_from_model_name(payload) {
+            let request_id = envelope::request_id();
+            return Err(envelope::error_response_with_id(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                &request_id,
+            ));
+        }
         report.thinking_model_name_override = true;
     }
-    if plan.thinking.trigger_mode.is_enabled() {
+    if prompt_additions_enabled && plan.thinking.trigger_mode.is_enabled() {
         apply_thinking_trigger_mode(payload, runtime_config);
         report.thinking_trigger_mode = true;
     }
@@ -53,10 +63,7 @@ pub(super) async fn prepare(
                 config,
             )
             .await
-            .map_err(|message| {
-                tracing::warn!("多模态 source 处理失败: {}", message);
-                envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
-            })?;
+            .map_err(multimodal_preprocessing_error_response)?;
             report.multimodal = Some(multimodal);
         }
     }

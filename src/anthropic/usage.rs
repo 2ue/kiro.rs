@@ -1,12 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc,
 };
-use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -31,12 +30,13 @@ const USAGE_REDIS_WRITER_BATCH_MAX: usize = 64;
 const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(10);
 const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
 const USAGE_WRITER_ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_millis(100);
-const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
 const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
 const ERROR_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 8192;
 const ERROR_DIAGNOSTIC_MAX_STRING_BYTES: usize = 512;
 const ERROR_DIAGNOSTIC_MAX_ARRAY_ITEMS: usize = 20;
+const REQUEST_REJECTION_ERROR_TYPE: &str = "request_rejection";
+const REQUEST_REJECTION_ERROR_MESSAGE: &str = "sampled request rejection";
 pub const REALTIME_USAGE_WINDOW_SECS: u32 = 60;
 pub const DEFAULT_USAGE_DASHBOARD_TIMEZONE: &str = "Asia/Shanghai";
 
@@ -196,9 +196,15 @@ impl UsageSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLatencyTrace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_attempts:
+        Option<crate::anthropic::inference_attempt_budget::InferenceAttemptSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_attempts:
+        Option<crate::anthropic::inference_attempt_budget::AuxiliaryAttemptSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_weight_units: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +246,8 @@ pub struct UsageLatencyTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_retry_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_retry_dispatch_failures: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_retry_reasons: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_dropped_ms: Option<u64>,
@@ -259,6 +267,12 @@ pub struct UsageLatencyTrace {
     pub suspected_tool_context_leak_end_turn: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_context_leak_markers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_tool_context_leak_blocks: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_tool_context_leak_chars: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_tool_context_leak_kinds: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_tail_intent_hint: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,13 +307,16 @@ pub enum StreamTerminalReason {
     UpstreamJsonException,
     UpstreamIdleTimeout,
     MalformedSse,
+    ProtocolContamination,
     ClientDropped,
     InternalError,
 }
 
 impl UsageLatencyTrace {
     pub fn is_empty(&self) -> bool {
-        self.payload_guard_ms.is_none()
+        self.inference_attempts.is_none()
+            && self.auxiliary_attempts.is_none()
+            && self.payload_guard_ms.is_none()
             && self.capacity_weight_units.is_none()
             && self.estimated_input_tokens.is_none()
             && self.upstream_header_ms.is_none()
@@ -325,6 +342,7 @@ impl UsageLatencyTrace {
                 .is_none()
             && self.upstream_event_types_before_first_output.is_none()
             && self.stream_retry_attempts.is_none()
+            && self.stream_retry_dispatch_failures.is_none()
             && self.stream_retry_reasons.is_none()
             && self.client_dropped_ms.is_none()
             && self.terminal_reason.is_none()
@@ -335,6 +353,9 @@ impl UsageLatencyTrace {
             && self.intent_preamble_risk.is_none()
             && self.suspected_tool_context_leak_end_turn.is_none()
             && self.tool_context_leak_markers.is_none()
+            && self.suppressed_tool_context_leak_blocks.is_none()
+            && self.suppressed_tool_context_leak_chars.is_none()
+            && self.suppressed_tool_context_leak_kinds.is_none()
             && self.assistant_tail_intent_hint.is_none()
             && self.end_turn_anomaly_reason.is_none()
             && self.end_turn_anomaly_risk.is_none()
@@ -380,6 +401,8 @@ pub struct UsageRecord {
     pub model_resolution_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_api_key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -468,6 +491,91 @@ pub struct UsageRecord {
     pub payload_guard_report: Option<serde_json::Value>,
 }
 
+/// Builds a bounded diagnostic record for a sampled gateway rejection.
+///
+/// `observed_count` is the monotonic count observed when the sample was selected. It is not the
+/// exact number of rejected requests represented by this record.
+pub(crate) fn sampled_request_rejection_usage_record(
+    request_id: &str,
+    endpoint: &str,
+    request_api_key_id: Option<String>,
+    reason: &'static str,
+    stage: &'static str,
+    status: http::StatusCode,
+    observed_count: u64,
+) -> UsageRecord {
+    UsageRecord {
+        id: request_id.to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        endpoint: endpoint.to_string(),
+        stream: false,
+        model: "unknown".to_string(),
+        requested_max_tokens: None,
+        downstream_stop_reason: None,
+        upstream_model: None,
+        external_outbound_model: None,
+        model_resolution_source: None,
+        model_resolution_note: None,
+        conversation_id: None,
+        request_api_key_id,
+        credential_id: None,
+        credential_label: None,
+        status: UsageRecordStatus::Error,
+        usage_source: UsageSource::None,
+        raw_usage: None,
+        total_input_tokens: 0,
+        compat_input_tokens: 0,
+        billable_input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+        estimated_cost_usd: 0.0,
+        original_cost_usd: 0.0,
+        kiro_metering_usage: 0.0,
+        pricing_available: false,
+        pricing_model: None,
+        duration_ms: 0,
+        first_token_latency_ms: None,
+        response_latency_ms: None,
+        latency_trace: None,
+        simulated: false,
+        sticky_bound: false,
+        fallback_from_sticky: false,
+        credential_attempts: Vec::new(),
+        route_kind: None,
+        route_subtype: None,
+        fallback_reason: None,
+        direct_policy_reason: None,
+        local_attempted: None,
+        local_preflight: None,
+        external_pool_id: None,
+        external_pool_name: None,
+        external_attempts: Vec::new(),
+        usage_projection_applied: None,
+        external_pool_billing: None,
+        error_type: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
+        error_message: Some(REQUEST_REJECTION_ERROR_MESSAGE.to_string()),
+        error_detail: None,
+        error_status_code: Some(status.as_u16()),
+        error_source: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
+        error_id: Some(request_id.to_string()),
+        error_metadata: Some(serde_json::json!({
+            "sampled": true,
+            "observedCount": observed_count,
+            "observedCountIsExact": false,
+            "stage": stage,
+            "reason": reason,
+        })),
+        public_error_status_code: None,
+        public_error_type: None,
+        public_error_message: None,
+        payload_breakdown: None,
+        payload_guard_report: None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UsageRecordQuery {
     pub limit: usize,
@@ -475,6 +583,7 @@ pub struct UsageRecordQuery {
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
+    pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
     pub route_kind: Option<UsageRouteKind>,
@@ -496,6 +605,7 @@ impl Default for UsageRecordQuery {
             q: None,
             endpoint: None,
             conversation_id: None,
+            request_api_key_id: None,
             credential_id: None,
             external_pool_id: None,
             route_kind: None,
@@ -1025,12 +1135,14 @@ pub struct UsageRecorderStats {
     pub backpressured_persist_records: u64,
     pub dropped_persist_records: u64,
     pub rejected_after_shutdown: u64,
+    pub rejected_by_cleanup_watermark: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageRecordOutcome {
     Accepted,
     RejectedShuttingDown,
+    RejectedCleanupWatermark,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1172,16 +1284,12 @@ pub struct UsageRecorder {
     accepting: Arc<AtomicBool>,
     shutdown: Arc<UsageShutdownState>,
     rejected_after_shutdown: AtomicU64,
+    cleanup_watermark_micros: AtomicI64,
+    rejected_by_cleanup_watermark: AtomicU64,
     backpressured_persist_records: AtomicU64,
     backpressured_redis_records: AtomicU64,
     dropped_persist_records: Arc<AtomicU64>,
     dropped_redis_records: Arc<AtomicU64>,
-}
-
-enum UsageDashboardCacheRead {
-    Hit(UsageDashboardResponse),
-    Empty,
-    Timeout,
 }
 
 fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
@@ -1421,6 +1529,8 @@ impl UsageRecorder {
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
             rejected_after_shutdown: AtomicU64::new(0),
+            cleanup_watermark_micros: AtomicI64::new(0),
+            rejected_by_cleanup_watermark: AtomicU64::new(0),
             backpressured_persist_records: AtomicU64::new(0),
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
@@ -1428,11 +1538,37 @@ impl UsageRecorder {
         }
     }
 
-    pub fn with_postgres_and_redis(
+    #[cfg(test)]
+    pub(crate) fn with_postgres_and_redis(
         limit: usize,
         postgres_store: Arc<PostgresUsageStore>,
         redis_store: Option<Arc<RedisStore>>,
     ) -> Self {
+        Self::with_postgres_internal(limit, postgres_store, redis_store)
+    }
+
+    fn with_postgres_internal(
+        limit: usize,
+        postgres_store: Arc<PostgresUsageStore>,
+        redis_store: Option<Arc<RedisStore>>,
+    ) -> Self {
+        let initial_cleanup_watermark = block_on_usage_store({
+            let postgres_store = postgres_store.clone();
+            async move { postgres_store.soft_delete_cleanup_watermark().await }
+        })
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "读取 usage cleanup watermark 失败，启动时暂按未清理处理");
+            None
+        });
+        if let (Some(redis), Some(cutoff)) =
+            (redis_store.as_ref(), initial_cleanup_watermark.as_ref())
+        {
+            redis.note_usage_cleanup_watermark(*cutoff);
+        }
+        let initial_cleanup_watermark_micros = initial_cleanup_watermark
+            .as_ref()
+            .map(|cutoff| cutoff.timestamp_micros().max(0))
+            .unwrap_or(0);
         let runtime_available = tokio::runtime::Handle::try_current().is_ok();
         let dropped_persist_records = Arc::new(AtomicU64::new(0));
         let dropped_redis_records = Arc::new(AtomicU64::new(0));
@@ -1481,11 +1617,40 @@ impl UsageRecorder {
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
             rejected_after_shutdown: AtomicU64::new(0),
+            cleanup_watermark_micros: AtomicI64::new(initial_cleanup_watermark_micros),
+            rejected_by_cleanup_watermark: AtomicU64::new(0),
             backpressured_persist_records: AtomicU64::new(0),
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records,
             dropped_redis_records,
         }
+    }
+
+    /// Build the production recorder with PostgreSQL as the only usage data store.
+    ///
+    /// Scheduler coordination may use Redis independently, but it must not be attached here:
+    /// per-request usage materialization can otherwise contend with scheduler operations on the
+    /// same single-threaded Redis server.
+    #[cfg(test)]
+    pub fn with_postgres(limit: usize, postgres_store: Arc<PostgresUsageStore>) -> Self {
+        Self::with_postgres_internal(limit, postgres_store, None)
+    }
+
+    /// Build the production recorder with an optional, independently configured observability
+    /// Redis. Startup validates that this store does not share the business Redis authority.
+    /// `None` deliberately means PostgreSQL-only; it must never be replaced by scheduler Redis.
+    pub fn with_postgres_and_observability_redis(
+        limit: usize,
+        postgres_store: Arc<PostgresUsageStore>,
+        observability_redis_store: Option<Arc<RedisStore>>,
+    ) -> Self {
+        assert!(
+            observability_redis_store
+                .as_ref()
+                .is_none_or(|redis| redis.is_observability()),
+            "UsageRecorder observability materialization must not use business Redis"
+        );
+        Self::with_postgres_internal(limit, postgres_store, observability_redis_store)
     }
 
     pub fn record(&self, record: UsageRecord) -> UsageRecordOutcome {
@@ -1498,6 +1663,27 @@ impl UsageRecorder {
             return UsageRecordOutcome::RejectedShuttingDown;
         }
         let record = normalize_error_diagnostics(record);
+        let record_micros = parse_record_time(&record.created_at)
+            .unwrap_or_else(Utc::now)
+            .timestamp_micros()
+            .max(0);
+        let cleanup_watermark = self.cleanup_watermark_micros.load(Ordering::Acquire);
+        if record_micros < cleanup_watermark {
+            let rejected = self
+                .rejected_by_cleanup_watermark
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if should_log_usage_counter(rejected) {
+                tracing::debug!(
+                    rejected,
+                    request_id = %record.id,
+                    record_micros,
+                    cleanup_watermark,
+                    "usage record 早于清理 watermark，拒绝晚到重放"
+                );
+            }
+            return UsageRecordOutcome::RejectedCleanupWatermark;
+        }
 
         self.record_usage_postgres(record.clone());
 
@@ -1657,6 +1843,9 @@ impl UsageRecorder {
                 .load(Ordering::Relaxed),
             dropped_persist_records: self.dropped_persist_records.load(Ordering::Relaxed),
             rejected_after_shutdown: self.rejected_after_shutdown.load(Ordering::Relaxed),
+            rejected_by_cleanup_watermark: self
+                .rejected_by_cleanup_watermark
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1883,36 +2072,6 @@ impl UsageRecorder {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            match block_on_usage_store(async move {
-                match tokio::time::timeout(
-                    StdDuration::from_secs(USAGE_DASHBOARD_REDIS_TIMEOUT_SECS),
-                    redis.usage_dashboard(timezone.as_deref(), high_cache_threshold),
-                )
-                .await
-                {
-                    Ok(Ok(Some(dashboard))) => Ok(UsageDashboardCacheRead::Hit(dashboard)),
-                    Ok(Ok(None)) => Ok(UsageDashboardCacheRead::Empty),
-                    Ok(Err(err)) => Err(err),
-                    Err(_) => Ok(UsageDashboardCacheRead::Timeout),
-                }
-            }) {
-                Ok(UsageDashboardCacheRead::Hit(dashboard)) => return Ok(dashboard),
-                Ok(UsageDashboardCacheRead::Empty) => {}
-                Ok(UsageDashboardCacheRead::Timeout) => {
-                    tracing::warn!(
-                        timeout_secs = USAGE_DASHBOARD_REDIS_TIMEOUT_SECS,
-                        "读取 Redis usage dashboard 超时，回退 PgSQL"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!("读取 Redis usage dashboard 失败，回退 PgSQL: {}", err)
-                }
-            }
-        }
-
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
@@ -1932,7 +2091,7 @@ impl UsageRecorder {
             });
         }
 
-        anyhow::bail!("usage dashboard 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard 的精确窗口与 P95 需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_windows(
@@ -1940,35 +2099,22 @@ impl UsageRecorder {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardWindowsResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            match block_on_usage_store(async move {
-                redis
-                    .usage_dashboard_windows_only(timezone.as_deref(), high_cache_threshold)
-                    .await
-            }) {
-                Ok(Some((generated_at, timezone, windows))) => {
-                    return Ok(UsageDashboardWindowsResponse {
-                        generated_at,
-                        timezone,
-                        windows,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    "读取 Redis usage dashboard windows 失败，回退 PgSQL: {}",
-                    err
-                ),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
             let (generated_at, timezone, windows) = block_on_usage_store(async move {
-                store
-                    .dashboard_windows_only(timezone.as_deref(), high_cache_threshold)
-                    .await
+                match tokio::time::timeout(
+                    StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
+                    store.dashboard_windows_only(timezone.as_deref(), high_cache_threshold),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => anyhow::bail!(
+                        "读取 PgSQL usage dashboard windows 超过 {} 秒，已中止本次后台查询",
+                        USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
+                    ),
+                }
             })?;
             return Ok(UsageDashboardWindowsResponse {
                 generated_at,
@@ -1976,7 +2122,7 @@ impl UsageRecorder {
                 windows,
             });
         }
-        anyhow::bail!("usage dashboard windows 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard windows 的精确人口与 P95 需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_series(
@@ -2045,46 +2191,24 @@ impl UsageRecorder {
         timezone: Option<&str>,
         window_key: &str,
     ) -> anyhow::Result<UsageDashboardBreakdownResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            let window_key = window_key.to_string();
-            match block_on_usage_store(async move {
-                redis
-                    .usage_dashboard_breakdown_only(timezone.as_deref(), &window_key)
-                    .await
-            }) {
-                Ok(Some((
-                    generated_at,
-                    timezone,
-                    window_key,
-                    status_breakdown,
-                    usage_source_breakdown,
-                ))) => {
-                    return Ok(UsageDashboardBreakdownResponse {
-                        generated_at,
-                        timezone,
-                        window_key,
-                        status_breakdown,
-                        usage_source_breakdown,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    "读取 Redis usage dashboard breakdown 失败，回退 PgSQL: {}",
-                    err
-                ),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
             let window_key = window_key.to_string();
             let (generated_at, timezone, window_key, status_breakdown, usage_source_breakdown) =
                 block_on_usage_store(async move {
-                    store
-                        .dashboard_breakdown_only(timezone.as_deref(), &window_key)
-                        .await
+                    match tokio::time::timeout(
+                        StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
+                        store.dashboard_breakdown_only(timezone.as_deref(), &window_key),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => anyhow::bail!(
+                            "读取 PgSQL usage dashboard breakdown 超过 {} 秒，已中止本次后台查询",
+                            USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
+                        ),
+                    }
                 })?;
             return Ok(UsageDashboardBreakdownResponse {
                 generated_at,
@@ -2094,7 +2218,7 @@ impl UsageRecorder {
                 usage_source_breakdown,
             });
         }
-        anyhow::bail!("usage dashboard breakdown 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard breakdown 的精确窗口人口需要 PgSQL 聚合存储")
     }
 
     pub fn dashboard_external_pool_billing(
@@ -2102,39 +2226,25 @@ impl UsageRecorder {
         timezone: Option<&str>,
         window_key: &str,
     ) -> anyhow::Result<UsageDashboardExternalPoolBillingResponse> {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let timezone = timezone.map(str::to_string);
-            let window_key = window_key.to_string();
-            match block_on_usage_store(async move {
-                redis
-                    .usage_dashboard_external_pool_billing_only(timezone.as_deref(), &window_key)
-                    .await
-            }) {
-                Ok(Some((generated_at, timezone, window_key, external_pool_billing_by_pool))) => {
-                    return Ok(UsageDashboardExternalPoolBillingResponse {
-                        generated_at,
-                        timezone,
-                        window_key,
-                        external_pool_billing_by_pool,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(
-                    "读取 Redis usage dashboard external pool billing 失败，回退 PgSQL: {}",
-                    err
-                ),
-            }
-        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
             let window_key = window_key.to_string();
             let (generated_at, timezone, window_key, external_pool_billing_by_pool) =
                 block_on_usage_store(async move {
-                    store
-                        .dashboard_external_pool_billing_only(timezone.as_deref(), &window_key)
-                        .await
+                    match tokio::time::timeout(
+                        StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
+                        store
+                            .dashboard_external_pool_billing_only(timezone.as_deref(), &window_key),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => anyhow::bail!(
+                            "读取 PgSQL usage dashboard external pool billing 超过 {} 秒，已中止本次后台查询",
+                            USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
+                        ),
+                    }
                 })?;
             return Ok(UsageDashboardExternalPoolBillingResponse {
                 generated_at,
@@ -2143,7 +2253,7 @@ impl UsageRecorder {
                 external_pool_billing_by_pool,
             });
         }
-        anyhow::bail!("usage dashboard external pool billing 需要 Redis 或 PgSQL 聚合存储")
+        anyhow::bail!("usage dashboard external pool billing 的精确窗口人口需要 PgSQL 聚合存储")
     }
 
     fn summary_memory(&self, high_cache_threshold: i32) -> UsageSummary {
@@ -2383,21 +2493,26 @@ impl UsageRecorder {
         summaries
     }
 
-    pub fn clear(&self) {
-        self.records.lock().clear();
+    pub async fn advance_cleanup_watermark(&self, cutoff: DateTime<Utc>) -> anyhow::Result<usize> {
+        let cutoff_micros = cutoff.timestamp_micros().max(0);
+        self.cleanup_watermark_micros
+            .fetch_max(cutoff_micros, Ordering::AcqRel);
+        let removed = self.remove_memory_records_before(cutoff);
         if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            if let Err(err) = block_on_usage_store(async move { redis.clear_usage_summary().await })
-            {
-                tracing::warn!("清空 Redis usage summary 失败: {}", err);
-            }
+            redis.advance_usage_cleanup_watermark(cutoff).await?;
         }
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            if let Err(err) = block_on_usage_store(async move { store.clear().await }) {
-                tracing::warn!("清空 PgSQL usage records 失败: {}", err);
-            }
-        }
+        Ok(removed)
+    }
+
+    pub fn remove_memory_records_before(&self, cutoff: DateTime<Utc>) -> usize {
+        let mut records = self.records.lock();
+        let before = records.len();
+        records.retain(|record| {
+            DateTime::parse_from_rfc3339(&record.created_at)
+                .map(|created_at| created_at.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(true)
+        });
+        before.saturating_sub(records.len())
     }
 }
 
@@ -2654,7 +2769,7 @@ async fn persist_usage_redis_batch_with_timeout(
     let results = run_bounded_usage_batch(
         records,
         StdDuration::from_secs(USAGE_REDIS_WRITER_TIMEOUT_SECS),
-        |record| async move { redis.record_usage_summary(&record).await },
+        |record| async move { redis.record_usage_summary(&record).await.map(|_| ()) },
     )
     .await;
     let mut failed = 0u64;
@@ -2692,27 +2807,36 @@ async fn persist_usage_redis_batch_with_timeout(
 
 async fn run_bounded_usage_batch<T, F, Fut>(
     items: Vec<T>,
-    operation_timeout: StdDuration,
+    batch_timeout: StdDuration,
     write: F,
 ) -> Vec<anyhow::Result<()>>
 where
     F: Fn(T) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    join_all(items.into_iter().map(|item| {
-        let write = write(item);
-        async move {
-            tokio::time::timeout(operation_timeout, write)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "usage batch operation timed out after {}ms",
-                        operation_timeout.as_millis()
-                    )
-                })?
+    let deadline = tokio::time::Instant::now() + batch_timeout;
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            results.push(Err(anyhow::anyhow!(
+                "usage batch timed out after {}ms before the operation started",
+                batch_timeout.as_millis()
+            )));
+            continue;
         }
-    }))
-    .await
+        let result = tokio::time::timeout(remaining, write(item))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "usage batch timed out after {}ms",
+                    batch_timeout.as_millis()
+                )
+            })
+            .and_then(|result| result);
+        results.push(result);
+    }
+    results
 }
 
 fn block_on_usage_store<T: Send>(
@@ -2804,6 +2928,11 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
     }
     if let Some(conversation_id) = &query.conversation_id {
         if record.conversation_id.as_ref() != Some(conversation_id) {
+            return false;
+        }
+    }
+    if let Some(request_api_key_id) = &query.request_api_key_id {
+        if record.request_api_key_id.as_ref() != Some(request_api_key_id) {
             return false;
         }
     }
@@ -2902,6 +3031,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.model_resolution_source.as_deref(),
         record.model_resolution_note.as_deref(),
         record.conversation_id.as_deref(),
+        record.request_api_key_id.as_deref(),
         external_pool_id.as_deref(),
         record.external_pool_name.as_deref(),
         Some(original_cost.as_str()),
@@ -2986,6 +3116,7 @@ mod tests {
             model_resolution_source: None,
             model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
+            request_api_key_id: Some("request-key-a".to_string()),
             credential_id: Some(1),
             credential_label: Some("test@example.com".to_string()),
             status: UsageRecordStatus::Success,
@@ -3042,6 +3173,120 @@ mod tests {
         record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
     }
 
+    #[test]
+    fn sampled_request_rejection_factory_preserves_bounded_contract_for_five_rounds() {
+        const CASES: [(&str, &str, http::StatusCode, u64); 5] = [
+            (
+                "rpm_limit",
+                "request_admission",
+                http::StatusCode::TOO_MANY_REQUESTS,
+                1,
+            ),
+            (
+                "concurrency_full",
+                "request_admission",
+                http::StatusCode::TOO_MANY_REQUESTS,
+                2,
+            ),
+            (
+                "body_too_large",
+                "request_body",
+                http::StatusCode::PAYLOAD_TOO_LARGE,
+                4,
+            ),
+            (
+                "provider_unavailable",
+                "provider_preflight",
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                8,
+            ),
+            (
+                "payload_guard_rejected",
+                "payload_guard",
+                http::StatusCode::BAD_REQUEST,
+                16,
+            ),
+        ];
+
+        for (round, (reason, stage, status, observed_count)) in CASES.into_iter().enumerate() {
+            let request_id = format!("sampled-rejection-{round}");
+            let request_api_key_id = format!("request-key-digest-{round}");
+            let usage = sampled_request_rejection_usage_record(
+                &request_id,
+                "/v1/messages",
+                Some(request_api_key_id.clone()),
+                reason,
+                stage,
+                status,
+                observed_count,
+            );
+
+            assert_eq!(usage.id, request_id, "round {round}");
+            assert!(
+                DateTime::parse_from_rfc3339(&usage.created_at).is_ok(),
+                "round {round}"
+            );
+            assert_eq!(usage.endpoint, "/v1/messages", "round {round}");
+            assert!(!usage.stream, "round {round}");
+            assert_eq!(usage.model, "unknown", "round {round}");
+            assert_eq!(
+                usage.request_api_key_id.as_deref(),
+                Some(request_api_key_id.as_str()),
+                "round {round}"
+            );
+            assert_eq!(usage.status, UsageRecordStatus::Error, "round {round}");
+            assert_eq!(usage.usage_source, UsageSource::None, "round {round}");
+            assert_eq!(usage.total_input_tokens, 0, "round {round}");
+            assert_eq!(usage.compat_input_tokens, 0, "round {round}");
+            assert_eq!(usage.billable_input_tokens, 0, "round {round}");
+            assert_eq!(usage.output_tokens, 0, "round {round}");
+            assert_eq!(usage.cache_read_input_tokens, 0, "round {round}");
+            assert_eq!(usage.cache_creation_input_tokens, 0, "round {round}");
+            assert_eq!(usage.cache_creation_5m_input_tokens, 0, "round {round}");
+            assert_eq!(usage.cache_creation_1h_input_tokens, 0, "round {round}");
+            assert_eq!(usage.estimated_cost_usd, 0.0, "round {round}");
+            assert_eq!(usage.original_cost_usd, 0.0, "round {round}");
+            assert_eq!(usage.kiro_metering_usage, 0.0, "round {round}");
+            assert!(!usage.pricing_available, "round {round}");
+            assert_eq!(
+                usage.error_type.as_deref(),
+                Some(REQUEST_REJECTION_ERROR_TYPE),
+                "round {round}"
+            );
+            assert_eq!(
+                usage.error_source.as_deref(),
+                Some(REQUEST_REJECTION_ERROR_TYPE),
+                "round {round}"
+            );
+            assert_eq!(
+                usage.error_message.as_deref(),
+                Some(REQUEST_REJECTION_ERROR_MESSAGE),
+                "round {round}"
+            );
+            assert!(usage.error_detail.is_none(), "round {round}");
+            assert_eq!(
+                usage.error_status_code,
+                Some(status.as_u16()),
+                "round {round}"
+            );
+            assert_eq!(usage.error_id.as_deref(), Some(request_id.as_str()));
+            assert_eq!(
+                usage.error_metadata,
+                Some(json!({
+                    "sampled": true,
+                    "observedCount": observed_count,
+                    "observedCountIsExact": false,
+                    "stage": stage,
+                    "reason": reason,
+                })),
+                "round {round}"
+            );
+            assert!(usage.public_error_message.is_none(), "round {round}");
+            assert!(usage.payload_breakdown.is_none(), "round {round}");
+            assert!(usage.payload_guard_report.is_none(), "round {round}");
+        }
+    }
+
     fn recorder_with_test_writer(
         capacity: usize,
         pause_first: bool,
@@ -3083,6 +3328,8 @@ mod tests {
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
             rejected_after_shutdown: AtomicU64::new(0),
+            cleanup_watermark_micros: AtomicI64::new(0),
+            rejected_by_cleanup_watermark: AtomicU64::new(0),
             backpressured_persist_records: AtomicU64::new(0),
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
@@ -3100,6 +3347,250 @@ mod tests {
         .unwrap();
 
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn in_memory_usage_cleanup_watermark_rejects_replay_for_three_rounds() {
+        let recorder = UsageRecorder::new(32);
+
+        for round in 0..3 {
+            let mut old = record(
+                &format!("memory-cleanup-old-round-{round}"),
+                0,
+                UsageSource::None,
+            );
+            old.created_at = Utc::now().to_rfc3339();
+            assert_eq!(recorder.record(old.clone()), UsageRecordOutcome::Accepted);
+            tokio::time::sleep(StdDuration::from_millis(2)).await;
+            let cutoff = Utc::now();
+            assert_eq!(
+                recorder.advance_cleanup_watermark(cutoff).await.unwrap(),
+                1,
+                "round {round}: the pre-cutoff memory record is removed"
+            );
+            assert_eq!(
+                recorder.record(old),
+                UsageRecordOutcome::RejectedCleanupWatermark,
+                "round {round}: late memory replay is rejected"
+            );
+
+            let mut new = record(
+                &format!("memory-cleanup-new-round-{round}"),
+                0,
+                UsageSource::None,
+            );
+            new.created_at = Utc::now().to_rfc3339();
+            assert_eq!(recorder.record(new), UsageRecordOutcome::Accepted);
+            assert_eq!(recorder.remove_memory_records_before(Utc::now()), 1);
+        }
+
+        assert_eq!(recorder.writer_stats().rejected_by_cleanup_watermark, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds()
+    {
+        let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+        else {
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let mut config = crate::model::config::Config::default();
+        config.postgres.url = Some(postgres_url);
+        config.postgres.max_connections = 2;
+        config.redis.url = Some(redis_url);
+        config.redis.key_prefix = format!("kiro_rs:test:usage-cleanup:{}", uuid::Uuid::new_v4());
+        let postgres = Arc::new(
+            crate::storage::postgres::PostgresStore::connect_test(&config)
+                .await
+                .unwrap(),
+        );
+        let postgres_usage = Arc::new(PostgresUsageStore::new(postgres.clone()));
+        let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
+        redis.clear_usage_summary().await.unwrap();
+
+        for round in 0..3 {
+            let recorder = Arc::new(UsageRecorder::with_postgres_and_redis(
+                64,
+                postgres_usage.clone(),
+                Some(redis.clone()),
+            ));
+            let mut old = record(
+                &format!("persistent-cleanup-old-round-{round}"),
+                600,
+                UsageSource::UpstreamMetadata,
+            );
+            old.created_at = Utc::now().to_rfc3339();
+            assert_eq!(recorder.record(old.clone()), UsageRecordOutcome::Accepted);
+            tokio::time::sleep(StdDuration::from_millis(2)).await;
+            let cutoff = Utc::now();
+            tokio::time::sleep(StdDuration::from_millis(2)).await;
+            let mut new = record(
+                &format!("persistent-cleanup-new-round-{round}"),
+                600,
+                UsageSource::UpstreamMetadata,
+            );
+            new.created_at = Utc::now().to_rfc3339();
+            assert_eq!(recorder.record(new), UsageRecordOutcome::Accepted);
+            let drained = recorder.drain(StdDuration::from_secs(2)).await;
+            assert!(drained.postgres.drained, "round {round}: postgres writer");
+            assert!(drained.redis.drained, "round {round}: redis writer");
+
+            let effective_cutoff = postgres_usage
+                .advance_soft_delete_cleanup_watermark(cutoff)
+                .await
+                .unwrap();
+            recorder
+                .advance_cleanup_watermark(effective_cutoff)
+                .await
+                .unwrap();
+            redis.invalidate_usage_derived_cache().await.unwrap();
+            loop {
+                let batch = postgres_usage
+                    .soft_delete_cleanup_batch(cutoff, 10)
+                    .await
+                    .unwrap();
+                if batch.has_remaining == Some(false) {
+                    break;
+                }
+            }
+            redis.clear_usage_summary().await.unwrap();
+
+            assert!(
+                redis.usage_summary(500).await.unwrap().is_none(),
+                "round {round}: invalidated Redis summary must force PgSQL fallback"
+            );
+            let summary = recorder.summary(500);
+            assert_eq!(summary.total_requests, 1, "round {round}");
+            assert!((summary.total_estimated_cost_usd - 0.001).abs() < 1e-12);
+            let dashboard = recorder.dashboard(Some("UTC"), 500).unwrap();
+            let last24h = dashboard
+                .windows
+                .iter()
+                .find(|window| window.key == "last24h")
+                .unwrap();
+            assert_eq!(last24h.summary.total_requests, 1, "round {round}");
+            assert!((last24h.summary.total_estimated_cost_usd - 0.001).abs() < 1e-12);
+            let costs = recorder.credential_cost_summary();
+            let credential = costs.get(&1).expect("remaining credential cost");
+            assert!((credential.estimated_cost_usd - 0.001).abs() < 1e-12);
+
+            let mut summary_latencies = Vec::with_capacity(20);
+            for _ in 0..20 {
+                let started = Instant::now();
+                assert_eq!(recorder.summary(500).total_requests, 1);
+                summary_latencies.push(started.elapsed().as_micros() as u64);
+            }
+            summary_latencies.sort_unstable();
+            let summary_p95 = summary_latencies[18];
+            let mut dashboard_latencies = Vec::with_capacity(10);
+            for _ in 0..10 {
+                let started = Instant::now();
+                recorder.dashboard(Some("UTC"), 500).unwrap();
+                dashboard_latencies.push(started.elapsed().as_micros() as u64);
+            }
+            dashboard_latencies.sort_unstable();
+            let dashboard_p95 = dashboard_latencies[8];
+            eprintln!(
+                "usage cleanup fallback round {round}: summary_p95_us={summary_p95}, dashboard_p95_us={dashboard_p95}"
+            );
+            assert!(
+                summary_p95 < 250_000,
+                "round {round}: PgSQL summary fallback p95 was {summary_p95}us"
+            );
+            assert!(
+                dashboard_p95 < 500_000,
+                "round {round}: PgSQL dashboard fallback p95 was {dashboard_p95}us"
+            );
+            assert!(recorder.shutdown(StdDuration::from_secs(2)).await.drained);
+            drop(recorder);
+
+            let restarted = UsageRecorder::with_postgres_and_redis(
+                64,
+                postgres_usage.clone(),
+                Some(redis.clone()),
+            );
+            assert_eq!(
+                restarted.record(old),
+                UsageRecordOutcome::RejectedCleanupWatermark,
+                "round {round}: restart reloads the persistent watermark"
+            );
+            assert_eq!(restarted.summary(500).total_requests, 1, "round {round}");
+            assert!(restarted.shutdown(StdDuration::from_secs(2)).await.drained);
+        }
+
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_postgres_only_usage_never_materializes_redis_for_five_rounds() {
+        let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+        else {
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let mut config = crate::model::config::Config::default();
+        config.postgres.url = Some(postgres_url);
+        config.postgres.max_connections = 2;
+        config.redis.url = Some(redis_url);
+        config.redis.key_prefix =
+            format!("kiro_rs:test:usage-postgres-only:{}", uuid::Uuid::new_v4());
+        let postgres = Arc::new(
+            crate::storage::postgres::PostgresStore::connect_test(&config)
+                .await
+                .unwrap(),
+        );
+        let postgres_usage = Arc::new(PostgresUsageStore::new(postgres.clone()));
+        let redis = RedisStore::connect(&config).await.unwrap();
+        assert_eq!(redis.clear_usage_summary().await.unwrap(), 0);
+
+        let recorder = Arc::new(UsageRecorder::with_postgres(1024, postgres_usage));
+        for round in 0..5 {
+            for index in 0..128 {
+                assert_eq!(
+                    recorder.record(record(
+                        &format!("postgres-only-round-{round}-record-{index}"),
+                        600,
+                        UsageSource::UpstreamMetadata,
+                    )),
+                    UsageRecordOutcome::Accepted,
+                );
+            }
+
+            let drained = recorder.drain(StdDuration::from_secs(5)).await;
+            assert!(drained.postgres.drained, "round {round}: PostgreSQL writer");
+            assert_eq!(drained.redis, UsageWriterDrainStatus::default());
+            let stats = recorder.writer_stats();
+            assert!(!stats.redis_enabled, "round {round}");
+            assert!(!stats.redis_queue_enabled, "round {round}");
+            assert_eq!(stats.redis_writer_accepted, 0, "round {round}");
+            assert_eq!(stats.redis_writer_finished, 0, "round {round}");
+            assert_eq!(stats.dropped_redis_records, 0, "round {round}");
+            assert_eq!(
+                recorder.summary(500).total_requests,
+                (round + 1) * 128,
+                "round {round}: PostgreSQL is the usage authority",
+            );
+            assert_eq!(
+                redis.clear_usage_summary().await.unwrap(),
+                0,
+                "round {round}: production usage must not create Redis usage keys",
+            );
+        }
+
+        let shutdown = recorder.shutdown(StdDuration::from_secs(5)).await;
+        assert!(shutdown.drained);
+        assert!(!shutdown.stats.redis_enabled);
+        assert_eq!(redis.clear_usage_summary().await.unwrap(), 0);
+        postgres.drop_test_schema().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3244,27 +3735,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_usage_batch_runs_operations_concurrently() {
-        let started_at = Instant::now();
-        let results = run_bounded_usage_batch(
-            (0..8).collect::<Vec<_>>(),
-            StdDuration::from_millis(500),
-            |_| async {
-                tokio::time::sleep(StdDuration::from_millis(40)).await;
-                Ok(())
-            },
-        )
-        .await;
-        assert!(results.iter().all(Result::is_ok));
-        assert!(started_at.elapsed() < StdDuration::from_millis(200));
+    async fn bounded_usage_batch_uses_one_shared_deadline_without_waiter_fanout() {
+        use std::sync::atomic::AtomicUsize;
 
-        let started_at = Instant::now();
-        let results = run_bounded_usage_batch(vec![1, 2, 3], StdDuration::from_millis(20), |_| {
-            std::future::pending::<anyhow::Result<()>>()
-        })
-        .await;
-        assert!(results.iter().all(Result::is_err));
-        assert!(started_at.elapsed() < StdDuration::from_millis(200));
+        for round in 1..=5 {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let started_at = Instant::now();
+            let results = run_bounded_usage_batch(
+                (0..8).collect::<Vec<_>>(),
+                StdDuration::from_millis(500),
+                |_| {
+                    let active = Arc::clone(&active);
+                    let max_active = Arc::clone(&max_active);
+                    async move {
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(now_active, Ordering::SeqCst);
+                        tokio::time::sleep(StdDuration::from_millis(20)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            assert!(results.iter().all(Result::is_ok), "round {round}");
+            assert_eq!(max_active.load(Ordering::SeqCst), 1, "round {round}");
+            assert!(started_at.elapsed() < StdDuration::from_millis(500));
+
+            let started_at = Instant::now();
+            let results =
+                run_bounded_usage_batch(vec![1, 2, 3], StdDuration::from_millis(20), |_| {
+                    std::future::pending::<anyhow::Result<()>>()
+                })
+                .await;
+            assert!(results.iter().all(Result::is_err), "round {round}");
+            assert!(started_at.elapsed() < StdDuration::from_millis(200));
+        }
     }
 
     #[test]
@@ -3494,11 +4000,13 @@ mod tests {
         let mut first = record("req_01alpha", 10, UsageSource::UpstreamMetadata);
         first.model = "claude-sonnet-4".to_string();
         first.upstream_model = Some("claude-sonnet-4-20250514".to_string());
+        first.request_api_key_id = Some("request-key-alpha".to_string());
         recorder.record(first);
 
         let mut second = record("req_01beta", 20, UsageSource::UpstreamMetadata);
         second.model = "claude-sonnet-4.5".to_string();
         second.external_outbound_model = Some("claude-sonnet-4-5".to_string());
+        second.request_api_key_id = Some("request-key-beta".to_string());
         recorder.record(second);
 
         let by_request_id = recorder.query(UsageRecordQuery {
@@ -3507,6 +4015,20 @@ mod tests {
         });
         assert_eq!(by_request_id.total, 1);
         assert_eq!(by_request_id.records[0].id, "req_01alpha");
+
+        let by_request_api_key = recorder.query(UsageRecordQuery {
+            request_api_key_id: Some("request-key-beta".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_request_api_key.total, 1);
+        assert_eq!(by_request_api_key.records[0].id, "req_01beta");
+
+        let by_request_api_key_search = recorder.query(UsageRecordQuery {
+            q: Some("request-key-alpha".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_request_api_key_search.total, 1);
+        assert_eq!(by_request_api_key_search.records[0].id, "req_01alpha");
 
         let by_upstream_model = recorder.query(UsageRecordQuery {
             model: Some("claude-sonnet-4-20250514".to_string()),

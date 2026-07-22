@@ -126,6 +126,35 @@ fn sanitize_tool_name(name: &str) -> String {
     }
 }
 
+/// Returns the exact deterministic name used when a request tool must be mapped for Kiro.
+pub(super) fn deterministic_mapped_tool_name(name: &str) -> String {
+    let sanitized = sanitize_tool_name(name);
+    if sanitized != name || sanitized.len() > TOOL_NAME_MAX_LEN {
+        shorten_tool_name(&sanitized, name)
+    } else {
+        sanitized
+    }
+}
+
+/// Exact name emitted by the pre-2026-05-29 mapper for an overlong tool.
+/// This is response/history compatibility only; new requests always use the
+/// current Kiro-safe mapper above.
+pub(super) fn legacy_overlong_mapped_tool_name(name: &str) -> Option<String> {
+    if name.len() <= TOOL_NAME_MAX_LEN {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    let hash_hex = format!("{:x}", hasher.finalize());
+    let hash_suffix = &hash_hex[..8];
+    let prefix_max = TOOL_NAME_MAX_LEN - 1 - 8;
+    let prefix = match name.char_indices().nth(prefix_max) {
+        Some((index, _)) => &name[..index],
+        None => name,
+    };
+    Some(format!("{prefix}_{hash_suffix}"))
+}
+
 /// 生成确定性 Kiro-safe 名称：截断前缀 + Hash + 8 位 SHA256 hex
 pub(super) fn shorten_tool_name(name: &str, hash_input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -150,14 +179,14 @@ pub(super) fn map_tool_name(
     if !options.conversion.tool_name_mapping.is_enabled() {
         return name.to_string();
     }
-    let sanitized = sanitize_tool_name(name);
-    let mapped = if sanitized != name || sanitized.len() > TOOL_NAME_MAX_LEN {
-        shorten_tool_name(&sanitized, name)
-    } else {
-        sanitized
-    };
+    let mapped = deterministic_mapped_tool_name(name);
     if mapped != name {
-        tool_name_map.insert(mapped.clone(), name.to_string());
+        // `convert_tools` rejects ambiguous allocations before committing this
+        // reverse map. Keep this helper non-overwriting as a final invariant for
+        // its test-only/direct callers.
+        tool_name_map
+            .entry(mapped.clone())
+            .or_insert_with(|| name.to_string());
     }
     mapped
 }
@@ -194,36 +223,133 @@ fn parse_tool_choice(tool_choice: &Option<serde_json::Value>) -> ToolChoiceDirec
     }
 }
 
-fn tool_choice_matches_name(tool_name: &str, requested_name: &str) -> bool {
-    tool_name == requested_name
-        || sanitize_tool_name(tool_name) == sanitize_tool_name(requested_name)
-}
-
-fn selected_tool_indices(tools: &[AnthropicTool], directive: &ToolChoiceDirective) -> Vec<usize> {
+fn selected_tool_indices(
+    tools: &[AnthropicTool],
+    directive: &ToolChoiceDirective,
+) -> Result<Vec<usize>, ConversionError> {
     match directive {
-        ToolChoiceDirective::None => Vec::new(),
+        ToolChoiceDirective::None => Ok(Vec::new()),
         ToolChoiceDirective::Tool(requested_name) => {
-            let selected = tools
+            let exact = tools
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, tool)| {
-                    tool_choice_matches_name(&tool.name, requested_name).then_some(idx)
+                    (tool.name.as_str() == requested_name.as_str()).then_some(idx)
                 })
                 .collect::<Vec<_>>();
-            if selected.is_empty() {
-                tracing::warn!(
-                    requested_tool = requested_name,
-                    "tool_choice requested a tool that is not present in tools; preserving all tools for compatibility"
-                );
-                (0..tools.len()).collect()
-            } else {
-                selected
+            if !exact.is_empty() {
+                return Ok(exact);
+            }
+
+            let normalized_requested = sanitize_tool_name(requested_name);
+            let normalized = tools
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, tool)| {
+                    (sanitize_tool_name(&tool.name) == normalized_requested).then_some(idx)
+                })
+                .collect::<Vec<_>>();
+            match normalized.len() {
+                0 => {
+                    tracing::warn!(
+                        requested_tool = requested_name,
+                        "tool_choice requested a tool that is not present in tools; preserving all tools for compatibility"
+                    );
+                    Ok((0..tools.len()).collect())
+                }
+                1 => Ok(normalized),
+                _ => Err(ConversionError::UnsupportedContent(
+                    "tool_choice name is ambiguous after tool-name normalization".to_string(),
+                )),
             }
         }
         ToolChoiceDirective::Auto | ToolChoiceDirective::Any | ToolChoiceDirective::Unknown => {
-            (0..tools.len()).collect()
+            Ok((0..tools.len()).collect())
         }
     }
+}
+
+fn allocate_selected_tool_names(
+    tools: &[AnthropicTool],
+    selected_indices: &[usize],
+    existing_tool_name_map: &HashMap<String, String>,
+    options: &ConverterOptions,
+) -> Result<(Vec<(usize, String)>, HashMap<String, String>), ConversionError> {
+    let mut reserved = HashMap::<String, String>::new();
+    let mut selected_definition_by_name = HashMap::<String, usize>::new();
+    for (mapped, original) in existing_tool_name_map {
+        let key = mapped.to_ascii_lowercase();
+        if reserved.insert(key, original.clone()).is_some() {
+            return Err(ConversionError::UnsupportedContent(
+                "existing tool-name reverse map is ambiguous".to_string(),
+            ));
+        }
+    }
+
+    let mut allocated = Vec::with_capacity(selected_indices.len());
+    let mut pending_reverse_map = HashMap::new();
+    for &idx in selected_indices {
+        let tool = &tools[idx];
+        let mapped = if options.conversion.tool_name_mapping.is_enabled() {
+            deterministic_mapped_tool_name(&tool.name)
+        } else {
+            tool.name.clone()
+        };
+        let collision_key = mapped.to_ascii_lowercase();
+        if let Some(previous_original) = reserved.get(&collision_key) {
+            if previous_original == &tool.name {
+                if let Some(previous_idx) = selected_definition_by_name.get(&collision_key) {
+                    if equivalent_tool_definitions(&tools[*previous_idx], tool) {
+                        tracing::warn!(
+                            original_tool_name = %tool.name,
+                            mapped_tool_name = %mapped,
+                            "跳过结构完全相同的重复工具定义"
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        original_tool_name = %tool.name,
+                        mapped_tool_name = %mapped,
+                        "拒绝同名但定义冲突的工具"
+                    );
+                    return Err(ConversionError::UnsupportedContent(
+                        "duplicate tool definitions with the same name are not structurally equivalent"
+                            .to_string(),
+                    ));
+                }
+                // A matching entry supplied by the caller reserves the reverse
+                // mapping, but does not itself represent a tool definition.
+                // Allow the first selected definition to claim it below.
+            } else {
+                tracing::warn!(
+                    previous_original_tool_name = %previous_original,
+                    original_tool_name = %tool.name,
+                    mapped_tool_name = %mapped,
+                    "拒绝歧义工具名映射"
+                );
+                return Err(ConversionError::UnsupportedContent(
+                    "multiple tool definitions resolve to the same Kiro tool name".to_string(),
+                ));
+            }
+        }
+        reserved.insert(collision_key.clone(), tool.name.clone());
+        selected_definition_by_name.insert(collision_key, idx);
+        if mapped != tool.name {
+            pending_reverse_map.insert(mapped.clone(), tool.name.clone());
+        }
+        allocated.push((idx, mapped));
+    }
+
+    Ok((allocated, pending_reverse_map))
+}
+
+fn equivalent_tool_definitions(left: &AnthropicTool, right: &AnthropicTool) -> bool {
+    left.name == right.name
+        && left.description == right.description
+        && left.input_schema == right.input_schema
+        && left.tool_type == right.tool_type
+        && left.max_uses == right.max_uses
+        && left.cache_control == right.cache_control
 }
 
 fn input_schema_from_json(
@@ -305,10 +431,10 @@ pub(super) fn convert_tools(
     } else {
         ToolChoiceDirective::Auto
     };
-    let selected_indices = selected_tool_indices(tools, &directive);
-    let selected: std::collections::HashSet<_> = selected_indices.into_iter().collect();
+    let selected_indices = selected_tool_indices(tools, &directive)?;
+    let (allocated_tools, pending_reverse_map) =
+        allocate_selected_tool_names(tools, &selected_indices, tool_name_map, &options)?;
 
-    let mut seen_tool_names = std::collections::HashSet::new();
     let mut converted = Vec::new();
     let mut cache_point_insert_after = Vec::new();
     let mut tool_schema_key_map = ToolSchemaKeyMap::default();
@@ -326,11 +452,8 @@ pub(super) fn convert_tools(
         );
     }
 
-    for (_, t) in tools
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| selected.contains(idx))
-    {
+    for (idx, mapped_name) in allocated_tools {
+        let t = &tools[idx];
         let mut description = normalize_tool_description(&t.name, &t.description);
 
         // 对 Write/Edit 工具追加自定义描述后缀
@@ -353,16 +476,6 @@ pub(super) fn convert_tools(
             Some((idx, _)) => description[..idx].to_string(),
             None => description,
         };
-
-        let mapped_name = map_tool_name(&t.name, tool_name_map, options.clone());
-        if !seen_tool_names.insert(mapped_name.to_ascii_lowercase()) {
-            tracing::warn!(
-                original_tool_name = %t.name,
-                mapped_tool_name = %mapped_name,
-                "跳过重复工具定义，避免 Kiro 工具名冲突"
-            );
-            continue;
-        }
 
         let converted_idx = converted.len();
         let has_cache_control = t.cache_control.is_some();
@@ -387,6 +500,11 @@ pub(super) fn convert_tools(
             cache_point_insert_after.push(converted_idx);
         }
     }
+
+    // Commit only after every selected definition and schema converted
+    // successfully, so callers never observe a partial or collision-overwritten
+    // reverse map.
+    tool_name_map.extend(pending_reverse_map);
 
     Ok(ConvertedTools {
         tools: converted,

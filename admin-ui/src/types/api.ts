@@ -438,7 +438,8 @@ export interface SuccessResponse {
 }
 
 export type UsageCleanupMode = 'soft_delete' | 'hard_delete'
-export type UsageCleanupJobStatus = 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
+export type UsageCleanupJobStatus = 'idle' | 'queued' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed'
+export type UsageCleanupPhase = 'idle' | 'postgres' | 'redis_admin_cache' | 'redis_snapshots' | 'complete'
 
 export interface UsageCleanupRequest {
   mode?: UsageCleanupMode
@@ -460,6 +461,7 @@ export interface UsageCleanupPreviewResponse {
 export interface UsageCleanupStatusResponse {
   jobId?: string
   status: UsageCleanupJobStatus
+  phase: UsageCleanupPhase
   mode?: UsageCleanupMode
   cutoffAt?: string
   batchSize: number
@@ -470,6 +472,12 @@ export interface UsageCleanupStatusResponse {
   processedRows: number
   lastBatchRows: number
   batches: number
+  redisDeletedKeys: number
+  redisDeleteCommands: number
+  redisMaxCommandKeys: number
+  redisScanPasses: number
+  redisUsedDelFallback: boolean
+  redisPassLimitReached: boolean
   cancelRequested: boolean
   stopReason?: string
   startedAt?: string
@@ -673,7 +681,27 @@ export type UsageSource =
   | 'request_estimate'
   | 'none'
 
+export interface InferenceAttemptSnapshot {
+  maxAttempts: number
+  consumed: number
+  localAttempts: number
+  externalAttempts: number
+  mcpAttempts: number
+  exhausted: boolean
+  downstreamCommitted: boolean
+}
+
+export interface AuxiliaryAttemptSnapshot {
+  maxAttempts: number
+  consumed: number
+  tokenRefreshAttempts: number
+  profileDiscoveryAttempts: number
+  exhausted: boolean
+}
+
 export interface UsageLatencyTrace {
+  inferenceAttempts?: InferenceAttemptSnapshot
+  auxiliaryAttempts?: AuxiliaryAttemptSnapshot
   capacityWeightUnits?: number
   estimatedInputTokens?: number
   payloadGuardMs?: number
@@ -694,6 +722,7 @@ export interface UsageLatencyTrace {
   upstreamEventParseErrorsBeforeFirstOutput?: number
   upstreamEventTypesBeforeFirstOutput?: Record<string, number>
   streamRetryAttempts?: number
+  streamRetryDispatchFailures?: number
   streamRetryReasons?: string[]
   clientDroppedMs?: number
   terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
@@ -743,6 +772,7 @@ export interface UsageRecord {
   modelResolutionSource?: string
   modelResolutionNote?: string
   conversationId?: string
+  requestApiKeyId?: string
   credentialId?: number
   credentialLabel?: string
   status: UsageRecordStatus
@@ -1057,6 +1087,7 @@ export interface UsageTopAggregate {
 export interface UsageRecordsQuery {
   limit?: number
   requestId?: string
+  requestApiKeyId?: string
   q?: string
   endpoint?: string
   conversationId?: string
@@ -1503,11 +1534,44 @@ export interface MissingMaxTokensConfig {
   defaultValue: number
 }
 
+export interface RequestAdmissionConfig {
+  rpm: number
+  maxConcurrentRequests: number
+  maxQueuedRequests: number
+  queueTimeoutMs: number
+}
+
+export interface AuxiliaryUpstreamRuntime {
+  configuredLimit: number
+  inFlight: number
+  peakInFlight: number
+  rejected: number
+  refreshClientCacheEntries: number
+  refreshClientCacheMaxEntries: number
+  refreshClientBuilds: number
+  refreshClientHits: number
+  refreshClientMisses: number
+  refreshClientCacheSaturated: number
+}
+
+export interface TokenRefreshAdmissionRuntime {
+  authority: 'process_local' | 'redis_global' | 'redis_global_degraded'
+  configuredRpm: number
+  configuredBurst: number
+  admitted: number
+  rateLimited: number
+  coordinationRejected: number
+  redisErrors: number
+  lastRetryAfterMs: number
+  remainingMilliTokens: number
+}
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
   proxyPassword?: string | null
   credentialRpm: number
+  requestAdmission: RequestAdmissionConfig
   credentialMaxConcurrentRequests: number
   credentialTransientCooldownSecs: number
   credentialRateLimitCooldownSecs: number
@@ -1525,6 +1589,13 @@ export interface RuntimeConfig {
   kiroUpstreamStreamIdleTimeoutSecs: number
   kiroUpstreamStreamRetryEnabled: boolean
   kiroUpstreamStreamRetryMaxAttempts: number
+  inferenceUpstreamMaxAttempts: number
+  auxiliaryUpstreamMaxAttempts: number
+  auxiliaryUpstreamMaxConcurrentRequests: number
+  auxiliaryUpstreamRuntime: AuxiliaryUpstreamRuntime
+  tokenRefreshMaxRpm: number
+  tokenRefreshBurst: number
+  tokenRefreshAdmissionRuntime: TokenRefreshAdmissionRuntime
   kiroUpstreamStreamRetryOnIdleTimeout: boolean
   kiroUpstreamStreamRetryOnReadError: boolean
   kiroUpstreamStreamRetryOnStatusError: boolean
@@ -1662,6 +1733,11 @@ export interface ModelCapabilitiesStatus {
   lastSyncedAt?: string
   lastError?: string
   models: ModelCapabilityItem[]
+  reasoningFields?: Record<string, {
+    path: 'output_config' | 'reasoning'
+    efforts: string[]
+    defaultEffort?: string
+  }>
 }
 
 export interface ManualModelPricingRequest {

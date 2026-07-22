@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::config::RequestAdmissionConfig;
 
 fn cleanup_request() -> UsageCleanupRequest {
     UsageCleanupRequest {
@@ -95,6 +96,33 @@ fn runtime_cooldown_validation_rejects_zero_values() {
         validate_runtime_cooldown_settings(1, 2, &[1, 0]),
         Err(AdminServiceError::InvalidCredential(_))
     ));
+}
+
+#[test]
+fn request_admission_admin_save_refresh_returns_canonical_queue_fields() {
+    let queue_only = RequestAdmissionConfig {
+        rpm: 0,
+        max_concurrent_requests: 0,
+        max_queued_requests: 64,
+        queue_timeout_ms: 1_000,
+    };
+    let saved = normalize_admin_request_admission(queue_only).expect("Admin save");
+    assert_eq!(saved, RequestAdmissionConfig::disabled());
+    assert!(!saved.enabled());
+
+    let half_disabled_queue = RequestAdmissionConfig {
+        rpm: 300,
+        max_concurrent_requests: 32,
+        max_queued_requests: 0,
+        queue_timeout_ms: 1_000,
+    };
+    let saved = normalize_admin_request_admission(half_disabled_queue).expect("Admin save");
+    assert_eq!(saved.max_queued_requests, 0);
+    assert_eq!(saved.queue_timeout_ms, 0);
+    assert!(saved.enabled());
+
+    // Runtime GET applies the same idempotent normalization before returning the value.
+    assert_eq!(saved.normalized(), saved);
 }
 
 #[test]
@@ -433,7 +461,7 @@ fn usage_cleanup_request_uses_safe_manual_defaults() {
     let after = Utc::now();
 
     assert_eq!(plan.mode, UsageCleanupMode::SoftDelete);
-    assert_eq!(plan.batch_size, 1000);
+    assert_eq!(plan.batch_size, USAGE_CLEANUP_DEFAULT_BATCH_SIZE);
     assert_eq!(plan.max_batches, USAGE_CLEANUP_DEFAULT_MAX_BATCHES);
     assert_eq!(plan.pause_ms_between_batches, 100);
     assert!(plan.cutoff >= before - ChronoDuration::days(7) - ChronoDuration::seconds(1));
@@ -447,7 +475,7 @@ fn usage_cleanup_request_cutoff_before_overrides_days() {
     request.mode = UsageCleanupMode::HardDelete;
     request.older_than_days = Some(1);
     request.cutoff_before = Some(cutoff.to_rfc3339());
-    request.batch_size = Some(5000);
+    request.batch_size = Some(USAGE_CLEANUP_MAX_BATCH_SIZE);
     request.max_batches = Some(10_000);
     request.pause_ms_between_batches = Some(0);
 
@@ -455,7 +483,7 @@ fn usage_cleanup_request_cutoff_before_overrides_days() {
 
     assert_eq!(plan.mode, UsageCleanupMode::HardDelete);
     assert_eq!(plan.cutoff, cutoff);
-    assert_eq!(plan.batch_size, 5000);
+    assert_eq!(plan.batch_size, USAGE_CLEANUP_MAX_BATCH_SIZE);
     assert_eq!(plan.max_batches, 10_000);
     assert_eq!(plan.pause_ms_between_batches, 0);
 }
@@ -476,7 +504,7 @@ fn usage_cleanup_request_zero_days_uses_execution_cutoff() {
 #[test]
 fn usage_cleanup_request_rejects_unsafe_bounds() {
     let mut large_batch = cleanup_request();
-    large_batch.batch_size = Some(5001);
+    large_batch.batch_size = Some(USAGE_CLEANUP_MAX_BATCH_SIZE + 1);
     assert!(matches!(
         normalize_usage_cleanup_request(large_batch),
         Err(AdminServiceError::InvalidCredential(_))
@@ -498,22 +526,164 @@ fn usage_cleanup_request_rejects_unsafe_bounds() {
 }
 
 #[test]
+fn usage_cleanup_resume_gets_a_fresh_per_run_batch_budget() {
+    assert!(usage_cleanup_run_batch_limit_reached(10, 0, 10));
+    assert!(!usage_cleanup_run_batch_limit_reached(10, 10, 10));
+    assert!(!usage_cleanup_run_batch_limit_reached(19, 10, 10));
+    assert!(usage_cleanup_run_batch_limit_reached(20, 10, 10));
+}
+
+#[test]
+fn usage_cleanup_lock_contention_backoff_is_bounded() {
+    assert_eq!(
+        usage_cleanup_lock_contention_backoff(1),
+        StdDuration::from_millis(25)
+    );
+    assert_eq!(
+        usage_cleanup_lock_contention_backoff(2),
+        StdDuration::from_millis(50)
+    );
+    assert_eq!(
+        usage_cleanup_lock_contention_backoff(5),
+        StdDuration::from_millis(400)
+    );
+    assert_eq!(
+        usage_cleanup_lock_contention_backoff(100),
+        StdDuration::from_millis(400)
+    );
+}
+
+#[tokio::test]
+async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_rounds() {
+    let Some(url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL") else {
+        eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+    let mut config = crate::model::config::Config::default();
+    config.postgres.url = Some(url);
+    config.postgres.max_connections = 2;
+    let postgres = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+    let usage_store = PostgresUsageStore::new(postgres.clone());
+
+    for round in 0..3 {
+        sqlx::query("TRUNCATE TABLE usage_cleanup_jobs")
+            .execute(postgres.pool())
+            .await
+            .unwrap();
+        let job_id = format!("cleanup-heartbeat-round-{round}");
+        let worker_id = format!("heartbeat-worker-{round}");
+        usage_store
+            .create_cleanup_job(NewUsageCleanupJob {
+                job_id: &job_id,
+                mode: "soft_delete",
+                cutoff_at: Utc::now() - ChronoDuration::days(7),
+                batch_size: 250,
+                max_batches: 100,
+                pause_ms_between_batches: 10,
+            })
+            .await
+            .unwrap();
+        usage_store
+            .claim_cleanup_job(&job_id, &worker_id, 30)
+            .await
+            .unwrap()
+            .expect("queued cleanup job must be claimable");
+
+        let mut blocker = postgres.pool().begin().await.unwrap();
+        sqlx::query("SELECT job_id FROM usage_cleanup_jobs WHERE job_id = $1 FOR UPDATE")
+            .bind(&job_id)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let renewal_store = usage_store.clone();
+        let renewal_job_id = job_id.clone();
+        let renewal_worker_id = worker_id.clone();
+        let started = Instant::now();
+        let renewal = tokio::spawn(async move {
+            renew_usage_cleanup_lease_with_retry(
+                &renewal_store,
+                &renewal_job_id,
+                &renewal_worker_id,
+                UsageCleanupHeartbeatPolicy {
+                    lease_secs: 30,
+                    attempt_timeout: StdDuration::from_millis(40),
+                    max_attempts: 3,
+                    retry_delay: StdDuration::from_millis(15),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        blocker.rollback().await.unwrap();
+        let renewed = renewal.await.unwrap().unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(renewed, Some(false), "round {round}");
+        assert!(
+            elapsed >= StdDuration::from_millis(70),
+            "round {round}: the injected row lock must affect at least one attempt: {elapsed:?}"
+        );
+        assert!(
+            elapsed < StdDuration::from_millis(250),
+            "round {round}: heartbeat retry must stay bounded: {elapsed:?}"
+        );
+
+        let lease_owner: Option<String> = sqlx::query_scalar(
+            "SELECT lease_owner FROM usage_cleanup_jobs WHERE job_id = $1 AND lease_until > now()",
+        )
+        .bind(&job_id)
+        .fetch_one(postgres.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            lease_owner.as_deref(),
+            Some(worker_id.as_str()),
+            "round {round}"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
 fn remove_request_api_key_by_id_removes_requested_key() {
     let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
 
-    let removed = remove_request_api_key_by_id(&mut keys, &request_api_key_id("sk-one"))
-        .expect("key should be removed");
+    let removed = remove_request_api_key_by_id(
+        &mut keys,
+        &crate::common::auth::request_api_key_id("sk-one"),
+    )
+    .expect("key should be removed");
 
     assert_eq!(removed, "sk-one");
     assert_eq!(keys, vec!["sk-two".to_string()]);
 }
 
 #[test]
+fn admin_request_key_id_matches_runtime_authenticated_identity() {
+    let items = request_api_key_items(&[" sk-one ".to_string()]);
+    let store = RequestApiKeyStore::new(["sk-one"]);
+    let runtime_id = store.authenticate("sk-one").unwrap().stable_id();
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, runtime_id);
+    assert_eq!(items[0].id.len(), 64);
+    assert_eq!(
+        items[0].id,
+        crate::common::auth::request_api_key_id("sk-one")
+    );
+}
+
+#[test]
 fn remove_request_api_key_by_id_rejects_missing_key() {
     let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
 
-    let err = remove_request_api_key_by_id(&mut keys, &request_api_key_id("sk-missing"))
-        .expect_err("missing key should fail");
+    let err = remove_request_api_key_by_id(
+        &mut keys,
+        &crate::common::auth::request_api_key_id("sk-missing"),
+    )
+    .expect_err("missing key should fail");
 
     assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
     assert_eq!(keys, vec!["sk-one".to_string(), "sk-two".to_string()]);
@@ -523,8 +693,11 @@ fn remove_request_api_key_by_id_rejects_missing_key() {
 fn remove_request_api_key_by_id_rejects_removing_last_key() {
     let mut keys = vec!["sk-one".to_string()];
 
-    let err = remove_request_api_key_by_id(&mut keys, &request_api_key_id("sk-one"))
-        .expect_err("last key should not be removable");
+    let err = remove_request_api_key_by_id(
+        &mut keys,
+        &crate::common::auth::request_api_key_id("sk-one"),
+    )
+    .expect_err("last key should not be removable");
 
     assert!(matches!(err, AdminServiceError::Conflict(_)));
     assert_eq!(keys, vec!["sk-one".to_string()]);

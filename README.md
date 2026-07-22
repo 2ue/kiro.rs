@@ -113,6 +113,10 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
    "redis": {
       "url": "redis://127.0.0.1:26379/0"
    },
+   "observabilityRedis": {
+      "url": null,
+      "keyPrefix": "kiro_rs:observability"
+   },
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
@@ -121,7 +125,9 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
 }
 ```
 > PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
-> PgSQL 和 Redis 为必需依赖。首次启动时会把 `config.json` 和 `credentials.json` 导入 PgSQL；之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用和跨实例 Token 刷新锁以 Redis 为准。
+> PgSQL 和业务 Redis 为必需依赖。首次启动时会把 `config.json` 和 `credentials.json` 导入 PgSQL；之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用、external fencing 和跨实例 Token 刷新锁只使用业务 `redis`。
+>
+> `observabilityRedis` 是可选的独立观测故障域，用于 usage 派生 materialization、Admin/余额缓存和 usage cleanup 的 Redis 阶段。未配置时这些能力使用 PostgreSQL/进程内状态，绝不会回落到业务 Redis。配置后必须使用不同的 Redis 网络 authority；只改 logical DB 或 `keyPrefix` 仍共享同一个 Redis 单线程，启动会拒绝这种伪隔离。也可以通过 `KIRO_RS_OBSERVABILITY_REDIS_URL` 和 `KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX` 设置。
 
 创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
 > PS: 可以前往 Web 管理面板配置跳过本步骤
@@ -250,7 +256,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `postgres.url` | string | 必填 | PgSQL 连接地址。服务启动必须能连接；首次启动可从配置文件导入运行配置和凭据 |
 | `postgres.maxConnections` | number | `10` | PgSQL 连接池最大连接数 |
 | `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表；生产建议保持开启 |
-| `postgres.compressUsageRollupsOnStart` | boolean | `false` | 启动时是否执行历史 usage rollup 小桶压缩；生产默认关闭，建议低峰期显式开启一次或使用单独维护窗口处理 |
+| `postgres.compressUsageRollupsOnStart` | boolean | `false` | 已废弃的兼容字段；设置为 `true` 会在连接数据库前拒绝启动。请先停止并排空所有网关实例，再运行 `maintenance usage-rollup-compression` |
 | `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
 | `redis.keyPrefix` | string | `kiro_rs:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |

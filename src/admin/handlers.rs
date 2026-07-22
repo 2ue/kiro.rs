@@ -24,7 +24,7 @@ use super::{
         SetWarmupRequest, SuccessResponse, SystemVersionResponse, TestCredentialRequest,
         UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
         UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-        UsageCleanupRequest, ValidateExistingCredentialsRequest,
+        UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
         ValidateExternalCredentialsRequest,
     },
 };
@@ -102,6 +102,7 @@ pub struct UsageRecordsQueryParams {
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
+    pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
     pub route_kind: Option<String>,
@@ -125,6 +126,7 @@ pub struct UsageRecordsPageQueryParams {
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
+    pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
     pub route_kind: Option<String>,
@@ -174,6 +176,7 @@ impl UsageRecordsQueryParams {
             q,
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
+            request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
             external_pool_id: self.external_pool_id,
             route_kind: parse_optional_usage_route_kind(self.route_kind)?,
@@ -207,6 +210,7 @@ impl UsageRecordsPageQueryParams {
             q,
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
+            request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
             external_pool_id: self.external_pool_id,
             route_kind: parse_optional_usage_route_kind(self.route_kind)?,
@@ -227,6 +231,16 @@ fn non_blank(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn parse_optional_request_api_key_id(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = non_blank(value) else {
+        return Ok(None);
+    };
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("无效 requestApiKeyId：必须为 64 位 SHA-256 十六进制摘要".to_string());
+    }
+    Ok(Some(value.to_ascii_lowercase()))
 }
 
 fn extract_request_id_token(value: &str) -> Option<String> {
@@ -1137,6 +1151,13 @@ pub async fn delete_manual_model(
     }
 }
 
+fn sensitive_export_response_builder() -> axum::http::response::Builder {
+    Response::builder()
+        .header(header::CACHE_CONTROL, "no-store, private")
+        .header(header::PRAGMA, "no-cache")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+}
+
 /// GET /api/admin/credentials/export?format=json|backup-json|jsonl
 /// 导出完整凭据。
 pub async fn export_credentials(
@@ -1151,7 +1172,7 @@ pub async fn export_credentials(
             } else {
                 "application/json; charset=utf-8"
             };
-            Response::builder()
+            sensitive_export_response_builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, content_type)
                 .header(
@@ -1291,8 +1312,10 @@ pub async fn get_usage_writer_stats(State(state): State<AdminState>) -> impl Int
 /// POST /api/admin/usage-records/clear
 /// 清空请求级 usage 记录
 pub async fn clear_usage_records(State(state): State<AdminState>) -> impl IntoResponse {
-    state.service.clear_usage_records();
-    Json(SuccessResponse::new("Usage 记录已清空"))
+    match state.service.clear_usage_records() {
+        Ok(data) => (StatusCode::ACCEPTED, Json(data)).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/usage-records/cleanup/preview
@@ -1314,7 +1337,19 @@ pub async fn start_usage_cleanup(
     Json(request): Json<UsageCleanupRequest>,
 ) -> impl IntoResponse {
     match state.service.start_usage_cleanup(request) {
-        Ok(data) => Json(data).into_response(),
+        Ok(data) => (StatusCode::ACCEPTED, Json(data)).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/usage-records/cleanup/resume
+/// 恢复一个失败或已取消的持久化 usage 清理任务。
+pub async fn resume_usage_cleanup(
+    State(state): State<AdminState>,
+    Json(request): Json<UsageCleanupResumeRequest>,
+) -> impl IntoResponse {
+    match state.service.resume_usage_cleanup(request) {
+        Ok(data) => (StatusCode::ACCEPTED, Json(data)).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -1328,7 +1363,10 @@ pub async fn get_usage_cleanup_status(State(state): State<AdminState>) -> impl I
 /// POST /api/admin/usage-records/cleanup/cancel
 /// 请求取消当前手动 usage 清理任务。
 pub async fn cancel_usage_cleanup(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.cancel_usage_cleanup())
+    match state.service.cancel_usage_cleanup() {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/audit-logs
@@ -1355,6 +1393,7 @@ mod tests {
             request_id: None,
             q: Some("   ".to_string()),
             conversation_id: Some("   ".to_string()),
+            request_api_key_id: Some("   ".to_string()),
             credential_id: Some(7),
             external_pool_id: None,
             route_kind: Some("external".to_string()),
@@ -1374,6 +1413,7 @@ mod tests {
         assert_eq!(query.limit, 25);
         assert_eq!(query.q, None);
         assert_eq!(query.conversation_id, None);
+        assert_eq!(query.request_api_key_id, None);
         assert_eq!(query.credential_id, Some(7));
         assert_eq!(query.route_kind, Some(UsageRouteKind::ExternalPool));
         assert_eq!(query.model, None);
@@ -1392,6 +1432,7 @@ mod tests {
             request_id: None,
             q: Some("请求 ID: req_01abcXYZ-123，模型 opus".to_string()),
             conversation_id: None,
+            request_api_key_id: None,
             credential_id: None,
             external_pool_id: None,
             route_kind: None,
@@ -1442,6 +1483,7 @@ mod tests {
             request_id: Some("  req_01explicit  ".to_string()),
             q: Some("req_01fromq".to_string()),
             conversation_id: None,
+            request_api_key_id: None,
             credential_id: None,
             external_pool_id: None,
             route_kind: None,
@@ -1469,6 +1511,7 @@ mod tests {
             request_id: None,
             q: None,
             conversation_id: None,
+            request_api_key_id: None,
             credential_id: None,
             external_pool_id: None,
             route_kind: None,
@@ -1491,6 +1534,7 @@ mod tests {
             request_id: None,
             q: None,
             conversation_id: None,
+            request_api_key_id: None,
             credential_id: None,
             external_pool_id: None,
             route_kind: None,
@@ -1513,6 +1557,7 @@ mod tests {
             request_id: None,
             q: None,
             conversation_id: None,
+            request_api_key_id: None,
             credential_id: None,
             external_pool_id: None,
             route_kind: None,
@@ -1529,6 +1574,14 @@ mod tests {
         .into_query()
         .unwrap_err();
         assert!(bad_time.contains("无效时间"));
+
+        let invalid_request_key: UsageRecordsQueryParams =
+            serde_json::from_value(serde_json::json!({
+                "requestApiKeyId": "sk-raw-key-must-not-be-queryable"
+            }))
+            .unwrap();
+        let invalid_request_key = invalid_request_key.into_query().unwrap_err();
+        assert!(invalid_request_key.contains("无效 requestApiKeyId"));
     }
 
     #[test]
@@ -1539,6 +1592,7 @@ mod tests {
             request_id: None,
             q: Some("sonnet".to_string()),
             conversation_id: Some("session-a".to_string()),
+            request_api_key_id: Some("A".repeat(64)),
             credential_id: None,
             external_pool_id: None,
             route_kind: None,
@@ -1560,6 +1614,36 @@ mod tests {
         assert_eq!(query.limit, 50);
         assert_eq!(query.q.as_deref(), Some("sonnet"));
         assert_eq!(query.conversation_id.as_deref(), Some("session-a"));
+        assert_eq!(query.request_api_key_id, Some("a".repeat(64)));
         assert_eq!(query.endpoint.as_deref(), Some("/ha"));
+    }
+
+    #[test]
+    fn sensitive_credential_export_is_not_cacheable_or_content_sniffable() {
+        let response = sensitive_export_response_builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::PRAGMA)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
     }
 }

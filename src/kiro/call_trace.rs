@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +141,75 @@ impl KiroCredentialAttempt {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct McpCallAttributionSnapshot {
+    pub credential_id: Option<u64>,
+    pub credential_label: Option<String>,
+    pub attempts: Vec<KiroCredentialAttempt>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct McpCallAttributionSink {
+    state: Arc<Mutex<McpCallAttributionSnapshot>>,
+}
+
+impl McpCallAttributionSink {
+    pub fn begin_send(&self, attempt: usize, credential_id: u64, credential_label: &str) {
+        let mut state = self.state.lock();
+        state.credential_id = Some(credential_id);
+        state.credential_label = Some(credential_label.to_string());
+        let pending = KiroCredentialAttempt::new(
+            attempt,
+            credential_id,
+            Some(credential_label.to_string()),
+            None,
+            "pending",
+            None::<String>,
+            None::<String>,
+            0,
+        );
+        if let Some(existing) = state
+            .attempts
+            .iter_mut()
+            .find(|existing| existing.attempt == pending.attempt)
+        {
+            *existing = pending;
+        } else {
+            state.attempts.push(pending);
+            state.attempts.sort_by_key(|attempt| attempt.attempt);
+        }
+    }
+
+    pub fn replace(
+        &self,
+        credential_id: Option<u64>,
+        credential_label: Option<String>,
+        attempts: Vec<KiroCredentialAttempt>,
+    ) {
+        *self.state.lock() = McpCallAttributionSnapshot {
+            credential_id,
+            credential_label,
+            attempts,
+        };
+    }
+
+    pub fn snapshot(&self) -> McpCallAttributionSnapshot {
+        self.state.lock().clone()
+    }
+
+    pub fn snapshot_for_client_drop(&self) -> McpCallAttributionSnapshot {
+        let mut state = self.state.lock();
+        for attempt in &mut state.attempts {
+            if attempt.action == "pending" {
+                attempt.action = "fail".to_string();
+                attempt.error_type = Some("client_dropped".to_string());
+                attempt.error_message = Some("mcp_client_cancelled".to_string());
+            }
+        }
+        state.clone()
+    }
+}
+
 pub fn summarize_attempts(attempts: &[KiroCredentialAttempt]) -> String {
     attempts
         .iter()
@@ -151,6 +223,19 @@ pub struct KiroCallError {
     message: String,
     attempts: Vec<KiroCredentialAttempt>,
     selection_failure: Option<SelectionFailureSummary>,
+    failure_kind: Option<KiroCallFailureKind>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KiroCallFailureKind {
+    InferenceAttemptsExhausted,
+    InferenceAttemptReservedForFallback,
+    DownstreamCommitted,
+    AuxiliaryAttemptsExhausted,
+    AuxiliaryConcurrencySaturated,
+    ThinkingSignatureInvalid,
+    ThinkingSignatureRetryFailed,
 }
 
 impl KiroCallError {
@@ -159,6 +244,7 @@ impl KiroCallError {
             message: message.into(),
             attempts,
             selection_failure: None,
+            failure_kind: None,
         }
     }
 
@@ -174,6 +260,15 @@ impl KiroCallError {
     pub fn selection_failure(&self) -> Option<&SelectionFailureSummary> {
         self.selection_failure.as_ref()
     }
+
+    pub fn with_failure_kind(mut self, failure_kind: KiroCallFailureKind) -> Self {
+        self.failure_kind = Some(failure_kind);
+        self
+    }
+
+    pub fn failure_kind(&self) -> Option<KiroCallFailureKind> {
+        self.failure_kind
+    }
 }
 
 impl fmt::Display for KiroCallError {
@@ -183,3 +278,35 @@ impl fmt::Display for KiroCallError {
 }
 
 impl std::error::Error for KiroCallError {}
+
+#[cfg(test)]
+mod tests {
+    use super::McpCallAttributionSink;
+
+    #[test]
+    fn mcp_attribution_sink_finalizes_pending_send_on_client_drop_for_five_rounds() {
+        for round in 1..=5 {
+            let sink = McpCallAttributionSink::default();
+            sink.begin_send(0, round, &format!("credential-{round}"));
+
+            let pending = sink.snapshot();
+            assert_eq!(pending.credential_id, Some(round));
+            assert_eq!(pending.attempts.len(), 1);
+            assert_eq!(pending.attempts[0].action, "pending");
+
+            let dropped = sink.snapshot_for_client_drop();
+            assert_eq!(dropped.attempts.len(), 1);
+            assert_eq!(dropped.attempts[0].attempt, 1);
+            assert_eq!(dropped.attempts[0].credential_id, round);
+            assert_eq!(dropped.attempts[0].action, "fail");
+            assert_eq!(
+                dropped.attempts[0].error_type.as_deref(),
+                Some("client_dropped")
+            );
+            assert_eq!(
+                dropped.attempts[0].error_message.as_deref(),
+                Some("mcp_client_cancelled")
+            );
+        }
+    }
+}

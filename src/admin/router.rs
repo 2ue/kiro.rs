@@ -24,7 +24,7 @@ use super::{
         get_usage_dashboard_breakdown, get_usage_dashboard_external_pool_billing,
         get_usage_dashboard_series, get_usage_dashboard_top, get_usage_dashboard_windows,
         get_usage_records, get_usage_records_page, get_usage_summary, get_usage_writer_stats,
-        preview_usage_cleanup, refresh_credentials_info, reset_failure_count,
+        preview_usage_cleanup, refresh_credentials_info, reset_failure_count, resume_usage_cleanup,
         set_credential_concurrency, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_credential_proxy, set_credential_rate_limit_auto_disable,
         set_credential_regions, set_credential_rpm, set_credential_supported_models,
@@ -186,6 +186,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(preview_usage_cleanup),
         )
         .route("/usage-records/cleanup/start", post(start_usage_cleanup))
+        .route("/usage-records/cleanup/resume", post(resume_usage_cleanup))
         .route(
             "/usage-records/cleanup/status",
             get(get_usage_cleanup_status),

@@ -30,6 +30,9 @@ use serde_json::{Value, json};
 use tokio::{sync::Semaphore, task::JoinSet, time::sleep};
 use tracing_subscriber::EnvFilter;
 
+const LOADTEST_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const LOADTEST_SSE_EVENT_MAX_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(name = "kiro_loadtest")]
 #[command(about = "Kiro proxy load/chaos test helper")]
@@ -487,7 +490,7 @@ async fn execute_request(
             if first_byte.is_none() {
                 first_byte = Some(started.elapsed().as_millis());
             }
-            parser.push(&chunk);
+            parser.push(&chunk)?;
             if config.scenario == Scenario::ClientDrop && first_byte.is_some() {
                 break;
             }
@@ -505,7 +508,9 @@ async fn execute_request(
             error_id: error_id.or(metrics.error_id),
         })
     } else {
-        let bytes = response.bytes().await?;
+        let bytes =
+            read_response_bytes_with_limit(response, LOADTEST_NON_STREAM_RESPONSE_MAX_BYTES)
+                .await?;
         let body_error_id = error_id_from_json(&bytes);
         let json_exception = body_is_json_exception(&bytes);
         Ok(RequestResult {
@@ -521,11 +526,34 @@ async fn execute_request(
     }
 }
 
+async fn read_response_bytes_with_limit(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Bytes> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!("loadtest response exceeds {max_bytes} bytes");
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(max_bytes.min(16 * 1024));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            bail!("loadtest response exceeds {max_bytes} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
 fn request_body(config: &RunConfig, index: usize) -> Value {
     let messages = payload_case_messages(config, index);
     let mut body = json!({
         "model": config.model,
-        "max_tokens": 256,
+        "max_tokens": if config.thinking { 4096 } else { 256 },
         "stream": config.stream,
         "messages": messages
     });
@@ -976,13 +1004,29 @@ impl SseMetricsParser {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
         self.buffer.extend_from_slice(chunk);
-        while let Some((idx, delimiter_len)) = find_sse_delimiter(&self.buffer) {
-            let event = self.buffer[..idx].to_vec();
-            self.buffer.drain(..idx + delimiter_len);
-            self.inspect_event(&event);
+        let mut ranges = Vec::new();
+        let mut offset = 0usize;
+        while let Some((idx, delimiter_len)) = find_sse_delimiter(&self.buffer[offset..]) {
+            let event_end = offset + idx;
+            ranges.push(offset..event_end);
+            offset = event_end + delimiter_len;
         }
+        if offset > 0 {
+            let pending = self.buffer.split_off(offset);
+            let complete = std::mem::replace(&mut self.buffer, pending);
+            for range in ranges {
+                self.inspect_event(&complete[range]);
+            }
+        }
+        if self.buffer.len() > LOADTEST_SSE_EVENT_MAX_BYTES {
+            bail!(
+                "loadtest SSE event exceeds {} bytes",
+                LOADTEST_SSE_EVENT_MAX_BYTES
+            );
+        }
+        Ok(())
     }
 
     fn finish(mut self) -> ParsedSseMetrics {
@@ -1020,16 +1064,21 @@ impl SseMetricsParser {
 }
 
 fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|idx| (idx, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|idx| (idx, 2))
-        })
+    for index in 0..buffer.len() {
+        if buffer
+            .get(index..index.saturating_add(4))
+            .is_some_and(|window| window == b"\r\n\r\n")
+        {
+            return Some((index, 4));
+        }
+        if buffer
+            .get(index..index.saturating_add(2))
+            .is_some_and(|window| window == b"\n\n")
+        {
+            return Some((index, 2));
+        }
+    }
+    None
 }
 
 fn event_data(event: &str) -> Vec<String> {
@@ -1411,10 +1460,16 @@ async fn fake_handler(
     let sequence = state.counter.fetch_add(1, Ordering::Relaxed) + 1;
     let request_id = format!("fake_req_{}", sequence);
     let request = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| json!({}));
+    if is_kiro_model_discovery_request(&uri, &headers) {
+        capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
+        return fake_kiro_model_discovery_message(&request_id);
+    }
     let stream = request
         .get("stream")
         .and_then(Value::as_bool)
-        .unwrap_or_else(|| wants_stream(&headers) || wants_kiro_eventstream(&state, &uri));
+        .unwrap_or_else(|| {
+            wants_stream(&headers) || wants_kiro_eventstream(&state, &uri, &headers)
+        });
     let scenario = effective_fake_scenario(&state, sequence);
     capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
     let thinking = body_requests_thinking(&request);
@@ -1650,7 +1705,20 @@ async fn fake_handler(
                 fake_json_message(&request_id)
             }
         }
-        Scenario::NormalNonStream => fake_json_message(&request_id),
+        Scenario::NormalNonStream => {
+            if stream {
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(
+                        request_id,
+                        normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
+                    )
+                } else {
+                    sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
+                }
+            } else {
+                fake_json_message(&request_id)
+            }
+        }
         Scenario::NormalStream | Scenario::ClientDrop | Scenario::RecoveryAfterBurst => {
             if stream {
                 if state.kiro_eventstream {
@@ -1727,11 +1795,33 @@ fn wants_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("text/event-stream"))
+        .is_some_and(|value| {
+            value.contains("text/event-stream")
+                || value.contains("application/vnd.amazon.eventstream")
+        })
 }
 
-fn wants_kiro_eventstream(state: &FakeServerState, uri: &Uri) -> bool {
-    state.kiro_eventstream && uri.path().contains("generateAssistantResponse")
+fn wants_kiro_eventstream(state: &FakeServerState, uri: &Uri, headers: &HeaderMap) -> bool {
+    if !state.kiro_eventstream {
+        return false;
+    }
+    if uri.path().contains("generateAssistantResponse") {
+        return true;
+    }
+    headers
+        .get("x-amz-target")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|target| target.ends_with(".GenerateAssistantResponse"))
+}
+
+fn is_kiro_model_discovery_request(uri: &Uri, headers: &HeaderMap) -> bool {
+    if uri.path().ends_with("/ListAvailableModels") {
+        return true;
+    }
+    headers
+        .get("x-amz-target")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|target| target.ends_with(".ListAvailableModels"))
 }
 
 fn body_contains_cache_point(value: &Value) -> bool {
@@ -1883,6 +1973,15 @@ fn body_requests_thinking(value: &Value) -> bool {
             {
                 return true;
             }
+            if map
+                .get("additionalModelRequestFields")
+                .is_some_and(native_reasoning_fields_request_thinking)
+            {
+                return true;
+            }
+            if native_reasoning_fields_request_thinking(value) {
+                return true;
+            }
             map.values().any(body_requests_thinking)
         }
         Value::Array(items) => items.iter().any(body_requests_thinking),
@@ -1892,6 +1991,19 @@ fn body_requests_thinking(value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn native_reasoning_fields_request_thinking(value: &Value) -> bool {
+    value
+        .get("output_config")
+        .and_then(|output_config| output_config.get("effort"))
+        .and_then(Value::as_str)
+        .is_some_and(|effort| !effort.trim().is_empty())
+        || value
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+            .and_then(Value::as_str)
+            .is_some_and(|effort| !effort.trim().is_empty())
 }
 
 fn thinking_value_enabled(value: &Value) -> bool {
@@ -1939,6 +2051,49 @@ fn fake_json_message(request_id: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+fn fake_kiro_model_discovery_message(request_id: &str) -> Response {
+    (
+        StatusCode::OK,
+        [("request-id", request_id), ("x-amzn-requestid", request_id)],
+        Json(json!({
+            "models": [
+                fake_kiro_model("claude-sonnet-4"),
+                fake_kiro_model("claude-sonnet-4-20250514"),
+                fake_kiro_model("claude-sonnet-4.6")
+            ],
+            "nextToken": null
+        })),
+    )
+        .into_response()
+}
+
+fn fake_kiro_model(model_id: &str) -> Value {
+    json!({
+        "modelId": model_id,
+        "modelName": format!("Kiro loadtest fixture {model_id}"),
+        "supportedInputTypes": ["TEXT", "IMAGE"],
+        "tokenLimits": {
+            "maxInputTokens": 1000000,
+            "maxOutputTokens": 64000
+        },
+        "additionalModelRequestFieldsSchema": {
+            "type": "object",
+            "properties": {
+                "output_config": {
+                    "type": "object",
+                    "properties": {
+                        "effort": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "max"],
+                            "default": "high"
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn sse_response(request_id: String, events: Vec<(Duration, String)>) -> Response {
@@ -2562,12 +2717,36 @@ mod tests {
         let started = Instant::now();
         let mut parser = SseMetricsParser::new(started);
         for (_, event) in thinking_sse_events(Duration::ZERO) {
-            parser.push(event.as_bytes());
+            parser.push(event.as_bytes()).unwrap();
         }
         let metrics = parser.finish();
         assert!(metrics.first_thinking_ms.is_some());
         assert!(metrics.first_text_ms.is_some());
         assert!(metrics.saw_message_stop);
+    }
+
+    #[test]
+    fn sse_parser_bounds_only_the_pending_event_for_five_rounds() {
+        let complete_event = b"data: {\"type\":\"ping\"}\n\n";
+        let complete_batch =
+            complete_event.repeat(LOADTEST_SSE_EVENT_MAX_BYTES / complete_event.len() + 2);
+
+        for round in 0..5 {
+            let mut complete = SseMetricsParser::new(Instant::now());
+            complete
+                .push(&complete_batch)
+                .unwrap_or_else(|error| panic!("round {round}: complete events: {error}"));
+            assert!(complete.buffer.is_empty(), "round {round}");
+
+            let mut pending = SseMetricsParser::new(Instant::now());
+            let error = pending
+                .push(&vec![b'x'; LOADTEST_SSE_EVENT_MAX_BYTES + 1])
+                .expect_err("an unterminated oversized event must be rejected");
+            assert!(
+                error.to_string().contains("SSE event exceeds"),
+                "round {round}"
+            );
+        }
     }
 
     fn kiro_event_payload(frame: &[u8]) -> Value {
@@ -2600,6 +2779,82 @@ mod tests {
         let split_args = Args::try_parse_from(["kiro_loadtest", "--fake-kiro-usage", "split"])
             .expect("parse split fake usage mode");
         assert_eq!(split_args.fake_kiro_usage, FakeKiroUsageMode::Split);
+    }
+
+    #[test]
+    fn fake_kiro_server_detects_cli_eventstream_by_accept_and_target() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            "application/vnd.amazon.eventstream".parse().unwrap(),
+        );
+        assert!(wants_stream(&headers));
+
+        let state = FakeServerState {
+            scenario: Scenario::NormalStream,
+            counter: Arc::new(AtomicU64::new(0)),
+            delay: Duration::ZERO,
+            recover_after: 10,
+            stream_chunks: 1,
+            stream_chunk_delay: Duration::ZERO,
+            fake_tool_input_chars: 0,
+            kiro_eventstream: true,
+            kiro_usage: FakeKiroUsageMode::Reported,
+            capture_dir: None,
+        };
+        let uri: Uri = "/fixture/".parse().unwrap();
+        let mut target_headers = HeaderMap::new();
+        target_headers.insert(
+            "x-amz-target",
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+                .parse()
+                .unwrap(),
+        );
+
+        assert!(wants_kiro_eventstream(&state, &uri, &target_headers));
+    }
+
+    #[test]
+    fn fake_kiro_server_detects_model_discovery_and_reports_reasoning_schema() {
+        let cli_uri: Uri = "/fixture/?origin=KIRO_CLI".parse().unwrap();
+        let mut cli_headers = HeaderMap::new();
+        cli_headers.insert(
+            "x-amz-target",
+            "AmazonCodeWhispererService.ListAvailableModels"
+                .parse()
+                .unwrap(),
+        );
+        assert!(is_kiro_model_discovery_request(&cli_uri, &cli_headers));
+
+        let ide_uri: Uri = "/fixture/ListAvailableModels?origin=AI_EDITOR"
+            .parse()
+            .unwrap();
+        assert!(is_kiro_model_discovery_request(&ide_uri, &HeaderMap::new()));
+
+        let model = fake_kiro_model("claude-sonnet-4.6");
+        assert_eq!(model["modelId"], "claude-sonnet-4.6");
+        assert_eq!(
+            model["additionalModelRequestFieldsSchema"]["properties"]["output_config"]["properties"]
+                ["effort"]["enum"],
+            json!(["low", "medium", "high", "max"])
+        );
+    }
+
+    #[test]
+    fn thinking_loadtest_payload_keeps_budget_below_max_tokens() {
+        let mut config = test_config(PayloadCase::TextHistory);
+        config.model = "sonnet".to_string();
+        config.thinking = true;
+
+        let body = request_body(&config, 0);
+        let max_tokens = body["max_tokens"].as_i64().unwrap();
+        let budget_tokens = body["thinking"]["budget_tokens"].as_i64().unwrap();
+
+        assert!(budget_tokens >= 1024);
+        assert!(
+            budget_tokens < max_tokens,
+            "thinking budget must pass the proxy entry validation"
+        );
     }
 
     #[test]
@@ -2692,6 +2947,27 @@ mod tests {
         });
 
         assert!(body_requests_thinking(&request));
+    }
+
+    #[test]
+    fn fake_server_detects_native_kiro_reasoning_fields() {
+        let output_config_request = json!({
+            "additionalModelRequestFields": {
+                "output_config": {
+                    "effort": "high"
+                }
+            }
+        });
+        let reasoning_request = json!({
+            "additionalModelRequestFields": {
+                "reasoning": {
+                    "effort": "max"
+                }
+            }
+        });
+
+        assert!(body_requests_thinking(&output_config_request));
+        assert!(body_requests_thinking(&reasoning_request));
     }
 
     #[test]
@@ -2858,7 +3134,7 @@ mod tests {
         let events = long_stream_sse_events(Duration::ZERO, 4, Duration::ZERO);
         assert!(events.len() >= 8);
         for (_, event) in events {
-            parser.push(event.as_bytes());
+            parser.push(event.as_bytes()).unwrap();
         }
         let metrics = parser.finish();
         assert!(metrics.first_text_ms.is_some());

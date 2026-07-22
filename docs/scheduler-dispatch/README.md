@@ -12,6 +12,12 @@ has been applied in this repository.
   cooldown policy, concurrency controls, observability, and deliberate non-goals.
 - [Implementation Record](./implementation-plan.md): what was changed in backend, Redis state,
   Admin APIs, the old UI, the current `/ui`, and tests.
+- [Production Follow-ups 2026-07-15](../../feature/audits/scheduler-production-followups-20260715.md): post-upgrade production
+  issues around strict local-first external fallback, Redis scheduler degraded errors, usage
+  cleanup risk, and health-balanced in-flight skew.
+- [Cross-topic Analysis Status Index 2026-07-15](../../feature/audits/analysis-status-index-20260715.md): unified
+  evidence chain, reproduction/validation matrix, and remaining actions across scheduler, usage,
+  stream, tool/schema, release, and production evidence topics.
 
 ## Implemented scope
 
@@ -44,6 +50,10 @@ Implemented backend behavior:
     fixed probability.
 11. Admin API snapshots expose per-credential health state and aggregate global capacity state.
 12. Both Admin UIs expose the new scheduler mode, runtime controls, and health/capacity state.
+13. In the current unreleased hardening tree, finite local/external queue leases cover the frozen
+    request wait deadline plus a 60-second safety margin and do not renew periodically; unlimited
+    local waits remain renewable. This removes per-waiter Redis write amplification without
+    weakening cancellation, release, or crash-TTL recovery.
 
 ## Recommended runtime posture
 

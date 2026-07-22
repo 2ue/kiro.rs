@@ -63,6 +63,24 @@ pub(super) fn concurrency_blocked_count(
         .count()
 }
 
+pub(super) fn rate_limit_blocked_count(
+    entries: &[CredentialEntry],
+    proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
+    model: Option<&str>,
+    excluded_ids: &HashSet<u64>,
+    now: Instant,
+    global_rpm: u32,
+) -> usize {
+    entries
+        .iter()
+        .filter(|entry| {
+            credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+                && entry_cooldown_remaining(entry, model, now).is_none()
+                && entry_rate_limit_remaining(entry, global_rpm, now).is_some()
+        })
+        .count()
+}
+
 pub(super) fn effective_concurrency_range_for_candidates(
     entries: &[CredentialEntry],
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,

@@ -15,15 +15,16 @@ use sha2::{Digest, Sha256};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AccessKeysResponse, AddCredentialRequest, AddCredentialResponse, BalanceResponse,
-    BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
-    BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
-    BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, BulkCredentialActionError,
-    BulkCredentialActionResponse, ClearInFlightRequest, CreateProxyResourceRequest,
-    CreateRequestApiKeyRequest, CredentialAccountInfo, CredentialAccountInfoItem,
-    CredentialAccountInfoListResponse, CredentialCooldown, CredentialCreditSummaryResponse,
-    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialListItem,
-    CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
+    AccessKeysResponse, AddCredentialRequest, AddCredentialResponse,
+    AuxiliaryUpstreamRuntimeResponse, BalanceResponse, BatchCredentialImportDefaults,
+    BatchCredentialImportDuplicateMode, BatchCredentialImportItem, BatchCredentialImportRequest,
+    BatchCredentialImportResponse, BatchUpdateCredentialItem, BatchUpdateCredentialsRequest,
+    BatchUpdateCredentialsResponse, BulkCredentialActionError, BulkCredentialActionResponse,
+    ClearInFlightRequest, CreateProxyResourceRequest, CreateRequestApiKeyRequest,
+    CredentialAccountInfo, CredentialAccountInfoItem, CredentialAccountInfoListResponse,
+    CredentialCooldown, CredentialCreditSummaryResponse, CredentialInfoRefreshItem,
+    CredentialInfoRefreshResponse, CredentialListItem, CredentialListResponse,
+    CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
     CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
     CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
     CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
@@ -35,13 +36,17 @@ use super::types::{
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
     SetLoadBalancingModeRequest, SetSupportedModelsRequest, SetWarmupRequest,
     SupportedModelsResponse, TestCredentialRequest, TestCredentialResponse,
-    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
-    UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
-    ValidateExternalCredentialsRequest,
+    TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
+    UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
+    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
+    inference_attempt_budget::{
+        MAX_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
+        MIN_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
+    },
     model_capabilities::{
         MANUAL_SOURCE, ModelCapabilitiesCatalog, ModelCapabilitiesStatus, ModelCapabilityItem,
         ModelResolutionSource, normalize_model_id, normalize_supported_input_types,
@@ -49,20 +54,21 @@ use crate::anthropic::{
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
     prompt_cache_creation_control::PromptCacheCreationController,
+    request_admission::RequestAdmissionController,
     usage::{
         UsageDashboardResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
         UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
-use crate::common::auth::RequestApiKeyStore;
+use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolManager,
     ExternalPoolTestResponse, ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest,
     UpdateExternalPoolRequest, external_pool_messages_url, external_pool_models_url,
 };
 use crate::http_client::{
-    ProxyConfig, build_client, response_bytes_with_body_timeout, response_text_with_body_timeout,
-    send_with_response_header_timeout,
+    ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
+    response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::events::Event;
@@ -75,15 +81,19 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
-use crate::model::config::{ExternalPoolsConfig, normalize_defined_cache_routes};
+use crate::model::config::{
+    ExternalPoolsConfig, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM,
+    MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
+};
 use crate::model::model_support::{
     expand_claude_supported_model_variants, normalize_supported_models,
 };
 use crate::storage::postgres::{
-    AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
-    PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
+    AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, NewUsageCleanupJob,
+    PostgresStore, PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
+    UsageCleanupJobProgress, UsageCleanupJobRow,
 };
-use crate::storage::redis_cache::RedisStore;
+use crate::storage::redis_cache::{RedisPatternDeleteStats, RedisStore};
 
 /// 账号信息缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -95,6 +105,17 @@ const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
+const USAGE_CLEANUP_DEFAULT_BATCH_SIZE: usize = 250;
+const USAGE_CLEANUP_MAX_BATCH_SIZE: usize = 500;
+const USAGE_CLEANUP_LEASE_SECS: u64 = 30;
+const USAGE_CLEANUP_HEARTBEAT_ATTEMPT_TIMEOUT_MS: u64 = 2_000;
+const USAGE_CLEANUP_HEARTBEAT_MAX_ATTEMPTS: usize = 3;
+const USAGE_CLEANUP_HEARTBEAT_RETRY_MS: u64 = 100;
+const USAGE_CLEANUP_RECOVERY_POLL_MIN_SECS: u64 = 1;
+const USAGE_CLEANUP_RECOVERY_POLL_MAX_SECS: u64 = 15;
+const USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRIES: usize = 5;
+const USAGE_CLEANUP_LOCK_CONTENTION_RETRY_MS: u64 = 25;
+const USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRY_MS: u64 = 400;
 const ADMIN_USAGE_CACHE_TTL_SECS: usize = 2;
 const ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS: usize = 2;
 const ADMIN_CACHE_DEFAULT_LOCAL_TTL_SECS: usize = 2;
@@ -103,6 +124,8 @@ const ADMIN_CACHE_LOCAL_STALE_TTL_SECS: u64 = 30;
 const DEFAULT_PROXY_TEST_URL: &str = "https://api.ipify.org?format=json";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 12;
 const PROXY_TEST_PREVIEW_CHARS: usize = 300;
+const ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+const ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
@@ -429,15 +452,15 @@ fn mask_secret(value: &str) -> String {
     format!("{}...{}", head, tail)
 }
 
-fn request_api_key_id(key: &str) -> String {
-    hex::encode(Sha256::digest(key.as_bytes()))
+fn credential_secret_hash(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 fn request_api_key_items(keys: &[String]) -> Vec<RequestApiKeyItem> {
     keys.iter()
         .enumerate()
         .map(|(index, key)| RequestApiKeyItem {
-            id: request_api_key_id(key),
+            id: crate::common::auth::request_api_key_id(key),
             api_key: key.clone(),
             masked_api_key: mask_secret(key),
             primary: index == 0,
@@ -479,7 +502,7 @@ fn remove_request_api_key_by_id(
 ) -> Result<String, AdminServiceError> {
     let index = keys
         .iter()
-        .position(|key| request_api_key_id(key) == key_id)
+        .position(|key| crate::common::auth::request_api_key_id(key) == key_id)
         .ok_or_else(|| AdminServiceError::InvalidCredential("调用 API Key 不存在".to_string()))?;
     if keys.len() <= 1 {
         return Err(AdminServiceError::Conflict(
@@ -503,8 +526,10 @@ struct CredentialsBackupExport {
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     postgres_store: Arc<PostgresStore>,
-    redis_store: Arc<RedisStore>,
+    /// Optional independent Redis for usage/statistics/Admin caches and cleanup only.
+    observability_redis_store: Option<Arc<RedisStore>>,
     request_api_key_store: Arc<RequestApiKeyStore>,
+    request_admission: Arc<RequestAdmissionController>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
     usage_recorder: Arc<UsageRecorder>,
@@ -514,6 +539,8 @@ pub struct AdminService {
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
     kiro_provider: Arc<KiroProvider>,
     external_pool_manager: Arc<ExternalPoolManager>,
+    /// Serializes credential imports so duplicate preflight cannot fan out auxiliary model calls.
+    credential_import_lock: Arc<tokio::sync::Mutex<()>>,
     usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
     admin_cache_shadow: Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
 }
@@ -528,8 +555,9 @@ pub struct AdminServiceDependencies {
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub kiro_provider: Arc<KiroProvider>,
     pub postgres_store: Arc<PostgresStore>,
-    pub redis_store: Arc<RedisStore>,
+    pub observability_redis_store: Option<Arc<RedisStore>>,
     pub request_api_key_store: Arc<RequestApiKeyStore>,
+    pub request_admission: Arc<RequestAdmissionController>,
     pub external_pool_manager: Arc<ExternalPoolManager>,
 }
 
@@ -561,6 +589,7 @@ impl Default for UsageCleanupRuntime {
             status: UsageCleanupStatusResponse {
                 job_id: None,
                 status: UsageCleanupJobStatus::Idle,
+                phase: "idle".to_string(),
                 mode: None,
                 cutoff_at: None,
                 batch_size: 0,
@@ -571,6 +600,12 @@ impl Default for UsageCleanupRuntime {
                 processed_rows: 0,
                 last_batch_rows: 0,
                 batches: 0,
+                redis_deleted_keys: 0,
+                redis_delete_commands: 0,
+                redis_max_command_keys: 0,
+                redis_scan_passes: 0,
+                redis_used_del_fallback: false,
+                redis_pass_limit_reached: false,
                 cancel_requested: false,
                 stop_reason: None,
                 started_at: None,
@@ -595,15 +630,23 @@ impl AdminService {
             model_capabilities,
             kiro_provider,
             postgres_store,
-            redis_store,
+            observability_redis_store,
             request_api_key_store,
+            request_admission,
             external_pool_manager,
         } = dependencies;
-        Self {
+        assert!(
+            observability_redis_store
+                .as_ref()
+                .is_none_or(|redis| redis.is_observability()),
+            "Admin observability caches must not receive the business Redis store"
+        );
+        let service = Self {
             token_manager,
             postgres_store,
-            redis_store,
+            observability_redis_store,
             request_api_key_store,
+            request_admission,
             known_endpoints: known_endpoints.into_iter().collect(),
             usage_recorder,
             prompt_cache,
@@ -612,16 +655,21 @@ impl AdminService {
             model_capabilities,
             kiro_provider,
             external_pool_manager,
+            credential_import_lock: Arc::new(tokio::sync::Mutex::new(())),
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
             admin_cache_shadow: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        service.resume_persisted_usage_cleanup();
+        service
     }
 
     fn invalidate_balance_cache(&self, id: u64) {
-        let redis = self.redis_store.clone();
+        let Some(redis) = self.observability_redis_store.clone() else {
+            return;
+        };
         tokio::spawn(async move {
             if let Err(err) = redis.del(balance_cache_key(id)).await {
-                tracing::warn!("清理 Redis 账号信息缓存失败: {}", err);
+                tracing::warn!("清理 observability Redis 账号信息缓存失败: {}", err);
             }
         });
     }
@@ -643,7 +691,9 @@ impl AdminService {
             }
         };
 
-        let redis = self.redis_store.clone();
+        let Some(redis) = self.observability_redis_store.clone() else {
+            return stale_value.and_then(|value| deserialize_admin_cache_value(&value));
+        };
         let key = key.to_string();
         let redis_key = key.clone();
         match block_on_admin_store(async move {
@@ -664,7 +714,7 @@ impl AdminService {
             }
             Ok(None) => stale_value.and_then(|value| deserialize_admin_cache_value(&value)),
             Err(err) => {
-                tracing::warn!("读取 Redis Admin 缓存失败: {}", err);
+                tracing::warn!("读取 observability Redis Admin 缓存失败: {}", err);
                 stale_value.and_then(|value| deserialize_admin_cache_value(&value))
             }
         }
@@ -682,10 +732,12 @@ impl AdminService {
             }
         };
         self.write_admin_cache_shadow(key.clone(), value.clone(), ttl_secs);
-        let redis = self.redis_store.clone();
+        let Some(redis) = self.observability_redis_store.clone() else {
+            return;
+        };
         tokio::spawn(async move {
             if let Err(err) = redis.set_json(key, &value, ttl_secs).await {
-                tracing::warn!("写入 Redis Admin 缓存失败: {}", err);
+                tracing::warn!("写入 observability Redis Admin 缓存失败: {}", err);
             }
         });
     }
@@ -706,19 +758,29 @@ impl AdminService {
 
     fn invalidate_admin_cache_pattern(&self, pattern: &'static str) {
         invalidate_admin_cache_shadow(&self.admin_cache_shadow, pattern);
-        let redis = self.redis_store.clone();
+        let Some(redis) = self.observability_redis_store.clone() else {
+            return;
+        };
         tokio::spawn(async move {
             if let Err(err) = redis.del_pattern(pattern).await {
-                tracing::warn!("清理 Redis Admin 缓存失败: {}", err);
+                tracing::warn!("清理 observability Redis Admin 缓存失败: {}", err);
             }
         });
     }
 
-    fn invalidate_usage_admin_cache(&self) {
-        self.invalidate_admin_cache_pattern("admin_cache:usage:*");
+    fn invalidate_external_pool_admin_cache_with_pool(
+        &self,
+        reason: &'static str,
+        pool: &ExternalPool,
+    ) {
+        self.external_pool_manager
+            .notify_external_pool_data_changed_with_local_pool(reason, pool);
+        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
     }
 
-    fn invalidate_external_pool_admin_cache(&self) {
+    fn invalidate_external_pool_admin_cache_for_delete(&self, reason: &'static str, pool_id: u64) {
+        self.external_pool_manager
+            .notify_external_pool_deleted(reason, pool_id);
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
     }
 
@@ -787,7 +849,7 @@ impl AdminService {
             keys,
             "create_request_api_key",
             json!({
-                "keyId": request_api_key_id(&next_key),
+                "keyId": stable_request_api_key_id(&next_key),
                 "maskedApiKey": mask_secret(&next_key),
             }),
         )?;
@@ -818,7 +880,7 @@ impl AdminService {
         let mut keys = self.token_manager.runtime_config().request_api_keys();
         let index = keys
             .iter()
-            .position(|key| request_api_key_id(key) == key_id)
+            .position(|key| stable_request_api_key_id(key) == key_id)
             .ok_or_else(|| {
                 AdminServiceError::InvalidCredential("调用 API Key 不存在".to_string())
             })?;
@@ -837,7 +899,7 @@ impl AdminService {
             "update_request_api_key",
             json!({
                 "keyId": key_id,
-                "nextKeyId": request_api_key_id(&next_key),
+                "nextKeyId": stable_request_api_key_id(&next_key),
                 "maskedApiKey": mask_secret(&next_key),
             }),
         )?;
@@ -877,8 +939,9 @@ impl AdminService {
         request: CreateExternalPoolRequest,
     ) -> Result<ExternalPool, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool = block_on_admin_store(async move { store.create_external_pool(request).await })
-            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        let pool =
+            block_on_admin_store(async move { store.create_external_pool_unmasked(request).await })
+                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
         self.audit(
             "create_external_pool",
             "external_pool",
@@ -887,8 +950,8 @@ impl AdminService {
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
-        self.invalidate_external_pool_admin_cache();
-        Ok(pool)
+        self.invalidate_external_pool_admin_cache_with_pool("create", &pool);
+        Ok(pool.masked_for_admin_response())
     }
 
     pub fn update_external_pool(
@@ -898,9 +961,11 @@ impl AdminService {
     ) -> Result<ExternalPool, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool =
-            block_on_admin_store(async move { store.update_external_pool(id, request).await })
-                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
-                .ok_or(AdminServiceError::NotFound { id })?;
+            block_on_admin_store(
+                async move { store.update_external_pool_unmasked(id, request).await },
+            )
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
         self.audit(
             "update_external_pool",
             "external_pool",
@@ -909,8 +974,8 @@ impl AdminService {
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
-        self.invalidate_external_pool_admin_cache();
-        Ok(pool)
+        self.invalidate_external_pool_admin_cache_with_pool("update", &pool);
+        Ok(pool.masked_for_admin_response())
     }
 
     pub fn set_external_pool_supported_models(
@@ -921,7 +986,7 @@ impl AdminService {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models(id, request.supported_models)
+                .set_external_pool_supported_models_unmasked(id, request.supported_models)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -934,7 +999,7 @@ impl AdminService {
             None,
             json!({ "supportedModels": pool.supported_models.clone() }),
         );
-        self.invalidate_external_pool_admin_cache();
+        self.invalidate_external_pool_admin_cache_with_pool("supported_models", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
@@ -953,7 +1018,7 @@ impl AdminService {
         let supported_models_for_store = supported_models.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models(id, supported_models_for_store)
+                .set_external_pool_supported_models_unmasked(id, supported_models_for_store)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -968,7 +1033,7 @@ impl AdminService {
                 "supportedModels": pool.supported_models.clone(),
             }),
         );
-        self.invalidate_external_pool_admin_cache();
+        self.invalidate_external_pool_admin_cache_with_pool("supported_models_sync", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
@@ -1058,11 +1123,12 @@ impl AdminService {
                 AdminServiceError::InvalidCredential(format!("外部池模型列表请求失败: {err}"))
             })?;
         let status = response.status();
-        let body = response_text_with_body_timeout(response, timeout_secs)
-            .await
-            .map_err(|err| {
-                AdminServiceError::InvalidCredential(format!("读取外部池模型列表失败: {err}"))
-            })?;
+        let body =
+            response_text_with_limit_and_body_timeout(response, timeout_secs, 4 * 1024 * 1024)
+                .await
+                .map_err(|err| {
+                    AdminServiceError::InvalidCredential(format!("读取外部池模型列表失败: {err}"))
+                })?;
         if !status.is_success() {
             let suffix = body.chars().take(500).collect::<String>();
             return Err(AdminServiceError::InvalidCredential(format!(
@@ -1096,7 +1162,7 @@ impl AdminService {
             None,
             json!({}),
         );
-        self.invalidate_external_pool_admin_cache();
+        self.invalidate_external_pool_admin_cache_for_delete("delete", id);
         Ok(())
     }
 
@@ -1107,7 +1173,9 @@ impl AdminService {
     ) -> Result<ExternalPool, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
-            store.set_external_pool_enabled(id, request.enabled).await
+            store
+                .set_external_pool_enabled_unmasked(id, request.enabled)
+                .await
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
         .ok_or(AdminServiceError::NotFound { id })?;
@@ -1119,8 +1187,8 @@ impl AdminService {
             None,
             json!({ "enabled": request.enabled }),
         );
-        self.invalidate_external_pool_admin_cache();
-        Ok(pool)
+        self.invalidate_external_pool_admin_cache_with_pool("enabled", &pool);
+        Ok(pool.masked_for_admin_response())
     }
 
     pub fn clear_external_pool_auto_disabled(
@@ -1128,10 +1196,11 @@ impl AdminService {
         id: u64,
     ) -> Result<ExternalPool, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool =
-            block_on_admin_store(async move { store.clear_external_pool_auto_disabled(id).await })
-                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
-                .ok_or(AdminServiceError::NotFound { id })?;
+        let pool = block_on_admin_store(async move {
+            store.clear_external_pool_auto_disabled_unmasked(id).await
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
         self.audit(
             "clear_external_pool_auto_disabled",
             "external_pool",
@@ -1140,8 +1209,8 @@ impl AdminService {
             None,
             json!({}),
         );
-        self.invalidate_external_pool_admin_cache();
-        Ok(pool)
+        self.invalidate_external_pool_admin_cache_with_pool("clear_auto_disabled", &pool);
+        Ok(pool.masked_for_admin_response())
     }
 
     pub fn get_external_pool_status(
@@ -1217,7 +1286,24 @@ impl AdminService {
             Ok::<ExternalPoolTestResponse, anyhow::Error>(match result {
                 Ok(response) => {
                     let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
+                    let body = match response_text_with_limit_and_body_timeout(
+                        response,
+                        15,
+                        ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(body) => body,
+                        Err(error) => {
+                            return Ok(ExternalPoolTestResponse {
+                                ok: false,
+                                status: Some(status.as_u16()),
+                                message: format!("读取外部池测试响应失败: {error}"),
+                                model,
+                                response: None,
+                            });
+                        }
+                    };
                     let response_text = if status.is_success() {
                         extract_external_pool_test_response_text(&body)
                     } else {
@@ -1383,6 +1469,13 @@ impl AdminService {
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
         };
+        credentials
+            .validate_api_key_import_fields()
+            .map_err(|reason| {
+                AdminServiceError::InvalidCredential(format!(
+                    "API-key import fields are invalid: {reason}"
+                ))
+            })?;
         credentials.canonicalize_auth_method();
         credentials.normalize_supported_models();
         credentials.normalize_api_key_defaults();
@@ -1408,6 +1501,50 @@ impl AdminService {
             }
         }
         Ok(credentials)
+    }
+
+    fn reject_duplicate_credential_before_auxiliary_calls(
+        &self,
+        credential: &KiroCredentials,
+    ) -> Result<(), AdminServiceError> {
+        let (candidate_hash, duplicate_label, api_key) = if credential.is_api_key_credential() {
+            let Some(value) = credential
+                .kiro_api_key
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(());
+            };
+            (credential_secret_hash(value), "kiroApiKey", true)
+        } else {
+            let Some(value) = credential
+                .refresh_token
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(());
+            };
+            (credential_secret_hash(value), "refreshToken", false)
+        };
+        let duplicate = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .any(|entry| {
+                if api_key {
+                    entry.api_key_hash.as_deref() == Some(candidate_hash.as_str())
+                } else {
+                    entry.refresh_token_hash.as_deref() == Some(candidate_hash.as_str())
+                }
+            });
+        if duplicate {
+            return Err(AdminServiceError::Conflict(format!(
+                "凭据已存在（{} 重复）",
+                duplicate_label
+            )));
+        }
+        Ok(())
     }
 
     fn invalidate_all_credential_caches(&self) {
@@ -2071,17 +2208,17 @@ impl AdminService {
         force: bool,
     ) -> Result<BalanceResponse, AdminServiceError> {
         if !force {
-            if let Ok(Some(cached)) = self
-                .redis_store
-                .get_json::<CachedBalance>(balance_cache_key(id))
-                .await
-            {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 账号信息命中 Redis 缓存", id);
-                    let cached_data = normalize_balance_credit_snapshot(&cached.data);
-                    self.save_account_info_snapshot(&cached_data).await?;
-                    return Ok(cached_data);
+            if let Some(redis) = self.observability_redis_store.as_ref() {
+                if let Ok(Some(cached)) =
+                    redis.get_json::<CachedBalance>(balance_cache_key(id)).await
+                {
+                    let now = Utc::now().timestamp() as f64;
+                    if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                        tracing::debug!("凭据 #{} 账号信息命中 Redis 缓存", id);
+                        let cached_data = normalize_balance_credit_snapshot(&cached.data);
+                        self.save_account_info_snapshot(&cached_data).await?;
+                        return Ok(cached_data);
+                    }
                 }
             }
         }
@@ -2094,16 +2231,17 @@ impl AdminService {
             cached_at: Utc::now().timestamp() as f64,
             data: balance.clone(),
         };
-        if let Err(err) = self
-            .redis_store
-            .set_json(
-                balance_cache_key(id),
-                &cached,
-                BALANCE_CACHE_TTL_SECS as usize,
-            )
-            .await
-        {
-            tracing::warn!("保存 Redis 账号信息缓存失败: {}", err);
+        if let Some(redis) = self.observability_redis_store.as_ref() {
+            if let Err(err) = redis
+                .set_json(
+                    balance_cache_key(id),
+                    &cached,
+                    BALANCE_CACHE_TTL_SECS as usize,
+                )
+                .await
+            {
+                tracing::warn!("保存 observability Redis 账号信息缓存失败: {}", err);
+            }
         }
 
         Ok(balance)
@@ -2481,9 +2619,10 @@ impl AdminService {
         let runtime_config = self.token_manager.runtime_config();
         let credential_id = api_response.credential_id();
         let (response, completion) = api_response.into_parts();
-        let body_bytes = match response_bytes_with_body_timeout(
+        let body_bytes = match response_bytes_with_limit_and_body_timeout(
             response,
             runtime_config.kiro_upstream_response_timeout_secs,
+            ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES,
         )
         .await
         {
@@ -2524,9 +2663,10 @@ impl AdminService {
             .await
             .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
         let (response, completion) = api_response.into_parts();
-        let body_bytes = match response_bytes_with_body_timeout(
+        let body_bytes = match response_bytes_with_limit_and_body_timeout(
             response,
             runtime_config.kiro_upstream_response_timeout_secs,
+            ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES,
         )
         .await
         {
@@ -2670,11 +2810,13 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        let _import_guard = self.credential_import_lock.lock().await;
         let email = req.email.clone();
         let warmup_remaining = req.warmup_remaining;
         let enable_overage_after_import = req.enable_overage_after_import.unwrap_or(false);
         let disabled = req.disabled.unwrap_or(false);
         let mut new_cred = self.credential_from_request(req, disabled)?;
+        self.reject_duplicate_credential_before_auxiliary_calls(&new_cred)?;
         let mut api_key_supported_models_autodiscovered = false;
 
         if new_cred.is_api_key_credential() && new_cred.supported_models.is_empty() {
@@ -3055,7 +3197,13 @@ impl AdminService {
 
         let status = response.status();
         let status_u16 = status.as_u16();
-        let body = match response_text_with_body_timeout(response, PROXY_TEST_TIMEOUT_SECS).await {
+        let body = match response_text_with_limit_and_body_timeout(
+            response,
+            PROXY_TEST_TIMEOUT_SECS,
+            64 * 1024,
+        )
+        .await
+        {
             Ok(body) => body,
             Err(err) => {
                 return Ok(ProxyResourceTestResponse {
@@ -3627,7 +3775,7 @@ impl AdminService {
     /// 手动同步 Kiro 模型能力。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_capabilities(&self) -> ModelCapabilitiesStatus {
         let status = match self.kiro_provider.list_available_models().await {
-            Ok(models) => self.model_capabilities.sync_from_kiro_models(models),
+            Ok(models) => self.model_capabilities.sync_from_kiro_catalog(models),
             Err(err) => {
                 tracing::warn!("同步 Kiro 模型能力失败，不影响请求调度: {}", err);
                 self.model_capabilities.record_sync_error(err.to_string())
@@ -3786,18 +3934,16 @@ impl AdminService {
         result
     }
 
-    /// 清空 usage 记录。
-    pub fn clear_usage_records(&self) {
-        self.usage_recorder.clear();
-        self.invalidate_usage_admin_cache();
-        self.audit(
-            "clear_usage_records",
-            "usage_record",
-            None,
-            true,
-            None,
-            json!({ "mode": "soft_delete" }),
-        );
+    /// 兼容旧清空入口：提交一个有界、可审计的全量明细软删除任务。
+    pub fn clear_usage_records(&self) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
+        self.start_usage_cleanup(UsageCleanupRequest {
+            mode: UsageCleanupMode::SoftDelete,
+            older_than_days: Some(0),
+            cutoff_before: None,
+            batch_size: Some(USAGE_CLEANUP_DEFAULT_BATCH_SIZE),
+            max_batches: None,
+            pause_ms_between_batches: None,
+        })
     }
 
     pub fn preview_usage_cleanup(
@@ -3833,38 +3979,53 @@ impl AdminService {
     ) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
         let plan = normalize_usage_cleanup_request(request)?;
         let store = PostgresUsageStore::new(self.postgres_store.clone());
-        let preview = block_on_admin_store({
+        let now = Utc::now();
+        let job_id = format!("usage-cleanup-{}", uuid::Uuid::new_v4().simple());
+        let inserted = block_on_admin_store({
             let store = store.clone();
+            let job_id = job_id.clone();
             let plan = plan.clone();
             async move {
-                match plan.mode {
-                    UsageCleanupMode::SoftDelete => {
-                        store.preview_soft_delete_cleanup(plan.cutoff).await
-                    }
-                    UsageCleanupMode::HardDelete => {
-                        store.preview_hard_delete_cleanup(plan.cutoff).await
-                    }
-                }
+                store
+                    .create_cleanup_job(NewUsageCleanupJob {
+                        job_id: &job_id,
+                        mode: usage_cleanup_mode_value(plan.mode),
+                        cutoff_at: plan.cutoff,
+                        batch_size: plan.batch_size,
+                        max_batches: plan.max_batches,
+                        pause_ms_between_batches: plan.pause_ms_between_batches,
+                    })
+                    .await
             }
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        if !inserted {
+            return Err(AdminServiceError::Conflict(
+                "已有 usage 清理任务正在排队或运行".to_string(),
+            ));
+        }
 
-        let now = Utc::now();
-        let job_id = format!("usage-cleanup-{}", now.timestamp_millis());
         let cancel = Arc::new(AtomicBool::new(false));
         let status = UsageCleanupStatusResponse {
             job_id: Some(job_id.clone()),
-            status: UsageCleanupJobStatus::Running,
+            status: UsageCleanupJobStatus::Queued,
+            phase: "postgres".to_string(),
             mode: Some(plan.mode),
             cutoff_at: Some(plan.cutoff.to_rfc3339()),
             batch_size: plan.batch_size,
             max_batches: plan.max_batches,
             pause_ms_between_batches: plan.pause_ms_between_batches,
-            matched_rows: Some(preview.matched_rows),
-            remaining_rows: Some(preview.matched_rows),
+            matched_rows: None,
+            remaining_rows: None,
             processed_rows: 0,
             last_batch_rows: 0,
             batches: 0,
+            redis_deleted_keys: 0,
+            redis_delete_commands: 0,
+            redis_max_command_keys: 0,
+            redis_scan_passes: 0,
+            redis_used_del_fallback: false,
+            redis_pass_limit_reached: false,
             cancel_requested: false,
             stop_reason: None,
             started_at: Some(now.to_rfc3339()),
@@ -3875,12 +4036,7 @@ impl AdminService {
 
         {
             let mut runtime = self.usage_cleanup.lock();
-            if runtime.status.status == UsageCleanupJobStatus::Running {
-                return Err(AdminServiceError::Conflict(
-                    "已有 usage 清理任务正在运行".to_string(),
-                ));
-            }
-            runtime.status = status;
+            runtime.status = status.clone();
             runtime.cancel = Some(cancel.clone());
         }
 
@@ -3896,43 +4052,181 @@ impl AdminService {
                 "cutoffAt": plan.cutoff.to_rfc3339(),
                 "batchSize": plan.batch_size,
                 "maxBatches": plan.max_batches,
-                "matchedRows": preview.matched_rows,
+                "submissionMode": "bounded_background_job",
             }),
         );
-
-        let cleanup_state = self.usage_cleanup.clone();
-        let redis = self.redis_store.clone();
-        let admin_cache_shadow = self.admin_cache_shadow.clone();
-        tokio::spawn(async move {
-            run_usage_cleanup_job(
-                job_id,
-                store,
-                redis,
-                admin_cache_shadow,
-                cleanup_state,
-                cancel,
-                plan,
-            )
-            .await;
-        });
-
-        Ok(self.get_usage_cleanup_status())
+        self.spawn_usage_cleanup_job(job_id, cancel);
+        Ok(status)
     }
 
     pub fn get_usage_cleanup_status(&self) -> UsageCleanupStatusResponse {
-        self.usage_cleanup.lock().status.clone()
+        let store = PostgresUsageStore::new(self.postgres_store.clone());
+        match block_on_admin_store(async move { store.latest_cleanup_job().await }) {
+            Ok(Some(job)) => {
+                let status = usage_cleanup_status_from_row(&job);
+                self.usage_cleanup.lock().status = status.clone();
+                status
+            }
+            Ok(None) => self.usage_cleanup.lock().status.clone(),
+            Err(err) => {
+                tracing::warn!("读取 usage cleanup 持久状态失败，回退进程内状态: {}", err);
+                self.usage_cleanup.lock().status.clone()
+            }
+        }
     }
 
-    pub fn cancel_usage_cleanup(&self) -> UsageCleanupStatusResponse {
-        let mut runtime = self.usage_cleanup.lock();
-        if runtime.status.status == UsageCleanupJobStatus::Running {
+    pub fn cancel_usage_cleanup(&self) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
+        let current = self.get_usage_cleanup_status();
+        let Some(job_id) = current.job_id.clone() else {
+            return Ok(current);
+        };
+        {
+            let mut runtime = self.usage_cleanup.lock();
             if let Some(cancel) = &runtime.cancel {
                 cancel.store(true, Ordering::Release);
             }
             runtime.status.cancel_requested = true;
             runtime.status.updated_at = Some(Utc::now().to_rfc3339());
         }
-        runtime.status.clone()
+        let store = PostgresUsageStore::new(self.postgres_store.clone());
+        let persisted = block_on_admin_store({
+            let job_id = job_id.clone();
+            async move { store.request_cleanup_cancel(&job_id).await }
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let status = persisted
+            .as_ref()
+            .map(usage_cleanup_status_from_row)
+            .unwrap_or_else(|| self.get_usage_cleanup_status());
+        self.usage_cleanup.lock().status = status.clone();
+        self.audit(
+            "cancel_usage_cleanup",
+            "usage_record",
+            Some(job_id.clone()),
+            persisted.is_some(),
+            persisted
+                .is_none()
+                .then(|| "任务已经结束或不存在".to_string()),
+            json!({ "jobId": job_id }),
+        );
+        Ok(status)
+    }
+
+    pub fn resume_usage_cleanup(
+        &self,
+        request: UsageCleanupResumeRequest,
+    ) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
+        let job_id = request.job_id.trim();
+        if job_id.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "jobId 不能为空".to_string(),
+            ));
+        }
+        let store = PostgresUsageStore::new(self.postgres_store.clone());
+        let resumed = block_on_admin_store({
+            let job_id = job_id.to_string();
+            async move { store.requeue_cleanup_job(&job_id).await }
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+        .ok_or_else(|| {
+            AdminServiceError::Conflict(
+                "只有已暂停、失败或已取消的 usage 清理任务可以恢复".to_string(),
+            )
+        })?;
+        let status = usage_cleanup_status_from_row(&resumed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut runtime = self.usage_cleanup.lock();
+            runtime.status = status.clone();
+            runtime.cancel = Some(cancel.clone());
+        }
+        self.audit(
+            "resume_usage_cleanup",
+            "usage_record",
+            Some(job_id.to_string()),
+            true,
+            None,
+            json!({ "jobId": job_id, "phase": resumed.phase }),
+        );
+        self.spawn_usage_cleanup_job(job_id.to_string(), cancel);
+        Ok(status)
+    }
+
+    fn spawn_usage_cleanup_job(&self, job_id: String, cancel: Arc<AtomicBool>) {
+        let store = PostgresUsageStore::new(self.postgres_store.clone());
+        let postgres = self.postgres_store.clone();
+        let observability_redis = self.observability_redis_store.clone();
+        let usage_recorder = self.usage_recorder.clone();
+        let admin_cache_shadow = self.admin_cache_shadow.clone();
+        let cleanup_state = self.usage_cleanup.clone();
+        tokio::spawn(async move {
+            run_usage_cleanup_job(
+                job_id,
+                store,
+                postgres,
+                observability_redis,
+                usage_recorder,
+                admin_cache_shadow,
+                cleanup_state,
+                cancel,
+            )
+            .await;
+        });
+    }
+
+    fn resume_persisted_usage_cleanup(&self) {
+        let store = PostgresUsageStore::new(self.postgres_store.clone());
+        let postgres = self.postgres_store.clone();
+        let observability_redis = self.observability_redis_store.clone();
+        let usage_recorder = self.usage_recorder.clone();
+        let admin_cache_shadow = self.admin_cache_shadow.clone();
+        let cleanup_state = Arc::downgrade(&self.usage_cleanup);
+        tokio::spawn(async move {
+            let mut poll_delay = StdDuration::from_secs(USAGE_CLEANUP_RECOVERY_POLL_MIN_SECS);
+            loop {
+                let Some(cleanup_state) = cleanup_state.upgrade() else {
+                    return;
+                };
+                match store.recoverable_cleanup_job().await {
+                    Ok(Some(job)) => {
+                        tracing::info!(
+                            job_id = %job.job_id,
+                            status = %job.status,
+                            lease_until = ?job.lease_until,
+                            "usage cleanup supervisor 发现可领取任务"
+                        );
+                        let cancel = Arc::new(AtomicBool::new(job.cancel_requested));
+                        {
+                            let mut runtime = cleanup_state.lock();
+                            runtime.status = usage_cleanup_status_from_row(&job);
+                            runtime.cancel = Some(cancel.clone());
+                        }
+                        run_usage_cleanup_job(
+                            job.job_id,
+                            store.clone(),
+                            postgres.clone(),
+                            observability_redis.clone(),
+                            usage_recorder.clone(),
+                            admin_cache_shadow.clone(),
+                            cleanup_state,
+                            cancel,
+                        )
+                        .await;
+                        poll_delay = StdDuration::from_secs(USAGE_CLEANUP_RECOVERY_POLL_MIN_SECS);
+                    }
+                    Ok(None) => {
+                        poll_delay = (poll_delay * 2)
+                            .min(StdDuration::from_secs(USAGE_CLEANUP_RECOVERY_POLL_MAX_SECS));
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "读取待恢复 usage cleanup job 失败");
+                        poll_delay = (poll_delay * 2)
+                            .min(StdDuration::from_secs(USAGE_CLEANUP_RECOVERY_POLL_MAX_SECS));
+                    }
+                }
+                tokio::time::sleep(poll_delay).await;
+            }
+        });
     }
 
     pub fn get_audit_logs(&self, page: usize, limit: usize) -> AdminAuditLogPage {
@@ -3952,11 +4246,15 @@ impl AdminService {
     /// 获取运行时全局配置。
     pub fn get_runtime_config(&self) -> RuntimeConfigResponse {
         let config = self.token_manager.runtime_config();
+        let auxiliary_concurrency = self.token_manager.auxiliary_concurrency_snapshot();
+        let token_refresh_admission = self.token_manager.token_refresh_admission_snapshot();
+        let refresh_clients = self.token_manager.refresh_client_cache_snapshot();
         RuntimeConfigResponse {
             proxy_url: config.proxy_url.clone(),
             proxy_username: config.proxy_username.clone(),
             proxy_password: config.proxy_password.clone(),
             credential_rpm: config.credential_rpm.unwrap_or(0),
+            request_admission: config.request_admission.normalized(),
             credential_max_concurrent_requests: config.credential_max_concurrent_requests,
             credential_transient_cooldown_secs: config.credential_transient_cooldown_secs,
             credential_rate_limit_cooldown_secs: config.credential_rate_limit_cooldown_secs,
@@ -3974,6 +4272,37 @@ impl AdminService {
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
             kiro_upstream_stream_retry_max_attempts: config.kiro_upstream_stream_retry_max_attempts,
+            inference_upstream_max_attempts: config.inference_upstream_max_attempts,
+            auxiliary_upstream_max_attempts: config.auxiliary_upstream_max_attempts,
+            auxiliary_upstream_max_concurrent_requests: config
+                .auxiliary_upstream_max_concurrent_requests,
+            auxiliary_upstream_runtime: AuxiliaryUpstreamRuntimeResponse {
+                configured_limit: auxiliary_concurrency.limit,
+                in_flight: auxiliary_concurrency.in_flight,
+                peak_in_flight: auxiliary_concurrency.peak_in_flight,
+                rejected: auxiliary_concurrency.rejected,
+                refresh_client_cache_entries: refresh_clients.entries,
+                refresh_client_cache_max_entries: refresh_clients.max_entries,
+                refresh_client_builds: refresh_clients.builds,
+                refresh_client_hits: refresh_clients.hits,
+                refresh_client_misses: refresh_clients.misses,
+                refresh_client_cache_saturated: refresh_clients.saturated,
+            },
+            token_refresh_max_rpm: config.token_refresh_max_rpm,
+            token_refresh_burst: config.token_refresh_burst,
+            token_refresh_admission_runtime: TokenRefreshAdmissionRuntimeResponse {
+                authority: token_refresh_admission.authority.as_str().to_string(),
+                breaker_state: token_refresh_admission.breaker_state.to_string(),
+                next_probe_after_ms: token_refresh_admission.next_probe_after_ms,
+                configured_rpm: token_refresh_admission.configured_rpm,
+                configured_burst: token_refresh_admission.configured_burst,
+                admitted: token_refresh_admission.admitted,
+                rate_limited: token_refresh_admission.rate_limited,
+                coordination_rejected: token_refresh_admission.coordination_rejected,
+                redis_errors: token_refresh_admission.redis_errors,
+                last_retry_after_ms: token_refresh_admission.last_retry_after_ms,
+                remaining_milli_tokens: token_refresh_admission.remaining_milli_tokens,
+            },
             kiro_upstream_stream_retry_on_idle_timeout: config
                 .kiro_upstream_stream_retry_on_idle_timeout,
             kiro_upstream_stream_retry_on_read_error: config
@@ -4055,6 +4384,10 @@ impl AdminService {
         req: UpdateRuntimeConfigRequest,
     ) -> Result<RuntimeConfigResponse, AdminServiceError> {
         let current_config = self.token_manager.runtime_config();
+        let request_admission = req
+            .request_admission
+            .unwrap_or(current_config.request_admission);
+        let request_admission = normalize_admin_request_admission(request_admission)?;
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
@@ -4070,6 +4403,21 @@ impl AdminService {
         let kiro_upstream_stream_retry_max_attempts = req
             .kiro_upstream_stream_retry_max_attempts
             .unwrap_or(current_config.kiro_upstream_stream_retry_max_attempts);
+        let inference_upstream_max_attempts = req
+            .inference_upstream_max_attempts
+            .unwrap_or(current_config.inference_upstream_max_attempts);
+        let auxiliary_upstream_max_attempts = req
+            .auxiliary_upstream_max_attempts
+            .unwrap_or(current_config.auxiliary_upstream_max_attempts);
+        let auxiliary_upstream_max_concurrent_requests = req
+            .auxiliary_upstream_max_concurrent_requests
+            .unwrap_or(current_config.auxiliary_upstream_max_concurrent_requests);
+        let token_refresh_max_rpm = req
+            .token_refresh_max_rpm
+            .unwrap_or(current_config.token_refresh_max_rpm);
+        let token_refresh_burst = req
+            .token_refresh_burst
+            .unwrap_or(current_config.token_refresh_burst);
         let kiro_upstream_stream_retry_on_idle_timeout = req
             .kiro_upstream_stream_retry_on_idle_timeout
             .unwrap_or(current_config.kiro_upstream_stream_retry_on_idle_timeout);
@@ -4287,6 +4635,7 @@ impl AdminService {
             .external_pools
             .clone()
             .unwrap_or_else(|| current_config.external_pools.clone());
+        let external_pool_policy_changed = external_pools != current_config.external_pools;
         let high_cache_threshold = req
             .high_cache_threshold
             .unwrap_or(current_config.high_cache_threshold);
@@ -4340,6 +4689,39 @@ impl AdminService {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialRetryMaxAttempts 不能大于 10000".to_string(),
             ));
+        }
+        if !(1..=10).contains(&inference_upstream_max_attempts) {
+            return Err(AdminServiceError::InvalidCredential(
+                "inferenceUpstreamMaxAttempts 必须在 1 到 10 之间".to_string(),
+            ));
+        }
+        if !(1..=10).contains(&auxiliary_upstream_max_attempts) {
+            return Err(AdminServiceError::InvalidCredential(
+                "auxiliaryUpstreamMaxAttempts 必须在 1 到 10 之间".to_string(),
+            ));
+        }
+        if !(MIN_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
+            ..=MAX_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS)
+            .contains(&auxiliary_upstream_max_concurrent_requests)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "auxiliaryUpstreamMaxConcurrentRequests 必须在 {} 到 {} 之间",
+                MIN_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
+                MAX_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS
+            )));
+        }
+        if !(MIN_TOKEN_REFRESH_MAX_RPM..=MAX_TOKEN_REFRESH_MAX_RPM).contains(&token_refresh_max_rpm)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "tokenRefreshMaxRpm 必须在 {} 到 {} 之间",
+                MIN_TOKEN_REFRESH_MAX_RPM, MAX_TOKEN_REFRESH_MAX_RPM
+            )));
+        }
+        if !(MIN_TOKEN_REFRESH_BURST..=MAX_TOKEN_REFRESH_BURST).contains(&token_refresh_burst) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "tokenRefreshBurst 必须在 {} 到 {} 之间",
+                MIN_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_BURST
+            )));
         }
         if credential_prompt_logic_retry_max_attempts > 10_000 {
             return Err(AdminServiceError::InvalidCredential(
@@ -4525,6 +4907,7 @@ impl AdminService {
         self.token_manager
             .update_runtime_config(|config| {
                 config.credential_rpm = credential_rpm;
+                config.request_admission = request_admission;
                 config.credential_max_concurrent_requests = req.credential_max_concurrent_requests;
                 config.credential_transient_cooldown_secs = req.credential_transient_cooldown_secs;
                 config.credential_rate_limit_cooldown_secs = credential_rate_limit_cooldown_secs;
@@ -4549,6 +4932,12 @@ impl AdminService {
                 config.kiro_upstream_stream_retry_enabled = kiro_upstream_stream_retry_enabled;
                 config.kiro_upstream_stream_retry_max_attempts =
                     kiro_upstream_stream_retry_max_attempts;
+                config.inference_upstream_max_attempts = inference_upstream_max_attempts;
+                config.auxiliary_upstream_max_attempts = auxiliary_upstream_max_attempts;
+                config.auxiliary_upstream_max_concurrent_requests =
+                    auxiliary_upstream_max_concurrent_requests;
+                config.token_refresh_max_rpm = token_refresh_max_rpm;
+                config.token_refresh_burst = token_refresh_burst;
                 config.kiro_upstream_stream_retry_on_idle_timeout =
                     kiro_upstream_stream_retry_on_idle_timeout;
                 config.kiro_upstream_stream_retry_on_read_error =
@@ -4620,6 +5009,7 @@ impl AdminService {
                 config.expose_proxy_warnings = expose_proxy_warnings;
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.request_admission.update_config(request_admission);
         self.audit(
             "update_runtime_config",
             "runtime_config",
@@ -4628,7 +5018,11 @@ impl AdminService {
             None,
             json!({}),
         );
-        self.invalidate_external_pool_admin_cache();
+        if external_pool_policy_changed {
+            self.external_pool_manager
+                .invalidate_external_pool_policy_state();
+            self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        }
 
         Ok(self.get_runtime_config())
     }
@@ -4796,13 +5190,17 @@ impl AdminService {
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
         let msg = e.to_string();
 
+        if msg.contains("凭据已存在")
+            || msg.contains("refreshToken 重复")
+            || msg.contains("kiroApiKey 重复")
+        {
+            return AdminServiceError::Conflict(msg);
+        }
+
         // 凭据验证失败（refreshToken 无效、格式错误等）
         let is_invalid_credential = msg.contains("缺少 refreshToken")
             || msg.contains("refreshToken 为空")
             || msg.contains("refreshToken 已被截断")
-            || msg.contains("凭据已存在")
-            || msg.contains("refreshToken 重复")
-            || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
             || msg.contains("代理资源不存在")
@@ -5087,6 +5485,15 @@ fn validate_runtime_cooldown_settings(
         ));
     }
     Ok(())
+}
+
+fn normalize_admin_request_admission(
+    config: crate::model::config::RequestAdmissionConfig,
+) -> Result<crate::model::config::RequestAdmissionConfig, AdminServiceError> {
+    config
+        .validate()
+        .map_err(AdminServiceError::InvalidCredential)?;
+    Ok(config.normalized())
 }
 
 fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {
@@ -6499,11 +6906,14 @@ fn normalize_usage_cleanup_request(
         ));
     }
 
-    let batch_size = request.batch_size.unwrap_or(1000);
-    if batch_size == 0 || batch_size > 5000 {
-        return Err(AdminServiceError::InvalidCredential(
-            "batchSize 必须在 1..=5000 之间".to_string(),
-        ));
+    let batch_size = request
+        .batch_size
+        .unwrap_or(USAGE_CLEANUP_DEFAULT_BATCH_SIZE);
+    if batch_size == 0 || batch_size > USAGE_CLEANUP_MAX_BATCH_SIZE {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "batchSize 必须在 1..={} 之间",
+            USAGE_CLEANUP_MAX_BATCH_SIZE
+        )));
     }
 
     let max_batches = request
@@ -6532,123 +6942,721 @@ fn normalize_usage_cleanup_request(
     })
 }
 
+fn usage_cleanup_mode_value(mode: UsageCleanupMode) -> &'static str {
+    match mode {
+        UsageCleanupMode::SoftDelete => "soft_delete",
+        UsageCleanupMode::HardDelete => "hard_delete",
+    }
+}
+
+fn usage_cleanup_mode_from_value(value: &str) -> Option<UsageCleanupMode> {
+    match value {
+        "soft_delete" => Some(UsageCleanupMode::SoftDelete),
+        "hard_delete" => Some(UsageCleanupMode::HardDelete),
+        _ => None,
+    }
+}
+
+fn usage_cleanup_status_value(status: UsageCleanupJobStatus) -> &'static str {
+    match status {
+        UsageCleanupJobStatus::Idle => "idle",
+        UsageCleanupJobStatus::Queued => "queued",
+        UsageCleanupJobStatus::Running => "running",
+        UsageCleanupJobStatus::Paused => "paused",
+        UsageCleanupJobStatus::Completed => "completed",
+        UsageCleanupJobStatus::Cancelled => "cancelled",
+        UsageCleanupJobStatus::Failed => "failed",
+    }
+}
+
+fn usage_cleanup_status_from_value(value: &str) -> UsageCleanupJobStatus {
+    match value {
+        "queued" => UsageCleanupJobStatus::Queued,
+        "running" => UsageCleanupJobStatus::Running,
+        "paused" => UsageCleanupJobStatus::Paused,
+        "completed" => UsageCleanupJobStatus::Completed,
+        "cancelled" => UsageCleanupJobStatus::Cancelled,
+        "failed" => UsageCleanupJobStatus::Failed,
+        _ => UsageCleanupJobStatus::Failed,
+    }
+}
+
+fn usage_cleanup_status_from_row(job: &UsageCleanupJobRow) -> UsageCleanupStatusResponse {
+    UsageCleanupStatusResponse {
+        job_id: Some(job.job_id.clone()),
+        status: usage_cleanup_status_from_value(&job.status),
+        phase: job.phase.clone(),
+        mode: usage_cleanup_mode_from_value(&job.mode),
+        cutoff_at: Some(job.cutoff_at.to_rfc3339()),
+        batch_size: job.batch_size,
+        max_batches: job.max_batches,
+        pause_ms_between_batches: job.pause_ms_between_batches,
+        matched_rows: job.matched_rows,
+        remaining_rows: job.remaining_rows,
+        processed_rows: job.processed_rows,
+        last_batch_rows: job.last_batch_rows,
+        batches: job.batches,
+        redis_deleted_keys: job.redis_deleted_keys,
+        redis_delete_commands: job.redis_delete_commands,
+        redis_max_command_keys: job.redis_max_command_keys,
+        redis_scan_passes: job.redis_scan_passes,
+        redis_used_del_fallback: job.redis_used_del_fallback,
+        redis_pass_limit_reached: job.redis_pass_limit_reached,
+        cancel_requested: job.cancel_requested,
+        stop_reason: job.stop_reason.clone(),
+        started_at: Some(job.started_at.to_rfc3339()),
+        updated_at: Some(job.updated_at.to_rfc3339()),
+        finished_at: job.finished_at.map(|value| value.to_rfc3339()),
+        last_error: job.last_error.clone(),
+    }
+}
+
+fn usage_cleanup_run_batch_limit_reached(
+    total_batches: usize,
+    run_start_batches: usize,
+    max_batches_per_run: usize,
+) -> bool {
+    total_batches.saturating_sub(run_start_batches) >= max_batches_per_run
+}
+
+fn usage_cleanup_lock_contention_backoff(retry: usize) -> StdDuration {
+    let multiplier = 1_u64 << retry.saturating_sub(1).min(8);
+    StdDuration::from_millis(
+        USAGE_CLEANUP_LOCK_CONTENTION_RETRY_MS
+            .saturating_mul(multiplier)
+            .min(USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRY_MS),
+    )
+}
+
+async fn usage_cleanup_has_remaining(
+    store: &PostgresUsageStore,
+    plan: &UsageCleanupPlan,
+) -> anyhow::Result<bool> {
+    match plan.mode {
+        UsageCleanupMode::SoftDelete => store.soft_delete_cleanup_has_remaining(plan.cutoff).await,
+        UsageCleanupMode::HardDelete => store.hard_delete_cleanup_has_remaining(plan.cutoff).await,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageCleanupHeartbeatPolicy {
+    lease_secs: u64,
+    attempt_timeout: StdDuration,
+    max_attempts: usize,
+    retry_delay: StdDuration,
+}
+
+impl Default for UsageCleanupHeartbeatPolicy {
+    fn default() -> Self {
+        Self {
+            lease_secs: USAGE_CLEANUP_LEASE_SECS,
+            attempt_timeout: StdDuration::from_millis(USAGE_CLEANUP_HEARTBEAT_ATTEMPT_TIMEOUT_MS),
+            max_attempts: USAGE_CLEANUP_HEARTBEAT_MAX_ATTEMPTS,
+            retry_delay: StdDuration::from_millis(USAGE_CLEANUP_HEARTBEAT_RETRY_MS),
+        }
+    }
+}
+
+async fn renew_usage_cleanup_lease_with_retry(
+    store: &PostgresUsageStore,
+    job_id: &str,
+    worker_id: &str,
+    policy: UsageCleanupHeartbeatPolicy,
+) -> anyhow::Result<Option<bool>> {
+    let max_attempts = policy.max_attempts.max(1);
+    let mut last_error = None;
+    for attempt in 1..=max_attempts {
+        match tokio::time::timeout(
+            policy.attempt_timeout,
+            store.renew_cleanup_job_lease(job_id, worker_id, policy.lease_secs),
+        )
+        .await
+        {
+            Ok(Ok(result)) => return Ok(result),
+            Ok(Err(err)) => last_error = Some(err.to_string()),
+            Err(_) => {
+                last_error = Some(format!(
+                    "lease renewal attempt timed out after {} ms",
+                    policy.attempt_timeout.as_millis()
+                ));
+            }
+        }
+        if attempt < max_attempts {
+            let multiplier = 1_u32 << (attempt.saturating_sub(1).min(8) as u32);
+            tokio::time::sleep(policy.retry_delay.saturating_mul(multiplier)).await;
+        }
+    }
+    anyhow::bail!(
+        "usage cleanup lease renewal failed after {max_attempts} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown renewal failure".to_string())
+    )
+}
+
+struct UsageCleanupLeaseHeartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for UsageCleanupLeaseHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn spawn_usage_cleanup_lease_heartbeat(
+    store: PostgresUsageStore,
+    job_id: String,
+    worker_id: String,
+    cancel: Arc<AtomicBool>,
+    lease_lost: Arc<AtomicBool>,
+) -> UsageCleanupLeaseHeartbeat {
+    let interval = StdDuration::from_secs((USAGE_CLEANUP_LEASE_SECS / 3).max(1));
+    let policy = UsageCleanupHeartbeatPolicy::default();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match renew_usage_cleanup_lease_with_retry(&store, &job_id, &worker_id, policy).await {
+                Ok(Some(cancel_requested)) => {
+                    if cancel_requested {
+                        cancel.store(true, Ordering::Release);
+                    }
+                }
+                Ok(None) => {
+                    lease_lost.store(true, Ordering::Release);
+                    cancel.store(true, Ordering::Release);
+                    tracing::warn!(job_id, "usage cleanup heartbeat 检测到 lease 已丢失");
+                    return;
+                }
+                Err(err) => {
+                    lease_lost.store(true, Ordering::Release);
+                    cancel.store(true, Ordering::Release);
+                    tracing::warn!(job_id, error = %err, "usage cleanup heartbeat 续租失败");
+                    return;
+                }
+            }
+        }
+    });
+    UsageCleanupLeaseHeartbeat { task }
+}
+
 async fn run_usage_cleanup_job(
     job_id: String,
     store: PostgresUsageStore,
-    redis: Arc<RedisStore>,
+    postgres: Arc<PostgresStore>,
+    observability_redis: Option<Arc<RedisStore>>,
+    usage_recorder: Arc<UsageRecorder>,
     admin_cache_shadow: Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
     cleanup_state: Arc<Mutex<UsageCleanupRuntime>>,
     cancel: Arc<AtomicBool>,
-    plan: UsageCleanupPlan,
 ) {
-    let mut processed_rows = 0u64;
-    let mut batches = 0usize;
-
-    let (final_status, stop_reason, last_error) = loop {
-        if cancel.load(Ordering::Acquire) {
-            break (
-                UsageCleanupJobStatus::Cancelled,
-                Some("cancel_requested".to_string()),
-                None,
-            );
-        }
-        if batches >= plan.max_batches {
-            break (
-                UsageCleanupJobStatus::Completed,
-                Some("max_batches_reached".to_string()),
-                None,
-            );
-        }
-
-        let batch_result = match plan.mode {
-            UsageCleanupMode::SoftDelete => {
-                store
-                    .soft_delete_cleanup_batch(plan.cutoff, plan.batch_size)
-                    .await
+    let worker_id = format!("usage-cleanup-worker-{}", uuid::Uuid::new_v4().simple());
+    let job = match store
+        .claim_cleanup_job(&job_id, &worker_id, USAGE_CLEANUP_LEASE_SECS)
+        .await
+    {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            match store.cleanup_job(&job_id).await {
+                Ok(Some(job)) if !matches!(job.status.as_str(), "queued" | "running") => {
+                    let mut runtime = cleanup_state.lock();
+                    runtime.status = usage_cleanup_status_from_row(&job);
+                    runtime.cancel = None;
+                }
+                Ok(Some(_)) => {
+                    tracing::debug!(job_id, "usage cleanup job 已由其他 worker 领取");
+                }
+                Ok(None) => tracing::warn!(job_id, "usage cleanup job 在领取前已不存在"),
+                Err(err) => tracing::warn!(job_id, error = %err, "读取 usage cleanup job 失败"),
             }
-            UsageCleanupMode::HardDelete => {
-                store
-                    .hard_delete_cleanup_batch(plan.cutoff, plan.batch_size)
-                    .await
-            }
-        };
-
-        let batch_rows = match batch_result {
-            Ok(rows) => rows,
-            Err(err) => {
-                break (
-                    UsageCleanupJobStatus::Failed,
-                    Some("batch_failed".to_string()),
-                    Some(err.to_string()),
-                );
-            }
-        };
-
-        if batch_rows == 0 {
-            break (
-                UsageCleanupJobStatus::Completed,
-                Some("no_more_rows".to_string()),
-                None,
-            );
+            return;
         }
+        Err(err) => {
+            tracing::warn!(job_id, error = %err, "领取 usage cleanup job 失败，交由 supervisor 稍后重试");
+            return;
+        }
+    };
 
-        batches += 1;
-        processed_rows = processed_rows.saturating_add(batch_rows);
-        update_usage_cleanup_progress(
+    cancel.store(job.cancel_requested, Ordering::Release);
+    {
+        let mut runtime = cleanup_state.lock();
+        runtime.status = usage_cleanup_status_from_row(&job);
+        runtime.cancel = Some(cancel.clone());
+    }
+
+    let mut processed_rows = job.processed_rows;
+    let mut batches = job.batches;
+    let run_start_batches = batches;
+    let mut phase = job.phase.clone();
+    let mut redis_stats = RedisPatternDeleteStats {
+        deleted_keys: job.redis_deleted_keys,
+        scan_calls: 0,
+        delete_commands: job.redis_delete_commands,
+        max_command_keys: job.redis_max_command_keys,
+        scan_passes: job.redis_scan_passes,
+        used_del_fallback: job.redis_used_del_fallback,
+        cancelled: false,
+        pass_limit_reached: job.redis_pass_limit_reached,
+    };
+    let lease_lost = Arc::new(AtomicBool::new(false));
+    let _heartbeat = spawn_usage_cleanup_lease_heartbeat(
+        store.clone(),
+        job_id.clone(),
+        worker_id.clone(),
+        cancel.clone(),
+        lease_lost.clone(),
+    );
+
+    let Some(mode) = usage_cleanup_mode_from_value(&job.mode) else {
+        let error = format!("invalid persisted cleanup mode: {}", job.mode);
+        let _ = persist_usage_cleanup_progress(
+            &store,
             &cleanup_state,
             &job_id,
-            UsageCleanupJobStatus::Running,
+            &worker_id,
+            UsageCleanupJobStatus::Failed,
+            &phase,
             processed_rows,
-            batch_rows,
+            0,
             batches,
-            None,
-            None,
-            None,
-        );
-
-        if batch_rows < plan.batch_size as u64 {
-            break (
-                UsageCleanupJobStatus::Completed,
-                Some("no_more_rows".to_string()),
-                None,
-            );
-        }
-
-        if plan.pause_ms_between_batches > 0 {
-            tokio::time::sleep(StdDuration::from_millis(plan.pause_ms_between_batches)).await;
-        }
+            job.remaining_rows,
+            Some("invalid_persisted_mode"),
+            Some(&error),
+            &redis_stats,
+            true,
+        )
+        .await;
+        tracing::error!(job_id, mode = %job.mode, "持久化 usage cleanup mode 非法");
+        return;
     };
-
-    let remaining_rows = match plan.mode {
+    let plan = UsageCleanupPlan {
+        mode,
+        cutoff: job.cutoff_at,
+        batch_size: job.batch_size,
+        max_batches: job.max_batches,
+        pause_ms_between_batches: job.pause_ms_between_batches,
+    };
+    let cleanup_watermark = match plan.mode {
         UsageCleanupMode::SoftDelete => store
-            .preview_soft_delete_cleanup(plan.cutoff)
+            .advance_soft_delete_cleanup_watermark(plan.cutoff)
             .await
-            .map(|preview| preview.matched_rows)
-            .ok(),
-        UsageCleanupMode::HardDelete => store
-            .preview_hard_delete_cleanup(plan.cutoff)
-            .await
-            .map(|preview| preview.matched_rows)
-            .ok(),
+            .map(Some),
+        UsageCleanupMode::HardDelete => store.soft_delete_cleanup_watermark().await,
     };
-    if processed_rows > 0 {
-        invalidate_usage_admin_cache_after_cleanup(&redis, &admin_cache_shadow).await;
-        if let Err(err) = redis.clear_usage_record_snapshots().await {
-            tracing::warn!("清理 Redis usage records snapshot 失败: {}", err);
+    let cleanup_watermark = match cleanup_watermark {
+        Ok(cutoff) => cutoff,
+        Err(err) => {
+            let error = err.to_string();
+            let _ = persist_usage_cleanup_progress(
+                &store,
+                &cleanup_state,
+                &job_id,
+                &worker_id,
+                UsageCleanupJobStatus::Failed,
+                &phase,
+                processed_rows,
+                0,
+                batches,
+                job.remaining_rows,
+                Some("postgres_cleanup_watermark_failed"),
+                Some(&error),
+                &redis_stats,
+                true,
+            )
+            .await;
+            return;
+        }
+    };
+    if let Some(cutoff) = cleanup_watermark {
+        if let Err(err) = usage_recorder.advance_cleanup_watermark(cutoff).await {
+            let error = err.to_string();
+            let _ = persist_usage_cleanup_progress(
+                &store,
+                &cleanup_state,
+                &job_id,
+                &worker_id,
+                UsageCleanupJobStatus::Failed,
+                &phase,
+                processed_rows,
+                0,
+                batches,
+                job.remaining_rows,
+                Some("redis_cleanup_watermark_failed"),
+                Some(&error),
+                &redis_stats,
+                true,
+            )
+            .await;
+            return;
+        }
+    }
+    if let Some(redis) = observability_redis.as_ref() {
+        if let Err(err) = redis.invalidate_usage_derived_cache().await {
+            let error = err.to_string();
+            let _ = persist_usage_cleanup_progress(
+                &store,
+                &cleanup_state,
+                &job_id,
+                &worker_id,
+                UsageCleanupJobStatus::Failed,
+                &phase,
+                processed_rows,
+                0,
+                batches,
+                job.remaining_rows,
+                Some("redis_usage_cache_invalidation_failed"),
+                Some(&error),
+                &redis_stats,
+                true,
+            )
+            .await;
+            return;
+        }
+    }
+    let mut final_status = UsageCleanupJobStatus::Completed;
+    let mut stop_reason = Some("no_more_rows".to_string());
+    let mut last_error = None;
+    let mut remaining_rows = None;
+    let mut postgres_complete = phase != "postgres";
+
+    if phase == "postgres" {
+        let mut lock_contention_retries = 0_usize;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                final_status = UsageCleanupJobStatus::Cancelled;
+                stop_reason = Some("cancel_requested".to_string());
+                break;
+            }
+            if usage_cleanup_run_batch_limit_reached(batches, run_start_batches, plan.max_batches) {
+                match usage_cleanup_has_remaining(&store, &plan).await {
+                    Ok(false) => {
+                        remaining_rows = Some(0);
+                        postgres_complete = true;
+                    }
+                    Ok(true) => {
+                        final_status = UsageCleanupJobStatus::Paused;
+                        stop_reason = Some("max_batches_reached".to_string());
+                    }
+                    Err(err) => {
+                        final_status = UsageCleanupJobStatus::Failed;
+                        stop_reason = Some("postgres_completion_probe_failed".to_string());
+                        last_error = Some(err.to_string());
+                    }
+                }
+                break;
+            }
+
+            let batch_result = match plan.mode {
+                UsageCleanupMode::SoftDelete => {
+                    store
+                        .soft_delete_cleanup_batch(plan.cutoff, plan.batch_size)
+                        .await
+                }
+                UsageCleanupMode::HardDelete => {
+                    store
+                        .hard_delete_cleanup_batch(plan.cutoff, plan.batch_size)
+                        .await
+                }
+            };
+            let batch_result = match batch_result {
+                Ok(result) => result,
+                Err(err) => {
+                    final_status = UsageCleanupJobStatus::Failed;
+                    stop_reason = Some("postgres_batch_failed".to_string());
+                    last_error = Some(err.to_string());
+                    break;
+                }
+            };
+            let batch_rows = batch_result.processed_rows;
+            if batch_rows == 0 {
+                match batch_result.has_remaining {
+                    Some(false) => {
+                        remaining_rows = Some(0);
+                        postgres_complete = true;
+                        break;
+                    }
+                    Some(true) => {
+                        lock_contention_retries = lock_contention_retries.saturating_add(1);
+                        if lock_contention_retries >= USAGE_CLEANUP_LOCK_CONTENTION_MAX_RETRIES {
+                            final_status = UsageCleanupJobStatus::Paused;
+                            stop_reason = Some("postgres_lock_contention".to_string());
+                            remaining_rows = None;
+                            break;
+                        }
+                        tokio::time::sleep(usage_cleanup_lock_contention_backoff(
+                            lock_contention_retries,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    None => {
+                        final_status = UsageCleanupJobStatus::Failed;
+                        stop_reason = Some("postgres_batch_contract_invalid".to_string());
+                        last_error = Some(
+                            "empty cleanup batch did not include a completion probe".to_string(),
+                        );
+                        break;
+                    }
+                }
+            }
+
+            lock_contention_retries = 0;
+            batches = batches.saturating_add(1);
+            processed_rows = processed_rows.saturating_add(batch_rows);
+            let persist_result = persist_usage_cleanup_progress(
+                &store,
+                &cleanup_state,
+                &job_id,
+                &worker_id,
+                UsageCleanupJobStatus::Running,
+                &phase,
+                processed_rows,
+                batch_rows,
+                batches,
+                None,
+                None,
+                None,
+                &redis_stats,
+                false,
+            )
+            .await;
+            match persist_result {
+                Ok(Some(cancel_requested)) => {
+                    if cancel_requested {
+                        cancel.store(true, Ordering::Release);
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(job_id, "usage cleanup lease 已丢失，当前 worker 停止");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(job_id, error = %err, "持久化 usage cleanup 批次进度失败");
+                    return;
+                }
+            }
+            if batch_result.has_remaining == Some(false) {
+                remaining_rows = Some(0);
+                postgres_complete = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+            if plan.pause_ms_between_batches > 0 {
+                tokio::time::sleep(StdDuration::from_millis(plan.pause_ms_between_batches)).await;
+            }
         }
     }
 
-    update_usage_cleanup_progress(
+    let needs_cache_cleanup = processed_rows > 0 || phase != "postgres";
+    if needs_cache_cleanup {
+        if plan.mode == UsageCleanupMode::SoftDelete {
+            usage_recorder.remove_memory_records_before(plan.cutoff);
+        }
+        if cancel.load(Ordering::Acquire) && final_status == UsageCleanupJobStatus::Completed {
+            final_status = UsageCleanupJobStatus::Cancelled;
+            stop_reason = Some("cancel_requested".to_string());
+            remaining_rows = None;
+        }
+
+        // The in-process Admin cache is always invalidated. Redis cleanup is optional and must
+        // never fall back to the business scheduler Redis when the observability store is absent.
+        invalidate_admin_cache_shadow(&admin_cache_shadow, "admin_cache:usage:*");
+
+        if let Some(redis) = observability_redis.as_deref() {
+            if phase == "postgres" || phase == "redis_admin_cache" {
+                phase = "redis_admin_cache".to_string();
+                match invalidate_usage_admin_cache_after_cleanup(
+                    redis,
+                    &admin_cache_shadow,
+                    Some(cancel.as_ref()),
+                )
+                .await
+                {
+                    Ok(stats) => {
+                        let cancelled = stats.cancelled;
+                        let pass_limit_reached = stats.pass_limit_reached;
+                        merge_redis_delete_stats(&mut redis_stats, stats);
+                        if lease_lost.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if pass_limit_reached {
+                            final_status = UsageCleanupJobStatus::Failed;
+                            stop_reason = Some("redis_admin_cache_pass_limit_reached".to_string());
+                            last_error = Some(
+                                "Redis admin cache cleanup did not converge within the pass limit"
+                                    .to_string(),
+                            );
+                        } else if cancelled {
+                            final_status = UsageCleanupJobStatus::Cancelled;
+                            stop_reason = Some("cancel_requested_during_redis_cleanup".to_string());
+                            remaining_rows = None;
+                        } else {
+                            phase = "redis_snapshots".to_string();
+                            match persist_usage_cleanup_progress(
+                                &store,
+                                &cleanup_state,
+                                &job_id,
+                                &worker_id,
+                                UsageCleanupJobStatus::Running,
+                                &phase,
+                                processed_rows,
+                                0,
+                                batches,
+                                remaining_rows,
+                                stop_reason.as_deref(),
+                                last_error.as_deref(),
+                                &redis_stats,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(Some(cancel_requested)) => {
+                                    if cancel_requested {
+                                        cancel.store(true, Ordering::Release);
+                                    }
+                                }
+                                Ok(None) => return,
+                                Err(err) => {
+                                    tracing::warn!(job_id, error = %err, "持久化 Redis admin cache 清理进度失败");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        final_status = UsageCleanupJobStatus::Failed;
+                        stop_reason = Some("redis_admin_cache_cleanup_failed".to_string());
+                        last_error = Some(err.to_string());
+                    }
+                }
+            }
+
+            let force_snapshot_index_only = redis_stats.pass_limit_reached
+                || (final_status == UsageCleanupJobStatus::Failed && phase == "redis_admin_cache");
+            let must_invalidate_snapshot_index = phase == "redis_snapshots"
+                || (processed_rows > 0
+                    && (cancel.load(Ordering::Acquire) || force_snapshot_index_only));
+            if must_invalidate_snapshot_index {
+                let interrupted_phase = phase.clone();
+                let index_only_cancel = AtomicBool::new(true);
+                let snapshot_cancel = if force_snapshot_index_only {
+                    &index_only_cancel
+                } else {
+                    cancel.as_ref()
+                };
+                match redis
+                    .clear_usage_record_snapshots_bounded(Some(snapshot_cancel))
+                    .await
+                {
+                    Ok(stats) => {
+                        let cancelled = stats.cancelled;
+                        let pass_limit_reached = stats.pass_limit_reached;
+                        merge_redis_delete_stats(&mut redis_stats, stats);
+                        if lease_lost.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if pass_limit_reached {
+                            final_status = UsageCleanupJobStatus::Failed;
+                            stop_reason = Some("redis_snapshot_pass_limit_reached".to_string());
+                            last_error = Some(
+                            "Redis usage snapshot cleanup did not converge within the pass limit"
+                                .to_string(),
+                        );
+                        } else if cancelled && force_snapshot_index_only {
+                            phase = interrupted_phase;
+                        } else if cancelled {
+                            final_status = UsageCleanupJobStatus::Cancelled;
+                            stop_reason = Some("cancel_requested_during_redis_cleanup".to_string());
+                            remaining_rows = None;
+                            phase = if postgres_complete {
+                                interrupted_phase
+                            } else {
+                                "postgres".to_string()
+                            };
+                        } else {
+                            phase = if postgres_complete
+                                && final_status == UsageCleanupJobStatus::Completed
+                            {
+                                "complete".to_string()
+                            } else {
+                                "postgres".to_string()
+                            };
+                        }
+                    }
+                    Err(err) => {
+                        final_status = UsageCleanupJobStatus::Failed;
+                        stop_reason = Some("redis_snapshot_cleanup_failed".to_string());
+                        last_error = Some(err.to_string());
+                    }
+                }
+            }
+        } else {
+            phase = if postgres_complete && final_status == UsageCleanupJobStatus::Completed {
+                "complete".to_string()
+            } else {
+                "postgres".to_string()
+            };
+        }
+    } else if postgres_complete && final_status == UsageCleanupJobStatus::Completed {
+        phase = "complete".to_string();
+    }
+
+    if lease_lost.load(Ordering::Acquire) {
+        return;
+    }
+
+    let final_persist = persist_usage_cleanup_progress(
+        &store,
         &cleanup_state,
         &job_id,
+        &worker_id,
         final_status,
+        &phase,
         processed_rows,
         0,
         batches,
         remaining_rows,
-        stop_reason,
-        last_error,
-    );
+        stop_reason.as_deref(),
+        last_error.as_deref(),
+        &redis_stats,
+        true,
+    )
+    .await;
+    match final_persist {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(job_id, error = %err, "持久化 usage cleanup 最终状态失败");
+            return;
+        }
+    }
+
+    let success = final_status != UsageCleanupJobStatus::Failed;
+    if let Err(err) = postgres
+        .record_admin_audit_log(
+            "usage-cleanup-worker",
+            "finish_usage_cleanup",
+            "usage_record",
+            Some(&job_id),
+            success,
+            last_error.as_deref(),
+            json!({
+                "jobId": job_id,
+                "status": usage_cleanup_status_value(final_status),
+                "phase": phase,
+                "processedRows": processed_rows,
+                "batches": batches,
+                "stopReason": stop_reason,
+                "redisDeletedKeys": redis_stats.deleted_keys,
+                "redisDeleteCommands": redis_stats.delete_commands,
+                "redisMaxCommandKeys": redis_stats.max_command_keys,
+                "redisScanPasses": redis_stats.scan_passes,
+                "redisUsedDelFallback": redis_stats.used_del_fallback,
+                "redisPassLimitReached": redis_stats.pass_limit_reached,
+            }),
+        )
+        .await
+    {
+        tracing::warn!(job_id, error = %err, "写入 usage cleanup 完成审计失败");
+    }
 }
 
 fn invalidate_admin_cache_shadow(
@@ -6666,50 +7674,112 @@ fn invalidate_admin_cache_shadow(
 async fn invalidate_usage_admin_cache_after_cleanup(
     redis: &RedisStore,
     admin_cache_shadow: &Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
-) {
+    cancel: Option<&AtomicBool>,
+) -> anyhow::Result<RedisPatternDeleteStats> {
     invalidate_admin_cache_shadow(admin_cache_shadow, "admin_cache:usage:*");
-    if let Err(err) = redis.del_pattern("admin_cache:usage:*").await {
-        tracing::warn!("清理 Redis Admin usage 缓存失败: {}", err);
-    }
+    let mut stats = redis
+        .delete_pattern_bounded("admin_cache:usage:*", cancel)
+        .await?;
+    let usage_summary_stats = redis.clear_usage_summary_aggregates_bounded(cancel).await?;
+    merge_redis_delete_stats(&mut stats, usage_summary_stats);
+    Ok(stats)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_usage_cleanup_progress(
+async fn persist_usage_cleanup_progress(
+    store: &PostgresUsageStore,
     cleanup_state: &Arc<Mutex<UsageCleanupRuntime>>,
     job_id: &str,
+    worker_id: &str,
     status: UsageCleanupJobStatus,
+    phase: &str,
     processed_rows: u64,
     last_batch_rows: u64,
     batches: usize,
     remaining_rows: Option<u64>,
-    stop_reason: Option<String>,
-    last_error: Option<String>,
-) {
+    stop_reason: Option<&str>,
+    last_error: Option<&str>,
+    redis_stats: &RedisPatternDeleteStats,
+    finished: bool,
+) -> anyhow::Result<Option<bool>> {
+    let cancel_requested = store
+        .update_cleanup_job_progress(
+            UsageCleanupJobProgress {
+                job_id,
+                worker_id,
+                status: usage_cleanup_status_value(status),
+                phase,
+                processed_rows,
+                last_batch_rows,
+                batches,
+                remaining_rows,
+                stop_reason,
+                last_error,
+                redis_deleted_keys: redis_stats.deleted_keys,
+                redis_delete_commands: redis_stats.delete_commands,
+                redis_max_command_keys: redis_stats.max_command_keys,
+                redis_scan_passes: redis_stats.scan_passes,
+                redis_used_del_fallback: redis_stats.used_del_fallback,
+                redis_pass_limit_reached: redis_stats.pass_limit_reached,
+                finished,
+            },
+            USAGE_CLEANUP_LEASE_SECS,
+        )
+        .await?;
+    if cancel_requested.is_none() {
+        return Ok(None);
+    }
+
     let now = Utc::now().to_rfc3339();
     let mut runtime = cleanup_state.lock();
     if runtime.status.job_id.as_deref() != Some(job_id) {
-        return;
+        return Ok(cancel_requested);
     }
     runtime.status.status = status;
+    runtime.status.phase = phase.to_string();
     runtime.status.processed_rows = processed_rows;
     runtime.status.last_batch_rows = last_batch_rows;
     runtime.status.batches = batches;
+    runtime.status.redis_deleted_keys = redis_stats.deleted_keys;
+    runtime.status.redis_delete_commands = redis_stats.delete_commands;
+    runtime.status.redis_max_command_keys = redis_stats.max_command_keys;
+    runtime.status.redis_scan_passes = redis_stats.scan_passes;
+    runtime.status.redis_used_del_fallback = redis_stats.used_del_fallback;
+    runtime.status.redis_pass_limit_reached = redis_stats.pass_limit_reached;
+    runtime.status.cancel_requested = cancel_requested.unwrap_or(false);
     runtime.status.updated_at = Some(now.clone());
     if let Some(remaining_rows) = remaining_rows {
         runtime.status.remaining_rows = Some(remaining_rows);
     } else if let Some(matched_rows) = runtime.status.matched_rows {
         runtime.status.remaining_rows = Some(matched_rows.saturating_sub(processed_rows));
     }
-    if stop_reason.is_some() {
-        runtime.status.stop_reason = stop_reason;
+    if let Some(stop_reason) = stop_reason {
+        runtime.status.stop_reason = Some(stop_reason.to_string());
     }
-    if last_error.is_some() {
-        runtime.status.last_error = last_error;
+    if let Some(last_error) = last_error {
+        runtime.status.last_error = Some(last_error.to_string());
     }
-    if status != UsageCleanupJobStatus::Running {
+    if finished {
         runtime.status.finished_at = Some(now);
         runtime.cancel = None;
     }
+    Ok(cancel_requested)
+}
+
+fn merge_redis_delete_stats(
+    aggregate: &mut RedisPatternDeleteStats,
+    current: RedisPatternDeleteStats,
+) {
+    aggregate.deleted_keys = aggregate.deleted_keys.saturating_add(current.deleted_keys);
+    aggregate.scan_calls = aggregate.scan_calls.saturating_add(current.scan_calls);
+    aggregate.delete_commands = aggregate
+        .delete_commands
+        .saturating_add(current.delete_commands);
+    aggregate.max_command_keys = aggregate.max_command_keys.max(current.max_command_keys);
+    aggregate.scan_passes = aggregate.scan_passes.saturating_add(current.scan_passes);
+    aggregate.used_del_fallback |= current.used_del_fallback;
+    aggregate.cancelled |= current.cancelled;
+    aggregate.pass_limit_reached |= current.pass_limit_reached;
 }
 
 fn extract_model_ids_from_models_response(body: &str) -> Vec<String> {

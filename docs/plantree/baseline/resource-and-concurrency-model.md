@@ -55,13 +55,14 @@ Evidence: `docs/analysis/prod-slow-first-token-root-cause-20260706.md:7-19,88-20
 | Stored Files count | 128 | Oldest entries evicted after insertion | `src/anthropic/files.rs:21-102` |
 | Stored Files bytes | 256 MiB | Process-local byte total; oldest entries evicted | `src/anthropic/files.rs:21-102` |
 | Stored Files ordering metadata | No complete bound under explicit-delete churn | Delete removes map/bytes but leaves FIFO ID tombstones | `src/anthropic/files.rs:87-126` |
-| Remote image/document response | 20 MiB per source | Streaming accumulation stops above the bound | `src/anthropic/body_processing.rs:15,300-429` |
-| Remote source request timeout | 25 seconds | Applied to the per-request reqwest client | `src/anthropic/body_processing.rs:139-160` |
-| Remote source redirects | 5 | Redirects are handled manually and revalidated | `src/anthropic/body_processing.rs:300-367` |
+| Remote image/document response | 20 MiB per source; 32 MiB downloaded and 44 MiB base64 per Messages request | Source count is 20; streaming accumulation and aggregate accounting stop above the bound | `src/anthropic/body_processing.rs` |
+| Remote source request/workflow timeout | 25 seconds per HTTP request; 45 seconds for the complete materialization workflow | The workflow deadline includes global admission, DNS, redirects and all source bodies | `src/anthropic/body_processing.rs` |
+| Remote source redirects/attempts | 5 redirects per source; 32 HTTP attempts per Messages request | All sources and redirects consume one request budget | `src/anthropic/body_processing.rs` |
+| Concurrent remote materialization | 4 workflows per process | Permit is retained through parsed-body handling/count-token processing and released on error/cancellation | `src/anthropic/body_processing.rs`, `src/anthropic/handlers.rs` |
 | External SSE event buffer | 1 MiB | Bounds one accumulated external SSE event | `src/external_pool.rs:88-97` |
 | Internal invoke hold buffer | 256 KiB | Bounds buffered data held for internal invoke handling | `src/anthropic/handlers.rs` |
 
-The remote-source 20 MiB bound is per source, not per Messages request. Sources are currently fetched serially and their materialized base64 content is retained in the request. There is no source-count limit, aggregate download limit, aggregate materialized-body limit, or process-wide remote-download semaphore.
+As of the 2026-07-16 dirty-tree containment fix, remote sources are still fetched serially and materialized base64 remains in the request, but source count, aggregate download/base64, HTTP attempts, workflow time and concurrent workflows are bounded. The transport resolver filters the addresses used for each actual connection and the materialization client does not inherit system proxies. Final release-candidate handler/load/RSS evidence remains open in [the active issue](../../../feature/issues/remote-multimodal-resource-and-ssrf-bounds.md).
 
 Base64 expands binary input by approximately one third before JSON/string overhead. A file or remote object can coexist temporarily as stored/downloaded bytes, an encoded string, parsed JSON, a rewritten request, and an upstream envelope. Therefore the 50 MiB HTTP limit and 256 MiB Files-store limit are not process memory ceilings.
 

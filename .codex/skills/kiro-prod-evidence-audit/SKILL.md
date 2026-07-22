@@ -17,14 +17,14 @@ The primary evidence source is not container stdout. For kiro.rs, start from cod
 - Prefer streaming command output back to local files. Do not create temp files on the production host unless the user explicitly approves and there is no safer option.
 - Use bounded commands: `timeout`, `LIMIT`, indexed predicates, small file samples, and short statement timeouts. Do not pull broad logs before code-defined evidence has identified the likely source.
 - Avoid expensive scans on large tables or disks. Inspect metadata first, then sample narrowly.
-- Prefer SSH key or ssh-agent access. If the user explicitly authorizes password login, use only a non-persistent path such as a hidden prompt, an in-memory expect/pty handoff, or a one-shot auth helper. Never record the password in repository files, evidence files, reports, archives, or final answers. Do not record auth helper source when it contains the password.
+- Prefer SSH key or ssh-agent access when it is already available. When the user explicitly provides production login credentials or says to log in directly, direct password SSH is allowed and should not be treated as a blocker. Establish a short-lived session and continue evidence collection without asking for a separate key setup. Use the least persistent practical method available in the current environment: an existing control socket, a one-shot `expect`/pty handoff, or a short-lived control-master session. Do not place the password in copied evidence, markdown reports, archives, final answers, or long-lived helper files. If a temporary local helper is unavoidable, keep it under the run's local raw area with owner-only permissions, redact it from packaging, and delete it at the end of the run.
 - Redact evidence before summarizing or packaging for sharing. Keep raw local evidence separate and do not include it in the default archive.
 
 ## Required Inputs
 
 Before any SSH command, confirm or infer:
 
-- SSH target: user, host, port, and auth mechanism. Password auth is allowed only after explicit user authorization and must be handled without logging or persisting the password.
+- SSH target: user, host, port, and auth mechanism. Password auth is allowed when the user explicitly supplies the password or asks to use password login for the audit. Direct login is permitted and should proceed directly; still avoid copying the password into durable evidence or final output.
 - Deployment directory, for example `~/docker-compose/<project>`.
 - Time window, for example last 2 hours, last 24 hours, or around specific request IDs.
 - Scope: request IDs, usage/business diagnostics, runtime/config state, tool-format debug files, gateway evidence, Docker state, container logs, PostgreSQL metadata, Redis metadata, or all of the above.
@@ -69,7 +69,7 @@ Use `scripts/package_evidence.py` after files are organized to redact, write `ma
 
 1. Create the local evidence root and `commands.md`.
 2. Read `references/kiro-rs-evidence-sources.md` and `references/evidence-map.md` before the first production SSH command.
-3. Establish safe SSH access without placing passwords in commands or files.
+3. Establish SSH access. If direct password login was requested, create a short-lived authenticated session or run bounded one-shot commands; prefer reusing a control socket for the rest of the run. Record the command purpose in `commands.md`, but do not record the password.
 4. Run Phase 1 inventory only: deployment directory, compose services, container health, app version, mounted volumes, runtime file paths, and database/Redis availability. Do not pull application logs in this phase.
 5. Run Phase 2 code-defined evidence discovery: bounded PostgreSQL metadata, usage summary/error fingerprints, Redis keyspace/usage summaries, runtime config redacted shape, credential runtime state summaries, admin audit/event summaries, and tool-format debug file index.
 6. Decide which evidence source is authoritative for each suspected issue. Only then run targeted Phase 3 collection from specific request IDs, time windows, tables, Redis keys, debug files, or container logs.
@@ -148,7 +148,7 @@ Use `--include-raw` only after explicit user approval.
 
 Stop and report a blocker when:
 
-- the only available auth path requires exposing a password in command arguments, evidence, reports, archives, or persistent files;
+- the only available auth path requires leaving a password in shared reports, packaged evidence, final answers, or persistent helper files that cannot be deleted/redacted;
 - a requested command would modify production;
 - evidence collection would require a full table scan, full disk scan, or unbounded log dump;
 - the next planned step is broad container log collection before checking `usage_records`, Redis usage snapshots, runtime tables, and tool-format debug file indexes;

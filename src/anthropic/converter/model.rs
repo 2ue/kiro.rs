@@ -1,7 +1,10 @@
 //! Model mapping and Kiro native reasoning field selection.
 
 use crate::anthropic::model_capabilities::strip_model_1m_suffix;
-use crate::anthropic::types::{MessagesRequest, normalize_thinking_effort};
+use crate::anthropic::model_capabilities::{
+    KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+};
+use crate::anthropic::types::{MessagesRequest, parse_thinking_effort};
 use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
 };
@@ -112,46 +115,35 @@ pub fn get_context_window_size(model: &str) -> i32 {
     200_000
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeReasoningSchemaPath {
-    OutputConfig,
-    #[allow(dead_code)]
-    Reasoning,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NativeReasoningSchema {
-    path: NativeReasoningSchemaPath,
-    efforts: &'static [&'static str],
-}
-
 const EFFORTS_WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const EFFORTS_WITHOUT_XHIGH: &[&str] = &["low", "medium", "high", "max"];
 
-fn native_reasoning_schema(model_id: &str) -> Option<NativeReasoningSchema> {
-    match model_id {
+fn legacy_native_reasoning_capability(model_id: &str) -> Option<KiroReasoningFieldCapability> {
+    let (efforts, default_effort) = match model_id {
         "claude-opus-4.8" | "claude-opus-4-8" | "claude-opus-4.7" | "claude-opus-4-7" => {
-            Some(NativeReasoningSchema {
-                path: NativeReasoningSchemaPath::OutputConfig,
-                efforts: EFFORTS_WITH_XHIGH,
-            })
+            (EFFORTS_WITH_XHIGH, "xhigh")
         }
         "claude-opus-4.6" | "claude-opus-4-6" | "claude-sonnet-4.6" | "claude-sonnet-4-6" => {
-            Some(NativeReasoningSchema {
-                path: NativeReasoningSchemaPath::OutputConfig,
-                efforts: EFFORTS_WITHOUT_XHIGH,
-            })
+            (EFFORTS_WITHOUT_XHIGH, "high")
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(KiroReasoningFieldCapability {
+        path: KiroReasoningFieldPath::OutputConfig,
+        efforts: efforts.iter().map(|effort| (*effort).to_string()).collect(),
+        default_effort: Some(default_effort.to_string()),
+    })
 }
 
-fn requested_native_reasoning(req: &MessagesRequest) -> bool {
-    req.thinking.as_ref().is_some_and(|t| t.is_enabled())
-        || req
-            .output_config
-            .as_ref()
-            .is_some_and(|oc| !oc.effort.trim().is_empty())
+pub(super) fn requested_native_reasoning(req: &MessagesRequest) -> bool {
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "disabled")
+    {
+        return false;
+    }
+    req.thinking.as_ref().is_some_and(|t| t.is_enabled()) || req.output_config.is_some()
 }
 
 fn effort_from_budget_tokens(tokens: i32) -> &'static str {
@@ -163,69 +155,120 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
     }
 }
 
-fn select_native_reasoning_effort(req: &MessagesRequest, schema: NativeReasoningSchema) -> String {
-    let requested = req
+fn select_native_reasoning_effort(
+    req: &MessagesRequest,
+    capability: &KiroReasoningFieldCapability,
+) -> Result<String, super::ConversionError> {
+    if let Some(explicit_effort) = req
         .output_config
         .as_ref()
-        .map(|oc| normalize_thinking_effort(&oc.effort))
-        .or_else(|| {
-            req.thinking.as_ref().map(|t| {
-                if t.thinking_type == "enabled" {
-                    effort_from_budget_tokens(t.budget_tokens)
-                } else {
-                    normalize_thinking_effort("")
-                }
-            })
-        })
-        .unwrap_or_else(|| normalize_thinking_effort(""));
-
-    if schema.efforts.contains(&requested) {
-        requested.to_string()
-    } else {
-        schema.efforts.last().copied().unwrap_or("high").to_string()
+        .and_then(|output_config| output_config.effort.as_deref())
+    {
+        let Some(requested) = parse_thinking_effort(explicit_effort) else {
+            return Err(super::ConversionError::UnsupportedContent(format!(
+                "unsupported output_config.effort: {explicit_effort}"
+            )));
+        };
+        if !capability.efforts.iter().any(|effort| effort == requested) {
+            return Err(super::ConversionError::UnsupportedContent(format!(
+                "output_config.effort {requested} is not supported by the selected upstream model"
+            )));
+        }
+        return Ok(requested.to_string());
     }
+
+    let requested = match req.thinking.as_ref() {
+        Some(thinking) if thinking.thinking_type == "enabled" => {
+            effort_from_budget_tokens(thinking.budget_tokens)
+        }
+        _ => {
+            return capability.default_effort.clone().ok_or_else(|| {
+                let detail = if req.output_config.is_some() {
+                    " for omitted output_config.effort"
+                } else {
+                    ""
+                };
+                super::ConversionError::UnsupportedContent(format!(
+                    "the selected upstream reasoning schema has no default effort{detail}"
+                ))
+            });
+        }
+    };
+    if capability.efforts.iter().any(|effort| effort == requested) {
+        return Ok(requested.to_string());
+    }
+    if requested == "xhigh" && capability.efforts.iter().any(|effort| effort == "max") {
+        return Ok("max".to_string());
+    }
+    Err(super::ConversionError::UnsupportedContent(format!(
+        "thinking budget maps to effort {requested}, which is not supported by the selected upstream model"
+    )))
 }
 
 pub(super) fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_id: &str,
     enabled: bool,
-) -> Option<AdditionalModelRequestFields> {
+    capability_state: &KiroReasoningCapabilityState,
+) -> Result<Option<AdditionalModelRequestFields>, super::ConversionError> {
     if !enabled {
-        return None;
+        return Ok(None);
     }
     if req
         .thinking
         .as_ref()
         .is_some_and(|t| t.thinking_type == "disabled")
     {
-        return None;
+        return Ok(None);
     }
 
-    let schema = native_reasoning_schema(model_id)?;
     if !requested_native_reasoning(req) {
-        return None;
+        return Ok(None);
     }
 
-    let effort = select_native_reasoning_effort(req, schema);
-    Some(match schema.path {
-        NativeReasoningSchemaPath::OutputConfig => AdditionalModelRequestFields {
+    let capability = match capability_state {
+        KiroReasoningCapabilityState::Supported(capability) => capability.clone(),
+        KiroReasoningCapabilityState::LegacyFallback => {
+            let Some(capability) = legacy_native_reasoning_capability(model_id) else {
+                return Ok(None);
+            };
+            capability
+        }
+        KiroReasoningCapabilityState::Unknown
+        | KiroReasoningCapabilityState::AuthoritativeAbsent
+        | KiroReasoningCapabilityState::AuthoritativeInvalid => return Ok(None),
+    };
+
+    let effort = select_native_reasoning_effort(req, &capability)?;
+    Ok(Some(match capability.path {
+        KiroReasoningFieldPath::OutputConfig => AdditionalModelRequestFields {
             thinking: None,
             output_config: Some(KiroOutputConfig { effort }),
             reasoning: None,
         },
-        NativeReasoningSchemaPath::Reasoning => AdditionalModelRequestFields {
+        KiroReasoningFieldPath::Reasoning => AdditionalModelRequestFields {
             thinking: None,
             output_config: None,
             reasoning: Some(KiroReasoningConfig { effort }),
         },
-    })
+    }))
 }
 
 pub(super) fn uses_native_reasoning_fields(
     req: &MessagesRequest,
     model_id: &str,
     enabled: bool,
+    capability_state: &KiroReasoningCapabilityState,
 ) -> bool {
-    build_additional_model_request_fields(req, model_id, enabled).is_some()
+    enabled
+        && !req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.thinking_type == "disabled")
+        && requested_native_reasoning(req)
+        && (capability_state.capability().is_some()
+            || (matches!(
+                capability_state,
+                KiroReasoningCapabilityState::LegacyFallback
+            ) && legacy_native_reasoning_capability(model_id).is_some()))
 }

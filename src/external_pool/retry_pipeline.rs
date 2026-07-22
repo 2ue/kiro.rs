@@ -11,10 +11,6 @@ pub(super) fn should_retry_payload_guard(
         return false;
     }
     payload_too_long_message(&err.message)
-        || err
-            .response_body
-            .as_ref()
-            .is_some_and(|body| payload_too_long_message(&String::from_utf8_lossy(body)))
 }
 
 pub(super) fn payload_guard_retry_route(
@@ -38,9 +34,12 @@ pub(super) fn payload_guard_retry_route(
         }
     };
     let breakdown = breakdown_anthropic_messages_request(&payload, body.len());
+    let request_input_tokens = count_external_route_input_tokens(&payload);
     let mut next = route.clone();
+    next.reset_preparation_cache();
     next.raw_body = body;
     next.payload = Some(payload);
+    next.request_input_tokens = request_input_tokens;
     next.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
     next.payload_breakdown = Some(breakdown);
     next.payload_guard_report = Some(report);

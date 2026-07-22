@@ -260,24 +260,64 @@ fn normalized_optional(value: Option<String>) -> Option<String> {
 /// 返回 `(api_key, region)`。没有 `|region` 时只返回 key。
 /// 该函数不打印、不记录原始 key，调用方负责继续按敏感字段处理。
 pub fn split_kiro_api_key_and_region(raw: &str) -> Option<(String, Option<String>)> {
+    validate_kiro_api_key_pipe_format(raw).ok()?;
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
 
     let Some((key, region)) = trimmed.split_once('|') else {
         return Some((trimmed.to_string(), None));
     };
 
     let key = key.trim();
-    if key.is_empty() {
-        return None;
-    }
     let region = region.trim();
     Some((
         key.to_string(),
         (!region.is_empty()).then(|| region.to_string()),
     ))
+}
+
+/// Validate only the `key|region` convenience envelope.
+///
+/// The API key itself is intentionally not restricted to a fixed prefix so future Kiro key
+/// formats remain compatible. A supplied region becomes part of an HTTP Host label, so it must
+/// not contain whitespace, controls, separators, or other host-unsafe characters.
+pub(crate) fn validate_kiro_api_key_pipe_format(raw: &str) -> Result<(), &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("key is empty");
+    }
+
+    let mut parts = trimmed.split('|');
+    let key = parts.next().unwrap_or_default().trim();
+    let region = parts.next();
+    if parts.next().is_some() {
+        return Err("multiple pipe separators are not allowed");
+    }
+    if key.is_empty() {
+        return Err("key before pipe is empty");
+    }
+
+    let Some(region) = region else {
+        return Ok(());
+    };
+    validate_kiro_region_host_label(region)
+}
+
+fn validate_kiro_region_host_label(region: &str) -> Result<(), &'static str> {
+    if region.is_empty() {
+        return Ok(());
+    }
+    if region != region.trim() || region.len() > 63 {
+        return Err("region is not a safe host label");
+    }
+    if region.starts_with('-')
+        || region.ends_with('-')
+        || !region
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err("region is not a safe host label");
+    }
+    Ok(())
 }
 
 fn looks_like_kiro_api_key_text(value: &str) -> bool {
@@ -433,7 +473,11 @@ impl CredentialsConfig {
         }
 
         match serde_json::from_str(&content) {
-            Ok(config) => Ok(config),
+            Ok(config) => {
+                let config: CredentialsConfig = config;
+                config.validate_api_key_pipe_formats()?;
+                Ok(config)
+            }
             Err(json_error) => {
                 if let Some(credentials) = api_key_credentials_from_plain_text(&content) {
                     Ok(CredentialsConfig::Multiple(credentials))
@@ -442,6 +486,25 @@ impl CredentialsConfig {
                 }
             }
         }
+    }
+
+    fn validate_api_key_pipe_formats(&self) -> anyhow::Result<()> {
+        let credentials: &[KiroCredentials] = match self {
+            Self::Single(credential) => std::slice::from_ref(credential),
+            Self::Multiple(credentials) => credentials,
+        };
+        for (index, credential) in credentials.iter().enumerate() {
+            credential
+                .validate_api_key_import_fields()
+                .map_err(|reason| {
+                    anyhow::anyhow!(
+                        "credential #{} has invalid API-key import fields: {}",
+                        index + 1,
+                        reason
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     /// 转换为按优先级排序的凭据列表
@@ -571,6 +634,26 @@ impl KiroCredentials {
         }
     }
 
+    pub(crate) fn validate_api_key_import_fields(&self) -> Result<(), &'static str> {
+        if !self.is_api_key_credential() {
+            return Ok(());
+        }
+        if let Some(api_key) = self.kiro_api_key.as_deref() {
+            validate_kiro_api_key_pipe_format(api_key)?;
+        }
+        for region in [
+            self.region.as_deref(),
+            self.auth_region.as_deref(),
+            self.api_region.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_kiro_region_host_label(region)?;
+        }
+        Ok(())
+    }
+
     /// 规范化 Kiro API Key/headless 凭据。
     ///
     /// 支持把 `kiroApiKey: "ksk_xxx|eu-central-1"` 拆成真实 key 和区域；
@@ -589,19 +672,22 @@ impl KiroCredentials {
             return;
         }
 
-        if let Some((api_key, parsed_region)) = split_kiro_api_key_and_region(&raw_key) {
-            self.kiro_api_key = Some(api_key);
-            if let Some(region) = parsed_region {
-                if self.region.as_deref().is_none_or(str::is_empty) {
-                    self.region = Some(region.clone());
-                }
-                if self.auth_region.as_deref().is_none_or(str::is_empty) {
-                    self.auth_region = Some(region.clone());
-                }
-                if self.api_region.as_deref().is_none_or(str::is_empty) {
-                    self.api_region = Some(region);
+        match split_kiro_api_key_and_region(&raw_key) {
+            Some((api_key, parsed_region)) => {
+                self.kiro_api_key = Some(api_key);
+                if let Some(region) = parsed_region {
+                    if self.region.as_deref().is_none_or(str::is_empty) {
+                        self.region = Some(region.clone());
+                    }
+                    if self.auth_region.as_deref().is_none_or(str::is_empty) {
+                        self.auth_region = Some(region.clone());
+                    }
+                    if self.api_region.as_deref().is_none_or(str::is_empty) {
+                        self.api_region = Some(region);
+                    }
                 }
             }
+            None => self.kiro_api_key = None,
         }
 
         self.auth_method = Some("api_key".to_string());
@@ -1205,6 +1291,165 @@ mod tests {
         assert!(creds.refresh_token.is_none());
         assert!(creds.profile_arn.is_none());
         assert!(creds.client_id.is_none());
+    }
+
+    #[test]
+    fn api_key_pipe_format_rejects_malformed_envelopes_for_three_rounds() {
+        for _round in 0..3 {
+            for malformed in [
+                "|us-east-1",
+                "ksk_fake|us-east-1|extra",
+                "ksk_fake|us east-1",
+                "ksk_fake|us-east-1\nextra",
+                "ksk_fake|us-east-1.example",
+                "ksk_fake|-us-east-1",
+                "ksk_fake|us-east-1-",
+            ] {
+                assert!(
+                    validate_kiro_api_key_pipe_format(malformed).is_err(),
+                    "malformed={malformed:?}"
+                );
+                assert_eq!(split_kiro_api_key_and_region(malformed), None);
+            }
+        }
+    }
+
+    #[test]
+    fn api_key_pipe_format_keeps_compatible_safe_forms_for_three_rounds() {
+        for _round in 0..3 {
+            for (input, expected) in [
+                ("future_key_format", ("future_key_format", None)),
+                (" ksk_fake ", ("ksk_fake", None)),
+                ("ksk_fake|", ("ksk_fake", None)),
+                ("ksk_fake|us-east-1", ("ksk_fake", Some("us-east-1"))),
+                (
+                    " ksk_fake|eu-central-1 ",
+                    ("ksk_fake", Some("eu-central-1")),
+                ),
+                (
+                    "ksk_fake|future-safe-region-9",
+                    ("ksk_fake", Some("future-safe-region-9")),
+                ),
+            ] {
+                let actual = split_kiro_api_key_and_region(input).unwrap();
+                assert_eq!(actual.0, expected.0);
+                assert_eq!(actual.1.as_deref(), expected.1);
+            }
+        }
+    }
+
+    #[test]
+    fn json_credentials_reject_malformed_api_key_pipe_before_normalization() {
+        let malformed = [
+            "|us-east-1",
+            "ksk_fake|us-east-1|extra",
+            "ksk_fake|us east-1",
+            "ksk_fake|us-east-1\\nextra",
+            "ksk_fake|us-east-1.example",
+        ];
+        for round in 0..3 {
+            for (index, value) in malformed.iter().enumerate() {
+                let path = std::env::temp_dir().join(format!(
+                    "kiro-rs-invalid-api-key-pipe-{round}-{index}-{}.json",
+                    uuid::Uuid::new_v4()
+                ));
+                let body = serde_json::json!([{
+                    "authMethod": "api_key",
+                    "kiroApiKey": value
+                }]);
+                std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+                let error = CredentialsConfig::load(&path).unwrap_err().to_string();
+                assert!(error.contains("invalid API-key import fields"));
+                assert!(!error.contains(value));
+                let _ = std::fs::remove_file(path);
+            }
+
+            for (index, (field, value)) in [
+                ("region", "us east-1"),
+                ("authRegion", "us-east-1\nextra"),
+                ("apiRegion", "us-east-1.example"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let path = std::env::temp_dir().join(format!(
+                    "kiro-rs-invalid-explicit-region-{round}-{index}-{}.json",
+                    uuid::Uuid::new_v4()
+                ));
+                let mut credential = serde_json::Map::new();
+                credential.insert("authMethod".to_string(), serde_json::json!("api_key"));
+                credential.insert("kiroApiKey".to_string(), serde_json::json!("ksk_fake"));
+                credential.insert(field.to_string(), serde_json::json!(value));
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec(&serde_json::json!([credential])).unwrap(),
+                )
+                .unwrap();
+                let error = CredentialsConfig::load(&path).unwrap_err().to_string();
+                assert!(error.contains("invalid API-key import fields"));
+                assert!(!error.contains(value));
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    #[test]
+    fn plain_credentials_reject_malformed_pipe_forms_for_three_rounds() {
+        for round in 0..3 {
+            for (index, value) in [
+                "|us-east-1",
+                "ksk_fake|us-east-1|extra",
+                "ksk_fake|us east-1",
+                "ksk_fake|us-east-1\nextra",
+                "ksk_fake|us-east-1.example",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let path = std::env::temp_dir().join(format!(
+                    "kiro-rs-invalid-plain-api-key-{round}-{index}-{}.txt",
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::write(&path, format!("{value}\n")).unwrap();
+                let error = CredentialsConfig::load(&path).unwrap_err().to_string();
+                assert!(!error.contains(value));
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_api_key_regions_reject_host_unsafe_values_for_three_rounds() {
+        for _round in 0..3 {
+            for (field, value) in [
+                ("region", "us east-1"),
+                ("authRegion", "us-east-1\nextra"),
+                ("apiRegion", "us-east-1.example"),
+            ] {
+                let mut credential = KiroCredentials {
+                    auth_method: Some("api_key".to_string()),
+                    kiro_api_key: Some("future_key_format".to_string()),
+                    ..Default::default()
+                };
+                match field {
+                    "region" => credential.region = Some(value.to_string()),
+                    "authRegion" => credential.auth_region = Some(value.to_string()),
+                    "apiRegion" => credential.api_region = Some(value.to_string()),
+                    _ => unreachable!(),
+                }
+                assert!(credential.validate_api_key_import_fields().is_err());
+            }
+
+            let compatible = KiroCredentials {
+                auth_method: Some("api_key".to_string()),
+                kiro_api_key: Some("future_key_format".to_string()),
+                region: Some("future-safe-region-9".to_string()),
+                auth_region: Some("future-auth-9".to_string()),
+                api_region: Some("future-api-9".to_string()),
+                ..Default::default()
+            };
+            assert!(compatible.validate_api_key_import_fields().is_ok());
+        }
     }
 
     #[test]

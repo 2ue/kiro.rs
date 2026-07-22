@@ -27,6 +27,7 @@ import {
   upstreamModelLabel,
 } from './usage-helpers'
 import { UsageCostBreakdown, UsageCostTiles, usageRecordCostModel } from './usage-billing'
+import { RequestApiKeyIdDisplay } from './request-api-key-id'
 
 function MetricTile({
   label,
@@ -124,6 +125,10 @@ export function UsageDetailModal({
           <div className="grid gap-3 sm:grid-cols-2">
             <DetailField label="时间" value={formatDate(record.createdAt)} />
             <DetailField label="请求 ID" value={record.id} mono />
+            <div>
+              <div className="text-xs text-muted-foreground">请求渠道 ID</div>
+              <RequestApiKeyIdDisplay value={record.requestApiKeyId} />
+            </div>
             <DetailField label="入口" value={record.endpoint} mono />
             <DetailField label="会话 ID" value={record.conversationId || '-'} mono />
             <DetailField label="模型（请求）" value={record.model} />
@@ -218,6 +223,18 @@ export function UsageDetailModal({
                 <MetricTile label="首次思考" value={formatLatency(record.latencyTrace.firstThinkingDeltaMs)} />
                 <MetricTile label="首次可见文本" value={formatLatency(record.latencyTrace.firstVisibleTextDeltaMs)} tone="success" />
                 <MetricTile label="分片到输出" value={formatLatency(record.latencyTrace.streamGapToFirstOutputMs)} />
+                {record.latencyTrace.inferenceAttempts && (
+                  <MetricTile label="推理发送" value={`${formatNumber(record.latencyTrace.inferenceAttempts.consumed)} / ${formatNumber(record.latencyTrace.inferenceAttempts.maxAttempts)}`} tone={record.latencyTrace.inferenceAttempts.exhausted ? 'warning' : 'info'} />
+                )}
+                {record.latencyTrace.inferenceAttempts && (
+                  <MetricTile label="推理发送分项" value={`本地 ${formatNumber(record.latencyTrace.inferenceAttempts.localAttempts)} / 外部 ${formatNumber(record.latencyTrace.inferenceAttempts.externalAttempts)} / MCP ${formatNumber(record.latencyTrace.inferenceAttempts.mcpAttempts)}`} />
+                )}
+                {record.latencyTrace.auxiliaryAttempts && (
+                  <MetricTile label="辅助发送" value={`${formatNumber(record.latencyTrace.auxiliaryAttempts.consumed)} / ${formatNumber(record.latencyTrace.auxiliaryAttempts.maxAttempts)}`} tone={record.latencyTrace.auxiliaryAttempts.exhausted ? 'warning' : 'info'} />
+                )}
+                {record.latencyTrace.auxiliaryAttempts && (
+                  <MetricTile label="辅助发送分项" value={`刷新 ${formatNumber(record.latencyTrace.auxiliaryAttempts.tokenRefreshAttempts)} / Profile ${formatNumber(record.latencyTrace.auxiliaryAttempts.profileDiscoveryAttempts)}`} />
+                )}
                 {typeof record.latencyTrace.capacityWeightUnits === 'number' && (
                   <MetricTile label="本地容量权重" value={`${formatNumber(record.latencyTrace.capacityWeightUnits)} 单位`} tone="info" />
                 )}
@@ -256,6 +273,9 @@ export function UsageDetailModal({
                 )}
                 {typeof record.latencyTrace.streamRetryAttempts === 'number' && (
                   <MetricTile label="首输出前重试" value={formatNumber(record.latencyTrace.streamRetryAttempts)} tone="warning" />
+                )}
+                {typeof record.latencyTrace.streamRetryDispatchFailures === 'number' && (
+                  <MetricTile label="重试调度失败" value={formatNumber(record.latencyTrace.streamRetryDispatchFailures)} tone="warning" />
                 )}
                 {record.latencyTrace.streamRetryReasons?.length ? (
                   <MetricTile label="重试原因" value={record.latencyTrace.streamRetryReasons.join(' / ')} />

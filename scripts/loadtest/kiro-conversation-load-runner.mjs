@@ -6,8 +6,10 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { URL } from "node:url";
 
+import { resolveLoadTarget } from "./validation-target.mjs";
+
 const args = parseArgs(process.argv.slice(2));
-const baseUrl = new URL(args.baseUrl || process.env.KIRO_BASE_URL || "http://127.0.0.1:9022");
+const { baseUrl, apiKey } = resolveLoadTarget(args);
 const path = args.path || process.env.KIRO_MESSAGES_PATH || "/cc/v1/messages";
 const durationMs = parseDuration(args.duration || process.env.DURATION || "5m");
 const concurrency = Number.parseInt(args.concurrency || process.env.CONCURRENCY || "16", 10);
@@ -21,7 +23,6 @@ const systemChars = Number.parseInt(args.systemChars || process.env.SYSTEM_CHARS
 const toolDescriptionChars = Number.parseInt(args.toolDescriptionChars || process.env.TOOL_DESCRIPTION_CHARS || "12000", 10);
 const streamMode = parseBool(args.stream ?? process.env.STREAM ?? "true");
 const scenario = args.scenario || process.env.KIRO_MOCK_SCENARIO || "success";
-const apiKey = args.apiKey || process.env.KIRO_API_KEY || "sk-kiro-rs-local-debug";
 const noSummary = parseBool(args.noSummary ?? process.env.NO_SUMMARY ?? "false");
 
 const agent =

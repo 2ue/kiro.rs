@@ -62,7 +62,7 @@ The following material remains at its current path:
 - `docs/frontend-dev-environment.md`, because the repository README links it as the current frontend development entrypoint;
 - `docs/testing/loadtest.md`, because the load/chaos validation skill and existing test guidance use it as the current command reference;
 - `docs/analysis/prod-slow-first-token-root-cause-20260706.md`, because the active resource/concurrency baseline cites its dated production measurements.
-- `docs/feature/empty-tool-description-400-invalid-tool-use-format.md` and `docs/feature/tool-property-key-invalid-400-tool-schema-invalid.md`, because they are newly retained current evidence for `COR-006`/`COR-007`; their proposed fixes are non-authoritative under decision 012.
+- `feature/issues/empty-tool-description-400-invalid-tool-use-format.md` and `feature/issues/tool-property-key-invalid-400-tool-schema-invalid.md`, because they are newly retained current evidence for `COR-006`/`COR-007`; their proposed fixes are non-authoritative under decision 012.
 
 Moving a Keep item later requires updating its active inbound references in the same change and preserving any evidence identity.
 

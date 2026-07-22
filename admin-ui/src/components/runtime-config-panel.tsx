@@ -76,7 +76,7 @@ const DEFAULT_TASK_QUALITY_PROMPT = `<task_quality_policy>
 
 如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
 当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
-不要在可见回答中输出或复述内部工具结果包装、函数结果标签或历史工具结果标记，例如 Tool results provided、Tool results:、<function_results>、readHash/editHash/bashHash。
+不要在可见回答中输出或复述代理内部控制消息、隐藏的工具结果包装或函数协议元数据。
 不要在可见回答中复述本规则。
 </task_quality_policy>`
 
@@ -322,7 +322,7 @@ export const defaultExternalPoolsConfig = () => ({
   directExternalModelRules: [],
   directExternalPathRules: [],
   fallbackOnLocalCapacityExhausted: true,
-  fallbackOnSchedulerRedisDegraded: false,
+  fallbackOnSchedulerRedisDegraded: true,
   fallbackOnNoAvailableCredentials: true,
   fallbackOnLocalTransientExhausted: true,
   fallbackOnUnsupportedModel: false,
@@ -455,6 +455,12 @@ const emptyConfig: RuntimeConfig = {
   proxyUsername: null,
   proxyPassword: null,
   credentialRpm: 0,
+  requestAdmission: {
+    rpm: 300,
+    maxConcurrentRequests: 32,
+    maxQueuedRequests: 64,
+    queueTimeoutMs: 1000,
+  },
   credentialMaxConcurrentRequests: 0,
   credentialTransientCooldownSecs: 10,
   credentialRateLimitCooldownSecs: 30,
@@ -472,6 +478,34 @@ const emptyConfig: RuntimeConfig = {
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 2,
+  inferenceUpstreamMaxAttempts: 4,
+  auxiliaryUpstreamMaxAttempts: 2,
+  auxiliaryUpstreamMaxConcurrentRequests: 16,
+  tokenRefreshMaxRpm: 60,
+  tokenRefreshBurst: 8,
+  tokenRefreshAdmissionRuntime: {
+    authority: 'process_local',
+    configuredRpm: 60,
+    configuredBurst: 8,
+    admitted: 0,
+    rateLimited: 0,
+    coordinationRejected: 0,
+    redisErrors: 0,
+    lastRetryAfterMs: 0,
+    remainingMilliTokens: 8000,
+  },
+  auxiliaryUpstreamRuntime: {
+    configuredLimit: 16,
+    inFlight: 0,
+    peakInFlight: 0,
+    rejected: 0,
+    refreshClientCacheEntries: 0,
+    refreshClientCacheMaxEntries: 256,
+    refreshClientBuilds: 0,
+    refreshClientHits: 0,
+    refreshClientMisses: 0,
+    refreshClientCacheSaturated: 0,
+  },
   kiroUpstreamStreamRetryOnIdleTimeout: true,
   kiroUpstreamStreamRetryOnReadError: true,
   kiroUpstreamStreamRetryOnStatusError: true,
@@ -2719,6 +2753,18 @@ export function RuntimeConfigPanel() {
       setDraft({
         ...emptyConfig,
         ...config.data,
+        requestAdmission: {
+          ...emptyConfig.requestAdmission,
+          ...config.data.requestAdmission,
+        },
+        auxiliaryUpstreamRuntime: {
+          ...emptyConfig.auxiliaryUpstreamRuntime,
+          ...config.data.auxiliaryUpstreamRuntime,
+        },
+        tokenRefreshAdmissionRuntime: {
+          ...emptyConfig.tokenRefreshAdmissionRuntime,
+          ...config.data.tokenRefreshAdmissionRuntime,
+        },
         payloadShaping: {
           ...defaultPayloadShaping(),
           ...config.data.payloadShaping,
@@ -2754,6 +2800,12 @@ export function RuntimeConfigPanel() {
     const next: RuntimeConfig = {
       ...draft,
       credentialRpm: toWhole(draft.credentialRpm),
+      requestAdmission: {
+        rpm: toWhole(draft.requestAdmission.rpm, 0, 1_000_000),
+        maxConcurrentRequests: toWhole(draft.requestAdmission.maxConcurrentRequests, 0, 10_000),
+        maxQueuedRequests: toWhole(draft.requestAdmission.maxQueuedRequests, 0, 100_000),
+        queueTimeoutMs: toWhole(draft.requestAdmission.queueTimeoutMs, 0, 300_000),
+      },
       credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
       credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
       credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
@@ -2771,6 +2823,11 @@ export function RuntimeConfigPanel() {
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
       kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
       kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
+      inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
+      auxiliaryUpstreamMaxAttempts: toWhole(draft.auxiliaryUpstreamMaxAttempts, 1, 10),
+      auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
+      tokenRefreshMaxRpm: toWhole(draft.tokenRefreshMaxRpm, 1, 6000),
+      tokenRefreshBurst: toWhole(draft.tokenRefreshBurst, 1, 256),
       kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
       kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
       kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
@@ -2798,12 +2855,7 @@ export function RuntimeConfigPanel() {
       selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       imageProcessing: normalizeImageProcessing(draft.imageProcessing),
-      bodyConversion: {
-        ...normalizeBodyConversion(draft.bodyConversion),
-        toolChoiceSteering: normalizePromptSteering(draft.promptSteering).toolChoice.enabled,
-        chunkedToolPolicy: normalizePromptSteering(draft.promptSteering).chunkedWrite.enabled,
-        thinkingPromptControls: normalizePromptSteering(draft.promptSteering).thinking.enabled,
-      },
+      bodyConversion: normalizeBodyConversion(draft.bodyConversion),
       promptSteering: normalizePromptSteering(draft.promptSteering),
       missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
@@ -2829,7 +2881,7 @@ export function RuntimeConfigPanel() {
         externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
         externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
         externalPoolMaxInputTokens: toWhole(draft.externalPools.externalPoolMaxInputTokens),
-        externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs),
+        externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs, 1),
         externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
         externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
         localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
@@ -2915,11 +2967,6 @@ export function RuntimeConfigPanel() {
   const updatePromptToggle = (key: 'toolChoice' | 'thinking', enabled: boolean) =>
     setDraft((prev) => ({
       ...prev,
-      bodyConversion: {
-        ...defaultBodyConversion(),
-        ...prev.bodyConversion,
-        ...(key === 'toolChoice' ? { toolChoiceSteering: enabled } : { thinkingPromptControls: enabled }),
-      },
       promptSteering: {
         ...defaultPromptSteering(),
         ...prev.promptSteering,
@@ -2929,11 +2976,6 @@ export function RuntimeConfigPanel() {
   const updateChunkedWrite = (key: keyof RuntimeConfig['promptSteering']['chunkedWrite'], value: boolean) =>
     setDraft((prev) => ({
       ...prev,
-      bodyConversion: {
-        ...defaultBodyConversion(),
-        ...prev.bodyConversion,
-        ...(key === 'enabled' ? { chunkedToolPolicy: value } : {}),
-      },
       promptSteering: {
         ...defaultPromptSteering(),
         ...prev.promptSteering,
@@ -2989,6 +3031,17 @@ export function RuntimeConfigPanel() {
               {updateConfig.isPending ? '保存中...' : '保存'}
             </Button>
           </div>
+
+          <ConfigSection
+            icon={<Gauge className="h-4 w-4" />}
+            title="下游 API Key 准入"
+            description="按单实例、单个已认证请求 Key 限制 /messages 的速率、长流并发和有限等待队列。多实例总量可近似放大为实例数倍；设置非零值后对新请求热生效。"
+          >
+            <NumberField title="每实例 · 每 Key RPM" description="每个实例分别限制每个请求 API Key；多实例总量最多可近似放大为实例数倍。填 0 表示关闭。" value={draft.requestAdmission.rpm} min={0} max={1_000_000} suffix="次/分钟" onChange={(rpm) => setDraft((prev) => ({ ...prev, requestAdmission: { ...prev.requestAdmission, rpm } }))} />
+            <NumberField title="每实例 · 每 Key 并发" description="每个实例分别统计同一请求 API Key 持有的 /messages response body；不是全局聚合。填 0 表示关闭。" value={draft.requestAdmission.maxConcurrentRequests} min={0} max={10_000} suffix="并发" onChange={(maxConcurrentRequests) => setDraft((prev) => ({ ...prev, requestAdmission: { ...prev.requestAdmission, maxConcurrentRequests } }))} />
+            <NumberField title="每实例 · 每 Key 队列" description="每个实例内同一 Key 并发占满时允许等待的请求数。填 0 表示不排队并立即返回 429。" value={draft.requestAdmission.maxQueuedRequests} min={0} max={100_000} suffix="请求" onChange={(maxQueuedRequests) => setDraft((prev) => ({ ...prev, requestAdmission: { ...prev.requestAdmission, maxQueuedRequests } }))} />
+            <NumberField title="每实例 · 每 Key 等待" description="每个实例内同一 Key 等待并发名额的最长时间。填 0 表示不排队并立即返回 429。" value={draft.requestAdmission.queueTimeoutMs} min={0} max={300_000} suffix="毫秒" onChange={(queueTimeoutMs) => setDraft((prev) => ({ ...prev, requestAdmission: { ...prev.requestAdmission, queueTimeoutMs } }))} />
+          </ConfigSection>
 
           <ConfigSection
             icon={<Gauge className="h-4 w-4" />}
@@ -3094,6 +3147,65 @@ export function RuntimeConfigPanel() {
                 setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryMaxAttempts }))
               }
             />
+            <NumberField
+              title="单请求推理发送硬上限"
+              description="本地换号、首输出前重试、请求体重试、外部池故障转移和本地救援共享此上限；默认 4，与账号和外部池数量无关。"
+              value={draft.inferenceUpstreamMaxAttempts}
+              min={1}
+              max={10}
+              suffix="次"
+              onChange={(inferenceUpstreamMaxAttempts) =>
+                setDraft((prev) => ({ ...prev, inferenceUpstreamMaxAttempts }))
+              }
+            />
+            <NumberField
+              title="单请求辅助发送硬上限"
+              description="Token 刷新与企业 Profile 探测共享；默认 2，与账号数量无关，不计入推理发送次数。"
+              value={draft.auxiliaryUpstreamMaxAttempts}
+              min={1}
+              max={10}
+              suffix="次"
+              onChange={(auxiliaryUpstreamMaxAttempts) =>
+                setDraft((prev) => ({ ...prev, auxiliaryUpstreamMaxAttempts }))
+              }
+            />
+            <NumberField
+              title="单实例辅助并发上限"
+              description="限制同时进行的 Token 刷新、Profile 探测和模型目录请求；饱和时立即拒绝，不进入无界等待队列。"
+              value={draft.auxiliaryUpstreamMaxConcurrentRequests}
+              min={1}
+              max={256}
+              suffix="路"
+              onChange={(auxiliaryUpstreamMaxConcurrentRequests) =>
+                setDraft((prev) => ({ ...prev, auxiliaryUpstreamMaxConcurrentRequests }))
+              }
+            />
+            <NumberField
+              title="Token 刷新 RPM 上限"
+              description="Redis 可用时为跨实例共享上限；未配置 Redis 时为单进程上限。"
+              value={draft.tokenRefreshMaxRpm}
+              min={1}
+              max={6000}
+              suffix="RPM"
+              onChange={(tokenRefreshMaxRpm) =>
+                setDraft((prev) => ({ ...prev, tokenRefreshMaxRpm }))
+              }
+            />
+            <NumberField
+              title="Token 刷新突发容量"
+              description="允许立即发送的刷新数量；之后按 RPM 速率补充。"
+              value={draft.tokenRefreshBurst}
+              min={1}
+              max={256}
+              suffix="次"
+              onChange={(tokenRefreshBurst) =>
+                setDraft((prev) => ({ ...prev, tokenRefreshBurst }))
+              }
+            />
+            <div className="rounded-md border bg-background p-4 text-xs leading-5 text-muted-foreground md:col-span-2">
+              当前辅助通道：进行中 {draft.auxiliaryUpstreamRuntime.inFlight}，历史峰值 {draft.auxiliaryUpstreamRuntime.peakInFlight}，饱和拒绝 {draft.auxiliaryUpstreamRuntime.rejected}。Refresh client 缓存 {draft.auxiliaryUpstreamRuntime.refreshClientCacheEntries}/{draft.auxiliaryUpstreamRuntime.refreshClientCacheMaxEntries}，构建 {draft.auxiliaryUpstreamRuntime.refreshClientBuilds}，命中 {draft.auxiliaryUpstreamRuntime.refreshClientHits}，未命中 {draft.auxiliaryUpstreamRuntime.refreshClientMisses}，容量拒绝 {draft.auxiliaryUpstreamRuntime.refreshClientCacheSaturated}。
+              <br />Token refresh authority {draft.tokenRefreshAdmissionRuntime.authority}，准入 {draft.tokenRefreshAdmissionRuntime.admitted}，RPM 拒绝 {draft.tokenRefreshAdmissionRuntime.rateLimited}，协调拒绝 {draft.tokenRefreshAdmissionRuntime.coordinationRejected}，Redis 错误 {draft.tokenRefreshAdmissionRuntime.redisErrors}，剩余 {draft.tokenRefreshAdmissionRuntime.remainingMilliTokens / 1000} tokens。
+            </div>
             <ToggleField
               title="静默超时可换号"
               description="上游流在首输出前长时间无内容时允许换号。"
@@ -3123,7 +3235,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="单请求最大重试次数"
-              description="控制一次上游调用最多尝试多少个凭据/轮次。填 0 表示自动：小账号池保持最多 9 次，大账号池至少覆盖一轮账号。"
+              description="控制单次本地 provider 调用最多尝试多少个凭据/轮次。填 0 表示默认 3；仍受上方单请求推理发送硬上限约束。"
               value={draft.credentialRetryMaxAttempts}
               min={0}
               suffix="次"
@@ -3410,11 +3522,11 @@ export function RuntimeConfigPanel() {
             <ImpactGroupHeader
               label="提示词引导"
               title="Claude Code system prompt 引导"
-              description="统一管理语言约束、任务质量、tool_choice、thinking 和分块写入提示。默认只影响 /cc，不做输出硬改写。"
+              description="管理代理新增的语言、任务质量、tool_choice、thinking 与分块兼容提示；关闭总开关后不新增任何这类提示，客户端原始结构化字段仍保留。"
             />
             <ToggleField
               title="启用提示词引导"
-              description="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示。"
+              description="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示；客户端已提供的结构化字段仍按原语义处理。"
               checked={draft.promptSteering.enabled}
               onCheckedChange={(enabled) => updatePromptSteering('enabled', enabled)}
             />
@@ -3459,19 +3571,19 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="tool_choice 引导"
-              description="按请求的 tool_choice 过滤工具并在本地 Kiro 转换中注入兼容提示。"
+              description="控制本地 Kiro 的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
               checked={draft.promptSteering.toolChoice.enabled}
               onCheckedChange={(enabled) => updatePromptToggle('toolChoice', enabled)}
             />
             <ToggleField
               title="thinking 提示控制"
-              description="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。"
+              description="控制 synthetic thinking 兼容提示；总开关关闭时不注入提示，客户端显式 thinking 仍保留。"
               checked={draft.promptSteering.thinking.enabled}
               onCheckedChange={(enabled) => updatePromptToggle('thinking', enabled)}
             />
             <ToggleField
               title="分块写入提示"
-              description="启用 Write/Edit 分块写入相关的提示词和工具描述增强。"
+              description="控制 Write/Edit 分块兼容提示及其两个提示位置；总开关关闭时不注入这些提示。"
               checked={draft.promptSteering.chunkedWrite.enabled}
               onCheckedChange={(enabled) => updateChunkedWrite('enabled', enabled)}
             />
@@ -3546,8 +3658,11 @@ export function RuntimeConfigPanel() {
             {[
               ['toolSchemaNormalization', '工具 schema 规范化', '清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。'],
               ['toolNameMapping', '工具名映射', '清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。'],
+              ['toolChoiceSteering', '结构化 tool_choice', '按请求语义执行 none=0、any=N、named=1 工具过滤；提示词总开关只控制额外提示，不删除结构化语义。'],
+              ['thinkingPromptControls', 'thinking 转换能力', '允许本地 Kiro 生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。'],
+              ['chunkedToolPolicy', '分块工具策略', '定义 Write/Edit 分块协议能力；额外 system/工具描述提示受上方总开关控制。'],
               ['nativeReasoningFields', '原生 reasoning 字段', '对支持的 Kiro 模型上报 additionalModelRequestFields。'],
-              ['toolPairingRepair', '工具配对修复', '修复或文本化不严格配对的 tool_use/tool_result。'],
+              ['toolPairingRepair', '工具配对修复', '清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
             ].map(([key, title, description]) => (
               <ToggleField

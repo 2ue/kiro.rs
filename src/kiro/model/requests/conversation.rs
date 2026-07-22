@@ -72,6 +72,34 @@ impl ConversationState {
         self.history = history;
         self
     }
+
+    /// Whether any assistant history entry carries Kiro-native reasoning.
+    pub fn has_history_reasoning_content(&self) -> bool {
+        self.history.iter().any(|message| {
+            matches!(
+                message,
+                Message::Assistant(assistant)
+                    if assistant.assistant_response_message.reasoning_content.is_some()
+            )
+        })
+    }
+
+    /// Remove all Kiro-native reasoning blocks from assistant history.
+    ///
+    /// This is intentionally narrower than removing an assistant entry: visible
+    /// content and tool uses remain byte-for-byte equivalent after serialization.
+    pub fn clear_history_reasoning_content(&mut self) -> usize {
+        self.history
+            .iter_mut()
+            .filter_map(|message| match message {
+                Message::Assistant(assistant) => assistant
+                    .assistant_response_message
+                    .reasoning_content
+                    .take(),
+                Message::User(_) => None,
+            })
+            .count()
+    }
 }
 
 /// 当前消息容器
@@ -312,6 +340,9 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// Kiro-native signed or redacted reasoning history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
 }
 
 impl AssistantMessage {
@@ -320,6 +351,7 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 
@@ -328,6 +360,58 @@ impl AssistantMessage {
         self.tool_uses = Some(tool_uses);
         self
     }
+
+    /// Set a single Kiro-native reasoning union value.
+    pub fn with_reasoning_content(mut self, reasoning_content: ReasoningContent) -> Self {
+        self.reasoning_content = Some(reasoning_content);
+        self
+    }
+}
+
+/// Kiro assistant history accepts exactly one native reasoning union member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReasoningContent {
+    /// Signed reasoning text returned by the same model.
+    ReasoningText(ReasoningTextContent),
+    /// Opaque canonical-base64 reasoning content.
+    RedactedContent(RedactedReasoningContent),
+}
+
+impl ReasoningContent {
+    pub fn reasoning_text(text: impl Into<String>, signature: impl Into<String>) -> Self {
+        Self::ReasoningText(ReasoningTextContent {
+            reasoning_text: ReasoningText {
+                text: text.into(),
+                signature: signature.into(),
+            },
+        })
+    }
+
+    pub fn redacted_content(content: impl Into<String>) -> Self {
+        Self::RedactedContent(RedactedReasoningContent {
+            redacted_content: content.into(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReasoningTextContent {
+    pub reasoning_text: ReasoningText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningText {
+    pub text: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RedactedReasoningContent {
+    pub redacted_content: String,
 }
 
 #[cfg(test)]
@@ -389,5 +473,85 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"images\""));
         assert!(json.contains("\"bytes\":\"aW1hZ2U=\""));
+    }
+
+    #[test]
+    fn assistant_reasoning_content_serializes_as_exact_kiro_union() {
+        let signed = AssistantMessage::new("answer")
+            .with_reasoning_content(ReasoningContent::reasoning_text("thought", "sig"));
+        assert_eq!(
+            serde_json::to_value(signed).unwrap(),
+            serde_json::json!({
+                "content": "answer",
+                "reasoningContent": {
+                    "reasoningText": {
+                        "text": "thought",
+                        "signature": "sig"
+                    }
+                }
+            })
+        );
+
+        let redacted = AssistantMessage::new(" ")
+            .with_reasoning_content(ReasoningContent::redacted_content("b3BhcXVl"));
+        assert_eq!(
+            serde_json::to_value(redacted).unwrap(),
+            serde_json::json!({
+                "content": " ",
+                "reasoningContent": {"redactedContent": "b3BhcXVl"}
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_content_deserialization_rejects_non_union_objects() {
+        for invalid in [
+            serde_json::json!({
+                "reasoningText": {"text": "thought", "signature": "sig"},
+                "redactedContent": "b3BhcXVl"
+            }),
+            serde_json::json!({"reasoningText": {"text": "thought"}}),
+            serde_json::json!({"redactedContent": "b3BhcXVl", "extra": true}),
+        ] {
+            assert!(serde_json::from_value::<ReasoningContent>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn conversation_state_clears_native_history_reasoning_only_for_five_rounds() {
+        for round in 0..5 {
+            let signed = AssistantMessage::new(format!("signed answer {round}"))
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")])
+                .with_reasoning_content(ReasoningContent::reasoning_text(
+                    format!("thought {round}"),
+                    format!("sig-{round}"),
+                ));
+            let redacted = AssistantMessage::new(format!("redacted answer {round}"))
+                .with_reasoning_content(ReasoningContent::redacted_content("b3BhcXVl"));
+            let mut state = ConversationState::new(format!("conv-{round}")).with_history(vec![
+                Message::User(HistoryUserMessage::new("question", "model")),
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: signed,
+                }),
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: redacted,
+                }),
+                Message::Assistant(HistoryAssistantMessage::new("plain answer")),
+            ]);
+
+            assert!(state.has_history_reasoning_content(), "round {round}");
+            assert_eq!(state.clear_history_reasoning_content(), 2, "round {round}");
+            assert!(!state.has_history_reasoning_content(), "round {round}");
+            assert_eq!(state.clear_history_reasoning_content(), 0, "round {round}");
+
+            let serialized = serde_json::to_string(&state.history).unwrap();
+            assert!(serialized.contains(&format!("signed answer {round}")));
+            assert!(serialized.contains(&format!("redacted answer {round}")));
+            assert!(serialized.contains("plain answer"));
+            assert!(serialized.contains("tool-1"));
+            assert!(!serialized.contains("reasoningContent"));
+            assert!(!serialized.contains(&format!("thought {round}")));
+            assert!(!serialized.contains(&format!("sig-{round}")));
+        }
     }
 }

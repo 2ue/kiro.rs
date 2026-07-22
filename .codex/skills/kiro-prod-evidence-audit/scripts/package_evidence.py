@@ -8,6 +8,7 @@ summary/, problems/, and redacted/.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -37,7 +38,8 @@ TEXT_EXTENSIONS = {
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(
-            r"(?i)(authorization\s*[:=]\s*)(bearer|basic)\s+([A-Za-z0-9._~+/=-]{12,})"
+            r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?\s*)"
+            r"(bearer|basic)\s+([A-Za-z0-9._~+/=-]{12,})"
         ),
         r"\1\2 [REDACTED]",
     ),
@@ -59,6 +61,10 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r"\1[REDACTED]@",
     ),
     (
+        re.compile(r"(?i)([a-z][a-z0-9+.-]*://)([^:@/\s]+):([^@/\s]+)@"),
+        r"\1[REDACTED_USER]:[REDACTED_PASS]@",
+    ),
+    (
         re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{16}\b"),
         "[REDACTED_AWS_KEY]",
     ),
@@ -70,7 +76,27 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
         "[REDACTED_JWT]",
     ),
+    (
+        re.compile(r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+        "[REDACTED_EMAIL]",
+    ),
 ]
+
+SENSITIVE_JSON_KEYS = {
+    "authorization",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "client_secret",
+    "refresh_token",
+    "access_token",
+    "session_id",
+    "cookie",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -110,6 +136,10 @@ def scrub_sensitive_json_value(value: object) -> object:
     if isinstance(value, dict):
         scrubbed: dict[str, object] = {}
         for key, child in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+            if normalized_key in SENSITIVE_JSON_KEYS:
+                scrubbed[key] = "[REDACTED]"
+                continue
             if key == "requestBody" and isinstance(child, dict):
                 request_body = dict(child)
                 if "content" in request_body:
@@ -165,8 +195,18 @@ def redact_structured_text(text: str, source_name: str) -> str:
 
 def iter_files(root: Path) -> Iterable[Path]:
     for path in sorted(root.rglob("*")):
-        if path.is_file():
+        if path.is_file() and not path.is_symlink():
             yield path
+
+
+def source_date_epoch() -> int:
+    raw = os.environ.get("SOURCE_DATE_EPOCH")
+    if raw is None:
+        return int(time.time())
+    try:
+        return max(0, int(raw))
+    except ValueError as error:
+        raise SystemExit("SOURCE_DATE_EPOCH must be a non-negative integer") from error
 
 
 def write_redacted(raw_dir: Path, redacted_dir: Path, max_file_bytes: int) -> list[dict[str, object]]:
@@ -226,9 +266,14 @@ def write_default_files(root: Path) -> None:
         (root / subdir).mkdir(parents=True, exist_ok=True)
 
 
-def build_manifest(root: Path, raw_entries: list[dict[str, object]], include_raw: bool) -> dict[str, object]:
+def build_manifest(
+    root: Path,
+    raw_entries: list[dict[str, object]],
+    include_raw: bool,
+    generated_at_epoch: int,
+) -> dict[str, object]:
     manifest: dict[str, object] = {
-        "generated_at_epoch": int(time.time()),
+        "generated_at_epoch": generated_at_epoch,
         "root": str(root),
         "include_raw_in_archive": include_raw,
         "raw_files": raw_entries,
@@ -238,6 +283,8 @@ def build_manifest(root: Path, raw_entries: list[dict[str, object]], include_raw
     for path in iter_files(root):
         rel = path.relative_to(root)
         if rel.parts and rel.parts[0] == "raw" and not include_raw:
+            continue
+        if rel == Path("manifest.json"):
             continue
         if path.name.endswith(".tar.gz"):
             continue
@@ -252,16 +299,32 @@ def build_manifest(root: Path, raw_entries: list[dict[str, object]], include_raw
     return manifest
 
 
-def create_archive(root: Path, archive: Path, include_raw: bool) -> None:
+def create_archive(
+    root: Path,
+    archive: Path,
+    include_raw: bool,
+    generated_at_epoch: int,
+) -> None:
     archive.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive, "w:gz") as tar:
-        for path in iter_files(root):
-            rel = path.relative_to(root)
-            if rel.parts and rel.parts[0] == "raw" and not include_raw:
-                continue
-            if path.resolve() == archive.resolve():
-                continue
-            tar.add(path, arcname=str(Path(root.name) / rel))
+    with archive.open("wb") as raw_archive:
+        with gzip.GzipFile(fileobj=raw_archive, mode="wb", filename="", mtime=generated_at_epoch) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w") as tar:
+                for path in iter_files(root):
+                    rel = path.relative_to(root)
+                    if rel.parts and rel.parts[0] == "raw" and not include_raw:
+                        continue
+                    if path.name.endswith(".tar.gz") or path.resolve() == archive.resolve():
+                        continue
+
+                    def normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ""
+                        info.gname = ""
+                        info.mtime = generated_at_epoch
+                        return info
+
+                    tar.add(path, arcname=str(Path(root.name) / rel), filter=normalize)
 
 
 def main() -> int:
@@ -290,7 +353,8 @@ def main() -> int:
 
     write_default_files(root)
     raw_entries = write_redacted(root / "raw", root / "redacted", args.max_file_mb * 1024 * 1024)
-    manifest = build_manifest(root, raw_entries, args.include_raw)
+    generated_at_epoch = source_date_epoch()
+    manifest = build_manifest(root, raw_entries, args.include_raw, generated_at_epoch)
     manifest_path = root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -299,7 +363,7 @@ def main() -> int:
         if args.archive
         else root / f"{root.name}-{'raw' if args.include_raw else 'redacted'}.tar.gz"
     )
-    create_archive(root, archive, args.include_raw)
+    create_archive(root, archive, args.include_raw, generated_at_epoch)
     print(json.dumps({"archive": str(archive), "include_raw": args.include_raw}, ensure_ascii=False))
     return 0
 

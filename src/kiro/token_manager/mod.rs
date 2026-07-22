@@ -1,5 +1,6 @@
 mod account_state;
 mod admin_snapshot;
+mod auxiliary;
 mod capacity;
 mod concurrency;
 mod cooldown;
@@ -20,7 +21,11 @@ pub use admin_snapshot::{
     CredentialBaseSnapshot, CredentialCooldownSnapshot, CredentialEntrySnapshot,
     ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
 };
+pub(crate) use auxiliary::{
+    AuxiliaryConcurrencyKind, AuxiliaryConcurrencySaturated, TokenRefreshAdmissionRejected,
+};
 pub use concurrency::InFlightLeaseGuard;
+pub(crate) use manager::AutomaticTokenRecoveryOutcome;
 #[allow(unused_imports)]
 pub use manager::{MultiTokenManager, StatsFlushShutdownReport, StatsFlushWorkerHandle};
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
@@ -37,8 +42,8 @@ pub use types::{
 
 #[allow(unused_imports)]
 pub(crate) use refresh::{
-    RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
-    is_token_expiring_within, refresh_token, validate_refresh_token,
+    RefreshFailure, RefreshFailureKind, RefreshFailureStage, get_usage_limits, is_token_expired,
+    is_token_expiring_within, validate_refresh_token,
 };
 #[allow(unused_imports)]
 pub(crate) use types::InFlightKind;

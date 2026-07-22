@@ -27,7 +27,7 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -48,9 +48,14 @@ use super::converter::{
     extract_stable_conversation_id,
 };
 use super::envelope;
+use super::inference_attempt_budget::{
+    DEFAULT_AUXILIARY_UPSTREAM_MAX_ATTEMPTS, DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
+    InferenceAttemptBudget,
+};
 use super::middleware::AppState;
 use super::model_capabilities::{
-    ModelResolution, ModelResolutionSource, strip_model_compat_suffixes,
+    KiroReasoningCapabilityState, ModelResolution, ModelResolutionSource,
+    strip_model_compat_suffixes,
 };
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
@@ -61,16 +66,24 @@ use super::payload_guard_runtime::prepare_kiro_request_body;
 use super::prompt_cache::{
     KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
 };
+use super::request_admission::{RequestRejectionAttribution, RequestRejectionReason};
+use super::request_body::MessagesBody;
+#[cfg(test)]
+use super::request_facts::MAX_MESSAGES_JSON_NESTING_DEPTH;
 use super::request_facts::{
-    probe_raw_messages_body, raw_messages_body_hints,
+    RawMessagesBodyProbe, deserialize_messages_request_with_probe, probe_raw_messages_body,
     rewrite_raw_missing_top_level_max_tokens_with_probe,
+    validate_raw_reasoning_protocol_with_probe,
 };
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
 use super::tool_schema_keys::ToolSchemaKeyMap;
+use super::transcript_sanitizer::RESPONSE_PROTOCOL_CONTAMINATION_DETAIL;
+#[cfg(test)]
+use super::types::OutputConfig;
 use super::types::{
-    CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, OutputConfig,
-    Thinking,
+    CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, Thinking,
+    validate_redacted_thinking_data,
 };
 use super::usage::{
     ExternalPoolAttempt, ExternalPoolUsageSnapshot, StreamTerminalReason, UsageLatencyTrace,
@@ -80,12 +93,12 @@ use super::usage::{
 use super::websearch;
 use crate::external_pool::{
     ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager,
-    ExternalPoolRequestBodyMode, ExternalRouteRequest,
+    ExternalPoolRequestBodyMode, ExternalRouteRequest, ExternalRouteRequestPreparationCache,
 };
-use crate::http_client::response_bytes_with_body_timeout;
-use crate::kiro::call_trace::KiroCredentialAttempt;
+use crate::http_client::response_bytes_with_limit_and_body_timeout;
+use crate::kiro::call_trace::{KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink};
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
-use crate::kiro::token_manager::LocalPoolRouteStateKind;
+use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteStateKind};
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
@@ -101,6 +114,7 @@ const SLOW_FIRST_VISIBLE_TEXT_MS: u64 = 10_000;
 const SLOW_STREAM_GAP_MS: u64 = 10_000;
 const SLOW_RESPONSE_MS: u64 = 60_000;
 const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
+const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct LocalStreamRetryConfig {
@@ -130,7 +144,9 @@ impl LocalStreamRetryConfig {
         match reason {
             StreamRetryReason::IdleTimeout => self.on_idle_timeout,
             StreamRetryReason::ReadError => self.on_read_error,
-            StreamRetryReason::StatusError => self.on_status_error,
+            StreamRetryReason::StatusError
+            | StreamRetryReason::ProtocolError
+            | StreamRetryReason::ProtocolContamination => self.on_status_error,
         }
     }
 }
@@ -140,6 +156,8 @@ enum StreamRetryReason {
     IdleTimeout,
     ReadError,
     StatusError,
+    ProtocolError,
+    ProtocolContamination,
 }
 
 impl StreamRetryReason {
@@ -148,6 +166,8 @@ impl StreamRetryReason {
             StreamRetryReason::IdleTimeout => "idle_timeout",
             StreamRetryReason::ReadError => "read_error",
             StreamRetryReason::StatusError => "status_error",
+            StreamRetryReason::ProtocolError => "protocol_error",
+            StreamRetryReason::ProtocolContamination => "protocol_contamination",
         }
     }
 }
@@ -230,6 +250,7 @@ struct RequestUsageContext {
     requested_max_tokens: i32,
     downstream_stop_reason: Arc<Mutex<Option<String>>>,
     conversation_id: Option<String>,
+    request_api_key_id: Option<String>,
     prompt_cache_scope_conversation_id: Option<String>,
     input_tokens: i32,
     context_window_tokens: i32,
@@ -263,6 +284,7 @@ struct RequestUsageContext {
 
 #[derive(Clone)]
 struct RequestLatencyTraceState {
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
     payload_guard_ms: Option<u64>,
     upstream_header_latency_ms: Arc<AtomicU64>,
     first_upstream_chunk_latency_ms: Arc<AtomicU64>,
@@ -282,6 +304,7 @@ struct RequestLatencyTraceState {
     upstream_event_parse_errors_before_first_output: Arc<AtomicU32>,
     upstream_event_types_before_first_output: Arc<Mutex<HashMap<&'static str, u32>>>,
     stream_retry_attempts: Arc<AtomicU32>,
+    stream_retry_dispatch_failures: Arc<AtomicU32>,
     stream_retry_reasons: Arc<Mutex<Vec<String>>>,
     terminal_reason: Arc<Mutex<Option<StreamTerminalReason>>>,
     upstream_message_status: Arc<Mutex<Option<String>>>,
@@ -291,6 +314,9 @@ struct RequestLatencyTraceState {
     intent_preamble_risk: Arc<Mutex<Option<String>>>,
     suspected_tool_context_leak_end_turn: Arc<Mutex<Option<bool>>>,
     tool_context_leak_markers: Arc<Mutex<Option<Vec<String>>>>,
+    suppressed_tool_context_leak_blocks: Arc<Mutex<Option<u32>>>,
+    suppressed_tool_context_leak_chars: Arc<Mutex<Option<u64>>>,
+    suppressed_tool_context_leak_kinds: Arc<Mutex<Option<Vec<String>>>>,
     assistant_tail_intent_hint: Arc<Mutex<Option<bool>>>,
     end_turn_anomaly_reason: Arc<Mutex<Option<String>>>,
     end_turn_anomaly_risk: Arc<Mutex<Option<String>>>,
@@ -306,8 +332,18 @@ struct RequestLatencyTraceState {
 }
 
 impl RequestLatencyTraceState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_inference_attempt_budget(Arc::new(InferenceAttemptBudget::new(
+            DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
+        )))
+    }
+
+    fn with_inference_attempt_budget(
+        inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    ) -> Self {
         Self {
+            inference_attempt_budget,
             payload_guard_ms: None,
             upstream_header_latency_ms: Arc::new(AtomicU64::new(0)),
             first_upstream_chunk_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -329,6 +365,7 @@ impl RequestLatencyTraceState {
             upstream_event_parse_errors_before_first_output: Arc::new(AtomicU32::new(0)),
             upstream_event_types_before_first_output: Arc::new(Mutex::new(HashMap::new())),
             stream_retry_attempts: Arc::new(AtomicU32::new(0)),
+            stream_retry_dispatch_failures: Arc::new(AtomicU32::new(0)),
             stream_retry_reasons: Arc::new(Mutex::new(Vec::new())),
             terminal_reason: Arc::new(Mutex::new(None)),
             upstream_message_status: Arc::new(Mutex::new(None)),
@@ -338,6 +375,9 @@ impl RequestLatencyTraceState {
             intent_preamble_risk: Arc::new(Mutex::new(None)),
             suspected_tool_context_leak_end_turn: Arc::new(Mutex::new(None)),
             tool_context_leak_markers: Arc::new(Mutex::new(None)),
+            suppressed_tool_context_leak_blocks: Arc::new(Mutex::new(None)),
+            suppressed_tool_context_leak_chars: Arc::new(Mutex::new(None)),
+            suppressed_tool_context_leak_kinds: Arc::new(Mutex::new(None)),
             assistant_tail_intent_hint: Arc::new(Mutex::new(None)),
             end_turn_anomaly_reason: Arc::new(Mutex::new(None)),
             end_turn_anomaly_risk: Arc::new(Mutex::new(None)),
@@ -560,7 +600,7 @@ fn log_thinking_request_trace(
     let output_effort = payload
         .output_config
         .as_ref()
-        .map(|config| config.effort.as_str());
+        .and_then(|config| config.effort.as_deref());
     let latest_user_has_visible_thinking_signal =
         request_has_claude_code_visible_thinking_signal(payload);
 
@@ -585,6 +625,7 @@ fn log_kiro_conversion_summary(
     request_bytes: usize,
     payload_guard_report: Option<&PayloadGuardReport>,
     warnings: &ProxyWarnings,
+    discovered_reasoning_capability: bool,
 ) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
@@ -604,6 +645,32 @@ fn log_kiro_conversion_summary(
     let final_history_entries = payload_guard_report
         .map(|report| report.final_history_entries)
         .unwrap_or(history_entries);
+    let (reasoning_path, reasoning_effort) =
+        match kiro_request.additional_model_request_fields.as_ref() {
+            Some(fields) if fields.output_config.is_some() => (
+                Some("output_config"),
+                fields
+                    .output_config
+                    .as_ref()
+                    .map(|config| config.effort.as_str()),
+            ),
+            Some(fields) if fields.reasoning.is_some() => (
+                Some("reasoning"),
+                fields
+                    .reasoning
+                    .as_ref()
+                    .map(|config| config.effort.as_str()),
+            ),
+            Some(fields) if fields.thinking.is_some() => (Some("thinking"), None),
+            _ => (None, None),
+        };
+    let reasoning_source = reasoning_path.map(|_| {
+        if discovered_reasoning_capability {
+            "kiro_model_schema"
+        } else {
+            "legacy_model_fallback"
+        }
+    });
 
     tracing::debug!(
         endpoint,
@@ -620,6 +687,9 @@ fn log_kiro_conversion_summary(
         current_tool_count = current_context.tools.len(),
         current_tool_result_count = current_context.tool_results.len(),
         current_image_count = current_user_input.images.len(),
+        reasoning_path = ?reasoning_path,
+        reasoning_effort = ?reasoning_effort,
+        reasoning_source = ?reasoning_source,
         warning_header = ?warnings_header,
         warning_prefill_dropped = warnings.prefill_dropped,
         warning_orphan_tool_results = warnings.orphan_tool_results,
@@ -629,6 +699,9 @@ fn log_kiro_conversion_summary(
         warning_duplicate_tool_results_textified = warnings.duplicate_tool_results_textified,
         warning_tool_result_content_placeholders = warnings.tool_result_content_placeholders,
         warning_empty_content_placeholders = warnings.empty_content_placeholders,
+        warning_sanitized_assistant_history_leaks = warnings.sanitized_assistant_history_leaks,
+        warning_sanitized_assistant_history_leak_chars = warnings
+            .sanitized_assistant_history_leak_chars,
         "Kiro conversion summary"
     );
 }
@@ -647,11 +720,15 @@ fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
 
 #[derive(Clone)]
 struct ExternalFallbackContext {
+    provider: Arc<KiroProvider>,
     manager: Arc<ExternalPoolManager>,
     config: ExternalPoolsConfig,
+    effective_raw_body: Bytes,
+    effective_raw_probe: Arc<RawMessagesBodyProbe>,
     raw_body: Bytes,
     headers: HeaderMap,
     endpoint: String,
+    compat_profile: CompatProfile,
     payload: MessagesRequest,
     request_input_tokens: i32,
     model_resolution: Option<ModelResolution>,
@@ -678,6 +755,9 @@ struct ExternalFallbackContext {
     payload_guard_external_enabled: bool,
     payload_guard_initial_config: PayloadGuardConfig,
     payload_guard_retry_config: Option<PayloadGuardConfig>,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    requires_normalized_body: bool,
 }
 
 #[derive(Clone)]
@@ -729,6 +809,8 @@ struct RequestRuntimeConfig {
     kiro_upstream_stream_idle_timeout_secs: u64,
     kiro_upstream_stream_retry_enabled: bool,
     kiro_upstream_stream_retry_max_attempts: u32,
+    inference_upstream_max_attempts: u32,
+    auxiliary_upstream_max_attempts: u32,
     kiro_upstream_stream_retry_on_idle_timeout: bool,
     kiro_upstream_stream_retry_on_read_error: bool,
     kiro_upstream_stream_retry_on_status_error: bool,
@@ -773,6 +855,8 @@ impl RequestRuntimeConfig {
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
             kiro_upstream_stream_retry_enabled: true,
             kiro_upstream_stream_retry_max_attempts: 2,
+            inference_upstream_max_attempts: DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
+            auxiliary_upstream_max_attempts: DEFAULT_AUXILIARY_UPSTREAM_MAX_ATTEMPTS,
             kiro_upstream_stream_retry_on_idle_timeout: true,
             kiro_upstream_stream_retry_on_read_error: true,
             kiro_upstream_stream_retry_on_status_error: true,
@@ -839,6 +923,8 @@ impl RequestRuntimeConfig {
             kiro_upstream_stream_retry_max_attempts: config
                 .kiro_upstream_stream_retry_max_attempts
                 .clamp(1, 100),
+            inference_upstream_max_attempts: config.inference_upstream_max_attempts.clamp(1, 10),
+            auxiliary_upstream_max_attempts: config.auxiliary_upstream_max_attempts.clamp(1, 10),
             kiro_upstream_stream_retry_on_idle_timeout: config
                 .kiro_upstream_stream_retry_on_idle_timeout,
             kiro_upstream_stream_retry_on_read_error: config
@@ -1036,7 +1122,7 @@ impl PayloadTooLongRetryRequest {
     fn build_retry_body(
         self,
         usage_context: &mut RequestUsageContext,
-    ) -> Result<(String, Option<String>), PayloadGuardError> {
+    ) -> Result<(String, Option<String>, KiroRequest), PayloadGuardError> {
         let mut request = self.request;
         let (request_body, report) = guard_kiro_request(&mut request, self.config)?;
         log_payload_guard_report(
@@ -1057,7 +1143,7 @@ impl PayloadTooLongRetryRequest {
         );
         usage_context.set_payload_diagnostics(Some(breakdown), report.clone());
         let warnings_header = merge_warning_headers(self.conversion_warnings, Some(&report));
-        Ok((request_body, warnings_header))
+        Ok((request_body, warnings_header, request))
     }
 }
 
@@ -1091,7 +1177,7 @@ impl CachePointRetryRequest {
         self,
         reason: &str,
         usage_context: &mut RequestUsageContext,
-    ) -> Result<String, PayloadGuardError> {
+    ) -> Result<(String, KiroRequest), PayloadGuardError> {
         let mut request = self.request;
         let planned = request.clear_tool_cache_point_plan();
         usage_context.attach_cache_point_retry(planned, reason);
@@ -1105,7 +1191,7 @@ impl CachePointRetryRequest {
             planned_cache_points = planned,
             "Kiro cachePoint payload was rejected; retrying once without cachePoint"
         );
-        Ok(body)
+        Ok((body, request))
     }
 }
 
@@ -1136,6 +1222,9 @@ async fn maybe_raw_external_direct_response(
     headers: HeaderMap,
     raw_body: Bytes,
     endpoint: &str,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<Response> {
     let provider = state.kiro_provider.as_ref()?.clone();
     let manager = state.external_pool_manager.clone()?;
@@ -1143,18 +1232,21 @@ async fn maybe_raw_external_direct_response(
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
     if !manager
-        .has_eligible_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
+        .has_eligible_pool_for_body_mode_and_model(
+            &config,
+            ExternalPoolRequestBodyMode::RawPassthrough,
+            raw_probe.model.as_deref(),
+        )
         .await
     {
         return None;
     }
 
-    let (model_hint, _) = raw_messages_body_hints(&raw_body);
     let reason = manager
-        .direct_policy_reason(&config, endpoint, model_hint.as_deref().unwrap_or(""))
+        .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
         .await?;
     let request_id = envelope::request_id();
-    let route = raw_external_route_request(
+    let route = raw_external_route_request_with_hints(
         state,
         &runtime_config,
         &cache_route,
@@ -1166,6 +1258,9 @@ async fn maybe_raw_external_direct_response(
         None,
         Some(reason),
         None,
+        inference_attempt_budget,
+        request_api_key_id,
+        raw_probe,
     );
 
     Some(manager.forward_with_failover(config, route).await)
@@ -1176,6 +1271,9 @@ async fn maybe_raw_external_preflight_response(
     headers: HeaderMap,
     raw_body: Bytes,
     endpoint: &str,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<Response> {
     let provider = state.kiro_provider.as_ref()?.clone();
     let manager = state.external_pool_manager.clone()?;
@@ -1186,17 +1284,22 @@ async fn maybe_raw_external_preflight_response(
         return None;
     }
     if !manager
-        .has_available_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
+        .has_eligible_pool_for_body_mode_and_model(
+            &config,
+            ExternalPoolRequestBodyMode::RawPassthrough,
+            raw_probe.model.as_deref(),
+        )
         .await
     {
         return None;
     }
 
-    let local_state = provider.local_pool_route_state(None);
-    if !local_state.kind.should_route_external() {
-        return None;
-    }
-    let Some(reason) = local_pool_route_fallback_reason(local_state.kind, &config) else {
+    let local_state = provider.local_pool_route_state_fresh(raw_probe.model.as_deref());
+    let Some(reason) = local_pool_fallback_reason_for_fresh_state(
+        local_state.kind,
+        local_state.dispatchable,
+        &config,
+    ) else {
         return None;
     };
 
@@ -1212,7 +1315,7 @@ async fn maybe_raw_external_preflight_response(
         retry_after_secs = ?local_state.retry_after_secs,
         "local credential pool is not immediately schedulable; routing raw request directly to external pool before parsing body"
     );
-    let route = raw_external_route_request(
+    let route = raw_external_route_request_with_hints(
         state,
         &runtime_config,
         &cache_route,
@@ -1229,11 +1332,15 @@ async fn maybe_raw_external_preflight_response(
             "preflightStage": "before_parse",
             "requiredBodyMode": ExternalPoolRequestBodyMode::RawPassthrough.as_str(),
         })),
+        inference_attempt_budget,
+        request_api_key_id,
+        raw_probe,
     );
 
     Some(manager.forward_with_failover(config, route).await)
 }
 
+#[cfg(test)]
 fn raw_external_route_request(
     state: &AppState,
     runtime_config: &RequestRuntimeConfig,
@@ -1246,12 +1353,54 @@ fn raw_external_route_request(
     fallback_reason: Option<String>,
     direct_policy_reason: Option<String>,
     local_preflight: Option<serde_json::Value>,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
 ) -> ExternalRouteRequest {
-    let (model_hint, stream_hint) = raw_messages_body_hints(&raw_body);
+    let raw_probe = Arc::new(probe_raw_messages_body(&raw_body));
+    raw_external_route_request_with_hints(
+        state,
+        runtime_config,
+        cache_route,
+        headers,
+        raw_body,
+        endpoint,
+        request_id,
+        route_subtype,
+        fallback_reason,
+        direct_policy_reason,
+        local_preflight,
+        inference_attempt_budget,
+        request_api_key_id,
+        raw_probe,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_external_route_request_with_hints(
+    state: &AppState,
+    runtime_config: &RequestRuntimeConfig,
+    cache_route: &ResolvedCacheRoutePolicy,
+    headers: HeaderMap,
+    raw_body: Bytes,
+    endpoint: &str,
+    request_id: String,
+    route_subtype: UsageRouteSubtype,
+    fallback_reason: Option<String>,
+    direct_policy_reason: Option<String>,
+    local_preflight: Option<serde_json::Value>,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    raw_probe: Arc<RawMessagesBodyProbe>,
+) -> ExternalRouteRequest {
+    let model_hint = raw_probe.model.clone();
+    let stream_hint = raw_probe.stream;
     let effective_cache_route =
         cache_route_for_request_stream(cache_route.clone(), stream_hint.unwrap_or(false));
     let policy = &effective_cache_route.policy;
     ExternalRouteRequest {
+        effective_raw_body: raw_body.clone(),
+        effective_raw_probe: Some(raw_probe),
+        preparation_cache: Arc::new(ExternalRouteRequestPreparationCache::default()),
         raw_body,
         headers,
         endpoint: endpoint.to_string(),
@@ -1297,6 +1446,8 @@ fn raw_external_route_request(
         payload_guard_external_enabled: false,
         payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
         payload_guard_retry_config: None,
+        inference_attempt_budget,
+        request_api_key_id,
     }
 }
 
@@ -1305,10 +1456,16 @@ fn build_external_fallback_context(
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
     endpoint: &str,
+    effective_raw_body: Bytes,
+    effective_raw_probe: Arc<RawMessagesBodyProbe>,
     raw_body: Bytes,
     headers: HeaderMap,
     payload: &MessagesRequest,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    requires_normalized_body: bool,
 ) -> Option<ExternalFallbackContext> {
+    let provider = state.kiro_provider.clone()?;
     let manager = state.external_pool_manager.clone()?;
     let config = runtime_config.external_pools.clone();
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
@@ -1316,11 +1473,15 @@ fn build_external_fallback_context(
     config
         .external_pools_enabled
         .then_some(ExternalFallbackContext {
+            provider,
             manager,
             config,
+            effective_raw_body,
+            effective_raw_probe,
             raw_body,
             headers,
             endpoint: endpoint.to_string(),
+            compat_profile: runtime_config.compat_profile,
             payload: payload.clone(),
             request_input_tokens: 0,
             model_resolution: None,
@@ -1348,25 +1509,74 @@ fn build_external_fallback_context(
             payload_guard_retry_config: (runtime_config.payload_guard_external_enabled
                 && runtime_config.too_long_retry_enabled())
             .then(|| runtime_config.payload_guard_config()),
+            inference_attempt_budget,
+            request_api_key_id,
+            requires_normalized_body,
         })
 }
 
 impl ExternalFallbackContext {
     fn refresh_payload(&mut self, payload: &MessagesRequest) {
+        let original_input_tokens = token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32;
         self.payload = payload.clone();
-        self.request_input_tokens = token::count_all_tokens(
+        if !self.compat_profile.is_strict() {
+            let report = super::transcript_sanitizer::sanitize_messages_request_assistant_history(
+                &mut self.payload,
+            );
+            if report.blocks > 0 {
+                tracing::warn!(
+                    sanitized_assistant_history_messages = report.messages,
+                    sanitized_assistant_history_blocks = report.blocks,
+                    sanitized_assistant_history_chars = report.chars,
+                    sanitized_assistant_history_kinds = ?report.kinds,
+                    "sanitized internal tool transcript from normalized external fallback payload"
+                );
+            }
+        }
+        let normalized_input_tokens = token::count_all_tokens(
             &self.payload.model,
             self.payload.system.as_deref(),
             &self.payload.messages,
             self.payload.tools.as_deref(),
         ) as i32;
+        self.request_input_tokens = original_input_tokens.max(normalized_input_tokens);
     }
 
-    async fn should_fail_fast_local(&self) -> bool {
-        if !local_pool_capacity_fail_fast_enabled(&self.config) {
-            return false;
+    async fn local_attempt_policy(&self) -> (AcquireMode, bool) {
+        let fallback_enabled = self.config.fallback_on_local_capacity_exhausted
+            || self.config.fallback_on_scheduler_redis_degraded
+            || self.config.fallback_on_no_available_credentials
+            || self.config.fallback_on_local_transient_exhausted
+            || self.config.fallback_on_unsupported_model;
+        if !fallback_enabled
+            || !self
+                .has_eligible_external_pool_for_model(&self.payload.model)
+                .await
+        {
+            return (AcquireMode::WaitForCapacity, false);
         }
-        self.manager.has_available_pool(&self.config).await
+        let acquire_mode = local_pool_acquire_mode(&self.config);
+        (acquire_mode, true)
+    }
+
+    async fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
+        match external_fallback_body_mode_filter(self.requires_normalized_body) {
+            Some(body_mode) => {
+                self.manager
+                    .has_eligible_pool_for_body_mode_and_model(&self.config, body_mode, Some(model))
+                    .await
+            }
+            None => {
+                self.manager
+                    .has_eligible_pool_for_model(&self.config, model)
+                    .await
+            }
+        }
     }
 
     async fn direct_policy_response(&self, request_id: &str) -> Option<Response> {
@@ -1395,21 +1605,22 @@ impl ExternalFallbackContext {
 
     async fn local_pool_preflight_outcome(
         &self,
-        provider: &KiroProvider,
         request_id: &str,
         model: Option<&str>,
     ) -> Option<ExternalPoolForwardOutcome> {
         if !self.config.local_pool_preflight_enabled {
             return None;
         }
-        let state = provider.local_pool_route_state(model);
-        if !state.kind.should_route_external() {
-            return None;
-        }
-        let Some(reason) = local_pool_route_fallback_reason(state.kind, &self.config) else {
+        let state = self.provider.local_pool_route_state_fresh(model);
+        let Some(reason) = local_pool_fallback_reason_for_fresh_state(
+            state.kind,
+            state.dispatchable,
+            &self.config,
+        ) else {
             return None;
         };
-        if !self.manager.has_eligible_pool(&self.config).await {
+        let route_model = model.unwrap_or(&self.payload.model);
+        if !self.has_eligible_external_pool_for_model(route_model).await {
             return None;
         }
 
@@ -1457,7 +1668,7 @@ impl ExternalFallbackContext {
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<Response> {
         match self
-            .fallback_after_local_error_outcome(request_id, error_message, local_attempts)
+            .fallback_after_local_error_outcome(request_id, error_message, None, local_attempts)
             .await?
         {
             ExternalPoolForwardOutcome::Response(response) => Some(response),
@@ -1469,12 +1680,14 @@ impl ExternalFallbackContext {
         &self,
         request_id: &str,
         error_message: &str,
+        call_failure_kind: Option<KiroCallFailureKind>,
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<ExternalPoolForwardOutcome> {
         let classification_attempts = local_attempts.clone();
         self.fallback_after_local_error_outcome_with_diagnostics(
             request_id,
             error_message,
+            call_failure_kind,
             classification_attempts,
             local_attempts,
         )
@@ -1485,14 +1698,60 @@ impl ExternalFallbackContext {
         &self,
         request_id: &str,
         error_message: &str,
+        call_failure_kind: Option<KiroCallFailureKind>,
         classification_attempts: Vec<KiroCredentialAttempt>,
         diagnostic_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<ExternalPoolForwardOutcome> {
-        let reason = classify_local_error_for_external_fallback(
+        let Some(classified_reason) = classify_local_error_for_external_fallback_with_kind(
             error_message,
             &classification_attempts,
             &self.config,
-        )?;
+            call_failure_kind,
+        ) else {
+            tracing::debug!(
+                request_id,
+                classification_attempt_count = classification_attempts.len(),
+                "local error is not eligible for external fallback"
+            );
+            return None;
+        };
+        let local_state = self
+            .provider
+            .local_pool_route_state_fresh(Some(&self.payload.model));
+        let typed_auxiliary_route_reason = match call_failure_kind {
+            Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted) => {
+                Some("local_auxiliary_attempts_exhausted")
+            }
+            Some(KiroCallFailureKind::AuxiliaryConcurrencySaturated) => {
+                Some("local_auxiliary_concurrency_saturated")
+            }
+            _ => None,
+        };
+        let classified_route_reason =
+            classified_local_error_route_reason(classified_reason.as_str());
+        let route_reason = typed_auxiliary_route_reason
+            .or(classified_route_reason)
+            .or_else(|| {
+                local_pool_fallback_reason_for_fresh_state(
+                    local_state.kind,
+                    local_state.dispatchable,
+                    &self.config,
+                )
+            });
+        let Some(route_reason) = route_reason else {
+            tracing::info!(
+                request_id,
+                classified_reason,
+                local_state = ?local_state.kind,
+                local_total = local_state.total,
+                local_available = local_state.available,
+                local_dispatchable = local_state.dispatchable,
+                local_usable = local_state.usable,
+                "external fallback suppressed because the fresh local pool remains dispatchable or its fallback policy is disabled"
+            );
+            return None;
+        };
+        let route_reason = route_reason.to_string();
         if self.config.local_pool_circuit_enabled {
             let mut seen_credentials = HashSet::new();
             let mut recorded = false;
@@ -1504,7 +1763,7 @@ impl ExternalFallbackContext {
                         .record_local_pool_failure(
                             &self.config,
                             Some(attempt.credential_id),
-                            &reason,
+                            &classified_reason,
                         )
                         .await;
                 }
@@ -1512,18 +1771,41 @@ impl ExternalFallbackContext {
             if !recorded {
                 let _ = self
                     .manager
-                    .record_local_pool_failure(&self.config, None, &reason)
+                    .record_local_pool_failure(&self.config, None, &classified_reason)
                     .await;
             }
         }
-        if !self.manager.has_eligible_pool(&self.config).await {
+        if !self
+            .has_eligible_external_pool_for_model(&self.payload.model)
+            .await
+        {
+            tracing::warn!(
+                request_id,
+                classified_reason,
+                route_reason,
+                local_state = ?local_state.kind,
+                local_dispatchable = local_state.dispatchable,
+                "fresh local state permits fallback but no external pool is eligible"
+            );
             return None;
         }
+        tracing::warn!(
+            request_id,
+            classified_reason,
+            route_reason,
+            local_state = ?local_state.kind,
+            local_total = local_state.total,
+            local_available = local_state.available,
+            local_dispatchable = local_state.dispatchable,
+            "fresh local state permits external fallback after local error"
+        );
         let local_preflight = Some(json!({
-            "reason": reason.clone(),
+            "reason": route_reason.clone(),
+            "classifiedLocalErrorReason": classified_reason,
             "error": error_message,
             "attemptCount": diagnostic_attempts.len(),
             "classificationAttemptCount": classification_attempts.len(),
+            "state": local_state,
         }));
         let route_subtype = if diagnostic_attempts.is_empty() {
             UsageRouteSubtype::ExternalFallbackPreflight
@@ -1533,7 +1815,7 @@ impl ExternalFallbackContext {
         let route = match self.route_request(
             request_id.to_string(),
             route_subtype,
-            Some(reason),
+            Some(route_reason),
             None,
             true,
             local_preflight,
@@ -1564,11 +1846,14 @@ impl ExternalFallbackContext {
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Result<ExternalRouteRequest, PayloadGuardError> {
         Ok(ExternalRouteRequest {
+            effective_raw_body: self.effective_raw_body.clone(),
+            effective_raw_probe: Some(self.effective_raw_probe.clone()),
+            preparation_cache: Arc::new(ExternalRouteRequestPreparationCache::default()),
             raw_body: self.raw_body.clone(),
             headers: self.headers.clone(),
             endpoint: self.endpoint.clone(),
             payload: Some(self.payload.clone()),
-            body_mode_filter: None,
+            body_mode_filter: external_fallback_body_mode_filter(self.requires_normalized_body),
             model_hint: None,
             stream_hint: None,
             request_input_tokens: self.request_input_tokens.max(0),
@@ -1618,12 +1903,30 @@ impl ExternalFallbackContext {
             payload_guard_external_enabled: self.payload_guard_external_enabled,
             payload_guard_initial_config: self.payload_guard_initial_config,
             payload_guard_retry_config: self.payload_guard_retry_config,
+            inference_attempt_budget: self.inference_attempt_budget.clone(),
+            request_api_key_id: self.request_api_key_id.clone(),
         })
     }
 }
 
+fn external_fallback_body_mode_filter(
+    requires_normalized_body: bool,
+) -> Option<ExternalPoolRequestBodyMode> {
+    requires_normalized_body.then_some(ExternalPoolRequestBodyMode::Normalized)
+}
+
 fn local_pool_capacity_fail_fast_enabled(config: &ExternalPoolsConfig) -> bool {
     config.local_pool_preflight_enabled && config.fallback_on_local_capacity_exhausted
+}
+
+fn local_pool_acquire_mode(config: &ExternalPoolsConfig) -> AcquireMode {
+    if local_pool_capacity_fail_fast_enabled(config) {
+        AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(
+            config.effective_dispatch_max_wait_secs(),
+        ))
+    } else {
+        AcquireMode::WaitForCapacity
+    }
 }
 
 fn capacity_weight_units_for_local_request(provider: &KiroProvider, input_tokens: i32) -> u32 {
@@ -1670,12 +1973,80 @@ fn local_pool_route_fallback_reason(
     }
 }
 
+fn local_pool_fallback_reason_for_fresh_state(
+    kind: LocalPoolRouteStateKind,
+    dispatchable: usize,
+    config: &ExternalPoolsConfig,
+) -> Option<&'static str> {
+    if matches!(kind, LocalPoolRouteStateKind::Ready) || dispatchable > 0 {
+        return None;
+    }
+    local_pool_route_fallback_reason(kind, config)
+}
+
+fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        // The local attempt already observed a distributed scheduler failure.
+        // A subsequent fresh route snapshot may still look locally
+        // dispatchable because it is based on in-memory capacity or stale
+        // breaker state; do not let that suppress the explicitly classified
+        // degraded fallback path.
+        "local_scheduler_redis_degraded" => Some("local_scheduler_redis_degraded"),
+        // These classifications are tied to the actual local attempt outcome,
+        // not to a fresh local capacity estimate.
+        "local_attempt_reserved_for_fallback" => Some("local_attempt_reserved_for_fallback"),
+        "unsupported_model" => Some("unsupported_model"),
+        "local_auxiliary_attempts_exhausted" => Some("local_auxiliary_attempts_exhausted"),
+        "local_auxiliary_concurrency_saturated" => Some("local_auxiliary_concurrency_saturated"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 fn classify_local_error_for_external_fallback(
     message: &str,
     attempts: &[KiroCredentialAttempt],
     config: &ExternalPoolsConfig,
 ) -> Option<String> {
+    classify_local_error_for_external_fallback_with_kind(message, attempts, config, None)
+}
+
+fn classify_local_error_for_external_fallback_with_kind(
+    message: &str,
+    attempts: &[KiroCredentialAttempt],
+    config: &ExternalPoolsConfig,
+    call_failure_kind: Option<KiroCallFailureKind>,
+) -> Option<String> {
+    match call_failure_kind {
+        Some(
+            KiroCallFailureKind::ThinkingSignatureInvalid
+            | KiroCallFailureKind::ThinkingSignatureRetryFailed,
+        ) => return None,
+        Some(KiroCallFailureKind::InferenceAttemptReservedForFallback) => {
+            return Some("local_attempt_reserved_for_fallback".to_string());
+        }
+        Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted)
+            if config.fallback_on_local_transient_exhausted =>
+        {
+            return Some("local_auxiliary_attempts_exhausted".to_string());
+        }
+        Some(KiroCallFailureKind::AuxiliaryConcurrencySaturated)
+            if config.fallback_on_local_transient_exhausted =>
+        {
+            return Some("local_auxiliary_concurrency_saturated".to_string());
+        }
+        Some(
+            KiroCallFailureKind::InferenceAttemptsExhausted
+            | KiroCallFailureKind::DownstreamCommitted
+            | KiroCallFailureKind::AuxiliaryAttemptsExhausted
+            | KiroCallFailureKind::AuxiliaryConcurrencySaturated,
+        )
+        | None => {}
+    }
     let lower = message.to_ascii_lowercase();
+    if lower.contains("local inference attempt reserved for fallback") {
+        return Some("local_attempt_reserved_for_fallback".to_string());
+    }
     if config.fallback_on_unsupported_model && is_unsupported_model_error(&lower, attempts) {
         return Some("unsupported_model".to_string());
     }
@@ -1806,6 +2177,9 @@ struct StreamCompletionObservability<'a> {
     intent_preamble_risk: Option<&'static str>,
     suspected_tool_context_leak_end_turn: bool,
     tool_context_leak_markers: Vec<String>,
+    suppressed_tool_context_leak_blocks: u32,
+    suppressed_tool_context_leak_chars: usize,
+    suppressed_tool_context_leak_kinds: Vec<String>,
     assistant_tail_intent_hint: bool,
     end_turn_anomaly_reason: Option<&'static str>,
     end_turn_anomaly_risk: Option<&'static str>,
@@ -1991,12 +2365,22 @@ impl RequestUsageContext {
         }
     }
 
-    fn mark_stream_retry_before_downstream_commit(&self, reason: impl Into<String>) {
-        saturating_fetch_add_u32(&self.latency.stream_retry_attempts, 1);
-        let reason = reason.into();
+    fn mark_stream_retry_sends(&self, sends: u32, reason: StreamRetryReason) {
+        if sends == 0 {
+            return;
+        }
+        saturating_fetch_add_u32(&self.latency.stream_retry_attempts, sends);
         let mut reasons = self.latency.stream_retry_reasons.lock();
         if reasons.len() < 8 {
-            reasons.push(reason.chars().take(160).collect());
+            reasons.push(format!("{}:sends={sends}", reason.as_str()));
+        }
+    }
+
+    fn mark_stream_retry_dispatch_failure(&self, reason: StreamRetryReason) {
+        saturating_fetch_add_u32(&self.latency.stream_retry_dispatch_failures, 1);
+        let mut reasons = self.latency.stream_retry_reasons.lock();
+        if reasons.len() < 8 {
+            reasons.push(format!("{}:dispatch_failed_without_send", reason.as_str()));
         }
     }
 
@@ -2030,6 +2414,11 @@ impl RequestUsageContext {
             *self.latency.tool_context_leak_markers.lock() =
                 Some(observability.tool_context_leak_markers);
         }
+        self.mark_suppressed_tool_context_leak(
+            observability.suppressed_tool_context_leak_blocks,
+            observability.suppressed_tool_context_leak_chars,
+            observability.suppressed_tool_context_leak_kinds,
+        );
         if observability.assistant_tail_intent_hint {
             *self.latency.assistant_tail_intent_hint.lock() = Some(true);
         }
@@ -2061,6 +2450,18 @@ impl RequestUsageContext {
         if observability.filtered_trivial_text_chars > 0 {
             *self.latency.filtered_trivial_text_chars.lock() =
                 Some(observability.filtered_trivial_text_chars);
+        }
+    }
+
+    fn mark_suppressed_tool_context_leak(&self, blocks: u32, chars: usize, kinds: Vec<String>) {
+        if blocks == 0 {
+            return;
+        }
+        *self.latency.suppressed_tool_context_leak_blocks.lock() = Some(blocks);
+        *self.latency.suppressed_tool_context_leak_chars.lock() =
+            Some(chars.min(u64::MAX as usize) as u64);
+        if !kinds.is_empty() {
+            *self.latency.suppressed_tool_context_leak_kinds.lock() = Some(kinds);
         }
     }
 
@@ -2150,11 +2551,20 @@ impl RequestUsageContext {
             let value = self.latency.stream_retry_attempts.load(Ordering::Acquire);
             (value > 0).then_some(value)
         };
+        let stream_retry_dispatch_failures = {
+            let value = self
+                .latency
+                .stream_retry_dispatch_failures
+                .load(Ordering::Acquire);
+            (value > 0).then_some(value)
+        };
         let stream_retry_reasons = {
             let reasons = self.latency.stream_retry_reasons.lock();
             (!reasons.is_empty()).then(|| reasons.clone())
         };
         let trace = UsageLatencyTrace {
+            inference_attempts: Some(self.latency.inference_attempt_budget.snapshot()),
+            auxiliary_attempts: Some(self.latency.inference_attempt_budget.auxiliary_snapshot()),
             capacity_weight_units: (capacity_weight_units > 1).then_some(capacity_weight_units),
             estimated_input_tokens: (capacity_weight_units > 1).then_some(self.input_tokens),
             payload_guard_ms: self.latency.payload_guard_ms,
@@ -2210,6 +2620,7 @@ impl RequestUsageContext {
                 ),
             upstream_event_types_before_first_output,
             stream_retry_attempts,
+            stream_retry_dispatch_failures,
             stream_retry_reasons,
             client_dropped_ms: load_latency_ms(&self.latency.client_dropped_latency_ms),
             terminal_reason: *self.latency.terminal_reason.lock(),
@@ -2226,6 +2637,19 @@ impl RequestUsageContext {
                 .suspected_tool_context_leak_end_turn
                 .lock(),
             tool_context_leak_markers: self.latency.tool_context_leak_markers.lock().clone(),
+            suppressed_tool_context_leak_blocks: *self
+                .latency
+                .suppressed_tool_context_leak_blocks
+                .lock(),
+            suppressed_tool_context_leak_chars: *self
+                .latency
+                .suppressed_tool_context_leak_chars
+                .lock(),
+            suppressed_tool_context_leak_kinds: self
+                .latency
+                .suppressed_tool_context_leak_kinds
+                .lock()
+                .clone(),
             assistant_tail_intent_hint: *self.latency.assistant_tail_intent_hint.lock(),
             end_turn_anomaly_reason: self.latency.end_turn_anomaly_reason.lock().clone(),
             end_turn_anomaly_risk: self.latency.end_turn_anomaly_risk.lock().clone(),
@@ -2979,6 +3403,9 @@ impl CredentialUsageContext {
                 suspected_tool_context_leak_end_turn: ctx
                     .suspected_tool_context_leak_end_turn(has_visible_text_output),
                 tool_context_leak_markers: ctx.tool_context_leak_markers(),
+                suppressed_tool_context_leak_blocks: ctx.suppressed_tool_context_leak_blocks(),
+                suppressed_tool_context_leak_chars: ctx.suppressed_tool_context_leak_chars(),
+                suppressed_tool_context_leak_kinds: ctx.suppressed_tool_context_leak_kinds(),
                 assistant_tail_intent_hint: ctx.assistant_tail_intent_hint(),
                 end_turn_anomaly_reason: ctx.end_turn_anomaly_reason(has_visible_text_output),
                 end_turn_anomaly_risk: ctx.end_turn_anomaly_risk(has_visible_text_output),
@@ -3172,7 +3599,6 @@ impl CredentialUsageContext {
     ) {
         let error_type = error_type.into();
         let error_message = error_message.into();
-        let error_detail = format!("{}: {}", error_type, error_message);
         let public_error = if error_type == "client_dropped" {
             None
         } else {
@@ -3182,6 +3608,19 @@ impl CredentialUsageContext {
                 None,
             ))
         };
+        self.record_failure_with_public_error(status, error_type, error_message, public_error);
+    }
+
+    fn record_failure_with_public_error(
+        &self,
+        status: UsageRecordStatus,
+        error_type: impl Into<String>,
+        error_message: impl Into<String>,
+        public_error: Option<UsagePublicError>,
+    ) {
+        let error_type = error_type.into();
+        let error_message = error_message.into();
+        let error_detail = format!("{}: {}", error_type, error_message);
         let usage = super::cache::CacheUsage {
             total_input_tokens: self.request.input_tokens,
             input_tokens: self.request.input_tokens,
@@ -3200,6 +3639,51 @@ impl CredentialUsageContext {
             Some(error_message),
             Some(error_detail),
             public_error,
+            None,
+        );
+    }
+
+    fn record_websearch_failure(
+        &self,
+        public_status: StatusCode,
+        error_type: &'static str,
+        internal_reason: &'static str,
+    ) {
+        let public_message = match error_type {
+            "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
+            "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+            _ if matches!(
+                public_status,
+                StatusCode::GATEWAY_TIMEOUT | StatusCode::SERVICE_UNAVAILABLE
+            ) =>
+            {
+                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE
+            }
+            _ => envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        };
+        let usage = super::cache::CacheUsage {
+            total_input_tokens: self.request.input_tokens,
+            input_tokens: self.request.input_tokens,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        self.record(
+            UsageRecordStatus::Error,
+            usage,
+            UsageSource::None,
+            Some(usage),
+            Some(error_type.to_string()),
+            Some(internal_reason.to_string()),
+            Some(format!("{error_type}: {internal_reason}")),
+            Some(usage_public_error(
+                public_status,
+                error_type,
+                public_message,
+                Some(&self.request.error_id),
+            )),
             None,
         );
     }
@@ -3355,6 +3839,7 @@ impl CredentialUsageContext {
                 .then_some(self.request.requested_max_tokens),
             downstream_stop_reason: self.request.downstream_stop_reason.lock().clone(),
             conversation_id: self.request.conversation_id.clone(),
+            request_api_key_id: self.request.request_api_key_id.clone(),
             credential_id: self.credential_id,
             credential_label: self.credential_label.clone(),
             status,
@@ -3420,9 +3905,14 @@ impl CredentialUsageContext {
 }
 
 fn provider_error_metadata(err: &Error) -> Option<serde_json::Value> {
-    let selection_failure = KiroProvider::selection_failure_from_error(err)?;
+    let selection_failure = KiroProvider::selection_failure_from_error(err);
+    let call_failure_kind = KiroProvider::call_failure_kind_from_error(err);
+    if selection_failure.is_none() && call_failure_kind.is_none() {
+        return None;
+    }
     serde_json::to_value(json!({
-        "selectionFailure": selection_failure
+        "selectionFailure": selection_failure,
+        "callFailureKind": call_failure_kind,
     }))
     .ok()
 }
@@ -3449,6 +3939,48 @@ fn should_persist_payload_diagnostics(
 struct StreamUsageGuard {
     usage_context: CredentialUsageContext,
     completed: Arc<AtomicBool>,
+}
+
+struct WebSearchPreResponseUsageGuard {
+    usage_context: Option<RequestUsageContext>,
+    attribution_sink: Arc<McpCallAttributionSink>,
+}
+
+impl WebSearchPreResponseUsageGuard {
+    fn new(
+        usage_context: RequestUsageContext,
+        attribution_sink: Arc<McpCallAttributionSink>,
+    ) -> Self {
+        Self {
+            usage_context: Some(usage_context),
+            attribution_sink,
+        }
+    }
+
+    fn take(&mut self) -> RequestUsageContext {
+        self.usage_context
+            .take()
+            .expect("WebSearch usage context can only be completed once")
+    }
+}
+
+impl Drop for WebSearchPreResponseUsageGuard {
+    fn drop(&mut self) {
+        let Some(usage_context) = self.usage_context.take() else {
+            return;
+        };
+        let attribution = self.attribution_sink.snapshot_for_client_drop();
+        usage_context.mark_client_dropped();
+        usage_context
+            .attach_credential(
+                attribution.credential_id,
+                attribution.credential_label,
+                false,
+                false,
+                attribution.attempts,
+            )
+            .record_client_dropped();
+    }
 }
 
 impl StreamUsageGuard {
@@ -3481,10 +4013,87 @@ impl Drop for StreamUsageGuard {
     }
 }
 
+fn wrap_websearch_stream_usage_record(
+    response: Response,
+    usage_context: CredentialUsageContext,
+    usage: super::cache::CacheUsage,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let data_stream = body.into_data_stream();
+    let guard = StreamUsageGuard::new(usage_context);
+    let stream = stream::unfold(
+        (data_stream, Some(guard)),
+        move |(mut data_stream, mut guard)| async move {
+            match data_stream.next().await {
+                Some(Ok(chunk)) => {
+                    if !chunk.is_empty() {
+                        if let Some(guard) = guard.as_ref() {
+                            guard
+                                .context()
+                                .request
+                                .latency
+                                .inference_attempt_budget
+                                .mark_downstream_committed();
+                        }
+                    }
+                    Some((Ok(chunk), (data_stream, guard)))
+                }
+                Some(Err(error)) => {
+                    if let Some(guard) = guard.take() {
+                        tracing::warn!(
+                            request_id = %guard.context().request.request_id,
+                            error = %error,
+                            "native WebSearch response body stream failed"
+                        );
+                        guard
+                            .context()
+                            .request
+                            .mark_stream_terminal(StreamTerminalReason::InternalError);
+                        guard.context().record_failure(
+                            UsageRecordStatus::StreamError,
+                            "api_error",
+                            "websearch_response_body_stream_error",
+                        );
+                        guard.complete();
+                    }
+                    Some((
+                        Err(std::io::Error::other(
+                            "native WebSearch response body stream failed",
+                        )),
+                        (data_stream, guard),
+                    ))
+                }
+                None => {
+                    if let Some(guard) = guard.take() {
+                        guard
+                            .context()
+                            .request
+                            .set_downstream_stop_reason("end_turn");
+                        guard
+                            .context()
+                            .request
+                            .mark_stream_terminal(StreamTerminalReason::Completed);
+                        guard.context().record_success_reported_with_metering(
+                            usage,
+                            UsageSource::RequestEstimate,
+                            Some(usage),
+                            None,
+                        );
+                        guard.complete();
+                    }
+                    None
+                }
+            }
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
 fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> Option<String> {
     provider.credential_label(id)
 }
 
+#[cfg(test)]
 fn prepare_usage_context(
     state: &AppState,
     cache_route: ResolvedCacheRoutePolicy,
@@ -3495,6 +4104,36 @@ fn prepare_usage_context(
     conversation_id: Option<String>,
     stable_conversation_id: Option<String>,
     input_tokens: i32,
+) -> RequestUsageContext {
+    prepare_usage_context_with_inference_attempt_budget(
+        state,
+        cache_route,
+        endpoint,
+        stream,
+        payload,
+        model_resolution,
+        conversation_id,
+        stable_conversation_id,
+        input_tokens,
+        Arc::new(InferenceAttemptBudget::new(
+            DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
+        )),
+        None,
+    )
+}
+
+fn prepare_usage_context_with_inference_attempt_budget(
+    state: &AppState,
+    cache_route: ResolvedCacheRoutePolicy,
+    endpoint: &str,
+    stream: bool,
+    payload: &MessagesRequest,
+    model_resolution: Option<ModelResolution>,
+    conversation_id: Option<String>,
+    stable_conversation_id: Option<String>,
+    input_tokens: i32,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
 ) -> RequestUsageContext {
     let policy = cache_route.policy;
     let simulation_mode = prompt_cache_simulation_mode_for_policy(&policy);
@@ -3598,6 +4237,7 @@ fn prepare_usage_context(
         requested_max_tokens: payload.max_tokens.max(0),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id,
+        request_api_key_id,
         prompt_cache_scope_conversation_id: stable_conversation_id,
         input_tokens,
         context_window_tokens: model_resolution
@@ -3636,7 +4276,7 @@ fn prepare_usage_context(
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         capacity_weight_units: Arc::new(AtomicU32::new(1)),
-        latency: RequestLatencyTraceState::new(),
+        latency: RequestLatencyTraceState::with_inference_attempt_budget(inference_attempt_budget),
     }
 }
 
@@ -3770,6 +4410,14 @@ fn provider_public_error_for_message(
     error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
 ) -> UsagePublicError {
+    if err_str.contains("reason=THINKING_SIGNATURE_INVALID") {
+        return usage_public_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            UPSTREAM_INVALID_REQUEST_MESSAGE,
+            error_id,
+        );
+    }
     if is_upstream_payload_too_long_error(err_str) {
         return usage_public_error(
             StatusCode::BAD_REQUEST,
@@ -3893,6 +4541,36 @@ fn map_provider_error(
     error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
 ) -> Response {
+    if let Some(failure_kind) = KiroProvider::call_failure_kind_from_error(&err) {
+        let status = match failure_kind {
+            KiroCallFailureKind::InferenceAttemptsExhausted
+            | KiroCallFailureKind::InferenceAttemptReservedForFallback
+            | KiroCallFailureKind::AuxiliaryAttemptsExhausted
+            | KiroCallFailureKind::AuxiliaryConcurrencySaturated => StatusCode::SERVICE_UNAVAILABLE,
+            KiroCallFailureKind::DownstreamCommitted => StatusCode::BAD_GATEWAY,
+            KiroCallFailureKind::ThinkingSignatureInvalid => StatusCode::BAD_REQUEST,
+            KiroCallFailureKind::ThinkingSignatureRetryFailed => StatusCode::BAD_GATEWAY,
+        };
+        log_provider_error_with_hint(
+            &err.to_string(),
+            "请求级或进程级上游发送策略拒绝了后续调用",
+            error_id,
+        );
+        let (error_type, public_message) = match failure_kind {
+            KiroCallFailureKind::ThinkingSignatureInvalid => {
+                ("invalid_request_error", UPSTREAM_INVALID_REQUEST_MESSAGE)
+            }
+            _ => ("api_error", envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE),
+        };
+        return public_error_response(
+            status,
+            error_type,
+            public_message,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
+    }
     let err_str = err.to_string();
 
     // Provider content length thresholds and model context windows are different limits.
@@ -4132,6 +4810,9 @@ fn should_retry_payload_guard_after_error(
 }
 
 fn should_retry_without_cache_point_after_error(value: &str) -> bool {
+    if value.contains("reason=THINKING_SIGNATURE_INVALID") {
+        return false;
+    }
     is_upstream_tool_use_format_error(value)
         || is_upstream_improperly_formed_error(value)
         || is_upstream_bad_request_error(value)
@@ -4256,13 +4937,6 @@ fn resolve_request_model(
         &runtime_config.model_mapping,
     );
     if resolution.source == ModelResolutionSource::Unsupported {
-        tracing::warn!(
-            endpoint,
-            requested_model = %payload.model,
-            model_resolution_mode = %runtime_config.model_resolution_mode.as_str(),
-            resolution = %resolution.source.as_str(),
-            "请求模型解析失败"
-        );
         return Err(envelope::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -4329,35 +5003,16 @@ fn merge_warning_headers(
 
 fn payload_guard_error_response(err: PayloadGuardError) -> Response {
     match err {
-        PayloadGuardError::Serialize(message) => {
-            tracing::error!("序列化请求失败: {}", message);
-            envelope::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-            )
-        }
-        PayloadGuardError::OversizedImage {
-            current_images,
-            current_image_bytes,
-            historical_images,
-            historical_image_bytes,
-            max_source_bytes,
-        } => {
-            tracing::warn!(
-                current_images,
-                current_image_bytes,
-                historical_images,
-                historical_image_bytes,
-                max_source_bytes,
-                "request contains image input exceeding upstream image size limit"
-            );
-            envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.",
-            )
-        }
+        PayloadGuardError::Serialize(_message) => envelope::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        ),
+        PayloadGuardError::OversizedImage { .. } => envelope::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.",
+        ),
     }
 }
 
@@ -4551,6 +5206,31 @@ fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, 
     Ok(prefix)
 }
 
+fn record_pre_usage_rejection(
+    attribution: Option<&RequestRejectionAttribution>,
+    reason: RequestRejectionReason,
+    endpoint: &str,
+    response: &Response,
+) {
+    let Some(attribution) = attribution else {
+        return;
+    };
+    let Some(request_id) = response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    attribution.record(
+        reason,
+        "handler_preflight",
+        response.status(),
+        request_id,
+        endpoint,
+    );
+}
+
 /// GET /dfcache/:route/v1/models
 pub async fn get_models_dfcache(
     State(state): State<AppState>,
@@ -4574,9 +5254,18 @@ pub async fn get_models_dfcache(
 pub async fn post_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    raw_body: Bytes,
+    attribution: Option<Extension<RequestRejectionAttribution>>,
+    MessagesBody(raw_body, request_api_key_id): MessagesBody,
 ) -> Response {
-    post_messages_for_endpoint(state, headers, raw_body, "/v1/messages".to_string()).await
+    post_messages_for_endpoint(
+        state,
+        headers,
+        raw_body,
+        "/v1/messages".to_string(),
+        request_api_key_id,
+        attribution.map(|Extension(value)| value),
+    )
+    .await
 }
 
 /// POST /na/v1/messages
@@ -4585,9 +5274,18 @@ pub async fn post_messages(
 pub async fn post_messages_real_cache_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
-    raw_body: Bytes,
+    attribution: Option<Extension<RequestRejectionAttribution>>,
+    MessagesBody(raw_body, request_api_key_id): MessagesBody,
 ) -> Response {
-    post_messages_for_endpoint(state, headers, raw_body, "/na/v1/messages".to_string()).await
+    post_messages_for_endpoint(
+        state,
+        headers,
+        raw_body,
+        "/na/v1/messages".to_string(),
+        request_api_key_id,
+        attribution.map(|Extension(value)| value),
+    )
+    .await
 }
 
 /// POST /ha/v1/messages
@@ -4596,9 +5294,18 @@ pub async fn post_messages_real_cache_usage(
 pub async fn post_messages_ha(
     State(state): State<AppState>,
     headers: HeaderMap,
-    raw_body: Bytes,
+    attribution: Option<Extension<RequestRejectionAttribution>>,
+    MessagesBody(raw_body, request_api_key_id): MessagesBody,
 ) -> Response {
-    post_messages_for_endpoint(state, headers, raw_body, "/ha/v1/messages".to_string()).await
+    post_messages_for_endpoint(
+        state,
+        headers,
+        raw_body,
+        "/ha/v1/messages".to_string(),
+        request_api_key_id,
+        attribution.map(|Extension(value)| value),
+    )
+    .await
 }
 
 /// POST /dfcache/:route/v1/messages
@@ -4608,14 +5315,32 @@ pub async fn post_messages_dfcache(
     State(state): State<AppState>,
     Path(route): Path<String>,
     headers: HeaderMap,
-    raw_body: Bytes,
+    attribution: Option<Extension<RequestRejectionAttribution>>,
+    MessagesBody(raw_body, request_api_key_id): MessagesBody,
 ) -> Response {
+    let endpoint = format!("/dfcache/{route}/v1/messages");
     let prefix = match resolve_defined_cache_route(&state, &route) {
         Ok(prefix) => prefix,
-        Err(response) => return response,
+        Err(response) => {
+            record_pre_usage_rejection(
+                attribution.as_ref().map(|Extension(value)| value),
+                RequestRejectionReason::DfcacheRouteInvalid,
+                &endpoint,
+                &response,
+            );
+            return response;
+        }
     };
     let endpoint = format!("{prefix}/v1/messages");
-    post_messages_for_endpoint(state, headers, raw_body, endpoint).await
+    post_messages_for_endpoint(
+        state,
+        headers,
+        raw_body,
+        endpoint,
+        request_api_key_id,
+        attribution.map(|Extension(value)| value),
+    )
+    .await
 }
 
 async fn post_messages_for_endpoint(
@@ -4623,16 +5348,32 @@ async fn post_messages_for_endpoint(
     headers: HeaderMap,
     raw_body: Bytes,
     endpoint: String,
+    request_api_key_id: Option<String>,
+    attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
-    request_entry::handle_messages_endpoint(state, headers, raw_body, endpoint).await
+    request_entry::handle_messages_endpoint(
+        state,
+        headers,
+        raw_body,
+        endpoint,
+        request_api_key_id,
+        attribution,
+    )
+    .await
 }
 
 async fn post_messages_inner(
     state: AppState,
     headers: HeaderMap,
+    effective_raw_body: Bytes,
+    effective_raw_probe: Arc<RawMessagesBodyProbe>,
     raw_body: Bytes,
     mut payload: MessagesRequest,
     endpoint: String,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    request_history_contaminated: bool,
+    attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
     tracing::debug!(
         endpoint = endpoint,
@@ -4647,54 +5388,39 @@ async fn post_messages_inner(
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
         None => {
-            tracing::error!("KiroProvider 未配置");
-            return envelope::error_response(
+            let response = envelope::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",
                 envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
             );
+            record_pre_usage_rejection(
+                attribution.as_ref(),
+                RequestRejectionReason::ProviderNotReady,
+                &endpoint,
+                &response,
+            );
+            return response;
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
-    let prompt_steering_applied = super::prompt_steering::apply_to_messages_request(
-        &endpoint,
-        runtime_config.compat_profile,
-        &runtime_config.prompt_steering,
-        &mut payload,
-    );
-    let raw_body = if prompt_steering_applied
-        && super::prompt_steering::should_apply_to_external_pool(
-            &endpoint,
-            runtime_config.compat_profile,
-            &runtime_config.prompt_steering,
-        ) {
-        match serde_json::to_vec(&payload) {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(err) => {
-                tracing::warn!("提示词引导后的请求体序列化失败: {}", err);
-                return envelope::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Failed to prepare request body.",
-                );
-            }
-        }
-    } else {
-        raw_body
-    };
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let mut external_fallback = build_external_fallback_context(
         &state,
         &runtime_config,
         &cache_route,
         &endpoint,
+        effective_raw_body,
+        effective_raw_probe,
         raw_body,
         headers.clone(),
         &payload,
+        inference_attempt_budget.clone(),
+        request_api_key_id.clone(),
+        request_history_contaminated,
     );
     let parsed_body_plan =
         ParsedAnthropicBodyPlan::shared_compatible(runtime_config.image_processing);
-    if let Err(response) = parsed_body_pipeline::prepare(
+    let _parsed_body_report = match parsed_body_pipeline::prepare(
         &state,
         &headers,
         &endpoint,
@@ -4704,11 +5430,41 @@ async fn post_messages_inner(
     )
     .await
     {
-        return response;
-    }
+        Ok(report) => report,
+        Err(response) => {
+            record_pre_usage_rejection(
+                attribution.as_ref(),
+                RequestRejectionReason::MultimodalInvalid,
+                &endpoint,
+                &response,
+            );
+            return response;
+        }
+    };
 
+    let prompt_steering_for_external = super::prompt_steering::should_apply_to_external_pool(
+        &endpoint,
+        runtime_config.compat_profile,
+        &runtime_config.prompt_steering,
+    );
+    if prompt_steering_for_external {
+        super::prompt_steering::apply_to_messages_request(
+            &endpoint,
+            runtime_config.compat_profile,
+            &runtime_config.prompt_steering,
+            &mut payload,
+        );
+    }
     if let Some(external) = external_fallback.as_mut() {
         external.refresh_payload(&payload);
+    }
+    if !prompt_steering_for_external {
+        super::prompt_steering::apply_to_messages_request(
+            &endpoint,
+            runtime_config.compat_profile,
+            &runtime_config.prompt_steering,
+            &mut payload,
+        );
     }
 
     if let Some(external) = external_fallback.as_ref() {
@@ -4732,6 +5488,12 @@ async fn post_messages_inner(
             {
                 return external_response;
             }
+            record_pre_usage_rejection(
+                attribution.as_ref(),
+                RequestRejectionReason::ModelUnsupported,
+                &endpoint,
+                &response,
+            );
             return response;
         }
     };
@@ -4742,13 +5504,20 @@ async fn post_messages_inner(
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         if !websearch_supported_for_profile(runtime_config.compat_profile) {
-            return envelope::error_response(
+            let response = envelope::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "The web_search tool is not supported for this request.",
             );
+            record_pre_usage_rejection(
+                attribution.as_ref(),
+                RequestRejectionReason::WebSearchUnsupported,
+                &endpoint,
+                &response,
+            );
+            return response;
         }
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+        tracing::info!("detected native WebSearch tool request");
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
@@ -4758,22 +5527,132 @@ async fn post_messages_inner(
             payload.tools.as_deref(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let websearch_cache_route =
+            cache_route_for_request_stream(cache_route.clone(), payload.stream);
+        let usage_context = prepare_usage_context_with_inference_attempt_budget(
+            &state,
+            websearch_cache_route,
+            &endpoint,
+            payload.stream,
+            &payload,
+            Some(model_resolution.clone()),
+            None,
+            None,
+            input_tokens,
+            inference_attempt_budget.clone(),
+            request_api_key_id.clone(),
+        );
+        let request_id = usage_context.request_id.clone();
+        let error_id = usage_context.error_id.clone();
+        let attribution_sink = Arc::new(McpCallAttributionSink::default());
+        let mut usage_guard =
+            WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
+        let outcome = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            inference_attempt_budget,
+            attribution_sink,
+            &request_id,
+            &error_id,
+        )
+        .await;
+        let usage_context = usage_guard.take();
+        return match outcome {
+            websearch::WebSearchOutcome::Success {
+                response,
+                output_tokens,
+                attribution,
+            } => {
+                let usage_context = usage_context.attach_credential(
+                    attribution.credential_id,
+                    attribution.credential_label,
+                    false,
+                    false,
+                    attribution.attempts,
+                );
+                let usage = super::cache::CacheUsage {
+                    total_input_tokens: input_tokens.max(0),
+                    input_tokens: input_tokens.max(0),
+                    output_tokens: output_tokens.max(0),
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation_5m_input_tokens: 0,
+                    cache_creation_1h_input_tokens: 0,
+                };
+                if payload.stream {
+                    wrap_websearch_stream_usage_record(response, usage_context, usage)
+                } else {
+                    usage_context.request.set_downstream_stop_reason("end_turn");
+                    usage_context
+                        .request
+                        .latency
+                        .inference_attempt_budget
+                        .mark_downstream_committed();
+                    usage_context.record_success_reported_with_metering(
+                        usage,
+                        UsageSource::RequestEstimate,
+                        Some(usage),
+                        None,
+                    );
+                    response
+                }
+            }
+            websearch::WebSearchOutcome::Failure {
+                response,
+                error_type,
+                internal_reason,
+                attribution,
+            } => {
+                let usage_context = usage_context.attach_credential(
+                    attribution.credential_id,
+                    attribution.credential_label,
+                    false,
+                    false,
+                    attribution.attempts,
+                );
+                usage_context.record_websearch_failure(
+                    response.status(),
+                    error_type,
+                    internal_reason,
+                );
+                response
+            }
+        };
     }
 
     let local_cache_route = cache_route_for_request_stream(cache_route, payload.stream);
     let request_simulation_mode =
         prompt_cache_simulation_mode_for_policy(&local_cache_route.policy);
     let cache_type = local_cache_route.policy.cache_type;
+    let native_reasoning_capability = model_resolution
+        .upstream_model
+        .as_deref()
+        .map(|model| {
+            let capability_cohort_keys = provider.model_capability_cohort_keys();
+            state
+                .model_capabilities
+                .reasoning_capability_state_for(model, &capability_cohort_keys)
+        })
+        .unwrap_or(KiroReasoningCapabilityState::Unknown);
     let prepared_local = match local_body_pipeline::prepare(
         &endpoint,
         &payload,
         &runtime_config,
         &local_cache_route,
         &model_resolution,
+        native_reasoning_capability,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(response) => {
+            record_pre_usage_rejection(
+                attribution.as_ref(),
+                RequestRejectionReason::LocalBodyPrepare,
+                &endpoint,
+                &response,
+            );
+            return response;
+        }
     };
     let local_body_pipeline::PreparedLocalKiroBody {
         request_body,
@@ -4793,7 +5672,7 @@ async fn post_messages_inner(
         cache_point_retry,
     } = prepared_local;
 
-    let mut usage_context = prepare_usage_context(
+    let mut usage_context = prepare_usage_context_with_inference_attempt_budget(
         &state,
         local_cache_route,
         &endpoint,
@@ -4803,6 +5682,8 @@ async fn post_messages_inner(
         Some(conversation_id.clone()),
         prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
         input_tokens,
+        inference_attempt_budget.clone(),
+        request_api_key_id,
     );
     if let Some(report) = payload_guard_report.clone() {
         usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
@@ -4821,7 +5702,7 @@ async fn post_messages_inner(
         handle_stream_request(
             provider,
             &request_body,
-            &kiro_request,
+            kiro_request,
             &payload.model,
             model_resolution
                 .upstream_model
@@ -4859,6 +5740,7 @@ async fn post_messages_inner(
                 .as_deref()
                 .unwrap_or(&payload.model),
             input_tokens,
+            thinking_enabled,
             extract_thinking,
             tool_name_map,
             tool_schema_key_map,
@@ -4877,29 +5759,44 @@ async fn post_messages_inner(
 async fn call_api_stream_maybe_fail_fast(
     provider: &Arc<KiroProvider>,
     request_body: &str,
+    kiro_request: Option<&KiroRequest>,
     request_id: Option<&str>,
     external_fallback: Option<&ExternalFallbackContext>,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
-    if let Some(external) = external_fallback {
-        if external.should_fail_fast_local().await {
-            return provider
-                .call_api_stream_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
-                    request_body,
-                    request_id,
-                    capacity_weight_units,
-                    dispatch_model_filter,
-                )
-                .await;
-        }
+    let (acquire_mode, preserve_external_attempt) = if let Some(external) = external_fallback {
+        external.local_attempt_policy().await
+    } else {
+        (AcquireMode::WaitForCapacity, false)
+    };
+    if let Some(kiro_request) =
+        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    {
+        return provider
+            .call_api_stream_with_request_id_and_thinking_signature_retry(
+                request_body,
+                request_id,
+                acquire_mode,
+                capacity_weight_units,
+                dispatch_model_filter,
+                inference_attempt_budget,
+                preserve_external_attempt,
+                None,
+                move || build_thinking_signature_retry_body(kiro_request),
+            )
+            .await;
     }
     provider
-        .call_api_stream_with_request_id_and_capacity_weight_and_model_filter(
+        .call_api_stream_with_request_id_and_attempt_budget(
             request_body,
             request_id,
+            acquire_mode,
             capacity_weight_units,
             dispatch_model_filter,
+            inference_attempt_budget,
+            preserve_external_attempt,
         )
         .await
 }
@@ -4907,31 +5804,57 @@ async fn call_api_stream_maybe_fail_fast(
 async fn call_api_maybe_fail_fast(
     provider: &Arc<KiroProvider>,
     request_body: &str,
+    kiro_request: Option<&KiroRequest>,
     request_id: Option<&str>,
     external_fallback: Option<&ExternalFallbackContext>,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
-    if let Some(external) = external_fallback {
-        if external.should_fail_fast_local().await {
-            return provider
-                .call_api_with_context_with_request_id_fail_fast_and_capacity_weight_and_model_filter(
-                    request_body,
-                    request_id,
-                    capacity_weight_units,
-                    dispatch_model_filter,
-                )
-                .await;
-        }
+    let (acquire_mode, preserve_external_attempt) = if let Some(external) = external_fallback {
+        external.local_attempt_policy().await
+    } else {
+        (AcquireMode::WaitForCapacity, false)
+    };
+    if let Some(kiro_request) =
+        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    {
+        return provider
+            .call_api_with_context_with_request_id_and_thinking_signature_retry(
+                request_body,
+                request_id,
+                acquire_mode,
+                capacity_weight_units,
+                dispatch_model_filter,
+                inference_attempt_budget,
+                preserve_external_attempt,
+                None,
+                move || build_thinking_signature_retry_body(kiro_request),
+            )
+            .await;
     }
     provider
-        .call_api_with_context_with_request_id_and_capacity_weight_and_model_filter(
+        .call_api_with_context_with_request_id_and_attempt_budget(
             request_body,
             request_id,
+            acquire_mode,
             capacity_weight_units,
             dispatch_model_filter,
+            inference_attempt_budget,
+            preserve_external_attempt,
         )
         .await
+}
+
+fn build_thinking_signature_retry_body(request: &KiroRequest) -> anyhow::Result<String> {
+    let mut retry_request = request.clone();
+    let removed = retry_request
+        .conversation_state
+        .clear_history_reasoning_content();
+    if removed == 0 {
+        anyhow::bail!("thinking signature retry request has no historical reasoningContent");
+    }
+    serialize_kiro_request(&retry_request).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 async fn maybe_forward_external_after_local_error(
@@ -4949,10 +5872,11 @@ async fn maybe_external_fallback_after_local_error_outcome(
     external_fallback: Option<&ExternalFallbackContext>,
     request_id: &str,
     message: &str,
+    call_failure_kind: Option<KiroCallFailureKind>,
     attempts: Vec<KiroCredentialAttempt>,
 ) -> Option<ExternalPoolForwardOutcome> {
     external_fallback?
-        .fallback_after_local_error_outcome(request_id, message, attempts)
+        .fallback_after_local_error_outcome(request_id, message, call_failure_kind, attempts)
         .await
 }
 
@@ -4960,6 +5884,7 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
     external_fallback: Option<&ExternalFallbackContext>,
     request_id: &str,
     message: &str,
+    call_failure_kind: Option<KiroCallFailureKind>,
     classification_attempts: Vec<KiroCredentialAttempt>,
     diagnostic_attempts: Vec<KiroCredentialAttempt>,
 ) -> Option<ExternalPoolForwardOutcome> {
@@ -4967,6 +5892,7 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
         .fallback_after_local_error_outcome_with_diagnostics(
             request_id,
             message,
+            call_failure_kind,
             classification_attempts,
             diagnostic_attempts,
         )
@@ -4975,12 +5901,11 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
 
 async fn maybe_local_pool_preflight_external_response(
     external_fallback: Option<&ExternalFallbackContext>,
-    provider: &KiroProvider,
     request_id: &str,
     model: Option<&str>,
 ) -> Option<Response> {
     let outcome = external_fallback?
-        .local_pool_preflight_outcome(provider, request_id, model)
+        .local_pool_preflight_outcome(request_id, model)
         .await?;
     Some(match outcome {
         ExternalPoolForwardOutcome::Response(response) => response,
@@ -5020,6 +5945,18 @@ fn local_rescue_reason_after_external_error(
     Some("external_error")
 }
 
+fn budgeted_local_rescue_reason_after_external_error(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolFinalError,
+    local_fallback_reason: Option<&str>,
+    inference_attempt_budget: &InferenceAttemptBudget,
+) -> Option<&'static str> {
+    if inference_attempt_budget.available_attempts(0) == 0 {
+        return None;
+    }
+    local_rescue_reason_after_external_error(config, err, local_fallback_reason)
+}
+
 /// Last-chance local retry after an external-pool final error.
 ///
 /// This deliberately calls the provider-local `*_max_wait` entrypoint directly. Do not route this
@@ -5028,18 +5965,42 @@ fn local_rescue_reason_after_external_error(
 async fn call_stream_local_rescue_after_external_error(
     provider: &Arc<KiroProvider>,
     request_body: &str,
+    kiro_request: Option<&KiroRequest>,
     request_id: &str,
     external: &ExternalFallbackContext,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
+    let acquire_mode = AcquireMode::WaitForCapacityMax(Duration::from_secs(
+        external.config.external_pool_local_rescue_max_wait_secs,
+    ));
+    if let Some(kiro_request) =
+        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    {
+        return provider
+            .call_api_stream_with_request_id_and_thinking_signature_retry(
+                request_body,
+                Some(request_id),
+                acquire_mode,
+                capacity_weight_units,
+                dispatch_model_filter,
+                external.inference_attempt_budget.clone(),
+                false,
+                Some(1),
+                move || build_thinking_signature_retry_body(kiro_request),
+            )
+            .await;
+    }
     provider
-        .call_api_stream_with_request_id_max_wait_and_capacity_weight_and_model_filter(
+        .call_api_stream_with_request_id_and_attempt_budget_max_sends(
             request_body,
             Some(request_id),
-            Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
+            acquire_mode,
             capacity_weight_units,
             dispatch_model_filter,
+            external.inference_attempt_budget.clone(),
+            false,
+            Some(1),
         )
         .await
 }
@@ -5052,18 +6013,42 @@ async fn call_stream_local_rescue_after_external_error(
 async fn call_non_stream_local_rescue_after_external_error(
     provider: &Arc<KiroProvider>,
     request_body: &str,
+    kiro_request: Option<&KiroRequest>,
     request_id: &str,
     external: &ExternalFallbackContext,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
+    let acquire_mode = AcquireMode::WaitForCapacityMax(Duration::from_secs(
+        external.config.external_pool_local_rescue_max_wait_secs,
+    ));
+    if let Some(kiro_request) =
+        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    {
+        return provider
+            .call_api_with_context_with_request_id_and_thinking_signature_retry(
+                request_body,
+                Some(request_id),
+                acquire_mode,
+                capacity_weight_units,
+                dispatch_model_filter,
+                external.inference_attempt_budget.clone(),
+                false,
+                Some(1),
+                move || build_thinking_signature_retry_body(kiro_request),
+            )
+            .await;
+    }
     provider
-        .call_api_with_context_with_request_id_max_wait_and_capacity_weight_and_model_filter(
+        .call_api_with_context_with_request_id_and_attempt_budget_max_sends(
             request_body,
             Some(request_id),
-            Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
+            acquire_mode,
             capacity_weight_units,
             dispatch_model_filter,
+            external.inference_attempt_budget.clone(),
+            false,
+            Some(1),
         )
         .await
 }
@@ -5118,6 +6103,7 @@ struct StreamRetryPlan {
     config: LocalStreamRetryConfig,
     provider: Arc<KiroProvider>,
     request_body: Arc<str>,
+    kiro_request: Option<Arc<KiroRequest>>,
     request_id: String,
     external_fallback: Option<ExternalFallbackContext>,
     capacity_weight_units: u32,
@@ -5231,7 +6217,7 @@ fn external_rescue_preflight(reason: &str, err: &ExternalPoolFinalError) -> serd
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
-    kiro_request: &KiroRequest,
+    kiro_request: KiroRequest,
     model: &str,
     preflight_model: &str,
     requested_max_tokens: i32,
@@ -5257,9 +6243,9 @@ async fn handle_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
+    let mut successful_derived_request: Option<(String, KiroRequest)> = None;
     if let Some(response) = maybe_local_pool_preflight_external_response(
         external_fallback.as_ref(),
-        provider.as_ref(),
         &request_id,
         Some(model),
     )
@@ -5270,10 +6256,12 @@ async fn handle_stream_request(
     let response = match call_api_stream_maybe_fail_fast(
         &provider,
         request_body,
+        Some(&kiro_request),
         Some(&request_id),
         external_fallback.as_ref(),
         capacity_weight_units,
         Some(model),
+        usage_context.latency.inference_attempt_budget.clone(),
     )
     .await
     {
@@ -5286,7 +6274,7 @@ async fn handle_stream_request(
             attach_and_log_tool_use_format_diagnostics(
                 &message,
                 request_body,
-                kiro_request,
+                &kiro_request,
                 &mut usage_context,
                 &endpoint,
                 model,
@@ -5304,10 +6292,11 @@ async fn handle_stream_request(
                     && should_retry_without_cache_point_after_error(&message)
             }) {
                 retry_attempt_prefix = attempts.clone();
-                let retry_body = match retry.build_retry_body(&message, &mut usage_context) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        usage_context
+                let (retry_body, retry_kiro_request) =
+                    match retry.build_retry_body(&message, &mut usage_context) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            usage_context
                             .attach_provider_error_credential(&provider, &message, attempts)
                             .with_error_metadata(provider_error_metadata(&e))
                             .record_failure(
@@ -5318,20 +6307,25 @@ async fn handle_stream_request(
                                     err
                                 ),
                             );
-                        return payload_guard_error_response(err);
-                    }
-                };
+                            return payload_guard_error_response(err);
+                        }
+                    };
                 match call_api_stream_maybe_fail_fast(
                     &provider,
                     &retry_body,
+                    Some(&retry_kiro_request),
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
                     Some(model),
+                    usage_context.latency.inference_attempt_budget.clone(),
                 )
                 .await
                 {
-                    Ok(resp) => resp,
+                    Ok(resp) => {
+                        successful_derived_request = Some((retry_body, retry_kiro_request));
+                        resp
+                    }
                     Err(retry_error) => {
                         let retry_message = retry_error.to_string();
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
@@ -5343,7 +6337,7 @@ async fn handle_stream_request(
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
                             &retry_body,
-                            kiro_request,
+                            &retry_kiro_request,
                             &mut usage_context,
                             &endpoint,
                             model,
@@ -5354,6 +6348,7 @@ async fn handle_stream_request(
                                 external_fallback.as_ref(),
                                 &request_id,
                                 &retry_message,
+                                KiroProvider::call_failure_kind_from_error(&retry_error),
                                 classification_attempts,
                                 all_attempts.clone(),
                             )
@@ -5395,7 +6390,7 @@ async fn handle_stream_request(
                     "Kiro stream request rejected as too long; applying configured payload guard and retrying once"
                 );
                 retry_attempt_prefix = attempts.clone();
-                let (retry_body, retry_warnings_header) =
+                let (retry_body, retry_warnings_header, retry_kiro_request) =
                     match retry.build_retry_body(&mut usage_context) {
                         Ok(result) => result,
                         Err(err) => {
@@ -5417,14 +6412,19 @@ async fn handle_stream_request(
                 match call_api_stream_maybe_fail_fast(
                     &provider,
                     &retry_body,
+                    Some(&retry_kiro_request),
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
                     Some(model),
+                    usage_context.latency.inference_attempt_budget.clone(),
                 )
                 .await
                 {
-                    Ok(resp) => resp,
+                    Ok(resp) => {
+                        successful_derived_request = Some((retry_body, retry_kiro_request));
+                        resp
+                    }
                     Err(retry_error) => {
                         let retry_message = retry_error.to_string();
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
@@ -5436,7 +6436,7 @@ async fn handle_stream_request(
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
                             &retry_body,
-                            kiro_request,
+                            &retry_kiro_request,
                             &mut usage_context,
                             &endpoint,
                             model,
@@ -5447,6 +6447,7 @@ async fn handle_stream_request(
                                 external_fallback.as_ref(),
                                 &request_id,
                                 &retry_message,
+                                KiroProvider::call_failure_kind_from_error(&retry_error),
                                 classification_attempts.clone(),
                                 all_attempts.clone(),
                             )
@@ -5457,16 +6458,20 @@ async fn handle_stream_request(
                                 ExternalPoolForwardOutcome::FinalError(err) => {
                                     if let Some(external) = external_fallback.as_ref() {
                                         let local_fallback_reason =
-                                            classify_local_error_for_external_fallback(
+                                            classify_local_error_for_external_fallback_with_kind(
                                                 &retry_message,
                                                 &classification_attempts,
                                                 &external.config,
+                                                KiroProvider::call_failure_kind_from_error(
+                                                    &retry_error,
+                                                ),
                                             );
                                         if let Some(reason) =
-                                            local_rescue_reason_after_external_error(
+                                            budgeted_local_rescue_reason_after_external_error(
                                                 &external.config,
                                                 &err,
                                                 local_fallback_reason.as_deref(),
+                                                external.inference_attempt_budget.as_ref(),
                                             )
                                         {
                                             tracing::warn!(
@@ -5486,6 +6491,7 @@ async fn handle_stream_request(
                                             match call_stream_local_rescue_after_external_error(
                                                 &provider,
                                                 &retry_body,
+                                                Some(&retry_kiro_request),
                                                 &request_id,
                                                 external,
                                                 capacity_weight_units,
@@ -5493,7 +6499,11 @@ async fn handle_stream_request(
                                             )
                                             .await
                                             {
-                                                Ok(resp) => resp,
+                                                Ok(resp) => {
+                                                    successful_derived_request =
+                                                        Some((retry_body, retry_kiro_request));
+                                                    resp
+                                                }
                                                 Err(rescue_error) => {
                                                     let rescue_message = rescue_error.to_string();
                                                     let rescue_attempts =
@@ -5567,6 +6577,7 @@ async fn handle_stream_request(
                     external_fallback.as_ref(),
                     &request_id,
                     &message,
+                    KiroProvider::call_failure_kind_from_error(&e),
                     attempts.clone(),
                 )
                 .await
@@ -5576,16 +6587,20 @@ async fn handle_stream_request(
                         ExternalPoolForwardOutcome::FinalError(err) => {
                             if let Some(external) = external_fallback.as_ref() {
                                 let local_fallback_reason =
-                                    classify_local_error_for_external_fallback(
+                                    classify_local_error_for_external_fallback_with_kind(
                                         &message,
                                         &attempts,
                                         &external.config,
+                                        KiroProvider::call_failure_kind_from_error(&e),
                                     );
-                                if let Some(reason) = local_rescue_reason_after_external_error(
-                                    &external.config,
-                                    &err,
-                                    local_fallback_reason.as_deref(),
-                                ) {
+                                if let Some(reason) =
+                                    budgeted_local_rescue_reason_after_external_error(
+                                        &external.config,
+                                        &err,
+                                        local_fallback_reason.as_deref(),
+                                        external.inference_attempt_budget.as_ref(),
+                                    )
+                                {
                                     tracing::warn!(
                                         request_id,
                                         reason,
@@ -5603,6 +6618,7 @@ async fn handle_stream_request(
                                     match call_stream_local_rescue_after_external_error(
                                         &provider,
                                         request_body,
+                                        Some(&kiro_request),
                                         &request_id,
                                         external,
                                         capacity_weight_units,
@@ -5672,6 +6688,9 @@ async fn handle_stream_request(
     };
     usage_context.mark_upstream_header();
     let (response, completion) = response.into_parts();
+    let thinking_signature_retry_succeeded = completion.attempts().iter().any(|attempt| {
+        attempt.action == "response_headers_received_after_thinking_signature_retry"
+    });
     let credential_attempts =
         merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
     let base_usage_context = usage_context.clone();
@@ -5696,17 +6715,67 @@ async fn handle_stream_request(
         known_tool_names,
     };
     let (ctx, initial_events) = context_template.build(&credential_usage);
-    let retry_plan = stream_retry_config.active().then(|| StreamRetryPlan {
-        config: stream_retry_config,
-        provider: provider.clone(),
-        request_body: Arc::<str>::from(request_body.to_string()),
-        request_id: request_id.clone(),
-        external_fallback: external_fallback.clone(),
-        capacity_weight_units,
-        dispatch_model_filter: Some(model.to_string()),
-        base_usage_context,
-        context_template,
-    });
+    let retry_plan = if stream_retry_config.active() {
+        let (mut effective_body, mut effective_request) = successful_derived_request
+            .take()
+            .unwrap_or_else(|| (request_body.to_string(), kiro_request));
+        if thinking_signature_retry_succeeded {
+            let removed = effective_request
+                .conversation_state
+                .clear_history_reasoning_content();
+            if removed == 0 {
+                tracing::warn!(
+                    request_id,
+                    "thinking signature retry succeeded without typed historical reasoning; disabling precommit stream retry"
+                );
+                None
+            } else {
+                match serialize_kiro_request(&effective_request) {
+                    Ok(body) => {
+                        effective_body = body;
+                        Some(StreamRetryPlan {
+                            config: stream_retry_config,
+                            provider: provider.clone(),
+                            request_body: Arc::<str>::from(effective_body),
+                            kiro_request: None,
+                            request_id: request_id.clone(),
+                            external_fallback: external_fallback.clone(),
+                            capacity_weight_units,
+                            dispatch_model_filter: Some(model.to_string()),
+                            base_usage_context,
+                            context_template,
+                        })
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            request_id,
+                            "failed to preserve stripped thinking signature request for precommit stream retry"
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            let retry_kiro_request = effective_request
+                .conversation_state
+                .has_history_reasoning_content()
+                .then(|| Arc::new(effective_request));
+            Some(StreamRetryPlan {
+                config: stream_retry_config,
+                provider: provider.clone(),
+                request_body: Arc::<str>::from(effective_body),
+                kiro_request: retry_kiro_request,
+                request_id: request_id.clone(),
+                external_fallback: external_fallback.clone(),
+                capacity_weight_units,
+                dispatch_model_filter: Some(model.to_string()),
+                base_usage_context,
+                context_template,
+            })
+        }
+    } else {
+        None
+    };
 
     // 创建 SSE 流
     let response_request_id = credential_usage.request.request_id.clone();
@@ -5792,7 +6861,7 @@ fn parse_three_part_semver(version: &str) -> Option<[u32; 3]> {
 struct JsonStreamError {
     error_type: &'static str,
     internal_detail: String,
-    body_preview: String,
+    body_bytes: usize,
 }
 
 enum JsonStreamSniffResult {
@@ -5819,6 +6888,23 @@ impl JsonStreamErrorSniffer {
     fn inspect(&mut self, chunk: Bytes) -> JsonStreamSniffResult {
         if !self.enabled || self.decided {
             return JsonStreamSniffResult::Pass(chunk);
+        }
+
+        // Kiro can label a binary EventStream as application/json. The first
+        // non-whitespace byte of an EventStream prelude is normally binary, so
+        // decide it in place and keep the hot path zero-copy. Buffering is only
+        // needed for a JSON-looking body that may span chunks.
+        if self.buffer.is_empty() {
+            if let Some(first_non_ws) = chunk
+                .iter()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace())
+            {
+                if !matches!(first_non_ws, b'{' | b'[') {
+                    self.decided = true;
+                    return JsonStreamSniffResult::Pass(chunk);
+                }
+            }
         }
 
         self.buffer.extend_from_slice(&chunk);
@@ -5858,7 +6944,7 @@ impl JsonStreamErrorSniffer {
             Err(err) => JsonStreamSniffResult::Error(JsonStreamError {
                 error_type: "api_error",
                 internal_detail: format!("json_stream_malformed_json: {}", err),
-                body_preview: bytes_preview(trimmed),
+                body_bytes: trimmed.len(),
             }),
         }
     }
@@ -5874,14 +6960,14 @@ impl JsonStreamErrorSniffer {
             return Some(JsonStreamError {
                 error_type: "api_error",
                 internal_detail: "json_stream_empty_body".to_string(),
-                body_preview: String::new(),
+                body_bytes: 0,
             });
         }
 
         Some(JsonStreamError {
             error_type: "api_error",
             internal_detail: "json_stream_incomplete_json".to_string(),
-            body_preview: bytes_preview(trimmed),
+            body_bytes: trimmed.len(),
         })
     }
 
@@ -5889,7 +6975,7 @@ impl JsonStreamErrorSniffer {
         JsonStreamError {
             error_type: "api_error",
             internal_detail: reason.to_string(),
-            body_preview: bytes_preview(trim_ascii_whitespace(&self.buffer)),
+            body_bytes: trim_ascii_whitespace(&self.buffer).len(),
         }
     }
 }
@@ -5913,16 +6999,6 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
         .map(|idx| idx + 1)
         .unwrap_or(start);
     &bytes[start..end]
-}
-
-fn bytes_preview(bytes: &[u8]) -> String {
-    const PREVIEW_LIMIT: usize = 2048;
-    let end = bytes.len().min(PREVIEW_LIMIT);
-    let mut preview = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    if bytes.len() > PREVIEW_LIMIT {
-        preview.push_str("...[truncated]");
-    }
-    preview
 }
 
 fn json_string_at<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
@@ -5985,28 +7061,69 @@ fn classify_json_stream_error(value: &Value, raw_body: &[u8]) -> JsonStreamError
         "api_error"
     };
 
-    let mut fields = Vec::new();
-    if let Some(code) = code {
-        fields.push(format!("code={}", code));
-    }
-    if let Some(reason) = reason {
-        fields.push(format!("reason={}", reason));
-    }
-    if let Some(message) = message {
-        fields.push(format!("message={}", message));
-    }
-
-    let internal_detail = if fields.is_empty() {
+    let internal_detail = if code.is_none() && reason.is_none() && message.is_none() {
         "json_stream_unexpected_body".to_string()
     } else {
-        format!("json_stream_exception {}", fields.join(" "))
+        format!(
+            "json_stream_exception classified_as={} code_present={} reason_present={} message_present={}",
+            error_type,
+            code.is_some(),
+            reason.is_some(),
+            message.is_some()
+        )
     };
 
     JsonStreamError {
         error_type,
         internal_detail,
-        body_preview: bytes_preview(raw_body),
+        body_bytes: raw_body.len(),
     }
+}
+
+fn inspect_complete_upstream_body(
+    content_type: Option<&str>,
+    body: Bytes,
+) -> Result<Bytes, JsonStreamError> {
+    let mut sniffer = JsonStreamErrorSniffer::new(content_type);
+    match sniffer.inspect(body) {
+        JsonStreamSniffResult::Pass(body) => Ok(body),
+        JsonStreamSniffResult::Error(error) => Err(error),
+        JsonStreamSniffResult::Pending => {
+            Err(sniffer.finish().unwrap_or_else(|| JsonStreamError {
+                error_type: "api_error",
+                internal_detail: "json_stream_incomplete_body".to_string(),
+                body_bytes: 0,
+            }))
+        }
+    }
+}
+
+fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<Event>, String> {
+    let mut decoder = EventStreamDecoder::new();
+    decoder
+        .feed(body)
+        .map_err(|error| format!("upstream eventstream buffer error: {}", error))?;
+
+    let mut events = Vec::new();
+    for result in decoder.decode_iter() {
+        let frame = result
+            .map_err(|error| format!("upstream eventstream frame decode error: {}", error))?;
+        let event = Event::from_frame(frame)
+            .map_err(|error| format!("upstream event payload parse error: {}", error))?;
+        events.push(event);
+    }
+
+    if !decoder.is_clean_eof() {
+        return Err(format!(
+            "upstream eventstream ended with {} undecoded bytes",
+            decoder.pending_bytes()
+        ));
+    }
+    if decoder.frames_decoded() == 0 {
+        return Err("upstream eventstream ended without any frames".to_string());
+    }
+
+    Ok(events)
 }
 
 /// 创建 ping 事件的 SSE 字符串
@@ -6052,6 +7169,17 @@ fn sse_bytes_from_events(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>
         .collect()
 }
 
+fn mark_stream_downstream_committed(state: &mut SseStreamState) {
+    state
+        .usage_guard
+        .context()
+        .request
+        .latency
+        .inference_attempt_budget
+        .mark_downstream_committed();
+    state.downstream_committed = true;
+}
+
 fn prepend_initial_bytes_if_needed(
     state: &mut SseStreamState,
     mut bytes: Vec<Result<Bytes, Infallible>>,
@@ -6060,12 +7188,12 @@ fn prepend_initial_bytes_if_needed(
     if !state.downstream_committed && (commit_initial || !bytes.is_empty()) {
         let mut combined = sse_bytes_from_events(std::mem::take(&mut state.initial_events));
         combined.append(&mut bytes);
-        state.downstream_committed = true;
+        mark_stream_downstream_committed(state);
         return combined;
     }
 
     if !bytes.is_empty() {
-        state.downstream_committed = true;
+        mark_stream_downstream_committed(state);
     }
     bytes
 }
@@ -6118,21 +7246,73 @@ async fn retry_stream_before_downstream_commit(
     state.prior_attempts =
         merge_credential_attempts(std::mem::take(&mut state.prior_attempts), previous_attempts);
     state.usage_guard.complete();
-    plan.base_usage_context
-        .mark_stream_retry_before_downstream_commit(format!("{}: {}", reason.as_str(), detail));
-
-    match call_api_stream_maybe_fail_fast(
+    let attempt_budget = plan
+        .base_usage_context
+        .latency
+        .inference_attempt_budget
+        .clone();
+    let consumed_before = attempt_budget.snapshot().consumed;
+    let retry_dispatch = call_api_stream_maybe_fail_fast(
         &plan.provider,
         plan.request_body.as_ref(),
+        plan.kiro_request.as_deref(),
         Some(&plan.request_id),
         plan.external_fallback.as_ref(),
         plan.capacity_weight_units,
         plan.dispatch_model_filter.as_deref(),
+        attempt_budget.clone(),
     )
-    .await
-    {
+    .await;
+    let retry_sends = attempt_budget
+        .snapshot()
+        .consumed
+        .saturating_sub(consumed_before);
+    if retry_sends > 0 {
+        plan.base_usage_context
+            .mark_stream_retry_sends(retry_sends, reason);
+    } else if retry_dispatch.is_err() {
+        plan.base_usage_context
+            .mark_stream_retry_dispatch_failure(reason);
+    }
+
+    match retry_dispatch {
         Ok(response) => {
             let (response, completion) = response.into_parts();
+            let thinking_signature_retry_succeeded = completion.attempts().iter().any(|attempt| {
+                attempt.action == "response_headers_received_after_thinking_signature_retry"
+            });
+            let next_retry_plan = thinking_signature_retry_succeeded.then(|| {
+                let Some(request) = plan.kiro_request.as_deref() else {
+                    tracing::warn!(
+                        request_id = %plan.request_id,
+                        "thinking signature stream retry succeeded without a typed request; disabling further precommit retries"
+                    );
+                    return None;
+                };
+                let mut request = request.clone();
+                if request
+                    .conversation_state
+                    .clear_history_reasoning_content()
+                    == 0
+                {
+                    return None;
+                }
+                match serialize_kiro_request(&request) {
+                    Ok(body) => {
+                        let mut updated = plan.clone();
+                        updated.request_body = Arc::<str>::from(body);
+                        updated.kiro_request = None;
+                        Some(updated)
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            request_id = %plan.request_id,
+                            "failed to preserve stripped request after thinking signature stream retry"
+                        );
+                        None
+                    }
+                }
+            });
             let credential_attempts = merge_credential_attempts(
                 state.prior_attempts.clone(),
                 completion.attempts().to_vec(),
@@ -6145,11 +7325,11 @@ async fn retry_stream_before_downstream_commit(
                 completion.fallback_from_sticky(),
                 credential_attempts,
             );
-            StreamRetryOutcome::Retried(state.with_retry_attempt(
-                response,
-                completion,
-                credential_usage,
-            ))
+            let mut state = state.with_retry_attempt(response, completion, credential_usage);
+            if let Some(next_retry_plan) = next_retry_plan {
+                state.retry_plan = next_retry_plan;
+            }
+            StreamRetryOutcome::Retried(state)
         }
         Err(err) => {
             let retry_detail = format!("stream retry dispatch failed: {}", err);
@@ -6159,12 +7339,6 @@ async fn retry_stream_before_downstream_commit(
                 error = %retry_detail,
                 "本地 Kiro 流式首输出前重试失败"
             );
-            plan.base_usage_context
-                .mark_stream_retry_before_downstream_commit(format!(
-                    "{}: {}",
-                    reason.as_str(),
-                    retry_detail
-                ));
             state
                 .ctx
                 .record_stream_error("api_error", format!("{}; {}", detail, retry_detail));
@@ -6206,7 +7380,7 @@ fn create_sse_stream(
 
             if !state.downstream_committed && state.retry_plan.is_none() {
                 let bytes = sse_bytes_from_events(std::mem::take(&mut state.initial_events));
-                state.downstream_committed = true;
+                mark_stream_downstream_committed(&mut state);
                 return Some((stream::iter(bytes), state));
             }
 
@@ -6239,7 +7413,7 @@ fn create_sse_stream(
                                     tracing::warn!(
                                         error_type = error.error_type,
                                         error_detail = %error.internal_detail,
-                                        body = %error.body_preview,
+                                        body_bytes = error.body_bytes,
                                         "流式 API 返回 2xx JSON 错误体"
                                     );
                                     let retry_detail = error.internal_detail.clone();
@@ -6277,15 +7451,48 @@ fn create_sse_stream(
                             };
 
                             if let Err(e) = state.decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                let detail = format!("upstream eventstream buffer error: {}", e);
+                                tracing::warn!(error = %e, "EventStream 缓冲失败");
                                 state
                                     .usage_guard
                                     .context()
                                     .request
                                     .mark_upstream_frame_decode_error_before_first_output();
+                                if !state.downstream_committed {
+                                    match retry_stream_before_downstream_commit(
+                                        state,
+                                        StreamRetryReason::ProtocolError,
+                                        detail.clone(),
+                                    )
+                                    .await
+                                    {
+                                        StreamRetryOutcome::Retried(state) => {
+                                            let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                            return Some((stream::iter(bytes), state));
+                                        }
+                                        StreamRetryOutcome::NotRetried(next_state) => {
+                                            state = next_state;
+                                        }
+                                    }
+                                }
+                                state
+                                    .completion
+                                    .report_upstream_stream_failure(detail.clone());
+                                state.ctx.record_stream_error("api_error", detail);
+                                let bytes = finish_stream_with_recorded_error(
+                                    &mut state.ctx,
+                                    &state.usage_guard,
+                                    UsageRecordStatus::StreamError,
+                                    StreamTerminalReason::InternalError,
+                                );
+                                let bytes =
+                                    prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                                state.finished = true;
+                                return Some((stream::iter(bytes), state));
                             }
 
                             let mut events = Vec::new();
+                            let mut protocol_failure: Option<(StreamRetryReason, String)> = None;
                             let mut decoded_frames_in_chunk = 0_u32;
                             let mut first_output_reached_in_chunk =
                                 state.usage_guard.context().request.has_first_output();
@@ -6299,7 +7506,20 @@ fn create_sse_stream(
                                                 && !state.usage_guard.context().request.has_first_output();
                                         match Event::from_frame(frame) {
                                             Ok(event) => {
+                                                let suppressed_before = state
+                                                    .ctx
+                                                    .suppressed_tool_context_leak_blocks();
                                                 let sse_events = state.ctx.process_kiro_event(&event);
+                                                if state.ctx.suppressed_tool_context_leak_blocks()
+                                                    > suppressed_before
+                                                {
+                                                    protocol_failure = Some((
+                                                        StreamRetryReason::ProtocolContamination,
+                                                        RESPONSE_PROTOCOL_CONTAMINATION_DETAIL
+                                                            .to_string(),
+                                                    ));
+                                                    break;
+                                                }
                                                 let frame_has_first_output = sse_events
                                                     .iter()
                                                     .any(is_first_token_output_event);
@@ -6325,7 +7545,7 @@ fn create_sse_stream(
 
                                                 events.extend(sse_events);
                                             }
-                                            Err(_) => {
+                                            Err(e) => {
                                                 if before_first_output {
                                                     state
                                                         .usage_guard
@@ -6338,6 +7558,14 @@ fn create_sse_stream(
                                                         .request
                                                         .mark_upstream_event_parse_error_before_first_output();
                                                 }
+                                                protocol_failure = Some((
+                                                    StreamRetryReason::ProtocolError,
+                                                    format!(
+                                                        "upstream event payload parse error: {}",
+                                                        e
+                                                    ),
+                                                ));
+                                                break;
                                             }
                                         }
                                     }
@@ -6352,8 +7580,57 @@ fn create_sse_stream(
                                                 .request
                                                 .mark_upstream_frame_decode_error_before_first_output();
                                         }
+                                        protocol_failure = Some((
+                                            StreamRetryReason::ProtocolError,
+                                            format!(
+                                                "upstream eventstream frame decode error: {}",
+                                                e
+                                            ),
+                                        ));
+                                        break;
                                     }
                                 }
+                            }
+                            if let Some((retry_reason, detail)) = protocol_failure {
+                                let protocol_contamination = matches!(
+                                    retry_reason,
+                                    StreamRetryReason::ProtocolContamination
+                                );
+                                if !state.downstream_committed {
+                                    match retry_stream_before_downstream_commit(
+                                        state,
+                                        retry_reason,
+                                        detail.clone(),
+                                    )
+                                    .await
+                                    {
+                                        StreamRetryOutcome::Retried(state) => {
+                                            let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                            return Some((stream::iter(bytes), state));
+                                        }
+                                        StreamRetryOutcome::NotRetried(next_state) => {
+                                            state = next_state;
+                                        }
+                                    }
+                                }
+                                state
+                                    .completion
+                                    .report_upstream_stream_failure(detail.clone());
+                                state.ctx.record_stream_error("api_error", detail);
+                                let bytes = finish_stream_with_recorded_error(
+                                    &mut state.ctx,
+                                    &state.usage_guard,
+                                    UsageRecordStatus::StreamError,
+                                    if protocol_contamination {
+                                        StreamTerminalReason::ProtocolContamination
+                                    } else {
+                                        StreamTerminalReason::InternalError
+                                    },
+                                );
+                                let bytes =
+                                    prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                                state.finished = true;
+                                return Some((stream::iter(bytes), state));
                             }
                             if !first_output_reached_in_chunk
                                 && !state.usage_guard.context().request.has_first_output()
@@ -6419,7 +7696,7 @@ fn create_sse_stream(
                                 tracing::warn!(
                                     error_type = error.error_type,
                                     error_detail = %error.internal_detail,
-                                    body = %error.body_preview,
+                                    body_bytes = error.body_bytes,
                                     "流式 API 返回未完成的 JSON 错误体"
                                 );
                                 let retry_detail = error.internal_detail.clone();
@@ -6455,18 +7732,68 @@ fn create_sse_stream(
                                 return Some((stream::iter(bytes), state));
                             }
 
-                            if state.ctx.has_stream_error() {
-                                let scheduler_reason = state.ctx
-                                    .stream_error_detail()
-                                    .map(|(kind, detail)| format!("{}: {}", kind, detail))
-                                    .unwrap_or_else(|| "upstream stream error event".to_string());
-                                state.completion.report_upstream_stream_failure(scheduler_reason);
+                            let terminal_protocol_failure = if !state.decoder.is_clean_eof() {
+                                Some(format!(
+                                    "upstream eventstream ended with {} undecoded bytes",
+                                    state.decoder.pending_bytes()
+                                ))
+                            } else if state.decoder.frames_decoded() == 0 {
+                                Some("upstream eventstream ended without any frames".to_string())
+                            } else if state.ctx.upstream_status_indicates_incomplete() {
+                                Some(format!(
+                                    "upstream eventstream ended with incomplete messageStatus={}",
+                                    state.ctx.upstream_message_status().unwrap_or("unknown")
+                                ))
+                            } else if let Some(detail) =
+                                state.ctx.upstream_terminal_failure_detail()
+                            {
+                                Some(detail.to_string())
                             } else {
-                                state.completion.report_success();
+                                None
+                            };
+                            if let Some(detail) = terminal_protocol_failure {
+                                tracing::warn!(
+                                    pending_bytes = state.decoder.pending_bytes(),
+                                    frames_decoded = state.decoder.frames_decoded(),
+                                    upstream_message_status = ?state.ctx.upstream_message_status(),
+                                    error = %detail,
+                                    "EventStream 在协议完成前结束"
+                                );
+                                if !state.downstream_committed {
+                                    match retry_stream_before_downstream_commit(
+                                        state,
+                                        StreamRetryReason::ProtocolError,
+                                        detail.clone(),
+                                    )
+                                    .await
+                                    {
+                                        StreamRetryOutcome::Retried(state) => {
+                                            let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                            return Some((stream::iter(bytes), state));
+                                        }
+                                        StreamRetryOutcome::NotRetried(next_state) => {
+                                            state = next_state;
+                                        }
+                                    }
+                                }
+                                state
+                                    .completion
+                                    .report_upstream_stream_failure(detail.clone());
+                                state.ctx.record_stream_error("api_error", detail);
+                                let bytes = finish_stream_with_recorded_error(
+                                    &mut state.ctx,
+                                    &state.usage_guard,
+                                    UsageRecordStatus::StreamError,
+                                    StreamTerminalReason::InternalError,
+                                );
+                                let bytes =
+                                    prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                                state.finished = true;
+                                return Some((stream::iter(bytes), state));
                             }
-                            let had_stream_error = state.ctx.has_stream_error();
-                            let error_detail = state.ctx.stream_error_detail();
-                            let final_events = if had_stream_error {
+
+                            let had_stream_error_before_finalization = state.ctx.has_stream_error();
+                            let final_events = if had_stream_error_before_finalization {
                                 state.ctx.generate_final_events()
                             } else {
                                 state.ctx.generate_final_events_with_reported_usage_mapper(
@@ -6484,12 +7811,57 @@ fn create_sse_stream(
                                     },
                                 )
                             };
+                            let protocol_contamination =
+                                state.ctx.response_protocol_contamination_detected();
+                            if protocol_contamination && !state.downstream_committed {
+                                match retry_stream_before_downstream_commit(
+                                    state,
+                                    StreamRetryReason::ProtocolContamination,
+                                    RESPONSE_PROTOCOL_CONTAMINATION_DETAIL.to_string(),
+                                )
+                                .await
+                                {
+                                    StreamRetryOutcome::Retried(state) => {
+                                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                        return Some((stream::iter(bytes), state));
+                                    }
+                                    StreamRetryOutcome::NotRetried(next_state) => {
+                                        state = next_state;
+                                    }
+                                }
+                                if state.ctx.has_stream_error() {
+                                    let bytes = finish_stream_with_recorded_error(
+                                        &mut state.ctx,
+                                        &state.usage_guard,
+                                        UsageRecordStatus::StreamError,
+                                        StreamTerminalReason::ProtocolContamination,
+                                    );
+                                    let bytes =
+                                        prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                                    state.finished = true;
+                                    return Some((stream::iter(bytes), state));
+                                }
+                            }
+                            let error_detail = state.ctx.stream_error_detail();
+                            let had_stream_error = error_detail.is_some();
+                            if let Some((kind, detail)) = error_detail.as_ref() {
+                                state.completion.report_upstream_stream_failure(format!(
+                                    "{}: {}",
+                                    kind, detail
+                                ));
+                            } else {
+                                state.completion.report_success();
+                            }
                             state
                                 .usage_guard
                                 .context()
                                 .request
                                 .mark_stream_terminal(if had_stream_error {
-                                    StreamTerminalReason::UpstreamStatusError
+                                    if protocol_contamination {
+                                        StreamTerminalReason::ProtocolContamination
+                                    } else {
+                                        StreamTerminalReason::UpstreamStatusError
+                                    }
                                 } else {
                                     StreamTerminalReason::Completed
                                 });
@@ -6577,7 +7949,7 @@ fn create_sse_stream(
                             create_ping_sse()
                         }
                     };
-                    state.downstream_committed = true;
+                    mark_stream_downstream_committed(&mut state);
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(bytes)];
                     Some((stream::iter(bytes), state))
                 }
@@ -6597,6 +7969,169 @@ fn normalize_stream_idle_timeout_secs(value: u64) -> u64 {
 
 use super::converter::get_context_window_size;
 
+fn append_recovered_non_stream_blocks(
+    text: &str,
+    content: &mut Vec<Value>,
+    known_tool_names: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+    tool_schema_key_map: &ToolSchemaKeyMap,
+    seen_tool_sigs: &mut HashSet<String>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    for block in super::stream::extract_invoke_content_blocks(
+        text,
+        known_tool_names,
+        tool_name_map,
+        tool_schema_key_map,
+    ) {
+        if block["type"] == "tool_use" {
+            let name = block["name"].as_str().unwrap_or("");
+            let input = block["input"].clone();
+            let sig = crate::anthropic::stream::tool_use_signature(name, &input);
+            if seen_tool_sigs.insert(sig) {
+                content.push(block);
+            } else {
+                tracing::debug!(tool = %name, "重复的泄漏 tool_use 已跳过");
+            }
+        } else if block["type"] == "text" {
+            if block["text"].as_str().is_some_and(|text| !text.is_empty()) {
+                content.push(block);
+            }
+        } else {
+            content.push(block);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_non_stream_reasoning_and_text(
+    content: &mut Vec<Value>,
+    native_reasoning_enabled: bool,
+    extract_xml_thinking: bool,
+    redacted_thinking: Option<&str>,
+    native_thinking_content: &str,
+    native_thinking_signature: Option<&str>,
+    text_content: &str,
+    known_tool_names: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+    tool_schema_key_map: &ToolSchemaKeyMap,
+    seen_tool_sigs: &mut HashSet<String>,
+    thinking_transcript_sanitizer: &mut super::transcript_sanitizer::ToolTranscriptSanitizer,
+) -> Result<(), &'static str> {
+    if native_reasoning_enabled {
+        if let Some(redacted) = redacted_thinking {
+            let decoded_bytes = validate_redacted_thinking_data(redacted)?;
+            tracing::debug!(
+                redacted_thinking_encoded_bytes = redacted.len(),
+                redacted_thinking_decoded_bytes = decoded_bytes,
+                "preserving opaque non-stream redacted reasoning block"
+            );
+            content.push(json!({
+                "type": "redacted_thinking",
+                "data": redacted
+            }));
+            append_recovered_non_stream_blocks(
+                text_content,
+                content,
+                known_tool_names,
+                tool_name_map,
+                tool_schema_key_map,
+                seen_tool_sigs,
+            );
+            return Ok(());
+        }
+
+        if !native_thinking_content.is_empty() {
+            let signature = native_thinking_signature.filter(|value| !value.is_empty());
+            let (safe_thinking, polluted) = sanitize_complete_thinking_segment(
+                thinking_transcript_sanitizer,
+                native_thinking_content,
+                signature.into_iter(),
+            );
+            if !polluted || signature.is_none() {
+                let output = if signature.is_some() {
+                    native_thinking_content
+                } else {
+                    safe_thinking.as_str()
+                };
+                if !output.is_empty() {
+                    let mut thinking_block = json!({
+                        "type": "thinking",
+                        "thinking": output
+                    });
+                    if let Some(signature) = signature {
+                        thinking_block["signature"] = json!(signature);
+                    }
+                    content.push(thinking_block);
+                }
+            }
+            append_recovered_non_stream_blocks(
+                text_content,
+                content,
+                known_tool_names,
+                tool_name_map,
+                tool_schema_key_map,
+                seen_tool_sigs,
+            );
+            return Ok(());
+        }
+    }
+
+    if extract_xml_thinking {
+        let (thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(text_content);
+        if let Some(thinking_text) = thinking {
+            let (safe_thinking, _) = sanitize_complete_thinking_segment(
+                thinking_transcript_sanitizer,
+                &thinking_text,
+                std::iter::empty(),
+            );
+            if !safe_thinking.is_empty() {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": safe_thinking
+                }));
+            }
+        }
+        append_recovered_non_stream_blocks(
+            &remaining_text,
+            content,
+            known_tool_names,
+            tool_name_map,
+            tool_schema_key_map,
+            seen_tool_sigs,
+        );
+        return Ok(());
+    }
+
+    append_recovered_non_stream_blocks(
+        text_content,
+        content,
+        known_tool_names,
+        tool_name_map,
+        tool_schema_key_map,
+        seen_tool_sigs,
+    );
+    Ok(())
+}
+
+fn sanitize_complete_thinking_segment<'a>(
+    sanitizer: &mut super::transcript_sanitizer::ToolTranscriptSanitizer,
+    text: &str,
+    integrity_values: impl IntoIterator<Item = &'a str>,
+) -> (String, bool) {
+    let suppressed_before = sanitizer.suppressed_blocks();
+    let mut safe = sanitizer.push(text);
+    safe.push_str(&sanitizer.finish());
+    for value in integrity_values {
+        let _ = sanitizer.push(value);
+        let _ = sanitizer.finish();
+    }
+    (safe, sanitizer.suppressed_blocks() > suppressed_before)
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -6605,7 +8140,8 @@ async fn handle_non_stream_request(
     model: &str,
     preflight_model: &str,
     input_tokens: i32,
-    thinking_enabled: bool,
+    native_reasoning_enabled: bool,
+    extract_xml_thinking: bool,
     tool_name_map: HashMap<String, String>,
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
@@ -6623,7 +8159,6 @@ async fn handle_non_stream_request(
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
     if let Some(response) = maybe_local_pool_preflight_external_response(
         external_fallback.as_ref(),
-        provider.as_ref(),
         &request_id,
         Some(model),
     )
@@ -6634,10 +8169,12 @@ async fn handle_non_stream_request(
     let api_response = match call_api_maybe_fail_fast(
         &provider,
         request_body,
+        Some(kiro_request),
         Some(&request_id),
         external_fallback.as_ref(),
         capacity_weight_units,
         Some(model),
+        usage_context.latency.inference_attempt_budget.clone(),
     )
     .await
     {
@@ -6668,10 +8205,11 @@ async fn handle_non_stream_request(
                     && should_retry_without_cache_point_after_error(&message)
             }) {
                 retry_attempt_prefix = attempts.clone();
-                let retry_body = match retry.build_retry_body(&message, &mut usage_context) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        usage_context
+                let (retry_body, retry_kiro_request) =
+                    match retry.build_retry_body(&message, &mut usage_context) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            usage_context
                             .attach_provider_error_credential(&provider, &message, attempts)
                             .with_error_metadata(provider_error_metadata(&e))
                             .record_failure(
@@ -6682,16 +8220,18 @@ async fn handle_non_stream_request(
                                     err
                                 ),
                             );
-                        return payload_guard_error_response(err);
-                    }
-                };
+                            return payload_guard_error_response(err);
+                        }
+                    };
                 match call_api_maybe_fail_fast(
                     &provider,
                     &retry_body,
+                    Some(&retry_kiro_request),
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
                     Some(model),
+                    usage_context.latency.inference_attempt_budget.clone(),
                 )
                 .await
                 {
@@ -6707,7 +8247,7 @@ async fn handle_non_stream_request(
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
                             &retry_body,
-                            kiro_request,
+                            &retry_kiro_request,
                             &mut usage_context,
                             &endpoint,
                             model,
@@ -6718,6 +8258,7 @@ async fn handle_non_stream_request(
                                 external_fallback.as_ref(),
                                 &request_id,
                                 &retry_message,
+                                KiroProvider::call_failure_kind_from_error(&retry_error),
                                 classification_attempts,
                                 all_attempts.clone(),
                             )
@@ -6759,7 +8300,7 @@ async fn handle_non_stream_request(
                     "Kiro non-stream request rejected as too long; applying configured payload guard and retrying once"
                 );
                 retry_attempt_prefix = attempts.clone();
-                let (retry_body, retry_warnings_header) =
+                let (retry_body, retry_warnings_header, retry_kiro_request) =
                     match retry.build_retry_body(&mut usage_context) {
                         Ok(result) => result,
                         Err(err) => {
@@ -6781,10 +8322,12 @@ async fn handle_non_stream_request(
                 match call_api_maybe_fail_fast(
                     &provider,
                     &retry_body,
+                    Some(&retry_kiro_request),
                     Some(&request_id),
                     external_fallback.as_ref(),
                     capacity_weight_units,
                     Some(model),
+                    usage_context.latency.inference_attempt_budget.clone(),
                 )
                 .await
                 {
@@ -6800,7 +8343,7 @@ async fn handle_non_stream_request(
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
                             &retry_body,
-                            kiro_request,
+                            &retry_kiro_request,
                             &mut usage_context,
                             &endpoint,
                             model,
@@ -6811,6 +8354,7 @@ async fn handle_non_stream_request(
                                 external_fallback.as_ref(),
                                 &request_id,
                                 &retry_message,
+                                KiroProvider::call_failure_kind_from_error(&retry_error),
                                 classification_attempts.clone(),
                                 all_attempts.clone(),
                             )
@@ -6821,16 +8365,20 @@ async fn handle_non_stream_request(
                                 ExternalPoolForwardOutcome::FinalError(err) => {
                                     if let Some(external) = external_fallback.as_ref() {
                                         let local_fallback_reason =
-                                            classify_local_error_for_external_fallback(
+                                            classify_local_error_for_external_fallback_with_kind(
                                                 &retry_message,
                                                 &classification_attempts,
                                                 &external.config,
+                                                KiroProvider::call_failure_kind_from_error(
+                                                    &retry_error,
+                                                ),
                                             );
                                         if let Some(reason) =
-                                            local_rescue_reason_after_external_error(
+                                            budgeted_local_rescue_reason_after_external_error(
                                                 &external.config,
                                                 &err,
                                                 local_fallback_reason.as_deref(),
+                                                external.inference_attempt_budget.as_ref(),
                                             )
                                         {
                                             tracing::warn!(
@@ -6850,6 +8398,7 @@ async fn handle_non_stream_request(
                                             match call_non_stream_local_rescue_after_external_error(
                                                 &provider,
                                                 &retry_body,
+                                                Some(&retry_kiro_request),
                                                 &request_id,
                                                 external,
                                                 capacity_weight_units,
@@ -6931,6 +8480,7 @@ async fn handle_non_stream_request(
                     external_fallback.as_ref(),
                     &request_id,
                     &message,
+                    KiroProvider::call_failure_kind_from_error(&e),
                     attempts.clone(),
                 )
                 .await
@@ -6940,16 +8490,20 @@ async fn handle_non_stream_request(
                         ExternalPoolForwardOutcome::FinalError(err) => {
                             if let Some(external) = external_fallback.as_ref() {
                                 let local_fallback_reason =
-                                    classify_local_error_for_external_fallback(
+                                    classify_local_error_for_external_fallback_with_kind(
                                         &message,
                                         &attempts,
                                         &external.config,
+                                        KiroProvider::call_failure_kind_from_error(&e),
                                     );
-                                if let Some(reason) = local_rescue_reason_after_external_error(
-                                    &external.config,
-                                    &err,
-                                    local_fallback_reason.as_deref(),
-                                ) {
+                                if let Some(reason) =
+                                    budgeted_local_rescue_reason_after_external_error(
+                                        &external.config,
+                                        &err,
+                                        local_fallback_reason.as_deref(),
+                                        external.inference_attempt_budget.as_ref(),
+                                    )
+                                {
                                     tracing::warn!(
                                         request_id,
                                         reason,
@@ -6967,6 +8521,7 @@ async fn handle_non_stream_request(
                                     match call_non_stream_local_rescue_after_external_error(
                                         &provider,
                                         request_body,
+                                        Some(kiro_request),
                                         &request_id,
                                         external,
                                         capacity_weight_units,
@@ -7046,13 +8601,19 @@ async fn handle_non_stream_request(
         credential_attempts,
     );
     let (response, completion) = api_response.into_parts();
+    let upstream_content_type = response
+        .headers()
+        .get(REQWEST_CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
     // 读取响应体
-    let body_bytes = match response_bytes_with_body_timeout(
+    let body_bytes = match response_bytes_with_limit_and_body_timeout(
         response,
         provider
             .runtime_config()
             .kiro_upstream_response_timeout_secs,
+        LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
     )
     .await
     {
@@ -7074,11 +8635,64 @@ async fn handle_non_stream_request(
         }
     };
 
-    // 解析事件流
-    let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
-        tracing::warn!("缓冲区溢出: {}", e);
-    }
+    let body_bytes =
+        match inspect_complete_upstream_body(upstream_content_type.as_deref(), body_bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    error_type = error.error_type,
+                    error_detail = %error.internal_detail,
+                    body_bytes = error.body_bytes,
+                    "非流式 API 返回 2xx JSON 错误体"
+                );
+                let status = if error.error_type == "rate_limit_error" {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else if error.error_type == "invalid_request_error" {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                let public_message = if error.error_type == "rate_limit_error" {
+                    envelope::PUBLIC_RATE_LIMIT_MESSAGE
+                } else if error.error_type == "invalid_request_error" {
+                    UPSTREAM_INVALID_REQUEST_MESSAGE
+                } else {
+                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE
+                };
+                credential_usage.record_failure_with_public_error(
+                    UsageRecordStatus::Error,
+                    error.error_type,
+                    error.internal_detail,
+                    Some(usage_public_error(
+                        status,
+                        error.error_type,
+                        public_message,
+                        Some(&credential_usage.request.error_id),
+                    )),
+                );
+                completion.release();
+                return envelope::error_response_with_id(
+                    status,
+                    error.error_type,
+                    public_message,
+                    &credential_usage.request.request_id,
+                );
+            }
+        };
+    let upstream_events = match decode_complete_eventstream(&body_bytes) {
+        Ok(events) => events,
+        Err(detail) => {
+            tracing::warn!(error = %detail, "非流式 EventStream 响应不完整");
+            credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+            completion.release();
+            return envelope::error_response_with_id(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                &credential_usage.request.request_id,
+            );
+        }
+    };
 
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
@@ -7092,182 +8706,305 @@ async fn handle_non_stream_request(
     let mut native_thinking_signature: Option<String> = None;
     let mut redacted_thinking: Option<String> = None;
     let mut seen_tool_sigs: HashSet<String> = HashSet::new();
+    let mut transcript_sanitizer =
+        super::transcript_sanitizer::ToolTranscriptSanitizer::new(known_tool_names.iter().cloned());
+    let mut thinking_transcript_sanitizer =
+        super::transcript_sanitizer::ToolTranscriptSanitizer::new(known_tool_names.iter().cloned());
+    let mut upstream_message_status: Option<String> = None;
+    let mut saw_meaningful_upstream_response = false;
+    let mut saw_upstream_metadata = false;
+    let mut saw_completed_tool_use = false;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    for result in decoder.decode_iter() {
-        match result {
-            Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
-                        Event::AssistantResponse(resp) => {
-                            text_content.push_str(&resp.content);
-                        }
-                        Event::Code(code) => {
-                            text_content.push_str(&code.content);
-                        }
-                        Event::ReasoningContent(reasoning) => {
-                            if let Some(redacted) = reasoning.redacted_content {
-                                if !redacted.is_empty() {
-                                    redacted_thinking = Some(redacted);
-                                }
-                            }
-                            if !reasoning.text.is_empty() {
-                                native_thinking_content = reasoning.text;
-                            }
-                            if reasoning.signature.is_some() {
-                                native_thinking_signature = reasoning.signature;
-                            }
-                        }
-                        Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
+    for event in upstream_events {
+        match event {
+            Event::AssistantResponse(resp) => {
+                saw_meaningful_upstream_response |= !resp.content.is_empty();
+                if let Some(status) = resp
+                    .message_status
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|status| !status.is_empty())
+                {
+                    upstream_message_status = Some(status.chars().take(128).collect::<String>());
+                }
+                text_content.push_str(&transcript_sanitizer.push(&resp.content));
+            }
+            Event::Code(code) => {
+                saw_meaningful_upstream_response |= !code.content.is_empty();
+                text_content.push_str(&transcript_sanitizer.push(&code.content));
+            }
+            Event::ReasoningContent(reasoning) => {
+                saw_meaningful_upstream_response |= !reasoning.text.is_empty()
+                    || reasoning
+                        .signature
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    || reasoning
+                        .redacted_content
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty());
+                text_content.push_str(&transcript_sanitizer.structured_tool_boundary());
+                if let Some(redacted) = reasoning.redacted_content {
+                    if !redacted.is_empty() {
+                        redacted_thinking = Some(redacted);
+                    }
+                }
+                if !reasoning.text.is_empty() {
+                    native_thinking_content = reasoning.text;
+                }
+                if reasoning.signature.is_some() {
+                    native_thinking_signature = reasoning.signature;
+                }
+            }
+            Event::ToolUse(tool_use) => {
+                saw_meaningful_upstream_response = true;
+                text_content.push_str(&transcript_sanitizer.structured_tool_boundary());
+                has_tool_use = true;
 
-                            // 累积工具的 JSON 输入
-                            let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
+                // 累积工具的 JSON 输入
+                tool_json_buffers
+                    .entry(tool_use.tool_use_id.clone())
+                    .or_default()
+                    .push_str(&tool_use.input);
 
-                            // 如果是完整的工具调用，添加到列表
-                            if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
-                                        tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                            e,
-                                            tool_use.tool_use_id
-                                        );
-                                        serde_json::json!({})
-                                    })
-                                };
-
-                                let original_name = tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
-                                let input =
-                                    tool_schema_key_map.reverse_tool_input(&tool_use.name, input);
-                                let input = crate::anthropic::stream::repair_tool_use_input_for_cli(
-                                    &original_name,
-                                    input,
-                                );
-                                let sig = crate::anthropic::stream::tool_use_signature(
-                                    &original_name,
-                                    &input,
-                                );
-                                if seen_tool_sigs.insert(sig) {
-                                    tool_uses.push(json!({
-                                        "type": "tool_use",
-                                        "id": tool_use.tool_use_id,
-                                        "name": original_name,
-                                        "input": input
-                                    }));
-                                } else {
-                                    tracing::debug!(
-                                        tool = %original_name,
+                // 如果是完整的工具调用，添加到列表
+                if tool_use.stop {
+                    saw_completed_tool_use = true;
+                    let buffer = tool_json_buffers
+                        .remove(&tool_use.tool_use_id)
+                        .unwrap_or_default();
+                    let input: serde_json::Value = if buffer.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        match serde_json::from_str(&buffer) {
+                            Ok(input) => input,
+                            Err(error) => {
+                                tracing::warn!(
+                                        error = %error,
                                         tool_use_id = %tool_use.tool_use_id,
-                                        "重复的结构化 tool_use 已跳过"
-                                    );
-                                }
-                            }
-                        }
-                        Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = credential_usage.request.context_window_tokens;
-                            let percentage = context_usage.context_usage_percentage;
-                            let actual_input_tokens = if percentage.is_finite() && percentage > 0.0
-                            {
-                                (percentage * (window_size as f64) / 100.0) as i32
-                            } else {
-                                0
-                            };
-                            if actual_input_tokens > 0 {
-                                context_input_tokens = Some(actual_input_tokens);
-                            }
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if percentage.is_finite() && percentage >= 100.0 {
-                                stop_reason = "model_context_window_exceeded".to_string();
-                            }
-                            tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
-                            );
-                        }
-                        Event::Metadata(metadata) => {
-                            if let Some(token_usage) = metadata.token_usage {
-                                tracing::debug!(
-                                    input_tokens = token_usage.input_tokens(),
-                                    output_tokens = token_usage.output_tokens,
-                                    cache_read_input_tokens = token_usage.cache_read_input_tokens,
-                                    cache_write_input_tokens = token_usage.cache_write_input_tokens,
-                                    "非流式响应收到 metadataEvent token usage"
+                                        "非流式工具输入 JSON 解析失败"
                                 );
-                                metadata_usage
-                                    .get_or_insert_with(Default::default)
-                                    .merge_positive_from(&token_usage);
-                            }
-                        }
-                        Event::MessageMetadata(metadata) => {
-                            if let Some(token_usage) = metadata.token_usage {
-                                tracing::debug!(
-                                    conversation_id = ?metadata.conversation_id,
-                                    utterance_id = ?metadata.utterance_id,
-                                    input_tokens = token_usage.input_tokens(),
-                                    output_tokens = token_usage.output_tokens,
-                                    cache_read_input_tokens = token_usage.cache_read_input_tokens,
-                                    cache_write_input_tokens = token_usage.cache_write_input_tokens,
-                                    "非流式响应收到 messageMetadataEvent token usage"
+                                credential_usage.record_failure(
+                                    UsageRecordStatus::Error,
+                                    "api_error",
+                                    format!(
+                                        "upstream tool input JSON parse error for {}: {}",
+                                        tool_use.tool_use_id, error
+                                    ),
                                 );
-                                metadata_usage
-                                    .get_or_insert_with(Default::default)
-                                    .merge_positive_from(&token_usage);
+                                completion.release();
+                                return envelope::error_response_with_id(
+                                    StatusCode::BAD_GATEWAY,
+                                    "api_error",
+                                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                                    &credential_usage.request.request_id,
+                                );
                             }
                         }
-                        Event::Metering(metering) => {
-                            if metering.usage.is_finite() {
-                                kiro_metering_usage = Some(metering.usage);
-                            }
-                            tracing::debug!(usage = metering.usage, "非流式响应收到 meteringEvent");
-                        }
-                        Event::InvalidState(invalid) => {
-                            let message = invalid.error_text();
-                            tracing::warn!(
-                                reason = %invalid.reason,
-                                message = %message,
-                                "非流式响应收到 invalidStateEvent"
-                            );
-                            credential_usage.record_failure(
-                                UsageRecordStatus::Error,
-                                "invalid_request_error",
-                                message.clone(),
-                            );
-                            completion.release();
-                            return envelope::error_response_with_id(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_request_error",
-                                UPSTREAM_INVALID_REQUEST_MESSAGE,
-                                &credential_usage.request.request_id,
-                            );
-                        }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
-                            }
-                        }
-                        _ => {}
+                    };
+
+                    let original_name = tool_name_map
+                        .get(&tool_use.name)
+                        .cloned()
+                        .unwrap_or_else(|| tool_use.name.clone());
+                    let input = tool_schema_key_map.reverse_tool_input(&tool_use.name, input);
+                    let input = crate::anthropic::stream::repair_tool_use_input_for_cli(
+                        &original_name,
+                        input,
+                    );
+                    let sig = crate::anthropic::stream::tool_use_signature(&original_name, &input);
+                    if seen_tool_sigs.insert(sig) {
+                        tool_uses.push(json!({
+                            "type": "tool_use",
+                            "id": tool_use.tool_use_id,
+                            "name": original_name,
+                            "input": input
+                        }));
+                    } else {
+                        tracing::debug!(
+                            tool = %original_name,
+                            tool_use_id = %tool_use.tool_use_id,
+                            "重复的结构化 tool_use 已跳过"
+                        );
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("解码事件失败: {}", e);
+            Event::ContextUsage(context_usage) => {
+                // 从上下文使用百分比计算实际的 input_tokens
+                let window_size = credential_usage.request.context_window_tokens;
+                let percentage = context_usage.context_usage_percentage;
+                let actual_input_tokens = if percentage.is_finite() && percentage > 0.0 {
+                    (percentage * (window_size as f64) / 100.0) as i32
+                } else {
+                    0
+                };
+                if actual_input_tokens > 0 {
+                    context_input_tokens = Some(actual_input_tokens);
+                }
+                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                if percentage.is_finite() && percentage >= 100.0 {
+                    stop_reason = "model_context_window_exceeded".to_string();
+                }
+                tracing::debug!(
+                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                    context_usage.context_usage_percentage,
+                    actual_input_tokens
+                );
             }
+            Event::Metadata(metadata) => {
+                saw_upstream_metadata = true;
+                if let Some(token_usage) = metadata.token_usage {
+                    tracing::debug!(
+                        input_tokens = token_usage.input_tokens(),
+                        output_tokens = token_usage.output_tokens,
+                        cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                        cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                        "非流式响应收到 metadataEvent token usage"
+                    );
+                    metadata_usage
+                        .get_or_insert_with(Default::default)
+                        .merge_positive_from(&token_usage);
+                }
+            }
+            Event::MessageMetadata(metadata) => {
+                saw_upstream_metadata = true;
+                if let Some(token_usage) = metadata.token_usage {
+                    tracing::debug!(
+                        conversation_id = ?metadata.conversation_id,
+                        utterance_id = ?metadata.utterance_id,
+                        input_tokens = token_usage.input_tokens(),
+                        output_tokens = token_usage.output_tokens,
+                        cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                        cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                        "非流式响应收到 messageMetadataEvent token usage"
+                    );
+                    metadata_usage
+                        .get_or_insert_with(Default::default)
+                        .merge_positive_from(&token_usage);
+                }
+            }
+            Event::Metering(metering) => {
+                if metering.usage.is_finite() {
+                    kiro_metering_usage = Some(metering.usage);
+                }
+                tracing::debug!(usage = metering.usage, "非流式响应收到 meteringEvent");
+            }
+            Event::InvalidState(invalid) => {
+                let message = invalid.error_text();
+                tracing::warn!(
+                    reason = %invalid.reason,
+                    message = %message,
+                    "非流式响应收到 invalidStateEvent"
+                );
+                credential_usage.record_failure(
+                    UsageRecordStatus::Error,
+                    "invalid_request_error",
+                    message.clone(),
+                );
+                completion.release();
+                return envelope::error_response_with_id(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    UPSTREAM_INVALID_REQUEST_MESSAGE,
+                    &credential_usage.request.request_id,
+                );
+            }
+            Event::Error {
+                error_code,
+                error_message,
+            } => {
+                let detail = format!("upstream error event {}: {}", error_code, error_message);
+                tracing::warn!(error = %detail, "非流式响应收到 error 事件");
+                credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+                completion.release();
+                return envelope::error_response_with_id(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                    &credential_usage.request.request_id,
+                );
+            }
+            Event::Exception {
+                exception_type,
+                message,
+            } => {
+                if exception_type == "ContentLengthExceededException" {
+                    stop_reason = "max_tokens".to_string();
+                } else {
+                    let detail =
+                        format!("upstream exception event {}: {}", exception_type, message);
+                    tracing::warn!(error = %detail, "非流式响应收到异常事件");
+                    credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+                    completion.release();
+                    return envelope::error_response_with_id(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                        &credential_usage.request.request_id,
+                    );
+                }
+            }
+            _ => {}
         }
     }
+    if let Some(status) = upstream_message_status.as_deref() {
+        if !status.eq_ignore_ascii_case("COMPLETED") {
+            let detail = format!(
+                "upstream eventstream ended with incomplete messageStatus={}",
+                status
+            );
+            tracing::warn!(error = %detail, "非流式响应未完成");
+            credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+            completion.release();
+            return envelope::error_response_with_id(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                &credential_usage.request.request_id,
+            );
+        }
+    } else {
+        let terminal_failure = if !saw_meaningful_upstream_response {
+            Some(
+                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
+            )
+        } else if !saw_completed_tool_use && !saw_upstream_metadata {
+            Some("upstream eventstream ended without a trusted completion signal")
+        } else {
+            None
+        };
+        if let Some(detail) = terminal_failure {
+            tracing::warn!(error = detail, "非流式响应缺少可信完成信号");
+            credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+            completion.release();
+            return envelope::error_response_with_id(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                &credential_usage.request.request_id,
+            );
+        }
+    }
+    if !tool_json_buffers.is_empty() {
+        let detail = format!(
+            "upstream eventstream ended with {} incomplete tool input buffer(s)",
+            tool_json_buffers.len()
+        );
+        tracing::warn!(error = %detail, "非流式工具调用未完成");
+        credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+        completion.release();
+        return envelope::error_response_with_id(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            &credential_usage.request.request_id,
+        );
+    }
+    text_content.push_str(&transcript_sanitizer.finish());
 
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
@@ -7276,67 +9013,74 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
-    let mut append_recovered_blocks = |text: &str, content: &mut Vec<serde_json::Value>| {
-        if text.is_empty() {
-            return;
-        }
-        for block in super::stream::extract_invoke_content_blocks(
-            text,
-            &known_tool_names,
-            &tool_name_map,
-            &tool_schema_key_map,
-        ) {
-            if block["type"] == "tool_use" {
-                let name = block["name"].as_str().unwrap_or("");
-                let input = block["input"].clone();
-                let sig = crate::anthropic::stream::tool_use_signature(name, &input);
-                if seen_tool_sigs.insert(sig) {
-                    content.push(block);
-                } else {
-                    tracing::debug!(tool = %name, "重复的泄漏 tool_use 已跳过");
-                }
-            } else if block["type"] == "text" {
-                if block["text"].as_str().is_some_and(|text| !text.is_empty()) {
-                    content.push(block);
-                }
-            } else {
-                content.push(block);
-            }
-        }
-    };
+    if let Err(detail) = append_non_stream_reasoning_and_text(
+        &mut content,
+        native_reasoning_enabled,
+        extract_xml_thinking,
+        redacted_thinking.as_deref(),
+        &native_thinking_content,
+        native_thinking_signature.as_deref(),
+        &text_content,
+        &known_tool_names,
+        &tool_name_map,
+        &tool_schema_key_map,
+        &mut seen_tool_sigs,
+        &mut thinking_transcript_sanitizer,
+    ) {
+        tracing::warn!(
+            redacted_thinking_encoded_bytes = redacted_thinking.as_ref().map(String::len),
+            reason = detail,
+            "rejected invalid opaque non-stream redacted reasoning block"
+        );
+        credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail.to_string());
+        completion.release();
+        return envelope::error_response_with_id(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            &credential_usage.request.request_id,
+        );
+    }
 
-    if thinking_enabled && redacted_thinking.is_some() {
-        content.push(json!({
-            "type": "redacted_thinking",
-            "data": redacted_thinking.unwrap()
-        }));
-    } else if thinking_enabled && !native_thinking_content.is_empty() {
-        let mut thinking_block = json!({
-            "type": "thinking",
-            "thinking": native_thinking_content
-        });
-        if let Some(signature) = native_thinking_signature {
-            if !signature.is_empty() {
-                thinking_block["signature"] = json!(signature);
-            }
-        }
-        content.push(thinking_block);
-        append_recovered_blocks(&text_content, &mut content);
-    } else if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
-            content.push(json!({
-                "type": "thinking",
-                "thinking": thinking_text
-            }));
-        }
-
-        append_recovered_blocks(&remaining_text, &mut content);
-    } else if !text_content.is_empty() {
-        append_recovered_blocks(&text_content, &mut content);
+    let suppressed_tool_context_leak_blocks = transcript_sanitizer
+        .suppressed_blocks()
+        .saturating_add(thinking_transcript_sanitizer.suppressed_blocks());
+    let suppressed_tool_context_leak_chars = transcript_sanitizer
+        .suppressed_chars()
+        .saturating_add(thinking_transcript_sanitizer.suppressed_chars());
+    let mut suppressed_tool_context_leak_kinds = transcript_sanitizer
+        .matched_kinds()
+        .into_iter()
+        .chain(thinking_transcript_sanitizer.matched_kinds())
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    suppressed_tool_context_leak_kinds.sort_unstable();
+    if suppressed_tool_context_leak_blocks > 0 {
+        tracing::warn!(
+            suppressed_tool_context_leak_blocks,
+            suppressed_tool_context_leak_chars,
+            suppressed_tool_context_leak_kinds = ?suppressed_tool_context_leak_kinds,
+            "suppressed internal tool transcript from non-streaming assistant response"
+        );
+        credential_usage.request.mark_suppressed_tool_context_leak(
+            suppressed_tool_context_leak_blocks,
+            suppressed_tool_context_leak_chars,
+            suppressed_tool_context_leak_kinds.clone(),
+        );
+        credential_usage.record_failure(
+            UsageRecordStatus::Error,
+            "api_error",
+            RESPONSE_PROTOCOL_CONTAMINATION_DETAIL,
+        );
+        completion.release();
+        return envelope::error_response_with_id(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            &credential_usage.request.request_id,
+        );
     }
 
     content.extend(tool_uses);
@@ -7398,6 +9142,11 @@ async fn handle_non_stream_request(
         usage_source,
         raw_usage,
     );
+    credential_usage
+        .request
+        .latency
+        .inference_attempt_budget
+        .mark_downstream_committed();
     credential_usage.record_success_reported_with_metering(
         reported_usage,
         usage_source,
@@ -7432,7 +9181,6 @@ async fn handle_non_stream_request(
 #[derive(Debug, Clone, Copy)]
 struct ThinkingModelDefaults {
     thinking_type: &'static str,
-    effort: Option<&'static str>,
     budget_tokens: i32,
 }
 
@@ -7459,28 +9207,14 @@ fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
         "opus" | "opusplan" | "best" | "default"
     );
     let is_sonnet_alias = model_base == "sonnet";
-    let is_opus = is_opus_alias || model_base.contains("opus");
-    let is_sonnet = is_sonnet_alias || model_base.contains("sonnet");
-
     let opus_minor = claude_minor_version(&model_base, "opus");
     let sonnet_minor = claude_minor_version(&model_base, "sonnet");
     let adaptive = is_opus_alias
         || is_sonnet_alias
         || opus_minor.is_some_and(|minor| minor >= 6)
         || sonnet_minor.is_some_and(|minor| minor >= 6);
-    let effort = if is_opus_alias || opus_minor.is_some_and(|minor| minor >= 6) {
-        Some("xhigh")
-    } else if is_sonnet_alias || sonnet_minor.is_some_and(|minor| minor >= 6) {
-        Some("high")
-    } else if is_opus || is_sonnet {
-        Some("high")
-    } else {
-        None
-    };
-
     Some(ThinkingModelDefaults {
         thinking_type: if adaptive { "adaptive" } else { "enabled" },
-        effort,
         budget_tokens: if adaptive { 0 } else { 20000 },
     })
 }
@@ -7489,24 +9223,35 @@ fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
 ///
 /// - 调用方已指定 `thinking` 字段：保留原值
 /// - 调用方未指定：按模型族注入默认 thinking，确保 `-thinking` 兼容模型有真实 thinking 输出
-///   - Opus/Sonnet 4.6+ 和别名使用 `adaptive` + `output_config.effort`
+///   - Opus/Sonnet 4.6+ 和别名只注入 `adaptive`；effort 由目标能力合同决定
 ///   - 旧模型使用 `enabled` + `budget_tokens`
-/// - `output_config.effort` 在最终 thinking 类型为 adaptive 且未设置时按模型族填充
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+fn override_thinking_from_model_name(payload: &mut MessagesRequest) -> Result<(), String> {
     let Some(defaults) = thinking_model_defaults(&payload.model) else {
-        return;
+        return Ok(());
     };
 
     if payload.thinking.is_none() {
         tracing::info!(
             model = %payload.model,
             thinking_type = defaults.thinking_type,
-            effort = defaults.effort.unwrap_or(""),
             "模型名包含 thinking 后缀，注入默认 thinking 配置"
         );
+        let budget_tokens = if defaults.thinking_type == "enabled" {
+            if payload.max_tokens <= 1_024 {
+                return Err(
+                    "max_tokens must be greater than 1024 for an enabled thinking model"
+                        .to_string(),
+                );
+            }
+            defaults
+                .budget_tokens
+                .min(payload.max_tokens.saturating_sub(1))
+        } else {
+            defaults.budget_tokens
+        };
         payload.thinking = Some(Thinking {
             thinking_type: defaults.thinking_type.to_string(),
-            budget_tokens: defaults.budget_tokens,
+            budget_tokens,
         });
     } else {
         tracing::debug!(
@@ -7515,21 +9260,17 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         );
     }
 
-    let final_thinking_type = payload
-        .thinking
-        .as_ref()
-        .map(|thinking| thinking.thinking_type.as_str());
-    if final_thinking_type == Some("adaptive") && payload.output_config.is_none() {
-        payload.output_config = Some(OutputConfig {
-            effort: defaults.effort.unwrap_or("high").to_string(),
-        });
-    }
+    Ok(())
 }
 
 fn apply_thinking_trigger_mode(
     payload: &mut MessagesRequest,
     runtime_config: &RequestRuntimeConfig,
 ) {
+    if !runtime_config.prompt_steering.enabled {
+        return;
+    }
+
     let should_trigger = match runtime_config.thinking_trigger_mode {
         ThinkingTriggerMode::Always => true,
         ThinkingTriggerMode::RealRequest => {
@@ -7555,10 +9296,9 @@ fn apply_thinking_trigger_mode(
                 model = %payload.model,
                 thinking_type = %thinking.thinking_type,
                 trigger_mode = ?runtime_config.thinking_trigger_mode,
-                "thinking 触发信号已匹配，改写未知 thinking 类型为 adaptive"
+                "thinking 触发信号已匹配，但未知 thinking 类型保持原值并拒绝隐式触发"
             );
-            thinking.thinking_type = "adaptive".to_string();
-            thinking.budget_tokens = 0;
+            return;
         }
         None => {
             payload.thinking = Some(Thinking {
@@ -7566,17 +9306,6 @@ fn apply_thinking_trigger_mode(
                 budget_tokens: 0,
             });
         }
-    }
-
-    if payload
-        .thinking
-        .as_ref()
-        .is_some_and(|thinking| thinking.thinking_type == "adaptive")
-        && payload.output_config.is_none()
-    {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
     }
 }
 
@@ -7656,6 +9385,10 @@ fn should_force_visible_thinking(
     payload: &MessagesRequest,
     runtime_config: &RequestRuntimeConfig,
 ) -> bool {
+    if !runtime_config.prompt_steering.enabled {
+        return false;
+    }
+
     if !payload
         .thinking
         .as_ref()
@@ -7693,6 +9426,23 @@ pub async fn count_tokens_cc(
     count_tokens_for_endpoint(state, payload, "/cc/v1/messages/count_tokens").await
 }
 
+fn multimodal_preprocessing_error_response(message: String) -> Response {
+    if body_processing::is_remote_multimodal_capacity_error(&message) {
+        let mut response = envelope::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "Remote media processing is temporarily at capacity. Retry shortly.",
+        );
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        response
+    } else {
+        envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+    }
+}
+
 async fn count_tokens_for_endpoint(
     state: AppState,
     mut payload: CountTokensRequest,
@@ -7714,7 +9464,7 @@ async fn count_tokens_for_endpoint(
     );
 
     let image_processing = request_image_processing_config(&state);
-    if let Err(message) = body_processing::prepare_multimodal_message_sources(
+    let _multimodal_report = match body_processing::prepare_multimodal_message_sources(
         &state.file_store,
         &mut payload.messages,
         None,
@@ -7722,9 +9472,12 @@ async fn count_tokens_for_endpoint(
     )
     .await
     {
-        tracing::warn!("count_tokens 多模态 source 处理失败: {}", message);
-        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
-    }
+        Ok(report) => report,
+        Err(message) => {
+            tracing::warn!("count_tokens 多模态 source 处理失败: {}", message);
+            return multimodal_preprocessing_error_response(message);
+        }
+    };
 
     let total_tokens = token::count_all_tokens(
         &payload.model,
@@ -7761,9 +9514,18 @@ pub async fn count_tokens_dfcache(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     headers: HeaderMap,
-    raw_body: Bytes,
+    attribution: Option<Extension<RequestRejectionAttribution>>,
+    MessagesBody(raw_body, request_api_key_id): MessagesBody,
 ) -> Response {
-    post_messages_for_endpoint(state, headers, raw_body, "/cc/v1/messages".to_string()).await
+    post_messages_for_endpoint(
+        state,
+        headers,
+        raw_body,
+        "/cc/v1/messages".to_string(),
+        request_api_key_id,
+        attribution.map(|Extension(value)| value),
+    )
+    .await
 }
 
 #[cfg(test)]
