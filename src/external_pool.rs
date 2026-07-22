@@ -914,6 +914,12 @@ struct ExternalUsageCapture {
     shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
     projected: bool,
+    usage_estimated: bool,
+    usage_estimate_reason: Option<String>,
+    usage_candidate_path: Option<String>,
+    observed_output_tokens: i32,
+    observed_output: bool,
+    synthetic_usage_emitted: bool,
     stream_error_message: Option<String>,
     stream_response_mode: Option<ExternalPoolStreamResponseMode>,
 }
@@ -3086,8 +3092,7 @@ impl ExternalPoolManager {
         }
         let response_headers = response.headers().clone();
         let status = response.status();
-        let response_is_stream =
-            route.is_stream() || response_headers_look_like_sse(&response_headers);
+        let response_is_stream = route.is_stream();
         if response_is_stream {
             if success_response_headers_look_like_html(&response_headers) {
                 return Err(ExternalForwardError::new(
@@ -3114,6 +3119,8 @@ impl ExternalPoolManager {
                 .then(|| Duration::from_secs(config.external_pool_stream_idle_timeout_secs));
             let stream_usage_projection = projection_context.clone();
             let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+                request_input_tokens: (route.request_input_tokens > 0)
+                    .then_some(route.request_input_tokens),
                 stream_response_mode: Some(stream_plan.response_mode),
                 ..ExternalUsageCapture::default()
             }));
@@ -3341,6 +3348,19 @@ impl ExternalPoolManager {
                     outbound_model.clone(),
                 )
             })?;
+            if response_headers_look_like_sse(&response_headers)
+                && serde_json::from_slice::<serde_json::Value>(&bytes).is_err()
+            {
+                return Err(ExternalForwardError::new(
+                    success_protocol_error(
+                        &response_headers,
+                        Some(&bytes),
+                        config,
+                        "model endpoint returned an SSE response for a non-streaming request",
+                    ),
+                    outbound_model.clone(),
+                ));
+            }
             if success_response_looks_like_html(&response_headers, &bytes) {
                 return Err(ExternalForwardError::new(
                     success_protocol_error(
@@ -3367,23 +3387,37 @@ impl ExternalPoolManager {
                 config.external_pool_usage_projection_output_uplift_min_tokens,
                 config.external_pool_usage_projection_output_uplift_percent,
             );
-            let projected = maybe_project_non_stream_usage(bytes, projection_context.as_ref());
+            let projected =
+                process_non_stream_response_usage(bytes, Some(route), projection_context.as_ref());
             let billing = external_pool_billing_from_capture(route, pool, projected.usage_capture);
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
-            let response = builder.body(Body::from(projected.body)).map_err(|err| {
-                ExternalForwardError::new(
-                    ExternalPoolError {
-                        status: None,
-                        message: format!("build external response failed: {}", err),
-                        retryable: false,
-                        auto_disable_reason: None,
-                        cooldown: None,
-                        response_body: None,
-                    },
-                    outbound_model.clone(),
-                )
-            })?;
+            let upstream_declared_sse = response_headers_look_like_sse(&response_headers);
+            let downstream_body = projected.body;
+            let mut response =
+                builder
+                    .body(Body::from(downstream_body.clone()))
+                    .map_err(|err| {
+                        ExternalForwardError::new(
+                            ExternalPoolError {
+                                status: None,
+                                message: format!("build external response failed: {}", err),
+                                retryable: false,
+                                auto_disable_reason: None,
+                                cooldown: None,
+                                response_body: None,
+                            },
+                            outbound_model.clone(),
+                        )
+                    })?;
+            if upstream_declared_sse
+                && serde_json::from_slice::<serde_json::Value>(&downstream_body).is_ok()
+            {
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+            }
             Ok(ExternalForwardResponse {
                 response,
                 outbound_model,
@@ -4381,7 +4415,9 @@ impl ExternalPoolManager {
                     }
                     None => {
                         if let Some(mut guard) = guard.take() {
-                            guard.record_success();
+                            if let Some(synthetic_usage) = guard.record_success() {
+                                return Some((Ok(synthetic_usage), (data_stream, None)));
+                            }
                         }
                         None
                     }
@@ -4597,9 +4633,9 @@ impl ExternalStreamUsageGuard {
         }
     }
 
-    fn record_success(&mut self) {
+    fn record_success(&mut self) -> Option<Bytes> {
         if self.completed {
-            return;
+            return None;
         }
         let stream_error_message = self
             .usage_capture
@@ -4627,8 +4663,19 @@ impl ExternalStreamUsageGuard {
                 None,
             );
             self.completed = true;
-            return;
+            return None;
         }
+        let synthetic_usage = self
+            .usage_capture
+            .as_ref()
+            .and_then(|capture| {
+                maybe_synthetic_sse_usage_before_terminal(
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    self.usage_projection.as_ref(),
+                    Some(capture),
+                )
+            })
+            .map(Bytes::from);
         let billing = self.usage_capture.as_ref().and_then(|capture| {
             external_pool_billing_from_capture_ref(&self.route, &self.pool, capture)
         });
@@ -4642,6 +4689,7 @@ impl ExternalStreamUsageGuard {
             billing,
         );
         self.completed = true;
+        synthetic_usage
     }
 
     fn record_stream_error(&mut self, message: &str) {
@@ -5751,40 +5799,350 @@ fn maybe_project_non_stream_usage(
     bytes: Bytes,
     projection: Option<&ExternalUsageProjectionContext>,
 ) -> ProjectedNonStreamBody {
-    let mut usage_capture = ExternalUsageCapture::default();
+    process_non_stream_response_usage(bytes, None, projection)
+}
+
+fn process_non_stream_response_usage(
+    bytes: Bytes,
+    route: Option<&ExternalRouteRequest>,
+    projection: Option<&ExternalUsageProjectionContext>,
+) -> ProjectedNonStreamBody {
+    let mut usage_capture = ExternalUsageCapture {
+        request_input_tokens: route
+            .map(|route| estimated_external_request_input_tokens(route, projection)),
+        ..ExternalUsageCapture::default()
+    };
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return ProjectedNonStreamBody {
             body: bytes,
             usage_capture,
         };
     };
-    let Some(usage) = value.get_mut("usage") else {
-        return ProjectedNonStreamBody {
-            body: bytes,
-            usage_capture,
-        };
-    };
-    let raw_usage = cache_usage_from_value(usage);
-    usage_capture.raw = raw_usage;
-    usage_capture.reported = raw_usage;
 
-    if let Some(projected) = project_usage_value(usage, projection, true) {
-        usage_capture.request_input_tokens = Some(projected.request_input_tokens);
-        usage_capture.shaped = Some(projected.shaped);
-        usage_capture.reported = cache_usage_from_value(usage)
-            .or(Some(projected.reported))
-            .or(raw_usage);
-        usage_capture.projected = true;
-        let body = serde_json::to_vec(&value).map(Bytes::from).unwrap_or(bytes);
+    if let Some((candidate_path, pointer)) = select_non_stream_usage_candidate(&value) {
+        usage_capture.usage_candidate_path = Some(candidate_path.to_string());
+        let mut changed = false;
+        {
+            let Some(usage) = value.pointer_mut(pointer) else {
+                return ProjectedNonStreamBody {
+                    body: bytes,
+                    usage_capture,
+                };
+            };
+            let normalized = normalize_external_usage_value(usage);
+            usage_capture.raw = normalized.usage;
+            usage_capture.reported = normalized.usage;
+            changed |= normalized.changed;
+
+            if let Some(projected) = project_usage_value(usage, projection, true) {
+                usage_capture.request_input_tokens = Some(projected.request_input_tokens);
+                usage_capture.shaped = Some(projected.shaped);
+                usage_capture.reported = cache_usage_from_value(usage)
+                    .or(Some(projected.reported))
+                    .or(normalized.usage);
+                usage_capture.projected = true;
+                changed = true;
+            }
+        }
+
+        if pointer != "/usage" {
+            if let Some(reported) = usage_capture.reported.or(usage_capture.raw) {
+                changed |= set_top_level_usage_value(
+                    &mut value,
+                    anthropic_usage_value_for_body(reported, usage_capture.projected),
+                );
+            }
+        }
+
+        let body = if changed {
+            serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| bytes.clone())
+        } else {
+            bytes
+        };
         return ProjectedNonStreamBody {
             body,
             usage_capture,
         };
     }
 
+    if route.is_some() && normal_non_stream_model_response(&value) {
+        if let Some(estimated) = estimate_non_stream_response_usage(route, projection, &value) {
+            usage_capture.raw = Some(estimated.raw);
+            usage_capture.shaped = Some(estimated.shaped);
+            usage_capture.reported = Some(estimated.reported);
+            usage_capture.projected = estimated.projected;
+            usage_capture.usage_estimated = true;
+            usage_capture.usage_estimate_reason = Some("missing_upstream_usage".to_string());
+            usage_capture.request_input_tokens = Some(estimated.request_input_tokens);
+
+            set_top_level_usage_value(
+                &mut value,
+                anthropic_usage_value_for_body(estimated.reported, estimated.projected),
+            );
+            let body = serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| bytes.clone());
+            return ProjectedNonStreamBody {
+                body,
+                usage_capture,
+            };
+        }
+    }
+
     ProjectedNonStreamBody {
         body: bytes,
         usage_capture,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NormalizedUsageValue {
+    usage: Option<CacheUsage>,
+    changed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EstimatedExternalUsage {
+    request_input_tokens: i32,
+    raw: CacheUsage,
+    shaped: CacheUsage,
+    reported: CacheUsage,
+    projected: bool,
+}
+
+fn select_non_stream_usage_candidate(
+    value: &serde_json::Value,
+) -> Option<(&'static str, &'static str)> {
+    const CANDIDATES: [(&str, &str); 5] = [
+        ("$.usage", "/usage"),
+        ("$.message.usage", "/message/usage"),
+        ("$.delta.usage", "/delta/usage"),
+        ("$.data.usage", "/data/usage"),
+        ("$.response.usage", "/response/usage"),
+    ];
+    CANDIDATES.into_iter().find(|(_, pointer)| {
+        value
+            .pointer(pointer)
+            .and_then(cache_usage_from_any_value)
+            .is_some()
+    })
+}
+
+fn normalize_external_usage_value(usage: &mut serde_json::Value) -> NormalizedUsageValue {
+    if let Some(usage) = cache_usage_from_value(usage) {
+        return NormalizedUsageValue {
+            usage: Some(usage),
+            changed: false,
+        };
+    }
+
+    let Some(openai_usage) = openai_usage_from_value(usage) else {
+        return NormalizedUsageValue {
+            usage: None,
+            changed: false,
+        };
+    };
+    let Some(obj) = usage.as_object_mut() else {
+        return NormalizedUsageValue {
+            usage: Some(openai_usage),
+            changed: false,
+        };
+    };
+    obj.insert("input_tokens".to_string(), json!(openai_usage.input_tokens));
+    obj.insert(
+        "output_tokens".to_string(),
+        json!(openai_usage.output_tokens),
+    );
+    obj.entry("cache_creation_input_tokens".to_string())
+        .or_insert_with(|| json!(0));
+    obj.entry("cache_read_input_tokens".to_string())
+        .or_insert_with(|| json!(0));
+    NormalizedUsageValue {
+        usage: Some(openai_usage),
+        changed: true,
+    }
+}
+
+fn cache_usage_from_any_value(value: &serde_json::Value) -> Option<CacheUsage> {
+    cache_usage_from_value(value).or_else(|| openai_usage_from_value(value))
+}
+
+fn openai_usage_from_value(value: &serde_json::Value) -> Option<CacheUsage> {
+    let input_tokens = usage_i32(value, "prompt_tokens");
+    let output_tokens = usage_i32(value, "completion_tokens");
+    if input_tokens == 0 && output_tokens == 0 {
+        return None;
+    }
+    Some(CacheUsage {
+        total_input_tokens: input_tokens,
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    })
+}
+
+fn set_top_level_usage_value(value: &mut serde_json::Value, usage: serde_json::Value) -> bool {
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    if obj.get("usage") == Some(&usage) {
+        return false;
+    }
+    obj.insert("usage".to_string(), usage);
+    true
+}
+
+fn anthropic_usage_value_for_body(
+    usage: CacheUsage,
+    include_cache_creation_breakdown: bool,
+) -> serde_json::Value {
+    let mut value = usage.to_anthropic_usage_json();
+    if include_cache_creation_breakdown {
+        if let Some(obj) = value.as_object_mut() {
+            apply_projected_cache_creation_breakdown(obj, usage);
+        }
+    }
+    value
+}
+
+fn normal_non_stream_model_response(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "message")
+        || value.get("content").is_some()
+        || value.pointer("/message/content").is_some()
+        || value.pointer("/data/content").is_some()
+        || value.pointer("/response/content").is_some()
+}
+
+fn estimate_non_stream_response_usage(
+    route: Option<&ExternalRouteRequest>,
+    projection: Option<&ExternalUsageProjectionContext>,
+    value: &serde_json::Value,
+) -> Option<EstimatedExternalUsage> {
+    let route = route?;
+    let request_input_tokens = estimated_external_request_input_tokens(route, projection);
+    let output_tokens = estimate_non_stream_output_tokens(value).unwrap_or(0);
+    Some(estimated_external_usage_from_parts(
+        request_input_tokens,
+        output_tokens,
+        projection,
+        true,
+    ))
+}
+
+fn estimated_external_request_input_tokens(
+    route: &ExternalRouteRequest,
+    projection: Option<&ExternalUsageProjectionContext>,
+) -> i32 {
+    projection
+        .map(|projection| projection.raw_input_tokens)
+        .filter(|tokens| *tokens > 0)
+        .or_else(|| (route.request_input_tokens > 0).then_some(route.request_input_tokens))
+        .or_else(|| {
+            route
+                .payload
+                .as_ref()
+                .map(count_external_route_input_tokens)
+        })
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn estimate_non_stream_output_tokens(value: &serde_json::Value) -> Option<i32> {
+    const CONTENT_POINTERS: [&str; 4] = [
+        "/content",
+        "/message/content",
+        "/data/content",
+        "/response/content",
+    ];
+    for pointer in CONTENT_POINTERS {
+        let Some(content) = value.pointer(pointer) else {
+            continue;
+        };
+        match content {
+            serde_json::Value::Array(items) if content_items_have_external_output(items) => {
+                return Some(token::estimate_output_tokens(items).max(0));
+            }
+            serde_json::Value::Array(_) => {
+                return Some(0);
+            }
+            serde_json::Value::String(text) => {
+                return Some(
+                    (!text.trim().is_empty())
+                        .then(|| (token::count_tokens(text) as i32).max(1))
+                        .unwrap_or(0),
+                );
+            }
+            _ => {}
+        }
+    }
+    if non_stream_response_has_stop_reason(value) {
+        return Some(0);
+    }
+    None
+}
+
+fn content_items_have_external_output(items: &[serde_json::Value]) -> bool {
+    items.iter().any(|item| {
+        item.get("text")
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.trim().is_empty())
+            || item
+                .get("thinking")
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| !text.trim().is_empty())
+            || item
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == "tool_use")
+    })
+}
+
+fn non_stream_response_has_stop_reason(value: &serde_json::Value) -> bool {
+    value.get("stop_reason").is_some()
+        || value.pointer("/message/stop_reason").is_some()
+        || value.pointer("/data/stop_reason").is_some()
+        || value.pointer("/response/stop_reason").is_some()
+}
+
+fn estimated_external_usage_from_parts(
+    request_input_tokens: i32,
+    output_tokens: i32,
+    projection: Option<&ExternalUsageProjectionContext>,
+    commit_cache_state: bool,
+) -> EstimatedExternalUsage {
+    let raw = CacheUsage {
+        total_input_tokens: request_input_tokens.max(0),
+        input_tokens: request_input_tokens.max(0),
+        output_tokens: output_tokens.max(0),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    };
+    let mut usage_value = raw.to_anthropic_usage_json();
+    if let Some(projected) = project_usage_value(&mut usage_value, projection, commit_cache_state) {
+        return EstimatedExternalUsage {
+            request_input_tokens: projected.request_input_tokens,
+            raw,
+            shaped: projected.shaped,
+            reported: projected.reported,
+            projected: true,
+        };
+    }
+    EstimatedExternalUsage {
+        request_input_tokens: request_input_tokens.max(0),
+        raw,
+        shaped: raw,
+        reported: raw,
+        projected: false,
     }
 }
 
@@ -5869,6 +6227,7 @@ fn process_usage_slots_in_sse_value(
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
     rewrite: bool,
 ) -> SseUsageProcessingResult {
+    observe_external_stream_value(capture, value);
     let mut result = SseUsageProcessingResult::default();
     let mut handled_top_level = false;
     if let Some(usage) = value.get_mut("usage") {
@@ -5934,13 +6293,143 @@ fn process_sse_event_with_plan(
     if let Some(masked) = masked {
         return masked;
     }
-    if projection.is_some() {
-        return rewrite_sse_event_usage(event, projection, capture);
-    }
-    if plan.capture_usage {
+    let mut processed = if projection.is_some() {
+        rewrite_sse_event_usage(event, projection, capture)
+    } else if plan.capture_usage {
         capture_sse_event_usage(event, projection, capture);
+        event.to_vec()
+    } else {
+        event.to_vec()
+    };
+    if let Some(injected) = maybe_synthetic_sse_usage_before_terminal(event, projection, capture) {
+        let mut with_usage = injected;
+        with_usage.extend(processed);
+        processed = with_usage;
     }
-    event.to_vec()
+    processed
+}
+
+fn observe_external_stream_value(
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    value: &serde_json::Value,
+) {
+    let Some(capture) = capture else {
+        return;
+    };
+    let mut observed_tokens = 0i32;
+    let mut observed_output = false;
+    for text in external_stream_value_text_fragments(value) {
+        if text.trim().is_empty() {
+            continue;
+        }
+        observed_output = true;
+        observed_tokens = observed_tokens.saturating_add((token::count_tokens(text) as i32).max(1));
+    }
+    if !observed_output {
+        return;
+    }
+    let mut capture = capture.lock();
+    capture.observed_output = true;
+    capture.observed_output_tokens = capture
+        .observed_output_tokens
+        .saturating_add(observed_tokens.max(1));
+}
+
+fn external_stream_value_text_fragments(value: &serde_json::Value) -> Vec<&str> {
+    let mut fragments = Vec::new();
+    if let Some(text) = value
+        .pointer("/delta/text")
+        .and_then(|value| value.as_str())
+    {
+        fragments.push(text);
+    }
+    if let Some(text) = value
+        .pointer("/content_block/text")
+        .and_then(|value| value.as_str())
+    {
+        fragments.push(text);
+    }
+    if let Some(text) = value.get("text").and_then(|value| value.as_str()) {
+        fragments.push(text);
+    }
+    fragments
+}
+
+fn maybe_synthetic_sse_usage_before_terminal(
+    event: &[u8],
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+) -> Option<Vec<u8>> {
+    let capture = capture?;
+    if !external_sse_event_is_terminal(event) {
+        return None;
+    }
+    let mut capture = capture.lock();
+    if capture.raw.is_some() || capture.synthetic_usage_emitted {
+        return None;
+    }
+    let request_input_tokens = projection
+        .map(|projection| projection.raw_input_tokens)
+        .filter(|tokens| *tokens > 0)
+        .or(capture.request_input_tokens)
+        .unwrap_or(0)
+        .max(0);
+    let output_tokens = if capture.observed_output {
+        capture.observed_output_tokens.max(1)
+    } else {
+        0
+    };
+    let estimated =
+        estimated_external_usage_from_parts(request_input_tokens, output_tokens, projection, true);
+    capture.request_input_tokens = Some(estimated.request_input_tokens);
+    capture.raw = Some(estimated.raw);
+    capture.shaped = Some(estimated.shaped);
+    capture.reported = Some(estimated.reported);
+    capture.projected = estimated.projected;
+    capture.usage_estimated = true;
+    capture.usage_estimate_reason = Some("stream_missing_final_usage".to_string());
+    capture.synthetic_usage_emitted = true;
+
+    Some(external_synthetic_sse_usage_event(
+        estimated.reported,
+        estimated.projected,
+    ))
+}
+
+fn external_synthetic_sse_usage_event(usage: CacheUsage, projected: bool) -> Vec<u8> {
+    let data = json!({
+        "type": "message_delta",
+        "usage": anthropic_usage_value_for_body(usage, projected),
+    });
+    format!("event: message_delta\ndata: {data}\n\n").into_bytes()
+}
+
+fn external_sse_event_is_terminal(event: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return false;
+    };
+    for line in text.lines() {
+        let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return true;
+        }
+        if serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value == "message_stop")
+            })
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn drain_sse_events(
@@ -6444,6 +6933,10 @@ fn external_pool_billing_from_capture(
         capture.projected,
     );
     billing.stream_response_mode = stream_response_mode;
+    billing.usage_estimated = capture.usage_estimated;
+    billing.usage_estimate_reason = capture.usage_estimate_reason;
+    billing.usage_candidate_path = capture.usage_candidate_path;
+    billing.body_usage_projection_applied = capture.projected;
     Some(billing)
 }
 
@@ -6513,6 +7006,10 @@ fn external_pool_billing(
         pricing_model: Some(reported_estimate.model),
         usage_projection_mode: pool.usage_projection_mode.as_str().to_string(),
         stream_response_mode: None,
+        usage_estimated: false,
+        usage_estimate_reason: None,
+        usage_candidate_path: None,
+        body_usage_projection_applied: usage_projection_applied,
     }
 }
 
@@ -6532,7 +7029,6 @@ fn build_external_usage_projection_context(
     )
 }
 
-#[cfg(test)]
 fn count_external_route_input_tokens(payload: &MessagesRequest) -> i32 {
     crate::token::count_all_tokens(
         &payload.model,

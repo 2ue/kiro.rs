@@ -47,6 +47,69 @@ async fn test_external_pool_manager_with_release_capacity(
     ))
 }
 
+async fn spawn_fake_external_upstream_once(
+    content_type: &'static str,
+    body: &'static [u8],
+) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("fake upstream addr");
+    let body = body.to_vec();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut socket, _) = listener.accept().await.expect("accept fake upstream");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let read = socket.read(&mut buf).await.expect("read fake request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len().saturating_sub(header_end) < content_length {
+                let read = socket.read(&mut buf).await.expect("read fake request body");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+        }
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write fake response headers");
+        socket
+            .write_all(&body)
+            .await
+            .expect("write fake response body");
+        request
+    });
+    (format!("http://{addr}"), server)
+}
+
 fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExternalPoolRequest {
     CreateExternalPoolRequest {
         name: name.to_string(),
@@ -342,6 +405,84 @@ async fn external_pool_manager_selects_multiple_pools_by_priority_and_capacity()
     }
     let after_release = after_release.expect("primary should be selected again after release");
     assert_eq!(after_release.id, primary.id);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_fake_upstream_non_stream_json_with_sse_header_records_billing() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream_body = br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":734}}"#;
+    let (base_url, server) =
+        spawn_fake_external_upstream_once("text/event-stream", upstream_body).await;
+
+    let mut request = create_pool_request("external-fake-json-sse-header", 1, true);
+    request.base_url = base_url;
+    request.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let pool = postgres.create_external_pool(request).await.unwrap();
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 1,
+        external_pool_request_timeout_secs: 5,
+        external_pool_stream_request_timeout_secs: 5,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-opus-4-6");
+    route.endpoint = "/v1/messages".to_string();
+    route.request_id = "req_fake_upstream_json_sse_header".to_string();
+    route.error_id = "req_01fake_upstream_json_sse_header".to_string();
+    route.recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(8));
+    let recorder = route.recorder.clone();
+
+    let outcome = manager.forward_with_failover_result(config, route).await;
+    let response = match outcome {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("fake upstream should return success, got {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read downstream body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("downstream json");
+    let usage = value.get("usage").expect("downstream usage");
+    assert_eq!(usage["output_tokens"], 2);
+    assert_ne!(usage["cache_read_input_tokens"], 734);
+
+    let records = recorder.records_snapshot();
+    let record = records.last().expect("usage record");
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.stream, false);
+    assert_eq!(record.external_pool_id, Some(pool.id));
+    assert!(record.raw_usage.is_some());
+    let billing = record
+        .external_pool_billing
+        .as_ref()
+        .expect("external pool billing");
+    assert_eq!(billing.raw_usage.input_tokens, 4165);
+    assert_eq!(billing.raw_usage.cache_read_input_tokens, 734);
+    assert_eq!(billing.reported_usage.output_tokens, 2);
+    assert!(billing.usage_projection_applied);
+    assert!(billing.body_usage_projection_applied);
+    assert_eq!(
+        billing.reported_usage.cache_read_input_tokens,
+        usage["cache_read_input_tokens"].as_i64().unwrap() as i32
+    );
+
+    let request_bytes = server.await.expect("fake upstream task");
+    let request_text = String::from_utf8_lossy(&request_bytes);
+    assert!(request_text.starts_with("POST /v1/messages "));
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -3956,6 +4097,187 @@ fn usage_projection_path_skip_non_stream_keeps_external_usage_raw() {
     assert_eq!(billing.shaped_usage.input_tokens, 4165);
     assert_eq!(billing.reported_usage.input_tokens, 4165);
     assert_eq!(billing.reported_usage.output_tokens, 2);
+}
+
+#[test]
+fn non_stream_pass_through_keeps_body_and_billing_raw() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = maybe_project_non_stream_usage(body.clone(), None);
+
+    assert_eq!(projected.body, body);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.input_tokens),
+        Some(4165)
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .map(|usage| usage.output_tokens),
+        Some(2)
+    );
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(!billing.usage_projection_applied);
+    assert!(!billing.body_usage_projection_applied);
+    assert_eq!(billing.raw_usage.input_tokens, 4165);
+    assert_eq!(billing.reported_usage.input_tokens, 4165);
+    assert!(!billing.usage_estimated);
+}
+
+#[test]
+fn non_stream_current_path_policy_projects_body_and_marks_billing() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":734}}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 0);
+    let projected = process_non_stream_response_usage(body, Some(&route), projection.as_ref());
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.input_tokens),
+        Some(4165)
+    );
+    assert!(projected.usage_capture.projected);
+    assert_eq!(
+        projected.usage_capture.usage_candidate_path.as_deref(),
+        Some("$.usage")
+    );
+    assert!(usage["cache_read_input_tokens"].as_i64().unwrap() >= 0);
+    assert_ne!(usage["cache_read_input_tokens"].as_i64().unwrap(), 734);
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_projection_applied);
+    assert!(billing.body_usage_projection_applied);
+    assert_eq!(billing.raw_usage.input_tokens, 4165);
+    assert_eq!(billing.reported_usage.output_tokens, 2);
+}
+
+#[test]
+fn non_stream_missing_usage_injects_estimated_billing_body() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = process_non_stream_response_usage(body, Some(&route), None);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("missing_upstream_usage")
+    );
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0);
+    assert!(usage["output_tokens"].as_i64().unwrap() >= 0);
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("missing_upstream_usage")
+    );
+    assert!(billing.reported_usage.input_tokens > 0);
+}
+
+#[test]
+fn non_stream_missing_usage_empty_content_with_stop_reason_estimates_zero_output() {
+    let body = Bytes::from_static(br#"{"type":"message","content":[],"stop_reason":"end_turn"}"#);
+    let route = test_route("claude-opus-4-6");
+
+    let projected = process_non_stream_response_usage(body, Some(&route), None);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(usage["output_tokens"], 0);
+}
+
+#[test]
+fn openai_usage_is_normalized_for_non_stream_external_pool_body() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = maybe_project_non_stream_usage(body, None);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(usage["input_tokens"], 11);
+    assert_eq!(usage["output_tokens"], 3);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.input_tokens),
+        Some(11)
+    );
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert_eq!(billing.raw_usage.input_tokens, 11);
+    assert_eq!(billing.reported_usage.output_tokens, 3);
+}
+
+#[test]
+fn stream_terminal_without_usage_injects_synthetic_usage_and_billing() {
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        request_input_tokens: Some(route.request_input_tokens),
+        ..ExternalUsageCapture::default()
+    }));
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}
+
+"#;
+    let terminal_event = br#"event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+    let out_1 = process_sse_event_with_plan(
+        text_event,
+        Some(&projection),
+        Some(&capture),
+        None,
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough),
+    );
+    assert!(!out_1.is_empty());
+    let out_2 = process_sse_event_with_plan(
+        terminal_event,
+        Some(&projection),
+        Some(&capture),
+        None,
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough),
+    );
+    let text = std::str::from_utf8(&out_2).expect("utf8");
+    assert!(text.contains(r#"event: message_delta"#));
+    assert!(text.contains(r#""usage""#));
+    assert!(text.contains(r#"event: message_stop"#));
+
+    let billing =
+        external_pool_billing_from_capture(&route, &pool, capture.lock().clone()).expect("billing");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("stream_missing_final_usage")
+    );
 }
 
 #[test]
