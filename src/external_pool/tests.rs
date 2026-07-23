@@ -488,6 +488,78 @@ async fn external_pool_fake_upstream_non_stream_json_with_sse_header_records_bil
 }
 
 #[tokio::test]
+async fn external_pool_fake_upstream_non_stream_unknown_json_records_estimated_billing() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream_body = br#"{"id":"chatcmpl_fake","object":"chat.completion","model":"claude-opus-4-6","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}"#;
+    let (base_url, server) =
+        spawn_fake_external_upstream_once("application/json", upstream_body).await;
+
+    let mut request = create_pool_request("external-fake-unknown-json", 1, true);
+    request.base_url = base_url;
+    let pool = postgres.create_external_pool(request).await.unwrap();
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 1,
+        external_pool_request_timeout_secs: 5,
+        external_pool_stream_request_timeout_secs: 5,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-opus-4-6");
+    route.endpoint = "/v1/messages".to_string();
+    route.request_id = "req_fake_upstream_unknown_json".to_string();
+    route.error_id = "req_01fake_upstream_unknown_json".to_string();
+    route.recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(8));
+    let recorder = route.recorder.clone();
+
+    let outcome = manager.forward_with_failover_result(config, route).await;
+    let response = match outcome {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("fake upstream should return success, got {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read downstream body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("downstream json");
+    assert!(value.get("choices").is_some());
+    let usage = value.get("usage").expect("estimated downstream usage");
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0);
+    assert!(usage["output_tokens"].as_i64().unwrap() > 0);
+
+    let records = recorder.records_snapshot();
+    let record = records.last().expect("usage record");
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.usage_source, UsageSource::RequestEstimate);
+    assert_eq!(record.external_pool_id, Some(pool.id));
+    assert!(record.raw_usage.is_some());
+    assert!(record.output_tokens > 0);
+    assert!(record.estimated_cost_usd > 0.0);
+    let billing = record
+        .external_pool_billing
+        .as_ref()
+        .expect("external pool billing");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert_eq!(billing.usage_candidate_path, None);
+    assert!(!billing.usage_projection_applied);
+    assert!(billing.pricing_available);
+
+    let request_bytes = server.await.expect("fake upstream task");
+    let request_text = String::from_utf8_lossy(&request_bytes);
+    assert!(request_text.starts_with("POST /v1/messages "));
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
 async fn external_pool_manager_distinguishes_global_capacity_from_no_pool() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -4205,6 +4277,59 @@ fn non_stream_missing_usage_empty_content_with_stop_reason_estimates_zero_output
 
     assert!(projected.usage_capture.usage_estimated);
     assert_eq!(usage["output_tokens"], 0);
+}
+
+#[test]
+fn non_stream_unknown_json_without_usage_injects_estimated_usage_and_billing() {
+    let body = Bytes::from_static(
+        br#"{"id":"chatcmpl_fake","choices":[{"message":{"role":"assistant","content":"OK"}}],"model":"claude-opus-4-6"}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = process_non_stream_response_usage(body, Some(&route), None);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("estimated usage");
+
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0);
+    assert!(usage["output_tokens"].as_i64().unwrap() > 0);
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert!(billing.reported_usage.output_tokens > 0);
+}
+
+#[test]
+fn non_stream_unknown_text_without_usage_records_estimated_billing_without_rewriting_body() {
+    let body = Bytes::from_static(b"OK");
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = process_non_stream_response_usage(body.clone(), Some(&route), None);
+
+    assert_eq!(projected.body, body);
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert_eq!(billing.reported_usage.output_tokens, 0);
 }
 
 #[test]

@@ -4490,6 +4490,11 @@ impl ExternalPoolManager {
             .is_some_and(|billing| billing.usage_projection_applied)
         {
             UsageSource::LocalPromptCache
+        } else if billing
+            .as_ref()
+            .is_some_and(|billing| billing.usage_estimated)
+        {
+            UsageSource::RequestEstimate
         } else if usage.is_some() {
             UsageSource::UpstreamMetadata
         } else {
@@ -5814,6 +5819,15 @@ fn process_non_stream_response_usage(
         ..ExternalUsageCapture::default()
     };
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        if let Some(estimated) =
+            estimate_unrecognized_non_stream_response_usage(route, projection, None)
+        {
+            apply_estimated_usage_capture(
+                &mut usage_capture,
+                estimated,
+                "unrecognized_success_body",
+            );
+        }
         return ProjectedNonStreamBody {
             body: bytes,
             usage_capture,
@@ -5871,13 +5885,7 @@ fn process_non_stream_response_usage(
     if normal_non_stream_model_response(&value)
         && let Some(estimated) = estimate_non_stream_response_usage(route, projection, &value)
     {
-        usage_capture.raw = Some(estimated.raw);
-        usage_capture.shaped = Some(estimated.shaped);
-        usage_capture.reported = Some(estimated.reported);
-        usage_capture.projected = estimated.projected;
-        usage_capture.usage_estimated = true;
-        usage_capture.usage_estimate_reason = Some("missing_upstream_usage".to_string());
-        usage_capture.request_input_tokens = Some(estimated.request_input_tokens);
+        apply_estimated_usage_capture(&mut usage_capture, estimated, "missing_upstream_usage");
 
         set_top_level_usage_value(
             &mut value,
@@ -5890,6 +5898,25 @@ fn process_non_stream_response_usage(
             body,
             usage_capture,
         };
+    }
+
+    if let Some(estimated) =
+        estimate_unrecognized_non_stream_response_usage(route, projection, Some(&value))
+    {
+        apply_estimated_usage_capture(&mut usage_capture, estimated, "unrecognized_success_body");
+        if value.is_object() {
+            set_top_level_usage_value(
+                &mut value,
+                anthropic_usage_value_for_body(estimated.reported, estimated.projected),
+            );
+            let body = serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| bytes.clone());
+            return ProjectedNonStreamBody {
+                body,
+                usage_capture,
+            };
+        }
     }
 
     ProjectedNonStreamBody {
@@ -5911,6 +5938,20 @@ struct EstimatedExternalUsage {
     shaped: CacheUsage,
     reported: CacheUsage,
     projected: bool,
+}
+
+fn apply_estimated_usage_capture(
+    usage_capture: &mut ExternalUsageCapture,
+    estimated: EstimatedExternalUsage,
+    reason: &'static str,
+) {
+    usage_capture.raw = Some(estimated.raw);
+    usage_capture.shaped = Some(estimated.shaped);
+    usage_capture.reported = Some(estimated.reported);
+    usage_capture.projected = estimated.projected;
+    usage_capture.usage_estimated = true;
+    usage_capture.usage_estimate_reason = Some(reason.to_string());
+    usage_capture.request_input_tokens = Some(estimated.request_input_tokens);
 }
 
 fn select_non_stream_usage_candidate(
@@ -6036,6 +6077,24 @@ fn estimate_non_stream_response_usage(
     ))
 }
 
+fn estimate_unrecognized_non_stream_response_usage(
+    route: Option<&ExternalRouteRequest>,
+    projection: Option<&ExternalUsageProjectionContext>,
+    value: Option<&serde_json::Value>,
+) -> Option<EstimatedExternalUsage> {
+    let route = route?;
+    let request_input_tokens = estimated_external_request_input_tokens(route, projection);
+    let output_tokens = value
+        .and_then(estimate_unrecognized_non_stream_output_tokens)
+        .unwrap_or(0);
+    Some(estimated_external_usage_from_parts(
+        request_input_tokens,
+        output_tokens,
+        projection,
+        true,
+    ))
+}
+
 fn estimated_external_request_input_tokens(
     route: &ExternalRouteRequest,
     projection: Option<&ExternalUsageProjectionContext>,
@@ -6052,6 +6111,59 @@ fn estimated_external_request_input_tokens(
         })
         .unwrap_or(0)
         .max(0)
+}
+
+fn estimate_unrecognized_non_stream_output_tokens(value: &serde_json::Value) -> Option<i32> {
+    estimate_openai_choices_output_tokens(value).or_else(|| {
+        const STRING_POINTERS: [&str; 7] = [
+            "/output_text",
+            "/text",
+            "/result",
+            "/data/output_text",
+            "/data/text",
+            "/data/result",
+            "/response/output_text",
+        ];
+        STRING_POINTERS
+            .iter()
+            .find_map(|pointer| string_output_tokens(value.pointer(pointer)))
+    })
+}
+
+fn estimate_openai_choices_output_tokens(value: &serde_json::Value) -> Option<i32> {
+    let choices = value.get("choices")?.as_array()?;
+    let mut tokens = 0i32;
+    let mut observed = false;
+    for choice in choices {
+        for pointer in ["/message/content", "/delta/content", "/text"] {
+            let Some(candidate) = choice.pointer(pointer) else {
+                continue;
+            };
+            if let Some(candidate_tokens) = estimate_json_output_fragment_tokens(candidate) {
+                tokens = tokens.saturating_add(candidate_tokens);
+                observed = true;
+            }
+        }
+    }
+    Some(if observed { tokens.max(1) } else { 0 })
+}
+
+fn estimate_json_output_fragment_tokens(value: &serde_json::Value) -> Option<i32> {
+    match value {
+        serde_json::Value::String(text) => {
+            (!text.trim().is_empty()).then(|| (token::count_tokens(text) as i32).max(1))
+        }
+        serde_json::Value::Array(items) if content_items_have_external_output(items) => {
+            Some(token::estimate_output_tokens(items).max(0))
+        }
+        serde_json::Value::Array(_) => Some(0),
+        _ => None,
+    }
+}
+
+fn string_output_tokens(value: Option<&serde_json::Value>) -> Option<i32> {
+    let text = value?.as_str()?;
+    (!text.trim().is_empty()).then(|| (token::count_tokens(text) as i32).max(1))
 }
 
 fn estimate_non_stream_output_tokens(value: &serde_json::Value) -> Option<i32> {
