@@ -57,6 +57,15 @@ the historical 2026-07-12 release artifact below.
 Docker dynamic execution is explicitly waived by the user for this phase and is not counted
 as pass. Existing `127.0.0.1:9022` production/development service was not modified.
 
+- Post-release follow-up on the current `main` worktree: external-pool success 0-billing
+  minimal port from `feature/scheduler-high-concurrency-resilience` was applied to the
+  working tree, covering non-stream OpenAI usage normalization, missing/unrecognized success
+  usage estimation, non-JSON success input billing, and SSE-header JSON non-stream routing
+  correction. See
+  [feature evidence](../../../../../feature/evidence/external-pool-success-zero-billing-20260723.md)
+  and
+  [feature issue](../../../../../feature/issues/external-pool-success-zero-billing.md).
+
 ## 2026-07-12 Tool Schema Key Compatibility
 
 - Implemented `bodyConversion.toolSchemaKeyMapping` with `sanitize` (default), `reject`, and `disabled`; implemented configurable `bodyConversion.toolSchemaKeyValidationRegex` defaulting to `^[a-zA-Z0-9_.-]{1,64}$`.

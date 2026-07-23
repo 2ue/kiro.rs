@@ -7912,6 +7912,10 @@ mod tests {
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             usage_projection_mode: "current_path_policy".to_string(),
             stream_response_mode: None,
+            usage_estimated: false,
+            usage_estimate_reason: None,
+            usage_candidate_path: None,
+            body_usage_projection_applied: true,
         });
         let mut error = usage_record(
             "redis-usage-error",

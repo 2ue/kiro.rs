@@ -132,6 +132,14 @@ pub struct ExternalPoolBilling {
     pub usage_projection_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_response_mode: Option<String>,
+    #[serde(default)]
+    pub usage_estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_estimate_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_candidate_path: Option<String>,
+    #[serde(default)]
+    pub body_usage_projection_applied: bool,
 }
 
 impl ExternalPoolBilling {
@@ -1536,6 +1544,12 @@ impl UsageRecorder {
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
             dropped_redis_records: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn records_snapshot(&self) -> Vec<UsageRecord> {
+        self.records.lock().iter().cloned().collect()
     }
 
     #[cfg(test)]

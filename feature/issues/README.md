@@ -39,6 +39,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [payload guard 语义、上限与性能](payload-guard-semantics-limits-and-performance.md)
 - [远程图片/文档辅助请求、资源上限与 SSRF 连接绑定](remote-multimodal-resource-and-ssrf-bounds.md)
 - [external profile 与 SSE 安全](external-pool-profiles-and-sse-safety.md)
+- [外部池成功请求 0 计费与非流式 usage 捕获分裂](external-pool-success-zero-billing.md)
 - [external pool Redis 协调、restart fencing 与 release backlog](external-pool-redis-coordination-and-release.md)
 - [external pool 权威选池 PostgreSQL 扇出与发送 revision fence](external-pool-authoritative-selection-and-dispatch-fence.md)
 - [重试预算、准入与 RPM 放大](retry-budget-admission-and-rpm-amplification.md)

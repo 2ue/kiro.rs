@@ -867,6 +867,10 @@ export interface ExternalPoolBilling {
   pricingModel?: string
   usageProjectionMode: string
   streamResponseMode?: ExternalPoolStreamResponseMode
+  usageEstimated?: boolean
+  usageEstimateReason?: string
+  usageCandidatePath?: string
+  bodyUsageProjectionApplied?: boolean
 }
 
 export interface ExternalPoolAttempt {

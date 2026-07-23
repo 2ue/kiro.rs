@@ -8480,6 +8480,192 @@ fn usage_projection_pass_through_keeps_body_unchanged() {
 }
 
 #[test]
+fn openai_usage_is_normalized_for_non_stream_external_pool_body() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = maybe_project_non_stream_usage(body, None);
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(usage["input_tokens"], 11);
+    assert_eq!(usage["output_tokens"], 3);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.input_tokens),
+        Some(11)
+    );
+    assert_eq!(
+        projected.usage_capture.usage_candidate_path.as_deref(),
+        Some("$.usage")
+    );
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert_eq!(billing.raw_usage.input_tokens, 11);
+    assert_eq!(billing.reported_usage.output_tokens, 3);
+    assert_eq!(billing.usage_candidate_path.as_deref(), Some("$.usage"));
+    assert!(!billing.usage_estimated);
+}
+
+#[test]
+fn non_stream_missing_usage_injects_estimated_billing_body() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected =
+        process_non_stream_response_usage(body, Some(&route), None, std::iter::empty::<String>());
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("estimated usage");
+
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("missing_upstream_usage")
+    );
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0);
+    assert!(usage["output_tokens"].as_i64().unwrap() >= 0);
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("missing_upstream_usage")
+    );
+    assert_eq!(billing.usage_candidate_path, None);
+    assert!(billing.reported_usage.input_tokens > 0);
+}
+
+#[test]
+fn non_stream_unknown_json_without_usage_injects_estimated_usage_and_billing() {
+    let body = Bytes::from_static(
+        br#"{"id":"chatcmpl_fake","choices":[{"message":{"role":"assistant","content":"OK"}}],"model":"claude-opus-4-6"}"#,
+    );
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected =
+        process_non_stream_response_usage(body, Some(&route), None, std::iter::empty::<String>());
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("estimated usage");
+
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0);
+    assert!(usage["output_tokens"].as_i64().unwrap() > 0);
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert_eq!(billing.usage_candidate_path, None);
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert!(billing.reported_usage.output_tokens > 0);
+}
+
+#[test]
+fn non_stream_unknown_text_without_usage_records_estimated_billing_without_rewriting_body() {
+    let body = Bytes::from_static(b"OK");
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected = process_non_stream_response_usage(
+        body.clone(),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+
+    assert_eq!(projected.body, body);
+    assert!(projected.usage_capture.usage_estimated);
+    assert_eq!(
+        projected.usage_capture.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("unrecognized_success_body")
+    );
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert_eq!(billing.reported_usage.output_tokens, 0);
+}
+
+#[test]
+fn external_record_usage_source_prefers_request_estimate_for_estimated_billing() {
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+
+    let estimated = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"id":"chatcmpl_fake","choices":[{"message":{"role":"assistant","content":"OK"}}]}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    let estimated_billing =
+        external_pool_billing_from_capture(&route, &pool, estimated.usage_capture)
+            .expect("estimated billing");
+    assert!(estimated_billing.usage_estimated);
+    assert_eq!(
+        external_record_usage_source(Some(&estimated_billing), true),
+        UsageSource::RequestEstimate
+    );
+
+    let projected_route = test_route("claude-opus-4-6");
+    let mut projected_pool = test_pool("http://pool.example.com", false);
+    projected_pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&projected_route, &projected_pool, 0).expect("projection");
+    let projected = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        ),
+        Some(&projection),
+    );
+    let projected_billing = external_pool_billing_from_capture(
+        &projected_route,
+        &projected_pool,
+        projected.usage_capture,
+    )
+    .expect("projected billing");
+    assert!(projected_billing.usage_projection_applied);
+    assert_eq!(
+        external_record_usage_source(Some(&projected_billing), true),
+        UsageSource::LocalPromptCache
+    );
+
+    let passthrough = maybe_project_non_stream_usage(
+        Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        ),
+        None,
+    );
+    let passthrough_billing =
+        external_pool_billing_from_capture(&route, &pool, passthrough.usage_capture)
+            .expect("passthrough billing");
+    assert_eq!(
+        external_record_usage_source(Some(&passthrough_billing), true),
+        UsageSource::UpstreamMetadata
+    );
+}
+
+#[test]
 fn external_non_stream_response_contamination_is_retryable_not_partial_success() {
     let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
     let cases = [
