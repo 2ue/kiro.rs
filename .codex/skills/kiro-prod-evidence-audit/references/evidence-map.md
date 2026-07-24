@@ -19,7 +19,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_TARGET" \
   > "$ROOT/raw/docker/compose-ps.json"
 ```
 
-Use key/agent access when available. If the user explicitly authorizes password auth, use a local hidden prompt or in-memory pty/expect handoff. Do not place the password in command arguments, evidence files, reports, archives, or persistent files.
+If the user explicitly provides production login credentials or says to connect directly, use direct password SSH first. Prefer a local hidden prompt, in-memory pty/expect handoff, or short-lived control socket. Do not place the password in command arguments, evidence files, reports, archives, or persistent files.
 
 ## Host and Docker Inventory
 

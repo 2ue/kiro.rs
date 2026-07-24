@@ -424,7 +424,8 @@ fn pricing_model_candidates(model: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut candidates = vec![normalized.clone()];
+    let mut candidates = Vec::new();
+    push_candidate(&mut candidates, &normalized);
     let without_1m = normalized.strip_suffix("[1m]").unwrap_or(&normalized);
     push_candidate(&mut candidates, without_1m);
 
@@ -451,10 +452,52 @@ fn pricing_model_candidates(model: &str) -> Vec<String> {
 }
 
 fn push_candidate(candidates: &mut Vec<String>, candidate: &str) {
-    let candidate = normalize_pricing_model_id(candidate).replace('.', "-");
-    if !candidate.is_empty() && !candidates.contains(&candidate) {
-        candidates.push(candidate);
+    let candidate = normalize_pricing_model_id(candidate);
+    push_candidate_exact(candidates, &candidate);
+
+    let dashed = candidate.replace('.', "-");
+    push_candidate_exact(candidates, &dashed);
+
+    if let Some(dotted) = claude_family_minor_dot_candidate(&dashed) {
+        push_candidate_exact(candidates, &dotted);
     }
+}
+
+fn push_candidate_exact(candidates: &mut Vec<String>, candidate: &str) {
+    if !candidate.is_empty() && !candidates.iter().any(|item| item == candidate) {
+        candidates.push(candidate.to_string());
+    }
+}
+
+fn claude_family_minor_dot_candidate(model: &str) -> Option<String> {
+    let normalized = normalize_pricing_model_id(model);
+    let start = normalized.find("claude-")?;
+    let prefix = &normalized[..start];
+    let rest = &normalized[start + "claude-".len()..];
+    let family = ["opus", "sonnet", "haiku"]
+        .into_iter()
+        .find(|family| rest.starts_with(&format!("{}-", family)))?;
+    let version = &rest[family.len() + 1..];
+    let (major, after_major) = take_leading_digits(version)?;
+    let after_major = after_major.strip_prefix(['-', '.'])?;
+    let (minor, tail) = take_leading_digits(after_major)?;
+    if major.is_empty() || minor.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}claude-{}-{}.{}{}",
+        prefix, family, major, minor, tail
+    ))
+}
+
+fn take_leading_digits(value: &str) -> Option<(&str, &str)> {
+    let len = value
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    (len > 0).then(|| value.split_at(len))
 }
 
 fn claude_family_version_candidate(model: &str) -> Option<String> {
@@ -719,6 +762,64 @@ mod tests {
         assert!(estimate.available);
         assert_eq!(estimate.model, "claude-opus-4-8");
         assert!((estimate.cost_usd - 0.003).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_matches_dashed_request_to_dotted_price_model() {
+        let catalog = PricingCatalog::new();
+        catalog.upsert_manual_price(
+            "claude-opus-4.8",
+            ModelPricing {
+                input_cost_per_token: 0.000007,
+                output_cost_per_token: 0.000031,
+                cache_creation_input_token_cost: 0.000008,
+                cache_read_input_token_cost: 0.0000007,
+            },
+        );
+        let usage = CacheUsage {
+            total_input_tokens: 100,
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let estimate = catalog.estimate("claude-opus-4-8", usage);
+
+        assert!(estimate.available);
+        assert_eq!(estimate.model, "claude-opus-4.8");
+        assert!((estimate.cost_usd - 0.00101).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_matches_dotted_request_to_dashed_price_model() {
+        let catalog = PricingCatalog::new();
+        catalog.upsert_manual_price(
+            "claude-opus-4-8",
+            ModelPricing {
+                input_cost_per_token: 0.000007,
+                output_cost_per_token: 0.000031,
+                cache_creation_input_token_cost: 0.000008,
+                cache_read_input_token_cost: 0.0000007,
+            },
+        );
+        let usage = CacheUsage {
+            total_input_tokens: 100,
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let estimate = catalog.estimate("claude-opus-4.8", usage);
+
+        assert!(estimate.available);
+        assert_eq!(estimate.model, "claude-opus-4-8");
+        assert!((estimate.cost_usd - 0.00101).abs() < f64::EPSILON);
     }
 
     #[test]

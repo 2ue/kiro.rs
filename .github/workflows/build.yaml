@@ -140,10 +140,10 @@ jobs:
         run: node scripts/ci/check-clippy-baseline.mjs
 
       - name: Test without default features
-        run: cargo test --locked --all-targets --no-default-features
+        run: cargo test --locked --all-targets --no-default-features -- --test-threads=1
 
       - name: Test with default features
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets -- --test-threads=1
 
       - name: Build release with default features
         run: cargo build --release --locked
