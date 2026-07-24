@@ -131,3 +131,7 @@ runner 同时移除了对既有 9022 listener 的前后 `lsof` 探测，只在�
 未来 Claude CLI 或 Kiro 上游可能增加 effort/thinking 取值、改变默认或改名。实现必须保留 unknown-field 观测与明确 fail-closed/compatibility policy，不能通过硬编码当前 CLI 版本掩盖变化。
 
 回滚不得恢复“关闭提示词引导即关闭所有 thinking/tool 协议能力”的旧耦合，也不得用无日志的 clamp 保持表面成功。若新映射与真实上游不兼容，应回滚到上一记录 binary，并保留明确错误与本专题阻断，直到重新完成 wire 矩阵。
+
+### 2026-07-23 最终候选复核
+
+v0.0.117 冻结候选执行两层证据：raw Claude CLI capture 30/30 表明 Claude Code CLI 2.1.197 原生发送 `thinking: {type:"adaptive"}`，absent 默认 `output_config.effort=high`，显式 `low/medium/high/xhigh/max` 均原样；Kiro thinking wire 60/60 pass，CLI/IDE 两入口、6 effort × 5 轮均无 `max -> high`、无 invalid wire JSON、无 protocol violations、无 unknown requests。最终 wire 使用上游广告的 native schema；未广告 thinking 字段时不发明 thinking 字段，避免与官方 schema 冲突。报告路径与 SHA 见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。

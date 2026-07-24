@@ -83,7 +83,13 @@ const MAX_SERVICE_FD_GROWTH = 32
 const MAX_SERVICE_PEAK_FDS = 512
 const MAX_RUNNER_RSS_GROWTH_BYTES = 128 * 1024 * 1024
 const MAX_RUNNER_HEAP_GROWTH_BYTES = 64 * 1024 * 1024
-const MAX_WALL_DURATION_MS = 20 * 60 * 1000
+const MAX_WALL_DURATION_MS = parseOptionalIntegerEnvironment(
+  'KIRO_THINKING_WIRE_MAX_WALL_MS',
+  20 * 60 * 1000,
+  60_000,
+  60 * 60 * 1000,
+)
+const PROGRESS_LOGGING_ENABLED = process.env.KIRO_VALIDATION_PROGRESS === '1'
 const SOURCE_MANIFEST_PATHS = [
   'Cargo.toml',
   'Cargo.lock',
@@ -162,6 +168,26 @@ function requiredEnvironment(name) {
   const value = String(process.env[name] || '').trim()
   if (!value) throw new Error(`${name} is required`)
   return value
+}
+
+function parseOptionalIntegerEnvironment(name, fallback, minimum, maximum) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const value = Number.parseInt(raw, 10)
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer in ${minimum}..${maximum}`)
+  }
+  return value
+}
+
+function progressLog(event) {
+  if (!PROGRESS_LOGGING_ENABLED) return
+  console.error(JSON.stringify({
+    schemaVersion: 1,
+    kind: 'thinking_effort_wire_progress',
+    timestamp: new Date().toISOString(),
+    ...event,
+  }))
 }
 
 function pathIsWithin(parent, candidate) {
@@ -1949,6 +1975,7 @@ async function runEndpoint({ endpoint, upstreamPort, fake }) {
         throwIfShutdownRequested()
         const id = `${endpoint}-${effort}-${round}`
         activeCase = { id, endpoint, effort, round }
+        progressLog({ event: 'case_start', id, endpoint, effort, round })
         const ingressStart = ingress.records.length
         const wireStart = fake.records.length
         const cli = await runClaude({ endpoint, effort, round, ingressPort })
@@ -1986,6 +2013,17 @@ async function runEndpoint({ endpoint, upstreamPort, fake }) {
           stderrSha256: cli.stderrSha256,
           violations: validation.violations,
           resource,
+        })
+        progressLog({
+          event: 'case_done',
+          id,
+          endpoint,
+          effort,
+          round,
+          durationMs: cli.durationMs,
+          exitCode: cli.code,
+          timedOut: cli.timedOut,
+          violations: validation.violations,
         })
         activeCase = null
       }

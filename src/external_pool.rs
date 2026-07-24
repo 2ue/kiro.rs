@@ -2072,6 +2072,7 @@ struct ExternalPoolReleaseDispatcherStats {
 struct ExternalPoolReleaseDispatcher {
     redis: Arc<RedisStore>,
     capacity_signal: Arc<CapacitySignal>,
+    selection_runtime_snapshot: Arc<SyncMutex<Option<CachedSelectionRuntimeSnapshot>>>,
     capacity: Arc<Semaphore>,
     drained_notify: Notify,
     work_notify: Notify,
@@ -2091,10 +2092,15 @@ pub struct ExternalPoolReleaseDrainReport {
 }
 
 impl ExternalPoolReleaseDispatcher {
-    fn new(redis: Arc<RedisStore>, capacity_signal: Arc<CapacitySignal>) -> Arc<Self> {
+    fn new(
+        redis: Arc<RedisStore>,
+        capacity_signal: Arc<CapacitySignal>,
+        selection_runtime_snapshot: Arc<SyncMutex<Option<CachedSelectionRuntimeSnapshot>>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             redis,
             capacity_signal,
+            selection_runtime_snapshot,
             capacity: Arc::new(Semaphore::new(EXTERNAL_POOL_RELEASE_CAPACITY)),
             drained_notify: Notify::new(),
             work_notify: Notify::new(),
@@ -2237,6 +2243,7 @@ impl ExternalPoolReleaseDispatcher {
                 self.stats
                     .completed
                     .fetch_add(completed as u64, Ordering::Relaxed);
+                self.selection_runtime_snapshot.lock().take();
             }
             self.capacity_signal.capacity_released(released_capacity);
             if failed == 0 {
@@ -2339,6 +2346,8 @@ impl ExternalPoolLease {
     fn confirm(&mut self) {
         debug_assert_eq!(self.state, ExternalPoolLeaseState::Pending);
         self.state = ExternalPoolLeaseState::Confirmed;
+        self.manager
+            .invalidate_external_pool_runtime_capacity_state();
         self.heartbeat = Some(ExternalPoolLeaseHeartbeat::spawn(
             self.manager.clone(),
             self.pool_id,
@@ -2370,6 +2379,8 @@ impl Drop for ExternalPoolLease {
             }
             ExternalPoolLeaseState::Disarmed => return,
         };
+        self.manager
+            .invalidate_external_pool_runtime_capacity_state();
         let release_permit = self
             .release_permit
             .take()
@@ -2402,9 +2413,7 @@ async fn run_external_pool_lease_heartbeat(
         50,
         EXTERNAL_POOL_COORDINATOR_REDIS_OPERATION_TIMEOUT.as_millis() as u64,
     ));
-    let loss_after = max_age
-        .saturating_sub(interval.saturating_add(operation_timeout))
-        .max(interval);
+    let loss_after = max_age.saturating_sub(operation_timeout).max(interval);
     let retry_delay = Duration::from_millis(EXTERNAL_POOL_LEASE_HEARTBEAT_RETRY_MILLIS)
         .min(interval)
         .max(Duration::from_millis(50));
@@ -3125,8 +3134,12 @@ fn direct_external_policy_static_reason(
 impl ExternalPoolManager {
     pub fn new(postgres: Arc<PostgresStore>, redis: Arc<RedisStore>) -> Self {
         let capacity_signal = Arc::new(CapacitySignal::default());
-        let release_dispatcher =
-            ExternalPoolReleaseDispatcher::new(redis.clone(), capacity_signal.clone());
+        let selection_runtime_snapshot = Arc::new(SyncMutex::new(None));
+        let release_dispatcher = ExternalPoolReleaseDispatcher::new(
+            redis.clone(),
+            capacity_signal.clone(),
+            selection_runtime_snapshot.clone(),
+        );
         Self {
             postgres,
             redis,
@@ -3142,7 +3155,7 @@ impl ExternalPoolManager {
             authoritative_pool_snapshot: Arc::new(SyncMutex::new(None)),
             authoritative_pool_snapshot_refresh_lock: Arc::new(AsyncMutex::new(())),
             authoritative_pool_snapshot_changed: Arc::new(Notify::new()),
-            selection_runtime_snapshot: Arc::new(SyncMutex::new(None)),
+            selection_runtime_snapshot,
             selection_runtime_snapshot_refresh_lock: Arc::new(AsyncMutex::new(())),
             static_pool_snapshot_fresh_ttl: EXTERNAL_POOL_STATIC_SNAPSHOT_FRESH_TTL,
             static_pool_snapshot_stale_ttl: EXTERNAL_POOL_STATIC_SNAPSHOT_STALE_TTL,
@@ -3424,6 +3437,13 @@ impl ExternalPoolManager {
     }
 
     pub fn invalidate_external_pool_policy_state(&self) {
+        self.selection_runtime_snapshot.lock().take();
+        #[cfg(test)]
+        self.availability_cache.lock().take();
+    }
+
+    fn invalidate_external_pool_runtime_capacity_state(&self) {
+        self.selection_runtime_snapshot.lock().take();
         #[cfg(test)]
         self.availability_cache.lock().take();
     }
@@ -8427,6 +8447,16 @@ struct ProjectedNonStreamBody {
     protocol_contamination: bool,
 }
 
+impl ProjectedNonStreamBody {
+    fn without_protocol_contamination(body: Bytes, usage_capture: ExternalUsageCapture) -> Self {
+        Self {
+            body,
+            usage_capture,
+            protocol_contamination: false,
+        }
+    }
+}
+
 #[cfg(test)]
 fn maybe_project_non_stream_usage(
     bytes: Bytes,
@@ -8463,11 +8493,7 @@ fn process_non_stream_response_usage(
                 "unrecognized_success_body",
             );
         }
-        return ProjectedNonStreamBody {
-            body: bytes,
-            usage_capture,
-            protocol_contamination: false,
-        };
+        return ProjectedNonStreamBody::without_protocol_contamination(bytes, usage_capture);
     };
     let sanitization = sanitize_response_content(&mut value, known_tool_names);
     let sanitized = sanitization.blocks > 0;

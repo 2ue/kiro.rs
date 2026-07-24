@@ -136,3 +136,7 @@ node feature/tests/run-redis-fault-domain-product-validation.mjs
 如果 observability Redis 配置错误，系统会降级到 PostgreSQL/进程内观测，可能导致 Admin cache 命中率下降或 usage dashboard Redis materialization 缺失；这是可接受的可用性取舍。回滚只能删除或修正 `observabilityRedis`，不得把 observability fallback 指向业务 Redis。
 
 跨实例总并发仍取决于所有进程写入同一个 observability Redis 的 aggregate 负载；当前产品 runner 只验证单进程 `RedisStore`、两个独立 Redis fault domains 和产品注入路径。多进程真实服务 SIGKILL/restart、external takeover、生产高基数和最终 release soak 仍是发布阻断。
+
+## 2026-07-23 最终候选复核
+
+v0.0.117 冻结候选在 default/no-default 全量 Rust gate 与 frozen L3/L4/L5 load/chaos 下再次证明：usage/observability 压力和错误突发不会把正常恢复路径拖成账号持久禁用；L3/L4 recovery case 全部 12/12 成功，L5 复核在 60s idle 后 RSS/FD 回落。生产高基数 Redis summary 与业务 Redis 物理隔离仍需要上线后只读观测；本轮未执行 Docker/生产 9022 动态验证。

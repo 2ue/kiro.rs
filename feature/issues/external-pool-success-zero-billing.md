@@ -238,3 +238,7 @@ git diff --check
 - `unrecognized_success_body` 的 output tokens 是估算，不等价于上游真实 output usage。它的目标是防止 success 记录完全 0 计费，并提供诊断字段方便后续对账。
 - 如果外部池返回非常规成功体且 output 无法从 `choices` 或常见文本字段识别，仍只计 input 成本，output 记 0；这比 `externalPoolBilling` 缺失更安全，但不是精确 usage。
 - 发布前仍需要项目最终发布 gate：全量测试一次性绿、release inventory、版本提交和 tag。当前证据只关闭“外部池成功 usage/billing 逻辑”这一个问题。
+
+## 2026-07-23 最终候选复核
+
+v0.0.117 候选 default/no-default 全量 Rust gate 已包含 external pool usage/billing 相关测试，其中 `postgres_rolls_up_external_pool_billing_for_large_samples_and_removes_after_cleanup` 通过；同时本轮移植后的非流式 usage projection、nested/OpenAI-style usage 识别、缺 usage 成功估算、`usageEstimated/usageEstimateReason/usageCandidatePath/bodyUsageProjectionApplied` 诊断字段和 `usageSource=request_estimate` 分类均由专题证据与全量 gate 覆盖。最终发布门禁还记录了冻结候选 SHA 与通过范围，见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。

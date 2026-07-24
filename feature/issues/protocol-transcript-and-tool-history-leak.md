@@ -212,3 +212,7 @@ Let me continue
 - `on_too_long` 另有故障注入：首个 554 KiB inference 被 fake Kiro 返回 `Input is too long`，代理 exactly 1 次 retry，retry body 约 37 KiB，仍无内部 transcript 指纹。
 
 当前残余项是实际 HTTP 首输出前 retry、真实 CLI 20/100 tool cycle、120k history/resume、MCP/agent 混合和最终性能。回滚不得恢复命令型 placeholder、原文 textify、任意 `Hashxxxxxxxx` matcher 或 suppression 后 success；未知未来 scaffold 应 fail closed，并以结构化观测支持后续扩展。
+
+### 2026-07-23 最终候选复核
+
+v0.0.117 冻结候选再次执行真实 Claude Code CLI 长会话 gate：5 个 session × 20 tool cycles，共 110 个 CLI turn、105 个 continue turn、100 个 Bash/Read tool turn、100/100 tool_use/tool_result、210 次 fake upstream inference，`leakMatches=0`、fake unknown requests 0。检测模式覆盖 `user Continue`、`user Tool results provided`、`Tool results:`、`<function_results>`、`<function_calls>`、`<invoke name=`、已知 `bash/read/edit/...Hash[0-9a-f]{8}` 和通用 `Hash[0-9a-f]{8}`。同轮 `bare-invoke` 20/20 也通过，15 个 literal XML/invoke negative case 未被升级成工具调用，5 个 structured case 正常生成工具 pair。报告路径与 SHA 见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。

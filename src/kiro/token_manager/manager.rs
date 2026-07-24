@@ -860,6 +860,14 @@ pub struct MultiTokenManager {
     pending_stats_batches: Mutex<VecDeque<PendingCredentialStatsBatch>>,
     /// PgSQL 临时不可用时保留的权威运行态 mutation，按凭据 FIFO 重放。
     pending_runtime_mutations: Mutex<HashMap<u64, VecDeque<PendingCredentialRuntimeMutation>>>,
+    /// 成功请求用于发现“其他实例写入的 PgSQL 运行态脏状态”的限频探测。
+    ///
+    /// 本地已知脏态和待重放 mutation 仍立即持久化；只有本进程内存干净、但可能存在
+    /// 跨实例失败计数时，才按凭据短 TTL 触发一次 PgSQL reconcile，避免稳态成功请求
+    /// 对 PgSQL 做一请求一事务的热路径放大。
+    last_runtime_success_reconcile_probe_at: Mutex<HashMap<u64, Instant>>,
+    #[cfg(test)]
+    runtime_success_reconcile_probe_attempts: AtomicU64,
     overflow_runtime_mutations: AtomicU64,
     runtime_mutation_flush_cursor: AtomicU64,
     /// 会话粘性绑定：conversationId -> credential id
@@ -887,6 +895,7 @@ const CONCURRENCY_WAIT_WAKEUP_SECS: u64 = 30;
 const DISPATCH_QUEUE_LEASE_SAFETY_MARGIN_SECS: u64 = 60;
 const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const PERSISTED_RUNTIME_SUCCESS_RECONCILE_MIN_INTERVAL: StdDuration = StdDuration::from_secs(2);
 /// Capacity/queue operations are correctness-critical, but a single Docker/Redis/runtime jitter
 /// above the old 75ms budget must not turn a healthy local pool into a global 429 wave.
 /// Affinity/sticky operations keep their stricter budget on a separate breaker.
@@ -1449,6 +1458,7 @@ enum PendingCredentialRuntimeMutation {
     Success {
         operation_id: uuid::Uuid,
         expected_generation: u64,
+        success_count: u32,
     },
     ApiFailure {
         operation_id: uuid::Uuid,
@@ -1829,6 +1839,28 @@ impl PendingCredentialRuntimeMutation {
             Self::Success { .. } | Self::ApiFailure { .. } => false,
             #[cfg(test)]
             Self::RefreshFailure { .. } => false,
+        }
+    }
+
+    fn coalesce_into_previous(&self, previous: &mut Self) -> bool {
+        match (previous, self) {
+            (
+                Self::Success {
+                    expected_generation: previous_generation,
+                    success_count: previous_success_count,
+                    ..
+                },
+                Self::Success {
+                    expected_generation,
+                    success_count,
+                    ..
+                },
+            ) if previous_generation == expected_generation => {
+                *previous_success_count =
+                    previous_success_count.saturating_add((*success_count).max(1));
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -2233,6 +2265,9 @@ impl MultiTokenManager {
             pending_stats_deltas: Mutex::new(HashMap::new()),
             pending_stats_batches: Mutex::new(VecDeque::new()),
             pending_runtime_mutations: Mutex::new(HashMap::new()),
+            last_runtime_success_reconcile_probe_at: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            runtime_success_reconcile_probe_attempts: AtomicU64::new(0),
             overflow_runtime_mutations: AtomicU64::new(0),
             runtime_mutation_flush_cursor: AtomicU64::new(0),
             session_bindings: Mutex::new(HashMap::new()),
@@ -6257,10 +6292,10 @@ impl MultiTokenManager {
             let kind = if tokio::time::Instant::now() >= deadline {
                 RefreshFailureKind::Timeout
             } else {
-                RefreshFailureKind::Coordination
+                RefreshFailureKind::Persistence
             };
             anyhow::Error::new(RefreshFailure::new(
-                RefreshFailureStage::Coordination,
+                RefreshFailureStage::Persistence,
                 kind,
                 None,
                 None,
@@ -7983,11 +8018,17 @@ impl MultiTokenManager {
             } else {
                 let total = pending.values().map(VecDeque::len).sum::<usize>();
                 let queue = pending.entry(id).or_default();
-                let over_soft_budget = total >= SOFT_PENDING_RUNTIME_MUTATIONS_TOTAL
-                    || queue.len() >= SOFT_PENDING_RUNTIME_MUTATIONS_PER_CREDENTIAL;
                 let requires_quarantine = mutation_requires_quarantine
                     || queue.iter().any(|item| item.requires_dispatch_quarantine());
-                queue.push_back(mutation);
+                let coalesced_tail = queue
+                    .back_mut()
+                    .is_some_and(|previous| mutation.coalesce_into_previous(previous));
+                let over_soft_budget = !coalesced_tail
+                    && (total >= SOFT_PENDING_RUNTIME_MUTATIONS_TOTAL
+                        || queue.len() >= SOFT_PENDING_RUNTIME_MUTATIONS_PER_CREDENTIAL);
+                if !coalesced_tail {
+                    queue.push_back(mutation);
+                }
                 (over_soft_budget, requires_quarantine)
             }
         };
@@ -8020,8 +8061,14 @@ impl MultiTokenManager {
             PendingCredentialRuntimeMutation::Success {
                 operation_id,
                 expected_generation,
+                success_count,
             } => store
-                .record_credential_success_at_generation(id, operation_id, expected_generation)
+                .record_credential_success_at_generation_with_count(
+                    id,
+                    operation_id,
+                    expected_generation,
+                    success_count,
+                )
                 .await
                 .map(|result| PersistedCredentialRuntimeMutation {
                     state: result.state,
@@ -8405,6 +8452,7 @@ impl MultiTokenManager {
                 PendingCredentialRuntimeMutation::Success {
                     operation_id,
                     expected_generation,
+                    success_count: 1,
                 },
             );
         }
@@ -8413,7 +8461,7 @@ impl MultiTokenManager {
                 let store = store.clone();
                 match block_on_credential_pgsql("原子记录 PgSQL 凭据调用成功", async move {
                     store
-                        .record_credential_success_at_generation(
+                        .record_credential_success_if_runtime_dirty_at_generation(
                             id,
                             operation_id,
                             expected_generation,
@@ -8445,6 +8493,7 @@ impl MultiTokenManager {
                             PendingCredentialRuntimeMutation::Success {
                                 operation_id,
                                 expected_generation,
+                                success_count: 1,
                             },
                         );
                     }
@@ -8458,6 +8507,30 @@ impl MultiTokenManager {
             .iter()
             .find(|entry| entry.id == id)
             .is_some_and(|entry| entry.disabled)
+    }
+
+    fn should_probe_persisted_runtime_success_state(&self, id: u64) -> bool {
+        if self.postgres_store.is_none() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut last_probe_at = self.last_runtime_success_reconcile_probe_at.lock();
+        if last_probe_at.get(&id).is_some_and(|last| {
+            now.saturating_duration_since(*last) < PERSISTED_RUNTIME_SUCCESS_RECONCILE_MIN_INTERVAL
+        }) {
+            return false;
+        }
+        last_probe_at.insert(id, now);
+        #[cfg(test)]
+        self.runtime_success_reconcile_probe_attempts
+            .fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    #[cfg(test)]
+    fn runtime_success_reconcile_probe_attempts(&self) -> u64 {
+        self.runtime_success_reconcile_probe_attempts
+            .load(Ordering::Acquire)
     }
 
     fn record_success_stats_delta(&self, id: u64, last_used_at: &str) {
@@ -9123,9 +9196,15 @@ impl MultiTokenManager {
             Some((expected_generation, last_used_at, true)) => {
                 self.persist_success_state(id, expected_generation, &last_used_at)
             }
-            Some((_, last_used_at, false)) => {
-                self.record_success_stats_delta(id, &last_used_at);
-                false
+            Some((expected_generation, last_used_at, false)) => {
+                if self.has_pending_runtime_mutations(id)
+                    || self.should_probe_persisted_runtime_success_state(id)
+                {
+                    self.persist_success_state(id, expected_generation, &last_used_at)
+                } else {
+                    self.record_success_stats_delta(id, &last_used_at);
+                    false
+                }
             }
             None => false,
         };

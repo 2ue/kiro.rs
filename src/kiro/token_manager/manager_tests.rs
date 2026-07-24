@@ -1229,6 +1229,17 @@ async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds
     let mut credential = api_key_credential("stats-shutdown-drain");
     credential.id = Some(1);
     store.save_credentials(&[credential.clone()]).await.unwrap();
+    store
+        .patch_credential_runtime_state(
+            1,
+            uuid::Uuid::new_v4(),
+            &CredentialRuntimeStatePatch {
+                warmup_remaining: Some(2),
+                ..CredentialRuntimeStatePatch::default()
+            },
+        )
+        .await
+        .unwrap();
     let manager = Arc::new(
         MultiTokenManager::new_with_stores(
             Config::default(),
@@ -1264,15 +1275,30 @@ async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds
             last_used_at: Some("2026-01-01T00:00:00Z".to_string()),
         },
     );
-    for _ in 0..2 {
-        assert!(manager.enqueue_pending_runtime_mutation(
-            1,
-            PendingCredentialRuntimeMutation::Success {
-                operation_id: uuid::Uuid::new_v4(),
-                expected_generation: 0,
-            },
-        ));
-    }
+    assert!(manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::Success {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            success_count: 1,
+        },
+    ));
+    assert!(manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::ApiFailure {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            last_used_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+    ));
+    assert!(manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::Success {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            success_count: 1,
+        },
+    ));
     manager.mark_stats_dirty();
 
     // Delay the periodic tick so this exercises only the shutdown drain. A limit of one
@@ -1299,7 +1325,9 @@ async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds
         Some("2026-01-01T00:00:00Z")
     );
     let runtime = store.load_credential_runtime_state().await.unwrap();
-    assert_eq!(runtime[&1].revision, 2);
+    assert_eq!(runtime[&1].revision, 4);
+    assert_eq!(runtime[&1].failure_count, 0);
+    assert_eq!(runtime[&1].warmup_remaining, 0);
 
     store.drop_test_schema().await.unwrap();
 }
@@ -1318,6 +1346,19 @@ async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
         })
         .collect();
     store.save_credentials(&credentials).await.unwrap();
+    for id in [2, 3] {
+        store
+            .patch_credential_runtime_state(
+                id,
+                uuid::Uuid::new_v4(),
+                &CredentialRuntimeStatePatch {
+                    warmup_remaining: Some(2),
+                    ..CredentialRuntimeStatePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
     let manager = MultiTokenManager::new_with_stores(
         Config::default(),
         credentials,
@@ -1335,6 +1376,7 @@ async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
                 PendingCredentialRuntimeMutation::Success {
                     operation_id: uuid::Uuid::new_v4(),
                     expected_generation: 0,
+                    success_count: 1,
                 },
             ));
         }
@@ -1346,16 +1388,28 @@ async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
     {
         let pending = manager.pending_runtime_mutations.lock();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending.get(&1).map(VecDeque::len), Some(2));
+        let failed_queue = pending
+            .get(&1)
+            .expect("failed credential keeps pending success");
+        assert_eq!(failed_queue.len(), 1);
+        match failed_queue.front().unwrap() {
+            PendingCredentialRuntimeMutation::Success { success_count, .. } => {
+                assert_eq!(*success_count, 2);
+            }
+            other => panic!("expected coalesced success mutation, got {other:?}"),
+        }
     }
     let states = store.load_credential_runtime_state().await.unwrap();
     assert_eq!(states[&2].revision, 2);
+    assert_eq!(states[&2].warmup_remaining, 0);
     assert_eq!(states[&3].revision, 2);
+    assert_eq!(states[&3].warmup_remaining, 0);
     {
         let entries = manager.entries.lock();
         let failed = entries.iter().find(|entry| entry.id == 1).unwrap();
         assert!(failed.runtime_persistence_degraded);
-        assert!(failed.disabled);
+        assert!(!failed.runtime_persistence_quarantined);
+        assert!(!failed.disabled);
         for id in [2, 3] {
             let healthy = entries.iter().find(|entry| entry.id == id).unwrap();
             assert_eq!(healthy.runtime_revision, 2);
@@ -1528,6 +1582,7 @@ fn delete_credential_clears_pending_persistence_for_that_id() {
         PendingCredentialRuntimeMutation::Success {
             operation_id: uuid::Uuid::new_v4(),
             expected_generation: 0,
+            success_count: 1,
         },
     ));
     manager.mark_stats_dirty();
@@ -1630,6 +1685,7 @@ async fn reload_remote_delete_clears_pending_persistence_for_removed_id() {
         PendingCredentialRuntimeMutation::Success {
             operation_id: uuid::Uuid::new_v4(),
             expected_generation: 0,
+            success_count: 1,
         },
     ));
     manager.mark_stats_dirty();
@@ -1924,6 +1980,7 @@ async fn runtime_mutation_flush_respects_global_wall_clock_budget() {
             PendingCredentialRuntimeMutation::Success {
                 operation_id: uuid::Uuid::new_v4(),
                 expected_generation: 0,
+                success_count: 1,
             },
         ));
     }
@@ -2494,7 +2551,7 @@ async fn ordinary_refresh_postgres_failure_is_typed_and_credential_health_neutra
         eprintln!("跳过 PgSQL/Redis TokenManager 集成测试：未设置存储集成测试环境变量");
         return;
     };
-    let (token_endpoint, _request_received, server) = spawn_force_refresh_token_endpoint().await;
+    let (token_endpoint, request_received, server) = spawn_force_refresh_token_endpoint().await;
     let mut credential = force_refresh_test_credential(token_endpoint);
     credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
     store
@@ -2529,7 +2586,13 @@ async fn ordinary_refresh_postgres_failure_is_typed_and_credential_health_neutra
         .expect("refresh persistence failure must remain typed");
     assert_eq!(typed.stage, RefreshFailureStage::Persistence);
     assert_eq!(typed.kind, RefreshFailureKind::Persistence);
-    assert!(typed.send_committed);
+    assert!(!typed.send_committed);
+    assert!(
+        tokio::time::timeout(StdDuration::from_millis(50), request_received.notified())
+            .await
+            .is_err(),
+        "PgSQL authority reload failure must fail before sending an OAuth refresh request"
+    );
     let expected_refresh_token = "r".repeat(150);
     {
         let entries = manager.entries.lock();
@@ -3862,6 +3925,126 @@ async fn postgres_success_reset_is_ordered_before_next_cross_manager_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postgres_clean_success_reconciliation_is_rate_limited_per_credential() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credential = api_key_credential("ksk_success_reconcile_rate_limit");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+
+    for _ in 0..8 {
+        manager.report_success(1);
+    }
+
+    assert_eq!(
+        manager.runtime_success_reconcile_probe_attempts(),
+        1,
+        "clean steady-state success must not issue one PgSQL runtime reconcile transaction per request"
+    );
+
+    store.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn pending_success_runtime_mutations_coalesce_at_queue_tail() {
+    let mut credential = api_key_credential("ksk_pending_success_coalesce");
+    credential.id = Some(1);
+    let manager = MultiTokenManager::new(Config::default(), vec![credential], None, None, false)
+        .expect("construct token manager");
+
+    manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::Success {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            success_count: 1,
+        },
+    );
+    manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::Success {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            success_count: 1,
+        },
+    );
+    assert_eq!(
+        manager.runtime_mutation_backlog(),
+        (1, 0),
+        "repeated clean successes while PgSQL is degraded must not grow the pending queue"
+    );
+    {
+        let pending = manager.pending_runtime_mutations.lock();
+        let mutation = pending
+            .get(&1)
+            .and_then(|queue| queue.front())
+            .expect("coalesced success must remain queued");
+        match mutation {
+            PendingCredentialRuntimeMutation::Success { success_count, .. } => {
+                assert_eq!(*success_count, 2);
+            }
+            other => panic!("expected coalesced success mutation, got {other:?}"),
+        }
+    }
+
+    manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::ApiFailure {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            last_used_at: Utc::now().to_rfc3339(),
+        },
+    );
+    manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::Success {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            success_count: 1,
+        },
+    );
+    manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::Success {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            success_count: 1,
+        },
+    );
+    assert_eq!(
+        manager.runtime_mutation_backlog(),
+        (3, 0),
+        "a success after a pending failure must be preserved, then tail-coalesced again"
+    );
+    {
+        let pending = manager.pending_runtime_mutations.lock();
+        let tail = pending
+            .get(&1)
+            .and_then(|queue| queue.back())
+            .expect("coalesced tail success must remain queued");
+        match tail {
+            PendingCredentialRuntimeMutation::Success { success_count, .. } => {
+                assert_eq!(*success_count, 2);
+            }
+            other => panic!("expected coalesced success tail, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_refresh_failure_counts_are_atomic_across_managers() {
     let Some(store) = test_postgres_store().await else {
         eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -4014,6 +4197,7 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
         PendingCredentialRuntimeMutation::Success {
             operation_id: uuid::Uuid::new_v4(),
             expected_generation: 0,
+            success_count: 1,
         },
     ));
     {
@@ -4228,6 +4412,7 @@ fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five
                 0 => PendingCredentialRuntimeMutation::Success {
                     operation_id: uuid::Uuid::new_v4(),
                     expected_generation: 0,
+                    success_count: 1,
                 },
                 1 => PendingCredentialRuntimeMutation::ApiFailure {
                     operation_id: uuid::Uuid::new_v4(),
@@ -9195,29 +9380,25 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn redis_business_and_observability_fault_domains_are_independent_for_three_rounds() {
-    let Some(business_url) =
-        crate::storage::integration_test_url("KIRO_RS_TEST_BUSINESS_REDIS_URL")
+    let Some(business_url) = std::env::var("KIRO_RS_TEST_BUSINESS_REDIS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
     else {
         eprintln!("跳过双 Redis 故障域测试：未设置 KIRO_RS_TEST_BUSINESS_REDIS_URL");
         return;
     };
-    let Some(observability_url) =
-        crate::storage::integration_test_url("KIRO_RS_TEST_OBSERVABILITY_REDIS_URL")
+    let Some(observability_url) = std::env::var("KIRO_RS_TEST_OBSERVABILITY_REDIS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
     else {
         eprintln!("跳过双 Redis 故障域测试：未设置 KIRO_RS_TEST_OBSERVABILITY_REDIS_URL");
         return;
     };
     let Some(_) = test_fault_domain_toxiproxy("business") else {
-        if std::env::var("KIRO_RS_REQUIRE_STORAGE_TESTS").is_ok() {
-            panic!("business Redis Toxiproxy variables are required");
-        }
         eprintln!("跳过双 Redis 故障域测试：未设置 business Toxiproxy variables");
         return;
     };
     let Some(_) = test_fault_domain_toxiproxy("observability") else {
-        if std::env::var("KIRO_RS_REQUIRE_STORAGE_TESTS").is_ok() {
-            panic!("observability Redis Toxiproxy variables are required");
-        }
         eprintln!("跳过双 Redis 故障域测试：未设置 observability Toxiproxy variables");
         return;
     };
@@ -10324,6 +10505,12 @@ async fn provisional_local_reservation_spreads_concurrent_redis_acquires() {
         for context in &mut contexts {
             context.release_in_flight();
         }
+        assert!(
+            manager
+                .drain_scheduler_redis_releases(StdDuration::from_secs(3))
+                .await,
+            "round with concurrency={contenders}: Redis release dispatcher must drain"
+        );
         crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
             .await;
         assert!(

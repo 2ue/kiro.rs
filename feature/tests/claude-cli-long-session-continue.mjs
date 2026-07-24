@@ -20,6 +20,7 @@ const REDIS_URL = requiredEnvironment('KIRO_LONG_SESSION_REDIS_URL')
 const CLAUDE = process.env.KIRO_CLAUDE_BINARY || 'claude'
 const ROUNDS = parseBoundedInteger('KIRO_LONG_SESSION_ROUNDS', 5, 1, 5)
 const TOOL_CYCLES = parseBoundedInteger('KIRO_LONG_SESSION_TOOL_CYCLES', 20, 1, 100)
+const PROGRESS_LOGGING_ENABLED = process.env.KIRO_VALIDATION_PROGRESS === '1'
 const RUN_ID = `long-session-${Date.now()}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `${RUN_ID}-`))
 const REPORT_ROOT = path.join(ARTIFACT_ROOT, 'reports', 'claude-cli-long-session-continue')
@@ -47,6 +48,16 @@ function requiredEnvironment(name) {
   const value = String(process.env[name] || '').trim()
   if (!value) throw new Error(`${name} is required`)
   return value
+}
+
+function progressLog(event) {
+  if (!PROGRESS_LOGGING_ENABLED) return
+  console.error(JSON.stringify({
+    schemaVersion: 1,
+    kind: 'long_session_continue_progress',
+    timestamp: new Date().toISOString(),
+    ...event,
+  }))
 }
 
 function parseBoundedInteger(name, fallback, minimum, maximum) {
@@ -847,6 +858,7 @@ async function main() {
     const cliVersion = commandOutput(CLAUDE, ['--version'])
     const sessions = []
     for (let round = 1; round <= ROUNDS; round += 1) {
+      progressLog({ event: 'session_start', round })
       const sessionRoot = path.join(TEMP_ROOT, `session-${round}`)
       const projectRoot = path.join(sessionRoot, 'project')
       fs.mkdirSync(projectRoot, { recursive: true, mode: 0o700 })
@@ -856,6 +868,7 @@ async function main() {
       let firstUserMarker = null
 
       for (let turn = 1; turn <= TOOL_CYCLES + 2; turn += 1) {
+        progressLog({ event: 'turn_start', round, turn })
         const toolName = turn === 1 || turn === TOOL_CYCLES + 2
           ? null
           : turn % 2 === 0 ? 'Bash' : 'Read'
@@ -934,6 +947,17 @@ async function main() {
           stdoutSha256: cli.stdoutSha256,
           stderrSha256: cli.stderrSha256,
         })
+        progressLog({
+          event: 'turn_done',
+          round,
+          turn,
+          invocation: turn === 1 ? 'session-id' : 'continue',
+          durationMs: cli.durationMs,
+          exitCode: cli.code,
+          toolUseCount: parsed.toolUseIds.length,
+          toolResultCount: parsed.toolResultIds.length,
+          leakMatches: leaks,
+        })
         previousAssistantMarker = scenario.assistantMarker
       }
 
@@ -949,6 +973,7 @@ async function main() {
         firstWireBodyBytes: turns[0].firstWireBodyBytes,
         finalWireBodyBytes: turns.at(-1).lastWireBodyBytes,
       })
+      progressLog({ event: 'session_done', round })
     }
 
     const allTurns = sessions.flatMap((session) => session.turns)

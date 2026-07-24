@@ -1081,6 +1081,17 @@ mod tests {
     };
     use crate::model::config::{Config, TlsBackend};
 
+    fn refresh_test_tls_backend() -> TlsBackend {
+        #[cfg(feature = "native-tls")]
+        {
+            TlsBackend::NativeTls
+        }
+        #[cfg(not(feature = "native-tls"))]
+        {
+            TlsBackend::Rustls
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
     enum FakeOAuthScenario {
@@ -1575,7 +1586,7 @@ mod tests {
         config.credential_rate_limit_cooldown_secs = 1;
         config.credential_max_cooldown_secs = 2;
         config.credential_cooldown_jitter_percent = 0;
-        config.tls_backend = TlsBackend::NativeTls;
+        config.tls_backend = refresh_test_tls_backend();
         Arc::new(
             MultiTokenManager::new(config, credentials, None, None, false)
                 .expect("construct automatic auth recovery manager"),
@@ -1773,7 +1784,7 @@ mod tests {
         config.credential_cooldown_jitter_percent = 0;
         config.credential_max_concurrent_requests = 1;
         config.auxiliary_upstream_max_concurrent_requests = auxiliary_max_concurrent_requests;
-        config.tls_backend = TlsBackend::NativeTls;
+        config.tls_backend = refresh_test_tls_backend();
         Arc::new(
             MultiTokenManager::new(config, credentials, None, None, false)
                 .expect("construct focused fake OAuth token manager"),
@@ -2086,7 +2097,7 @@ mod tests {
                 1,
                 60_000_000 + round,
                 &server.token_endpoint,
-                TlsBackend::NativeTls,
+                refresh_test_tls_backend(),
                 1,
                 1,
             );
@@ -2127,7 +2138,7 @@ mod tests {
                 1,
                 70_000_000 + round,
                 &server.token_endpoint,
-                TlsBackend::NativeTls,
+                refresh_test_tls_backend(),
                 1,
                 1,
             );
@@ -2273,7 +2284,7 @@ mod tests {
                     1,
                     81_000_000 + scenario as usize * 100 + round,
                     &server.token_endpoint,
-                    TlsBackend::NativeTls,
+                    refresh_test_tls_backend(),
                     0,
                 );
                 let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
@@ -2611,7 +2622,7 @@ mod tests {
                     1,
                     82_000_000 + scenario as usize * 100 + round,
                     &server.token_endpoint,
-                    TlsBackend::NativeTls,
+                    refresh_test_tls_backend(),
                     0,
                 );
                 let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
@@ -2788,7 +2799,7 @@ mod tests {
                             POOL_SIZE,
                             namespace,
                             &server.token_endpoint,
-                            TlsBackend::NativeTls,
+                            refresh_test_tls_backend(),
                             0,
                         );
                         tasks.push(tokio::spawn(async move {
@@ -2881,7 +2892,7 @@ mod tests {
                             1,
                             9_000_000 + round * 100 + recovery_index,
                             &recovery_server.token_endpoint,
-                            TlsBackend::NativeTls,
+                            refresh_test_tls_backend(),
                             0,
                         );
                         recovery_tasks.push(tokio::spawn(async move {
@@ -2928,7 +2939,7 @@ mod tests {
                         POOL_SIZE,
                         scenario as usize * 100_000 + concurrency * 100 + round,
                         &server.token_endpoint,
-                        TlsBackend::NativeTls,
+                        refresh_test_tls_backend(),
                         1,
                         EXPECTED_PROCESS_AUXILIARY_MAX_CONCURRENCY as u32,
                         6_000,
@@ -3116,7 +3127,7 @@ mod tests {
                 1,
                 19_000_000 + round,
                 &server.token_endpoint,
-                TlsBackend::NativeTls,
+                refresh_test_tls_backend(),
                 0,
             );
             let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
@@ -3177,7 +3188,7 @@ mod tests {
                     POOL_SIZE,
                     20_000_000 + concurrency * 100 + round,
                     &server.token_endpoint,
-                    TlsBackend::NativeTls,
+                    refresh_test_tls_backend(),
                     1,
                     64,
                     6_000,

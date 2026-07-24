@@ -134,3 +134,7 @@ E03-E05、F03。故障注入覆盖 50/74/75/90/150/500 ms、connection reset、r
 - `redis-fault-domain-product-20260722-r1`：business Redis `<loopback>:26379/db8`、observability Redis `<loopback>:50892/db2`，3 outer × 1 exact × 内部 3 轮通过。结果 `dockerUsed=false`、`flushDbUsed=false`、`protected9022ProbeSkipped=true`，证明 usage/observability 故障域不会把 scheduler 拉入 degraded 或 `AllDisabled`。
 
 这把“单实例 Redis chaos + usage 同窗故障 + business/observability Redis 分离 + SchedulerRedisDegraded external takeover 正/负向动态路径”的当前工作树证据更新到 2026-07-22。剩余发布门仍包括两实例组合故障、真实上游/全能力 CLI、UI、upgrade 和最终 inventory。完整证据见 [final-regression-rerun-20260722](../evidence/final-regression-rerun-20260722.md) 与 [external takeover evidence](../evidence/external-takeover-scheduler-degraded-20260721.md)。
+
+## 2026-07-23 最终候选复核
+
+v0.0.117 冻结候选通过 load/chaos L3/L4：突发错误、429/500、invalid tool、client-drop、proxy restart 后恢复流量均 12/12 成功；未出现“账号全部禁用”或调度退化后无法恢复的表现。L3/L4 使用 fake upstream 和独立 PG/Redis，不是生产 9022 或 Docker 动态验证。SchedulerRedisDegraded external takeover 的正/负向动态证据仍以 2026-07-22 的专门 runner 为准；最终门禁补充证明该修复未被后续改动破坏。详见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。

@@ -705,6 +705,17 @@ impl AuxiliaryRuntime {
 mod tests {
     use super::*;
 
+    fn refresh_test_tls_backend() -> TlsBackend {
+        #[cfg(feature = "native-tls")]
+        {
+            TlsBackend::NativeTls
+        }
+        #[cfg(not(feature = "native-tls"))]
+        {
+            TlsBackend::Rustls
+        }
+    }
+
     #[test]
     fn token_refresh_local_bucket_refill_is_integer_and_stable_for_five_rounds() {
         for _ in 0..5 {
@@ -909,7 +920,7 @@ mod tests {
     {
         for _ in 0..5 {
             let mut config = Config::default();
-            config.tls_backend = TlsBackend::NativeTls;
+            config.tls_backend = refresh_test_tls_backend();
             let runtime = Arc::new(AuxiliaryRuntime::new(&config, None, false).unwrap());
             let barrier = Arc::new(tokio::sync::Barrier::new(32));
             let tasks = (0..32)
@@ -918,7 +929,9 @@ mod tests {
                     let barrier = barrier.clone();
                     tokio::spawn(async move {
                         barrier.wait().await;
-                        runtime.refresh_client(TlsBackend::NativeTls, None).await
+                        runtime
+                            .refresh_client(refresh_test_tls_backend(), None)
+                            .await
                     })
                 })
                 .collect::<Vec<_>>();

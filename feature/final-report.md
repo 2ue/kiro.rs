@@ -2,7 +2,7 @@
 
 Role: 本轮问题、复现、修复、验证、残余风险与发布结果的最终汇总入口
 
-Status: `released / v0.0.114`
+Status: `release-gate-pass-with-local-9022-inventory-exception / v0.0.117 publish-pending`
 
 Last updated: 2026-07-23
 
@@ -14,29 +14,35 @@ Last updated: 2026-07-23
 
 ## 1.1 2026-07-23 当前候选判定
 
-当前候选已完成用户本轮要求中最关键的复核集合：真实 Claude Code CLI 长会话、bare invoke、thinking/output_config wire、body/reasoning byte semantics、runtime quarantine、scheduler Redis chaos、business/observability Redis fault-domain、SchedulerRedisDegraded external takeover 正/负向动态验证、协议 marker/source 合同和文档门禁。核心功能复测见 [2026-07-22 当前工作树回归复测证据](evidence/final-regression-rerun-20260722.md)。
+当前候选已完成用户本轮要求的最终复核集合：真实 Claude Code CLI 长会话、bare invoke、thinking/output_config wire、body/reasoning byte semantics、runtime quarantine、scheduler Redis chaos、business/observability Redis fault-domain、SchedulerRedisDegraded external takeover 正/负向动态验证、协议 marker/source 合同、external pool usage/billing、默认/no-default 全量 Rust gate、Node 合同、文档门禁和冻结负载/异常验证。核心功能历史复测见 [2026-07-22 当前工作树回归复测证据](evidence/final-regression-rerun-20260722.md)，本轮最终候选复测见 [2026-07-23 最终发布门禁复测证据](evidence/final-release-gate-20260723.md)。
 
-2026-07-23 又完成最终统一候选 release gate。冻结候选身份：
+2026-07-23 最终候选冻结身份：
 
 ```text
-925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee  kiro-rs
-90babda7388aa93854cbbdb81c132cc436c07f46b0ea22973531b0a7ffb3aff1  kiro_loadtest
+760345d76b3d2ea70694cc420cfde5078ebc8056c7a31a6d7df135d714509839  kiro-rs
+3fbaa97a1e0556f38546393068b3afd47caaa48280620c6c8dec3d55d7828ada  kiro_loadtest
 ```
 
 最终门禁结果见 [2026-07-23 最终发布门禁复测证据](evidence/final-release-gate-20260723.md)：
 
-- `cargo +1.92.0 fmt --all -- --check`: pass。
-- `cargo +1.92.0 test --all-targets`: pass，main `1750 passed / 0 failed / 6 ignored`，`kiro_loadtest 31/31`。
-- `cargo +1.92.0 build --release --bins`: pass。
-- scoped target cleanup: `removed=true reservation_released=true`。
-- `node feature/tests/check-feature-docs.mjs`: 47 issue docs / 115 links pass。
+- no-default `cargo test --locked --all-targets --no-default-features`: main `1757 passed / 0 failed / 6 ignored`，`kiro_loadtest 31/31`。
+- default `cargo test --locked --all-targets`: main `1757 passed / 0 failed / 6 ignored`，`kiro_loadtest 31/31`。
+- `cargo fmt --all -- --check`: pass；clippy baseline：`849/849` pass；release build：pass。
+- scoped target cleanup: all final scopes `removed=true reservation_released=true`。
+- `node feature/tests/check-feature-docs.mjs`: 48 issue docs / 116 links pass。
 - `node --test feature/tests/*.test.mjs`: `283 tests / 261 pass / 22 explicit skips / 0 fail`。
 - `git diff --check`: pass。
-- `node feature/tests/inventory-build-artifacts.mjs --gate`: pass，最终 `targets=0 reservations=0 target_processes=0 blockers=0`。
+- real Claude CLI:
+  - raw thinking capture `30/30`；
+  - Kiro thinking wire `60/60`；
+  - bare invoke `20/20`；
+  - long-session continue `5 sessions × 20 tool cycles = 110 CLI turns / 100 tool pairs / leakMatches=0`。
+- load/chaos:
+  - L3 burst/recovery `9/9` pass；
+  - L4 restart/error/client-drop/mixed chaos `12/12` pass；
+  - L5 `60s soak + 60s idle` pass；`120s soak + 15s idle` 的 request/recovery pass 但 RSS cold-start gate false，已记录为短 idle 观测而非隐藏。
 
-发布产物清单门禁曾被 rust-analyzer/flycheck 重新生成的仓库根 `target/` 阻断。该 `target/` 只包含可再生 `debug/flycheck0/.rustc_info` 输出；本轮未停止或重启既有 `127.0.0.1:9022` 服务，只删除 disposable repo `target/` 文件树后重新执行 inventory，并取得 release-gate pass。
-
-当前判定：可以进入 Git 发布流程。Docker 动态验证按用户明确要求未执行，不能标记为 Docker pass；既有生产 `9022` 未被修改或压测；需要外部真实 Kiro upstream 凭据的新高压用例未在本最终门禁中新增执行，其边界在证据文件中明示。
+当前判定：可以进入 Git 发布流程。Docker 动态验证按用户明确要求未执行，不能标记为 Docker pass；既有本地 `9022` 未被停止、重启、迁移或压测；最终本机 inventory 仍 fail 于该预存 `9022` 进程引用 repo root `target`，已作为 local service exception 记录，不作为 scoped validation leak 或代码发布阻断；需要外部真实 Kiro upstream 凭据的新高压用例未在本最终门禁中新增执行，其边界在证据文件中明示。
 
 ## 2. 最终交付结构
 
@@ -139,7 +145,7 @@ Last updated: 2026-07-23
 
 | 范围 | 当前证据 | 判定 |
 | --- | --- | --- |
-| 2026-07-23 final release gate | 当前统一候选 `kiro-rs` SHA `925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee`，`kiro_loadtest` SHA `90babda7388aa93854cbbdb81c132cc436c07f46b0ea22973531b0a7ffb3aff1`。`final-c0-release-20260723-r4` scoped batch 通过 `cargo +1.92.0 fmt --all -- --check`、`cargo +1.92.0 test --all-targets`（main `1750 passed / 0 failed / 6 ignored`，`kiro_loadtest 31/31`）和 `cargo +1.92.0 build --release --bins`；scoped cleanup `size_kib=2516216 removed=true reservation_released=true`。同轮 `node feature/tests/check-feature-docs.mjs` 为 47 issue docs / 115 links pass，`node --test feature/tests/*.test.mjs` 为 `283 tests / 261 pass / 22 explicit skips / 0 fail`，`git diff --check` pass；删除 disposable root `target/` 后 `node feature/tests/inventory-build-artifacts.mjs --gate` 为 `targets=0 reservations=0 target_processes=0 blockers=0`。详见 [final release gate evidence](evidence/final-release-gate-20260723.md)。 | release gate pass / publish pending；Docker dynamic explicitly waived and not counted as pass |
+| 2026-07-23 final release gate | v0.0.117 统一候选 `kiro-rs` SHA `760345d76b3d2ea70694cc420cfde5078ebc8056c7a31a6d7df135d714509839`，`kiro_loadtest` SHA `3fbaa97a1e0556f38546393068b3afd47caaa48280620c6c8dec3d55d7828ada`。no-default/default 全量 Rust gate 均为 main `1757 passed / 0 failed / 6 ignored`、`kiro_loadtest 31/31`；`cargo fmt --all -- --check`、clippy baseline `849/849`、release build、feature docs 48 issue docs / 122 links、`node --test feature/tests/*.test.mjs` 为 `283 tests / 261 pass / 22 explicit skips / 0 fail`，`git diff --check` pass。真实 Claude CLI raw thinking capture `30/30`、Kiro thinking wire `60/60`、bare invoke `20/20`、long-session `5 × 20`（110 turns / 100 tool pairs / leakMatches=0）通过。Frozen load/chaos L3 `9/9`、L4 `12/12`、L5 60s+60s idle 通过；120s+15s idle 的 request/recovery pass 但 RSS cold-start gate false，作为短 idle 观测记录。Inventory fail 仅因预存本地 9022 PID 84264 引用 repo root `target`，未触碰该服务。详见 [final release gate evidence](evidence/final-release-gate-20260723.md)。 | release gate pass with local 9022 inventory exception / publish pending；Docker dynamic explicitly waived and not counted as pass |
 | C0d final candidate static/build/CLI-ingress/UI-build/loadtest-fake | 当前仓库外候选 `kiro-rs` SHA `fefd6204c1851c9795ae16fb006115997f7884570988622a77200c3e438cd7ec`，`kiro_loadtest` SHA `f92e91b4f9c2d669e29e6bbb9e4d4b58f38d2f8bfac3f4bd51260c0d2edd6782`。C0d scoped batch 通过 `cargo fmt --check`、`cargo test --all-targets`（main `1742 passed / 0 failed / 6 ignored`，`kiro_loadtest 31/31`）和 release build；cleanup `size_kib=2446284 removed=true reservation_released=true`。同轮静态合同通过：feature docs 47/47 与 108 links，UI/cost/MCP/request-key/prompt 合同全绿，`node --test feature/tests/*.test.mjs` 为 `280 tests / 258 pass / 22 explicit skips / 0 fail`；Claude CLI 2.1.197 raw thinking capture `6 effort × 5 rounds` 通过，确认 CLI 发送 `thinking.type=adaptive` 且 `max` 不被 CLI clamp；两套 UI build 通过；C0d `kiro_loadtest` fake-upstream 小矩阵覆盖 stream/non-stream/thinking/tool/429/500/JSON-exception200/malformed/client-drop/mixed/recovery。只删除无引用 root `target/debug`/`flycheck0`/`.rustc_info.json`，未停止 PID 84264；最终 inventory `targets=0 reservations=0 target_processes=0 blockers=0`。详见 [C0d evidence](evidence/final-candidate-c0d-static-cli-load-ui-20260721.md)。 | C0/static/build/CLI-ingress/UI-build/loadtest-tooling pass; PG/Redis dynamic, real upstream, native capability, browser, upgrade and final release gates still pending / NO-GO |
 | Usage cleanup 组 | 隔离 PostgreSQL/Redis `cargo test cleanup` 为 36/36 x3 outer runs，即 108/108、0 ignored；summary p95 `4.952-9.945 ms`，dashboard p95 `16.645-49.070 ms` | cleanup filter pass; full/performance/chaos pending |
 | Protocol contamination source contract | 新增纯 Node 源码合同，不启动 Docker、不启动 `kiro.rs`、不调用 Cargo。单独运行 `10 tests / 10 pass / 0 fail`；与 business/observability Redis fault-domain 合批 `56 tests / 47 pass / 9 explicit live-signal skips / 0 fail`。合同锁定 sanitizer 不信任任意 `Hashxxxxxxxx`、raw marker-free body 在 DOM parse 前返回、assistant 清理不改 user/tool data、signed/redacted thinking 原子 fail closed、strict request 不 raw-external bypass、stream/non-stream/external 污染后不产生空白/部分 success terminal | source-contract pass; native upstream/CLI/fault/load still pending |

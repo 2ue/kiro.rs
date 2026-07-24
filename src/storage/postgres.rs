@@ -2897,38 +2897,103 @@ impl PostgresStore {
         operation_id: Uuid,
     ) -> anyhow::Result<CredentialRuntimeStateRow> {
         Ok(self
-            .record_credential_success_with_expected_generation(credential_id, operation_id, None)
+            .record_credential_success_with_expected_generation(
+                credential_id,
+                operation_id,
+                None,
+                1,
+            )
             .await?
             .state)
     }
 
-    pub async fn record_credential_success_at_generation(
+    pub async fn record_credential_success_at_generation_with_count(
         &self,
         credential_id: u64,
         operation_id: Uuid,
         expected_generation: u64,
+        success_count: u32,
     ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
         self.record_credential_success_with_expected_generation(
             credential_id,
             operation_id,
             Some(expected_generation),
+            success_count,
         )
         .await
     }
 
-    async fn record_credential_success_with_expected_generation(
+    pub async fn record_credential_success_if_runtime_dirty_at_generation(
         &self,
         credential_id: u64,
         operation_id: Uuid,
-        expected_generation: Option<u64>,
+        expected_generation: u64,
     ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
         let mut tx = self.pool.begin().await?;
+        let credential_disabled = lock_active_credential_in_tx(&mut tx, credential_id).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO credential_runtime_state (
+                credential_id, failure_count, refresh_failure_count,
+                disabled_reason, warmup_remaining, generation, revision, updated_at
+            )
+            VALUES ($1, 0, 0, NULL, 0, 0, 0, now())
+            ON CONFLICT (credential_id) DO NOTHING
+            "#,
+        )
+        .bind(credential_id as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT failure_count, refresh_failure_count, disabled_reason,
+                   warmup_remaining, generation, revision
+            FROM credential_runtime_state
+            WHERE credential_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(credential_id as i64)
+        .fetch_one(&mut *tx)
+        .await?;
+        let state = runtime_state_from_row(&row)?;
+        if expected_generation < state.generation {
+            tx.commit().await?;
+            return Ok(CredentialRuntimeStateMutationResult {
+                state,
+                credential_disabled,
+                applied: false,
+            });
+        }
+        if expected_generation > state.generation {
+            anyhow::bail!(
+                "凭据 #{} 运行态 generation 超前：期望 {}，当前 {}",
+                credential_id,
+                expected_generation,
+                state.generation
+            );
+        }
+
+        let runtime_dirty = state.failure_count > 0
+            || state.refresh_failure_count > 0
+            || state.disabled_reason.is_some()
+            || state.warmup_remaining > 0;
+        if !runtime_dirty {
+            tx.commit().await?;
+            return Ok(CredentialRuntimeStateMutationResult {
+                state,
+                credential_disabled,
+                applied: false,
+            });
+        }
+
         let (next_revision, credential_disabled) = match prepare_credential_runtime_mutation(
             &mut tx,
             credential_id,
             operation_id,
             "success",
-            expected_generation,
+            Some(expected_generation),
         )
         .await?
         {
@@ -2974,6 +3039,82 @@ impl PostgresStore {
             "#,
         )
         .bind(credential_id as i64)
+        .fetch_one(&mut *tx)
+        .await?;
+        let state = runtime_state_from_row(&row)?;
+        verify_runtime_mutation_revision(&state, next_revision)?;
+        tx.commit().await?;
+        Ok(CredentialRuntimeStateMutationResult {
+            state,
+            credential_disabled,
+            applied: true,
+        })
+    }
+
+    async fn record_credential_success_with_expected_generation(
+        &self,
+        credential_id: u64,
+        operation_id: Uuid,
+        expected_generation: Option<u64>,
+        success_count: u32,
+    ) -> anyhow::Result<CredentialRuntimeStateMutationResult> {
+        let warmup_decrement = i32::try_from(success_count.max(1)).unwrap_or(i32::MAX);
+        let mut tx = self.pool.begin().await?;
+        let (next_revision, credential_disabled) = match prepare_credential_runtime_mutation(
+            &mut tx,
+            credential_id,
+            operation_id,
+            "success",
+            expected_generation,
+        )
+        .await?
+        {
+            CredentialRuntimeMutationPreparation::Apply {
+                next_revision,
+                credential_disabled,
+                ..
+            } => (next_revision, credential_disabled),
+            CredentialRuntimeMutationPreparation::Duplicate {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: true,
+                });
+            }
+            CredentialRuntimeMutationPreparation::Stale {
+                state,
+                credential_disabled,
+            } => {
+                tx.commit().await?;
+                return Ok(CredentialRuntimeStateMutationResult {
+                    state,
+                    credential_disabled,
+                    applied: false,
+                });
+            }
+        };
+        let row = sqlx::query(
+            r#"
+            UPDATE credential_runtime_state
+            SET failure_count = 0,
+                refresh_failure_count = 0,
+                warmup_remaining = GREATEST(
+                    credential_runtime_state.warmup_remaining - $2,
+                    0
+                ),
+                revision = credential_runtime_state.revision + 1,
+                updated_at = now()
+            WHERE credential_id = $1
+            RETURNING failure_count, refresh_failure_count, disabled_reason,
+                      warmup_remaining, generation, revision
+            "#,
+        )
+        .bind(credential_id as i64)
+        .bind(warmup_decrement)
         .fetch_one(&mut *tx)
         .await?;
         let state = runtime_state_from_row(&row)?;
@@ -14585,7 +14726,7 @@ mod tests {
         assert_eq!(current_refresh.state.revision, 4);
 
         let current_success = store
-            .record_credential_success_at_generation(credential_id, Uuid::new_v4(), 2)
+            .record_credential_success_at_generation_with_count(credential_id, Uuid::new_v4(), 2, 1)
             .await
             .unwrap();
         assert!(current_success.applied);
@@ -14596,7 +14737,12 @@ mod tests {
 
         let future_operation_id = Uuid::new_v4();
         let future_error = store
-            .record_credential_success_at_generation(credential_id, future_operation_id, 3)
+            .record_credential_success_at_generation_with_count(
+                credential_id,
+                future_operation_id,
+                3,
+                1,
+            )
             .await
             .unwrap_err();
         assert!(future_error.to_string().contains("generation 超前"));

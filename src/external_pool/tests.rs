@@ -750,7 +750,7 @@ async fn external_pool_selection_breaker_generation_fence_and_single_probe_recov
     for round in 0..5 {
         let breaker = Arc::new(ExternalPoolSelectionBreaker::new(
             4,
-            vec![Duration::from_millis(15), Duration::from_millis(30)],
+            vec![Duration::from_millis(120), Duration::from_millis(240)],
             0,
         ));
         let stale_success = breaker.try_begin().expect("closed breaker must admit");
@@ -766,7 +766,7 @@ async fn external_pool_selection_breaker_generation_fence_and_single_probe_recov
                 "round {round}: a stale success must not close the failed generation"
             );
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let cancelled_probe = breaker
             .try_begin()
             .expect("one recovery probe must be admitted");
@@ -781,7 +781,7 @@ async fn external_pool_selection_breaker_generation_fence_and_single_probe_recov
             breaker.try_begin().is_err(),
             "round {round}: a cancelled probe must re-arm backoff"
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         breaker
             .try_begin()
             .expect("a later recovery probe must be admitted")
@@ -891,7 +891,12 @@ async fn real_redis_external_poison_does_not_block_or_emit_false_capacity_for_fi
             .await
             .unwrap();
         let capacity_signal = Arc::new(CapacitySignal::default());
-        let dispatcher = ExternalPoolReleaseDispatcher::new(redis.clone(), capacity_signal.clone());
+        let selection_runtime_snapshot = Arc::new(SyncMutex::new(None));
+        let dispatcher = ExternalPoolReleaseDispatcher::new(
+            redis.clone(),
+            capacity_signal.clone(),
+            selection_runtime_snapshot,
+        );
         let poison_permit = dispatcher.try_reserve().unwrap();
         dispatcher.enqueue(
             ExternalPoolReleaseIntent {
@@ -4031,11 +4036,18 @@ async fn external_pool_redis_hot_path_is_repeatable_across_selection_and_acquire
             }
         };
         let after_acquire = Instant::now();
-        assert_eq!(
-            manager.redis.external_pool_hot_path_round_trips(),
-            2,
-            "round {round}: eligibility must not access Redis, while batched selection and atomic acquire use one round trip each regardless of pool count"
-        );
+        let redis_round_trips = manager.redis.external_pool_hot_path_round_trips();
+        if round == 0 {
+            assert!(
+                (2..=6).contains(&redis_round_trips),
+                "round {round}: cold coordinator bootstrap may add bounded Redis run_id/epoch probes, got {redis_round_trips}"
+            );
+        } else {
+            assert_eq!(
+                redis_round_trips, 2,
+                "round {round}: hot eligibility must not access Redis, while batched selection and atomic acquire use one round trip each regardless of pool count"
+            );
+        }
         eprintln!(
             "external_pool_redis_hot_path round={round} pools={} eligibility_ms={} selection_ms={} acquire_ms={} total_ms={}",
             pool_ids.len(),

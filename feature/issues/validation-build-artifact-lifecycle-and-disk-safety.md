@@ -131,3 +131,9 @@ feature/tests/run-cargo-scoped.sh pg-usage -- \
 - command PGID 可覆盖 Cargo/rustc 的正常进程树，但主动创建新 session/PGID 的恶意或非常规子进程可能逃离该组。runner 合同禁止 detached build work；最终 inventory 的 cwd/executable/txt/参数检查继续作为独立兜底。无法证明归属时不自动 kill 或删目录。
 - 命令运行期间若单次构建异常超过剩余空间，事后 trap 来不及预防 `ENOSPC`。20 GiB preflight 和 12 GiB预算是当前仓库经验阈值；若实际 clean all-target/release 构建超过预算，必须先记录并调整，不得静默放宽。
 - 回滚 wrapper 不会改变业务二进制，但会重新暴露无 owner 构建缓存累积风险；因此只能在有等价自动清理机制时替换。
+
+## 2026-07-23 最终候选复核
+
+v0.0.117 候选所有 Cargo 命令均通过 scoped wrapper 执行。no-default/default 全量测试、clippy、release build 和 focused rerun 的 cleanup 均报告 `removed=true reservation_released=true`；冻结二进制复制到仓库外候选目录后再删除 scoped target。协议/负载验证使用仓库外 artifact root 和冻结 binary，没有再次构建或依赖 `target/debug|release`。本轮临时 PostgreSQL/Redis 数据目录位于 `/tmp`，不是 Cargo target；测试数据库和 Redis owned prefixes 已清理。
+
+最终本机 `inventory-build-artifacts --gate` 仍 fail 于一个预存 local service exception：PID 84264 正在以 `./target/release/kiro-rs -c config.json --credentials credentials.json` 运行既有 `127.0.0.1:9022` 服务，并引用 repo root `target`。该 target/process 不是 scoped validation leak，本轮未停止、重启或删除该服务。若要求严格零 root target，需要服务 owner 单独迁移/停止该本地服务；本次发布按用户要求不让 9022 阻断代码发版。最终证据见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。

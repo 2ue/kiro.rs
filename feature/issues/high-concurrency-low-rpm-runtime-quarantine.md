@@ -185,3 +185,7 @@ cleanup.occupiedPorts=[]
 - `scheduler-redis-chaos-20260722-r1` 使用空 Redis DB7 与非 Docker loopback proxy，3 outer × 8 exact，24/24 通过；覆盖 affinity/capacity 分离、50/500ms latency、连续 timeout breaker、300 lease release、disconnect/reconnect、usage writer + scheduler 联合故障、cancel 和 commit-unknown cleanup；结束 `databaseEmpty=true`。
 - `redis-fault-domain-product-20260722-r1` 使用 business Redis `<loopback>:26379/db8` 与 observability Redis `<loopback>:50892/db2`，3 outer × 1 exact × 内部 3 轮通过；证明 usage/observability Redis 故障不影响 business scheduler，business fault fail-closed 且不伪装 `AllDisabled`。
 - 当前复核证据集中在 [2026-07-22 回归证据](../evidence/final-regression-rerun-20260722.md)。
+
+### 2026-07-23 最终候选复核
+
+v0.0.117 冻结候选再次以 fake-upstream load/chaos 覆盖高并发、低 RPM、突发错误和恢复：L3 burst/recovery 9/9 pass，包含 c40/r100 spike 全 100 成功、错误突发后 recovery 12/12；L4 restart/429/500/invalid-tool/client-drop/mixed-chaos 12/12 pass，所有恢复 case 12/12 成功；L5 60s soak + 60s idle pass，RSS/FD 均回落。第一次 120s soak + 15s idle 的请求和恢复均 pass，但 RSS cold-start threshold false，已记录为短 idle 观测而非隐藏。最终 no-default/default 全量 Rust gate 也包含 40x15/global-500、runtime degraded != persistent disabled、success persistence generation fence 等用例。详见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。
