@@ -6,7 +6,7 @@ use crate::anthropic::model_capabilities::{
 };
 use crate::anthropic::types::{MessagesRequest, parse_thinking_effort};
 use crate::kiro::model::requests::kiro::{
-    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
 };
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
@@ -210,6 +210,7 @@ pub(super) fn build_additional_model_request_fields(
     model_id: &str,
     enabled: bool,
     capability_state: &KiroReasoningCapabilityState,
+    force_visible_thinking: bool,
 ) -> Result<Option<AdditionalModelRequestFields>, super::ConversionError> {
     if !enabled {
         return Ok(None);
@@ -242,7 +243,10 @@ pub(super) fn build_additional_model_request_fields(
     let effort = select_native_reasoning_effort(req, &capability)?;
     Ok(Some(match capability.path {
         KiroReasoningFieldPath::OutputConfig => AdditionalModelRequestFields {
-            thinking: None,
+            thinking: Some(KiroThinkingConfig {
+                thinking_type: "adaptive".to_string(),
+                display: force_visible_thinking.then(|| "summarized".to_string()),
+            }),
             output_config: Some(KiroOutputConfig { effort }),
             reasoning: None,
         },

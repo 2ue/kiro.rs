@@ -1457,6 +1457,10 @@ pub struct StreamContext {
     saw_upstream_completed_tool_use: bool,
     /// 是否见过上游 metadataEvent。
     saw_upstream_metadata: bool,
+    /// 是否见过上游 contextUsageEvent。
+    saw_upstream_context_usage: bool,
+    /// 是否见过上游 meteringEvent。
+    saw_upstream_metering: bool,
     /// 最近一次 assistant/code 内容片段的字符数。
     last_assistant_content_chars: u32,
     /// 最近 assistant/code 可见文本尾部窗口，仅用于低成本异常特征检测，不落库。
@@ -1639,6 +1643,8 @@ impl StreamContext {
             saw_upstream_tool_use: false,
             saw_upstream_completed_tool_use: false,
             saw_upstream_metadata: false,
+            saw_upstream_context_usage: false,
+            saw_upstream_metering: false,
             last_assistant_content_chars: 0,
             assistant_text_tail: String::new(),
             tool_context_leak_markers: Vec::new(),
@@ -1690,10 +1696,14 @@ impl StreamContext {
         if self.saw_upstream_completed_tool_use {
             return None;
         }
-        if self.saw_upstream_metadata {
+        if self.has_trusted_upstream_completion_signal() {
             return None;
         }
         Some("upstream eventstream ended without a trusted completion signal")
+    }
+
+    fn has_trusted_upstream_completion_signal(&self) -> bool {
+        self.saw_upstream_metadata || self.saw_upstream_context_usage || self.saw_upstream_metering
     }
 
     fn has_meaningful_upstream_response(&self) -> bool {
@@ -1950,7 +1960,10 @@ impl StreamContext {
                 self.saw_upstream_metadata = true;
                 "metadataEvent"
             }
-            Event::Metering(_) => "meteringEvent",
+            Event::Metering(metering) => {
+                self.saw_upstream_metering |= metering.usage.is_finite();
+                "meteringEvent"
+            }
             Event::Code(code) => {
                 self.saw_upstream_assistant_response = true;
                 self.saw_upstream_assistant_content |= !code.content.is_empty();
@@ -1958,7 +1971,11 @@ impl StreamContext {
                 self.record_assistant_text_observability(&code.content);
                 "codeEvent"
             }
-            Event::ContextUsage(_) => "contextUsageEvent",
+            Event::ContextUsage(context_usage) => {
+                self.saw_upstream_context_usage |=
+                    context_usage.context_usage_percentage.is_finite();
+                "contextUsageEvent"
+            }
             Event::MessageMetadata(_) => {
                 self.saw_upstream_metadata = true;
                 "messageMetadataEvent"
@@ -3595,7 +3612,9 @@ mod tests {
 
     #[test]
     fn trusted_terminal_contract_rejects_silent_eof_and_keeps_legacy_terminals_for_five_rounds() {
-        use crate::kiro::model::events::{MetadataEvent, ToolUseEvent};
+        use crate::kiro::model::events::{
+            ContextUsageEvent, MetadataEvent, MeteringEvent, ToolUseEvent,
+        };
 
         for round in 0..5 {
             let mut unknown =
@@ -3632,6 +3651,34 @@ mod tests {
                 metadata.upstream_terminal_failure_detail(),
                 None,
                 "metadata round {round}"
+            );
+
+            let mut context_usage =
+                StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            context_usage.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                "legacy context usage complete",
+                None,
+            )));
+            context_usage.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 1.25,
+            }));
+            assert_eq!(
+                context_usage.upstream_terminal_failure_detail(),
+                None,
+                "context usage round {round}"
+            );
+
+            let mut metering =
+                StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            metering.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                "legacy metering complete",
+                None,
+            )));
+            metering.process_kiro_event(&Event::Metering(MeteringEvent { usage: 0.01 }));
+            assert_eq!(
+                metering.upstream_terminal_failure_detail(),
+                None,
+                "metering round {round}"
             );
 
             let mut partial_tool =

@@ -1620,6 +1620,14 @@ mod tests {
                 )
                     .into_response();
             }
+            "provider_json_headers" => {
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    Vec::<u8>::new(),
+                )
+                    .into_response();
+            }
             "provider_eventstream_json_exception" => {
                 return (
                     StatusCode::OK,
@@ -4908,7 +4916,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn provider_status_and_json_error_matrix_is_private_typed_and_bounded() {
+    async fn provider_status_and_non_eventstream_matrix_is_private_typed_and_bounded() {
         let captured = CapturedProviderLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -4967,41 +4975,6 @@ mod tests {
                 Some(503),
                 true,
                 Some("api_server_error"),
-            ),
-            (
-                "provider_200_invalid_json_error",
-                "invalid_request",
-                Some(200),
-                false,
-                None,
-            ),
-            (
-                "provider_200_throttle_json_error",
-                "rate_limit",
-                Some(200),
-                true,
-                Some("api_rate_limit"),
-            ),
-            (
-                "provider_200_server_json_error",
-                "server_error",
-                Some(200),
-                true,
-                Some("api_server_error"),
-            ),
-            (
-                "provider_200_timeout_json_error",
-                "upstream_timeout",
-                Some(200),
-                true,
-                Some("api_timeout"),
-            ),
-            (
-                "provider_200_unknown_json_error",
-                "unknown_upstream_error",
-                Some(200),
-                false,
-                None,
             ),
             (
                 "provider_200_non_eventstream",
@@ -5537,6 +5510,87 @@ mod tests {
                 !logs.contains(&marker),
                 "provider must not log eventstream-labeled JSON body marker {marker}"
             );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_content_type_response_headers_remain_for_handler_sniffing_for_five_rounds() {
+        let server = FakeBadRequestServer::start().await;
+
+        for is_stream in [false, true] {
+            for round in 1..=5 {
+                let mut config = Config::default();
+                config.kiro_upstream_base_url = Some(server.base_url.clone());
+                config.kiro_upstream_response_timeout_secs = 10;
+                config.credential_retry_max_attempts = 100;
+                let manager = Arc::new(
+                    MultiTokenManager::new(
+                        config,
+                        fake_bad_request_credentials(1),
+                        None,
+                        None,
+                        false,
+                    )
+                    .expect("JSON content-type sniff token manager"),
+                );
+                let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+                endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+                let provider =
+                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+                let request_body = serde_json::json!({
+                    "testScenario": "provider_json_headers",
+                    "conversationState": {
+                        "conversationId": format!("json-content-type-{is_stream}-{round}"),
+                        "currentMessage": {"userInputMessage": {
+                            "content": "test",
+                            "modelId": "claude-sonnet-4"
+                        }}
+                    }
+                })
+                .to_string();
+                let budget = Arc::new(InferenceAttemptBudget::new(4));
+
+                if is_stream {
+                    let response = provider
+                        .call_api_stream_with_request_id_and_attempt_budget(
+                            &request_body,
+                            Some("req-json-content-type"),
+                            AcquireMode::WaitForCapacity,
+                            1,
+                            Some("claude-sonnet-4"),
+                            budget.clone(),
+                            false,
+                        )
+                        .await
+                        .expect("JSON content-type reaches handler for stream");
+                    let (response, completion) = response.into_parts();
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    assert_eq!(completion.attempts()[0].action, "response_headers_received");
+                    assert_eq!(manager.snapshot().entries[0].success_count, 0);
+                    drop(completion);
+                } else {
+                    let response = provider
+                        .call_api_with_context_with_request_id_and_attempt_budget(
+                            &request_body,
+                            Some("req-json-content-type"),
+                            AcquireMode::WaitForCapacity,
+                            1,
+                            Some("claude-sonnet-4"),
+                            budget.clone(),
+                            false,
+                        )
+                        .await
+                        .expect("JSON content-type reaches handler for non-stream");
+                    assert_eq!(response.attempts()[0].action, "response_headers_received");
+                    let (response, completion) = response.into_parts();
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    assert_eq!(manager.snapshot().entries[0].success_count, 0);
+                    completion.release();
+                }
+
+                assert_eq!(budget.snapshot().consumed, 1);
+                assert_eq!(manager.snapshot().entries[0].in_flight_requests, 0);
+            }
         }
     }
 
@@ -6500,6 +6554,10 @@ impl KiroProvider {
 
     pub fn local_pool_route_state_fresh(&self, model: Option<&str>) -> LocalPoolRouteState {
         self.token_manager.local_pool_route_state_fresh(model)
+    }
+
+    pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
+        self.token_manager.local_pool_route_state_cached(model)
     }
 
     fn credential_log_label(&self, id: u64) -> String {
@@ -10126,7 +10184,20 @@ impl KiroProvider {
 
             // A 200 response header is not a successful inference. The body parser owns the
             // terminal success decision, so the provider records only a pending header outcome.
-            if status.is_success() && content_kind == UpstreamContentKind::EventStream {
+            //
+            // The legacy IDE endpoint can return a binary AWS EventStream while labeling the
+            // response as `application/json`. This is valid Kiro behavior observed in production
+            // for social accounts: the body starts with an EventStream prelude and contains
+            // assistantResponseEvent/contextUsageEvent/meteringEvent frames. Let the downstream
+            // stream/non-stream handlers sniff the body bytes: binary frames pass through to the
+            // EventStream decoder, while real JSON error envelopes are still rejected before any
+            // downstream success is committed.
+            if status.is_success()
+                && matches!(
+                    content_kind,
+                    UpstreamContentKind::EventStream | UpstreamContentKind::Json
+                )
+            {
                 return Ok(ApiCallResponse {
                     response,
                     credential_id: ctx.id,

@@ -8613,13 +8613,13 @@ fn process_non_stream_response_usage(
             }
         }
 
-        if pointer != "/usage"
-            && let Some(reported) = usage_capture.reported.or(usage_capture.raw)
-        {
-            changed |= set_top_level_usage_value(
-                &mut value,
-                anthropic_usage_value_for_body(reported, usage_capture.projected),
-            );
+        if pointer != "/usage" {
+            if let Some(reported) = usage_capture.reported.or(usage_capture.raw) {
+                changed |= set_top_level_usage_value(
+                    &mut value,
+                    anthropic_usage_value_for_body(reported, usage_capture.projected),
+                );
+            }
         }
 
         let body = if sanitized || changed {
@@ -8636,22 +8636,22 @@ fn process_non_stream_response_usage(
         };
     }
 
-    if normal_non_stream_model_response(&value)
-        && let Some(estimated) = estimate_non_stream_response_usage(route, projection, &value)
-    {
-        apply_estimated_usage_capture(&mut usage_capture, estimated, "missing_upstream_usage");
-        set_top_level_usage_value(
-            &mut value,
-            anthropic_usage_value_for_body(estimated.reported, estimated.projected),
-        );
-        let body = serde_json::to_vec(&value)
-            .map(Bytes::from)
-            .unwrap_or_else(|_| bytes.clone());
-        return ProjectedNonStreamBody {
-            body,
-            usage_capture,
-            protocol_contamination: sanitized,
-        };
+    if normal_non_stream_model_response(&value) {
+        if let Some(estimated) = estimate_non_stream_response_usage(route, projection, &value) {
+            apply_estimated_usage_capture(&mut usage_capture, estimated, "missing_upstream_usage");
+            set_top_level_usage_value(
+                &mut value,
+                anthropic_usage_value_for_body(estimated.reported, estimated.projected),
+            );
+            let body = serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| bytes.clone());
+            return ProjectedNonStreamBody {
+                body,
+                usage_capture,
+                protocol_contamination: sanitized,
+            };
+        }
     }
 
     if let Some(estimated) =
@@ -8804,8 +8804,10 @@ fn anthropic_usage_value_for_body(
     include_cache_creation_breakdown: bool,
 ) -> serde_json::Value {
     let mut value = usage.to_anthropic_usage_json();
-    if include_cache_creation_breakdown && let Some(obj) = value.as_object_mut() {
-        apply_projected_cache_creation_breakdown(obj, usage);
+    if include_cache_creation_breakdown {
+        if let Some(obj) = value.as_object_mut() {
+            apply_projected_cache_creation_breakdown(obj, usage);
+        }
     }
     value
 }

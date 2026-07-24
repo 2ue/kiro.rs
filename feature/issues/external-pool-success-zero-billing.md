@@ -169,6 +169,36 @@ usageSource=request_estimate
 
 即使该估算 usage 又经过了 current path policy projection，也不会被误标为 `local_prompt_cache` 或 `upstream_metadata`。
 
+### 5. 模型计价 key 兼容修正
+
+2026-07-25 生产复核补充发现：部分成功请求 usage 返回给下游正常，但系统内部计费仍为 `0`，原因不是 usage 缺失，而是计价模型 key 匹配失败。
+
+典型样本：
+
+```text
+requested model / usage model: claude-opus-4-8
+pricing catalog key:          claude-opus-4.8
+```
+
+修复目标：
+
+- 只在计价匹配阶段兼容 dashed/dotted patch alias，例如 `opus-4-8` 能匹配 `opus-4.8`。
+- 不改变请求路由、上游模型映射、下游返回 model 字段或 external pool raw model policy。
+- 如果已有精确 pricing key，精确 key 仍优先。
+
+新增验证：
+
+```text
+external_pool_billing_matches_dashed_opus_request_to_dotted_pricing_model
+```
+
+该测试构造 `route.model=claude-opus-4-8`，只配置 `claude-opus-4.8` 价格，确认：
+
+- `pricingAvailable=true`
+- `pricingModel=claude-opus-4.8`
+- `billableCostUsd > 0`
+- 费用等于 `100 input * 0.000007 + 10 output * 0.000031 = 0.00101`
+
 ## 验证结果
 
 本轮验证记录见：
@@ -238,6 +268,83 @@ git diff --check
 - `unrecognized_success_body` 的 output tokens 是估算，不等价于上游真实 output usage。它的目标是防止 success 记录完全 0 计费，并提供诊断字段方便后续对账。
 - 如果外部池返回非常规成功体且 output 无法从 `choices` 或常见文本字段识别，仍只计 input 成本，output 记 0；这比 `externalPoolBilling` 缺失更安全，但不是精确 usage。
 - 发布前仍需要项目最终发布 gate：全量测试一次性绿、release inventory、版本提交和 tag。当前证据只关闭“外部池成功 usage/billing 逻辑”这一个问题。
+
+## 2026-07-25 生产复核：0.0.113 仍大量 0 计费
+
+只读证据目录：
+
+```text
+tmp/prod-evidence/20260725-044228-rpm-slow-142-159
+```
+
+机器 `152.53.243.159` 当前运行：
+
+```text
+version=0.0.113
+revision=36b65ce509809120ba53bb46c6b536e3658a6129
+```
+
+最近 2 小时外部池成功请求仍大量 `externalPoolBilling.totalCostUsd=0`：
+
+```text
+zero_billing|claude-opus-4-8|jinnyapi|883 total|882 success|882 zero
+zero_billing|claude-opus-4-8|apiv3.52codeflow|675 total|670 success|670 zero
+zero_billing|claude-opus-4-8|kkkkyue|568 total|566 success|566 zero
+zero_billing|claude-sonnet-4-6|jinnyapi|517 total|516 success|516 zero
+zero_billing|claude-opus-4-6|jinnyapi|374 total|372 success|372 zero
+```
+
+抽样 `billing_sample` 显示这不是下游没有返回成功，而是 billing 字段没有算出费用：
+
+```text
+routeKind=external_pool
+routeSubtype=external_direct_policy
+status=success
+model=claude-opus-4-8
+externalPoolName=apiv3.52codeflow / jinnyapi / kkkkyue
+externalPoolBilling.totalCostUsd=<empty>
+externalPoolBilling.pricingModel=claude-opus-4-8 或 <empty>
+externalPoolUsage.input_tokens/output_tokens=<empty>
+```
+
+这与本专题根因吻合：旧版本既有“成功 body usage 未捕获/未估算”的路径，也有“计价模型 key 不兼容”的路径。尤其是用户指出的：
+
+```text
+request/usage model: claude-opus-4-8
+pricing catalog:      claude-opus-4.8
+```
+
+当前分支新增的计价阶段 dotted/dashed fallback 只影响 pricing lookup，不改变：
+
+- 请求模型；
+- 上游模型映射；
+- 下游返回 model；
+- external pool raw model policy。
+
+因此上线当前分支后，类似 `claude-opus-4-8` 应能在计价阶段匹配 `claude-opus-4.8`，但必须以发布后生产 usage 复核为准：
+
+```sql
+-- 发布后只读核验口径
+select model,
+       data->>'externalPoolName' as pool,
+       count(*) filter (where status='success') as success,
+       count(*) filter (
+         where status='success'
+           and coalesce(nullif(data#>>'{externalPoolBilling,totalCostUsd}', ''), '0')::numeric = 0
+       ) as zero_billing
+from usage_records
+where deleted_at is null
+  and created_at >= now() - interval '30 minutes'
+  and data->>'routeKind' = 'external_pool'
+group by model, data->>'externalPoolName'
+order by success desc;
+```
+
+预期结果：
+
+- 能识别 usage 的成功请求：`externalPoolBilling.totalCostUsd > 0`。
+- 缺 usage 但 body 可估算的成功请求：`usageSource=request_estimate` 且至少 input 成本非 0。
+- `sampled request rejection` 这类 admission 采样记录仍然 usage 为 0，不能纳入外部池成功 0 计费统计。
 
 ## 2026-07-23 最终候选复核
 

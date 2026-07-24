@@ -2722,9 +2722,24 @@ impl MultiTokenManager {
     }
 
     pub fn local_pool_route_state_fresh(&self, model: Option<&str>) -> LocalPoolRouteState {
-        let mut state = self.compute_local_pool_route_state(model);
+        let mut state = self.compute_local_pool_route_state(model, true);
         if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {
-            state = self.compute_local_pool_route_state(model);
+            state = self.compute_local_pool_route_state(model, true);
+        }
+        state
+    }
+
+    /// Returns a local-memory routing snapshot without performing scheduler Redis reads/probes.
+    ///
+    /// This is intentionally weaker than `local_pool_route_state_fresh`: it is suitable for
+    /// request-entry fail-fast guards that must avoid adding Redis work on an already degraded hot
+    /// path. It still preserves the existing TooManyFailures auto-heal behavior so entry-level
+    /// fast-fail does not strand a self-healable local pool. The authoritative scheduler state is
+    /// still refreshed by normal dispatch/preflight paths before a local upstream call is made.
+    pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
+        let mut state = self.compute_local_pool_route_state(model, false);
+        if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {
+            state = self.compute_local_pool_route_state(model, false);
         }
         state
     }
@@ -2736,7 +2751,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         error_message: &str,
     ) -> SelectionFailureSummary {
-        let state = self.compute_local_pool_route_state(model);
+        let state = self.compute_local_pool_route_state(model, true);
         let (stage, primary_reason) =
             Self::selection_failure_stage_and_reason(&state, error_message);
         let config = self.config.lock().clone();
@@ -3069,16 +3084,24 @@ impl MultiTokenManager {
         }
     }
 
-    fn compute_local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
+    fn compute_local_pool_route_state(
+        &self,
+        model: Option<&str>,
+        refresh_scheduler_state: bool,
+    ) -> LocalPoolRouteState {
         let config = self.config.lock().clone();
         let now = Instant::now();
         let risk_circuit = self.local_pool_risk_circuit_snapshot_from_config(now, &config);
-        if !risk_circuit.open {
+        if refresh_scheduler_state && !risk_circuit.open {
             if let Err(err) = self.refresh_scheduler_state_from_redis() {
                 tracing::warn!("本地池路由预检同步 Redis 调度状态失败: {}", err);
             }
         }
-        self.cleanup_expired_in_flight_leases_local_first();
+        if refresh_scheduler_state {
+            self.cleanup_expired_in_flight_leases_local_first();
+        } else if let Some(max_age) = self.in_flight_lease_max_age() {
+            self.cleanup_expired_local_in_flight_leases(max_age, Instant::now());
+        }
 
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
@@ -3095,7 +3118,7 @@ impl MultiTokenManager {
             config.dispatch_global_max_concurrent_requests,
             1,
         );
-        if !risk_circuit.open {
+        if refresh_scheduler_state && !risk_circuit.open {
             self.probe_scheduler_redis_capacity_recovery_if_due();
         }
         let scheduler_redis_retry_after_secs = self.scheduler_redis_degraded_retry_after_secs();

@@ -42,7 +42,7 @@ const MAX_RPM_BURST: u32 = 32;
 const REJECTION_LOG_BURST_CAPACITY: u32 = 64;
 const REJECTION_LOG_REFILL_PER_SECOND: f64 = 8.0;
 const REJECTION_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
-const REQUEST_REJECTION_REASON_COUNT: usize = 16;
+const REQUEST_REJECTION_REASON_COUNT: usize = RequestRejectionReason::COUNT;
 const LOCAL_TEMPORARY_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const LOCAL_TEMPORARY_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
@@ -136,10 +136,14 @@ pub(crate) enum RequestRejectionReason {
     ModelUnsupported,
     WebSearchUnsupported,
     LocalBodyPrepare,
+    LocalPoolUnavailable,
+    LocalPoolTemporaryUnavailable,
     AdmissionLocalTemporaryBackoff,
 }
 
 impl RequestRejectionReason {
+    const COUNT: usize = Self::AdmissionLocalTemporaryBackoff as usize + 1;
+
     const fn index(self) -> usize {
         self as usize
     }
@@ -161,6 +165,8 @@ impl RequestRejectionReason {
             Self::ModelUnsupported => "model_unsupported",
             Self::WebSearchUnsupported => "websearch_unsupported",
             Self::LocalBodyPrepare => "local_body_prepare",
+            Self::LocalPoolUnavailable => "local_pool_unavailable",
+            Self::LocalPoolTemporaryUnavailable => "local_pool_temporary_unavailable",
             Self::AdmissionLocalTemporaryBackoff => "admission_local_temporary_backoff",
         }
     }
@@ -1902,6 +1908,36 @@ mod tests {
                     .len(),
                 10
             );
+        }
+    }
+
+    #[test]
+    fn request_rejection_reason_count_covers_every_index() {
+        const ALL_REASONS: [RequestRejectionReason; REQUEST_REJECTION_REASON_COUNT] = [
+            RequestRejectionReason::AdmissionRpm,
+            RequestRejectionReason::AdmissionConcurrencyFull,
+            RequestRejectionReason::AdmissionQueueFull,
+            RequestRejectionReason::AdmissionQueueTimeout,
+            RequestRejectionReason::AdmissionStateCapacity,
+            RequestRejectionReason::BodyTooLarge,
+            RequestRejectionReason::BodyReadFailed,
+            RequestRejectionReason::RequestEntryInvalid,
+            RequestRejectionReason::StrictRequestProtocolContamination,
+            RequestRejectionReason::DfcacheRouteInvalid,
+            RequestRejectionReason::ProviderNotReady,
+            RequestRejectionReason::MultimodalInvalid,
+            RequestRejectionReason::ModelUnsupported,
+            RequestRejectionReason::WebSearchUnsupported,
+            RequestRejectionReason::LocalBodyPrepare,
+            RequestRejectionReason::LocalPoolUnavailable,
+            RequestRejectionReason::LocalPoolTemporaryUnavailable,
+            RequestRejectionReason::AdmissionLocalTemporaryBackoff,
+        ];
+
+        for (expected_index, reason) in ALL_REASONS.iter().copied().enumerate() {
+            assert_eq!(reason.index(), expected_index);
+            assert!(reason.index() < REQUEST_REJECTION_REASON_COUNT);
+            assert!(!reason.as_str().is_empty());
         }
     }
 

@@ -6,6 +6,38 @@ Date: 2026-07-24
 
 `post-v0.0.115 scheduler-risk hardening in progress`：已完成 114/115 发布后的生产只读复核，并针对“Redis 调度退化 + 快速失败 RPM + 上游 TEMPORARILY_SUSPENDED 后整池烧光”的放大链实现第一批修复。当前工作树尚未发布新版本；下一步是完成隔离负载/异常恢复验证、UI 类型检查、文档检查和发布门禁。
 
+## 2026-07-25 Production follow-up
+
+- 对 `152.53.243.159` 和 `152.53.194.142` 追加只读快照：
+  - `.159` 当前仍运行 `0.0.113`，本地 15 个启用凭据全部 `TemporarilySuspended`，最近 30 分钟主要由外部池成功承接；旧缺陷配置仍存在。
+  - `.142` 当前运行 `0.0.114`，最近 30 分钟无流量，2 个启用凭据正常；过去 2 小时仍有 18 个 risk suspension/删除事件；外部池全局关闭。
+- 2026-07-25 04:54 +08 又补一轮当前态只读复核，证据目录 `tmp/prod-evidence/20260725-044228-rpm-slow-142-159`：
+  - `.159` 主机/PG/Redis 当前未打满，入口约 `19~83 rpm`，但外部池成功请求平均/最大耗时高，最大约 `503s`；本地 `TemporarilySuspended=15`，所以当前慢点主要是“本地池不可调度后全走外部池，外部池/上游慢”，不是当前 Redis scheduler CPU 卡死。
+  - `.159` 仍大量成功 0 计费，`claude-opus-4-8` 等模型在 `jinnyapi/apiv3.52codeflow/kkkkyue` 上几百条 success 的 `externalPoolBilling.totalCostUsd` 为空或 0；当前分支的 dashed/dotted pricing fix 需要发布后按专题 SQL 复核。
+  - `.142` 当前 `healthz/readyz` 正常，Redis `instantaneous_ops_per_sec=0`、`slowlog_len=0`，近 2 小时无普通业务 usage；历史 `sampled request rejection` 是 admission 采样 usage，模型固定 `unknown`、usage 为 0，不按外部池成功计费异常处理。
+- 新增 request-entry fast-fail：
+  - 在 raw external 接管之后、完整 parse/payload guard 之前，对无外部池接管可能且本地池处于 `NoCredentials/AllDisabled/ProxyBlocked/SchedulerRedisDegraded/RiskCircuitOpen` 的请求快速返回；
+  - 使用 `local_pool_route_state_cached`，不新增 scheduler Redis read/probe 热路径；
+  - 对临时类状态写入 request-admission per-key local backoff；
+  - 不抢跑 `Ready/NoModelCompatible/AllCoolingDown/CapacityFull`，保留模型校验和等待/队列语义。
+- 新增/复跑验证：
+  - `local_pool_fast_fail_*`: 2 passed；
+  - `local_temporary_backoff`: 4 passed；
+  - `local_pool_risk_circuit`: 1 passed；
+  - `request_admission_has_conservative_defaults_and_explicit_zero_disables`: 1 passed；
+  - `provider_status_and_non_eventstream_matrix_is_private_typed_and_bounded`: passed；
+  - `handler_binary_eventstream_with_json_content_type_is_body_sniffed_for_five_rounds`: passed；
+  - `external_pool_billing_matches_dashed_opus_request_to_dotted_pricing_model`: passed；
+  - release C0 final：Rust 1.92.0 scoped `cargo fmt --all -- --check`、`cargo test --locked --all-targets`、`cargo build --release --bins` 全部通过；main `1781 passed / 0 failed / 6 ignored`，`kiro_loadtest 31 passed / 0 failed`；冻结 `kiro-rs` SHA-256 `1290930ed48ee6e20d6ed0ea01095aa08d190164c5252921b7fa1688ca5e569e`，`kiro_loadtest` SHA-256 `4f529fd5484b8f5552c0abb2a47bb5c9197b526c825a43c6d7cc44cd37a7ffd2`；
+  - C0 后清理复核：删除无进程引用的当前仓库 root `target/` 约 `926 MiB`，`node feature/tests/inventory-build-artifacts.mjs --gate` 通过；
+  - 本地 9022 使用同一冻结候选补 direct/Claude CLI smoke：direct non-stream 第 2 轮成功且 usage 非零；Claude CLI 普通 `stream-json` 成功且 final usage 非零；Claude CLI Bash tool 最小场景成功且 tool_result 配对；direct `thinking.type=adaptive + output_config.effort=max` 成功；上述输出均未命中 `bashHash/readHash/editHash/Tool results provided/function_results/credential/fallback pool/upstream pool/private scheduler/local_scheduler`。
+  - 所有本轮 Cargo 批次均通过 `feature/tests/run-cargo-scoped.sh` 执行并清理 scoped target。
+- 文档：
+  - [生产低并发高 RPM / 前端慢 / 调度卡死排查](issues/prod-scheduler-rpm-freeze-142-159-20260725.md)
+  - [Social/Gmail 凭据 api_protocol_error](issues/social-gmail-api-protocol-error.md)
+  - [外部池成功请求 0 计费与非流式 usage 捕获分裂](issues/external-pool-success-zero-billing.md)
+  - [Release C0 and Claude CLI smoke evidence 2026-07-25](evidence/release-c0-cli-smoke-20260725.md)
+
 ## 2026-07-24 Scheduler Risk Follow-up
 
 - 本轮修复：

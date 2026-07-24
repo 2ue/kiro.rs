@@ -9,9 +9,10 @@ Use this skill to validate kiro.rs with the real Claude Code CLI, not only unit 
 
 ## Safety Contract
 
-- Do not touch a live `9022` process unless the user explicitly asks for that exact port.
-- Prefer a temporary release service with `KIRO_RS_HOST=127.0.0.1` and `KIRO_RS_PORT=<temp-port>`.
-- Verify the temp port before and after the run with `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
+- For normal local validation, default to the existing local environment and local service port (commonly `9022`); restart that service directly when a restart is needed.
+- Use an isolated temporary service only when isolation is required: initialization/deployment validation, no usable local service/config, or a concrete risk of corrupting unrelated state.
+- Before touching an existing local service, identify the exact listener PID/command and confirm it is this project’s `kiro-rs`; stop only that process.
+- Verify the selected port before and after the run with `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
 - Use isolated Claude config directories for tests:
   - `HOME=/tmp/kiro-claude-home-<port>`
   - `CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-<port>`
@@ -68,7 +69,7 @@ KIRO_RS_HOST=127.0.0.1 KIRO_RS_PORT=19022 \
   "$KIRO_RS_BINARY" -c config.json --credentials credentials.json
 ```
 
-If runtime config is loaded from PgSQL, confirm the process actually listens on the requested temp port.
+If the user asked to restart the existing local service, start the release binary with the real local `config.json` / `credentials.json` and the existing configured port instead of the temp command above. If runtime config is loaded from PgSQL, confirm the restarted process actually listens on the intended local port.
 
 ## How To Prove Thinking Is Real
 

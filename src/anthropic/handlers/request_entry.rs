@@ -119,6 +119,15 @@ pub(super) async fn handle_messages_endpoint(
             return response;
         }
     }
+    if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
+        &state,
+        &runtime_config,
+        &endpoint,
+        attribution.as_ref(),
+        &parsed_raw_probe,
+    ) {
+        return response;
+    }
     let request_id = envelope::request_id();
     let payload = match parse_messages_payload_with_probe(&raw_body, &parsed_raw_probe, &request_id)
     {
@@ -146,6 +155,112 @@ pub(super) async fn handle_messages_endpoint(
 
 fn should_try_raw_external_routes(request_history_contaminated: bool) -> bool {
     !request_history_contaminated
+}
+
+fn maybe_local_pool_unavailable_fast_fail_response(
+    state: &AppState,
+    runtime_config: &RequestRuntimeConfig,
+    endpoint: &str,
+    attribution: Option<&RequestRejectionAttribution>,
+    raw_probe: &RawMessagesBodyProbe,
+) -> Option<Response> {
+    let provider = state.kiro_provider.as_ref()?;
+    let model = raw_probe
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())?;
+
+    // If external pools are globally enabled and wired, the normalized external fallback path may
+    // still be eligible after typed parsing. Do not preempt it with a local-only response.
+    if runtime_config.external_pools.external_pools_enabled && state.external_pool_manager.is_some()
+    {
+        return None;
+    }
+
+    let local_state = provider.local_pool_route_state_cached(Some(model));
+    let Some((status, error_type, message, reason, retry_after_secs)) =
+        local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)
+    else {
+        return None;
+    };
+
+    if let (Some(attribution), Some(retry_after_secs)) = (attribution, retry_after_secs) {
+        attribution.apply_local_temporary_backoff(retry_after_secs);
+    }
+
+    let request_id = envelope::request_id();
+    tracing::warn!(
+        request_id,
+        endpoint,
+        model,
+        local_state = ?local_state.kind,
+        local_total = local_state.total,
+        local_available = local_state.available,
+        local_dispatchable = local_state.dispatchable,
+        local_usable = local_state.usable,
+        retry_after_secs = ?retry_after_secs,
+        "local credential pool is unavailable and no external pool takeover is available; rejecting before full body processing"
+    );
+    let response = match retry_after_secs {
+        Some(retry_after_secs) => envelope::error_response_with_id_and_headers(
+            status,
+            error_type,
+            message,
+            &request_id,
+            [("retry-after", retry_after_secs.to_string())],
+        ),
+        None => envelope::error_response_with_id(status, error_type, message, &request_id),
+    };
+    record_pre_usage_rejection(attribution, reason, endpoint, &response);
+    Some(response)
+}
+
+fn local_pool_fast_fail_response_parts(
+    kind: LocalPoolRouteStateKind,
+    retry_after_secs: Option<u64>,
+) -> Option<(
+    StatusCode,
+    &'static str,
+    String,
+    RequestRejectionReason,
+    Option<u64>,
+)> {
+    Some(match kind {
+        LocalPoolRouteStateKind::NoCredentials
+        | LocalPoolRouteStateKind::AllDisabled
+        | LocalPoolRouteStateKind::ProxyBlocked => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE.to_string(),
+            RequestRejectionReason::LocalPoolUnavailable,
+            None,
+        ),
+        LocalPoolRouteStateKind::SchedulerRedisDegraded => {
+            let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                envelope::public_rate_limit_message(Some(retry_after_secs)),
+                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                Some(retry_after_secs),
+            )
+        }
+        LocalPoolRouteStateKind::RiskCircuitOpen => {
+            let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE.to_string(),
+                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                Some(retry_after_secs),
+            )
+        }
+        LocalPoolRouteStateKind::Ready
+        | LocalPoolRouteStateKind::NoModelCompatible
+        | LocalPoolRouteStateKind::AllCoolingDown
+        | LocalPoolRouteStateKind::CapacityFull => return None,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -722,6 +837,87 @@ mod tests {
                 let error = parse_messages_payload(&Bytes::copy_from_slice(fixture), "req_invalid")
                     .expect_err("invalid reasoning controls must be rejected");
                 assert_eq!(error.status, StatusCode::BAD_REQUEST, "round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_pool_fast_fail_maps_only_terminal_or_temporary_pool_states_for_five_rounds() {
+        for round in 0..5 {
+            for kind in [
+                LocalPoolRouteStateKind::NoCredentials,
+                LocalPoolRouteStateKind::AllDisabled,
+                LocalPoolRouteStateKind::ProxyBlocked,
+            ] {
+                let (status, error_type, message, reason, retry_after) =
+                    local_pool_fast_fail_response_parts(kind, None)
+                        .unwrap_or_else(|| panic!("round {round}: {kind:?} should fast-fail"));
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "round {round}");
+                assert_eq!(error_type, "api_error", "round {round}");
+                assert_eq!(
+                    message,
+                    envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
+                    "round {round}"
+                );
+                assert_eq!(
+                    reason,
+                    RequestRejectionReason::LocalPoolUnavailable,
+                    "round {round}"
+                );
+                assert_eq!(retry_after, None, "round {round}");
+            }
+
+            let (status, error_type, message, reason, retry_after) =
+                local_pool_fast_fail_response_parts(
+                    LocalPoolRouteStateKind::SchedulerRedisDegraded,
+                    Some(4),
+                )
+                .expect("scheduler degraded should fast-fail");
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "round {round}");
+            assert_eq!(error_type, "rate_limit_error", "round {round}");
+            assert!(
+                message.contains("Retry after 4 seconds."),
+                "round {round}: {message}"
+            );
+            assert_eq!(
+                reason,
+                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                "round {round}"
+            );
+            assert_eq!(retry_after, Some(4), "round {round}");
+
+            let (status, error_type, message, reason, retry_after) =
+                local_pool_fast_fail_response_parts(LocalPoolRouteStateKind::RiskCircuitOpen, None)
+                    .expect("risk circuit should fast-fail");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "round {round}");
+            assert_eq!(error_type, "api_error", "round {round}");
+            assert_eq!(
+                message,
+                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+                "round {round}"
+            );
+            assert_eq!(
+                reason,
+                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                "round {round}"
+            );
+            assert_eq!(retry_after, Some(1), "round {round}");
+        }
+    }
+
+    #[test]
+    fn local_pool_fast_fail_does_not_preempt_waitable_or_model_states_for_five_rounds() {
+        for round in 0..5 {
+            for kind in [
+                LocalPoolRouteStateKind::Ready,
+                LocalPoolRouteStateKind::NoModelCompatible,
+                LocalPoolRouteStateKind::AllCoolingDown,
+                LocalPoolRouteStateKind::CapacityFull,
+            ] {
+                assert!(
+                    local_pool_fast_fail_response_parts(kind, Some(2)).is_none(),
+                    "round {round}: {kind:?} must continue through normal parsing/routing"
+                );
             }
         }
     }

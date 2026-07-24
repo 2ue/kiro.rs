@@ -8825,6 +8825,8 @@ async fn handle_non_stream_request(
     let mut upstream_message_status: Option<String> = None;
     let mut saw_meaningful_upstream_response = false;
     let mut saw_upstream_metadata = false;
+    let mut saw_upstream_context_usage = false;
+    let mut saw_upstream_metering = false;
     let mut saw_completed_tool_use = false;
 
     // 收集工具调用的增量 JSON
@@ -8946,6 +8948,7 @@ async fn handle_non_stream_request(
                 }
             }
             Event::ContextUsage(context_usage) => {
+                saw_upstream_context_usage |= context_usage.context_usage_percentage.is_finite();
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = credential_usage.request.context_window_tokens;
                 let percentage = context_usage.context_usage_percentage;
@@ -9002,6 +9005,7 @@ async fn handle_non_stream_request(
             Event::Metering(metering) => {
                 if metering.usage.is_finite() {
                     kiro_metering_usage = Some(metering.usage);
+                    saw_upstream_metering = true;
                 }
                 tracing::debug!(usage = metering.usage, "非流式响应收到 meteringEvent");
             }
@@ -9084,7 +9088,11 @@ async fn handle_non_stream_request(
             Some(
                 "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
             )
-        } else if !saw_completed_tool_use && !saw_upstream_metadata {
+        } else if !saw_completed_tool_use
+            && !saw_upstream_metadata
+            && !saw_upstream_context_usage
+            && !saw_upstream_metering
+        {
             Some("upstream eventstream ended without a trusted completion signal")
         } else {
             None

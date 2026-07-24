@@ -135,3 +135,57 @@ runner 同时移除了对既有 9022 listener 的前后 `lsof` 探测，只在�
 ### 2026-07-23 最终候选复核
 
 v0.0.117 冻结候选执行两层证据：raw Claude CLI capture 30/30 表明 Claude Code CLI 2.1.197 原生发送 `thinking: {type:"adaptive"}`，absent 默认 `output_config.effort=high`，显式 `low/medium/high/xhigh/max` 均原样；Kiro thinking wire 60/60 pass，CLI/IDE 两入口、6 effort × 5 轮均无 `max -> high`、无 invalid wire JSON、无 protocol violations、无 unknown requests。最终 wire 使用上游广告的 native schema；未广告 thinking 字段时不发明 thinking 字段，避免与官方 schema 冲突。报告路径与 SHA 见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。
+
+### 2026-07-25 修订：output_config 路径补 adaptive thinking
+
+用户追加复核问题后重新确认：Claude Code CLI 当前发送的是成对结构化意图：
+
+```json
+{
+  "thinking": { "type": "adaptive" },
+  "output_config": { "effort": "max" }
+}
+```
+
+因此当前工作树把 `KiroReasoningFieldPath::OutputConfig` 的上游 wire 改为同时包含：
+
+```json
+{
+  "thinking": { "type": "adaptive" },
+  "output_config": { "effort": "<low|medium|high|xhigh|max>" }
+}
+```
+
+并在 `force_visible_thinking=true` 时发送：
+
+```json
+{
+  "thinking": { "type": "adaptive", "display": "summarized" },
+  "output_config": { "effort": "max" }
+}
+```
+
+关键约束：
+
+- 显式 `max` 不降级为 `high`。
+- 这个变更只影响 native `output_config` reasoning wire，不改变模型路由、模型 alias 或下游 model 字段。
+- `thinking.type=enabled/disabled` 与 `output_config` 的不兼容组合仍由 request facts fail-closed；`output_config` 只与 adaptive 或 omitted thinking 兼容。
+- prompt 总开关不应决定结构化 `thinking/output_config` 是否能映射；它只控制文本提示增强。
+
+新增 Rust 精确测试：
+
+```text
+explicit_max_output_config_effort_survives_authoritative_wire_conversion_five_rounds
+native_output_config_visible_thinking_sets_summarized_display_for_five_rounds
+```
+
+本轮本地冻结候选还补了 direct live smoke：
+
+```text
+request: thinking.type=adaptive + output_config.effort=max
+result: success
+usage: input_tokens=13, cache_creation_input_tokens=7417, output_tokens=3
+leak markers: []
+```
+
+该 smoke 证明当前代理不会把 `adaptive + max` 在入口误拒绝或降级；精确 wire 字段由上述 converter 测试与 C0 全量 Rust gate 覆盖。证据见 [Release C0 and Claude CLI smoke evidence 2026-07-25](../evidence/release-c0-cli-smoke-20260725.md)。

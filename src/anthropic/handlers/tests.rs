@@ -1980,6 +1980,7 @@ fn local_stream_protocol_contamination_retry_uses_status_policy_and_explicit_ter
 #[derive(Debug, Clone, Copy)]
 enum HandlerEventStreamFault {
     JsonExceptionBeforeOutput,
+    BinaryEventStreamWithJsonContentType,
     JsonBodyWithEventStreamContentType,
     ReadErrorBeforeOutput,
     IdleBeforeOutput,
@@ -1990,6 +1991,7 @@ enum HandlerEventStreamFault {
     UnknownEventOnly,
     MissingCompletionAfterText,
     LegacyTextWithMetadataNoStatus,
+    TextWithMeteringNoStatus,
     CompleteToolWithoutStatus,
     TextThenReadError,
     ThinkingThenReadError,
@@ -2110,6 +2112,14 @@ fn handler_eventstream_bytes_response(bytes: Vec<u8>) -> Response {
         .expect("build EventStream bytes response")
 }
 
+fn handler_eventstream_json_labeled_bytes_response(bytes: Vec<u8>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .expect("build JSON-labeled EventStream bytes response")
+}
+
 fn handler_eventstream_chunked_response(
     chunks: Vec<(Duration, Result<Bytes, std::io::Error>)>,
 ) -> Response {
@@ -2145,6 +2155,9 @@ async fn handler_eventstream_fault_upstream(
             })),
         )
             .into_response(),
+        HandlerEventStreamFault::BinaryEventStreamWithJsonContentType => {
+            handler_eventstream_json_labeled_bytes_response(handler_eventstream_normal_body())
+        }
         HandlerEventStreamFault::JsonBodyWithEventStreamContentType => {
             handler_eventstream_bytes_response(
                 serde_json::to_vec(&json!({
@@ -2228,6 +2241,21 @@ async fn handler_eventstream_fault_upstream(
                         "cacheWriteInputTokens": 0
                     }
                 }),
+            ));
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::TextWithMeteringNoStatus => {
+            let mut body = eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"metered-terminal-ok"}),
+            );
+            body.extend(eventstream_test_frame(
+                "contextUsageEvent",
+                json!({"contextUsagePercentage":0.01}),
+            ));
+            body.extend(eventstream_test_frame(
+                "meteringEvent",
+                json!({"usage":0.42}),
             ));
             handler_eventstream_bytes_response(body)
         }
@@ -2638,12 +2666,18 @@ async fn run_provider_json_exception_retry_and_single_credential_failure_are_pri
         assert_ne!(
             record.credential_attempts[0].credential_id,
             record.credential_attempts[1].credential_id,
-            "round={round}: provider retry must move to the alternate credential"
+            "round={round}: JSON stream retry must move to the alternate credential"
         );
-        let trace = record.latency_trace.as_ref().expect("provider retry trace");
-        assert_eq!(trace.stream_retry_attempts, None);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("JSON stream retry trace");
+        assert_eq!(trace.stream_retry_attempts, Some(1));
         assert_eq!(trace.stream_retry_dispatch_failures, None);
-        assert_eq!(trace.stream_retry_reasons, None);
+        assert_eq!(
+            trace.stream_retry_reasons.as_deref(),
+            Some(&["status_error:sends=1".to_string()][..])
+        );
         let serialized = serde_json::to_string(&record).expect("serialize provider retry usage");
         assert!(!serialized.contains(&marker));
     }
@@ -2659,29 +2693,45 @@ async fn run_provider_json_exception_retry_and_single_credential_failure_are_pri
             handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
         let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
 
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
         assert_eq!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS,
+            body.matches("event: message_start").count(),
+            1,
             "round={round} body={body}"
         );
-        assert!(body.contains(&request_id));
+        assert_eq!(
+            body.matches("event: error").count(),
+            1,
+            "round={round} body={body}"
+        );
+        assert!(body.contains(r#""type":"rate_limit_error""#));
+        assert!(!body.contains("event: message_stop"));
+        assert!(!body.contains("recovered-ok"));
         assert!(!body.contains(&marker));
         assert_eq!(upstream.hits(), 1, "round={round}");
-        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
-        let record = usage_record_for_request(&usage_recorder, &request_id);
-        assert_eq!(record.public_error_status_code, Some(429));
-        assert_eq!(
-            record.public_error_type.as_deref(),
-            Some("rate_limit_error")
+        assert_fault_usage(
+            &usage_recorder,
+            &request_id,
+            UsageRecordStatus::StreamError,
+            1,
         );
+        let record = usage_record_for_request(&usage_recorder, &request_id);
         assert_eq!(record.credential_attempts.len(), 1);
         let trace = record
             .latency_trace
             .as_ref()
-            .expect("single provider failure trace");
+            .expect("single JSON stream failure trace");
         assert_eq!(trace.stream_retry_attempts, None);
-        assert_eq!(trace.stream_retry_dispatch_failures, None);
-        assert_eq!(trace.stream_retry_reasons, None);
+        assert_eq!(trace.stream_retry_dispatch_failures, Some(1));
+        assert_eq!(
+            trace.stream_retry_reasons.as_deref(),
+            Some(&["status_error:dispatch_failed_without_send".to_string()][..])
+        );
+        let error_id = record
+            .error_id
+            .as_deref()
+            .expect("single JSON stream error-id");
+        assert!(body.contains(error_id), "round={round} body={body}");
         let serialized =
             serde_json::to_string(&record).expect("serialize provider JSON failure usage");
         assert!(!serialized.contains(&marker));
@@ -2990,6 +3040,50 @@ fn handler_non_stream_eventstream_faults_fail_closed_for_five_rounds() {
     );
 }
 
+async fn run_handler_binary_eventstream_with_json_content_type_matrix() {
+    for stream in [true, false] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::BinaryEventStreamWithJsonContentType,
+            )
+            .await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "stream={stream} round={round} body={body}"
+            );
+            assert!(
+                body.contains("recovered-ok"),
+                "stream={stream} round={round} body={body}"
+            );
+            assert!(
+                !body.contains(r#""type":"error""#),
+                "stream={stream} round={round} body={body}"
+            );
+            if stream {
+                assert_eq!(
+                    body.matches("event: message_stop").count(),
+                    1,
+                    "stream={stream} round={round} body={body}"
+                );
+            }
+            assert_eq!(upstream.hits(), 1, "stream={stream} round={round}");
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 1);
+        }
+    }
+}
+
+#[test]
+fn handler_binary_eventstream_with_json_content_type_is_body_sniffed_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "json-labeled-binary-eventstream-fixture",
+        run_handler_binary_eventstream_with_json_content_type_matrix,
+    );
+}
+
 async fn run_handler_json_stream_secret_markers_matrix() {
     let captured = CapturedTestLogs::default();
     let subscriber = tracing_subscriber::fmt()
@@ -3192,16 +3286,24 @@ fn handler_non_stream_untrusted_eof_fails_closed_for_five_rounds() {
 }
 
 async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
-    for (fault, expected_content, expected_stop_reason) in [
+    for (fault, expected_content, expected_stop_reason, expected_kiro_metering_usage) in [
         (
             HandlerEventStreamFault::LegacyTextWithMetadataNoStatus,
             "legacy-terminal-ok",
             "end_turn",
+            0.0,
+        ),
+        (
+            HandlerEventStreamFault::TextWithMeteringNoStatus,
+            "metered-terminal-ok",
+            "end_turn",
+            0.42,
         ),
         (
             HandlerEventStreamFault::CompleteToolWithoutStatus,
             r#""name":"Bash""#,
             "tool_use",
+            0.0,
         ),
     ] {
         for stream in [true, false] {
@@ -3234,13 +3336,18 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
                     record.downstream_stop_reason.as_deref(),
                     Some(expected_stop_reason)
                 );
+                assert!(
+                    (record.kiro_metering_usage - expected_kiro_metering_usage).abs() < 0.000_001,
+                    "fault={fault:?} stream={stream} round={round} kiro_metering_usage={}",
+                    record.kiro_metering_usage
+                );
             }
         }
     }
 }
 
 #[test]
-fn handler_legacy_metadata_and_complete_tool_are_trusted_terminals_for_five_rounds() {
+fn handler_legacy_metadata_metering_and_complete_tool_are_trusted_terminals_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread(
         "legacy-terminal-positive-fixture",
         run_handler_legacy_metadata_and_complete_tool_matrix,

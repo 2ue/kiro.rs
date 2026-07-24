@@ -231,6 +231,35 @@ feature docs: PASS, 48 issue documents, 116 relative links
 validation-build-cleanup scope=external-billing-final-fmt-check removed=true reservation_released=true
 ```
 
+### 10. Dashed/dotted model pricing alias regression
+
+2026-07-25 追加验证：生产上仍有一类 `success` 记录下游 usage 正常但内部计费为 `0`，原因是计价 catalog 使用 dotted model key，而请求/usage 侧使用 dashed alias。
+
+Command:
+
+```bash
+RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh protocol-billing-focused -- \
+  bash -lc 'cargo test --locked --all-targets provider_status_and_non_eventstream_matrix_is_private_typed_and_bounded && cargo test --locked --all-targets handler_binary_eventstream_with_json_content_type_is_body_sniffed_for_five_rounds && cargo test --locked --all-targets external_pool_billing_matches_dashed_opus_request_to_dotted_pricing_model'
+```
+
+Result:
+
+```text
+provider_status_and_non_eventstream_matrix_is_private_typed_and_bounded: passed
+handler_binary_eventstream_with_json_content_type_is_body_sniffed_for_five_rounds: passed
+external_pool_billing_matches_dashed_opus_request_to_dotted_pricing_model: passed
+validation-build-cleanup scope=protocol-billing-focused size_kib=1730452 removed=true reservation_released=true
+```
+
+Specific contract:
+
+- request/route model remains `claude-opus-4-8`;
+- pricing catalog only contains `claude-opus-4.8`;
+- billing selects `pricingModel=claude-opus-4.8`;
+- `pricingAvailable=true`;
+- `billableCostUsd=0.00101`;
+- no route/model mapping behavior is changed outside the pricing lookup path.
+
 ## Isolated dynamic gate
 
 Purpose: prove the full request path writes correct PostgreSQL usage records, not only in-memory unit functions.

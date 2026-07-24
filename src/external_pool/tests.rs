@@ -8555,6 +8555,34 @@ fn non_stream_missing_usage_injects_estimated_billing_body() {
 }
 
 #[test]
+fn external_pool_billing_matches_dashed_opus_request_to_dotted_pricing_model() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+    let route = test_route("claude-opus-4-8");
+    route.pricing_catalog.upsert_manual_price(
+        "claude-opus-4.8",
+        crate::anthropic::pricing::ModelPricing {
+            input_cost_per_token: 0.000007,
+            output_cost_per_token: 0.000031,
+            cache_creation_input_token_cost: 0.000008,
+            cache_read_input_token_cost: 0.0000007,
+        },
+    );
+    let pool = test_pool("http://pool.example.com", false);
+
+    let projected =
+        process_non_stream_response_usage(body, Some(&route), None, std::iter::empty::<String>());
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing should be captured");
+
+    assert!(billing.pricing_available);
+    assert_eq!(billing.pricing_model.as_deref(), Some("claude-opus-4.8"));
+    assert!(billing.billable_cost_usd > 0.0);
+    assert!((billing.billable_cost_usd - 0.00101).abs() < f64::EPSILON);
+}
+
+#[test]
 fn non_stream_unknown_json_without_usage_injects_estimated_usage_and_billing() {
     let body = Bytes::from_static(
         br#"{"id":"chatcmpl_fake","choices":[{"message":{"role":"assistant","content":"OK"}}],"model":"claude-opus-4-6"}"#,
