@@ -2,7 +2,7 @@
 
 日期：2026-07-24
 
-本目录记录 114 升级后暴露的三类问题、生产现象、复现方式、修复方案和已执行验证。所有生产证据均已脱敏，不记录 admin key、数据库 URL、SSH 密码或外部池 API key。
+本目录记录 114 升级后暴露的问题、生产现象、复现方式、修复方案和已执行验证。所有生产证据均已脱敏，不记录 admin key、数据库 URL、SSH 密码或外部池 API key。
 
 ## 问题清单
 
@@ -11,6 +11,7 @@
 | P1 | 现网从 113 升 114 后备用池看似丢失、Dashboard 报 `error returned from database` | 已修复/已加防复发保护 | `PostgresStore::connect` 增加当前二进制所需 schema 兼容检查；Compose 模板显式 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true`；Dashboard 总接口降重；旧 admin-ui 改用拆分接口 | Rust schema 单测/聚焦编译；admin-ui tsc/build；新 UI tsc/build |
 | P2 | 外部池成功请求大量 0 计费 | 已定位并修复主因 | 流式外部池成功但上游没有 usage event 时，基于请求估算和已输出 SSE 内容生成 `missing_stream_usage` billing，再走现有价格目录计费 | 新增 stream output token estimator 单测；新增 stream missing usage billing 单测；pricing alias 单测 |
 | P3 | Usage 中出现 `sampled request rejection` | 已解释，暂不作为代码缺陷处理 | 这是 request API key admission 采样诊断记录，设计上 `model=unknown/tokens=0/cost=0`，用于低开销记录 RPM/队列/入口拒绝，不代表上游模型调用失败 | 生产聚合显示 24h 只有 41 条，不是 0 计费主因 |
+| P4 | 生产 Redis 调度退化后高 RPM 快速失败，并最终触发/暴露整池 `TEMPORARILY_SUSPENDED` 风控禁用 | 已记录，待后续修复验证 | 当前 main 已有 Redis fault-domain 分离、scheduler degraded fallback、dashboard 降重；仍需新增 local-pool risk circuit、导入/调参 ramp-up、per-key admission/backoff | 待执行 Redis latency 注入、mock 上游风控、批量导入 ramp-up、request key admission 与前端 dashboard 压测 |
 
 ## 本轮代码改动范围
 
@@ -64,4 +65,3 @@
    - `/api/admin/usage-dashboard/windows`、`/series`、`/top` 200；
    - 观察新流式外部池成功记录：`externalPoolBilling` 应存在，`usageEstimateReason=missing_stream_usage`，`pricingAvailable=true`，`estimatedCostUsd>0`；
    - 继续确认 `sampled request rejection` 数量是否与 request API key 配额设置相符。
-

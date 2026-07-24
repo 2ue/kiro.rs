@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -3084,6 +3084,14 @@ impl RequestAdmissionConfig {
     }
 }
 
+fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3189,7 +3197,7 @@ pub struct Config {
     ///
     /// 缺少整个字段的旧配置采用保守默认值；RPM 与并发均为 0 时关闭准入限制。
     /// Queue 只修饰并发等待，无独立 enabled 语义，并在无效组合中规范化为 0/0。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub request_admission: RequestAdmissionConfig,
 
     /// 单凭据目标请求速率（RPM）。
@@ -5120,6 +5128,13 @@ mod tests {
 
         let legacy: Config = serde_json::from_str(r#"{"apiKey":"sk-legacy"}"#).unwrap();
         assert_eq!(legacy.request_admission, RequestAdmissionConfig::default());
+
+        let legacy_null: Config =
+            serde_json::from_str(r#"{"apiKey":"sk-legacy","requestAdmission":null}"#).unwrap();
+        assert_eq!(
+            legacy_null.request_admission,
+            RequestAdmissionConfig::default()
+        );
 
         let partial: Config = serde_json::from_str(
             r#"{
