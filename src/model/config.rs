@@ -2808,7 +2808,7 @@ impl Default for ExternalPoolsConfig {
             external_pool_local_rescue_on_capacity: true,
             external_pool_local_rescue_max_wait_secs:
                 default_external_pool_local_rescue_max_wait_secs(),
-            local_pool_circuit_enabled: false,
+            local_pool_circuit_enabled: true,
             local_pool_circuit_window_secs: default_local_pool_circuit_window_secs(),
             local_pool_circuit_open_after_failures: default_local_pool_circuit_open_after_failures(
             ),
@@ -3680,7 +3680,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 7;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 8;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -4710,6 +4710,14 @@ impl Config {
             // records, so an old persisted startup toggle must not reactivate that path.
             self.postgres.compress_usage_rollups_on_start = false;
             self.runtime_config_migration_version = 7;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 8 {
+            // Risk-control bursts must fail safe. Older persisted runtime configs materialized
+            // this field as false because the original circuit only fed external direct policy;
+            // v8 makes it a local-account safety circuit as well.
+            self.external_pools.local_pool_circuit_enabled = true;
+            self.runtime_config_migration_version = 8;
             changed = true;
         }
         changed

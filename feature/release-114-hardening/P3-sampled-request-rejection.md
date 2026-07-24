@@ -5,7 +5,8 @@
 生产 Usage 明细中出现：
 
 - `errorType=request_rejection`
-- `errorMessage=sampled request rejection`
+- 老版本：`errorMessage=sampled request rejection`
+- 当前修复后：`errorMessage=request rejected before upstream dispatch`
 - `model=unknown`
 - tokens/cost 均为 0
 
@@ -56,18 +57,15 @@
 
 ## 处理结论
 
-本轮不把它作为代码缺陷修复，原因：
+原始语义不是计费缺陷，原因：
 
 1. 它是故意的 admission 观测记录；
 2. 数量远小于外部池流式 0 计费主因；
 3. 它不应计费，tokens/cost=0 符合设计；
 4. 需要继续观察的是 admission 配额是否配置过低，或是否存在某个 request API key 短时打满 RPM/队列。
 
-## 后续建议
+## 本轮处理
 
-如果仍认为 UI 明细里“sampled request rejection”容易误导，可以后续做显示层优化：
-
-- 在 Usage 明细里把 `request_rejection` 显示为“网关准入拒绝采样”；
-- 在详情里展示 `reason/stage/observedCountIsExact=false`；
-- 不把它归类为上游错误或账号错误。
-
+- 将内部措辞 `sampled request rejection` 改成 `request rejected before upstream dispatch`。
+- 保留 `errorMetadata.sampled=true`、`reason/stage/observedCountIsExact=false`，仍能说明这是采样诊断记录。
+- 新增 realtime 成功/错误细分后，Usage 卡片可以区分入口拒绝/快失败导致的错误 RPM。

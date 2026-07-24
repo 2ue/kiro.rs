@@ -895,7 +895,11 @@ export interface UsageAggregate {
 export interface UsageRealtimeStats {
   windowSeconds: number
   requests: number
+  successRequests?: number
+  errorRequests?: number
   rpm: number
+  successRpm?: number
+  errorRpm?: number
   inputTpm: number
   outputTpm: number
   totalTpm: number

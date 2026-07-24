@@ -10,8 +10,9 @@
 | --- | --- | --- | --- | --- |
 | P1 | 现网从 113 升 114 后备用池看似丢失、Dashboard 报 `error returned from database` | 已修复/已加防复发保护 | `PostgresStore::connect` 增加当前二进制所需 schema 兼容检查；Compose 模板显式 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true`；Dashboard 总接口降重；旧 admin-ui 改用拆分接口 | Rust schema 单测/聚焦编译；admin-ui tsc/build；新 UI tsc/build |
 | P2 | 外部池成功请求大量 0 计费 | 已定位并修复主因 | 流式外部池成功但上游没有 usage event 时，基于请求估算和已输出 SSE 内容生成 `missing_stream_usage` billing，再走现有价格目录计费 | 新增 stream output token estimator 单测；新增 stream missing usage billing 单测；pricing alias 单测 |
-| P3 | Usage 中出现 `sampled request rejection` | 已解释，暂不作为代码缺陷处理 | 这是 request API key admission 采样诊断记录，设计上 `model=unknown/tokens=0/cost=0`，用于低开销记录 RPM/队列/入口拒绝，不代表上游模型调用失败 | 生产聚合显示 24h 只有 41 条，不是 0 计费主因 |
-| P4 | 生产 Redis 调度退化后高 RPM 快速失败，并最终触发/暴露整池 `TEMPORARILY_SUSPENDED` 风控禁用 | 已记录，待后续修复验证 | 当前 main 已有 Redis fault-domain 分离、scheduler degraded fallback、dashboard 降重；仍需新增 local-pool risk circuit、导入/调参 ramp-up、per-key admission/backoff | 待执行 Redis latency 注入、mock 上游风控、批量导入 ramp-up、request key admission 与前端 dashboard 压测 |
+| P3 | Usage 中出现 `sampled request rejection` | 已优化文案/保留采样语义 | request API key admission 采样诊断记录不代表上游失败；文案改为 `request rejected before upstream dispatch`，采样细节仍在 metadata | usage 采样单测、realtime 成功/错误细分测试 |
+| P4 | 生产 Redis 调度退化后高 RPM 快速失败，并最终触发/暴露整池 `TEMPORARILY_SUSPENDED` 风控禁用 | 已完成核心防放大修复，待隔离高并发矩阵继续验证 | local-pool risk circuit；circuit 打开后 acquire/preflight 不先碰 Redis；风险控制后不继续烧剩余账号；单凭据/全局容量变化 warmup | 风险熔断、warmup、runtime migration、public error 聚焦测试通过 |
+| P5 | 并发低、RPM 高、页面卡与调度观测口径 | 已完成源码复核、观测补强和入口防放大，待负载矩阵验证 | 区分 admission 并发、本地账号 lease、usage 完成 RPM、dashboard 聚合；新增 realtime success/error 细分；本地临时调度失败反馈到 per-key admission backoff | usage memory/Redis/PgSQL summary 聚焦测试、request admission backoff 测试和 handler 分类器测试通过 |
 
 ## 本轮代码改动范围
 
@@ -64,4 +65,5 @@
    - `/api/admin/external-pools` 仍返回现有池数量；
    - `/api/admin/usage-dashboard/windows`、`/series`、`/top` 200；
    - 观察新流式外部池成功记录：`externalPoolBilling` 应存在，`usageEstimateReason=missing_stream_usage`，`pricingAvailable=true`，`estimatedCostUsd>0`；
-   - 继续确认 `sampled request rejection` 数量是否与 request API key 配额设置相符。
+   - 继续确认 `request_rejection` 数量是否与 request API key 配额设置相符；
+   - 观察 realtime `successRequests/errorRequests`，确认高 RPM 是否主要来自错误快失败。

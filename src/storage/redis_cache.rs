@@ -2293,6 +2293,14 @@ impl RedisStore {
             .arg(1i64)
             .cmd("HINCRBY")
             .arg(&realtime_key)
+            .arg(if record.status == UsageRecordStatus::Success {
+                "success_requests"
+            } else {
+                "error_requests"
+            })
+            .arg(1i64)
+            .cmd("HINCRBY")
+            .arg(&realtime_key)
             .arg("input_tokens")
             .arg(record.total_input_tokens as i64)
             .cmd("HINCRBY")
@@ -2983,18 +2991,24 @@ impl RedisStore {
         let mut manager = self.manager.clone();
         let buckets: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
         let mut requests = 0usize;
+        let mut success_requests = 0usize;
+        let mut error_requests = 0usize;
         let mut input_tokens = 0i64;
         let mut output_tokens = 0i64;
         let mut billable_input_tokens = 0i64;
         for bucket in buckets {
             requests += usage_usize(&bucket, "requests");
+            success_requests += usage_usize(&bucket, "success_requests");
+            error_requests += usage_usize(&bucket, "error_requests");
             input_tokens += usage_i64(&bucket, "input_tokens");
             output_tokens += usage_i64(&bucket, "output_tokens");
             billable_input_tokens += usage_i64(&bucket, "billable_input_tokens");
         }
-        Ok(UsageRealtimeStats::from_totals(
+        Ok(UsageRealtimeStats::from_totals_with_status(
             REALTIME_USAGE_WINDOW_SECS,
             requests,
+            success_requests,
+            error_requests,
             input_tokens,
             output_tokens,
             billable_input_tokens,
@@ -7938,6 +7952,12 @@ mod tests {
         assert_eq!(summary.error_requests, 1);
         assert_eq!(summary.high_cache_requests, 1);
         assert_eq!(summary.total_input_tokens, 300);
+        assert_eq!(summary.realtime.requests, 3);
+        assert_eq!(summary.realtime.success_requests, 2);
+        assert_eq!(summary.realtime.error_requests, 1);
+        assert_eq!(summary.realtime.rpm, 3.0);
+        assert_eq!(summary.realtime.success_rpm, 2.0);
+        assert_eq!(summary.realtime.error_rpm, 1.0);
         assert_eq!(summary.top_credentials.len(), 2);
 
         let dashboard = store

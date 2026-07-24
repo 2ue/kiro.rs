@@ -11,6 +11,7 @@ pub enum LocalPoolRouteStateKind {
     AllCoolingDown,
     CapacityFull,
     SchedulerRedisDegraded,
+    RiskCircuitOpen,
 }
 
 impl LocalPoolRouteStateKind {

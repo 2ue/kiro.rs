@@ -4,7 +4,7 @@
 
 ## 状态
 
-已完成只读生产复核，待后续代码修复与验证。
+已完成只读生产复核；本轮已完成核心防放大修复和聚焦验证，仍需在隔离假上游/负载矩阵下继续验证更大并发场景。
 
 生产证据来源：
 
@@ -130,25 +130,38 @@ Asia/Shanghai 时间：
 
 ## 后续必须修复
 
+## 本轮已修复
+
 1. 增加本地账号池风控熔断。
-   - 短窗口内 N 个不同凭据出现 `TEMPORARILY_SUSPENDED`/security lock 后，立即打开 local-pool risk circuit。
-   - circuit 打开后停止继续探测剩余本地凭据。
-   - 有外部池时转外部池；无外部池时返回受控 retryable 错误。
+   - 短窗口内多个凭据出现 `TEMPORARILY_SUSPENDED`/风险控制后，打开进程内 local-pool risk circuit。
+   - circuit 打开后 `local_pool_route_state` 返回 `risk_circuit_open`，`dispatchable=0`。
+   - 本地 `acquire_context` 在碰 Redis scheduler 前先检查进程内 circuit，避免 Redis degraded 时仍被 Redis 热路径拖住。
+   - 有外部池且配置允许时走外部池；无可用外部池时返回受控临时失败，并带 `retry-after`。
 
-2. 风控 auto-disable 保留单账号禁用，但不得继续把剩余账号全部探测到死。
+2. 风控 auto-disable 保留单账号禁用，但不再继续把剩余账号全部探测到死。
+   - provider 收到上游风险控制后使用 `report_risk_controlled_outcome`。
+   - 若 circuit 已打开，即使仍有未禁用账号，也不继续 local retry。
 
-3. 批量导入/批量改并发后强制缓启动。
-   - 新增/刚更新凭据进入 ramp-up。
-   - 初期限制高并发、高 RPM、高 token、高 cache route 选择。
-   - 成功样本积累后逐步放量。
+3. 批量/配置调参后的缓启动补强。
+   - 单凭据 RPM/并发修改会重置该凭据 `warmup_remaining`。
+   - 全局 `credential_rpm`、全局单凭据并发、全局 dispatch 并发、weighted capacity、负载均衡模式、warmup 参数变化时，会重置本进程活跃凭据 warmup。
+   - 禁用凭据不会因 warmup 重置被重新引入。
 
-4. request API key 必须成为准入与诊断实体。
-   - 按 key 维度限制 RPM、并发、排队。
-   - usage 记录必须能按 key 聚合，避免 0.0.113 这种事故后无法快速定位下游来源。
+4. 观测字段补强。
+   - `UsageRealtimeStats` 新增 `successRequests/errorRequests/successRpm/errorRpm`，用来区分高 RPM 是成功完成、错误快失败，还是混合。
+   - Usage 页面和 admin usage 面板已显示实时成功/错误细分。
+   - `sampled request rejection` 内部措辞改为 `request rejected before upstream dispatch`，采样属性仍保留在 metadata。
 
-5. scheduler degraded 期间要对同 key/同 route 做短 backoff，避免无限快速失败把 RPM 放大。
+5. 生产部署隔离要求已在当前 main 中保持。
+   - usage/statistics/admin cache 只使用独立 observability Redis；如果没有配置或无法证明与业务 Redis 是不同 server，则降级 PostgreSQL/进程内，不回落业务 Redis。
+   - 业务 Redis 仍只承载调度、事件、lease 等核心路径。
 
-6. 生产部署必须保证业务 Redis 与 observability Redis 是不同 Redis 服务/容器，而不是不同 DB 或 key prefix。
+## 仍需继续验证/可能后续优化
+
+1. 隔离假上游高并发矩阵下验证 risk circuit 打开后的恢复、外部池接管、无外部池 retry-after 行为。
+2. scheduler degraded 期间是否需要进一步按 request API key 做短 backoff/collapse，避免大量客户端持续重试时仍产生高 completed-error RPM。
+3. 管理页 dashboard 在 PgSQL 高基数 usage 下的响应时间和缓存命中情况还需要隔离数据集验证。
+4. 跨实例 local-pool risk circuit 当前是进程内 fail-safe，不依赖 Redis；它能避免单实例继续烧账号，但不等于跨实例全局风控熔断。跨实例 circuit 若实现，必须放在独立低争用存储或独立 Redis fault-domain，不能再依赖业务 Redis 热路径。
 
 ## 验证计划
 
@@ -161,3 +174,16 @@ Asia/Shanghai 时间：
 5. request API key admission 测试，验证单 key 重试不会拖垮全局。
 6. 前端 dashboard 在大 usage 表下的响应时间测试。
 
+## 本轮已执行聚焦验证
+
+所有 Cargo 命令均通过 `feature/tests/run-cargo-scoped.sh` 执行并清理 scoped target。
+
+- `cargo fmt --all -- --check` 通过。
+- `cargo test --locked --all-targets local_pool_risk_circuit_stops_burning_remaining_credentials` 通过。
+- `cargo test --locked --all-targets priority_mode_respects_warmup_candidate_share` 通过。
+- `cargo test --locked --all-targets credential_capacity_updates_reset_warmup_remaining` 通过。
+- `cargo test --locked --all-targets runtime_capacity_updates_reset_active_credential_warmup` 通过。
+- `cargo test --locked --all-targets auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_internal_terms` 通过，覆盖 risk circuit public error + `retry-after`。
+- `cargo test --locked --all-targets runtime_config_migration` 通过。
+- `cargo test --locked --all-targets external_pool_scheduler_redis_fallback_preserves_explicit_boolean_values` 通过。
+- `cargo test --locked --all-targets local_pool_circuit` 通过。

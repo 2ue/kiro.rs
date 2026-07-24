@@ -35,6 +35,7 @@ pub enum AccountRejectReason {
     GlobalConcurrencyFull,
     CooldownActive,
     HealthBlocked,
+    RiskCircuitOpen,
     StickyTargetUnavailable,
     RefreshInProgress,
     RefreshFailed,
@@ -234,6 +235,7 @@ pub enum KiroCallFailureKind {
     DownstreamCommitted,
     AuxiliaryAttemptsExhausted,
     AuxiliaryConcurrencySaturated,
+    LocalPoolRiskCircuitOpen,
     ThinkingSignatureInvalid,
     ThinkingSignatureRetryFailed,
 }

@@ -9268,7 +9268,7 @@ impl KiroProvider {
                     status,
                     response_body_bytes
                 );
-                let has_available = self.token_manager.report_risk_controlled(
+                let risk_outcome = self.token_manager.report_risk_controlled_outcome(
                     ctx.id,
                     risk_reason,
                     format!("MCP status={status} risk_control={risk_reason:?}"),
@@ -9281,20 +9281,33 @@ impl KiroProvider {
                     ctx.id,
                     &credential_label,
                     Some(status),
-                    if has_available { "retry" } else { "fail" },
+                    if risk_outcome.can_retry_local() {
+                        "retry"
+                    } else {
+                        "fail"
+                    },
                     Some(failure_kind.as_error_type()),
                     Some("mcp_risk_control".to_string()),
                     attempt_started_at,
                     None,
                 );
-                if !has_available {
+                if !risk_outcome.can_retry_local() {
                     self.finish_attempt(&mut ctx);
                     return Err(Self::mcp_failure_error_with_attribution(
                         failure_kind,
-                        format!(
-                            "MCP 请求失败（{}，所有账号已用尽）: {}",
-                            credential_context, status
-                        ),
+                        if risk_outcome.circuit_open {
+                            format!(
+                                "MCP 请求失败（{}，本地账号池风险保护已打开，retry_after_secs={}）: {}",
+                                credential_context,
+                                risk_outcome.retry_after_secs.unwrap_or(1),
+                                status
+                            )
+                        } else {
+                            format!(
+                                "MCP 请求失败（{}，所有账号已用尽）: {}",
+                                credential_context, status
+                            )
+                        },
                         Some(ctx.id),
                         Some(credential_label),
                         attempts,
@@ -10428,16 +10441,25 @@ impl KiroProvider {
                     max_retries,
                     "Kiro API credential entered a terminal risk-control state"
                 );
-                let has_available =
-                    self.token_manager
-                        .report_risk_controlled(ctx.id, risk_reason, message.clone());
+                let risk_outcome = self.token_manager.report_risk_controlled_outcome(
+                    ctx.id,
+                    risk_reason,
+                    message.clone(),
+                );
                 if let Some(session_id) = conversation_id.as_deref() {
                     self.token_manager
                         .unbind_session_if_bound_to(session_id, ctx.id);
                 }
-                if !has_available {
-                    let final_message =
-                        format!("{} all_credentials_exhausted=true 所有账号已用尽", message);
+                if !risk_outcome.can_retry_local() {
+                    let final_message = if risk_outcome.circuit_open {
+                        format!(
+                            "{} local_pool_risk_circuit_open=true retry_after_secs={} 本地账号池风险保护已打开",
+                            message,
+                            risk_outcome.retry_after_secs.unwrap_or(1)
+                        )
+                    } else {
+                        format!("{} all_credentials_exhausted=true 所有账号已用尽", message)
+                    };
                     Self::push_attempt(
                         &mut attempts,
                         attempt,
@@ -10452,7 +10474,15 @@ impl KiroProvider {
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
-                    return Err(Self::traced_error(final_message, &attempts));
+                    return if risk_outcome.circuit_open {
+                        Err(Self::traced_error_with_failure_kind(
+                            final_message,
+                            &attempts,
+                            KiroCallFailureKind::LocalPoolRiskCircuitOpen,
+                        ))
+                    } else {
+                        Err(Self::traced_error(final_message, &attempts))
+                    };
                 }
                 Self::push_attempt(
                     &mut attempts,

@@ -346,11 +346,11 @@ export function ExternalPoolsPage() {
                   <TextAreaBox disabled={!directPolicyActive} label="路径原因规则" value={pathRulesText} onChange={setPathRulesText} />
                 </div>
                 <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <ToggleRow disabled={!directPolicyActive} label="启用本地保护统计" checked={configDraft.localPoolCircuitEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitEnabled: v }))} />
-                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="统计窗口" suffix="秒" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitWindowSecs: v }))} />
-                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="失败阈值" suffix="次" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitOpenAfterFailures: v }))} />
-                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="涉及账号" suffix="个" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitRequireDistinctCredentials: v }))} />
-                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="暂停时长" suffix="秒" value={configDraft.localPoolCircuitOpenSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitOpenSecs: v }))} />
+                  <ToggleRow label="启用本地保护统计" checked={configDraft.localPoolCircuitEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitEnabled: v }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="统计窗口" suffix="秒" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitWindowSecs: v }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="失败阈值" suffix="次" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitOpenAfterFailures: v }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="涉及账号" suffix="个" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitRequireDistinctCredentials: v }))} />
+                  <NumberBox disabled={!configDraft.localPoolCircuitEnabled} label="暂停时长" suffix="秒" value={configDraft.localPoolCircuitOpenSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolCircuitOpenSecs: v }))} />
                 </div>
               </FormSection>
             </div>

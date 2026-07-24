@@ -36,7 +36,7 @@ const ERROR_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 8192;
 const ERROR_DIAGNOSTIC_MAX_STRING_BYTES: usize = 512;
 const ERROR_DIAGNOSTIC_MAX_ARRAY_ITEMS: usize = 20;
 const REQUEST_REJECTION_ERROR_TYPE: &str = "request_rejection";
-const REQUEST_REJECTION_ERROR_MESSAGE: &str = "sampled request rejection";
+const REQUEST_REJECTION_ERROR_MESSAGE: &str = "request rejected before upstream dispatch";
 pub const REALTIME_USAGE_WINDOW_SECS: u32 = 60;
 pub const DEFAULT_USAGE_DASHBOARD_TIMEZONE: &str = "Asia/Shanghai";
 
@@ -664,7 +664,15 @@ pub struct UsageAggregate {
 pub struct UsageRealtimeStats {
     pub window_seconds: u32,
     pub requests: usize,
+    #[serde(default)]
+    pub success_requests: usize,
+    #[serde(default)]
+    pub error_requests: usize,
     pub rpm: f64,
+    #[serde(default)]
+    pub success_rpm: f64,
+    #[serde(default)]
+    pub error_rpm: f64,
     pub input_tpm: f64,
     pub output_tpm: f64,
     pub total_tpm: f64,
@@ -676,7 +684,11 @@ impl UsageRealtimeStats {
         Self {
             window_seconds,
             requests: 0,
+            success_requests: 0,
+            error_requests: 0,
             rpm: 0.0,
+            success_rpm: 0.0,
+            error_rpm: 0.0,
             input_tpm: 0.0,
             output_tpm: 0.0,
             total_tpm: 0.0,
@@ -684,9 +696,11 @@ impl UsageRealtimeStats {
         }
     }
 
-    pub fn from_totals(
+    pub fn from_totals_with_status(
         window_seconds: u32,
         requests: usize,
+        success_requests: usize,
+        error_requests: usize,
         input_tokens: i64,
         output_tokens: i64,
         billable_input_tokens: i64,
@@ -701,7 +715,11 @@ impl UsageRealtimeStats {
         Self {
             window_seconds,
             requests,
+            success_requests,
+            error_requests,
             rpm: requests as f64 * scale,
+            success_rpm: success_requests as f64 * scale,
+            error_rpm: error_requests as f64 * scale,
             input_tpm,
             output_tpm,
             total_tpm: input_tpm + output_tpm,
@@ -2301,6 +2319,8 @@ impl UsageRecorder {
         let realtime_cutoff =
             Utc::now() - chrono::Duration::seconds(REALTIME_USAGE_WINDOW_SECS as i64);
         let mut realtime_requests = 0usize;
+        let mut realtime_success_requests = 0usize;
+        let mut realtime_error_requests = 0usize;
         let mut realtime_input_tokens = 0i64;
         let mut realtime_output_tokens = 0i64;
         let mut realtime_billable_input_tokens = 0i64;
@@ -2369,6 +2389,11 @@ impl UsageRecorder {
                 .unwrap_or(false)
             {
                 realtime_requests += 1;
+                if record.status == UsageRecordStatus::Success {
+                    realtime_success_requests += 1;
+                } else {
+                    realtime_error_requests += 1;
+                }
                 realtime_input_tokens += record.total_input_tokens as i64;
                 realtime_output_tokens += record.output_tokens as i64;
                 realtime_billable_input_tokens += record.billable_input_tokens as i64;
@@ -2418,9 +2443,11 @@ impl UsageRecorder {
 
         summary.top_credentials = top_aggregates(credentials);
         summary.top_conversations = top_aggregates(conversations);
-        summary.realtime = UsageRealtimeStats::from_totals(
+        summary.realtime = UsageRealtimeStats::from_totals_with_status(
             REALTIME_USAGE_WINDOW_SECS,
             realtime_requests,
+            realtime_success_requests,
+            realtime_error_requests,
             realtime_input_tokens,
             realtime_output_tokens,
             realtime_billable_input_tokens,
@@ -4185,7 +4212,11 @@ mod tests {
         assert_eq!(summary.local_prompt_cache_creation_input_tokens, 5);
         assert_eq!(summary.realtime.window_seconds, REALTIME_USAGE_WINDOW_SECS);
         assert_eq!(summary.realtime.requests, 2);
+        assert_eq!(summary.realtime.success_requests, 2);
+        assert_eq!(summary.realtime.error_requests, 0);
         assert_eq!(summary.realtime.rpm, 2.0);
+        assert_eq!(summary.realtime.success_rpm, 2.0);
+        assert_eq!(summary.realtime.error_rpm, 0.0);
         assert_eq!(summary.realtime.total_tpm, 220.0);
         assert_eq!(summary.realtime.billable_tpm, 120.0);
         assert!((summary.total_original_cost_usd - 0.010).abs() < f64::EPSILON);

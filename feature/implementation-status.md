@@ -1,10 +1,49 @@
 # Implementation Status
 
-Date: 2026-07-23
+Date: 2026-07-24
 
 ## Current Phase
 
-`release-gate-pass-with-local-9022-inventory-exception / v0.0.117 publish-pending`：当前候选已完成 2026-07-22 真实 Claude CLI、thinking wire、body/reasoning、runtime quarantine、scheduler Redis chaos、业务/观测 Redis fault-domain 与 SchedulerRedisDegraded external takeover 正/负向动态复测；2026-07-23 又完成 v0.0.117 最终统一候选的默认/no-default Rust 全量测试、clippy baseline、release build、Node 合同、文档、diff、真实 Claude CLI long-session/bare/thinking wire，以及 frozen load/chaos L3/L4/L5。既有 `127.0.0.1:9022` 服务未被停止、重启、迁移或压测；最终本机 inventory fail 只来自该预存服务引用 repo root `target`，作为 local service exception 记录，不作为 scoped validation leak。Docker 动态验证按用户要求豁免且不记为 pass。Git 发布尚未执行，下一步是提交、升版本到 `0.0.117`、打 tag 并推送。
+`post-v0.0.115 scheduler-risk hardening in progress`：已完成 114/115 发布后的生产只读复核，并针对“Redis 调度退化 + 快速失败 RPM + 上游 TEMPORARILY_SUSPENDED 后整池烧光”的放大链实现第一批修复。当前工作树尚未发布新版本；下一步是完成隔离负载/异常恢复验证、UI 类型检查、文档检查和发布门禁。
+
+## 2026-07-24 Scheduler Risk Follow-up
+
+- 本轮修复：
+  - local-pool risk circuit：多个凭据短窗口风险控制后打开本进程账号池熔断，停止继续探测剩余本地账号。
+  - circuit 打开后 `local_pool_route_state` / `acquire_context` 先走进程内检查，不先碰 Redis scheduler 热路径。
+  - risk circuit public error 归一为临时失败并带 `retry-after`。
+  - 单凭据 RPM/并发变化重置该凭据 warmup。
+  - 全局 credential RPM、单凭据全局并发、全局 dispatch 并发、weighted capacity、负载均衡模式和 warmup 参数变化时，重置本进程活跃凭据 warmup。
+  - Usage realtime 新增 `successRequests/errorRequests/successRpm/errorRpm`，两套 usage 页面显示成功/错误细分。
+  - request admission 采样记录文案从 `sampled request rejection` 改为 `request rejected before upstream dispatch`。
+  - request admission 新增 per-key 本地临时调度失败 backoff：本地 risk circuit / Redis scheduler degraded / 本地账号调度容量或队列临时失败最终返回下游时，同一 request API key 在 1-8 秒内入口层直接 429，不进入 provider/Redis scheduler 热路径；普通上游 429 不触发。
+- 已通过聚焦验证：
+  - `local_pool_risk_circuit_stops_burning_remaining_credentials`
+  - `priority_mode_respects_warmup_candidate_share`
+  - `credential_capacity_updates_reset_warmup_remaining`
+  - `runtime_capacity_updates_reset_active_credential_warmup`
+  - `auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_internal_terms`
+  - `summary_counts_high_cache_and_sources`
+  - `redis_usage_summary_and_dashboard_are_materialized`
+  - `non_stream_missing_usage_injects_estimated_billing_body`
+  - `stream_missing_usage_builds_estimated_billable_external_pool_billing`
+  - `runtime_config_migration`
+  - `external_pool_scheduler_redis_fallback_preserves_explicit_boolean_values`
+  - `local_pool_circuit`
+  - `test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load`：600 请求、24 账号、global 48、per credential 3，20 个非冷却账号全部参与，分布 29-31 次。
+  - `test_model_scoped_429_high_concurrency_disabled_and_model_filters`
+  - request API key admission queue/RPM/concurrency focused tests：single-key RPM、key 隔离并发、bounded queue、FIFO queue。
+  - request API key admission local backoff：`local_temporary_backoff_*` 4 项通过，覆盖 RPM 前拒绝、retry-after 上限、排队 waiter 唤醒和 admission disabled；handler 分类器 `local_scheduler_error_enables_admission_backoff_classification` / `upstream_rate_limit_does_not_enable_local_admission_backoff` 通过。
+  - `request_admission` 模块回归 24 项通过。
+  - `local_pool_risk_circuit_stops_burning_remaining_credentials` 通过。
+  - `warmup` 相关聚焦 6 项通过。
+  - `summary_counts_high_cache_and_sources` 与 `redis_usage_summary_and_dashboard_are_materialized` 通过。
+  - `cargo check --locked --all-targets` 通过。
+  - `git diff --check`、`node feature/tests/check-feature-docs.mjs`、`ui pnpm run check`、`admin-ui pnpm exec tsc -b --pretty false` 通过。
+  - `node --test feature/tests/*.test.mjs` 通过：283 tests / 261 pass / 22 explicit skips / 0 fail。
+  - Claude Code CLI 当前版本记录为 `2.1.197`。本轮未启动真实 CLI temp service：当前 `9022` 为既有本地服务，按验证安全合同不触碰；真实 CLI C1-C4 需要后续冻结临时 binary 和独占端口再跑。
+- 构建产物约束：上述 Cargo 批次均通过 `feature/tests/run-cargo-scoped.sh` 执行，日志显示 `removed=true reservation_released=true`。
+- 当前 build artifact inventory 的唯一 release-gate blocker 是既有 PID `84264` 仍从仓库 `target/release/kiro-rs` 运行并写 `target/local-verify/kiro-rs-9022.log`；这是用户本地 9022 服务，不属于本轮 scoped Cargo 残留，未停止、未删除。
 
 ## 2026-07-23 Final Release Gate Checkpoint
 

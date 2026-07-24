@@ -6086,11 +6086,15 @@ async fn test_simulation_mixed_large_requests_failures_and_disabled_accounts() {
     let manager = Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
 
     assert!(manager.report_quota_exhausted(3));
-    assert!(manager.report_risk_controlled(
-        4,
-        CredentialRiskControlReason::TemporarilySuspended,
-        "TEMPORARILY_SUSPENDED"
-    ));
+    assert!(
+        manager
+            .report_risk_controlled_outcome(
+                4,
+                CredentialRiskControlReason::TemporarilySuspended,
+                "TEMPORARILY_SUSPENDED"
+            )
+            .can_retry_local()
+    );
     assert!(
         manager
             .report_transient_failure_kind(
@@ -6360,6 +6364,59 @@ async fn test_credential_rpm_override_zero_bypasses_global_limit() {
     assert_eq!(snapshot.entries[0].rpm, 0);
     assert_eq!(snapshot.entries[0].rpm_override, Some(0));
     assert!(!snapshot.entries[0].rate_limited);
+}
+
+#[tokio::test]
+async fn priority_mode_respects_warmup_candidate_share() {
+    let mut config = Config::default();
+    config.load_balancing_mode = "priority".to_string();
+    config.credential_warmup_selection_percent = 0;
+    config.credential_warmup_max_selection_percent = 0;
+
+    let mut ready = test_access_token_credential("ready", "Pro");
+    ready.priority = 10;
+    let mut warming = test_access_token_credential("warming", "Pro");
+    warming.priority = 0;
+
+    let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+    manager
+        .set_warmup_remaining(2, 5)
+        .expect("mark second credential warming");
+
+    let mut ctx = manager
+        .acquire_context(None)
+        .await
+        .expect("ready credential should be selected");
+    assert_eq!(
+        ctx.id, 1,
+        "priority mode must not bypass warmup share to select the lower-priority warming account"
+    );
+    ctx.release_in_flight();
+}
+
+#[test]
+fn credential_capacity_updates_reset_warmup_remaining() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 7;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("capacity", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 0);
+    manager.set_credential_rpm(1, Some(30)).unwrap();
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 7);
+
+    manager.report_success(1);
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 6);
+    manager
+        .set_credential_max_concurrent_requests(1, Some(20))
+        .unwrap();
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 7);
 }
 
 #[tokio::test]
@@ -11494,11 +11551,15 @@ fn test_report_risk_controlled_disables_with_specific_reason() {
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-    assert!(manager.report_risk_controlled(
-        1,
-        CredentialRiskControlReason::TemporarilySuspended,
-        "TEMPORARILY_SUSPENDED"
-    ));
+    assert!(
+        manager
+            .report_risk_controlled_outcome(
+                1,
+                CredentialRiskControlReason::TemporarilySuspended,
+                "TEMPORARILY_SUSPENDED"
+            )
+            .can_retry_local()
+    );
 
     let snapshot = manager.snapshot();
     assert_eq!(snapshot.available, 1);
@@ -11510,6 +11571,116 @@ fn test_report_risk_controlled_disables_with_specific_reason() {
         Some("TemporarilySuspended")
     );
     assert_eq!(disabled.failure_count, MAX_FAILURES_PER_CREDENTIAL);
+}
+
+#[tokio::test]
+async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
+    let mut config = Config::default();
+    config.external_pools.local_pool_circuit_enabled = true;
+    config.external_pools.local_pool_circuit_open_after_failures = 2;
+    config
+        .external_pools
+        .local_pool_circuit_require_distinct_credentials = 2;
+    config.external_pools.local_pool_circuit_open_secs = 30;
+
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            test_access_token_credential("risk-1", "Pro"),
+            test_access_token_credential("risk-2", "Pro"),
+            test_access_token_credential("risk-3", "Pro"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    let first = manager.report_risk_controlled_outcome(
+        1,
+        CredentialRiskControlReason::TemporarilySuspended,
+        "TEMPORARILY_SUSPENDED first",
+    );
+    assert!(first.can_retry_local());
+    assert!(!first.circuit_open);
+    assert_eq!(manager.available_count(), 2);
+
+    let second = manager.report_risk_controlled_outcome(
+        2,
+        CredentialRiskControlReason::TemporarilySuspended,
+        "TEMPORARILY_SUSPENDED second",
+    );
+    assert!(
+        second.has_available_credentials,
+        "one untouched credential remains available"
+    );
+    assert!(second.circuit_open);
+    assert!(!second.can_retry_local());
+    assert!(second.retry_after_secs.is_some());
+    assert_eq!(manager.available_count(), 1);
+
+    let state = manager.local_pool_route_state(None);
+    assert_eq!(state.kind, LocalPoolRouteStateKind::RiskCircuitOpen);
+    assert_eq!(state.available, 1);
+    assert_eq!(state.dispatchable, 0);
+    assert!(state.retry_after_secs.is_some());
+
+    let error = match manager.acquire_context(None).await {
+        Ok(mut ctx) => {
+            ctx.release_in_flight();
+            panic!("risk circuit must stop local acquisition");
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("本地账号池风险保护已打开"),
+        "unexpected error: {error}"
+    );
+    let snapshot = manager.snapshot();
+    let untouched = snapshot.entries.iter().find(|entry| entry.id == 3).unwrap();
+    assert!(
+        !untouched.disabled,
+        "circuit must not disable untouched accounts"
+    );
+}
+
+#[test]
+fn runtime_capacity_updates_reset_active_credential_warmup() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 5;
+    config.credential_rpm = Some(60);
+
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            test_access_token_credential("warmup-global-1", "Pro"),
+            test_access_token_credential("warmup-global-2", "Pro"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    {
+        let mut entries = manager.entries.lock();
+        entries[0].warmup_remaining = 0;
+        entries[1].warmup_remaining = 0;
+        entries[1].credentials.disabled = true;
+        entries[1].disabled = true;
+    }
+
+    manager
+        .update_runtime_config(|config| {
+            config.credential_rpm = Some(90);
+        })
+        .unwrap();
+
+    let entries = manager.entries.lock();
+    assert_eq!(entries[0].warmup_remaining, 5);
+    assert_eq!(
+        entries[1].warmup_remaining, 0,
+        "disabled credentials should not be reintroduced by global capacity warmup"
+    );
 }
 
 #[tokio::test]

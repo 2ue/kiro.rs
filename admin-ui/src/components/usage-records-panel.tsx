@@ -668,7 +668,7 @@ export function UsageRecordsPanel() {
           <CardContent>
             <div className="text-2xl font-bold">{formatNumber(realtime?.rpm || 0)}</div>
             <div className="text-xs text-muted-foreground">
-              近 {realtimeWindow} 秒 {formatNumber(realtime?.requests || 0)} 请求
+              近 {realtimeWindow} 秒 {formatNumber(realtime?.requests || 0)} 请求 · 成功 {formatNumber(realtime?.successRequests || 0)} · 错误 {formatNumber(realtime?.errorRequests || 0)}
             </div>
           </CardContent>
         </Card>

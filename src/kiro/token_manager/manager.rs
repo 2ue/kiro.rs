@@ -398,6 +398,38 @@ impl StatsFlushWorkerHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RiskControlReportOutcome {
+    pub has_available_credentials: bool,
+    pub circuit_open: bool,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl RiskControlReportOutcome {
+    pub(crate) fn can_retry_local(self) -> bool {
+        self.has_available_credentials && !self.circuit_open
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalPoolRiskCircuitEvent {
+    at: Instant,
+    credential_id: u64,
+}
+
+#[derive(Debug, Default)]
+struct LocalPoolRiskCircuit {
+    failures: VecDeque<LocalPoolRiskCircuitEvent>,
+    open_until: Option<Instant>,
+    reason: Option<CredentialRiskControlReason>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalPoolRiskCircuitSnapshot {
+    open: bool,
+    retry_after: Option<StdDuration>,
+}
+
 #[derive(Debug)]
 struct ModelCapabilityCohortCache {
     generation: u64,
@@ -874,6 +906,9 @@ pub struct MultiTokenManager {
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
     /// 凭据容量 credit 与广播 generation；多槽释放不会折叠成一个通知。
     capacity_signal: Arc<CapacitySignal>,
+    /// 进程内本地账号池风控熔断。它不依赖 Redis，确保 Redis degraded 或外部池
+    /// 配置异常时也能先停止继续探测剩余本地账号。
+    local_pool_risk_circuit: Mutex<LocalPoolRiskCircuit>,
     /// 本进程近期已经释放的 Redis lease。Redis release 是异步写，后台同步可能先读到旧快照；
     /// 这里用短 TTL tombstone 避免旧 lease 被重新导入本地并发槽。
     released_in_flight_lease_tombstones: ReleasedInFlightLeaseTombstones,
@@ -2272,6 +2307,7 @@ impl MultiTokenManager {
             runtime_mutation_flush_cursor: AtomicU64::new(0),
             session_bindings: Mutex::new(HashMap::new()),
             capacity_signal: Arc::new(CapacitySignal::default()),
+            local_pool_risk_circuit: Mutex::new(LocalPoolRiskCircuit::default()),
             released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
             next_in_flight_lease_id: AtomicU64::new(initial_lease_id),
             queued_requests: Arc::new(AtomicU32::new(0)),
@@ -2317,6 +2353,52 @@ impl MultiTokenManager {
     /// 获取当前运行时配置快照。
     pub fn runtime_config(&self) -> Config {
         self.config.lock().clone()
+    }
+
+    fn runtime_capacity_change_should_reset_warmup(previous: &Config, current: &Config) -> bool {
+        previous.credential_rpm != current.credential_rpm
+            || previous.credential_max_concurrent_requests
+                != current.credential_max_concurrent_requests
+            || previous.dispatch_global_max_concurrent_requests
+                != current.dispatch_global_max_concurrent_requests
+            || previous.weighted_capacity != current.weighted_capacity
+            || previous.load_balancing_mode != current.load_balancing_mode
+            || previous.credential_warmup_requests != current.credential_warmup_requests
+            || previous.credential_warmup_selection_percent
+                != current.credential_warmup_selection_percent
+            || previous.credential_warmup_max_selection_percent
+                != current.credential_warmup_max_selection_percent
+    }
+
+    fn reset_active_warmup_after_runtime_capacity_change(
+        &self,
+        previous: &Config,
+        current: &Config,
+        reason: &'static str,
+    ) -> usize {
+        if current.credential_warmup_requests == 0
+            || !Self::runtime_capacity_change_should_reset_warmup(previous, current)
+        {
+            return 0;
+        }
+        let warmup_remaining = current.credential_warmup_requests;
+        let mut entries = self.entries.lock();
+        let mut reset = 0usize;
+        for entry in entries.iter_mut().filter(|entry| !entry.disabled) {
+            if entry.warmup_remaining != warmup_remaining {
+                entry.warmup_remaining = warmup_remaining;
+                reset += 1;
+            }
+        }
+        if reset > 0 {
+            tracing::info!(
+                reason,
+                reset,
+                warmup_remaining,
+                "运行时调度容量配置变化，已重置本进程活跃凭据 warmup"
+            );
+        }
+        reset
     }
 
     pub(crate) fn auxiliary_concurrency_controller(&self) -> Arc<AuxiliaryConcurrencyController> {
@@ -2546,7 +2628,8 @@ impl MultiTokenManager {
 
     /// 更新当前运行时配置并写入 PgSQL。
     pub fn update_runtime_config(&self, update: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
-        let mut updated = self.runtime_config();
+        let previous_config = self.runtime_config();
+        let mut updated = previous_config.clone();
         update(&mut updated);
         updated.set_config_path_for_runtime(None);
         validate_token_refresh_admission_config(&updated)?;
@@ -2566,6 +2649,11 @@ impl MultiTokenManager {
             *config = updated;
         }
         let config = self.config.lock().clone();
+        self.reset_active_warmup_after_runtime_capacity_change(
+            &previous_config,
+            &config,
+            "runtime_config_updated",
+        );
         let auxiliary_limit = config.auxiliary_upstream_max_concurrent_requests;
         self.auxiliary_runtime.update_limit(auxiliary_limit);
         self.auxiliary_runtime
@@ -2593,10 +2681,16 @@ impl MultiTokenManager {
         };
         config.set_config_path_for_runtime(None);
         validate_token_refresh_admission_config(&config)?;
+        let previous_config = self.runtime_config();
         {
             let mut current = self.config.lock();
             *current = config.clone();
         }
+        self.reset_active_warmup_after_runtime_capacity_change(
+            &previous_config,
+            &config,
+            "runtime_config_reloaded",
+        );
         self.auxiliary_runtime
             .update_limit(config.auxiliary_upstream_max_concurrent_requests);
         self.auxiliary_runtime
@@ -2682,6 +2776,12 @@ impl MultiTokenManager {
                 AccountRejectReason::Unknown,
             );
         }
+        if error_message.contains("本地账号池风险保护") {
+            return (
+                SelectionFailureStage::UpstreamPreflight,
+                AccountRejectReason::RiskCircuitOpen,
+            );
+        }
         if error_message.contains("等待队列已满") {
             return (
                 SelectionFailureStage::DispatchQueue,
@@ -2762,6 +2862,10 @@ impl MultiTokenManager {
                 SelectionFailureStage::DispatchQueue,
                 AccountRejectReason::Unknown,
             ),
+            LocalPoolRouteStateKind::RiskCircuitOpen => (
+                SelectionFailureStage::UpstreamPreflight,
+                AccountRejectReason::RiskCircuitOpen,
+            ),
             LocalPoolRouteStateKind::Ready => (
                 SelectionFailureStage::AccountEligibility,
                 AccountRejectReason::Unknown,
@@ -2793,6 +2897,9 @@ impl MultiTokenManager {
             1,
         );
         let global_rpm = config.credential_rpm.unwrap_or(0);
+        let risk_circuit_open = self
+            .local_pool_risk_circuit_snapshot_from_config(now, &config)
+            .open;
         let mut reason_counts: BTreeMap<AccountRejectReason, usize> = BTreeMap::new();
         let mut sampled_accounts = Vec::new();
         let mut rejected_account_count = 0usize;
@@ -2807,6 +2914,8 @@ impl MultiTokenManager {
                 (AccountRejectReason::ModelNotSupported, None)
             } else if !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
                 (AccountRejectReason::ProxyUnavailable, None)
+            } else if risk_circuit_open {
+                (AccountRejectReason::RiskCircuitOpen, None)
             } else if let Some(remaining) = entry_cooldown_remaining(entry, model, now) {
                 (AccountRejectReason::CooldownActive, Some(remaining))
             } else if entry_rate_limit_remaining(entry, global_rpm, now).is_some() {
@@ -2853,16 +2962,126 @@ impl MultiTokenManager {
         )
     }
 
+    fn local_pool_risk_circuit_snapshot_from_config(
+        &self,
+        now: Instant,
+        config: &Config,
+    ) -> LocalPoolRiskCircuitSnapshot {
+        if !config.external_pools.local_pool_circuit_enabled {
+            return LocalPoolRiskCircuitSnapshot::default();
+        }
+        let window =
+            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        while circuit
+            .failures
+            .front()
+            .is_some_and(|event| now.saturating_duration_since(event.at) > window)
+        {
+            circuit.failures.pop_front();
+        }
+        let open_until = circuit.open_until.filter(|until| *until > now);
+        if open_until.is_none() {
+            circuit.open_until = None;
+            circuit.reason = None;
+        }
+        LocalPoolRiskCircuitSnapshot {
+            open: open_until.is_some(),
+            retry_after: open_until.map(|until| until.saturating_duration_since(now)),
+        }
+    }
+
+    fn local_pool_risk_circuit_snapshot(&self, now: Instant) -> LocalPoolRiskCircuitSnapshot {
+        let config = self.config.lock().clone();
+        self.local_pool_risk_circuit_snapshot_from_config(now, &config)
+    }
+
+    fn record_local_pool_risk_circuit_failure(
+        &self,
+        credential_id: u64,
+        reason: CredentialRiskControlReason,
+    ) -> LocalPoolRiskCircuitSnapshot {
+        let config = self.config.lock().clone();
+        if !config.external_pools.local_pool_circuit_enabled {
+            return LocalPoolRiskCircuitSnapshot::default();
+        }
+        let now = Instant::now();
+        let window =
+            StdDuration::from_secs(config.external_pools.local_pool_circuit_window_secs.max(1));
+        let open_for =
+            StdDuration::from_secs(config.external_pools.local_pool_circuit_open_secs.max(1));
+        let open_after_failures = config
+            .external_pools
+            .local_pool_circuit_open_after_failures
+            .max(1);
+        let required_distinct = config
+            .external_pools
+            .local_pool_circuit_require_distinct_credentials
+            .max(1);
+
+        let mut circuit = self.local_pool_risk_circuit.lock();
+        while circuit
+            .failures
+            .front()
+            .is_some_and(|event| now.saturating_duration_since(event.at) > window)
+        {
+            circuit.failures.pop_front();
+        }
+        circuit.failures.push_back(LocalPoolRiskCircuitEvent {
+            at: now,
+            credential_id,
+        });
+
+        let distinct_credentials = circuit
+            .failures
+            .iter()
+            .map(|event| event.credential_id)
+            .collect::<HashSet<_>>()
+            .len()
+            .min(u32::MAX as usize) as u32;
+        let recent_failures = circuit.failures.len().min(u32::MAX as usize) as u32;
+
+        let already_open = circuit.open_until.is_some_and(|until| until > now);
+        if already_open {
+            if circuit.reason.is_none() {
+                circuit.reason = Some(reason);
+            }
+        } else if recent_failures >= open_after_failures
+            && distinct_credentials >= required_distinct
+        {
+            let open_until = now.checked_add(open_for).unwrap_or(now);
+            circuit.open_until = Some(open_until);
+            circuit.reason = Some(reason);
+            tracing::error!(
+                credential_id,
+                risk_reason = reason.event_reason(),
+                recent_failures,
+                distinct_credentials,
+                open_secs = open_for.as_secs(),
+                "本地账号池风控熔断已打开，暂停继续探测剩余本地账号"
+            );
+        }
+
+        let open_until = circuit.open_until.filter(|until| *until > now);
+        LocalPoolRiskCircuitSnapshot {
+            open: open_until.is_some(),
+            retry_after: open_until.map(|until| until.saturating_duration_since(now)),
+        }
+    }
+
     fn compute_local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
-        if let Err(err) = self.refresh_scheduler_state_from_redis() {
-            tracing::warn!("本地池路由预检同步 Redis 调度状态失败: {}", err);
+        let config = self.config.lock().clone();
+        let now = Instant::now();
+        let risk_circuit = self.local_pool_risk_circuit_snapshot_from_config(now, &config);
+        if !risk_circuit.open {
+            if let Err(err) = self.refresh_scheduler_state_from_redis() {
+                tracing::warn!("本地池路由预检同步 Redis 调度状态失败: {}", err);
+            }
         }
         self.cleanup_expired_in_flight_leases_local_first();
 
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
-        let config = self.config.lock().clone();
-        let now = Instant::now();
         let total = entries.len();
         let available = entries.iter().filter(|entry| !entry.disabled).count();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
@@ -2876,7 +3095,9 @@ impl MultiTokenManager {
             config.dispatch_global_max_concurrent_requests,
             1,
         );
-        self.probe_scheduler_redis_capacity_recovery_if_due();
+        if !risk_circuit.open {
+            self.probe_scheduler_redis_capacity_recovery_if_due();
+        }
         let scheduler_redis_retry_after_secs = self.scheduler_redis_degraded_retry_after_secs();
         let mut model_usable = 0usize;
         let mut usable = 0usize;
@@ -2937,10 +3158,18 @@ impl MultiTokenManager {
 
             dispatchable += 1;
         }
+        if risk_circuit.open {
+            dispatchable = 0;
+        }
 
         let dispatch_candidate_count = usable;
         let retry_after_secs = wait_for
             .map(|duration| duration.as_secs().saturating_add(1))
+            .or_else(|| {
+                risk_circuit
+                    .retry_after
+                    .map(|duration| duration.as_secs().saturating_add(1).max(1))
+            })
             .or(scheduler_redis_retry_after_secs)
             .filter(|value| *value > 0);
         let effective_credential_max_concurrent_requests =
@@ -2950,6 +3179,8 @@ impl MultiTokenManager {
             LocalPoolRouteStateKind::NoCredentials
         } else if available == 0 {
             LocalPoolRouteStateKind::AllDisabled
+        } else if risk_circuit.open {
+            LocalPoolRouteStateKind::RiskCircuitOpen
         } else if model.is_some() && model_usable == 0 {
             LocalPoolRouteStateKind::NoModelCompatible
         } else if model_usable > 0 && usable == 0 && proxy_blocked >= model_usable {
@@ -4887,7 +5118,9 @@ impl MultiTokenManager {
             }
             _ => {
                 // priority 模式（默认）：优先级仍是第一排序，但同优先级账号优先选低并发。
-                let entry = available.iter().min_by_key(|e| priority_selection_key(e))?;
+                let entry = candidates
+                    .iter()
+                    .min_by_key(|e| priority_selection_key(e))?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -5284,6 +5517,15 @@ impl MultiTokenManager {
         };
 
         loop {
+            if let Some(retry_after) = self
+                .local_pool_risk_circuit_snapshot(Instant::now())
+                .retry_after
+            {
+                anyhow::bail!(
+                    "本地账号池风险保护已打开（retry_after_secs={}）",
+                    retry_after.as_secs().saturating_add(1).max(1)
+                );
+            }
             let mut capacity_waiter = self.capacity_signal.register();
 
             self.refresh_scheduler_state_from_redis()?;
@@ -7549,6 +7791,42 @@ impl MultiTokenManager {
         self.persist_credential_update(&base, &requested)
     }
 
+    fn persist_credential_capacity_mutation(
+        &self,
+        id: u64,
+        mutate: impl FnOnce(&mut KiroCredentials) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<KiroCredentials> {
+        let base = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(Self::credential_from_entry)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        let mut requested = base.clone();
+        let capacity_changed = mutate(&mut requested)?;
+        requested.canonicalize_auth_method();
+        requested.normalize_supported_models();
+        requested.normalize_api_key_defaults();
+        requested.normalize_external_idp_defaults();
+
+        let warmup_remaining = self.config.lock().credential_warmup_requests;
+        if capacity_changed && warmup_remaining > 0 {
+            self.persist_credential_update_with_runtime_patch(
+                &base,
+                &requested,
+                CredentialRuntimeStatePatch {
+                    warmup_remaining: Some(warmup_remaining),
+                    advance_generation: true,
+                    ..Default::default()
+                },
+            )
+        } else {
+            self.persist_credential_update(&base, &requested)
+        }
+    }
+
     pub fn reload_credentials_from_postgres(&self) -> anyhow::Result<bool> {
         let Some(store) = &self.postgres_store else {
             return Ok(false);
@@ -9658,12 +9936,12 @@ impl MultiTokenManager {
     ///
     /// 这类错误不是普通瞬态 429，也不是连续失败阈值问题；继续调度该凭据通常只会
     /// 放大风控。这里立即禁用并记录独立原因，后台可通过 reset/enable 人工恢复。
-    pub fn report_risk_controlled(
+    pub(crate) fn report_risk_controlled_outcome(
         &self,
         id: u64,
         reason: CredentialRiskControlReason,
         detail: impl Into<String>,
-    ) -> bool {
+    ) -> RiskControlReportOutcome {
         let detail = detail.into();
         let detail_summary = truncate_for_audit(&detail, 500);
         let disabled_reason = reason.disabled_reason();
@@ -9675,11 +9953,27 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => {
+                    let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                    return RiskControlReportOutcome {
+                        has_available_credentials: entries.iter().any(|e| !e.disabled),
+                        circuit_open: circuit.open,
+                        retry_after_secs: circuit
+                            .retry_after
+                            .map(|duration| duration.as_secs().saturating_add(1).max(1)),
+                    };
+                }
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                return RiskControlReportOutcome {
+                    has_available_credentials: entries.iter().any(|e| !e.disabled),
+                    circuit_open: circuit.open,
+                    retry_after_secs: circuit
+                        .retry_after
+                        .map(|duration| duration.as_secs().saturating_add(1).max(1)),
+                };
             }
             expected_generation = entry.runtime_generation;
 
@@ -9716,6 +10010,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
         self.persist_disabled_state(
@@ -9759,7 +10054,13 @@ impl MultiTokenManager {
         self.publish_credentials_changed("credential_risk_controlled");
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
-        result
+        RiskControlReportOutcome {
+            has_available_credentials: result,
+            circuit_open: circuit.open,
+            retry_after_secs: circuit
+                .retry_after
+                .map(|duration| duration.as_secs().saturating_add(1).max(1)),
+        }
     }
 
     /// 报告指定凭据刷新 Token 失败。
@@ -10461,9 +10762,10 @@ impl MultiTokenManager {
         id: u64,
         max_concurrent_requests: Option<u32>,
     ) -> anyhow::Result<()> {
-        self.persist_credential_mutation(id, |credential| {
+        self.persist_credential_capacity_mutation(id, |credential| {
+            let changed = credential.max_concurrent_requests != max_concurrent_requests;
             credential.max_concurrent_requests = max_concurrent_requests;
-            Ok(())
+            Ok(changed)
         })?;
 
         self.notify_dispatch_state_changed();
@@ -10477,9 +10779,10 @@ impl MultiTokenManager {
     /// `Some(0)` 表示该凭据不做本地 RPM 限制；
     /// `Some(n)` 表示该凭据每分钟最多调度 n 次。
     pub fn set_credential_rpm(&self, id: u64, rpm: Option<u32>) -> anyhow::Result<()> {
-        self.persist_credential_mutation(id, |credential| {
+        self.persist_credential_capacity_mutation(id, |credential| {
+            let changed = credential.rpm != rpm;
             credential.rpm = rpm;
-            Ok(())
+            Ok(changed)
         })?;
 
         self.clear_rate_limit_for_credential(id);

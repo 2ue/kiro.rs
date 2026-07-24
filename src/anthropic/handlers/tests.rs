@@ -4360,13 +4360,17 @@ async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_
             KiroCallFailureKind::DownstreamCommitted,
             KiroCallFailureKind::AuxiliaryAttemptsExhausted,
             KiroCallFailureKind::AuxiliaryConcurrencySaturated,
+            KiroCallFailureKind::LocalPoolRiskCircuitOpen,
         ] {
-            let err: anyhow::Error = crate::kiro::call_trace::KiroCallError::new(
-                "local inference attempt reserved for fallback",
-                Vec::new(),
-            )
-            .with_failure_kind(failure_kind)
-            .into();
+            let error_message = if failure_kind == KiroCallFailureKind::LocalPoolRiskCircuitOpen {
+                "本地账号池风险保护已打开（retry_after_secs=7）"
+            } else {
+                "local inference attempt reserved for fallback"
+            };
+            let err: anyhow::Error =
+                crate::kiro::call_trace::KiroCallError::new(error_message, Vec::new())
+                    .with_failure_kind(failure_kind)
+                    .into();
             let response = map_provider_error(
                 err,
                 Some("req_attempt_limit_test"),
@@ -4379,6 +4383,15 @@ async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_
                 StatusCode::SERVICE_UNAVAILABLE
             };
             assert_eq!(response.status(), expected_status);
+            if failure_kind == KiroCallFailureKind::LocalPoolRiskCircuitOpen {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("7")
+                );
+            }
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("read public error response");
@@ -6448,6 +6461,24 @@ fn provider_error_metadata_wraps_selection_failure_without_error_id_duplication(
     );
     assert!(metadata.pointer("/errorId").is_none());
     assert!(metadata.pointer("/selectionFailure/errorId").is_none());
+}
+
+#[test]
+fn local_scheduler_error_enables_admission_backoff_classification() {
+    let err =
+        anyhow::anyhow!("本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=4）");
+
+    assert_eq!(local_temporary_admission_backoff_secs(&err, None), Some(4));
+}
+
+#[test]
+fn upstream_rate_limit_does_not_enable_local_admission_backoff() {
+    let err = anyhow::anyhow!(
+        "{}",
+        r#"Kiro API 请求失败: 429 Too Many Requests {"error":"rate_limit"}"#
+    );
+
+    assert_eq!(local_temporary_admission_backoff_secs(&err, None), None);
 }
 
 #[tokio::test]

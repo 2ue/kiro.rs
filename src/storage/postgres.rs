@@ -5677,6 +5677,8 @@ impl PostgresUsageStore {
                 COALESCE(t.external_pool_billable_cost_usd, 0)::double precision AS external_pool_billable_cost_usd,
                 COALESCE(t.external_pool_cost_floor_delta_usd, 0)::double precision AS external_pool_cost_floor_delta_usd,
                 COUNT(r.id) FILTER (WHERE r.created_at >= now() - interval '60 seconds')::bigint AS realtime_requests,
+                COUNT(r.id) FILTER (WHERE r.created_at >= now() - interval '60 seconds' AND r.status = 'success')::bigint AS realtime_success_requests,
+                COUNT(r.id) FILTER (WHERE r.created_at >= now() - interval '60 seconds' AND r.status <> 'success')::bigint AS realtime_error_requests,
                 COALESCE(SUM(r.total_input_tokens) FILTER (WHERE r.created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_input_tokens,
                 COALESCE(SUM(r.output_tokens) FILTER (WHERE r.created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_output_tokens,
                 COALESCE(SUM(r.billable_input_tokens) FILTER (WHERE r.created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_billable_input_tokens
@@ -5745,9 +5747,11 @@ impl PostgresUsageStore {
                 billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
                 cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
             },
-            realtime: UsageRealtimeStats::from_totals(
+            realtime: UsageRealtimeStats::from_totals_with_status(
                 REALTIME_USAGE_WINDOW_SECS,
                 row_i64_to_usize(&row, "realtime_requests")?,
+                row_i64_to_usize(&row, "realtime_success_requests")?,
+                row_i64_to_usize(&row, "realtime_error_requests")?,
                 row.try_get("realtime_input_tokens")?,
                 row.try_get("realtime_output_tokens")?,
                 row.try_get("realtime_billable_input_tokens")?,
@@ -13069,7 +13073,11 @@ mod tests {
         assert_eq!(summary.unpriced_requests, 1);
         assert_eq!(summary.realtime.window_seconds, REALTIME_USAGE_WINDOW_SECS);
         assert_eq!(summary.realtime.requests, 2);
+        assert_eq!(summary.realtime.success_requests, 1);
+        assert_eq!(summary.realtime.error_requests, 1);
         assert_eq!(summary.realtime.rpm, 2.0);
+        assert_eq!(summary.realtime.success_rpm, 1.0);
+        assert_eq!(summary.realtime.error_rpm, 1.0);
         assert_eq!(summary.realtime.total_tpm, 240.0);
         assert_eq!(summary.realtime.billable_tpm, 60.0);
         assert_eq!(summary.top_credentials[0].key, "7");

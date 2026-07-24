@@ -1241,7 +1241,7 @@ export function UsagePage() {
           value={formatNumber(realtime?.rpm ?? 0)}
           desc={
             <span>
-              TPM {formatCompact(realtime?.totalTpm ?? 0)} · 近 {realtimeWindow} 秒 {formatNumber(realtime?.requests ?? 0)} 请求
+              近 {realtimeWindow} 秒 · 成功 {formatNumber(realtime?.successRequests ?? 0)} · 错误 {formatNumber(realtime?.errorRequests ?? 0)} · TPM {formatCompact(realtime?.totalTpm ?? 0)}
             </span>
           }
           icon={<Zap />}

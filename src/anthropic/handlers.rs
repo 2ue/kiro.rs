@@ -1969,6 +1969,9 @@ fn local_pool_route_fallback_reason(
         {
             Some("local_scheduler_redis_degraded")
         }
+        LocalPoolRouteStateKind::RiskCircuitOpen if config.local_pool_circuit_enabled => {
+            Some("local_pool_risk_circuit_open")
+        }
         _ => None,
     }
 }
@@ -1978,7 +1981,10 @@ fn local_pool_fallback_reason_for_fresh_state(
     dispatchable: usize,
     config: &ExternalPoolsConfig,
 ) -> Option<&'static str> {
-    if matches!(kind, LocalPoolRouteStateKind::Ready) || dispatchable > 0 {
+    if matches!(kind, LocalPoolRouteStateKind::Ready) {
+        return None;
+    }
+    if !matches!(kind, LocalPoolRouteStateKind::RiskCircuitOpen) && dispatchable > 0 {
         return None;
     }
     local_pool_route_fallback_reason(kind, config)
@@ -1998,6 +2004,7 @@ fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
         "unsupported_model" => Some("unsupported_model"),
         "local_auxiliary_attempts_exhausted" => Some("local_auxiliary_attempts_exhausted"),
         "local_auxiliary_concurrency_saturated" => Some("local_auxiliary_concurrency_saturated"),
+        "local_pool_risk_circuit_open" => Some("local_pool_risk_circuit_open"),
         _ => None,
     }
 }
@@ -2035,11 +2042,17 @@ fn classify_local_error_for_external_fallback_with_kind(
         {
             return Some("local_auxiliary_concurrency_saturated".to_string());
         }
+        Some(KiroCallFailureKind::LocalPoolRiskCircuitOpen)
+            if config.local_pool_circuit_enabled =>
+        {
+            return Some("local_pool_risk_circuit_open".to_string());
+        }
         Some(
             KiroCallFailureKind::InferenceAttemptsExhausted
             | KiroCallFailureKind::DownstreamCommitted
             | KiroCallFailureKind::AuxiliaryAttemptsExhausted
-            | KiroCallFailureKind::AuxiliaryConcurrencySaturated,
+            | KiroCallFailureKind::AuxiliaryConcurrencySaturated
+            | KiroCallFailureKind::LocalPoolRiskCircuitOpen,
         )
         | None => {}
     }
@@ -4458,6 +4471,15 @@ fn provider_public_error_for_message(
         );
     }
 
+    if err_str.contains("本地账号池风险保护") {
+        return usage_public_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            error_id,
+        );
+    }
+
     if err_str.contains("临时冷却")
         || err_str.contains("本地限流")
         || err_str.contains("本地账号调度容量暂不可用")
@@ -4535,6 +4557,73 @@ fn official_kiro_upstream_public_error(
     Some(usage_public_error(status, error_type, message, error_id))
 }
 
+fn is_local_temporary_scheduler_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    value.contains("本地账号池风险保护")
+        || value.contains("Redis 调度协调状态不可用")
+        || value.contains("本地账号调度容量暂不可用")
+        || value.contains("本地凭据调度容量暂不可用")
+        || value.contains("账号调度等待队列已满")
+        || value.contains("凭据调度等待队列已满")
+        || value.contains("账号调度排队等待超时")
+        || value.contains("凭据调度排队等待超时")
+        || value.contains("并发槽位已满")
+        || lower.contains("local_pool_risk_circuit_open")
+        || lower.contains("local_scheduler_redis_degraded")
+        || lower.contains("schedulerredisdegraded")
+}
+
+fn local_temporary_admission_backoff_secs(
+    err: &Error,
+    provider: Option<&crate::kiro::provider::KiroProvider>,
+) -> Option<u64> {
+    if matches!(
+        KiroProvider::call_failure_kind_from_error(err),
+        Some(KiroCallFailureKind::LocalPoolRiskCircuitOpen)
+    ) {
+        return Some(
+            retry_after_secs_from_error(&err.to_string())
+                .map(|secs| secs.max(1))
+                .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1)),
+        );
+    }
+
+    let err_str = err.to_string();
+    if !is_local_temporary_scheduler_error(&err_str) {
+        return None;
+    }
+    Some(
+        retry_after_secs_from_error(&err_str)
+            .map(|secs| secs.max(1))
+            .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1)),
+    )
+}
+
+fn apply_local_temporary_admission_backoff(
+    attribution: Option<&RequestRejectionAttribution>,
+    err: &Error,
+    provider: Option<&crate::kiro::provider::KiroProvider>,
+) {
+    let Some(attribution) = attribution else {
+        return;
+    };
+    let Some(retry_after_secs) = local_temporary_admission_backoff_secs(err, provider) else {
+        return;
+    };
+    attribution.apply_local_temporary_backoff(retry_after_secs);
+}
+
+fn map_provider_error_with_admission_feedback(
+    err: Error,
+    request_id: Option<&str>,
+    error_id: Option<&str>,
+    provider: Option<&crate::kiro::provider::KiroProvider>,
+    attribution: Option<&RequestRejectionAttribution>,
+) -> Response {
+    apply_local_temporary_admission_backoff(attribution, &err, provider);
+    map_provider_error(err, request_id, error_id, provider)
+}
+
 fn map_provider_error(
     err: Error,
     request_id: Option<&str>,
@@ -4546,7 +4635,8 @@ fn map_provider_error(
             KiroCallFailureKind::InferenceAttemptsExhausted
             | KiroCallFailureKind::InferenceAttemptReservedForFallback
             | KiroCallFailureKind::AuxiliaryAttemptsExhausted
-            | KiroCallFailureKind::AuxiliaryConcurrencySaturated => StatusCode::SERVICE_UNAVAILABLE,
+            | KiroCallFailureKind::AuxiliaryConcurrencySaturated
+            | KiroCallFailureKind::LocalPoolRiskCircuitOpen => StatusCode::SERVICE_UNAVAILABLE,
             KiroCallFailureKind::DownstreamCommitted => StatusCode::BAD_GATEWAY,
             KiroCallFailureKind::ThinkingSignatureInvalid => StatusCode::BAD_REQUEST,
             KiroCallFailureKind::ThinkingSignatureRetryFailed => StatusCode::BAD_GATEWAY,
@@ -4562,13 +4652,21 @@ fn map_provider_error(
             }
             _ => ("api_error", envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE),
         };
+        let retry_after_headers = match failure_kind {
+            KiroCallFailureKind::LocalPoolRiskCircuitOpen => {
+                retry_after_secs_from_error(&err.to_string())
+                    .map(|secs| vec![("retry-after", secs.max(1).to_string())])
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
         return public_error_response(
             status,
             error_type,
             public_message,
             request_id,
             error_id,
-            std::iter::empty::<(&'static str, String)>(),
+            retry_after_headers,
         );
     }
     let err_str = err.to_string();
@@ -5717,6 +5815,7 @@ async fn post_messages_inner(
             tool_schema_key_map,
             known_tool_names,
             usage_context,
+            attribution,
             warnings_header,
             too_long_retry,
             cache_point_retry,
@@ -5746,6 +5845,7 @@ async fn post_messages_inner(
             tool_schema_key_map,
             known_tool_names,
             usage_context,
+            attribution,
             warnings_header,
             too_long_retry,
             cache_point_retry,
@@ -6229,6 +6329,7 @@ async fn handle_stream_request(
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
     usage_context: RequestUsageContext,
+    admission_attribution: Option<RequestRejectionAttribution>,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
     cache_point_retry: Option<CachePointRetryRequest>,
@@ -6370,11 +6471,12 @@ async fn handle_stream_request(
                             )
                             .with_error_metadata(provider_error_metadata(&retry_error))
                             .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
-                        return map_provider_error(
+                        return map_provider_error_with_admission_feedback(
                             retry_error,
                             Some(&request_id),
                             Some(&error_id),
                             Some(provider.as_ref()),
+                            admission_attribution.as_ref(),
                         );
                     }
                 }
@@ -6533,11 +6635,12 @@ async fn handle_stream_request(
                                                             "api_error",
                                                             rescue_message,
                                                         );
-                                                    return map_provider_error(
+                                                    return map_provider_error_with_admission_feedback(
                                                         rescue_error,
                                                         Some(&request_id),
                                                         Some(&error_id),
                                                         Some(provider.as_ref()),
+                                                        admission_attribution.as_ref(),
                                                     );
                                                 }
                                             }
@@ -6563,11 +6666,12 @@ async fn handle_stream_request(
                                     "api_error",
                                     retry_message,
                                 );
-                            return map_provider_error(
+                            return map_provider_error_with_admission_feedback(
                                 retry_error,
                                 Some(&request_id),
                                 Some(&error_id),
                                 Some(provider.as_ref()),
+                                admission_attribution.as_ref(),
                             );
                         }
                     }
@@ -6654,11 +6758,12 @@ async fn handle_stream_request(
                                                     "api_error",
                                                     rescue_message,
                                                 );
-                                            return map_provider_error(
+                                            return map_provider_error_with_admission_feedback(
                                                 rescue_error,
                                                 Some(&request_id),
                                                 Some(&error_id),
                                                 Some(provider.as_ref()),
+                                                admission_attribution.as_ref(),
                                             );
                                         }
                                     }
@@ -6676,11 +6781,12 @@ async fn handle_stream_request(
                         .attach_provider_error_credential(&provider, &message, attempts)
                         .with_error_metadata(provider_error_metadata(&e))
                         .record_failure(UsageRecordStatus::Error, "api_error", message);
-                    return map_provider_error(
+                    return map_provider_error_with_admission_feedback(
                         e,
                         Some(&request_id),
                         Some(&error_id),
                         Some(provider.as_ref()),
+                        admission_attribution.as_ref(),
                     );
                 }
             }
@@ -8146,6 +8252,7 @@ async fn handle_non_stream_request(
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
     usage_context: RequestUsageContext,
+    admission_attribution: Option<RequestRejectionAttribution>,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
     cache_point_retry: Option<CachePointRetryRequest>,
@@ -8280,11 +8387,12 @@ async fn handle_non_stream_request(
                             )
                             .with_error_metadata(provider_error_metadata(&retry_error))
                             .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
-                        return map_provider_error(
+                        return map_provider_error_with_admission_feedback(
                             retry_error,
                             Some(&request_id),
                             Some(&error_id),
                             Some(provider.as_ref()),
+                            admission_attribution.as_ref(),
                         );
                     }
                 }
@@ -8436,11 +8544,12 @@ async fn handle_non_stream_request(
                                                             "api_error",
                                                             rescue_message,
                                                         );
-                                                    return map_provider_error(
+                                                    return map_provider_error_with_admission_feedback(
                                                         rescue_error,
                                                         Some(&request_id),
                                                         Some(&error_id),
                                                         Some(provider.as_ref()),
+                                                        admission_attribution.as_ref(),
                                                     );
                                                 }
                                             }
@@ -8466,11 +8575,12 @@ async fn handle_non_stream_request(
                                     "api_error",
                                     retry_message,
                                 );
-                            return map_provider_error(
+                            return map_provider_error_with_admission_feedback(
                                 retry_error,
                                 Some(&request_id),
                                 Some(&error_id),
                                 Some(provider.as_ref()),
+                                admission_attribution.as_ref(),
                             );
                         }
                     }
@@ -8557,11 +8667,12 @@ async fn handle_non_stream_request(
                                                     "api_error",
                                                     rescue_message,
                                                 );
-                                            return map_provider_error(
+                                            return map_provider_error_with_admission_feedback(
                                                 rescue_error,
                                                 Some(&request_id),
                                                 Some(&error_id),
                                                 Some(provider.as_ref()),
+                                                admission_attribution.as_ref(),
                                             );
                                         }
                                     }
@@ -8579,11 +8690,12 @@ async fn handle_non_stream_request(
                         .attach_provider_error_credential(&provider, &message, attempts)
                         .with_error_metadata(provider_error_metadata(&e))
                         .record_failure(UsageRecordStatus::Error, "api_error", message);
-                    return map_provider_error(
+                    return map_provider_error_with_admission_feedback(
                         e,
                         Some(&request_id),
                         Some(&error_id),
                         Some(provider.as_ref()),
+                        admission_attribution.as_ref(),
                     );
                 }
             }
