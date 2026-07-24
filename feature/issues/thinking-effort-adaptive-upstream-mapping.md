@@ -1,6 +1,6 @@
 # Thinking Effort, Adaptive Mode, And Upstream Mapping
 
-Status: `in-progress / raw-cli-current-service-wire-and-frozen-fake-upstream-closed / real-upstream-native-capability-pending`
+Status: `fixed / final-candidate-validated / monitor future CLI-or-Kiro-schema changes`
 
 Severity: P0 protocol correctness / P1 capability compatibility
 
@@ -189,3 +189,49 @@ leak markers: []
 ```
 
 该 smoke 证明当前代理不会把 `adaptive + max` 在入口误拒绝或降级；精确 wire 字段由上述 converter 测试与 C0 全量 Rust gate 覆盖。证据见 [Release C0 and Claude CLI smoke evidence 2026-07-25](../evidence/release-c0-cli-smoke-20260725.md)。
+
+### 2026-07-25 最终候选验证补充
+
+最终候选：
+
+```text
+kiro-rs sha256=25ea01fb741bdffb103fa95397f0fb29b60c8bffee9267741f563f388ae237a4
+local service=existing 127.0.0.1:9022
+Claude Code CLI=2.1.197
+```
+
+当前权威结论：
+
+1. 对 native `output_config` reasoning path，最终 Kiro wire 必须携带：
+
+   ```json
+   {
+     "thinking": {"type": "adaptive"},
+     "output_config": {"effort": "max"}
+   }
+   ```
+
+   旧 fake-schema 结论“未声明 thinking 时不发明字段”只适用于当时的旧模型发现夹具，不再作为当前 output_config path 的产品合同。
+
+2. 显式 `output_config.effort=max` 不会被截断成 `high`。修复后的 provider body-capture 测试在 CLI/IDE、stream/non-stream、5 轮中验证 final wire 同时包含 `thinking.adaptive` 与 `output_config.max`。
+
+3. Native Kiro adaptive thinking 不携带 Anthropic-only `budget_tokens`。`budget_tokens` 属于 Anthropic `thinking.enabled` 输入形态；Kiro output_config path 使用 `thinking.type=adaptive` + `output_config.effort`。
+
+4. Claude Code CLI 2.1.197 的 `--effort medium/high/xhigh/max` 在本轮 ingress capture 里仍然不可直接从 visible JSON 字段区分：CLI 发送 `thinking.enabled + budget_tokens=31999`，没有 `output_config` 或 top-level effort。因此代理不能把 `budget_tokens=31999` 盲目推断成 `max`，否则会错误升级其他 effort 档。
+
+5. prompt steering 总开关不再作为结构化 thinking/output_config 能力的唯一开关。文本语言增强、任务质量、tool_choice prompt、thinking prompt、chunked tool prompt 应由子开关控制；客户端显式结构化字段仍按能力合同解析/映射。
+
+最终验证：
+
+```text
+cargo fmt --check: passed
+cargo test --bin kiro-rs -- --test-threads=2: 1784 passed / 0 failed / 6 ignored
+node feature/tests/check-feature-docs.mjs: passed
+node --test feature/tests/*.test.mjs: 261 passed / 22 skipped / 0 failed
+inventory-build-artifacts --gate: passed
+direct thinking/adaptive/max: real thinking block=1, thinking_delta=1, thinking_tokens=4, success
+Claude CLI --effort max: thinking block/delta present, text final-cli-think-ok, usage non-zero
+load/chaos L3/L4/L5: passed
+```
+
+仍需持续监控的不是当前修复，而是未来 CLI/Kiro schema 变化：如果官方上游把字段从 `output_config` 改成 `reasoning` 或新增 effort 枚举，必须通过 model discovery capability 和 wire capture 更新映射，不允许无证据硬编码。

@@ -2471,7 +2471,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn provider_sends_converter_max_effort_without_inventing_thinking_for_five_rounds() {
+    async fn provider_sends_converter_max_effort_with_native_adaptive_thinking_for_five_rounds() {
         use crate::anthropic::converter::{ConverterOptions, convert_request_with_options};
         use crate::anthropic::model_capabilities::{
             KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
@@ -2556,14 +2556,17 @@ mod tests {
                         serde_json::from_slice(&capture.bytes).expect("captured wire JSON");
                     assert_eq!(
                         wire["additionalModelRequestFields"],
-                        serde_json::json!({"output_config": {"effort": "max"}}),
-                        "{endpoint} stream={is_stream} round={round}: max must reach the final wire unchanged"
+                        serde_json::json!({
+                            "thinking": {"type": "adaptive"},
+                            "output_config": {"effort": "max"}
+                        }),
+                        "{endpoint} stream={is_stream} round={round}: max and adaptive thinking must reach the final wire unchanged"
                     );
                     assert!(
-                        wire["additionalModelRequestFields"]
-                            .get("thinking")
+                        wire["additionalModelRequestFields"]["thinking"]
+                            .get("budget_tokens")
                             .is_none(),
-                        "{endpoint} stream={is_stream} round={round}: endpoint must not invent an unadvertised thinking field"
+                        "{endpoint} stream={is_stream} round={round}: native Kiro adaptive thinking must not carry Anthropic budget_tokens"
                     );
                     assert_eq!(
                         wire["conversationState"]["currentMessage"]["userInputMessage"]["origin"],

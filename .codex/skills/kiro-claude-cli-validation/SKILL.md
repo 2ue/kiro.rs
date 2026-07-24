@@ -62,14 +62,19 @@ Record the CLI version:
 claude --version
 ```
 
-Start a temp service only after the release build succeeds:
+Exercise the release binary by restarting the existing local service by default:
 
 ```bash
-KIRO_RS_HOST=127.0.0.1 KIRO_RS_PORT=19022 \
-  "$KIRO_RS_BINARY" -c config.json --credentials credentials.json
+pid="$(lsof -nP -iTCP:9022 -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
+if [ -n "$pid" ]; then
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$cmd" in *kiro-rs*) kill "$pid" ;; *) echo "9022 is not kiro-rs: $cmd" >&2; exit 1 ;; esac
+fi
+"$KIRO_RS_BINARY" -c config.json --credentials credentials.json
 ```
 
-If the user asked to restart the existing local service, start the release binary with the real local `config.json` / `credentials.json` and the existing configured port instead of the temp command above. If runtime config is loaded from PgSQL, confirm the restarted process actually listens on the intended local port.
+If runtime config is loaded from PgSQL, confirm the restarted process actually listens on the intended local port.
+Start a temporary service port only when isolation is required, for example initialization/deployment validation, no usable local service/config, or a concrete risk of corrupting unrelated state.
 
 ## How To Prove Thinking Is Real
 

@@ -664,6 +664,17 @@ fn log_kiro_conversion_summary(
             Some(fields) if fields.thinking.is_some() => (Some("thinking"), None),
             _ => (None, None),
         };
+    let (native_thinking_type, native_thinking_display) = kiro_request
+        .additional_model_request_fields
+        .as_ref()
+        .and_then(|fields| fields.thinking.as_ref())
+        .map(|thinking| {
+            (
+                Some(thinking.thinking_type.as_str()),
+                thinking.display.as_deref(),
+            )
+        })
+        .unwrap_or((None, None));
     let reasoning_source = reasoning_path.map(|_| {
         if discovered_reasoning_capability {
             "kiro_model_schema"
@@ -689,6 +700,8 @@ fn log_kiro_conversion_summary(
         current_image_count = current_user_input.images.len(),
         reasoning_path = ?reasoning_path,
         reasoning_effort = ?reasoning_effort,
+        native_thinking_type = ?native_thinking_type,
+        native_thinking_display = ?native_thinking_display,
         reasoning_source = ?reasoning_source,
         warning_header = ?warnings_header,
         warning_prefill_dropped = warnings.prefill_dropped,

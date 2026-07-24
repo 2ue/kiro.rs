@@ -1,10 +1,50 @@
 # Implementation Status
 
-Date: 2026-07-24
+Date: 2026-07-25
 
 ## Current Phase
 
-`post-v0.0.115 scheduler-risk hardening in progress`：已完成 114/115 发布后的生产只读复核，并针对“Redis 调度退化 + 快速失败 RPM + 上游 TEMPORARILY_SUSPENDED 后整池烧光”的放大链实现第一批修复。当前工作树尚未发布新版本；下一步是完成隔离负载/异常恢复验证、UI 类型检查、文档检查和发布门禁。
+`post-v0.0.115 protocol/scheduler hardening final validation complete / release pending`：已完成 114/115 发布后的生产只读复核、`api_protocol_error` 协议修复、thinking/output_config adaptive 修复、真实本地 9022 + Claude Code CLI 验证、fake-upstream L3/L4/L5 负载/异常恢复验证、文档/Node/完整 Rust bin 门禁和构建产物 inventory。当前工作树尚未发布新版本；下一步是最终 diff 复核、必要 UI gate、提交并发版。
+
+## 2026-07-25 Final candidate protocol/load validation
+
+- 修复/确认：
+  - `2xx + application/json` 不再在 provider header 阶段被终局归类为 `api_protocol_error`；body 交给 handler sniff，可正确处理 JSON-labeled binary EventStream。
+  - EOF 没有 `messageStatus` 但有 `contextUsageEvent`/`meteringEvent` 时按成功终止信号处理；silent/unknown EOF 仍 fail-closed。
+  - Native `output_config` reasoning path 现在发送 `thinking.type=adaptive + output_config.effort=<selected>`；显式 `max` 不降为 `high`；native adaptive 不发送 Anthropic-only `budget_tokens`。
+  - request admission rejection reason count 改为 enum-derived，避免新增枚举后数组越界 panic。
+  - Claude CLI 验证技能改为默认使用现有本地 `9022` 并直接重启该 `kiro-rs`；只有初始化/部署/破坏性风险/无可用本地配置时才使用隔离服务。
+  - `docker-compose.local-infra.yml` 固定为 `postgres:16-alpine`，对齐当前本地 PG16 volume，避免重建时版本不兼容。
+- 最终候选：
+  - `kiro-rs` SHA-256 `25ea01fb741bdffb103fa95397f0fb29b60c8bffee9267741f563f388ae237a4`。
+  - 本地服务直接重启在现有 `127.0.0.1:9022`，PID `49735`。
+  - `kiro_loadtest` SHA-256 `da338c62b21a22f061e5eb5dbd2f26f60ab59e34255703fcf93aa5ece819d13f`。
+- 静态/单测/文档：
+  - `git diff --check`、`cargo fmt --check` 通过。
+  - `cargo test --bin kiro-rs -- --test-threads=2` 通过：`1784 passed / 0 failed / 6 ignored`。
+  - `node feature/tests/check-feature-docs.mjs` 通过：`50 issue documents / 123 relative links`。
+  - `node --test feature/tests/*.test.mjs` 通过：`261 passed / 22 skipped / 0 failed`。
+  - `node feature/tests/inventory-build-artifacts.mjs --gate` 通过：`targets=0 reservations=0 target_processes=0 blockers=0`。
+- 真实本地 9022 / 真实 Claude Code CLI：
+  - direct stream：`final-stream-ok`，usage success，pricingModel `claude-haiku-4-5`，metering 非零。
+  - direct non-stream：`final-nonstream-ok`，usage success，pricingModel `claude-haiku-4-5`，metering 非零。
+  - direct `thinking.adaptive + output_config.max`：真实 thinking block/delta，`thinking_tokens=4`，pricingModel `claude-sonnet-4-6`，metering 非零。
+  - Claude CLI 2.1.197 simple/tool/thinking/multi-turn/MCP 均通过；tool_use/tool_result 配对正确；未发现 `Tool results provided`、`<function_results>`、`*Hashxxxxxxxx`、`user Continue`、credential/fallback/upstream/private scheduler 等泄漏。
+  - 图片：标准 RGB PNG 成功；伪 PNG 本地拒绝且 `kiroMeteringUsage=0`；1x1 gray+alpha 被上游 400 拒绝但 payload guard 未改写 body。
+  - WebSearch：`server_tool_use=1`、`web_search_tool_result=1`、`message_stop`、usage 非零。
+- fake-upstream 负载/异常恢复：
+  - L1 fake normal-stream：20/20 success。
+  - L3：9/9 pass，覆盖正常 c1/c5/c10、40 并发 spike、错误爆发后恢复、invalid-tool 后恢复。
+  - L4：12/12 pass，覆盖代理重启、429、500、invalid-tool、client-drop、mixed-chaos 和恢复。
+  - L5：首次 60s+5s idle 业务全成功但 RSS 未达到回落阈值，不计 pass；按 60s+60s idle 重跑通过，441/441 long-stream success，恢复 12/12 success，RSS/FD 回落阈值均通过。
+- 清理：
+  - 所有 Cargo 批次均通过 scoped wrapper，结束 `removed=true reservation_released=true`。
+  - 临时 load-chaos PostgreSQL databases 已删除；Redis prefix 由 runner 清理。
+  - 当前运行中的 9022 candidate binary 目录仍需保留；停止/替换该进程后才可删除对应 candidate root。
+- 证据：
+  - [Protocol / Social EventStream / Thinking Effort Live Evidence - 2026-07-25](evidence/protocol-thinking-cli-live-20260725.md)
+  - [Social/Gmail 凭据 api_protocol_error](issues/social-gmail-api-protocol-error.md)
+  - [Thinking Effort, Adaptive Mode, And Upstream Mapping](issues/thinking-effort-adaptive-upstream-mapping.md)
 
 ## 2026-07-25 Production follow-up
 

@@ -1,6 +1,6 @@
 services:
   kiro-rs-postgres-local:
-    image: postgres:18-alpine
+    image: postgres:16-alpine
     container_name: kiro-rs-postgres-local
     environment:
       POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}

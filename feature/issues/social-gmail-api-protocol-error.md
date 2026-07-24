@@ -1,12 +1,12 @@
 # Social/Gmail 凭据 api_protocol_error
 
-Status: `partially-patched-in-working-tree / needs-upstream-body-fingerprint`
+Status: `fixed-for-json-labeled-eventstream / final-candidate-validated / production-body-fingerprint-still-recommended`
 
 Severity: P1
 
 ## 状态
 
-open / needs upstream-body sample
+fixed for confirmed proxy-side protocol bug; production recurrence still needs body fingerprint if it reappears
 
 ## 影响
 
@@ -208,3 +208,34 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh protocol-billing-focus
 - 在测试环境抓取同类响应 body；或
 - 临时启用受控、脱敏、限量的 `2xx JSON non_eventstream` 诊断采样；或
 - 用户明确授权对一个已隔离账号做单次指定模型/路径真实调用。
+
+## 2026-07-25 最终候选验证补充
+
+最终候选二进制：
+
+```text
+kiro-rs sha256=25ea01fb741bdffb103fa95397f0fb29b60c8bffee9267741f563f388ae237a4
+local service=existing 127.0.0.1:9022
+Claude Code CLI=2.1.197
+```
+
+已完成验证：
+
+- 完整 Rust bin 测试：`1784 passed / 0 failed / 6 ignored`。
+- feature docs：`50 issue documents / 123 relative links` 通过。
+- Node contract：`261 passed / 22 skipped / 0 failed`。
+- build artifact inventory：`targets=0 reservations=0 target_processes=0 blockers=0`。
+- direct stream：真实本地 social/IDE 凭据成功，`status=success`，`routeSubtype=local_success`，`pricingModel=claude-haiku-4-5`，`kiroMeteringUsage=0.006603686633499171`。
+- direct non-stream：真实本地 social/IDE 凭据成功，`status=success`，`routeSubtype=local_success`，`pricingModel=claude-haiku-4-5`，`kiroMeteringUsage=0.003777497379767828`。
+- direct `thinking.adaptive + output_config.effort=max`：真实 thinking block/delta 和 `thinking_tokens=4`，usage success，`pricingModel=claude-sonnet-4-6`，metering 非零。
+- Claude Code CLI simple/tool/thinking/multi-turn/MCP：均通过，usage 非零，没有 `Tool results provided`、`<function_results>`、`*Hashxxxxxxxx`、`user Continue` 等内部泄漏指纹。
+- 图片：标准 RGB PNG 成功；伪 PNG 本地拒绝且 `kiroMeteringUsage=0`；1x1 gray+alpha PNG 被上游 400 拒绝但 payload guard 显示未被本地改写。
+- WebSearch：server_tool_use 和 web_search_tool_result 正常，message_stop 和 usage 正常。
+- fake-upstream load/chaos：L1 fake smoke、L3 9/9、L4 12/12、L5 60s+60s idle 全部通过；错误爆发、429/500、invalid-tool、client-drop、mixed-chaos 后均能恢复。
+
+本轮结论：
+
+1. 已确认并修复一个足以解释大量 `upstream_status=200 content_type=json reason=api_protocol_error` 的代理侧 bug：旧 provider 在 header 阶段把 `2xx + application/json` 直接当作非 EventStream 协议错误；新逻辑把 body 交给 handler sniff，能够正确处理 JSON-labeled binary EventStream。
+2. 已确认 EOF 无 `messageStatus` 但有 `contextUsageEvent`/`meteringEvent` 的 Kiro 成功响应不再被误判为 protocol error。
+3. 本地使用真实 social/IDE 凭据的 stream、non-stream、thinking、CLI、tool、MCP、图片、WebSearch 均没有复现“上游成功但 usage 全错误”的问题。
+4. 如果生产再次出现 `2xx JSON api_protocol_error`，优先看 body fingerprint/top-level keys。若 body 是合法 EventStream，应由本修复解决；若 body 是真实 JSON 错误 envelope，则属于账号 capability/profile/region/订阅/路径组合问题，需要按 body fingerprint 继续分型，不应再盲目换号重试整组账号。

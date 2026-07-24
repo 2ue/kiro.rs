@@ -16,14 +16,18 @@ Use direct HTTP/SSE to prove the proxy protocol before involving Claude CLI.
 
 ## C2 Claude CLI Non-Interactive
 
-Use isolated config and `--output-format=stream-json` when possible.
+Use the existing local service port by default, commonly `9022`, and restart that local
+`kiro-rs` process directly when a rebuild needs to be exercised. Use an isolated service
+port only for initialization/deployment validation, missing local config, or tests that
+could corrupt unrelated local state. Always keep Claude's own HOME/config isolated so the
+operator's normal Claude Code state is not mutated.
 
 Common flags:
 
 ```bash
-HOME=/tmp/kiro-claude-home-19022 \
-CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-19022 \
-ANTHROPIC_BASE_URL=http://127.0.0.1:19022/cc \
+HOME=/tmp/kiro-claude-home-9022 \
+CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-9022 \
+ANTHROPIC_BASE_URL=http://127.0.0.1:9022/cc \
 ANTHROPIC_API_KEY=<redacted> \
 claude --bare --print --verbose \
   --output-format=stream-json \
@@ -67,4 +71,3 @@ Run these after changes to converter, payload guard, stream state, or thinking l
 - MCP tool schema containing nullable or nested `required` / `properties` edge cases.
 - payload near `payloadGuardMaxBytes`.
 - route-specific usage policy and high-cache/dfcache usage fields.
-
