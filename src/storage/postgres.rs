@@ -10042,6 +10042,13 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn postgres_timestamp_precision(value: DateTime<Utc>) -> DateTime<Utc> {
+        let nanos = value.timestamp_subsec_nanos();
+        value
+            .with_nanosecond((nanos / 1_000) * 1_000)
+            .expect("valid PostgreSQL microsecond-precision timestamp")
+    }
+
     fn dashboard_test_window(
         key: &str,
         from: DateTime<Utc>,
@@ -11037,7 +11044,11 @@ mod tests {
             );
 
             writer_tx.commit().await.unwrap();
-            assert_eq!(advancing.await.unwrap().unwrap(), cutoff, "round {round}");
+            assert_eq!(
+                advancing.await.unwrap().unwrap(),
+                postgres_timestamp_precision(cutoff),
+                "round {round}"
+            );
 
             let result = usage_store
                 .soft_delete_cleanup_batch(cutoff, 10)
@@ -11168,7 +11179,7 @@ mod tests {
                 .advance_soft_delete_cleanup_watermark(cutoff)
                 .await
                 .unwrap(),
-            cutoff
+            postgres_timestamp_precision(cutoff)
         );
         store.drop_test_schema().await.unwrap();
     }
