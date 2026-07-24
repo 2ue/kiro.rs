@@ -74,6 +74,124 @@ const USAGE_RECORD_COMMIT_LOCK_DOMAIN: i64 = 0x0055_5341_4745_4944;
 const USAGE_INDEX_STARTUP_MAX_BYTES: i64 = 64 * 1024 * 1024;
 const USAGE_SOFT_DELETE_WATERMARK_SCOPE: &str = "soft_delete_created_at";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequiredPostgresColumn {
+    table_name: &'static str,
+    column_name: &'static str,
+}
+
+const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
+    RequiredPostgresColumn {
+        table_name: "credentials",
+        column_name: "revision",
+    },
+    RequiredPostgresColumn {
+        table_name: "credential_runtime_state",
+        column_name: "revision",
+    },
+    RequiredPostgresColumn {
+        table_name: "credential_runtime_state",
+        column_name: "generation",
+    },
+    RequiredPostgresColumn {
+        table_name: "credential_runtime_mutations",
+        column_name: "operation_id",
+    },
+    RequiredPostgresColumn {
+        table_name: "credential_stats_delta_batches",
+        column_name: "operation_id",
+    },
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "revision",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "deleted_at",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "rollup_active",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "original_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "kiro_metering_usage",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "total_original_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "external_pool_raw_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "external_pool_uplifted_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "total_original_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "external_pool_raw_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "external_pool_uplifted_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_duration_rollup_time_buckets",
+        column_name: "duration_ms",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_credential_cost_summary",
+        column_name: "original_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_credential_cost_summary",
+        column_name: "kiro_metering_usage",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_capabilities_sync_status",
+        column_name: "reasoning_fields",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_capabilities_sync_status",
+        column_name: "reasoning_cohort_keys",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_capabilities_sync_status",
+        column_name: "reasoning_cohort_complete",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_capabilities_sync_status",
+        column_name: "reasoning_contract_version",
+    },
+    RequiredPostgresColumn {
+        table_name: "model_capabilities_sync_status",
+        column_name: "reasoning_invalid_models",
+    },
+];
+
+fn required_postgres_schema_missing_columns(present: &HashSet<(String, String)>) -> Vec<String> {
+    REQUIRED_POSTGRES_SCHEMA_COLUMNS
+        .iter()
+        .filter(|required| {
+            !present.contains(&(
+                required.table_name.to_string(),
+                required.column_name.to_string(),
+            ))
+        })
+        .map(|required| format!("{}.{}", required.table_name, required.column_name))
+        .collect()
+}
+
 struct UsageIndexDefinition {
     table: &'static str,
     name: &'static str,
@@ -433,6 +551,9 @@ impl PostgresStore {
         if config.postgres.migrate_on_start {
             store.migrate_with_options(false).await?;
         }
+        store
+            .verify_required_schema_compatibility(config.postgres.migrate_on_start)
+            .await?;
         Ok(store)
     }
 
@@ -469,6 +590,7 @@ impl PostgresStore {
             test_schema: Some(schema),
         };
         store.migrate_with_options(false).await?;
+        store.verify_required_schema_compatibility(true).await?;
         Ok(store)
     }
 
@@ -505,6 +627,68 @@ impl PostgresStore {
             pool,
             test_schema: None,
         })
+    }
+
+    async fn verify_required_schema_compatibility(
+        &self,
+        migrate_on_start: bool,
+    ) -> anyhow::Result<()> {
+        let mut table_names: Vec<String> = REQUIRED_POSTGRES_SCHEMA_COLUMNS
+            .iter()
+            .map(|required| required.table_name.to_string())
+            .collect();
+        table_names.sort();
+        table_names.dedup();
+
+        let mut column_names: Vec<String> = REQUIRED_POSTGRES_SCHEMA_COLUMNS
+            .iter()
+            .map(|required| required.column_name.to_string())
+            .collect();
+        column_names.sort();
+        column_names.dedup();
+
+        let rows = sqlx::query(
+            r#"
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = ANY($1)
+              AND column_name = ANY($2)
+            "#,
+        )
+        .bind(&table_names)
+        .bind(&column_names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("failed to verify PostgreSQL schema compatibility: {err}")
+        })?;
+
+        let present: HashSet<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("table_name"),
+                    row.get::<String, _>("column_name"),
+                )
+            })
+            .collect();
+
+        let missing = required_postgres_schema_missing_columns(&present);
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let migration_state = if migrate_on_start {
+            "startup migration was enabled but did not produce the required schema"
+        } else {
+            "startup migration is disabled"
+        };
+        anyhow::bail!(
+            "PostgreSQL schema is not compatible with this kiro.rs binary; missing required tables/columns: {}. {}. Set KIRO_RS_POSTGRES_MIGRATE_ON_START=true or postgres.migrateOnStart=true, restart once to migrate the database, and do not run the service with an old or partial schema.",
+            missing.join(", "),
+            migration_state
+        );
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -5578,58 +5762,17 @@ impl PostgresUsageStore {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardResponse> {
-        let now = Utc::now();
-        let (timezone, offset) = usage_dashboard_timezone(timezone);
-        let window_specs = usage_dashboard_windows(now, offset);
-        let mut windows = self
-            .dashboard_windows(&window_specs, high_cache_threshold)
+        let (generated_at, timezone, windows) = self
+            .dashboard_windows_only(timezone, high_cache_threshold)
             .await?;
-        let mut status_breakdown = self
-            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::Status)
-            .await?;
-        let mut usage_source_breakdown = self
-            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::UsageSource)
-            .await?;
-        let mut external_pool_billing_by_pool = self
-            .dashboard_external_pool_billing_by_pool(&window_specs)
-            .await?;
-
-        for window in &mut windows {
-            window.summary.status_breakdown =
-                status_breakdown.remove(&window.key).unwrap_or_default();
-            window.summary.usage_source_breakdown = usage_source_breakdown
-                .remove(&window.key)
-                .unwrap_or_default();
-            window.summary.external_pool_billing_by_pool = external_pool_billing_by_pool
-                .remove(&window.key)
-                .unwrap_or_default();
-        }
-
-        let hourly_specs = usage_dashboard_hourly_windows(now, offset);
-        let daily_specs = usage_dashboard_daily_windows(now, offset);
+        let (_, _, series) = self.dashboard_series_only(Some(&timezone)).await?;
+        let (_, top) = self.dashboard_top_only().await?;
         Ok(UsageDashboardResponse {
-            generated_at: now.to_rfc3339(),
+            generated_at,
             timezone,
             windows,
-            series: UsageDashboardSeries {
-                hourly_24h: self.dashboard_series(&hourly_specs).await?,
-                daily_7d: self.dashboard_series(&daily_specs).await?,
-            },
-            top: UsageDashboardTop {
-                window_key: "lifetime".to_string(),
-                models: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Model)
-                    .await?,
-                credentials: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Credential)
-                    .await?,
-                endpoints: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Endpoint)
-                    .await?,
-                errors: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Error)
-                    .await?,
-            },
+            series,
+            top,
         })
     }
 
@@ -9922,7 +10065,7 @@ FROM usage_duration_rollup_time_buckets_hourly;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use super::*;
@@ -9939,6 +10082,50 @@ mod tests {
         config.postgres.url = Some(url);
         config.postgres.max_connections = 2;
         Some(config)
+    }
+
+    #[test]
+    fn required_postgres_schema_columns_cover_known_upgrade_breakers() {
+        let required: HashSet<(&str, &str)> = REQUIRED_POSTGRES_SCHEMA_COLUMNS
+            .iter()
+            .map(|column| (column.table_name, column.column_name))
+            .collect();
+        for pair in [
+            ("external_upstream_pools", "revision"),
+            ("usage_records", "rollup_active"),
+            ("usage_records", "original_cost_usd"),
+            ("usage_records", "kiro_metering_usage"),
+            ("model_capabilities_sync_status", "reasoning_fields"),
+            ("credentials", "revision"),
+            ("credential_runtime_state", "generation"),
+            ("credential_runtime_mutations", "operation_id"),
+            ("credential_stats_delta_batches", "operation_id"),
+        ] {
+            assert!(
+                required.contains(&pair),
+                "missing required schema guard for {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_postgres_schema_missing_columns_reports_table_and_column() {
+        let present: HashSet<(String, String)> = REQUIRED_POSTGRES_SCHEMA_COLUMNS
+            .iter()
+            .filter(|required| {
+                !(required.table_name == "external_upstream_pools"
+                    && required.column_name == "revision")
+            })
+            .map(|required| {
+                (
+                    required.table_name.to_string(),
+                    required.column_name.to_string(),
+                )
+            })
+            .collect();
+
+        let missing = required_postgres_schema_missing_columns(&present);
+        assert_eq!(missing, vec!["external_upstream_pools.revision"]);
     }
 
     async fn clean(store: &PostgresStore) {
@@ -9967,6 +10154,31 @@ mod tests {
         ] {
             sqlx::query(statement).execute(store.pool()).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_schema_compatibility_check_rejects_missing_upgrade_column() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+
+        sqlx::query("ALTER TABLE external_upstream_pools DROP COLUMN revision")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let error = store
+            .verify_required_schema_compatibility(false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("external_upstream_pools.revision"));
+        assert!(error.contains("KIRO_RS_POSTGRES_MIGRATE_ON_START=true"));
+        assert!(error.contains("startup migration is disabled"));
+
+        store.drop_test_schema().await.unwrap();
     }
 
     fn usage_record(id: &str, cache_read: i32) -> UsageRecord {

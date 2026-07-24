@@ -1826,9 +1826,31 @@ impl AdminService {
         let mut enabled_credit_remaining = 0.0;
         let mut disabled_credit_limit = 0.0;
         let mut disabled_credit_remaining = 0.0;
+        let mut total_estimated_cost_usd = 0.0;
+        let mut total_original_cost_usd = 0.0;
+        let mut enabled_estimated_cost_usd = 0.0;
+        let mut enabled_original_cost_usd = 0.0;
+        let mut disabled_estimated_cost_usd = 0.0;
+        let mut disabled_original_cost_usd = 0.0;
         let mut last_checked_at: Option<String> = None;
+        let credential_ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
+        let cost_summaries = self
+            .usage_recorder
+            .credential_cost_summary_for_ids(&credential_ids);
 
         for credential in &credentials {
+            if let Some(summary) = cost_summaries.get(&credential.id) {
+                total_estimated_cost_usd += summary.estimated_cost_usd;
+                total_original_cost_usd += summary.original_cost_usd;
+                if credential.disabled {
+                    disabled_estimated_cost_usd += summary.estimated_cost_usd;
+                    disabled_original_cost_usd += summary.original_cost_usd;
+                } else {
+                    enabled_estimated_cost_usd += summary.estimated_cost_usd;
+                    enabled_original_cost_usd += summary.original_cost_usd;
+                }
+            }
+
             let Some(info) = account_info.get(&credential.id).map(account_info_from_row) else {
                 continue;
             };
@@ -1862,6 +1884,12 @@ impl AdminService {
             enabled_credit_remaining,
             disabled_credit_limit,
             disabled_credit_remaining,
+            total_estimated_cost_usd,
+            total_original_cost_usd,
+            enabled_estimated_cost_usd,
+            enabled_original_cost_usd,
+            disabled_estimated_cost_usd,
+            disabled_original_cost_usd,
             last_checked_at,
         })
     }
@@ -3887,8 +3915,15 @@ impl AdminService {
     }
 
     /// 导出完整凭据。仅格式化当前内存快照，不修改凭据状态。
-    pub fn export_credentials(&self, format: &str) -> Result<(String, String), AdminServiceError> {
-        let credentials = self.token_manager.export_credentials();
+    pub fn export_credentials(
+        &self,
+        format: &str,
+        selected_ids: &[u64],
+    ) -> Result<(String, String), AdminServiceError> {
+        let mut credentials = self.token_manager.export_credentials();
+        let selected_id_set: HashSet<u64> = selected_ids.iter().copied().collect();
+        let selected = !selected_id_set.is_empty();
+        filter_export_credentials_by_ids(&mut credentials, &selected_id_set)?;
         let credential_count = credentials.len();
         let normalized = format.trim().to_ascii_lowercase();
         let result = match normalized.as_str() {
@@ -3929,7 +3964,12 @@ impl AdminService {
             None,
             result.is_ok(),
             result.as_ref().err().map(ToString::to_string),
-            json!({ "format": normalized, "count": credential_count }),
+            json!({
+                "format": normalized,
+                "count": credential_count,
+                "selected": selected,
+                "requestedIds": selected_ids.len(),
+            }),
         );
         result
     }
@@ -7764,6 +7804,38 @@ async fn persist_usage_cleanup_progress(
         runtime.cancel = None;
     }
     Ok(cancel_requested)
+}
+
+fn filter_export_credentials_by_ids(
+    credentials: &mut Vec<KiroCredentials>,
+    selected_id_set: &HashSet<u64>,
+) -> Result<(), AdminServiceError> {
+    if selected_id_set.is_empty() {
+        return Ok(());
+    }
+
+    credentials.retain(|credential| {
+        credential
+            .id
+            .map(|id| selected_id_set.contains(&id))
+            .unwrap_or(false)
+    });
+    let exported_ids: HashSet<u64> = credentials
+        .iter()
+        .filter_map(|credential| credential.id)
+        .collect();
+    let missing_ids: Vec<u64> = selected_id_set
+        .iter()
+        .copied()
+        .filter(|id| !exported_ids.contains(id))
+        .collect();
+    if !missing_ids.is_empty() {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "选中的凭据不存在或不可导出: {:?}",
+            missing_ids
+        )));
+    }
+    Ok(())
 }
 
 fn merge_redis_delete_stats(

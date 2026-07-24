@@ -264,13 +264,20 @@ function mergeCredentialDefaults(cred: AddCredentialRequest, defaults: Credentia
   }
 }
 
-async function verifyImportedCredential(credentialId: number, mode: ImportVerificationMode, model: string): Promise<{ model: string; response: string }> {
+async function verifyImportedCredential(
+  credentialId: number,
+  mode: ImportVerificationMode,
+  model: string,
+  refreshInfoAfterModelTest: boolean,
+): Promise<{ model: string; response: string }> {
   if (mode === 'subscription_only') {
     const info = await getCredentialBalance(credentialId)
     return { model: '订阅查询', response: `订阅: ${info.subscriptionTitle || '未知'}，用量 ${info.currentUsage}/${info.usageLimit}` }
   }
   const tested = await testCredential(credentialId, { model, prompt: DEFAULT_TEST_PROMPT })
-  try { await getCredentialBalance(credentialId) } catch { /* ignore */ }
+  if (refreshInfoAfterModelTest) {
+    try { await getCredentialBalance(credentialId) } catch { /* ignore */ }
+  }
   return { model: testModelLabel(tested.model), response: tested.response }
 }
 
@@ -588,7 +595,8 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const [text, setText] = useState('')
   const [defaults, setDefaults] = useState(initialParameterDefaults)
   const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
-  const [skipVerify, setSkipVerify] = useState(false)
+  const [skipVerify, setSkipVerify] = useState(true)
+  const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
   const [parsed, setParsed] = useState<AddCredentialRequest[]>([])
@@ -604,7 +612,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const cancelRef = useRef(false)
 
   useEffect(() => {
-    if (!open) { setText(''); setDefaults(initialParameterDefaults()); setVerifyMode('subscription_only'); setSkipVerify(false); setResults([]); setParsed([]); setParseError(''); setRunning(false) }
+    if (!open) { setText(''); setDefaults(initialParameterDefaults()); setVerifyMode('subscription_only'); setSkipVerify(true); setRefreshInfoAfterModelTest(false); setResults([]); setParsed([]); setParseError(''); setRunning(false) }
   }, [open])
 
   const handleParse = () => {
@@ -674,7 +682,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
           newResults[i].status = 'verifying'
           if (!isRetry) setResults([...newResults])
           try {
-            const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel)
+            const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel, refreshInfoAfterModelTest)
             newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
           } catch (ve) {
             await rollbackCredential(res.credentialId)
@@ -739,16 +747,24 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
               <div className="text-sm font-semibold">验活方式</div>
               <div className="flex items-center gap-3">
                 <Checkbox checked={skipVerify} onCheckedChange={(v) => setSkipVerify(Boolean(v))} id="skip-verify" />
-                <label htmlFor="skip-verify" className="text-sm cursor-pointer">跳过验活（直接导入，不测试）</label>
+                <label htmlFor="skip-verify" className="text-sm cursor-pointer">跳过验活</label>
               </div>
               {!skipVerify && (
-                <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)}>
-                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="subscription_only">只查询订阅（不请求模型）</SelectItem>
-                    <SelectItem value="model_and_subscription">测试模型 + 查询订阅</SelectItem>
-                  </SelectContent>
-                </Select>
+                <div className="space-y-2">
+                  <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)}>
+                    <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="subscription_only">查询订阅/积分（不请求模型）</SelectItem>
+                      <SelectItem value="model_and_subscription">只测试模型</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {verifyMode === 'model_and_subscription' && (
+                    <div className="flex items-center gap-3">
+                      <Checkbox checked={refreshInfoAfterModelTest} onCheckedChange={(v) => setRefreshInfoAfterModelTest(Boolean(v))} id="batch-refresh-info-after-model-test" />
+                      <label htmlFor="batch-refresh-info-after-model-test" className="text-sm cursor-pointer">同步查询订阅/积分</label>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
             <div className="flex justify-end gap-2">
@@ -802,6 +818,8 @@ export function KamImportModal({ open, onClose, onDone }: {
   const [accounts, setAccounts] = useState<KamAccount[]>([])
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
+  const [skipVerify, setSkipVerify] = useState(true)
+  const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
   const [defaults, setDefaults] = useState(initialParameterDefaults)
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
@@ -820,7 +838,7 @@ export function KamImportModal({ open, onClose, onDone }: {
     if (!open) {
       setText(''); setAccounts([]); setResults([])
       setDefaults(initialParameterDefaults()); setRunning(false)
-      setSkipErrorAccounts(true); setVerifyMode('subscription_only')
+      setSkipErrorAccounts(true); setVerifyMode('subscription_only'); setSkipVerify(true); setRefreshInfoAfterModelTest(false)
     }
   }, [open])
 
@@ -882,14 +900,19 @@ export function KamImportModal({ open, onClose, onDone }: {
           machineId: optionalTrimmed(acc.machineId),
         }, defaults)
         const res = await addCredential(cred)
-        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning, status: 'verifying' }
-        setResults([...newResults])
-        try {
-          const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel)
-          newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
-        } catch (ve) {
-          await rollbackCredential(res.credentialId)
-          newResults[i] = { ...newResults[i], status: 'failed', error: `验活失败: ${extractErrorMessage(ve)}` }
+        newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
+        if (skipVerify) {
+          newResults[i] = { ...newResults[i], status: 'success' }
+        } else {
+          newResults[i] = { ...newResults[i], status: 'verifying' }
+          setResults([...newResults])
+          try {
+            const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel, refreshInfoAfterModelTest)
+            newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
+          } catch (ve) {
+            await rollbackCredential(res.credentialId)
+            newResults[i] = { ...newResults[i], status: 'failed', error: `验活失败: ${extractErrorMessage(ve)}` }
+          }
         }
       } catch (e) {
         newResults[i] = { ...newResults[i], status: 'failed', error: extractErrorMessage(e) }
@@ -954,13 +977,34 @@ export function KamImportModal({ open, onClose, onDone }: {
             {results.every((r) => r.status === 'pending') && (
               <div className="rounded-lg bg-muted/30 p-3 space-y-2">
                 <div className="text-sm font-semibold">导入选项</div>
-                <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)} disabled={running}>
-                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="subscription_only">只查询订阅（不请求模型）</SelectItem>
-                    <SelectItem value="model_and_subscription">测试模型 + 查询订阅</SelectItem>
-                  </SelectContent>
-                </Select>
+                <div className="flex items-center gap-2">
+                  <Checkbox checked={skipVerify} onCheckedChange={(v) => setSkipVerify(Boolean(v))} id="kam-skip-verify" disabled={running} />
+                  <label htmlFor="kam-skip-verify" className="text-sm cursor-pointer">跳过验活</label>
+                </div>
+                {!skipVerify && (
+                  <div className="space-y-2">
+                    <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)} disabled={running}>
+                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="subscription_only">查询订阅/积分（不请求模型）</SelectItem>
+                        <SelectItem value="model_and_subscription">只测试模型</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    {verifyMode === 'model_and_subscription' && (
+                      <div className="flex items-center gap-2">
+                        <Checkbox
+                          id="kam-refresh-info-after-model-test"
+                          checked={refreshInfoAfterModelTest}
+                          onCheckedChange={(v) => setRefreshInfoAfterModelTest(Boolean(v))}
+                          disabled={running}
+                        />
+                        <label htmlFor="kam-refresh-info-after-model-test" className="text-sm cursor-pointer">
+                          同步查询订阅/积分
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                )}
                 {hasErrorAccounts && (
                   <div className="flex items-center gap-2">
                     <Checkbox
@@ -1416,16 +1460,27 @@ export function BatchVerifyModal({ open, verifying, progress, results, testModel
 // CredentialExportModal
 // ============================================================================
 
-export function CredentialExportModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function CredentialExportModal({ open, onClose, selectedIds = [] }: {
+  open: boolean
+  onClose: () => void
+  selectedIds?: number[]
+}) {
   const [format, setFormat] = useState<CredentialExportFormat>('json')
+  const [scope, setScope] = useState<'selected' | 'all'>('all')
   const [loading, setLoading] = useState(false)
+  const selectedCount = selectedIds.length
+
+  useEffect(() => {
+    if (open) setScope(selectedCount > 0 ? 'selected' : 'all')
+  }, [open, selectedCount])
 
   const handleExport = async () => {
     setLoading(true)
     try {
-      const blob = await exportCredentials(format)
+      const exportIds = scope === 'selected' ? selectedIds : undefined
+      const blob = await exportCredentials(format, exportIds)
       downloadBlob(blob, exportFilename(format))
-      toast.success('导出成功')
+      toast.success(scope === 'selected' ? `已导出选中账号 ${selectedCount} 个` : '导出成功')
       onClose()
     } catch (e) {
       toast.error(`导出失败: ${extractErrorMessage(e)}`)
@@ -1447,6 +1502,17 @@ export function CredentialExportModal({ open, onClose }: { open: boolean; onClos
             </SelectContent>
           </Select>
         </Field>
+        {selectedCount > 0 && (
+          <Field label="导出范围">
+            <Select value={scope} onValueChange={(v) => setScope(v as 'selected' | 'all')} disabled={loading}>
+              <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="selected">导出选中账号（{selectedCount} 个）</SelectItem>
+                <SelectItem value="all">导出全部账号</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+        )}
         <div className="flex justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={onClose} disabled={loading}>取消</Button>
           <Button size="sm" onClick={handleExport} disabled={loading}>

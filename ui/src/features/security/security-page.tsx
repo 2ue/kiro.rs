@@ -427,7 +427,7 @@ export function SecurityPage() {
         {/* 修改区域 */}
         <div className="mt-5 space-y-2">
           <div className="text-sm font-semibold">修改登录 Key</div>
-          <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground leading-5">
+          <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900 dark:border-amber-800/60 dark:bg-amber-950/30 dark:text-amber-100">
             高危操作：保存后旧 Key 立即失效；所有其他已登录会话需重新登录。当前页面会自动写入新 Key。
           </div>
           <div className="flex flex-col gap-2 sm:flex-row">

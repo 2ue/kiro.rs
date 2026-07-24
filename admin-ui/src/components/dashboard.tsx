@@ -24,6 +24,7 @@ import { ProxyResourcesPanel } from '@/components/proxy-resources-panel'
 import { AccountValidationPanel } from '@/components/account-validation-panel'
 import { ExternalPoolsPanel } from '@/components/external-pools-panel'
 import {
+  useCredentials,
   useCredentialsAccountInfo,
   useCredentialsList,
   useCredentialsRuntime,
@@ -76,6 +77,16 @@ function formatCredits(value?: number | null): string {
 function formatDateTime(value?: string | null): string {
   if (!value) return '未查询'
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
+}
+
+function formatUsdFixed2(value?: number | null): string {
+  if (!Number.isFinite(value ?? Number.NaN)) return '-'
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value as number)
 }
 
 function credentialFromListItem(item: CredentialListItem): CredentialStatusItem {
@@ -210,6 +221,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const runtimeQuery = useCredentialsRuntime(visibleCredentialIds)
   const accountInfoQuery = useCredentialsAccountInfo(visibleCredentialIds)
   const usageSummaryQuery = useCredentialsUsageSummary(visibleCredentialIds)
+  const allCredentialsQuery = useCredentials({ enabled: false, refetchInterval: false })
   const { mutate: deleteCredential } = useDeleteCredential()
   const deleteDisabled = useDeleteDisabledCredentials()
   const batchUpdateCredentials = useBatchUpdateCredentials()
@@ -728,17 +740,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
-  // 查询当前页账号信息。后端批量接口会逐个查询并返回每个凭据的结果，避免前端制造请求风暴。
+  // 查询账号信息。后端批量接口会逐个查询并返回每个凭据的结果，避免前端制造请求风暴。
   const handleQueryCurrentPageInfo = async (enabledOnly = false) => {
-    if (currentCredentials.length === 0) {
-      toast.error('当前页没有可查询的凭据')
-      return
-    }
-
-    const ids = currentCredentials.filter(credential => !enabledOnly || !credential.disabled).map(credential => credential.id)
+    const ids = enabledOnly
+      ? ((allCredentialsQuery.data ?? (await allCredentialsQuery.refetch()).data)?.credentials || [])
+        .filter(credential => !credential.disabled)
+        .map(credential => credential.id)
+      : currentCredentials.map(credential => credential.id)
 
     if (ids.length === 0) {
-      toast.error(enabledOnly ? '当前页没有启用凭据可查询' : '当前页没有可查询信息的凭据')
+      toast.error(enabledOnly ? '没有启用凭据可查询' : '当前页没有可查询信息的凭据')
       return
     }
 
@@ -1109,6 +1120,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <div className="text-xs text-muted-foreground">
                 总额 {formatCredits(creditSummary.data?.enabledCreditLimit)} · {formatDateTime(creditSummary.data?.lastCheckedAt)}
               </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                已记录 {formatUsdFixed2(creditSummary.data?.enabledEstimatedCostUsd)} · 原始 {formatUsdFixed2(creditSummary.data?.enabledOriginalCostUsd)}
+              </div>
             </CardContent>
           </Card>
         </div>
@@ -1220,7 +1234,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   {queryingInfo ? '查询中...' : '查询本页信息'}
                 </Button>
               )}
-              {currentCredentials.some(credential => !credential.disabled) && (
+              {(summaryData?.available || 0) > 0 && (
                 <Button
                   onClick={() => handleQueryCurrentPageInfo(true)}
                   size="sm"
@@ -1228,7 +1242,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   disabled={queryingInfo}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  仅查启用信息
+                  查询启用信息
                 </Button>
               )}
               {(data?.total || 0) > 0 && (
@@ -1492,6 +1506,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <CredentialExportDialog
         open={exportDialogOpen}
         onOpenChange={setExportDialogOpen}
+        selectedIds={Array.from(selectedIds)}
       />
 
       {/* 批量验活对话框 */}

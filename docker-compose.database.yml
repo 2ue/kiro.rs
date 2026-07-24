@@ -52,6 +52,7 @@ services:
         condition: service_healthy
     environment:
       KIRO_RS_POSTGRES_URL: postgres://${KIRO_RS_POSTGRES_USER:-kiro_rs}:${KIRO_RS_POSTGRES_PASSWORD:-change-me}@kiro-rs-postgres:5432/${KIRO_RS_POSTGRES_DB:-kiro_rs}
+      KIRO_RS_POSTGRES_MIGRATE_ON_START: ${KIRO_RS_POSTGRES_MIGRATE_ON_START:-true}
       KIRO_RS_REDIS_URL: redis://kiro-rs-redis:6379/0
     ports:
       - "${KIRO_RS_PORT:-8990}:8990"

@@ -9,6 +9,11 @@ import {
   getModelCapabilities,
   getModelPricing,
   getUsageDashboard,
+  getUsageDashboardBreakdown,
+  getUsageDashboardExternalPoolBilling,
+  getUsageDashboardSeries,
+  getUsageDashboardTop,
+  getUsageDashboardWindows,
   getUsageRecords,
   getUsageRecordsPage,
   getUsageSummary,
@@ -56,6 +61,65 @@ export function useUsageDashboard(timezone = 'Asia/Shanghai', refetchInterval: R
   })
 }
 
+export function useUsageDashboardWindows(timezone = 'Asia/Shanghai', refetchInterval: RefetchInterval = false) {
+  return useQuery({
+    queryKey: ['usage-dashboard-windows', timezone],
+    queryFn: () => getUsageDashboardWindows(timezone),
+    refetchInterval,
+  })
+}
+
+export function useUsageDashboardSeries(timezone = 'Asia/Shanghai', refetchInterval: RefetchInterval = false) {
+  return useQuery({
+    queryKey: ['usage-dashboard-series', timezone],
+    queryFn: () => getUsageDashboardSeries(timezone),
+    refetchInterval,
+  })
+}
+
+export function useUsageDashboardTop(refetchInterval: RefetchInterval = false) {
+  return useQuery({
+    queryKey: ['usage-dashboard-top'],
+    queryFn: getUsageDashboardTop,
+    refetchInterval,
+  })
+}
+
+export function useUsageDashboardBreakdown(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'today',
+  refetchInterval: RefetchInterval = false
+) {
+  return useQuery({
+    queryKey: ['usage-dashboard-breakdown', timezone, windowKey],
+    queryFn: () => getUsageDashboardBreakdown(timezone, windowKey),
+    refetchInterval,
+    enabled: Boolean(windowKey),
+  })
+}
+
+export function useUsageDashboardExternalPoolBilling(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'today',
+  refetchInterval: RefetchInterval = false
+) {
+  return useQuery({
+    queryKey: ['usage-dashboard-external-pool-billing', timezone, windowKey],
+    queryFn: () => getUsageDashboardExternalPoolBilling(timezone, windowKey),
+    refetchInterval,
+    enabled: Boolean(windowKey),
+  })
+}
+
+function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQueryClient>) {
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-windows'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-series'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-top'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-breakdown'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-billing'] })
+}
+
 export function useClearUsageRecords() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -65,7 +129,7 @@ export function useClearUsageRecords() {
       queryClient.invalidateQueries({ queryKey: ['usage-records'] })
       queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
       queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
-      queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
+      invalidateUsageDashboardQueries(queryClient)
     },
   })
 }
@@ -93,7 +157,7 @@ export function useRefreshUsageQueriesAfterCleanup(status?: UsageCleanupStatusRe
     queryClient.invalidateQueries({ queryKey: ['usage-records'] })
     queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
     queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
-    queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
+    invalidateUsageDashboardQueries(queryClient)
   }, [queryClient, status?.jobId, status?.processedRows, status?.status])
 }
 
@@ -111,7 +175,7 @@ export function useStartUsageCleanup() {
       queryClient.invalidateQueries({ queryKey: ['usage-cleanup-status'] })
       queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
       queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
-      queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
+      invalidateUsageDashboardQueries(queryClient)
     },
   })
 }

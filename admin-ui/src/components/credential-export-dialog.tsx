@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Download } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -17,6 +17,7 @@ import type { CredentialExportFormat } from '@/types/api'
 interface CredentialExportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  selectedIds?: number[]
 }
 
 const formats: Array<{ value: CredentialExportFormat; label: string; description: string }> = [
@@ -53,16 +54,22 @@ function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url)
 }
 
-export function CredentialExportDialog({ open, onOpenChange }: CredentialExportDialogProps) {
+export function CredentialExportDialog({ open, onOpenChange, selectedIds = [] }: CredentialExportDialogProps) {
   const [format, setFormat] = useState<CredentialExportFormat>('json')
+  const [scope, setScope] = useState<'selected' | 'all'>('all')
   const [exporting, setExporting] = useState(false)
+  const selectedCount = selectedIds.length
+
+  useEffect(() => {
+    if (open) setScope(selectedCount > 0 ? 'selected' : 'all')
+  }, [open, selectedCount])
 
   const handleExport = async () => {
     setExporting(true)
     try {
-      const blob = await exportCredentials(format)
+      const blob = await exportCredentials(format, scope === 'selected' ? selectedIds : undefined)
       downloadBlob(blob, exportFilename(format))
-      toast.success('凭据已导出')
+      toast.success(scope === 'selected' ? `已导出选中凭据 ${selectedCount} 个` : '凭据已导出')
       onOpenChange(false)
     } catch (error) {
       toast.error(`导出失败: ${extractErrorMessage(error)}`)
@@ -94,6 +101,29 @@ export function CredentialExportDialog({ open, onOpenChange }: CredentialExportD
               <div className="text-sm text-muted-foreground">{item.description}</div>
             </button>
           ))}
+          {selectedCount > 0 && (
+            <div className="space-y-2">
+              <div className="text-sm font-medium">导出范围</div>
+              <button
+                type="button"
+                className={`w-full rounded-md border p-3 text-left transition-colors ${
+                  scope === 'selected' ? 'border-primary bg-primary/5' : 'hover:bg-muted'
+                }`}
+                onClick={() => setScope('selected')}
+              >
+                <div className="font-medium">选中凭据（{selectedCount} 个）</div>
+              </button>
+              <button
+                type="button"
+                className={`w-full rounded-md border p-3 text-left transition-colors ${
+                  scope === 'all' ? 'border-primary bg-primary/5' : 'hover:bg-muted'
+                }`}
+                onClick={() => setScope('all')}
+              >
+                <div className="font-medium">全部凭据</div>
+              </button>
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={exporting}>

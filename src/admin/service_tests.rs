@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::config::RequestAdmissionConfig;
+use std::collections::HashSet;
 
 fn cleanup_request() -> UsageCleanupRequest {
     UsageCleanupRequest {
@@ -24,6 +25,45 @@ fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
     .unwrap();
 
     assert_eq!(resolve_add_credential_auth_method(&req), "idc");
+}
+
+#[test]
+fn export_credentials_filter_keeps_selected_ids_and_rejects_missing_ids() {
+    let mut credentials = vec![
+        KiroCredentials {
+            id: Some(1),
+            ..Default::default()
+        },
+        KiroCredentials {
+            id: Some(2),
+            ..Default::default()
+        },
+        KiroCredentials {
+            id: Some(3),
+            ..Default::default()
+        },
+        KiroCredentials {
+            id: None,
+            ..Default::default()
+        },
+    ];
+    filter_export_credentials_by_ids(&mut credentials, &HashSet::from([3, 1])).unwrap();
+    assert_eq!(
+        credentials
+            .iter()
+            .filter_map(|credential| credential.id)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+
+    let mut credentials = vec![KiroCredentials {
+        id: Some(1),
+        ..Default::default()
+    }];
+    let err = filter_export_credentials_by_ids(&mut credentials, &HashSet::from([1, 2]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains('2'));
 }
 
 #[test]

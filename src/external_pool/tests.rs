@@ -8619,6 +8619,72 @@ fn non_stream_unknown_text_without_usage_records_estimated_billing_without_rewri
 }
 
 #[test]
+fn stream_output_token_estimator_counts_text_thinking_and_tool_events() {
+    let chunk = Bytes::from_static(
+        br#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello world"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"reasoning text"}}
+
+"#,
+    );
+
+    assert!(estimate_external_stream_output_tokens(&chunk) >= 3);
+}
+
+#[test]
+fn stream_missing_usage_builds_estimated_billable_external_pool_billing() {
+    let route = test_route("claude-opus-4-6");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    pool.stream_response_mode = Some(ExternalPoolStreamResponseMode::EventPassthrough);
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        request_input_tokens: Some(route.request_input_tokens),
+        stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+    let chunk = Bytes::from_static(
+        br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world"}}
+
+"#,
+    );
+    let output_tokens = estimate_external_stream_output_tokens(&chunk);
+
+    let billing = external_pool_billing_from_stream_estimate(
+        &route,
+        &pool,
+        &capture,
+        Some(&projection),
+        output_tokens,
+    )
+    .expect("estimated stream billing");
+
+    assert!(billing.usage_estimated);
+    assert_eq!(
+        billing.usage_estimate_reason.as_deref(),
+        Some("missing_stream_usage")
+    );
+    assert_eq!(
+        billing.usage_candidate_path.as_deref(),
+        Some("$stream.estimated")
+    );
+    assert_eq!(
+        billing.stream_response_mode.as_deref(),
+        Some(ExternalPoolStreamResponseMode::EventPassthrough.as_str())
+    );
+    assert!(billing.pricing_available);
+    assert!(billing.billable_cost_usd > 0.0);
+    assert!(billing.reported_usage.input_tokens > 0);
+    assert!(billing.reported_usage.output_tokens > 0);
+}
+
+#[test]
 fn external_record_usage_source_prefers_request_estimate_for_estimated_billing() {
     let route = test_route("claude-opus-4-6");
     let pool = test_pool("http://pool.example.com", false);

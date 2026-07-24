@@ -255,7 +255,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `postgres.url` | string | 必填 | PgSQL 连接地址。服务启动必须能连接；首次启动可从配置文件导入运行配置和凭据 |
 | `postgres.maxConnections` | number | `10` | PgSQL 连接池最大连接数 |
-| `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表；生产建议保持开启 |
+| `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表；生产升级必须保持开启或通过 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true` 覆盖配置，否则旧/半迁移 schema 会在启动兼容校验中被拒绝 |
 | `postgres.compressUsageRollupsOnStart` | boolean | `false` | 已废弃的兼容字段；设置为 `true` 会在连接数据库前拒绝启动。请先停止并排空所有网关实例，再运行 `maintenance usage-rollup-compression` |
 | `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
 | `redis.keyPrefix` | string | `kiro_rs:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |

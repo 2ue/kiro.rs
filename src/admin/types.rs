@@ -499,6 +499,8 @@ pub struct CredentialStatusItem {
 #[serde(rename_all = "camelCase")]
 pub struct ExportCredentialsQuery {
     pub format: Option<String>,
+    /// Comma-separated credential ids to export. Empty or absent means export all credentials.
+    pub ids: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -1226,6 +1228,24 @@ pub struct CredentialCreditSummaryResponse {
     pub enabled_credit_remaining: f64,
     pub disabled_credit_limit: f64,
     pub disabled_credit_remaining: f64,
+    /// Recorded estimated cost for all credentials in usage history.
+    #[serde(default)]
+    pub total_estimated_cost_usd: f64,
+    /// Recorded original/upstream cost for all credentials in usage history.
+    #[serde(default)]
+    pub total_original_cost_usd: f64,
+    /// Recorded estimated cost for currently enabled credentials in usage history.
+    #[serde(default)]
+    pub enabled_estimated_cost_usd: f64,
+    /// Recorded original/upstream cost for currently enabled credentials in usage history.
+    #[serde(default)]
+    pub enabled_original_cost_usd: f64,
+    /// Recorded estimated cost for currently disabled credentials in usage history.
+    #[serde(default)]
+    pub disabled_estimated_cost_usd: f64,
+    /// Recorded original/upstream cost for currently disabled credentials in usage history.
+    #[serde(default)]
+    pub disabled_original_cost_usd: f64,
     pub last_checked_at: Option<String>,
 }
 

@@ -18,11 +18,18 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
-import { useUsageDashboard } from '@/hooks/use-usage'
+import {
+  useUsageDashboardBreakdown,
+  useUsageDashboardExternalPoolBilling,
+  useUsageDashboardSeries,
+  useUsageDashboardTop,
+  useUsageDashboardWindows,
+} from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatUsd } from '@/lib/format'
 import type {
   UsageBreakdownItem,
+  UsageDashboardWindowsResponse,
   UsageDashboardWindow,
   UsageExternalPoolBillingByPool,
   UsageExternalPoolBillingSummary,
@@ -185,7 +192,7 @@ function DashboardToolbar({
   onAutoRefreshEnabledChange,
   onAutoRefreshSecondsChange,
 }: {
-  data: NonNullable<ReturnType<typeof useUsageDashboard>['data']>
+  data: UsageDashboardWindowsResponse
   selectedWindow: UsageDashboardWindow
   onWindowChange: (key: string) => void
   autoRefreshEnabled: boolean
@@ -627,24 +634,37 @@ function ExternalPoolBillingPanel({
 
 export function UsageDashboardPanel() {
   const autoRefresh = useAutoRefreshPreference(DASHBOARD_AUTO_REFRESH_KEY)
-  const dashboard = useUsageDashboard(DASHBOARD_TIMEZONE, autoRefresh.refetchInterval)
+  const windowsQuery = useUsageDashboardWindows(DASHBOARD_TIMEZONE, autoRefresh.refetchInterval)
   const [selectedWindowKey, setSelectedWindowKey] = useState('today')
   const [rankDimension, setRankDimension] = useState<RankDimension>('credentials')
-  const data = dashboard.data
+  const data = windowsQuery.data
   const selectedWindow = useMemo(
     () => activeWindow(data?.windows || [], selectedWindowKey),
     [data?.windows, selectedWindowKey]
   )
+  const effectiveWindowKey = selectedWindow?.key || selectedWindowKey
+  const seriesQuery = useUsageDashboardSeries(DASHBOARD_TIMEZONE, autoRefresh.refetchInterval)
+  const topQuery = useUsageDashboardTop(autoRefresh.refetchInterval)
+  const breakdownQuery = useUsageDashboardBreakdown(
+    DASHBOARD_TIMEZONE,
+    effectiveWindowKey,
+    autoRefresh.refetchInterval
+  )
+  const externalPoolBillingQuery = useUsageDashboardExternalPoolBilling(
+    DASHBOARD_TIMEZONE,
+    effectiveWindowKey,
+    autoRefresh.refetchInterval
+  )
 
-  if (dashboard.isLoading) {
+  if (windowsQuery.isLoading) {
     return <div className="py-12 text-center text-sm text-muted-foreground">正在加载用量总览...</div>
   }
 
-  if (dashboard.error) {
+  if (windowsQuery.error) {
     return (
       <Card>
         <CardContent className="p-4 text-sm text-destructive">
-          用量总览加载失败：{extractErrorMessage(dashboard.error)}
+          用量总览加载失败：{extractErrorMessage(windowsQuery.error)}
         </CardContent>
       </Card>
     )
@@ -655,10 +675,19 @@ export function UsageDashboardPanel() {
   }
 
   const summary = selectedWindow.summary
-  const top = data.top || EMPTY_TOP
-  const series = data.series || { hourly24h: [], daily7d: [] }
+  const top = topQuery.data?.top || EMPTY_TOP
+  const series = seriesQuery.data?.series || { hourly24h: [], daily7d: [] }
   const externalPoolBilling = summary.externalPoolBilling || EMPTY_EXTERNAL_POOL_BILLING
-  const externalPoolBillingByPool = summary.externalPoolBillingByPool || []
+  const externalPoolBillingByPool =
+    externalPoolBillingQuery.data?.externalPoolBillingByPool || summary.externalPoolBillingByPool || []
+  const statusBreakdown = breakdownQuery.data?.statusBreakdown || summary.statusBreakdown || []
+  const usageSourceBreakdown = breakdownQuery.data?.usageSourceBreakdown || summary.usageSourceBreakdown || []
+  const partialErrors = [
+    seriesQuery.error ? `趋势：${extractErrorMessage(seriesQuery.error)}` : '',
+    topQuery.error ? `排行：${extractErrorMessage(topQuery.error)}` : '',
+    breakdownQuery.error ? `分布：${extractErrorMessage(breakdownQuery.error)}` : '',
+    externalPoolBillingQuery.error ? `备用池计费：${extractErrorMessage(externalPoolBillingQuery.error)}` : '',
+  ].filter(Boolean)
   const pricedRatio = summary.totalRequests > 0 ? summary.pricedRequests / summary.totalRequests : 0
   const streamRatio = summary.totalRequests > 0 ? summary.streamRequests / summary.totalRequests : 0
   const totalTokens = summary.totalInputTokens + summary.totalOutputTokens
@@ -675,6 +704,14 @@ export function UsageDashboardPanel() {
         onAutoRefreshEnabledChange={autoRefresh.setEnabled}
         onAutoRefreshSecondsChange={autoRefresh.setIntervalSeconds}
       />
+
+      {partialErrors.length > 0 && (
+        <Card>
+          <CardContent className="p-3 text-xs text-kiro-warning">
+            部分数据加载失败：{partialErrors.join('；')}
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-7">
         <MetricCard title="请求健康" value={formatNumber(summary.totalRequests)} desc={`成功 ${formatNumber(summary.successRequests)} / 错误 ${formatNumber(summary.errorRequests)}`} icon={<Activity className="h-5 w-5" />} tone={errorRateTone(summary.errorRate)} />
@@ -707,8 +744,8 @@ export function UsageDashboardPanel() {
       <ExternalPoolBillingPanel billing={externalPoolBilling} billingByPool={externalPoolBillingByPool} />
 
       <div className="grid gap-3 xl:grid-cols-2">
-        <BreakdownPanel title="状态分布" subtitle="判断成功、上游超时、客户端错误等整体占比" items={summary.statusBreakdown || []} emptyText="暂无状态样本。" />
-        <BreakdownPanel title="用量来源" subtitle="判断真实上游、缓存模拟、补录等来源占比" items={summary.usageSourceBreakdown || []} emptyText="暂无来源样本。" />
+        <BreakdownPanel title="状态分布" subtitle="判断成功、上游超时、客户端错误等整体占比" items={statusBreakdown} emptyText="暂无状态样本。" />
+        <BreakdownPanel title="用量来源" subtitle="判断真实上游、缓存模拟、补录等来源占比" items={usageSourceBreakdown} emptyText="暂无来源样本。" />
       </div>
 
       <DimensionRankPanel top={top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />

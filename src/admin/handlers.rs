@@ -1158,14 +1158,49 @@ fn sensitive_export_response_builder() -> axum::http::response::Builder {
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
 }
 
-/// GET /api/admin/credentials/export?format=json|backup-json|jsonl
-/// 导出完整凭据。
+fn parse_export_credential_ids(raw: Option<&str>) -> Result<Vec<u64>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let id = part
+            .parse::<u64>()
+            .map_err(|_| format!("无效的导出凭据 ID: {}", part))?;
+        ids.push(id);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// GET /api/admin/credentials/export?format=json|backup-json|jsonl&ids=1,2,3
+/// 导出完整凭据。ids 为空时导出全部；ids 非空时仅导出选中凭据。
 pub async fn export_credentials(
     State(state): State<AdminState>,
     Query(query): Query<ExportCredentialsQuery>,
 ) -> Response {
     let format = query.format.as_deref().unwrap_or("json");
-    match state.service.export_credentials(format) {
+    let selected_ids = match parse_export_credential_ids(query.ids.as_deref()) {
+        Ok(ids) => ids,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorResponse::invalid_request(message)),
+            )
+                .into_response();
+        }
+    };
+    match state.service.export_credentials(format, &selected_ids) {
         Ok((body, filename)) => {
             let content_type = if filename.ends_with(".jsonl") {
                 "application/x-ndjson; charset=utf-8"
@@ -1645,5 +1680,22 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("nosniff")
         );
+    }
+
+    #[test]
+    fn export_credential_ids_query_parses_and_deduplicates_ids() {
+        assert_eq!(
+            parse_export_credential_ids(None).unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            parse_export_credential_ids(Some("")).unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            parse_export_credential_ids(Some("3, 1,3,2")).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(parse_export_credential_ids(Some("1,nope")).is_err());
     }
 }

@@ -53,7 +53,7 @@ interface KamAccount {
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
+  status: 'pending' | 'checking' | 'importing' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
   account?: KamAccount
   error?: string
   model?: string
@@ -104,7 +104,8 @@ function timestampToIsoString(value: number): string | undefined {
 
 async function verifyImportedCredential(
   credentialId: number,
-  mode: ImportVerificationMode
+  mode: ImportVerificationMode,
+  refreshInfoAfterModelTest: boolean
 ): Promise<{ model: string; response: string }> {
   if (mode === 'subscription_only') {
     const info = await getCredentialBalance(credentialId)
@@ -118,10 +119,12 @@ async function verifyImportedCredential(
     model: DEFAULT_TEST_MODEL,
     prompt: DEFAULT_TEST_PROMPT,
   })
-  try {
-    await getCredentialBalance(credentialId)
-  } catch (error) {
-    toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+  if (refreshInfoAfterModelTest) {
+    try {
+      await getCredentialBalance(credentialId)
+    } catch (error) {
+      toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+    }
   }
   return {
     model: testModelLabel(testResult.model),
@@ -250,6 +253,8 @@ async function parseKamFiles(files: File[]): Promise<{ accounts: KamAccount[]; e
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
+  const [skipVerification, setSkipVerification] = useState(true)
+  const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -284,6 +289,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setResults([])
     setDefaults(initialParameterDefaults())
     setVerificationMode('subscription_only')
+    setSkipVerification(true)
+    setRefreshInfoAfterModelTest(false)
   }
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -400,10 +407,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           continue
         }
 
-        // 验活中
+        // 导入/验活中
         setResults(prev => {
           const next = [...prev]
-          next[i] = { ...next[i], status: 'verifying' }
+          next[i] = { ...next[i], status: skipVerification ? 'importing' : 'verifying' }
           return next
         })
 
@@ -450,9 +457,31 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           addedCredId = addedCred.credentialId
 
+          if (skipVerification) {
+            successCount++
+            existingTokenHashes.add(tokenHash)
+            setCurrentProcessing(`导入成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
+            setResults(prev => {
+              const next = [...prev]
+              next[i] = {
+                ...next[i],
+                status: 'verified',
+                email: addedCred.email || account.email,
+                credentialId: addedCred.credentialId,
+              }
+              return next
+            })
+            setProgress({ current: i + 1, total: validAccounts.length })
+            continue
+          }
+
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode)
+          const verification = await verifyImportedCredential(
+            addedCred.credentialId,
+            verificationMode,
+            refreshInfoAfterModelTest
+          )
 
           successCount++
           existingTokenHashes.add(tokenHash)
@@ -508,7 +537,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
 
       if (failCount === 0 && duplicateCount === 0 && skippedCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个账号`)
+        toast.success(skipVerification ? `成功导入 ${successCount} 个账号` : `成功导入并验活 ${successCount} 个账号`)
       } else {
         toast.info(`导入完成：${parts.join('，')}`)
       }
@@ -538,6 +567,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       case 'pending':
         return <div className="w-5 h-5 rounded-full border-2 border-gray-300" />
       case 'checking':
+      case 'importing':
       case 'verifying':
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
       case 'verified':
@@ -555,11 +585,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     switch (result.status) {
       case 'pending': return '等待中'
       case 'checking': return '检查重复...'
+      case 'importing': return '导入中...'
       case 'verifying': return '验活中...'
-      case 'verified': return '验活成功'
+      case 'verified': return result.model ? '验活成功' : '导入成功'
       case 'duplicate': return '重复账号'
       case 'skipped': return '已跳过（error 状态）'
       case 'failed':
+        if (skipVerification) return '导入失败'
         if (result.rollbackStatus === 'success') return '验活失败（已排除）'
         if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
         return '验活失败（未创建）'
@@ -632,22 +664,45 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           />
 
           <div className="rounded-md border bg-muted/20 p-3">
-            <label htmlFor="kamImportVerificationMode" className="text-sm font-semibold">
+            <div className="text-sm font-semibold">
               验活方式
+            </div>
+            <label className="mt-2 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={skipVerification}
+                onChange={(event) => setSkipVerification(event.target.checked)}
+                disabled={importing}
+                className="rounded border-gray-300"
+              />
+              跳过验活
             </label>
-            <select
-              id="kamImportVerificationMode"
-              value={verificationMode}
-              onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
-              disabled={importing}
-              className="mt-2 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <option value="subscription_only">只查询订阅（不请求模型）</option>
-              <option value="model_and_subscription">测试模型 + 查询订阅</option>
-            </select>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。
-            </p>
+            {!skipVerification && (
+              <div className="mt-2 space-y-2">
+                <select
+                  id="kamImportVerificationMode"
+                  value={verificationMode}
+                  onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
+                  disabled={importing}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="subscription_only">查询订阅/积分</option>
+                  <option value="model_and_subscription">测试模型</option>
+                </select>
+                {verificationMode === 'model_and_subscription' && (
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={refreshInfoAfterModelTest}
+                      onChange={(event) => setRefreshInfoAfterModelTest(event.target.checked)}
+                      disabled={importing}
+                      className="rounded border-gray-300"
+                    />
+                    同步查询订阅/积分
+                  </label>
+                )}
+              </div>
+            )}
           </div>
 
           {/* 解析预览 */}

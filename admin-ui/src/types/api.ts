@@ -341,6 +341,12 @@ export interface CredentialCreditSummaryResponse {
   enabledCreditRemaining: number
   disabledCreditLimit: number
   disabledCreditRemaining: number
+  totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
+  enabledEstimatedCostUsd: number
+  enabledOriginalCostUsd: number
+  disabledEstimatedCostUsd: number
+  disabledOriginalCostUsd: number
   lastCheckedAt: string | null
 }
 

@@ -46,7 +46,7 @@ import {
   ToolbarActions,
   useConfirm,
 } from '@/components/patterns'
-import { formatCompact, formatCredits, formatFullDate, formatNumber } from '@/lib/format'
+import { formatCompact, formatCredits, formatFullDate, formatNumber, formatUsdFixed2 } from '@/lib/format'
 import {
   buildTestModelOptions,
   defaultTestModelForOptions,
@@ -433,9 +433,12 @@ export function CredentialsPage() {
     loadCreditDetails()
   }
 
-  const queryCurrentPageCreditInfo = async () => {
-    const ids = currentIds
-    if (!ids.length) { toast.error('当前页没有可查询信息的账号'); return }
+  const queryEnabledCreditInfo = async () => {
+    const snapshot = allCredentials.data ?? (await allCredentials.refetch()).data
+    const ids = (snapshot?.credentials || [])
+      .filter((credential) => !credential.disabled)
+      .map((credential) => credential.id)
+    if (!ids.length) { toast.error('没有启用账号可查询积分'); return }
     setQueryingCreditInfo(true)
     setLoadingBalanceIds((prev) => {
       const next = new Set(prev)
@@ -459,10 +462,10 @@ export function CredentialsPage() {
       invalidate()
       await creditSummary.refetch()
       if (creditDetailsOpen) await loadCreditDetails()
-      if (failed === 0) toast.success(`当前页积分已更新：成功 ${success}/${total}`)
-      else toast.warning(`当前页积分更新完成：成功 ${success}，失败 ${failed}`)
+      if (failed === 0) toast.success(`启用账号积分已更新：成功 ${success}/${total}`)
+      else toast.warning(`启用账号积分更新完成：成功 ${success}，失败 ${failed}`)
     } catch (e) {
-      toast.error(`查询当前页积分失败: ${extractErrorMessage(e)}`)
+      toast.error(`查询启用账号积分失败: ${extractErrorMessage(e)}`)
     } finally {
       setQueryingCreditInfo(false)
       setLoadingBalanceIds((prev) => {
@@ -700,9 +703,9 @@ export function CredentialsPage() {
             <Button variant="outline" size="sm" onClick={() => credentials.refetch()}>
               <RefreshCw className={`h-4 w-4 ${credentials.isFetching ? 'animate-spin' : ''}`} />
             </Button>
-            <Button variant="outline" size="sm" onClick={queryCurrentPageCreditInfo} disabled={queryingCreditInfo || currentIds.length === 0} title="只查询当前页账号信息，不触发全量账号刷新">
+            <Button variant="outline" size="sm" onClick={queryEnabledCreditInfo} disabled={queryingCreditInfo} title="查询所有启用账号信息，刷新积分汇总">
               {queryingCreditInfo ? <Spinner size="sm" /> : <Wallet className="h-4 w-4" />}
-              <span className="hidden sm:inline">查询当前页积分</span>
+              <span className="hidden sm:inline">查询启用积分</span>
             </Button>
             <Button variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" /><span className="hidden sm:inline">KAM</span>
@@ -786,6 +789,9 @@ export function CredentialsPage() {
             <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60 mt-1" />
           </div>
           <div className="mt-2 truncate pl-2.5 text-[0.72rem] text-muted-foreground">
+            已记录：{formatUsdFixed2(creditSummary.data?.enabledEstimatedCostUsd ?? 0)} · 原始 {formatUsdFixed2(creditSummary.data?.enabledOriginalCostUsd ?? 0)}
+          </div>
+          <div className="mt-1 truncate pl-2.5 text-[0.72rem] text-muted-foreground">
             最近查询：{creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}
           </div>
         </button>
@@ -1139,7 +1145,7 @@ export function CredentialsPage() {
       <BatchEditCredentialsModal open={batchEditOpen} ids={Array.from(selectedIds)} onClose={() => setBatchEditOpen(false)} onDone={() => { invalidate(); setSelectedIds(new Set()) }} />
       <BatchImportModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
       <KamImportModal open={kamOpen} onClose={() => setKamOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
-      <CredentialExportModal open={exportOpen} onClose={() => setExportOpen(false)} />
+      <CredentialExportModal open={exportOpen} onClose={() => setExportOpen(false)} selectedIds={Array.from(selectedIds)} />
       <BatchVerifyModal
         open={verifyOpen}
         verifying={verifying}

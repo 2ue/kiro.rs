@@ -32,7 +32,7 @@ type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed'
+  status: 'pending' | 'checking' | 'importing' | 'verifying' | 'verified' | 'duplicate' | 'failed'
   credential?: CredentialInput
   error?: string
   model?: string
@@ -45,7 +45,8 @@ interface VerificationResult {
 
 async function verifyImportedCredential(
   credentialId: number,
-  mode: ImportVerificationMode
+  mode: ImportVerificationMode,
+  refreshInfoAfterModelTest: boolean
 ): Promise<{ model: string; response: string }> {
   if (mode === 'subscription_only') {
     const info = await getCredentialBalance(credentialId)
@@ -59,10 +60,12 @@ async function verifyImportedCredential(
     model: DEFAULT_TEST_MODEL,
     prompt: DEFAULT_TEST_PROMPT,
   })
-  try {
-    await getCredentialBalance(credentialId)
-  } catch (error) {
-    toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+  if (refreshInfoAfterModelTest) {
+    try {
+      await getCredentialBalance(credentialId)
+    } catch (error) {
+      toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+    }
   }
   return {
     model: testModelLabel(testResult.model),
@@ -73,6 +76,8 @@ async function verifyImportedCredential(
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
+  const [skipVerification, setSkipVerification] = useState(true)
+  const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
@@ -113,6 +118,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
     setDefaults(initialParameterDefaults())
     setVerificationMode('subscription_only')
+    setSkipVerification(true)
+    setRefreshInfoAfterModelTest(false)
   }
 
   const appendCredentialsToInput = (credentials: AddCredentialRequest[]) => {
@@ -288,10 +295,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           }
         }
 
-        // 更新状态为验活中
+        // 更新状态为导入/验活中
         setResults(prev => {
           const newResults = [...prev]
-          newResults[i] = { ...newResults[i], status: 'verifying' }
+          newResults[i] = { ...newResults[i], status: skipVerification ? 'importing' : 'verifying' }
           return newResults
         })
 
@@ -324,10 +331,32 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
             addedCredId = addedCred.credentialId
 
+            if (skipVerification) {
+              successCount++
+              existingApiKeyHashes.add(credHash)
+              setCurrentProcessing(addedCred.email ? `导入成功: ${addedCred.email}` : `导入成功: 账号 ${i + 1}`)
+              setResults(prev => {
+                const newResults = [...prev]
+                newResults[i] = {
+                  ...newResults[i],
+                  status: 'verified',
+                  email: addedCred.email || cred.email || undefined,
+                  credentialId: addedCred.credentialId
+                }
+                return newResults
+              })
+              setProgress({ current: i + 1, total: credentials.length })
+              continue
+            }
+
             // 延迟 1 秒
             await new Promise(resolve => setTimeout(resolve, 1000))
 
-            const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode)
+            const verification = await verifyImportedCredential(
+              addedCred.credentialId,
+              verificationMode,
+              refreshInfoAfterModelTest
+            )
 
             successCount++
             existingApiKeyHashes.add(credHash)
@@ -398,10 +427,32 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           addedCredId = addedCred.credentialId
 
+          if (skipVerification) {
+            successCount++
+            existingOauthHashes.add(credHash)
+            setCurrentProcessing(addedCred.email ? `导入成功: ${addedCred.email}` : `导入成功: 账号 ${i + 1}`)
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'verified',
+                email: addedCred.email || cred.email || undefined,
+                credentialId: addedCred.credentialId
+              }
+              return newResults
+            })
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
+
           // 延迟 1 秒
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode)
+          const verification = await verifyImportedCredential(
+            addedCred.credentialId,
+            verificationMode,
+            refreshInfoAfterModelTest
+          )
 
           // 验活成功
           successCount++
@@ -458,12 +509,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
       // 显示结果
       if (failCount === 0 && duplicateCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个账号`)
+        toast.success(skipVerification ? `成功导入 ${successCount} 个账号` : `成功导入并验活 ${successCount} 个账号`)
       } else {
         const failureSummary = failCount > 0
           ? `，失败 ${failCount} 个（已排除 ${rollbackSuccessCount}，未排除 ${rollbackFailedCount}，无需排除 ${rollbackSkippedCount}）`
           : ''
-        toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${failureSummary}`)
+        toast.info(`${skipVerification ? '导入' : '验活'}完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${failureSummary}`)
 
         if (rollbackFailedCount > 0) {
           toast.warning(`有 ${rollbackFailedCount} 个失败账号回滚未完成，请手动禁用并删除`)
@@ -495,6 +546,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       case 'pending':
         return <div className="w-5 h-5 rounded-full border-2 border-gray-300" />
       case 'checking':
+      case 'importing':
       case 'verifying':
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
       case 'verified':
@@ -512,13 +564,16 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         return '等待中'
       case 'checking':
         return '检查重复...'
+      case 'importing':
+        return '导入中...'
       case 'verifying':
         return '验活中...'
       case 'verified':
-        return '验活成功'
+        return result.model ? '验活成功' : '导入成功'
       case 'duplicate':
         return '重复账号'
       case 'failed':
+        if (skipVerification) return '导入失败'
         if (result.rollbackStatus === 'success') return '验活失败（已排除）'
         if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
         return '验活失败（未创建）'
@@ -570,7 +625,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持单选或多选文件。导入后默认查询订阅，也可改为模型测试；失败的账号会被排除。
+              支持单选或多选文件。
             </p>
           </div>
 
@@ -583,22 +638,45 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           />
 
           <div className="rounded-md border bg-muted/20 p-3">
-            <label htmlFor="batchImportVerificationMode" className="text-sm font-semibold">
+            <div className="text-sm font-semibold">
               验活方式
+            </div>
+            <label className="mt-2 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={skipVerification}
+                onChange={(event) => setSkipVerification(event.target.checked)}
+                disabled={importing}
+                className="rounded border-gray-300"
+              />
+              跳过验活
             </label>
-            <select
-              id="batchImportVerificationMode"
-              value={verificationMode}
-              onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
-              disabled={importing}
-              className="mt-2 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <option value="subscription_only">只查询订阅（不请求模型）</option>
-              <option value="model_and_subscription">测试模型 + 查询订阅</option>
-            </select>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。
-            </p>
+            {!skipVerification && (
+              <div className="mt-2 space-y-2">
+                <select
+                  id="batchImportVerificationMode"
+                  value={verificationMode}
+                  onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
+                  disabled={importing}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="subscription_only">查询订阅/积分</option>
+                  <option value="model_and_subscription">测试模型</option>
+                </select>
+                {verificationMode === 'model_and_subscription' && (
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={refreshInfoAfterModelTest}
+                      onChange={(event) => setRefreshInfoAfterModelTest(event.target.checked)}
+                      disabled={importing}
+                      className="rounded border-gray-300"
+                    />
+                    同步查询订阅/积分
+                  </label>
+                )}
+              </div>
+            )}
           </div>
 
           {(importing || results.length > 0) && (

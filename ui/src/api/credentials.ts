@@ -436,9 +436,9 @@ export async function testExternalPool(id: number, req?: ExternalPoolTestRequest
   return data
 }
 
-export async function exportCredentials(format: CredentialExportFormat): Promise<Blob> {
+export async function exportCredentials(format: CredentialExportFormat, ids?: number[]): Promise<Blob> {
   const { data } = await api.get<Blob>('/credentials/export', {
-    params: { format },
+    params: { format, ids: ids && ids.length ? ids.join(',') : undefined },
     responseType: 'blob',
   })
   return data

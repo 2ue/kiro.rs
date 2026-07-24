@@ -6819,6 +6819,7 @@ impl ExternalPoolManager {
             usage_projection,
             chunks_before_first_output: 0,
             events_before_first_output: 0,
+            estimated_output_tokens: 0,
             completed: false,
         };
         let stream = futures::stream::unfold(
@@ -7057,11 +7058,15 @@ struct ExternalStreamUsageGuard {
     usage_projection: Option<ExternalUsageProjectionContext>,
     chunks_before_first_output: u32,
     events_before_first_output: u32,
+    estimated_output_tokens: i32,
     completed: bool,
 }
 
 impl ExternalStreamUsageGuard {
     fn mark_first_token_if_output(&mut self, chunk: &Bytes) {
+        self.estimated_output_tokens = self
+            .estimated_output_tokens
+            .saturating_add(estimate_external_stream_output_tokens(chunk));
         if self.route.first_token_latency_ms.load(Ordering::Relaxed) > 0 {
             return;
         }
@@ -7122,9 +7127,23 @@ impl ExternalStreamUsageGuard {
             self.completed = true;
             return;
         }
-        let billing = self.usage_capture.as_ref().and_then(|capture| {
-            external_pool_billing_from_capture_ref(&self.route, &self.pool, capture)
-        });
+        let billing = self
+            .usage_capture
+            .as_ref()
+            .and_then(|capture| {
+                external_pool_billing_from_capture_ref(&self.route, &self.pool, capture)
+            })
+            .or_else(|| {
+                self.usage_capture.as_ref().and_then(|capture| {
+                    external_pool_billing_from_stream_estimate(
+                        &self.route,
+                        &self.pool,
+                        capture,
+                        self.usage_projection.as_ref(),
+                        self.estimated_output_tokens,
+                    )
+                })
+            });
         if let Some(projection) = self.usage_projection.as_ref() {
             projection.record_success();
         }
@@ -7219,6 +7238,75 @@ fn count_external_stream_events_before_first_output(chunk: &Bytes) -> u32 {
         return count_external_stream_events(chunk);
     };
     count_complete_sse_events(&chunk.as_ref()[..index])
+}
+
+fn estimate_external_stream_output_tokens(chunk: &Bytes) -> i32 {
+    let bytes = chunk.as_ref();
+    let mut tokens = 0i32;
+    let mut offset = 0usize;
+    while let Some((idx, delimiter_len)) = find_sse_event_delimiter(&bytes[offset..]) {
+        let event_end = offset + idx + delimiter_len;
+        if let Ok(event) = std::str::from_utf8(&bytes[offset..event_end]) {
+            tokens = tokens.saturating_add(estimate_external_stream_event_output_tokens(event));
+        }
+        offset = event_end;
+    }
+    tokens.max(0)
+}
+
+fn estimate_external_stream_event_output_tokens(event: &str) -> i32 {
+    let mut tokens = 0i32;
+    for line in event.lines() {
+        let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+            tokens = tokens.saturating_add(estimate_external_stream_data_output_tokens(&value));
+        }
+    }
+    tokens.max(0)
+}
+
+fn estimate_external_stream_data_output_tokens(value: &serde_json::Value) -> i32 {
+    let mut tokens = estimate_openai_choices_output_tokens(value).unwrap_or(0);
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("content_block_start") => {
+            if let Some(block) = value.get("content_block") {
+                tokens =
+                    tokens.saturating_add(estimate_external_content_block_output_tokens(block));
+            }
+        }
+        Some("content_block_delta") => {
+            if let Some(delta) = value.get("delta") {
+                tokens = tokens.saturating_add(estimate_external_delta_output_tokens(delta));
+            }
+        }
+        _ => {}
+    }
+    tokens.max(0)
+}
+
+fn estimate_external_content_block_output_tokens(block: &serde_json::Value) -> i32 {
+    match block.get("type").and_then(|value| value.as_str()) {
+        Some("text") => string_output_tokens(block.get("text")).unwrap_or(0),
+        Some("thinking") => string_output_tokens(block.get("thinking")).unwrap_or(0),
+        Some("redacted_thinking") => string_output_tokens(block.get("data")).unwrap_or(0),
+        Some("tool_use" | "server_tool_use") => 1,
+        _ => 0,
+    }
+}
+
+fn estimate_external_delta_output_tokens(delta: &serde_json::Value) -> i32 {
+    match delta.get("type").and_then(|value| value.as_str()) {
+        Some("text_delta") => string_output_tokens(delta.get("text")).unwrap_or(0),
+        Some("thinking_delta") => string_output_tokens(delta.get("thinking")).unwrap_or(0),
+        Some("input_json_delta") => string_output_tokens(delta.get("partial_json")).unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn count_complete_sse_events(bytes: &[u8]) -> u32 {
@@ -10206,6 +10294,46 @@ fn external_pool_billing_from_capture_ref(
     capture: &Arc<SyncMutex<ExternalUsageCapture>>,
 ) -> Option<ExternalPoolBilling> {
     external_pool_billing_from_capture(route, pool, capture.lock().clone())
+}
+
+fn external_pool_billing_from_stream_estimate(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    capture: &Arc<SyncMutex<ExternalUsageCapture>>,
+    projection: Option<&ExternalUsageProjectionContext>,
+    estimated_output_tokens: i32,
+) -> Option<ExternalPoolBilling> {
+    let capture = capture.lock().clone();
+    let request_input_tokens = capture
+        .request_input_tokens
+        .unwrap_or_else(|| estimated_external_request_input_tokens(route, projection));
+    if request_input_tokens <= 0 && estimated_output_tokens <= 0 {
+        return None;
+    }
+
+    let estimated = estimated_external_usage_from_parts(
+        request_input_tokens,
+        estimated_output_tokens,
+        projection,
+        true,
+    );
+    let mut billing = external_pool_billing(
+        route,
+        pool,
+        Some(estimated.request_input_tokens),
+        estimated.raw,
+        estimated.shaped,
+        estimated.reported,
+        estimated.projected,
+    );
+    billing.stream_response_mode = capture
+        .stream_response_mode
+        .map(|mode| mode.as_str().to_string());
+    billing.usage_estimated = true;
+    billing.usage_estimate_reason = Some("missing_stream_usage".to_string());
+    billing.usage_candidate_path = Some("$stream.estimated".to_string());
+    billing.body_usage_projection_applied = estimated.projected;
+    Some(billing)
 }
 
 fn external_pool_billing(
