@@ -24,6 +24,7 @@ jobs:
     uses: ./.github/workflows/build.yaml
     with:
       release_tag: ${{ github.ref_name }}
+      profile: release
 
   build:
     needs: quality

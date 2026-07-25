@@ -5,6 +5,15 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Quality profile to run: full or release'
+        required: false
+        type: choice
+        options:
+          - full
+          - release
+        default: full
   workflow_call:
     inputs:
       release_tag:
@@ -12,6 +21,11 @@ on:
         required: false
         type: string
         default: ''
+      profile:
+        description: 'Quality profile to run: full or release'
+        required: false
+        type: string
+        default: full
 
 permissions:
   contents: read
@@ -30,6 +44,7 @@ env:
   CARGO_PROFILE_RELEASE_LTO: 'false'
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
   CARGO_TERM_COLOR: always
+  QUALITY_PROFILE: ${{ inputs.profile || 'full' }}
 
 jobs:
   quality:
@@ -67,7 +82,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate quality profile
+        shell: bash
+        run: |
+          case "$QUALITY_PROFILE" in
+            full|release) ;;
+            *)
+              echo "::error::Unsupported quality profile: $QUALITY_PROFILE"
+              exit 1
+              ;;
+          esac
+          echo "QUALITY_PROFILE=$QUALITY_PROFILE"
+
       - name: Check changed lines for whitespace errors
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: bash scripts/ci/check-diff.sh "$BASE_SHA" "$GITHUB_SHA"
@@ -112,21 +140,26 @@ jobs:
           test "$(docker exec "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
 
       - name: Install admin-ui dependencies
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         working-directory: admin-ui
         run: pnpm install --frozen-lockfile
 
       - name: Install ui dependencies
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         working-directory: ui
         run: pnpm install --frozen-lockfile
 
       - name: Check shared frontend contracts
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         run: node scripts/check-frontend-contracts.mjs
 
       - name: Build admin-ui
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         working-directory: admin-ui
         run: pnpm build
 
       - name: Build ui
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         working-directory: ui
         run: pnpm build
 
@@ -137,10 +170,21 @@ jobs:
         run: node scripts/ci/check-clippy-baseline.mjs
 
       - name: Test without default features
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         run: cargo test --locked --all-targets --no-default-features -- --test-threads=1
 
       - name: Test with default features
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         run: cargo test --locked --all-targets -- --test-threads=1
 
+      - name: Check no-default Rust compilation
+        if: ${{ env.QUALITY_PROFILE == 'release' }}
+        run: cargo check --locked --all-targets --no-default-features
+
+      - name: Run release PostgreSQL dashboard smoke test
+        if: ${{ env.QUALITY_PROFILE == 'release' }}
+        run: cargo test --locked --bin kiro-rs storage::postgres::tests::postgres_persists_runtime_config_credentials_stats_usage_and_pricing -- --exact --test-threads=1
+
       - name: Build release with default features
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         run: cargo build --release --locked

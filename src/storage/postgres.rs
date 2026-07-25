@@ -5766,8 +5766,14 @@ impl PostgresUsageStore {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardResponse> {
-        let (generated_at, timezone, windows) = self
-            .dashboard_windows_only(timezone, high_cache_threshold)
+        let now = Utc::now();
+        let generated_at = now.to_rfc3339();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_specs = usage_dashboard_windows(now, offset);
+        let mut windows = self
+            .dashboard_windows(&window_specs, high_cache_threshold)
+            .await?;
+        self.populate_dashboard_window_details(&window_specs, &mut windows)
             .await?;
         let (_, _, series) = self.dashboard_series_only(Some(&timezone)).await?;
         let (_, top) = self.dashboard_top_only().await?;
@@ -6096,6 +6102,36 @@ impl PostgresUsageStore {
         rows.into_iter()
             .map(dashboard_window_from_row)
             .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn populate_dashboard_window_details(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+        windows: &mut [UsageDashboardWindow],
+    ) -> anyhow::Result<()> {
+        if specs.is_empty() || windows.is_empty() {
+            return Ok(());
+        }
+
+        let mut status_breakdown = self
+            .dashboard_breakdown(specs, DashboardBreakdownColumn::Status)
+            .await?;
+        let mut usage_source_breakdown = self
+            .dashboard_breakdown(specs, DashboardBreakdownColumn::UsageSource)
+            .await?;
+        let mut external_pool_billing = self.dashboard_external_pool_billing_by_pool(specs).await?;
+
+        for window in windows {
+            window.summary.status_breakdown =
+                status_breakdown.remove(&window.key).unwrap_or_default();
+            window.summary.usage_source_breakdown = usage_source_breakdown
+                .remove(&window.key)
+                .unwrap_or_default();
+            window.summary.external_pool_billing_by_pool = external_pool_billing
+                .remove(&window.key)
+                .unwrap_or_default();
+        }
+        Ok(())
     }
 
     async fn dashboard_breakdown(
