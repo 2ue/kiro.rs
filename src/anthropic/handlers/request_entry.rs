@@ -179,11 +179,8 @@ fn maybe_local_pool_unavailable_fast_fail_response(
     }
 
     let local_state = provider.local_pool_route_state_cached(Some(model));
-    let Some((status, error_type, message, reason, retry_after_secs)) =
-        local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)
-    else {
-        return None;
-    };
+    let (status, error_type, message, reason, retry_after_secs) =
+        local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)?;
 
     if let (Some(attribution), Some(retry_after_secs)) = (attribution, retry_after_secs) {
         attribution.apply_local_temporary_backoff(retry_after_secs);
@@ -408,18 +405,19 @@ fn parse_messages_payload_with_probe(
 }
 
 fn validate_typed_reasoning_protocol(payload: &MessagesRequest) -> Result<(), EntryRequestError> {
-    if let Some(output_config) = payload.output_config.as_ref() {
-        if let Some(effort) = output_config.effort.as_deref() {
-            if super::super::types::parse_thinking_effort(effort).is_none() {
-                return Err(EntryRequestError::invalid(
-                    format!(
-                        "output_config.effort must be one of: {}",
-                        super::super::types::THINKING_EFFORT_VALUES.join(", ")
-                    ),
-                    "invalid_thinking_effort",
-                ));
-            }
-        }
+    if payload
+        .output_config
+        .as_ref()
+        .and_then(|output_config| output_config.effort.as_deref())
+        .is_some_and(|effort| super::super::types::parse_thinking_effort(effort).is_none())
+    {
+        return Err(EntryRequestError::invalid(
+            format!(
+                "output_config.effort must be one of: {}",
+                super::super::types::THINKING_EFFORT_VALUES.join(", ")
+            ),
+            "invalid_thinking_effort",
+        ));
     }
     let Some(thinking) = payload.thinking.as_ref() else {
         return Ok(());

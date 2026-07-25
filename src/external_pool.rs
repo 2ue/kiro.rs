@@ -3411,13 +3411,14 @@ impl ExternalPoolManager {
                 now + EXTERNAL_POOL_LOCAL_MUTATION_DISPATCH_TRUST_TTL,
             );
         }
-        if upsert_pool_id != delete_pool_id {
-            if let Some(pool_id) = upsert_pool_id {
+        match upsert_pool_id {
+            Some(pool_id) if upsert_pool_id != delete_pool_id => {
                 trust.retain(|(existing_pool_id, revision), _| {
                     *existing_pool_id != pool_id
                         || Some(*revision) == upsert_pool.map(|pool| pool.revision)
                 });
             }
+            _ => {}
         }
         self.invalidate_external_pool_policy_state();
     }
@@ -3956,27 +3957,26 @@ impl ExternalPoolManager {
     async fn external_pool_coordination_epoch(&self) -> anyhow::Result<String> {
         let now_ms = external_pool_coordination_monotonic_ms();
         let cached_epoch = self.coordinator_epoch.lock().clone();
-        if !self.coordinator_probe_required.load(Ordering::Acquire)
-            && now_ms < self.coordinator_next_probe_ms.load(Ordering::Acquire)
-        {
-            if let Some(epoch) = cached_epoch {
-                return Ok(epoch);
-            }
+        if let Some(epoch) = cached_epoch.filter(|_| {
+            !self.coordinator_probe_required.load(Ordering::Acquire)
+                && now_ms < self.coordinator_next_probe_ms.load(Ordering::Acquire)
+        }) {
+            return Ok(epoch);
         }
         let _local_lock = self.coordinator_reconcile_lock.lock().await;
         let now_ms = external_pool_coordination_monotonic_ms();
         let probe_required = self.coordinator_probe_required.load(Ordering::Acquire);
         let cached_epoch = self.coordinator_epoch.lock().clone();
         let cached_run_id = self.coordinator_run_id.lock().clone();
-        if !probe_required && now_ms < self.coordinator_next_probe_ms.load(Ordering::Acquire) {
-            if let Some(epoch) = cached_epoch.clone() {
-                return Ok(epoch);
-            }
+        if let Some(epoch) = cached_epoch.clone().filter(|_| {
+            !probe_required && now_ms < self.coordinator_next_probe_ms.load(Ordering::Acquire)
+        }) {
+            return Ok(epoch);
         }
 
         let current_run_id = self.redis.external_pool_redis_run_id().await?;
-        if let (Some(epoch), Some(run_id)) = (cached_epoch.as_ref(), cached_run_id.as_ref()) {
-            if *run_id == current_run_id {
+        match (cached_epoch.as_ref(), cached_run_id.as_ref()) {
+            (Some(epoch), Some(run_id)) if *run_id == current_run_id => {
                 if !probe_required {
                     self.record_external_pool_coordinator_probe(&current_run_id, epoch);
                     return Ok(epoch.clone());
@@ -3994,6 +3994,7 @@ impl ExternalPoolManager {
                     ExternalPoolCoordinatorGuardState::EpochMismatch { .. } => {}
                 }
             }
+            _ => {}
         }
 
         self.reconcile_external_pool_coordinator_guard(current_run_id)
@@ -8613,13 +8614,15 @@ fn process_non_stream_response_usage(
             }
         }
 
-        if pointer != "/usage" {
-            if let Some(reported) = usage_capture.reported.or(usage_capture.raw) {
-                changed |= set_top_level_usage_value(
-                    &mut value,
-                    anthropic_usage_value_for_body(reported, usage_capture.projected),
-                );
-            }
+        if let Some(reported) = usage_capture
+            .reported
+            .or(usage_capture.raw)
+            .filter(|_| pointer != "/usage")
+        {
+            changed |= set_top_level_usage_value(
+                &mut value,
+                anthropic_usage_value_for_body(reported, usage_capture.projected),
+            );
         }
 
         let body = if sanitized || changed {
@@ -8636,22 +8639,23 @@ fn process_non_stream_response_usage(
         };
     }
 
-    if normal_non_stream_model_response(&value) {
-        if let Some(estimated) = estimate_non_stream_response_usage(route, projection, &value) {
-            apply_estimated_usage_capture(&mut usage_capture, estimated, "missing_upstream_usage");
-            set_top_level_usage_value(
-                &mut value,
-                anthropic_usage_value_for_body(estimated.reported, estimated.projected),
-            );
-            let body = serde_json::to_vec(&value)
-                .map(Bytes::from)
-                .unwrap_or_else(|_| bytes.clone());
-            return ProjectedNonStreamBody {
-                body,
-                usage_capture,
-                protocol_contamination: sanitized,
-            };
-        }
+    if let Some(estimated) = normal_non_stream_model_response(&value)
+        .then(|| estimate_non_stream_response_usage(route, projection, &value))
+        .flatten()
+    {
+        apply_estimated_usage_capture(&mut usage_capture, estimated, "missing_upstream_usage");
+        set_top_level_usage_value(
+            &mut value,
+            anthropic_usage_value_for_body(estimated.reported, estimated.projected),
+        );
+        let body = serde_json::to_vec(&value)
+            .map(Bytes::from)
+            .unwrap_or_else(|_| bytes.clone());
+        return ProjectedNonStreamBody {
+            body,
+            usage_capture,
+            protocol_contamination: sanitized,
+        };
     }
 
     if let Some(estimated) =
@@ -8804,10 +8808,11 @@ fn anthropic_usage_value_for_body(
     include_cache_creation_breakdown: bool,
 ) -> serde_json::Value {
     let mut value = usage.to_anthropic_usage_json();
-    if include_cache_creation_breakdown {
-        if let Some(obj) = value.as_object_mut() {
-            apply_projected_cache_creation_breakdown(obj, usage);
-        }
+    if let Some(obj) = value
+        .as_object_mut()
+        .filter(|_| include_cache_creation_breakdown)
+    {
+        apply_projected_cache_creation_breakdown(obj, usage);
     }
     value
 }
@@ -10085,12 +10090,8 @@ fn project_usage_value(
         .map(|policy| policy.apply_final_output_guard_to_usage(projected))
         .unwrap_or(projected);
     let projected_json = projected.to_anthropic_usage_json();
-    let Some(obj) = usage.as_object_mut() else {
-        return None;
-    };
-    let Some(projected_obj) = projected_json.as_object() else {
-        return None;
-    };
+    let obj = usage.as_object_mut()?;
+    let projected_obj = projected_json.as_object()?;
     for (key, value) in projected_obj {
         obj.insert(key.clone(), value.clone());
     }

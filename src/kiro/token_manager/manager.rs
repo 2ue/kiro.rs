@@ -3092,10 +3092,13 @@ impl MultiTokenManager {
         let config = self.config.lock().clone();
         let now = Instant::now();
         let risk_circuit = self.local_pool_risk_circuit_snapshot_from_config(now, &config);
-        if refresh_scheduler_state && !risk_circuit.open {
-            if let Err(err) = self.refresh_scheduler_state_from_redis() {
-                tracing::warn!("本地池路由预检同步 Redis 调度状态失败: {}", err);
-            }
+        let scheduler_refresh_result = if refresh_scheduler_state && !risk_circuit.open {
+            self.refresh_scheduler_state_from_redis()
+        } else {
+            Ok(())
+        };
+        if let Err(err) = scheduler_refresh_result {
+            tracing::warn!("本地池路由预检同步 Redis 调度状态失败: {}", err);
         }
         if refresh_scheduler_state {
             self.cleanup_expired_in_flight_leases_local_first();
@@ -4152,9 +4155,7 @@ impl MultiTokenManager {
                     if rate_limit_interval_for_rpm(rpm).is_some() {
                         return None;
                     }
-                    if entry.rate_limit_available_at.is_none() {
-                        return None;
-                    }
+                    entry.rate_limit_available_at?;
                     let id = entry.id;
                     entry.rate_limit_available_at = None;
                     Some(id)
@@ -4753,10 +4754,13 @@ impl MultiTokenManager {
             return;
         }
         let _ = tokio::time::timeout(wakeup, capacity_waiter.wait_for_change()).await;
-        if self.redis_store.is_some() {
-            if let Err(err) = self.refresh_scheduler_state_from_redis() {
-                tracing::debug!("调度等待唤醒后同步 Redis 并发状态失败: {}", err);
-            }
+        let scheduler_refresh_result = if self.redis_store.is_some() {
+            self.refresh_scheduler_state_from_redis()
+        } else {
+            Ok(())
+        };
+        if let Err(err) = scheduler_refresh_result {
+            tracing::debug!("调度等待唤醒后同步 Redis 并发状态失败: {}", err);
         }
     }
 
@@ -4773,10 +4777,13 @@ impl MultiTokenManager {
             return;
         }
         tokio::time::sleep(wakeup).await;
-        if self.redis_store.is_some() {
-            if let Err(err) = self.refresh_scheduler_state_from_redis() {
-                tracing::debug!("Redis 调度协调恢复等待后同步并发状态失败: {}", err);
-            }
+        let scheduler_refresh_result = if self.redis_store.is_some() {
+            self.refresh_scheduler_state_from_redis()
+        } else {
+            Ok(())
+        };
+        if let Err(err) = scheduler_refresh_result {
+            tracing::debug!("Redis 调度协调恢复等待后同步并发状态失败: {}", err);
         }
     }
 
