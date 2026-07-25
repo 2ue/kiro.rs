@@ -1992,7 +1992,9 @@ enum HandlerEventStreamFault {
     MissingCompletionAfterText,
     LegacyTextWithMetadataNoStatus,
     TextWithMeteringNoStatus,
+    UsageOnlyMeteringNoStatus,
     CompleteToolWithoutStatus,
+    IncompleteToolWithoutStatus,
     TextThenReadError,
     ThinkingThenReadError,
     ToolThenReadError,
@@ -2259,6 +2261,15 @@ async fn handler_eventstream_fault_upstream(
             ));
             handler_eventstream_bytes_response(body)
         }
+        HandlerEventStreamFault::UsageOnlyMeteringNoStatus => {
+            let mut body =
+                eventstream_test_frame("contextUsageEvent", json!({"contextUsagePercentage":0.01}));
+            body.extend(eventstream_test_frame(
+                "meteringEvent",
+                json!({"usage":0.24,"inputTokens":123,"outputTokens":0}),
+            ));
+            handler_eventstream_bytes_response(body)
+        }
         HandlerEventStreamFault::CompleteToolWithoutStatus => {
             handler_eventstream_bytes_response(eventstream_test_frame(
                 "toolUseEvent",
@@ -2267,6 +2278,17 @@ async fn handler_eventstream_fault_upstream(
                     "toolUseId":"toolu_legacy_terminal",
                     "input":"{\"command\":\"printf legacy-tool-ok\"}",
                     "stop":true
+                }),
+            ))
+        }
+        HandlerEventStreamFault::IncompleteToolWithoutStatus => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_legacy_terminal",
+                    "input":"{\"command\":\"printf legacy-tool-ok\"}",
+                    "stop":false
                 }),
             ))
         }
@@ -3289,19 +3311,31 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
     for (fault, expected_content, expected_stop_reason, expected_kiro_metering_usage) in [
         (
             HandlerEventStreamFault::LegacyTextWithMetadataNoStatus,
-            "legacy-terminal-ok",
+            Some("legacy-terminal-ok"),
             "end_turn",
             0.0,
         ),
         (
             HandlerEventStreamFault::TextWithMeteringNoStatus,
-            "metered-terminal-ok",
+            Some("metered-terminal-ok"),
             "end_turn",
             0.42,
         ),
         (
+            HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
+            None,
+            "end_turn",
+            0.24,
+        ),
+        (
             HandlerEventStreamFault::CompleteToolWithoutStatus,
-            r#""name":"Bash""#,
+            Some(r#""name":"Bash""#),
+            "tool_use",
+            0.0,
+        ),
+        (
+            HandlerEventStreamFault::IncompleteToolWithoutStatus,
+            Some(r#""name":"Bash""#),
             "tool_use",
             0.0,
         ),
@@ -3317,10 +3351,12 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
                     StatusCode::OK,
                     "fault={fault:?} stream={stream} round={round} body={body}"
                 );
-                assert!(
-                    body.contains(expected_content),
-                    "fault={fault:?} stream={stream} round={round} body={body}"
-                );
+                if let Some(expected_content) = expected_content {
+                    assert!(
+                        body.contains(expected_content),
+                        "fault={fault:?} stream={stream} round={round} body={body}"
+                    );
+                }
                 assert!(
                     body.contains(&format!(r#""stop_reason":"{expected_stop_reason}""#)),
                     "fault={fault:?} stream={stream} round={round} body={body}"
@@ -3341,6 +3377,13 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
                     "fault={fault:?} stream={stream} round={round} kiro_metering_usage={}",
                     record.kiro_metering_usage
                 );
+                if matches!(fault, HandlerEventStreamFault::UsageOnlyMeteringNoStatus) {
+                    assert_eq!(record.output_tokens, 0);
+                    assert!(
+                        record.total_input_tokens > 0 || record.compat_input_tokens > 0,
+                        "usage-only metering should preserve an input-token signal: {record:?}"
+                    );
+                }
             }
         }
     }

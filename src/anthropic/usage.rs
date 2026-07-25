@@ -10,7 +10,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::runtime::{Runtime, RuntimeFlavor};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
@@ -31,6 +31,9 @@ const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_m
 const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
 const USAGE_WRITER_ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_millis(100);
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
+const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
+const USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES: usize = 2;
+const USAGE_DASHBOARD_GATE_WAIT_MS: u64 = 100;
 const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
 const ERROR_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 8192;
 const ERROR_DIAGNOSTIC_MAX_STRING_BYTES: usize = 512;
@@ -1306,6 +1309,7 @@ pub struct UsageRecorder {
     redis_store: Option<Arc<RedisStore>>,
     writer: Option<Arc<UsageWriterControl>>,
     redis_writer: Option<Arc<UsageWriterControl>>,
+    dashboard_query_gate: Arc<Semaphore>,
     lifecycle: Arc<RwLock<()>>,
     accepting: Arc<AtomicBool>,
     shutdown: Arc<UsageShutdownState>,
@@ -1551,6 +1555,7 @@ impl UsageRecorder {
             redis_store: None,
             writer: None,
             redis_writer: None,
+            dashboard_query_gate: Arc::new(Semaphore::new(USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES)),
             lifecycle: Arc::new(RwLock::new(())),
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
@@ -1645,6 +1650,7 @@ impl UsageRecorder {
             redis_store,
             writer,
             redis_writer,
+            dashboard_query_gate: Arc::new(Semaphore::new(USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES)),
             lifecycle: Arc::new(RwLock::new(())),
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
@@ -2099,28 +2105,82 @@ impl UsageRecorder {
         self.summary_memory(high_cache_threshold)
     }
 
+    fn dashboard_query<T, Fut>(
+        &self,
+        label: &'static str,
+        timeout_secs: u64,
+        future: Fut,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+    {
+        let gate = self.dashboard_query_gate.clone();
+        block_on_usage_store(async move {
+            let permit = match tokio::time::timeout(
+                StdDuration::from_millis(USAGE_DASHBOARD_GATE_WAIT_MS),
+                gate.acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => anyhow::bail!("usage dashboard 查询入口已关闭"),
+                Err(_) => anyhow::bail!("usage dashboard 查询繁忙，请稍后重试"),
+            };
+
+            let result = tokio::time::timeout(StdDuration::from_secs(timeout_secs), future).await;
+            drop(permit);
+
+            match result {
+                Ok(result) => result,
+                Err(_) => anyhow::bail!(
+                    "读取 {} 超过 {} 秒，已中止本次后台查询",
+                    label,
+                    timeout_secs
+                ),
+            }
+        })
+    }
+
     pub fn dashboard(
         &self,
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardResponse> {
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
             let timezone = timezone.map(str::to_string);
-            return block_on_usage_store(async move {
+            match block_on_usage_store(async move {
                 match tokio::time::timeout(
-                    StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
-                    store.dashboard(timezone.as_deref(), high_cache_threshold),
+                    StdDuration::from_secs(USAGE_DASHBOARD_REDIS_TIMEOUT_SECS),
+                    redis.usage_dashboard(timezone.as_deref(), high_cache_threshold),
                 )
                 .await
                 {
                     Ok(result) => result,
                     Err(_) => anyhow::bail!(
-                        "读取 PgSQL usage dashboard 超过 {} 秒，已中止本次后台查询",
-                        USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
+                        "读取 Redis usage dashboard 超过 {} 秒",
+                        USAGE_DASHBOARD_REDIS_TIMEOUT_SECS
                     ),
                 }
-            });
+            }) {
+                Ok(Some(dashboard)) => return Ok(dashboard),
+                Ok(None) => {}
+                Err(err) => tracing::warn!("读取 Redis usage dashboard 失败，回退 PgSQL: {}", err),
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let timezone = timezone.map(str::to_string);
+            return self.dashboard_query(
+                "PgSQL usage dashboard",
+                USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                async move {
+                    store
+                        .dashboard(timezone.as_deref(), high_cache_threshold)
+                        .await
+                },
+            );
         }
 
         anyhow::bail!("usage dashboard 的精确窗口与 P95 需要 PgSQL 聚合存储")
@@ -2131,23 +2191,49 @@ impl UsageRecorder {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<UsageDashboardWindowsResponse> {
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
             let timezone = timezone.map(str::to_string);
-            let (generated_at, timezone, windows) = block_on_usage_store(async move {
+            match block_on_usage_store(async move {
                 match tokio::time::timeout(
-                    StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
-                    store.dashboard_windows_only(timezone.as_deref(), high_cache_threshold),
+                    StdDuration::from_secs(USAGE_DASHBOARD_REDIS_TIMEOUT_SECS),
+                    redis.usage_dashboard_windows_only(timezone.as_deref(), high_cache_threshold),
                 )
                 .await
                 {
                     Ok(result) => result,
                     Err(_) => anyhow::bail!(
-                        "读取 PgSQL usage dashboard windows 超过 {} 秒，已中止本次后台查询",
-                        USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
+                        "读取 Redis usage dashboard windows 超过 {} 秒",
+                        USAGE_DASHBOARD_REDIS_TIMEOUT_SECS
                     ),
                 }
-            })?;
+            }) {
+                Ok(Some((generated_at, timezone, windows))) => {
+                    return Ok(UsageDashboardWindowsResponse {
+                        generated_at,
+                        timezone,
+                        windows,
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    "读取 Redis usage dashboard windows 失败，回退 PgSQL: {}",
+                    err
+                ),
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let timezone = timezone.map(str::to_string);
+            let (generated_at, timezone, windows) = self.dashboard_query(
+                "PgSQL usage dashboard windows",
+                USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                async move {
+                    store
+                        .dashboard_windows_only(timezone.as_deref(), high_cache_threshold)
+                        .await
+                },
+            )?;
             return Ok(UsageDashboardWindowsResponse {
                 generated_at,
                 timezone,
@@ -2165,7 +2251,18 @@ impl UsageRecorder {
             let redis = redis.clone();
             let timezone = timezone.map(str::to_string);
             match block_on_usage_store(async move {
-                redis.usage_dashboard_series_only(timezone.as_deref()).await
+                match tokio::time::timeout(
+                    StdDuration::from_secs(USAGE_DASHBOARD_REDIS_TIMEOUT_SECS),
+                    redis.usage_dashboard_series_only(timezone.as_deref()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => anyhow::bail!(
+                        "读取 Redis usage dashboard series 超过 {} 秒",
+                        USAGE_DASHBOARD_REDIS_TIMEOUT_SECS
+                    ),
+                }
             }) {
                 Ok(Some((generated_at, timezone, series))) => {
                     return Ok(UsageDashboardSeriesResponse {
@@ -2184,9 +2281,11 @@ impl UsageRecorder {
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
-            let (generated_at, timezone, series) = block_on_usage_store(async move {
-                store.dashboard_series_only(timezone.as_deref()).await
-            })?;
+            let (generated_at, timezone, series) = self.dashboard_query(
+                "PgSQL usage dashboard series",
+                USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                async move { store.dashboard_series_only(timezone.as_deref()).await },
+            )?;
             return Ok(UsageDashboardSeriesResponse {
                 generated_at,
                 timezone,
@@ -2199,7 +2298,20 @@ impl UsageRecorder {
     pub fn dashboard_top(&self) -> anyhow::Result<UsageDashboardTopResponse> {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
-            match block_on_usage_store(async move { redis.usage_dashboard_top_only().await }) {
+            match block_on_usage_store(async move {
+                match tokio::time::timeout(
+                    StdDuration::from_secs(USAGE_DASHBOARD_REDIS_TIMEOUT_SECS),
+                    redis.usage_dashboard_top_only(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => anyhow::bail!(
+                        "读取 Redis usage dashboard top 超过 {} 秒",
+                        USAGE_DASHBOARD_REDIS_TIMEOUT_SECS
+                    ),
+                }
+            }) {
                 Ok(Some((generated_at, top))) => {
                     return Ok(UsageDashboardTopResponse { generated_at, top });
                 }
@@ -2211,8 +2323,11 @@ impl UsageRecorder {
         }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
-            let (generated_at, top) =
-                block_on_usage_store(async move { store.dashboard_top_only().await })?;
+            let (generated_at, top) = self.dashboard_query(
+                "PgSQL usage dashboard top",
+                USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                async move { store.dashboard_top_only().await },
+            )?;
             return Ok(UsageDashboardTopResponse { generated_at, top });
         }
         anyhow::bail!("usage dashboard top 需要 Redis 或 PgSQL 聚合存储")
@@ -2228,20 +2343,15 @@ impl UsageRecorder {
             let timezone = timezone.map(str::to_string);
             let window_key = window_key.to_string();
             let (generated_at, timezone, window_key, status_breakdown, usage_source_breakdown) =
-                block_on_usage_store(async move {
-                    match tokio::time::timeout(
-                        StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
-                        store.dashboard_breakdown_only(timezone.as_deref(), &window_key),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => anyhow::bail!(
-                            "读取 PgSQL usage dashboard breakdown 超过 {} 秒，已中止本次后台查询",
-                            USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
-                        ),
-                    }
-                })?;
+                self.dashboard_query(
+                    "PgSQL usage dashboard breakdown",
+                    USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                    async move {
+                        store
+                            .dashboard_breakdown_only(timezone.as_deref(), &window_key)
+                            .await
+                    },
+                )?;
             return Ok(UsageDashboardBreakdownResponse {
                 generated_at,
                 timezone,
@@ -2262,22 +2372,16 @@ impl UsageRecorder {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
             let window_key = window_key.to_string();
-            let (generated_at, timezone, window_key, external_pool_billing_by_pool) =
-                block_on_usage_store(async move {
-                    match tokio::time::timeout(
-                        StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
+            let (generated_at, timezone, window_key, external_pool_billing_by_pool) = self
+                .dashboard_query(
+                    "PgSQL usage dashboard external pool billing",
+                    USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                    async move {
                         store
-                            .dashboard_external_pool_billing_only(timezone.as_deref(), &window_key),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => anyhow::bail!(
-                            "读取 PgSQL usage dashboard external pool billing 超过 {} 秒，已中止本次后台查询",
-                            USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
-                        ),
-                    }
-                })?;
+                            .dashboard_external_pool_billing_only(timezone.as_deref(), &window_key)
+                            .await
+                    },
+                )?;
             return Ok(UsageDashboardExternalPoolBillingResponse {
                 generated_at,
                 timezone,
@@ -3365,6 +3469,7 @@ mod tests {
             redis_store: None,
             writer: Some(Arc::new(UsageWriterControl::new(sender, task, progress))),
             redis_writer: None,
+            dashboard_query_gate: Arc::new(Semaphore::new(USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES)),
             lifecycle: Arc::new(RwLock::new(())),
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
@@ -3388,6 +3493,128 @@ mod tests {
         .unwrap();
 
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dashboard_query_gate_bounds_non_core_usage_queries() {
+        let recorder = Arc::new(UsageRecorder::new(16));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut holders = Vec::new();
+        for index in 0..USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES {
+            let recorder = recorder.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            holders.push(tokio::task::spawn_blocking(move || {
+                recorder
+                    .dashboard_query("test dashboard query", 1, async move {
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now_active, Ordering::SeqCst);
+                        tokio::time::sleep(StdDuration::from_millis(250)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok::<_, anyhow::Error>(index)
+                    })
+                    .unwrap()
+            }));
+        }
+
+        let started = Instant::now();
+        while active.load(Ordering::SeqCst) < USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES {
+            assert!(
+                started.elapsed() < StdDuration::from_secs(1),
+                "dashboard holder queries did not acquire the gate"
+            );
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+
+        let busy_recorder = recorder.clone();
+        let busy = tokio::task::spawn_blocking(move || {
+            busy_recorder.dashboard_query("test dashboard query", 1, async move {
+                Ok::<_, anyhow::Error>(())
+            })
+        })
+        .await
+        .unwrap();
+        let busy_message = busy.expect_err("third dashboard query must fail fast");
+        assert!(
+            busy_message
+                .to_string()
+                .contains("usage dashboard 查询繁忙"),
+            "{busy_message:#}"
+        );
+
+        for holder in holders {
+            holder.await.unwrap();
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dashboard_windows_uses_redis_observability_without_postgres_for_three_rounds() {
+        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let mut config = crate::model::config::Config::default();
+        config.redis.url = Some(redis_url);
+        config.redis.key_prefix = format!(
+            "kiro_rs:test:recorder-dashboard-redis-first:{}",
+            uuid::Uuid::new_v4()
+        );
+        let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
+        redis.clear_usage_summary().await.unwrap();
+
+        for round in 0..3 {
+            let mut usage = record(
+                &format!("recorder-dashboard-redis-first-{round}"),
+                1_000,
+                UsageSource::UpstreamMetadata,
+            );
+            usage.total_input_tokens = 1_200;
+            usage.billable_input_tokens = 1_200;
+            redis.record_usage_summary(&usage).await.unwrap();
+
+            let recorder = UsageRecorder {
+                records: Mutex::new(VecDeque::with_capacity(16)),
+                limit: 16,
+                postgres_store: None,
+                redis_store: Some(redis.clone()),
+                writer: None,
+                redis_writer: None,
+                dashboard_query_gate: Arc::new(Semaphore::new(
+                    USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES,
+                )),
+                lifecycle: Arc::new(RwLock::new(())),
+                accepting: Arc::new(AtomicBool::new(true)),
+                shutdown: Arc::new(UsageShutdownState::default()),
+                rejected_after_shutdown: AtomicU64::new(0),
+                cleanup_watermark_micros: AtomicI64::new(0),
+                rejected_by_cleanup_watermark: AtomicU64::new(0),
+                backpressured_persist_records: AtomicU64::new(0),
+                backpressured_redis_records: AtomicU64::new(0),
+                dropped_persist_records: Arc::new(AtomicU64::new(0)),
+                dropped_redis_records: Arc::new(AtomicU64::new(0)),
+            };
+
+            let windows = recorder.dashboard_windows(Some("UTC"), 500).unwrap();
+            let last24h = windows
+                .windows
+                .iter()
+                .find(|window| window.key == "last24h")
+                .unwrap();
+            assert_eq!(last24h.summary.total_requests, round + 1);
+            assert_eq!(last24h.summary.high_cache_requests, round + 1);
+            assert_eq!(
+                last24h.summary.total_input_tokens,
+                (round + 1) as i64 * 1_200
+            );
+        }
+
+        redis.clear_usage_summary().await.unwrap();
     }
 
     #[tokio::test]

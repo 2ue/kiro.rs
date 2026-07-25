@@ -112,6 +112,10 @@ impl EventPayload for MessageMetadataEvent {
 pub struct MeteringEvent {
     #[serde(default)]
     pub usage: f64,
+    #[serde(default)]
+    pub input_tokens: i32,
+    #[serde(default)]
+    pub output_tokens: i32,
 }
 
 impl EventPayload for MeteringEvent {
@@ -273,8 +277,11 @@ mod tests {
 
     #[test]
     fn metering_and_code_events_deserialize_without_extra_requirements() {
-        let metering: MeteringEvent = serde_json::from_str(r#"{"usage":1.25}"#).unwrap();
+        let metering: MeteringEvent =
+            serde_json::from_str(r#"{"usage":1.25,"inputTokens":30,"outputTokens":10}"#).unwrap();
         assert_eq!(metering.usage, 1.25);
+        assert_eq!(metering.input_tokens, 30);
+        assert_eq!(metering.output_tokens, 10);
 
         let code: CodeEvent = serde_json::from_str(r#"{"content":"println!(\"hi\");"}"#).unwrap();
         assert_eq!(code.content, "println!(\"hi\");");

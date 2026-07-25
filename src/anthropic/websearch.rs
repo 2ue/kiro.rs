@@ -115,6 +115,7 @@ pub enum WebSearchOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSearchFailureKind {
+    Scheduler,
     InvalidRequest,
     RateLimit,
     Timeout,
@@ -127,7 +128,7 @@ enum WebSearchFailureKind {
 struct WebSearchFailure {
     kind: WebSearchFailureKind,
     internal_reason: &'static str,
-    attribution: McpCallAttribution,
+    attribution: Box<McpCallAttribution>,
 }
 
 impl WebSearchFailure {
@@ -135,18 +136,22 @@ impl WebSearchFailure {
         Self {
             kind,
             internal_reason,
-            attribution: McpCallAttribution::default(),
+            attribution: Box::default(),
         }
     }
 
     fn with_attribution(mut self, attribution: McpCallAttribution) -> Self {
-        self.attribution = attribution;
+        self.attribution = Box::new(attribution);
         self
     }
 
     fn from_provider_error(error: &anyhow::Error) -> Self {
         let failure = match crate::kiro::provider::KiroProvider::mcp_failure_kind_from_error(error)
         {
+            Some(McpCallFailureKind::Scheduler) => Self::new(
+                WebSearchFailureKind::Scheduler,
+                "websearch_mcp_scheduler_unavailable",
+            ),
             Some(McpCallFailureKind::InvalidRequest) => Self::new(
                 WebSearchFailureKind::InvalidRequest,
                 "websearch_mcp_invalid_request",
@@ -192,6 +197,12 @@ impl WebSearchFailure {
 
     fn into_outcome(self, request_id: &str, error_id: &str) -> WebSearchOutcome {
         let (status, error_type, message, retry_after) = match self.kind {
+            WebSearchFailureKind::Scheduler => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+                Some("1".to_string()),
+            ),
             WebSearchFailureKind::InvalidRequest => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -238,7 +249,7 @@ impl WebSearchFailure {
             ),
             error_type,
             internal_reason: self.internal_reason,
-            attribution: self.attribution,
+            attribution: *self.attribution,
         }
     }
 }
@@ -326,10 +337,7 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     );
 
     // tool_use_id 使用相同格式
-    let tool_use_id = format!(
-        "srvtoolu_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..32].to_string()
-    );
+    let tool_use_id = format!("srvtoolu_{}", Uuid::new_v4().simple());
 
     let request = McpRequest {
         id: request_id,
@@ -769,6 +777,7 @@ pub async fn handle_websearch_request(
         &mcp_request,
         inference_attempt_budget,
         attribution_sink,
+        request_id,
     )
     .await
     {
@@ -828,6 +837,7 @@ async fn call_mcp_api(
     request: &McpRequest,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     attribution_sink: Arc<McpCallAttributionSink>,
+    request_id: &str,
 ) -> Result<(WebSearchResults, McpCallAttribution), WebSearchFailure> {
     let request_body = serde_json::to_string(request).map_err(|_| {
         WebSearchFailure::new(
@@ -836,7 +846,12 @@ async fn call_mcp_api(
         )
     })?;
     let response = provider
-        .call_mcp_with_attribution_sink(&request_body, inference_attempt_budget, attribution_sink)
+        .call_mcp_with_attribution_sink(
+            &request_body,
+            inference_attempt_budget,
+            attribution_sink,
+            Some(request_id),
+        )
         .await
         .map_err(|error| WebSearchFailure::from_provider_error(&error))?;
     let (response, completion) = response.into_parts();
@@ -898,6 +913,7 @@ async fn call_mcp_api(
         }
         Err(failure) => {
             let completion_kind = match failure.kind {
+                WebSearchFailureKind::Scheduler => McpCallFailureKind::Scheduler,
                 WebSearchFailureKind::InvalidRequest => McpCallFailureKind::InvalidRequest,
                 WebSearchFailureKind::RateLimit => McpCallFailureKind::RateLimit,
                 WebSearchFailureKind::Timeout => McpCallFailureKind::Timeout,
@@ -1254,6 +1270,11 @@ mod tests {
     fn auxiliary_focus_provider_typed_failures_ignore_misleading_error_text_for_five_rounds() {
         let cases = [
             (
+                McpCallFailureKind::Scheduler,
+                "private-response contains scheduler internals",
+                WebSearchFailureKind::Scheduler,
+            ),
+            (
                 McpCallFailureKind::InvalidRequest,
                 "private-response falsely says 429 timeout",
                 WebSearchFailureKind::InvalidRequest,
@@ -1318,6 +1339,10 @@ mod tests {
     #[tokio::test]
     async fn public_failures_are_normalized_and_redacted_for_five_rounds() {
         let cases = [
+            (
+                WebSearchFailureKind::Scheduler,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
             (
                 WebSearchFailureKind::InvalidRequest,
                 StatusCode::BAD_REQUEST,

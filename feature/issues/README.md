@@ -62,6 +62,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [生产证据 skill 校验与脱敏](evidence-skill-validation-and-redaction.md)
 - [协议能力回归矩阵](protocol-capability-regression-matrix.md)
 - [WebSearch/MCP 协议、错误、usage、attempt 与隐私边界](websearch-mcp-protocol-usage-and-privacy.md)
+- [企业/API-key 200 EventStream EOF 被误判 api_error](enterprise-eventstream-usage-only-tool-eof.md)
 - [运行时栈溢出与 handler future 大小](runtime-stack-overflow-and-handler-future-size.md)
 - [上游错误诊断隐私与响应体边界](upstream-error-diagnostic-privacy-and-bounds.md)
 - [运行时饥饿下的上游 HTTP deadline](upstream-http-deadline-runtime-starvation.md)

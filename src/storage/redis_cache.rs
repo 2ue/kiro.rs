@@ -13,16 +13,13 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use crate::anthropic::usage::{
-    REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageDashboardSeries, UsageDashboardTop,
-    UsageDashboardWindowSpec, UsageExternalPoolBillingSummary, UsageRealtimeStats, UsageRecord,
-    UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRouteKind, UsageSeriesPoint,
-    UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
-    usage_dashboard_hourly_windows, usage_dashboard_timezone,
-};
-#[cfg(test)]
-use crate::anthropic::usage::{
-    UsageBreakdownItem, UsageDashboardResponse, UsageDashboardSummary, UsageDashboardWindow,
-    UsageExternalPoolBillingByPool, usage_dashboard_windows,
+    REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem, UsageDashboardResponse,
+    UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow,
+    UsageDashboardWindowSpec, UsageExternalPoolBillingByPool, UsageExternalPoolBillingSummary,
+    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
+    UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
+    usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
+    usage_dashboard_windows,
 };
 use crate::model::config::{
     Config, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
@@ -427,7 +424,6 @@ pub struct LocalPoolCircuitState {
     pub distinct_credentials: u32,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 struct RedisExternalPoolIndexItem {
     id: String,
@@ -453,7 +449,6 @@ impl DashboardBucketCache {
         }))
     }
 
-    #[cfg(test)]
     fn high_cache_requests(
         &self,
         spec: &UsageDashboardWindowSpec,
@@ -514,7 +509,6 @@ const USAGE_DASHBOARD_TOP_CREDENTIALS_KEY: &str = "usage:dashboard:top:credentia
 const USAGE_DASHBOARD_TOP_ENDPOINTS_KEY: &str = "usage:dashboard:top:endpoints";
 const USAGE_DASHBOARD_TOP_ERRORS_KEY: &str = "usage:dashboard:top:errors";
 const USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY: &str = "usage:dashboard:top:external_pools";
-#[cfg(test)]
 const USAGE_DASHBOARD_EXTERNAL_POOL_LIMIT: isize = 19;
 const USAGE_RECORDS_INDEX_KEY: &str = "usage:records:index";
 const USAGE_RECORDS_TTL_SECS: usize = 35 * 24 * 60 * 60;
@@ -1507,7 +1501,6 @@ impl RedisStore {
         self.scheduler_capacity_manager.clone()
     }
 
-    #[cfg(test)]
     async fn dashboard_bucket_cache(
         &self,
         window_specs: &[UsageDashboardWindowSpec],
@@ -1633,7 +1626,6 @@ impl RedisStore {
         self.dashboard_bucket_cache_for_suffixes(suffixes).await
     }
 
-    #[cfg(test)]
     fn dashboard_breakdown_from_cache(
         &self,
         spec: &UsageDashboardWindowSpec,
@@ -1661,7 +1653,6 @@ impl RedisStore {
         items
     }
 
-    #[cfg(test)]
     fn dashboard_external_pool_billing_by_pool_from_cache(
         &self,
         spec: &UsageDashboardWindowSpec,
@@ -2785,7 +2776,6 @@ impl RedisStore {
         Ok(Some(high_cache_requests))
     }
 
-    #[cfg(test)]
     pub async fn usage_dashboard(
         &self,
         timezone: Option<&str>,
@@ -2870,6 +2860,44 @@ impl RedisStore {
             },
             top,
         }))
+    }
+
+    pub async fn usage_dashboard_windows_only(
+        &self,
+        timezone: Option<&str>,
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<Option<(String, String, Vec<UsageDashboardWindow>)>> {
+        self.ensure_observability_usage_store("read usage dashboard windows")?;
+        let Some(totals) = self.usage_totals_if_valid().await? else {
+            return Ok(None);
+        };
+        let lifetime_requests = usage_usize(&totals, "total_requests");
+
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_specs = usage_dashboard_windows(now, offset);
+        let external_pool_index = self.dashboard_external_pool_index().await?;
+        let bucket_cache = self
+            .dashboard_bucket_cache(&window_specs, &[], &[], &external_pool_index)
+            .await?;
+        let mut windows = Vec::with_capacity(window_specs.len());
+        for spec in &window_specs {
+            windows.push(self.dashboard_window_from_cache(
+                spec,
+                high_cache_threshold,
+                &external_pool_index,
+                &bucket_cache,
+            ));
+        }
+
+        let has_window_data = windows
+            .iter()
+            .any(|window| window.summary.total_requests > 0);
+        if lifetime_requests > 0 && !has_window_data {
+            return Ok(None);
+        }
+
+        Ok(Some((now.to_rfc3339(), timezone, windows)))
     }
 
     pub async fn usage_dashboard_series_only(
@@ -3053,7 +3081,6 @@ impl RedisStore {
         Ok(items)
     }
 
-    #[cfg(test)]
     fn dashboard_window_from_cache(
         &self,
         spec: &UsageDashboardWindowSpec,
@@ -3093,7 +3120,6 @@ impl RedisStore {
         }
     }
 
-    #[cfg(test)]
     async fn dashboard_external_pool_index(
         &self,
     ) -> anyhow::Result<Vec<RedisExternalPoolIndexItem>> {
@@ -6388,7 +6414,6 @@ fn append_usage_top_aggregate(
     }
 }
 
-#[cfg(test)]
 fn dashboard_summary_from_values(
     values: &HashMap<String, String>,
     high_cache_requests: usize,
@@ -6472,7 +6497,6 @@ fn sum_usage_hash_refs<'a>(
     totals
 }
 
-#[cfg(test)]
 fn collect_dashboard_window_bucket_keys(
     suffixes: &mut Vec<String>,
     seen: &mut HashSet<String>,
@@ -6538,7 +6562,6 @@ fn usage_hash_field_is_float(key: &str) -> bool {
     key.ends_with("_usd") || key == "kiro_metering_usage"
 }
 
-#[cfg(test)]
 fn usage_ratio(part: usize, total: usize) -> f64 {
     if total == 0 {
         0.0
@@ -6547,7 +6570,6 @@ fn usage_ratio(part: usize, total: usize) -> f64 {
     }
 }
 
-#[cfg(test)]
 fn token_ratio(part: i64, total: i64) -> f64 {
     if total <= 0 {
         0.0
@@ -6565,7 +6587,6 @@ fn non_empty_or_unknown(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
 const USAGE_STATUS_VALUES: [&str; 5] = [
     "success",
     "error",
@@ -6574,7 +6595,6 @@ const USAGE_STATUS_VALUES: [&str; 5] = [
     "client_dropped",
 ];
 
-#[cfg(test)]
 const USAGE_SOURCE_VALUES: [&str; 5] = [
     "upstream_metadata",
     "local_prompt_cache",
@@ -6603,7 +6623,6 @@ fn usage_source_value(source: UsageSource) -> &'static str {
     }
 }
 
-#[cfg(test)]
 fn usage_status_label(value: &str) -> String {
     match value {
         "success" => "成功",
@@ -6616,7 +6635,6 @@ fn usage_status_label(value: &str) -> String {
     .to_string()
 }
 
-#[cfg(test)]
 fn usage_source_label(value: &str) -> String {
     match value {
         "upstream_metadata" => "上游 metadata",
@@ -7965,12 +7983,29 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let (_, _, windows_only) = store
+            .usage_dashboard_windows_only(Some("UTC"), 500)
+            .await
+            .unwrap()
+            .unwrap();
         let last24h = dashboard
             .windows
             .iter()
             .find(|window| window.key == "last24h")
             .unwrap();
+        let last24h_windows_only = windows_only
+            .iter()
+            .find(|window| window.key == "last24h")
+            .unwrap();
         assert_eq!(last24h.summary.total_requests, 3);
+        assert_eq!(last24h_windows_only.summary.total_requests, 3);
+        assert_eq!(
+            last24h_windows_only
+                .summary
+                .external_pool_billing_by_pool
+                .len(),
+            1
+        );
         assert_eq!(last24h.summary.success_requests, 2);
         assert_eq!(last24h.summary.error_requests, 1);
         assert_eq!(last24h.summary.high_cache_requests, 1);

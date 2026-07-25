@@ -1367,6 +1367,8 @@ pub struct StreamContext {
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具输入 JSON 片段累计，用于 stop 时生成稳定去重签名。
     tool_input_buffers: HashMap<String, String>,
+    /// 工具输入缓冲对应的上游工具名，用于 EOF 容错 flush。
+    tool_input_names: HashMap<String, String>,
     /// 从文本泄漏中恢复出的工具调用，延迟到流末尾发出，以便和后续结构化 toolUseEvent 去重。
     pending_leaked_tools: Vec<(String, String, String)>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1595,6 +1597,7 @@ impl StreamContext {
             thinking_token_estimate: StreamTokenEstimate::default(),
             tool_block_indices: HashMap::new(),
             tool_input_buffers: HashMap::new(),
+            tool_input_names: HashMap::new(),
             pending_leaked_tools: Vec::new(),
             tool_name_map,
             tool_schema_key_map,
@@ -1688,10 +1691,18 @@ impl StreamContext {
         if self.has_stream_error() || self.saw_upstream_completed {
             return None;
         }
-        if !self.has_meaningful_upstream_response() {
+        if !self.has_meaningful_upstream_response()
+            && !self.has_trusted_upstream_completion_signal()
+        {
             return Some(
                 "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
             );
+        }
+        if !self.tool_input_buffers.is_empty() {
+            if self.has_flushable_incomplete_tool_input_buffers() {
+                return None;
+            }
+            return Some("upstream eventstream ended with incomplete tool input buffer(s)");
         }
         if self.saw_upstream_completed_tool_use {
             return None;
@@ -1710,6 +1721,14 @@ impl StreamContext {
         self.saw_upstream_assistant_content
             || self.saw_upstream_reasoning_content
             || self.saw_upstream_tool_use
+    }
+
+    fn has_flushable_incomplete_tool_input_buffers(&self) -> bool {
+        !self.tool_input_buffers.is_empty()
+            && self.tool_input_buffers.iter().all(|(tool_use_id, input)| {
+                self.tool_block_indices.contains_key(tool_use_id)
+                    && (input.trim().is_empty() || serde_json::from_str::<Value>(input).is_ok())
+            })
     }
 
     pub fn last_upstream_event_type(&self) -> Option<&'static str> {
@@ -2272,7 +2291,27 @@ impl StreamContext {
                 if metering.usage.is_finite() {
                     self.kiro_metering_usage = Some(metering.usage);
                 }
-                tracing::debug!(usage = metering.usage, "收到 meteringEvent");
+                if self
+                    .metadata_usage
+                    .as_ref()
+                    .is_none_or(|usage| !super::cache::metadata_usage_has_signal(usage))
+                    && (metering.input_tokens > 0 || metering.output_tokens > 0)
+                {
+                    let merged_usage = self.metadata_usage.get_or_insert_with(Default::default);
+                    if metering.input_tokens > 0 {
+                        merged_usage.uncached_input_tokens = metering.input_tokens;
+                    }
+                    if metering.output_tokens > 0 {
+                        merged_usage.output_tokens = metering.output_tokens;
+                        self.output_tokens = metering.output_tokens;
+                    }
+                }
+                tracing::debug!(
+                    usage = metering.usage,
+                    input_tokens = metering.input_tokens,
+                    output_tokens = metering.output_tokens,
+                    "收到 meteringEvent"
+                );
                 Vec::new()
             }
             Event::InvalidState(invalid) => {
@@ -3223,6 +3262,8 @@ impl StreamContext {
                 .or_default()
                 .push_str(&tool_use.input);
         }
+        self.tool_input_names
+            .insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
 
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
@@ -3246,8 +3287,8 @@ impl StreamContext {
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)。AskUserQuestion 需要先
         // 累计完整 JSON，避免已经发给 CLI 的增量参数无法修正。
-        if !defer_input_until_stop && !tool_use.input.is_empty() {
-            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+        let input_delta_event = if !defer_input_until_stop && !tool_use.input.is_empty() {
+            self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
                     "type": "content_block_delta",
@@ -3257,10 +3298,13 @@ impl StreamContext {
                         "partial_json": tool_use.input
                     }
                 }),
-            ) {
-                self.output_token_estimate.record(&tool_use.input);
-                events.push(delta_event);
-            }
+            )
+        } else {
+            None
+        };
+        if let Some(delta_event) = input_delta_event {
+            self.output_token_estimate.record(&tool_use.input);
+            events.push(delta_event);
         }
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
@@ -3269,6 +3313,7 @@ impl StreamContext {
                 .tool_input_buffers
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_else(|| tool_use.input.clone());
+            self.tool_input_names.remove(&tool_use.tool_use_id);
             let output_input = if has_schema_key_map {
                 self.tool_schema_key_map
                     .reverse_tool_input_json(&tool_use.name, &full_input)
@@ -3280,8 +3325,8 @@ impl StreamContext {
             } else {
                 output_input
             };
-            if defer_input_until_stop && !output_input.is_empty() {
-                if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            let input_delta_event = if defer_input_until_stop && !output_input.is_empty() {
+                self.state_manager.handle_content_block_delta(
                     block_index,
                     json!({
                         "type": "content_block_delta",
@@ -3291,10 +3336,13 @@ impl StreamContext {
                             "partial_json": output_input
                         }
                     }),
-                ) {
-                    self.output_token_estimate.record(&output_input);
-                    events.push(delta_event);
-                }
+                )
+            } else {
+                None
+            };
+            if let Some(delta_event) = input_delta_event {
+                self.output_token_estimate.record(&output_input);
+                events.push(delta_event);
             }
             let sig = tool_use_signature_from_json_str(&original_name, &output_input);
             self.seen_tool_sigs.insert(sig);
@@ -3303,6 +3351,70 @@ impl StreamContext {
             }
         }
 
+        events
+    }
+
+    fn flush_incomplete_tool_input_buffers(&mut self) -> Vec<SseEvent> {
+        if self.tool_input_buffers.is_empty() {
+            return Vec::new();
+        }
+
+        let pending = std::mem::take(&mut self.tool_input_buffers);
+        let mut events = Vec::new();
+        for (tool_use_id, full_input) in pending {
+            let Some(&block_index) = self.tool_block_indices.get(&tool_use_id) else {
+                self.tool_input_names.remove(&tool_use_id);
+                continue;
+            };
+            let upstream_name = self
+                .tool_input_names
+                .remove(&tool_use_id)
+                .unwrap_or_default();
+            let original_name = self
+                .tool_name_map
+                .get(&upstream_name)
+                .cloned()
+                .unwrap_or_else(|| upstream_name.clone());
+            let has_schema_key_map = self.tool_schema_key_map.has_tool(&upstream_name);
+            let defer_input_until_stop = original_name == "AskUserQuestion" || has_schema_key_map;
+            let output_input = if has_schema_key_map {
+                self.tool_schema_key_map
+                    .reverse_tool_input_json(&upstream_name, &full_input)
+            } else {
+                full_input
+            };
+            let output_input = if original_name == "AskUserQuestion" {
+                repair_tool_use_input_json_for_cli(&original_name, &output_input)
+            } else {
+                output_input
+            };
+
+            let input_delta_event = if defer_input_until_stop && !output_input.is_empty() {
+                self.state_manager.handle_content_block_delta(
+                    block_index,
+                    json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": output_input
+                        }
+                    }),
+                )
+            } else {
+                None
+            };
+            if let Some(delta_event) = input_delta_event {
+                self.output_token_estimate.record(&output_input);
+                events.push(delta_event);
+            }
+
+            let sig = tool_use_signature_from_json_str(&original_name, &output_input);
+            self.seen_tool_sigs.insert(sig);
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+                events.push(stop_event);
+            }
+        }
         events
     }
 
@@ -3329,6 +3441,7 @@ impl StreamContext {
         let mut events = Vec::new();
 
         events.extend(self.flush_pending_trivial_text());
+        events.extend(self.flush_incomplete_tool_input_buffers());
 
         if self.native_reasoning_seen {
             events.extend(self.close_native_reasoning_block());
@@ -3668,17 +3781,44 @@ mod tests {
                 "context usage round {round}"
             );
 
+            let mut context_usage_only =
+                StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            context_usage_only.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 1.25,
+            }));
+            assert_eq!(
+                context_usage_only.upstream_terminal_failure_detail(),
+                None,
+                "context usage only round {round}"
+            );
+
             let mut metering =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
             metering.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
                 "legacy metering complete",
                 None,
             )));
-            metering.process_kiro_event(&Event::Metering(MeteringEvent { usage: 0.01 }));
+            metering.process_kiro_event(&Event::Metering(MeteringEvent {
+                usage: 0.01,
+                ..Default::default()
+            }));
             assert_eq!(
                 metering.upstream_terminal_failure_detail(),
                 None,
                 "metering round {round}"
+            );
+
+            let mut metering_only =
+                StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            metering_only.process_kiro_event(&Event::Metering(MeteringEvent {
+                usage: 0.01,
+                input_tokens: 42,
+                ..Default::default()
+            }));
+            assert_eq!(
+                metering_only.upstream_terminal_failure_detail(),
+                None,
+                "metering only round {round}"
             );
 
             let mut partial_tool =
@@ -3691,8 +3831,23 @@ mod tests {
             }));
             assert_eq!(
                 partial_tool.upstream_terminal_failure_detail(),
-                Some("upstream eventstream ended without a trusted completion signal"),
+                Some("upstream eventstream ended with incomplete tool input buffer(s)"),
                 "partial tool round {round}"
+            );
+
+            let mut flushable_tool =
+                StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            flushable_tool.generate_initial_events();
+            flushable_tool.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "toolu_flushable".to_string(),
+                input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+                stop: false,
+            }));
+            assert_eq!(
+                flushable_tool.upstream_terminal_failure_detail(),
+                None,
+                "flushable tool round {round}"
             );
 
             let mut complete_tool =
@@ -4694,7 +4849,10 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let sse_events = ctx.process_kiro_event(&Event::Metering(MeteringEvent { usage: 1.25 }));
+        let sse_events = ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            usage: 1.25,
+            ..Default::default()
+        }));
         assert!(sse_events.is_empty());
         assert_eq!(ctx.kiro_metering_usage(), Some(1.25));
 

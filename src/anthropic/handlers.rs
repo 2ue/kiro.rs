@@ -97,7 +97,7 @@ use crate::external_pool::{
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
 use crate::kiro::call_trace::{KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink};
-use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
+use crate::kiro::provider::{KiroProvider, KiroStreamCompletion, McpCallAttribution};
 use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteStateKind};
 
 #[path = "handlers/local_body_pipeline.rs"]
@@ -3943,6 +3943,18 @@ fn provider_error_metadata(err: &Error) -> Option<serde_json::Value> {
     .ok()
 }
 
+fn websearch_error_metadata(
+    attribution: &McpCallAttribution,
+    internal_reason: &'static str,
+) -> Option<serde_json::Value> {
+    let selection_failure = attribution.selection_failure.as_ref()?;
+    serde_json::to_value(json!({
+        "selectionFailure": selection_failure,
+        "websearchFailureReason": internal_reason,
+    }))
+    .ok()
+}
+
 fn should_persist_payload_diagnostics(
     status: UsageRecordStatus,
     report: Option<&PayloadGuardReport>,
@@ -5715,6 +5727,7 @@ async fn post_messages_inner(
                 internal_reason,
                 attribution,
             } => {
+                let error_metadata = websearch_error_metadata(&attribution, internal_reason);
                 let usage_context = usage_context.attach_credential(
                     attribution.credential_id,
                     attribution.credential_label,
@@ -5722,11 +5735,9 @@ async fn post_messages_inner(
                     false,
                     attribution.attempts,
                 );
-                usage_context.record_websearch_failure(
-                    response.status(),
-                    error_type,
-                    internal_reason,
-                );
+                usage_context
+                    .with_error_metadata(error_metadata)
+                    .record_websearch_failure(response.status(), error_type, internal_reason);
                 response
             }
         };
@@ -8845,6 +8856,8 @@ async fn handle_non_stream_request(
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut tool_json_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for event in upstream_events {
         match event {
@@ -8875,10 +8888,11 @@ async fn handle_non_stream_request(
                         .as_deref()
                         .is_some_and(|value| !value.is_empty());
                 text_content.push_str(&transcript_sanitizer.structured_tool_boundary());
-                if let Some(redacted) = reasoning.redacted_content {
-                    if !redacted.is_empty() {
-                        redacted_thinking = Some(redacted);
-                    }
+                if let Some(redacted) = reasoning
+                    .redacted_content
+                    .filter(|redacted| !redacted.is_empty())
+                {
+                    redacted_thinking = Some(redacted);
                 }
                 if !reasoning.text.is_empty() {
                     native_thinking_content = reasoning.text;
@@ -8897,6 +8911,7 @@ async fn handle_non_stream_request(
                     .entry(tool_use.tool_use_id.clone())
                     .or_default()
                     .push_str(&tool_use.input);
+                tool_json_names.insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
 
                 // 如果是完整的工具调用，添加到列表
                 if tool_use.stop {
@@ -8904,6 +8919,7 @@ async fn handle_non_stream_request(
                     let buffer = tool_json_buffers
                         .remove(&tool_use.tool_use_id)
                         .unwrap_or_default();
+                    tool_json_names.remove(&tool_use.tool_use_id);
                     let input: serde_json::Value = if buffer.is_empty() {
                         serde_json::json!({})
                     } else {
@@ -9020,7 +9036,25 @@ async fn handle_non_stream_request(
                     kiro_metering_usage = Some(metering.usage);
                     saw_upstream_metering = true;
                 }
-                tracing::debug!(usage = metering.usage, "非流式响应收到 meteringEvent");
+                if metadata_usage
+                    .as_ref()
+                    .is_none_or(|usage| !super::cache::metadata_usage_has_signal(usage))
+                    && (metering.input_tokens > 0 || metering.output_tokens > 0)
+                {
+                    let merged_usage = metadata_usage.get_or_insert_with(Default::default);
+                    if metering.input_tokens > 0 {
+                        merged_usage.uncached_input_tokens = metering.input_tokens;
+                    }
+                    if metering.output_tokens > 0 {
+                        merged_usage.output_tokens = metering.output_tokens;
+                    }
+                }
+                tracing::debug!(
+                    usage = metering.usage,
+                    input_tokens = metering.input_tokens,
+                    output_tokens = metering.output_tokens,
+                    "非流式响应收到 meteringEvent"
+                );
             }
             Event::InvalidState(invalid) => {
                 let message = invalid.error_text();
@@ -9080,32 +9114,87 @@ async fn handle_non_stream_request(
             _ => {}
         }
     }
-    if let Some(status) = upstream_message_status.as_deref() {
-        if !status.eq_ignore_ascii_case("COMPLETED") {
-            let detail = format!(
-                "upstream eventstream ended with incomplete messageStatus={}",
-                status
-            );
-            tracing::warn!(error = %detail, "非流式响应未完成");
-            credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-            completion.release();
-            return envelope::error_response_with_id(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-                &credential_usage.request.request_id,
-            );
+    let missing_explicit_status = upstream_message_status.is_none();
+    if let Some(status) = upstream_message_status
+        .as_deref()
+        .filter(|status| !status.eq_ignore_ascii_case("COMPLETED"))
+    {
+        let detail = format!(
+            "upstream eventstream ended with incomplete messageStatus={}",
+            status
+        );
+        tracing::warn!(error = %detail, "非流式响应未完成");
+        credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+        completion.release();
+        return envelope::error_response_with_id(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            &credential_usage.request.request_id,
+        );
+    }
+    if !tool_json_buffers.is_empty() {
+        for (tool_use_id, buffer) in std::mem::take(&mut tool_json_buffers) {
+            let upstream_name = tool_json_names.remove(&tool_use_id).unwrap_or_default();
+            let original_name = tool_name_map
+                .get(&upstream_name)
+                .cloned()
+                .unwrap_or_else(|| upstream_name.clone());
+            let input: serde_json::Value = if buffer.is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str(&buffer) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            tool_use_id = %tool_use_id,
+                            "非流式 EOF flush 工具输入 JSON 解析失败"
+                        );
+                        credential_usage.record_failure(
+                            UsageRecordStatus::Error,
+                            "api_error",
+                            format!(
+                                "upstream tool input JSON parse error for {}: {}",
+                                tool_use_id, error
+                            ),
+                        );
+                        completion.release();
+                        return envelope::error_response_with_id(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                            &credential_usage.request.request_id,
+                        );
+                    }
+                }
+            };
+            let input = tool_schema_key_map.reverse_tool_input(&upstream_name, input);
+            let input =
+                crate::anthropic::stream::repair_tool_use_input_for_cli(&original_name, input);
+            let sig = crate::anthropic::stream::tool_use_signature(&original_name, &input);
+            if seen_tool_sigs.insert(sig) {
+                tool_uses.push(json!({
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": original_name,
+                    "input": input
+                }));
+                has_tool_use = true;
+                saw_completed_tool_use = true;
+            }
         }
-    } else {
-        let terminal_failure = if !saw_meaningful_upstream_response {
+    }
+    if missing_explicit_status {
+        let has_trusted_upstream_completion_signal =
+            saw_upstream_metadata || saw_upstream_context_usage || saw_upstream_metering;
+        let terminal_failure = if !saw_meaningful_upstream_response
+            && !has_trusted_upstream_completion_signal
+        {
             Some(
                 "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
             )
-        } else if !saw_completed_tool_use
-            && !saw_upstream_metadata
-            && !saw_upstream_context_usage
-            && !saw_upstream_metering
-        {
+        } else if !saw_completed_tool_use && !has_trusted_upstream_completion_signal {
             Some("upstream eventstream ended without a trusted completion signal")
         } else {
             None
@@ -9121,21 +9210,6 @@ async fn handle_non_stream_request(
                 &credential_usage.request.request_id,
             );
         }
-    }
-    if !tool_json_buffers.is_empty() {
-        let detail = format!(
-            "upstream eventstream ended with {} incomplete tool input buffer(s)",
-            tool_json_buffers.len()
-        );
-        tracing::warn!(error = %detail, "非流式工具调用未完成");
-        credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-        completion.release();
-        return envelope::error_response_with_id(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-            &credential_usage.request.request_id,
-        );
     }
     text_content.push_str(&transcript_sanitizer.finish());
 
@@ -9219,11 +9293,16 @@ async fn handle_non_stream_request(
     content.extend(tool_uses);
 
     // 估算输出 tokens
+    let estimated_content_output_tokens = if content.is_empty() {
+        0
+    } else {
+        token::estimate_output_tokens(&content)
+    };
     let output_tokens = metadata_usage
         .as_ref()
         .map(|usage| usage.output_tokens)
         .filter(|tokens| *tokens > 0)
-        .unwrap_or_else(|| token::estimate_output_tokens(&content));
+        .unwrap_or(estimated_content_output_tokens);
     if stop_reason == "end_turn"
         && !has_tool_use
         && super::stream::output_tokens_reached_requested_max_tokens(

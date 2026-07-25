@@ -263,6 +263,7 @@ struct ApiUpstreamBodyReadFailure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpCallFailureKind {
+    Scheduler,
     InvalidRequest,
     RateLimit,
     Timeout,
@@ -278,6 +279,7 @@ pub enum McpCallFailureKind {
 impl McpCallFailureKind {
     fn as_error_type(self) -> &'static str {
         match self {
+            Self::Scheduler => "mcp_scheduler_unavailable",
             Self::InvalidRequest => "mcp_invalid_request",
             Self::RateLimit => "mcp_rate_limit",
             Self::Timeout => "mcp_timeout",
@@ -293,6 +295,7 @@ impl McpCallFailureKind {
 
     fn scheduler_reason(self) -> &'static str {
         match self {
+            Self::Scheduler => "scheduler_unavailable",
             Self::InvalidRequest => "invalid_request",
             Self::RateLimit => "rate_limit",
             Self::Timeout => "body_timeout",
@@ -308,7 +311,8 @@ impl McpCallFailureKind {
 
     fn transient_failure_kind(self) -> Option<TransientFailureKind> {
         match self {
-            Self::InvalidRequest
+            Self::Scheduler
+            | Self::InvalidRequest
             | Self::AttemptLimit
             | Self::AuxiliaryAttemptLimit
             | Self::AuxiliaryConcurrency => None,
@@ -325,6 +329,7 @@ pub struct McpCallAttribution {
     pub credential_id: Option<u64>,
     pub credential_label: Option<String>,
     pub attempts: Vec<KiroCredentialAttempt>,
+    pub selection_failure: Option<SelectionFailureSummary>,
 }
 
 #[derive(Debug)]
@@ -707,6 +712,7 @@ impl McpCallCompletion {
             credential_id: Some(self.credential_id),
             credential_label: Some(self.credential_label.clone()),
             attempts: self.attempts.lock().clone(),
+            selection_failure: None,
         }
     }
 
@@ -6082,13 +6088,29 @@ mod tests {
         .await
         .expect("本地无可用凭据时 MCP 不应跑满 retry 上限")
         .err()
-        .unwrap()
-        .to_string();
+        .unwrap();
 
         assert!(
-            err.contains("所有账号均已禁用"),
+            err.to_string().contains("所有账号均已禁用"),
             "错误应直接来自本地调度失败，实际: {}",
             err
+        );
+        assert_eq!(
+            KiroProvider::mcp_failure_kind_from_error(&err),
+            Some(McpCallFailureKind::Scheduler)
+        );
+        let attribution = KiroProvider::mcp_attribution_from_error(&err);
+        let selection_failure = attribution
+            .selection_failure
+            .expect("MCP acquire failure must carry selectionFailure");
+        assert_eq!(selection_failure.request_id, "mcp");
+        assert_eq!(
+            selection_failure.stage,
+            crate::kiro::call_trace::SelectionFailureStage::AccountEligibility
+        );
+        assert_eq!(
+            selection_failure.primary_reason,
+            crate::kiro::call_trace::AccountRejectReason::Disabled
         );
     }
 
@@ -8730,6 +8752,7 @@ impl KiroProvider {
             request_body,
             inference_attempt_budget,
             Arc::new(McpCallAttributionSink::default()),
+            None,
         )
         .await
     }
@@ -8739,12 +8762,14 @@ impl KiroProvider {
         request_body: &str,
         inference_attempt_budget: Arc<InferenceAttemptBudget>,
         attribution_sink: Arc<McpCallAttributionSink>,
+        request_id: Option<&str>,
     ) -> anyhow::Result<McpCallResponse> {
         match self
             .call_mcp_with_retry(
                 request_body,
                 inference_attempt_budget.as_ref(),
                 attribution_sink.clone(),
+                request_id,
             )
             .await
         {
@@ -8805,6 +8830,23 @@ impl KiroProvider {
                 credential_id,
                 credential_label,
                 attempts,
+                selection_failure: None,
+            },
+        }
+        .into()
+    }
+
+    fn mcp_failure_error_with_selection_failure(
+        kind: McpCallFailureKind,
+        message: impl Into<String>,
+        selection_failure: SelectionFailureSummary,
+    ) -> anyhow::Error {
+        McpCallError {
+            kind,
+            message: message.into(),
+            attribution: McpCallAttribution {
+                selection_failure: Some(selection_failure),
+                ..Default::default()
             },
         }
         .into()
@@ -8825,6 +8867,7 @@ impl KiroProvider {
         request_body: &str,
         inference_attempt_budget: &InferenceAttemptBudget,
         attribution_sink: Arc<McpCallAttributionSink>,
+        request_id: Option<&str>,
     ) -> anyhow::Result<McpCallResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries =
@@ -8865,7 +8908,20 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(e) => {
                     if last_error.is_none() {
-                        last_error = Some(e);
+                        let error_message = e.to_string();
+                        let failure_kind = Self::auxiliary_mcp_failure_kind(&e)
+                            .unwrap_or(McpCallFailureKind::Scheduler);
+                        let selection_failure = self.token_manager.selection_failure_summary(
+                            request_id.unwrap_or("mcp"),
+                            "mcp",
+                            None,
+                            &error_message,
+                        );
+                        return Err(Self::mcp_failure_error_with_selection_failure(
+                            failure_kind,
+                            format!("MCP 获取凭据失败: {error_message}"),
+                            selection_failure,
+                        ));
                     } else {
                         tracing::warn!(
                             error = %e,

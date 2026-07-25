@@ -73,6 +73,8 @@ const USAGE_OFFLINE_MAINTENANCE_LOCK_ID: i64 = 4_950_531_234_004;
 const USAGE_RECORD_COMMIT_LOCK_DOMAIN: i64 = 0x0055_5341_4745_4944;
 const USAGE_INDEX_STARTUP_MAX_BYTES: i64 = 64 * 1024 * 1024;
 const USAGE_SOFT_DELETE_WATERMARK_SCOPE: &str = "soft_delete_created_at";
+const USAGE_DASHBOARD_STATEMENT_TIMEOUT_MS: u64 = 4_500;
+const USAGE_DASHBOARD_LOCK_TIMEOUT_MS: u64 = 250;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RequiredPostgresColumn {
@@ -203,6 +205,11 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
         table: "usage_records",
         name: "idx_usage_records_created_at",
         sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_rollup_active_created_at",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_rollup_active_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL AND rollup_active",
     },
     UsageIndexDefinition {
         table: "usage_records",
@@ -6098,7 +6105,10 @@ impl PostgresUsageStore {
             "#,
         );
 
-        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = builder.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
         rows.into_iter()
             .map(dashboard_window_from_row)
             .collect::<anyhow::Result<Vec<_>>>()
@@ -6203,7 +6213,10 @@ impl PostgresUsageStore {
             "#,
         );
 
-        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = builder.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
         let mut grouped: HashMap<String, Vec<UsageBreakdownItem>> = HashMap::new();
         for row in rows {
             let window_key: String = row.try_get("window_key")?;
@@ -6261,7 +6274,10 @@ impl PostgresUsageStore {
             ORDER BY w.ord
             "#,
         );
-        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = builder.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
         rows.into_iter()
             .map(series_point_from_row)
             .collect::<anyhow::Result<Vec<_>>>()
@@ -6324,7 +6340,10 @@ impl PostgresUsageStore {
             "#,
         );
 
-        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = builder.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
         let mut grouped: HashMap<String, Vec<UsageExternalPoolBillingByPool>> = HashMap::new();
         for row in rows {
             let window_key: String = row.try_get("window_key")?;
@@ -6390,7 +6409,10 @@ impl PostgresUsageStore {
             " ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC LIMIT 10",
         );
 
-        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = builder.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
         rows.into_iter()
             .map(usage_top_aggregate_from_row)
             .collect::<anyhow::Result<Vec<_>>>()
@@ -6708,6 +6730,27 @@ async fn configure_usage_cleanup_transaction(
     sqlx::query("SET LOCAL statement_timeout = '2s'")
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+async fn configure_usage_dashboard_read_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<()> {
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = '{}ms'",
+        USAGE_DASHBOARD_STATEMENT_TIMEOUT_MS
+    ))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(&format!(
+        "SET LOCAL lock_timeout = '{}ms'",
+        USAGE_DASHBOARD_LOCK_TIMEOUT_MS
+    ))
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -12226,6 +12269,40 @@ mod tests {
         assert_eq!(windows[0].summary.total_requests, 100);
         assert_eq!(windows[0].summary.p95_duration_ms, 1_000);
 
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_dashboard_read_transaction_is_bounded_and_read_only() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+
+        let mut tx = store.pool().begin().await.unwrap();
+        configure_usage_dashboard_read_transaction(&mut tx)
+            .await
+            .unwrap();
+
+        let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+        assert_eq!(statement_timeout, "4500ms");
+        assert_eq!(lock_timeout, "250ms");
+        assert_eq!(read_only, "on");
+
+        tx.commit().await.unwrap();
         store.drop_test_schema().await.unwrap();
     }
 
