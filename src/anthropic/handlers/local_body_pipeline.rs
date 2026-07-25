@@ -185,20 +185,7 @@ pub(super) fn prepare_with_plan(
     } else {
         0
     };
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false)
-        || payload.output_config.is_some()
-        || kiro_request
-            .additional_model_request_fields
-            .as_ref()
-            .is_some_and(|fields| {
-                fields.output_config.is_some()
-                    || fields.reasoning.is_some()
-                    || fields.thinking.is_some()
-            });
+    let thinking_enabled = should_expose_downstream_thinking(payload, &kiro_request);
     let warnings_header = if should_expose_proxy_warnings(runtime_config) {
         merge_warning_headers(
             conversion_result.warnings.encode_header(),
@@ -237,4 +224,124 @@ pub(super) fn prepare_with_plan(
         too_long_retry,
         cache_point_retry,
     })
+}
+
+fn should_expose_downstream_thinking(
+    payload: &MessagesRequest,
+    kiro_request: &KiroRequest,
+) -> bool {
+    if payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "disabled")
+    {
+        return false;
+    }
+    payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false)
+        || payload.output_config.is_some()
+        || kiro_request
+            .additional_model_request_fields
+            .as_ref()
+            .is_some_and(|fields| {
+                fields.output_config.is_some()
+                    || fields.reasoning.is_some()
+                    || fields.thinking.is_some()
+            })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+    use crate::kiro::model::requests::{
+        conversation::{ConversationState, CurrentMessage, UserInputMessage},
+        kiro::{AdditionalModelRequestFields, KiroOutputConfig, KiroThinkingConfig},
+    };
+
+    fn messages_request(
+        thinking_type: Option<&str>,
+        output_effort: Option<&str>,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 64_000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: thinking_type.map(|thinking_type| Thinking {
+                thinking_type: thinking_type.to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: output_effort.map(|effort| OutputConfig {
+                effort: Some(effort.to_string()),
+            }),
+            metadata: None,
+        }
+    }
+
+    fn kiro_request_with_native_output_config() -> KiroRequest {
+        KiroRequest {
+            conversation_state: ConversationState::new("conv").with_current_message(
+                CurrentMessage::new(UserInputMessage::new("hello", "claude-opus-4.8")),
+            ),
+            profile_arn: None,
+            additional_model_request_fields: Some(AdditionalModelRequestFields {
+                thinking: Some(KiroThinkingConfig {
+                    thinking_type: "adaptive".to_string(),
+                    display: None,
+                }),
+                output_config: Some(KiroOutputConfig {
+                    effort: "max".to_string(),
+                }),
+                reasoning: None,
+            }),
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
+        }
+    }
+
+    #[test]
+    fn disabled_thinking_suppresses_downstream_thinking_even_with_native_effort_for_five_rounds() {
+        let kiro_request = kiro_request_with_native_output_config();
+        for round in 0..5 {
+            assert!(
+                !should_expose_downstream_thinking(
+                    &messages_request(Some("disabled"), Some("max")),
+                    &kiro_request,
+                ),
+                "round {round}: client disabled thinking must control downstream visibility"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_or_omitted_thinking_with_output_effort_exposes_downstream_thinking_for_five_rounds()
+    {
+        let kiro_request = kiro_request_with_native_output_config();
+        for round in 0..5 {
+            assert!(
+                should_expose_downstream_thinking(
+                    &messages_request(Some("adaptive"), Some("max")),
+                    &kiro_request,
+                ),
+                "round {round}: adaptive thinking remains visible"
+            );
+            assert!(
+                should_expose_downstream_thinking(
+                    &messages_request(None, Some("max")),
+                    &kiro_request
+                ),
+                "round {round}: omitted thinking with explicit effort keeps prior output_config behavior"
+            );
+        }
+    }
 }

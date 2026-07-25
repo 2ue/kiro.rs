@@ -3228,6 +3228,59 @@ mod tests {
     }
 
     #[test]
+    fn disabled_thinking_keeps_explicit_output_effort_without_forcing_adaptive_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 64_000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "disabled".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: Some("max".to_string()),
+            }),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::OutputConfig,
+                    efforts: ["high", "max"].map(str::to_string).to_vec(),
+                    default_effort: Some("high".to_string()),
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for round in 0..5 {
+            let fields = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                .additional_model_request_fields
+                .expect("explicit output_config.effort should remain native");
+            assert_eq!(
+                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::json!({
+                    "output_config": {"effort": "max"}
+                }),
+                "round {round}: disabled thinking must not be rewritten to adaptive"
+            );
+        }
+    }
+
+    #[test]
     fn enabled_thinking_budget_remains_authoritative_over_omitted_output_effort_five_rounds() {
         use super::super::model_capabilities::{
             KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
@@ -3275,6 +3328,60 @@ mod tests {
                     "output_config": {"effort": "high"}
                 }),
                 "round {round}: enabled budget mapping must win over the max schema default"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_thinking_accepts_explicit_output_effort_for_native_output_config_five_rounds() {
+        use super::super::model_capabilities::{
+            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+        };
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4.5".to_string(),
+            max_tokens: 64_000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 32_000,
+            }),
+            output_config: Some(OutputConfig {
+                effort: Some("max".to_string()),
+            }),
+            metadata: None,
+        };
+        let options = ConverterOptions {
+            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
+                KiroReasoningFieldCapability {
+                    path: KiroReasoningFieldPath::OutputConfig,
+                    efforts: ["high", "max"].map(str::to_string).to_vec(),
+                    default_effort: Some("high".to_string()),
+                },
+            ),
+            ..ConverterOptions::default()
+        };
+
+        for round in 0..5 {
+            let fields = convert_request_with_options(&req, options.clone())
+                .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                .additional_model_request_fields
+                .expect("native reasoning fields");
+            assert_eq!(
+                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::json!({
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": "max"}
+                }),
+                "round {round}: explicit effort remains authoritative when budget is also valid"
             );
         }
     }

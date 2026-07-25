@@ -229,7 +229,6 @@ pub(crate) fn validate_raw_reasoning_protocol_with_probe(
         }
     }
 
-    let mut output_effort_explicit = false;
     match output_config.as_ref() {
         None | Some(serde_json::Value::Null) => {}
         Some(serde_json::Value::Object(object)) => {
@@ -241,21 +240,20 @@ pub(crate) fn validate_raw_reasoning_protocol_with_probe(
                         .ok_or_else(|| "output_config.effort must be a string".to_string())
                 })
                 .transpose()?;
-            if let Some(effort) = effort {
-                output_effort_explicit = true;
-                if crate::anthropic::types::parse_thinking_effort(effort).is_none() {
-                    return Err(format!(
-                        "output_config.effort must be one of: {}",
-                        crate::anthropic::types::THINKING_EFFORT_VALUES.join(", ")
-                    ));
-                }
+            if effort.is_some_and(|effort| {
+                crate::anthropic::types::parse_thinking_effort(effort).is_none()
+            }) {
+                return Err(format!(
+                    "output_config.effort must be one of: {}",
+                    crate::anthropic::types::THINKING_EFFORT_VALUES.join(", ")
+                ));
             }
         }
         Some(_) => return Err("output_config must be an object".to_string()),
     }
 
-    let thinking_type = match thinking.as_ref() {
-        None | Some(serde_json::Value::Null) => None,
+    match thinking.as_ref() {
+        None | Some(serde_json::Value::Null) => {}
         Some(serde_json::Value::Object(object)) => {
             let thinking_type = object
                 .get("type")
@@ -298,17 +296,10 @@ pub(crate) fn validate_raw_reasoning_protocol_with_probe(
                 }
                 _ => {}
             }
-            Some(thinking_type)
         }
         Some(_) => return Err("thinking must be an object".to_string()),
     };
 
-    if output_effort_explicit && matches!(thinking_type, Some("enabled") | Some("disabled")) {
-        return Err(
-            "output_config is only compatible with adaptive thinking or an omitted thinking field"
-                .to_string(),
-        );
-    }
     Ok(())
 }
 
@@ -1119,6 +1110,9 @@ mod tests {
             br#"{"model":"m","max_tokens":128000,"thinking":{"type":"enabled","budget_tokens":65536},"messages":[]}"#.as_slice(),
             br#"{"model":"m","thinking":{"type":"disabled"},"messages":[]}"#.as_slice(),
             br#"{"model":"m","thinking":{"type":"disabled"},"output_config":{},"messages":[]}"#.as_slice(),
+            br#"{"model":"m","thinking":{"type":"disabled"},"output_config":{"effort":"high"},"messages":[]}"#.as_slice(),
+            br#"{"model":"m","thinking":{"type":"disabled"},"output_config":{"effort":"max"},"messages":[]}"#.as_slice(),
+            br#"{"model":"m","max_tokens":8192,"thinking":{"type":"enabled","budget_tokens":4096},"output_config":{"effort":"high"},"messages":[]}"#.as_slice(),
             br#"{"model":"m","max_tokens":8192,"thinking":{"type":"enabled","budget_tokens":4096},"output_config":{},"messages":[]}"#.as_slice(),
             br#"{"model":"m","output_config":{"effort":"xhigh"},"messages":[]}"#.as_slice(),
             br#" { "model":"m", "output_config":{}, "messages":[] } "#.as_slice(),
@@ -1143,8 +1137,6 @@ mod tests {
             br#"{"thinking":{"type":"enabled","budget_tokens":1023}}"#.as_slice(),
             br#"{"thinking":{"type":"enabled"}}"#.as_slice(),
             br#"{"max_tokens":4096,"thinking":{"type":"enabled","budget_tokens":4096}}"#.as_slice(),
-            br#"{"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}"#.as_slice(),
-            br#"{"thinking":{"type":"enabled","budget_tokens":4096},"output_config":{"effort":"high"}}"#.as_slice(),
             br#"{"output_config":{"effort":"MAX"}}"#.as_slice(),
             br#"{"output_config":{"effort":" max "}}"#.as_slice(),
             br#"{"output_config":{"effort":"unknown"}}"#.as_slice(),
@@ -1156,7 +1148,8 @@ mod tests {
             br#"{"stream":false,"stream":true}"#.as_slice(),
             br#"{"max_tokens":4096,"max_tokens":8192}"#.as_slice(),
             br#"{"thinking":{"type":"adaptive","type":"disabled"}}"#.as_slice(),
-            br#"{"thinking":{"type":"enabled","budget_tokens":2048,"budget_tokens":4096}}"#.as_slice(),
+            br#"{"thinking":{"type":"enabled","budget_tokens":2048,"budget_tokens":4096}}"#
+                .as_slice(),
             br#"{"output_config":{"effort":"high","effort":"max"}}"#.as_slice(),
         ];
 

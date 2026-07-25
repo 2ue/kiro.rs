@@ -445,18 +445,6 @@ fn validate_typed_reasoning_protocol(payload: &MessagesRequest) -> Result<(), En
             ));
         }
     }
-    if payload
-        .output_config
-        .as_ref()
-        .and_then(|config| config.effort.as_ref())
-        .is_some()
-        && matches!(thinking.thinking_type.as_str(), "enabled" | "disabled")
-    {
-        return Err(EntryRequestError::invalid(
-            "output_config is only compatible with adaptive thinking or an omitted thinking field",
-            "ambiguous_thinking_controls",
-        ));
-    }
     Ok(())
 }
 
@@ -776,6 +764,12 @@ mod tests {
         let disabled = Bytes::from_static(
             br#"{"model":"claude-opus-4.8","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"output_config":{}}"#,
         );
+        let disabled_with_effort = Bytes::from_static(
+            br#"{"model":"claude-opus-4.8","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"output_config":{"effort":"max"}}"#,
+        );
+        let enabled_with_effort = Bytes::from_static(
+            br#"{"model":"claude-opus-4.5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":2048},"output_config":{"effort":"high"}}"#,
+        );
 
         for round in 0..5 {
             let parsed = parse_messages_payload(&enabled, "req_enabled_omitted")
@@ -815,6 +809,44 @@ mod tests {
                 None,
                 "round {round}"
             );
+
+            let parsed = parse_messages_payload(&disabled_with_effort, "req_disabled_effort")
+                .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+            assert_eq!(
+                parsed
+                    .thinking
+                    .as_ref()
+                    .map(|thinking| thinking.thinking_type.as_str()),
+                Some("disabled"),
+                "round {round}"
+            );
+            assert_eq!(
+                parsed
+                    .output_config
+                    .as_ref()
+                    .and_then(|config| config.effort.as_deref()),
+                Some("max"),
+                "round {round}: Claude CLI disabled thinking must not discard explicit effort"
+            );
+
+            let parsed = parse_messages_payload(&enabled_with_effort, "req_enabled_effort")
+                .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+            assert_eq!(
+                parsed
+                    .thinking
+                    .as_ref()
+                    .map(|thinking| thinking.thinking_type.as_str()),
+                Some("enabled"),
+                "round {round}"
+            );
+            assert_eq!(
+                parsed
+                    .output_config
+                    .as_ref()
+                    .and_then(|config| config.effort.as_deref()),
+                Some("high"),
+                "round {round}: valid budget plus explicit effort is a protocol-level supported form"
+            );
         }
     }
 
@@ -825,7 +857,6 @@ mod tests {
             br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":1023}}"#.as_slice(),
             br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled"}}"#.as_slice(),
             br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":4096}}"#.as_slice(),
-            br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"disabled"},"output_config":{"effort":"high"}}"#.as_slice(),
             br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":4096},"output_config":{"effort":"low"}}"#.as_slice(),
             br#"{"model":"m","max_tokens":4096,"messages":[],"output_config":{"effort":"MAX"}}"#.as_slice(),
             br#"{"model":"m","max_tokens":4096,"messages":[],"output_config":{"effort":"unknown"}}"#.as_slice(),

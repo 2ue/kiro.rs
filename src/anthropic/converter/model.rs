@@ -135,13 +135,22 @@ fn legacy_native_reasoning_capability(model_id: &str) -> Option<KiroReasoningFie
     })
 }
 
-pub(super) fn requested_native_reasoning(req: &MessagesRequest) -> bool {
-    if req
-        .thinking
+fn has_explicit_output_effort(req: &MessagesRequest) -> bool {
+    req.output_config
+        .as_ref()
+        .and_then(|output_config| output_config.effort.as_deref())
+        .is_some()
+}
+
+fn thinking_is_disabled(req: &MessagesRequest) -> bool {
+    req.thinking
         .as_ref()
         .is_some_and(|thinking| thinking.thinking_type == "disabled")
-    {
-        return false;
+}
+
+pub(super) fn requested_native_reasoning(req: &MessagesRequest) -> bool {
+    if thinking_is_disabled(req) {
+        return has_explicit_output_effort(req);
     }
     req.thinking.as_ref().is_some_and(|t| t.is_enabled()) || req.output_config.is_some()
 }
@@ -215,11 +224,7 @@ pub(super) fn build_additional_model_request_fields(
     if !enabled {
         return Ok(None);
     }
-    if req
-        .thinking
-        .as_ref()
-        .is_some_and(|t| t.thinking_type == "disabled")
-    {
+    if thinking_is_disabled(req) && !has_explicit_output_effort(req) {
         return Ok(None);
     }
 
@@ -243,7 +248,7 @@ pub(super) fn build_additional_model_request_fields(
     let effort = select_native_reasoning_effort(req, &capability)?;
     Ok(Some(match capability.path {
         KiroReasoningFieldPath::OutputConfig => AdditionalModelRequestFields {
-            thinking: Some(KiroThinkingConfig {
+            thinking: (!thinking_is_disabled(req)).then(|| KiroThinkingConfig {
                 thinking_type: "adaptive".to_string(),
                 display: force_visible_thinking.then(|| "summarized".to_string()),
             }),
@@ -264,11 +269,10 @@ pub(super) fn uses_native_reasoning_fields(
     enabled: bool,
     capability_state: &KiroReasoningCapabilityState,
 ) -> bool {
+    let disabled_without_explicit_effort =
+        thinking_is_disabled(req) && !has_explicit_output_effort(req);
     enabled
-        && !req
-            .thinking
-            .as_ref()
-            .is_some_and(|thinking| thinking.thinking_type == "disabled")
+        && !disabled_without_explicit_effort
         && requested_native_reasoning(req)
         && (capability_state.capability().is_some()
             || (matches!(
