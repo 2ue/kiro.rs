@@ -2,7 +2,7 @@
 
 Role: 本轮问题、复现、修复、验证、残余风险与发布结果的最终汇总入口
 
-Status: `current-candidate-validated / publish-pending`
+Status: `current-candidate-validated / v0.0.118 tag-pushed`
 
 Last updated: 2026-07-26
 
@@ -45,7 +45,7 @@ kiro-rs sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
 
 真实上游成功 smoke 当前不能记为 pass：本地 `9022` 的持久化凭据全部处于 disabled/runtime bad state（TemporarilySuspended/Manual/QuotaExceeded），继续调用会增加账号风险；现网只读证据也显示部分实例账号池已被风控或外部池接管。当前结论只能保证已列明的本地协议转换、body sniff、调度/异常恢复和 fake-upstream 行为；不承诺失效账号在真实上游立即恢复。
 
-当前判定：可进入 Git 发布流程。发布后必须按生产 SQL/usage 指纹复核：
+发布结果：`v0.0.118` 已基于当前仓库提交创建并推送 tag；发布 workflow 由 tag 触发。发布后必须按生产 SQL/usage 指纹复核：
 
 - `websearch_mcp_scheduler_unavailable` 在 normalized external 可用且本地池不可调度时不再新增；
 - `mcp_completion upstream_error` 不再写入主模型凭据卡片最近错误；

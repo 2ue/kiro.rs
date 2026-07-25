@@ -2,7 +2,7 @@
 
 Role: 将问题结论关联到可重复命令、报告、capture、配置快照、构建哈希和 request ID
 
-Status: 整理中
+Status: `v0.0.118 tag pushed / post-release verification pending`
 
 当前上一轮证据位于 `target/validation/deep-audit-20260715/`。该目录被忽略且只作为原始支持材料；最终结论必须在本目录记录测试命令、时间、源码 revision、二进制 SHA-256、隔离端口、配置摘要、轮次、成功/失败数、上游 attempts 和资源采样。
 

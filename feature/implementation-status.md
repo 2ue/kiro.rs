@@ -4,7 +4,7 @@ Date: 2026-07-26
 
 ## Current Phase
 
-`post-v0.0.117 production recurrence hardening validated / release pending`：已完成 114/115/116/117 后继续暴露的生产只读复核、WebSearch normalized fallback、MCP 辅助失败不污染主调度、PostgreSQL usage/dashboard pool 隔离、旧 schema dashboard 修复、thinking/output_config 兼容、thinking signature retry transient 分类、personal/social JSON-labeled EventStream body sniff、外部池 dashed/dotted 计价匹配、真实 Claude Code CLI fake-upstream 协议验证、fake-upstream L3/L4/L5 负载/异常恢复验证、构建产物 inventory 清理。当前工作树尚未发布新版本；下一步是最终非 Cargo gate、提交并发版。
+`v0.0.118 tag pushed / production recurrence hardening delivered`：已完成 114/115/116/117 后继续暴露的生产只读复核、WebSearch normalized fallback、MCP 辅助失败不污染主调度、PostgreSQL usage/dashboard pool 隔离、旧 schema dashboard 修复、thinking/output_config 兼容、thinking signature retry transient 分类、personal/social JSON-labeled EventStream body sniff、外部池 dashed/dotted 计价匹配、真实 Claude Code CLI fake-upstream 协议验证、fake-upstream L3/L4/L5 负载/异常恢复验证、构建产物 inventory 清理，并已推送 `v0.0.118` tag 触发发布 workflow。
 
 ## 2026-07-26 Current candidate validation
 
