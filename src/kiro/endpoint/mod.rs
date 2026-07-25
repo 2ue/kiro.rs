@@ -82,6 +82,48 @@ pub(super) fn serialize_json_with_capacity(
     String::from_utf8(output).ok()
 }
 
+pub(super) fn body_may_need_output_config_thinking_normalization(body: &str) -> bool {
+    let plain_markers = body.contains("\"additionalModelRequestFields\"")
+        && body.contains("\"output_config\"")
+        && body.contains("\"thinking\"");
+    plain_markers
+        || (body.as_bytes().contains(&b'\\')
+            && contains_json_object_key(
+                body,
+                &["additionalModelRequestFields", "output_config", "thinking"],
+            ))
+}
+
+pub(super) fn normalize_output_config_thinking_compatibility_json(
+    json: &mut serde_json::Value,
+) -> bool {
+    let Some(fields) = json
+        .get_mut("additionalModelRequestFields")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    if fields
+        .get("output_config")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        return false;
+    }
+    let incompatible_thinking = match fields.get("thinking") {
+        Some(serde_json::Value::Object(thinking)) => thinking
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|thinking_type| thinking_type != "adaptive"),
+        Some(_) => true,
+        None => false,
+    };
+    if incompatible_thinking {
+        fields.remove("thinking");
+        return true;
+    }
+    false
+}
+
 fn json_string_end(bytes: &[u8], mut index: usize) -> Option<usize> {
     while index < bytes.len() {
         match bytes[index] {

@@ -239,3 +239,19 @@ Claude Code CLI=2.1.197
 2. 已确认 EOF 无 `messageStatus` 但有 `contextUsageEvent`/`meteringEvent` 的 Kiro 成功响应不再被误判为 protocol error。
 3. 本地使用真实 social/IDE 凭据的 stream、non-stream、thinking、CLI、tool、MCP、图片、WebSearch 均没有复现“上游成功但 usage 全错误”的问题。
 4. 如果生产再次出现 `2xx JSON api_protocol_error`，优先看 body fingerprint/top-level keys。若 body 是合法 EventStream，应由本修复解决；若 body 是真实 JSON 错误 envelope，则属于账号 capability/profile/region/订阅/路径组合问题，需要按 body fingerprint 继续分型，不应再盲目换号重试整组账号。
+
+## 2026-07-26 当前候选补证
+
+当前冻结候选：
+
+```text
+kiro-rs sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
+```
+
+补充验证：
+
+- `2xx + application/json + binary EventStream body` 的 stream/non-stream handler sniff 回归仍在 C0/全量测试覆盖中。
+- 真实 Claude Code CLI fake-upstream bare/long-session/thinking-wire 均通过，未出现 `api_protocol_error`、工具历史泄漏或 thinking/output_config 组合错误；见 [candidate-c0-claude-cli-real-protocol-20260726](../evidence/candidate-c0-claude-cli-real-protocol-20260726.md)。
+- fake-upstream L3/L4/L5 通过，说明协议错误/invalid-tool/429/500/client-drop 不会让后续正常请求卡死；见 [candidate-c0-load-chaos-20260726](../evidence/candidate-c0-load-chaos-20260726.md)。
+
+当前真实上游 success smoke 未执行：本地 `9022` 的持久化凭据已全部处于 disabled/runtime bad state（TemporarilySuspended/Manual/QuotaExceeded），继续真实调用会增加账号风险，不应把失败账号当成产品协议回归证据。发布后若生产仍出现 `upstream_status=200 content_type=json reason=api_protocol_error`，必须优先采集脱敏 body fingerprint/top-level keys，区分真实 JSON error envelope 与 JSON-labeled EventStream。

@@ -124,8 +124,32 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
         column_name: "kiro_metering_usage",
     },
     RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "pricing_available",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "duration_ms",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_records",
+        column_name: "data",
+    },
+    RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
         column_name: "total_original_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "upstream_metadata_requests",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "sticky_bound_requests",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "fallback_from_sticky_requests",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
@@ -133,7 +157,35 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
+        column_name: "external_pool_shaped_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
         column_name: "external_pool_uplifted_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "external_pool_reported_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "external_pool_billable_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "external_pool_cost_floor_delta_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "duration_ms_sum",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "duration_ms_count",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "duration_ms_max",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
@@ -141,11 +193,51 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
+        column_name: "upstream_metadata_requests",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "sticky_bound_requests",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "fallback_from_sticky_requests",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
         column_name: "external_pool_raw_cost_usd",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
+        column_name: "external_pool_shaped_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
         column_name: "external_pool_uplifted_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "external_pool_reported_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "external_pool_billable_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "external_pool_cost_floor_delta_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "duration_ms_sum",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "duration_ms_count",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "duration_ms_max",
     },
     RequiredPostgresColumn {
         table_name: "usage_duration_rollup_time_buckets",
@@ -158,6 +250,14 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "usage_credential_cost_summary",
         column_name: "kiro_metering_usage",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_credential_cost_summary",
+        column_name: "priced_requests",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_credential_cost_summary",
+        column_name: "unpriced_requests",
     },
     RequiredPostgresColumn {
         table_name: "model_capabilities_sync_status",
@@ -564,6 +664,25 @@ impl PostgresStore {
         Ok(store)
     }
 
+    pub async fn connect_usage(config: &Config) -> anyhow::Result<Self> {
+        let url = config
+            .postgres
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
+        let pool = PgPoolOptions::new()
+            .max_connections(config.postgres.usage_max_connections.max(1))
+            .connect(url)
+            .await?;
+        let store = Self {
+            pool,
+            #[cfg(test)]
+            test_schema: None,
+        };
+        store.verify_required_schema_compatibility(false).await?;
+        Ok(store)
+    }
+
     #[cfg(test)]
     pub async fn connect_test(config: &Config) -> anyhow::Result<Self> {
         let url = config
@@ -580,7 +699,7 @@ impl PostgresStore {
 
         let schema_for_connect = schema.clone();
         let pool = PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(config.postgres.max_connections.max(1))
             .after_connect(move |conn, _meta| {
                 let schema = schema_for_connect.clone();
                 Box::pin(async move {
@@ -619,6 +738,43 @@ impl PostgresStore {
         let schema_for_connect = schema.clone();
         let pool = PgPoolOptions::new()
             .max_connections(config.postgres.max_connections.max(1))
+            .after_connect(move |conn, _meta| {
+                let schema = schema_for_connect.clone();
+                Box::pin(async move {
+                    sqlx::query(&format!(r#"SET search_path TO "{}""#, schema))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await?;
+        Ok(Self {
+            pool,
+            test_schema: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_usage_test_peer(
+        config: &Config,
+        owner: &PostgresStore,
+    ) -> anyhow::Result<Self> {
+        let url = config
+            .postgres
+            .url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
+        let schema = owner
+            .test_schema
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("PostgreSQL usage test peer requires a test schema owner")
+            })?
+            .clone();
+        let schema_for_connect = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(config.postgres.usage_max_connections.max(1))
             .after_connect(move |conn, _meta| {
                 let schema = schema_for_connect.clone();
                 Box::pin(async move {
@@ -6757,27 +6913,49 @@ async fn configure_usage_dashboard_read_transaction(
 async fn acquire_usage_writer_commit_guard(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
+    let lock_id = usage_cleanup_commit_lock_id(tx).await?;
     sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
-        .bind(USAGE_CLEANUP_COMMIT_LOCK_ID)
+        .bind(lock_id)
         .execute(&mut **tx)
         .await?;
     Ok(())
 }
 
-fn usage_record_commit_lock_id(id: &str) -> i64 {
+#[cfg(test)]
+async fn usage_advisory_lock_scope(tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<i64> {
+    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(&mut **tx)
+        .await?;
+    let digest = Sha256::digest(schema.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    Ok(i64::from_be_bytes(bytes))
+}
+
+#[cfg(not(test))]
+async fn usage_advisory_lock_scope(_tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<i64> {
+    Ok(0)
+}
+
+async fn usage_cleanup_commit_lock_id(tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<i64> {
+    Ok(USAGE_CLEANUP_COMMIT_LOCK_ID ^ usage_advisory_lock_scope(tx).await?)
+}
+
+fn usage_record_commit_lock_id(id: &str, scope: i64) -> i64 {
     let digest = Sha256::digest(id.as_bytes());
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    i64::from_be_bytes(bytes) ^ USAGE_RECORD_COMMIT_LOCK_DOMAIN
+    i64::from_be_bytes(bytes) ^ USAGE_RECORD_COMMIT_LOCK_DOMAIN ^ scope
 }
 
 async fn acquire_usage_record_commit_guards(
     tx: &mut Transaction<'_, Postgres>,
     ids: &[String],
 ) -> anyhow::Result<()> {
+    let scope = usage_advisory_lock_scope(tx).await?;
     let mut lock_ids = ids
         .iter()
-        .map(|id| usage_record_commit_lock_id(id))
+        .map(|id| usage_record_commit_lock_id(id, scope))
         .collect::<Vec<_>>();
     lock_ids.sort_unstable();
     lock_ids.dedup();
@@ -6797,8 +6975,9 @@ async fn acquire_usage_record_commit_guards(
 async fn acquire_usage_cleanup_commit_guard(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
+    let lock_id = usage_cleanup_commit_lock_id(tx).await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(USAGE_CLEANUP_COMMIT_LOCK_ID)
+        .bind(lock_id)
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -6807,8 +6986,9 @@ async fn acquire_usage_cleanup_commit_guard(
 async fn try_acquire_usage_cleanup_commit_guard(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<bool> {
+    let lock_id = usage_cleanup_commit_lock_id(tx).await?;
     sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(USAGE_CLEANUP_COMMIT_LOCK_ID)
+        .bind(lock_id)
         .fetch_one(&mut **tx)
         .await
         .map_err(Into::into)
@@ -9610,10 +9790,38 @@ CREATE TABLE IF NOT EXISTS usage_records (
 );
 
 ALTER TABLE usage_records
+    ADD COLUMN IF NOT EXISTS endpoint TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS stream BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS conversation_id TEXT,
+    ADD COLUMN IF NOT EXISTS credential_id BIGINT,
+    ADD COLUMN IF NOT EXISTS credential_label TEXT,
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'unknown',
+    ADD COLUMN IF NOT EXISTS usage_source TEXT NOT NULL DEFAULT 'none',
+    ADD COLUMN IF NOT EXISTS total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS compat_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS billable_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS output_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS pricing_available BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS pricing_model TEXT,
+    ADD COLUMN IF NOT EXISTS duration_ms BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS simulated BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS sticky_bound BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS fallback_from_sticky BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS error_type TEXT,
+    ADD COLUMN IF NOT EXISTS error_message TEXT,
+    ADD COLUMN IF NOT EXISTS error_detail TEXT,
+    ADD COLUMN IF NOT EXISTS data JSONB NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS rollup_active BOOLEAN NOT NULL DEFAULT true,
-    ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS usage_cleanup_watermarks (
     scope TEXT PRIMARY KEY,
@@ -9711,6 +9919,28 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
 );
 
 ALTER TABLE usage_rollup_totals
+    ADD COLUMN IF NOT EXISTS dimension_label TEXT,
+    ADD COLUMN IF NOT EXISTS requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS success_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS stream_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS non_stream_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS priced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS simulated_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_output_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
@@ -9722,7 +9952,11 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_ms_sum BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_ms_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     bucket_start TIMESTAMPTZ NOT NULL,
@@ -9770,6 +10004,28 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
 );
 
 ALTER TABLE usage_rollup_time_buckets
+    ADD COLUMN IF NOT EXISTS dimension_label TEXT,
+    ADD COLUMN IF NOT EXISTS requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS success_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS stream_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS non_stream_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS priced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS simulated_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_output_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
@@ -9781,7 +10037,11 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_ms_sum BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_ms_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS usage_cache_read_totals (
     cache_read_input_tokens INTEGER NOT NULL PRIMARY KEY,
@@ -9817,8 +10077,13 @@ CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
 );
 
 ALTER TABLE usage_credential_cost_summary
+    ADD COLUMN IF NOT EXISTS requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS priced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS model_pricing (
     model TEXT PRIMARY KEY,
@@ -10260,6 +10525,103 @@ mod tests {
         assert!(error.contains("external_upstream_pools.revision"));
         assert!(error.contains("KIRO_RS_POSTGRES_MIGRATE_ON_START=true"));
         assert!(error.contains("startup migration is disabled"));
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_pool_isolated_from_exhausted_main_pool_for_three_rounds() {
+        let Some(mut config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        config.postgres.max_connections = 1;
+        config.postgres.usage_max_connections = 1;
+
+        let main_store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&main_store).await;
+        let usage_store = Arc::new(
+            PostgresStore::connect_usage_test_peer(&config, main_store.as_ref())
+                .await
+                .unwrap(),
+        );
+        let usage = PostgresUsageStore::new(usage_store);
+
+        for round in 0..3 {
+            let holder = main_store.pool().acquire().await.unwrap();
+            let mut record = usage_record(&format!("isolated-usage-pool-{round}"), round);
+            record.conversation_id = Some(format!("usage-pool-isolation-{round}"));
+            let write = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                usage.record_batch(vec![record]),
+            )
+            .await;
+            drop(holder);
+
+            let result = write.unwrap_or_else(|_| {
+                panic!("round {round}: usage write waited on the exhausted main PgSQL pool")
+            });
+            assert!(
+                result.is_ok(),
+                "round {round}: isolated usage PgSQL pool write failed: {result:?}"
+            );
+        }
+
+        main_store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_startup_migration_repairs_usage_dashboard_upgrade_columns() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+
+        for statement in [
+            "ALTER TABLE usage_records DROP COLUMN pricing_available",
+            "ALTER TABLE usage_records DROP COLUMN duration_ms",
+            "ALTER TABLE usage_records DROP COLUMN data",
+            "ALTER TABLE usage_rollup_totals DROP COLUMN sticky_bound_requests",
+            "ALTER TABLE usage_rollup_totals DROP COLUMN external_pool_reported_cost_usd",
+            "ALTER TABLE usage_rollup_totals DROP COLUMN duration_ms_sum",
+            "ALTER TABLE usage_rollup_time_buckets DROP COLUMN sticky_bound_requests",
+            "ALTER TABLE usage_rollup_time_buckets DROP COLUMN external_pool_reported_cost_usd",
+            "ALTER TABLE usage_rollup_time_buckets DROP COLUMN duration_ms_sum",
+            "ALTER TABLE usage_credential_cost_summary DROP COLUMN priced_requests",
+        ] {
+            sqlx::query(statement).execute(store.pool()).await.unwrap();
+        }
+
+        let missing_before = store
+            .verify_required_schema_compatibility(false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing_before.contains("usage_records.pricing_available"));
+        assert!(missing_before.contains("usage_rollup_totals.external_pool_reported_cost_usd"));
+        assert!(missing_before.contains("usage_rollup_time_buckets.duration_ms_sum"));
+
+        store.migrate_with_options(false).await.unwrap();
+        store
+            .verify_required_schema_compatibility(true)
+            .await
+            .unwrap();
+
+        let usage = PostgresUsageStore::new(Arc::new(store.clone()));
+        usage
+            .record_batch(vec![usage_record("dashboard-upgrade-repaired", 750)])
+            .await
+            .unwrap();
+        let dashboard = usage.dashboard(Some("UTC"), 500).await.unwrap();
+        assert!(
+            dashboard
+                .windows
+                .iter()
+                .any(|window| window.summary.total_requests >= 1),
+            "dashboard should load after usage dashboard upgrade-column repair"
+        );
 
         store.drop_test_schema().await.unwrap();
     }
@@ -10826,6 +11188,41 @@ mod tests {
         }
 
         store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_cleanup_advisory_guards_are_test_schema_scoped() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store_a = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        let store_b = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store_a).await;
+        clean(&store_b).await;
+        let usage_b = PostgresUsageStore::new(store_b.clone());
+
+        let mut record = usage_record("schema-scoped-cleanup-row", 123);
+        record.created_at = Utc::now().to_rfc3339();
+        usage_b.record(record).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let cutoff = Utc::now();
+
+        let mut writer_in_other_schema = store_a.pool().begin().await.unwrap();
+        acquire_usage_writer_commit_guard(&mut writer_in_other_schema)
+            .await
+            .unwrap();
+
+        let cleaned = usage_b.soft_delete_cleanup_batch(cutoff, 10).await.unwrap();
+        assert_eq!(
+            cleaned.processed_rows, 1,
+            "a writer guard in another test schema must not trigger cleanup contention"
+        );
+        assert_eq!(cleaned.has_remaining, Some(false));
+
+        writer_in_other_schema.rollback().await.unwrap();
+        store_b.drop_test_schema().await.unwrap();
+        store_a.drop_test_schema().await.unwrap();
     }
 
     async fn assert_postgres_usage_cleanup_authorities_empty(

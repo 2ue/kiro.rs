@@ -64,6 +64,21 @@ pub struct AdditionalModelRequestFields {
     pub reasoning: Option<KiroReasoningConfig>,
 }
 
+impl AdditionalModelRequestFields {
+    pub fn normalize_output_config_thinking_compatibility(&mut self) -> bool {
+        if self.output_config.is_some()
+            && self
+                .thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.thinking_type != "adaptive")
+        {
+            self.thinking = None;
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroThinkingConfig {
     #[serde(rename = "type")]
@@ -87,6 +102,20 @@ fn default_cache_point_plan_recording_enabled() -> bool {
 }
 
 impl KiroRequest {
+    /// Normalize Kiro-native reasoning fields to the upstream wire contract.
+    ///
+    /// Kiro accepts `additionalModelRequestFields.output_config` only when the sibling
+    /// `thinking` field is either omitted or explicitly `{"type":"adaptive"}`. The Anthropic
+    /// ingress protocol may legitimately use `thinking.type=disabled` together with an
+    /// `output_config.effort`; by the time we send Kiro-native fields upstream, the disabled
+    /// client preference has already been applied to downstream visibility, so the safest Kiro
+    /// wire representation is to omit the incompatible sibling `thinking` field.
+    pub fn normalize_output_config_thinking_compatibility(&mut self) -> bool {
+        self.additional_model_request_fields.as_mut().is_some_and(
+            AdditionalModelRequestFields::normalize_output_config_thinking_compatibility,
+        )
+    }
+
     pub fn has_tool_cache_point_plan(&self) -> bool {
         !self.tool_cache_point_insert_after.is_empty()
     }
@@ -158,5 +187,47 @@ mod tests {
                 .is_none()
         );
         assert!(value.get("toolCachePointInsertAfter").is_none());
+    }
+
+    #[test]
+    fn output_config_thinking_compatibility_normalizer_drops_non_adaptive_thinking_for_five_rounds()
+    {
+        for round in 0..5 {
+            let state = ConversationState::new("conv").with_current_message(CurrentMessage::new(
+                UserInputMessage::new("hi", "claude-opus-4.7"),
+            ));
+            let mut request = KiroRequest {
+                conversation_state: state,
+                profile_arn: None,
+                additional_model_request_fields: Some(AdditionalModelRequestFields {
+                    thinking: Some(KiroThinkingConfig {
+                        thinking_type: "disabled".to_string(),
+                        display: None,
+                    }),
+                    output_config: Some(KiroOutputConfig {
+                        effort: "max".to_string(),
+                    }),
+                    reasoning: None,
+                }),
+                tool_cache_point_insert_after: Vec::new(),
+                cache_point_plan_recording_enabled: true,
+            };
+
+            assert!(
+                request.normalize_output_config_thinking_compatibility(),
+                "round {round}"
+            );
+            let value = serde_json::to_value(&request).unwrap();
+            assert!(
+                value["additionalModelRequestFields"]
+                    .get("thinking")
+                    .is_none(),
+                "round {round}"
+            );
+            assert_eq!(
+                value["additionalModelRequestFields"]["output_config"]["effort"], "max",
+                "round {round}"
+            );
+        }
     }
 }

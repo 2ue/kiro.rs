@@ -353,6 +353,24 @@ async fn main() {
         None
     };
 
+    let usage_postgres_store = Arc::new(
+        retry_startup_dependency(
+            "PgSQL usage pool",
+            STARTUP_DEPENDENCY_MAX_WAIT,
+            || PostgresStore::connect_usage(&config),
+            postgres_startup_error_is_retryable,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("连接 usage PgSQL 独立池失败: {:#}", e);
+            std::process::exit(1);
+        }),
+    );
+    tracing::info!(
+        usage_postgres_max_connections = config.postgres.usage_max_connections.max(1),
+        "usage/dashboard PgSQL 已使用独立连接池，避免占用主业务 PgSQL pool"
+    );
+
     let (credentials_list, initial_runtime_states) = postgres_store
         .load_credentials_with_runtime_state()
         .await
@@ -428,7 +446,7 @@ async fn main() {
     let usage_recorder = Arc::new(
         anthropic::usage::UsageRecorder::with_postgres_and_observability_redis(
             config.usage_record_limit,
-            Arc::new(PostgresUsageStore::new(postgres_store.clone())),
+            Arc::new(PostgresUsageStore::new(usage_postgres_store.clone())),
             observability_redis_store.clone(),
         ),
     );

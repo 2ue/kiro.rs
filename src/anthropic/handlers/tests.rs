@@ -9,8 +9,13 @@ use crate::anthropic::router::{
     AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider,
 };
 use crate::anthropic::types::{Message, Metadata, SystemMessage};
-use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder};
+use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder, UsageRouteKind, UsageRouteSubtype};
 use crate::common::auth::RequestApiKeyStore;
+use crate::external_pool::{
+    CreateExternalPoolRequest, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
+    ExternalPoolManager, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
+    ExternalPoolRequestBodyMode, ExternalPoolUsageProjectionMode,
+};
 use crate::kiro::call_trace::{
     AccountRejectReason, KiroCallError, SelectionFailureStage, SelectionFailureSummary,
 };
@@ -23,6 +28,7 @@ use crate::model::config::{
     PromptCacheCreationControlConfig, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
     RequestAdmissionConfig,
 };
+use crate::storage::{postgres::PostgresStore, redis_cache::RedisStore};
 use axum::{Router, body::Body, http::Request, routing::post};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::json;
@@ -142,6 +148,31 @@ struct WebSearchHandlerUpstream {
 }
 
 #[derive(Clone, Default)]
+struct ExternalMessagesUpstreamState {
+    hits: Arc<AtomicUsize>,
+    bodies: Arc<StdMutex<Vec<String>>>,
+}
+
+impl ExternalMessagesUpstreamState {
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::Acquire)
+    }
+
+    fn bodies(&self) -> Vec<String> {
+        self.bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+struct ExternalMessagesUpstream {
+    base_url: String,
+    state: ExternalMessagesUpstreamState,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Default)]
 struct CapturedTestLogs(Arc<StdMutex<Vec<u8>>>);
 
 struct CapturedTestLogWriter(Arc<StdMutex<Vec<u8>>>);
@@ -208,6 +239,37 @@ impl WebSearchHandlerUpstream {
 }
 
 impl Drop for WebSearchHandlerUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ExternalMessagesUpstream {
+    async fn start() -> Self {
+        let state = ExternalMessagesUpstreamState::default();
+        let app = Router::new()
+            .route("/v1/messages", post(external_messages_upstream))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake external messages upstream");
+        let address = listener
+            .local_addr()
+            .expect("fake external messages upstream address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake external messages upstream");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            state,
+            task,
+        }
+    }
+}
+
+impl Drop for ExternalMessagesUpstream {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -400,6 +462,111 @@ async fn websearch_handler_normal_upstream(
         body,
     )
         .into_response()
+}
+
+async fn external_messages_upstream(
+    State(state): State<ExternalMessagesUpstreamState>,
+    body: Bytes,
+) -> Response {
+    state.hits.fetch_add(1, Ordering::AcqRel);
+    let body_text = String::from_utf8_lossy(&body).into_owned();
+    state
+        .bodies
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(body_text.clone());
+    let stream = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false);
+    if stream {
+        let events = [
+            (
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_fake_external_websearch",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-opus-5",
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": 11,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                            "output_tokens": 1
+                        }
+                    }
+                }),
+            ),
+            (
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ),
+            (
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": "fake-normalized-external-ok"
+                    }
+                }),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {
+                        "input_tokens": 11,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 4
+                    }
+                }),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ];
+        let mut sse = String::new();
+        for (event, payload) in events {
+            sse.push_str("event: ");
+            sse.push_str(event);
+            sse.push_str("\ndata: ");
+            sse.push_str(&payload.to_string());
+            sse.push_str("\n\n");
+        }
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            sse,
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "id": "msg_fake_external_websearch",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-5",
+        "content": [{"type": "text", "text": "fake-normalized-external-ok"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {"input_tokens": 11, "output_tokens": 4}
+    }))
+    .into_response()
 }
 
 async fn multimodal_handler_upstream(
@@ -714,6 +881,140 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
     (router, usage_recorder)
 }
 
+async fn test_external_pool_manager_for_handlers(
+    base_url: &str,
+    body_mode: ExternalPoolRequestBodyMode,
+) -> Option<Arc<ExternalPoolManager>> {
+    let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+    else {
+        eprintln!("跳过 WebSearch external fallback 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return None;
+    };
+    let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
+        eprintln!("跳过 WebSearch external fallback 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        return None;
+    };
+
+    let mut postgres_config = Config::default();
+    postgres_config.postgres.url = Some(postgres_url);
+    postgres_config.postgres.max_connections = 2;
+    let postgres = Arc::new(
+        PostgresStore::connect_test(&postgres_config)
+            .await
+            .expect("connect handler external fallback test Postgres"),
+    );
+
+    let mut redis_config = Config::default();
+    redis_config.redis.url = Some(redis_url);
+    redis_config.redis.key_prefix =
+        format!("kiro_rs:test:handlers:websearch:{}", uuid::Uuid::new_v4());
+    let redis = Arc::new(
+        RedisStore::connect(&redis_config)
+            .await
+            .expect("connect handler external fallback test Redis"),
+    );
+
+    let manager = Arc::new(ExternalPoolManager::new(postgres.clone(), redis));
+    postgres
+        .create_external_pool(CreateExternalPoolRequest {
+            name: format!("handler-websearch-{body_mode:?}"),
+            base_url: base_url.to_string(),
+            api_key: "sk-handler-external-test".to_string(),
+            auth_type: ExternalPoolAuthType::XApiKey,
+            enabled: true,
+            priority: 1,
+            max_concurrent_requests: 10,
+            usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            stream_response_mode: None,
+            request_body_mode: body_mode,
+            raw_model_mode: ExternalPoolRawModelMode::None,
+            auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+            preserve_path: true,
+            normalize_model_version_dots: false,
+            model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+            model_mapping_require_match: false,
+            model_mapping_rules: Vec::new(),
+            supported_models: Vec::new(),
+            notes: None,
+        })
+        .await
+        .expect("create handler external fallback pool");
+    manager.invalidate_static_pool_snapshot();
+    Some(manager)
+}
+
+fn websearch_handler_test_router_with_external(
+    kiro_base_url: &str,
+    external_pool_manager: Arc<ExternalPoolManager>,
+) -> (Router, Arc<UsageRecorder>) {
+    websearch_handler_test_router_with_external_options(
+        kiro_base_url,
+        external_pool_manager,
+        Vec::new(),
+        true,
+    )
+}
+
+fn websearch_handler_test_router_with_external_options(
+    kiro_base_url: &str,
+    external_pool_manager: Arc<ExternalPoolManager>,
+    credentials: Vec<KiroCredentials>,
+    local_pool_preflight_enabled: bool,
+) -> (Router, Arc<UsageRecorder>) {
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(kiro_base_url.to_string());
+    config.kiro_upstream_response_timeout_secs = 1;
+    config.credential_retry_max_attempts = 0;
+    config.external_pools.external_pools_enabled = true;
+    config.external_pools.external_direct_policy_enabled = false;
+    config.external_pools.local_pool_preflight_enabled = local_pool_preflight_enabled;
+    config.external_pools.fallback_on_no_available_credentials = true;
+    config.external_pools.fallback_on_local_capacity_exhausted = true;
+    config.external_pools.fallback_on_scheduler_redis_degraded = true;
+    config.external_pools.fallback_on_local_transient_exhausted = true;
+    config
+        .external_pools
+        .external_pool_global_max_concurrent_requests = 20;
+    config.external_pools.external_pool_max_queued_requests = 0;
+    config.external_pools.external_pool_retry_max_attempts = 0;
+    config.external_pools.external_pool_request_timeout_secs = 10;
+    config
+        .external_pools
+        .external_pool_stream_request_timeout_secs = 10;
+    config.external_pools.external_pool_stream_idle_timeout_secs = 10;
+
+    let manager = Arc::new(
+        MultiTokenManager::new(config.clone(), credentials, None, None, false)
+            .expect("build WebSearch external fallback token manager"),
+    );
+    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    let provider = Arc::new(KiroProvider::with_proxy(
+        manager,
+        None,
+        endpoints,
+        "ide".to_string(),
+    ));
+    let usage_recorder = Arc::new(UsageRecorder::new(1_000));
+    let router = create_router_with_provider(
+        AnthropicRouterDependencies {
+            request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
+            kiro_provider: Some(provider),
+            usage_recorder: usage_recorder.clone(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            external_pool_manager: Some(external_pool_manager),
+        },
+        AnthropicRouterConfig::from_runtime_config(&config),
+    );
+    (router, usage_recorder)
+}
+
 fn websearch_messages_body(
     messages: Vec<Value>,
     stream: bool,
@@ -1014,6 +1315,211 @@ async fn run_websearch_canonical_detection_and_current_long_history_query_are_ex
 fn websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread("websearch-routing-matrix", || async {
         run_websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds(
+        )
+        .await;
+    });
+}
+
+async fn run_native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds() {
+    let mcp_upstream = WebSearchHandlerUpstream::start().await;
+    let external_upstream = ExternalMessagesUpstream::start().await;
+    let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
+        &external_upstream.base_url,
+        ExternalPoolRequestBodyMode::Normalized,
+    )
+    .await
+    else {
+        return;
+    };
+    let (router, usage_recorder) =
+        websearch_handler_test_router_with_external(&mcp_upstream.base_url, external_pool_manager);
+
+    for stream in [false, true] {
+        for round in 1..=5 {
+            let query = format!("normalized-external-websearch-{stream}-{round}");
+            let response = router
+                .clone()
+                .oneshot(multimodal_handler_request(
+                    "/ha/v1/messages",
+                    single_query_websearch_body(&query, stream),
+                ))
+                .await
+                .expect("normalized external WebSearch response");
+            let request_id = response_request_id(&response);
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "stream={stream} round={round}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .expect("normalized external WebSearch body");
+            let body = String::from_utf8(body.to_vec()).expect("external response UTF-8");
+            assert!(
+                body.contains("fake-normalized-external-ok"),
+                "stream={stream} round={round} body={body}"
+            );
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(
+                record.status,
+                UsageRecordStatus::Success,
+                "stream={stream} round={round}"
+            );
+            assert_eq!(
+                record.route_kind,
+                Some(UsageRouteKind::ExternalPool),
+                "stream={stream} round={round}"
+            );
+            assert_eq!(
+                record.route_subtype,
+                Some(UsageRouteSubtype::ExternalFallbackPreflight),
+                "stream={stream} round={round}"
+            );
+            assert_eq!(
+                record.fallback_reason.as_deref(),
+                Some("local_no_credentials"),
+                "stream={stream} round={round}"
+            );
+            assert_eq!(
+                record.local_attempted,
+                Some(false),
+                "stream={stream} round={round}"
+            );
+            let attempts = record
+                .latency_trace
+                .as_ref()
+                .and_then(|trace| trace.inference_attempts)
+                .expect("normalized external attempt trace");
+            assert_eq!(attempts.mcp_attempts, 0, "stream={stream} round={round}");
+            assert_eq!(
+                attempts.external_attempts, 1,
+                "stream={stream} round={round}"
+            );
+        }
+    }
+
+    assert_eq!(
+        external_upstream.state.hits(),
+        10,
+        "every normalized fallback request must reach external pool"
+    );
+    assert_eq!(
+        mcp_upstream.state.mcp_hits(),
+        0,
+        "native WebSearch must not call MCP when normalized external fallback is eligible"
+    );
+    let bodies = external_upstream.state.bodies();
+    assert_eq!(bodies.len(), 10);
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body.contains("web_search_20250305")),
+        "external fallback must preserve official WebSearch tool payload: {bodies:?}"
+    );
+}
+
+#[test]
+fn native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-normalized-external", || async {
+        run_native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds().await;
+    });
+}
+
+async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp_path_for_five_rounds()
+ {
+    let mcp_upstream = WebSearchHandlerUpstream::start().await;
+    let external_upstream = ExternalMessagesUpstream::start().await;
+    let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
+        &external_upstream.base_url,
+        ExternalPoolRequestBodyMode::Normalized,
+    )
+    .await
+    else {
+        return;
+    };
+    let (router, usage_recorder) = websearch_handler_test_router_with_external_options(
+        &mcp_upstream.base_url,
+        external_pool_manager,
+        Vec::new(),
+        false,
+    );
+
+    for stream in [false, true] {
+        for round in 1..=5 {
+            let query = format!("scheduler-after-mcp-websearch-{stream}-{round}");
+            let response = router
+                .clone()
+                .oneshot(multimodal_handler_request(
+                    "/ha/v1/messages",
+                    single_query_websearch_body(&query, stream),
+                ))
+                .await
+                .expect("post-MCP external fallback WebSearch response");
+            let request_id = response_request_id(&response);
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "stream={stream} round={round}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .expect("post-MCP external fallback body");
+            let body = String::from_utf8(body.to_vec()).expect("external response UTF-8");
+            assert!(
+                body.contains("fake-normalized-external-ok"),
+                "stream={stream} round={round} body={body}"
+            );
+
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_eq!(
+                record.status,
+                UsageRecordStatus::Success,
+                "stream={stream} round={round}"
+            );
+            assert_eq!(
+                record.route_kind,
+                Some(UsageRouteKind::ExternalPool),
+                "stream={stream} round={round}"
+            );
+            assert_eq!(
+                record.fallback_reason.as_deref(),
+                Some("local_no_credentials"),
+                "stream={stream} round={round}: scheduler failure must keep the real local-pool reason"
+            );
+            assert_eq!(
+                record.local_attempted,
+                Some(true),
+                "stream={stream} round={round}: fallback must record that the local MCP path was attempted"
+            );
+            let attempts = record
+                .latency_trace
+                .as_ref()
+                .and_then(|trace| trace.inference_attempts)
+                .expect("post-MCP fallback attempt trace");
+            assert_eq!(attempts.mcp_attempts, 0, "stream={stream} round={round}");
+            assert_eq!(
+                attempts.external_attempts, 1,
+                "stream={stream} round={round}"
+            );
+        }
+    }
+
+    assert_eq!(
+        external_upstream.state.hits(),
+        10,
+        "every post-MCP fallback request must reach external pool"
+    );
+    assert_eq!(
+        mcp_upstream.state.mcp_hits(),
+        0,
+        "scheduler failure before credential acquisition must not send MCP HTTP traffic"
+    );
+}
+
+#[test]
+fn native_websearch_scheduler_failure_falls_back_to_external_after_mcp_path_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("websearch-after-mcp-external", || async {
+        run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp_path_for_five_rounds(
         )
         .await;
     });
@@ -1982,6 +2488,8 @@ enum HandlerEventStreamFault {
     JsonExceptionBeforeOutput,
     BinaryEventStreamWithJsonContentType,
     JsonBodyWithEventStreamContentType,
+    SignatureInvalidThenJsonLabeledEventStreamSuccess,
+    SignatureInvalidThenJsonErrorEnvelope,
     ReadErrorBeforeOutput,
     IdleBeforeOutput,
     BadCrcBeforeOutput,
@@ -2144,10 +2652,33 @@ async fn handler_eventstream_fault_upstream(
 ) -> Response {
     let hit = state.hits.fetch_add(1, Ordering::AcqRel) + 1;
     if hit > 1 {
-        return handler_eventstream_bytes_response(handler_eventstream_normal_body());
+        return match state.fault {
+            HandlerEventStreamFault::SignatureInvalidThenJsonLabeledEventStreamSuccess => {
+                handler_eventstream_json_labeled_bytes_response(handler_eventstream_normal_body())
+            }
+            HandlerEventStreamFault::SignatureInvalidThenJsonErrorEnvelope => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(json!({
+                    "__type": "ThrottlingException",
+                    "message": state.json_secret_marker
+                })),
+            )
+                .into_response(),
+            _ => handler_eventstream_bytes_response(handler_eventstream_normal_body()),
+        };
     }
 
     match state.fault {
+        HandlerEventStreamFault::SignatureInvalidThenJsonLabeledEventStreamSuccess
+        | HandlerEventStreamFault::SignatureInvalidThenJsonErrorEnvelope => (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(json!({
+                "reason": "THINKING_SIGNATURE_INVALID"
+            })),
+        )
+            .into_response(),
         HandlerEventStreamFault::JsonExceptionBeforeOutput => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
@@ -2482,6 +3013,31 @@ fn handler_eventstream_fault_request(stream: bool) -> Request<Body> {
     )
 }
 
+fn handler_thinking_signature_retry_request(stream: bool) -> Request<Body> {
+    multimodal_handler_request(
+        "/cc/v1/messages",
+        json!({
+            "model":"claude-opus-4-8",
+            "max_tokens":128,
+            "stream":stream,
+            "thinking":{"type":"adaptive"},
+            "messages":[
+                {"role":"user","content":"Say hello."},
+                {"role":"assistant","content":[
+                    {
+                        "type":"thinking",
+                        "thinking":"prior private reasoning",
+                        "signature":"invalid-signature-fixture"
+                    },
+                    {"type":"text","text":"Hello."}
+                ]},
+                {"role":"user","content":"Reply exactly: recovered-ok"}
+            ]
+        })
+        .to_string(),
+    )
+}
+
 async fn call_handler_eventstream_fault(app: Router, stream: bool) -> (StatusCode, String, String) {
     let response = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2511,6 +3067,38 @@ async fn call_handler_eventstream_fault(app: Router, stream: bool) -> (StatusCod
     )
 }
 
+async fn call_handler_thinking_signature_retry(
+    app: Router,
+    stream: bool,
+) -> (StatusCode, String, String) {
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.oneshot(handler_thinking_signature_retry_request(stream)),
+    )
+    .await
+    .expect("signature retry handler response timed out")
+    .expect("signature retry handler response");
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("signature retry response request-id")
+        .to_string();
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await
+    .expect("signature retry response body timed out")
+    .expect("read signature retry response body");
+    (
+        status,
+        request_id,
+        String::from_utf8(body.to_vec()).expect("signature retry response UTF-8"),
+    )
+}
+
 fn assert_fault_usage(
     usage_recorder: &UsageRecorder,
     request_id: &str,
@@ -2534,6 +3122,125 @@ fn assert_fault_usage(
         "request_id={request_id}"
     );
     assert!(attempts.consumed <= 4, "request_id={request_id}");
+}
+
+async fn run_handler_thinking_signature_retry_accepts_json_labeled_eventstream_success_for_five_rounds()
+ {
+    for stream in [false, true] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::SignatureInvalidThenJsonLabeledEventStreamSuccess,
+            )
+            .await;
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
+            let (status, request_id, body) =
+                call_handler_thinking_signature_retry(app, stream).await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "stream={stream} round={round} body={body}"
+            );
+            assert!(
+                body.contains("recovered-ok"),
+                "stream={stream} round={round} body={body}"
+            );
+            assert_eq!(
+                upstream.hits(),
+                2,
+                "stream={stream} round={round}: signature retry must use exactly two sends"
+            );
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+        }
+    }
+}
+
+async fn run_handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds() {
+    for stream in [false, true] {
+        for round in 1..=5 {
+            let marker = format!("SIGNATURE_RETRY_JSON_ERROR_PRIVATE_{stream}_{round}");
+            let upstream = HandlerEventStreamFaultUpstream::start_with_json_secret_marker(
+                HandlerEventStreamFault::SignatureInvalidThenJsonErrorEnvelope,
+                marker.clone(),
+            )
+            .await;
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
+            let (status, request_id, body) =
+                call_handler_thinking_signature_retry(app, stream).await;
+
+            if stream {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "stream={stream} round={round} body={body}"
+                );
+                assert!(
+                    body.contains(r#""type":"error""#),
+                    "stream={stream} round={round} body={body}"
+                );
+                assert!(
+                    !body.contains("event: message_stop"),
+                    "stream={stream} round={round} body={body}"
+                );
+                assert_fault_usage(
+                    &usage_recorder,
+                    &request_id,
+                    UsageRecordStatus::StreamError,
+                    2,
+                );
+            } else {
+                assert!(
+                    status.is_client_error() || status.is_server_error(),
+                    "stream={stream} round={round} status={status} body={body}"
+                );
+                assert!(body.contains(&request_id), "round={round} body={body}");
+                assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 2);
+            }
+            assert_eq!(
+                upstream.hits(),
+                2,
+                "stream={stream} round={round}: signature retry should use exactly two sends"
+            );
+            assert!(
+                !body.contains("recovered-ok"),
+                "stream={stream} round={round} body={body}"
+            );
+            assert!(
+                !body.contains(&marker),
+                "stream={stream} round={round} body={body}"
+            );
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            assert_ne!(
+                record.status,
+                UsageRecordStatus::Success,
+                "stream={stream} round={round}"
+            );
+            let serialized =
+                serde_json::to_string(&record).expect("serialize signature retry JSON error usage");
+            assert!(
+                !serialized.contains(&marker),
+                "stream={stream} round={round}: usage leaked private JSON body"
+            );
+        }
+    }
+}
+
+#[test]
+fn handler_thinking_signature_retry_accepts_json_labeled_eventstream_success_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "signature-retry-json-eventstream",
+        run_handler_thinking_signature_retry_accepts_json_labeled_eventstream_success_for_five_rounds,
+    );
+}
+
+#[test]
+fn handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "signature-retry-json-error-envelope",
+        run_handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds,
+    );
 }
 
 fn expected_precommit_retry_reason(fault: HandlerEventStreamFault) -> &'static str {
@@ -3978,6 +4685,25 @@ fn all_parsed_external_fallback_entrypoints_share_model_and_body_mode_eligibilit
     );
     assert!(
         source.contains("match external_fallback_body_mode_filter(self.requires_normalized_body)")
+    );
+}
+
+#[test]
+fn native_websearch_runs_local_pool_preflight_before_mcp_intercept() {
+    let source = include_str!("../handlers.rs");
+    let websearch_block = source
+        .split("if websearch::has_web_search_tool(&payload)")
+        .nth(1)
+        .expect("native WebSearch block exists");
+    let preflight = websearch_block
+        .find("maybe_local_pool_preflight_external_response")
+        .expect("native WebSearch must run local-pool preflight before MCP");
+    let mcp_call = websearch_block
+        .find("websearch::handle_websearch_request")
+        .expect("native WebSearch MCP handler exists");
+    assert!(
+        preflight < mcp_call,
+        "local-pool preflight must happen before native MCP intercept so external-only deployments do not fail with websearch_mcp_scheduler_unavailable"
     );
 }
 

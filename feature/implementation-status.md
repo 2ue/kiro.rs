@@ -1,10 +1,27 @@
 # Implementation Status
 
-Date: 2026-07-25
+Date: 2026-07-26
 
 ## Current Phase
 
-`post-v0.0.115 protocol/scheduler hardening final validation complete / release pending`：已完成 114/115 发布后的生产只读复核、`api_protocol_error` 协议修复、thinking/output_config adaptive 修复、真实本地 9022 + Claude Code CLI 验证、fake-upstream L3/L4/L5 负载/异常恢复验证、文档/Node/完整 Rust bin 门禁和构建产物 inventory。当前工作树尚未发布新版本；下一步是最终 diff 复核、必要 UI gate、提交并发版。
+`post-v0.0.117 production recurrence hardening validated / release pending`：已完成 114/115/116/117 后继续暴露的生产只读复核、WebSearch normalized fallback、MCP 辅助失败不污染主调度、PostgreSQL usage/dashboard pool 隔离、旧 schema dashboard 修复、thinking/output_config 兼容、thinking signature retry transient 分类、personal/social JSON-labeled EventStream body sniff、外部池 dashed/dotted 计价匹配、真实 Claude Code CLI fake-upstream 协议验证、fake-upstream L3/L4/L5 负载/异常恢复验证、构建产物 inventory 清理。当前工作树尚未发布新版本；下一步是最终非 Cargo gate、提交并发版。
+
+## 2026-07-26 Current candidate validation
+
+- 冻结候选 `kiro-rs` SHA-256：`7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec`。
+- C0 静态/Rust/release build/clippy baseline：已在本候选上通过；本轮之后只改文档与本地验证 runner，没有改 Rust 源码。
+- 真实 Claude Code CLI fake-upstream：
+  - bare invoke：`20/20`，15 个 literal negative + 5 个 structured Bash tool loop，`violations=0`；
+  - long-session：`5 sessions / 110 CLI turns / 105 continue turns / 100 tool turns / tool_use=100 / tool_result=100 / leakMatches=0`；
+  - thinking-wire：`60/60`，CLI/IDE × absent/low/medium/high/xhigh/max × 5，`violations=0`，`thinking.type=adaptive` 与 `output_config.effort` wire 形态符合预期；
+  - 证据：[candidate-c0-claude-cli-real-protocol-20260726](evidence/candidate-c0-claude-cli-real-protocol-20260726.md)。
+- fake-upstream load/chaos：
+  - L3 burst/recovery：`9/9`；
+  - L4 restart/429/500/invalid-tool/client-drop/mixed chaos：`12/12`；
+  - L5 long-stream soak：`421/421` success，恢复 `12/12`，RSS/FD 回落；
+  - 证据：[candidate-c0-load-chaos-20260726](evidence/candidate-c0-load-chaos-20260726.md)。
+- 清理结果：CLI/load 原始临时目录已删除；caller-owned PostgreSQL 测试库已 drop；Redis owned prefixes 已清理；`node feature/tests/inventory-build-artifacts.mjs --gate` 当前通过，`targets=0 reservations=0 target_processes=0 blockers=0`。
+- 真实上游成功 smoke：当前本地 `9022` 的持久化凭据全部 disabled（TemporarilySuspended/Manual/QuotaExceeded），继续调用会增加账号风险；本项记录为环境阻塞，不作为产品 pass。
 
 ## 2026-07-25 Final candidate protocol/load validation
 

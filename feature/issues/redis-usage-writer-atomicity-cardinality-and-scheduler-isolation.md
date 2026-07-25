@@ -130,3 +130,29 @@ Redis batch 仍最多 64 条、总 deadline 仍为 2 秒，但不再用 `join_al
 - Redis command-level 错误依靠 invalidation 回退 PostgreSQL，而不是回滚已经执行的 Redis 命令；这是刻意的 fail-closed 设计。
 - Redis 整体不可达时可能无法写 invalidation marker。当前 disconnect/recovery 证明本轮 writer 没有隐藏重试并可恢复，但 Redis restart 后旧 derived cache 的跨实例 generation fence 仍需独立验证。
 - cache-read 4096 是保护上限，不是对生产分布的性能证明；生产规模可能需要更低上限或移除 exact-token Redis 物化。
+
+## 2026-07-26 增量：PgSQL usage/dashboard pool 与主业务 pool 隔离
+
+Redis usage writer 原子性不能覆盖 PgSQL 连接池拥塞。生产 113->114/117 的 dashboard 卡死和 usage 写入慢窗口显示：即使 Redis writer 不再放大 scheduler，usage/dashboard PgSQL 查询仍可能占用主业务 pool，影响 runtime config、credential、调度关键路径。
+
+当前工作树新增：
+
+- `postgres.usageMaxConnections`，默认 4；
+- `KIRO_RS_POSTGRES_USAGE_MAX_CONNECTIONS` 环境变量；
+- `PostgresStore::connect_usage(&Config)`；
+- `main` 中 usage recorder 使用独立 `PostgresUsageStore` pool；
+- `PostgresStore::connect_test` 不再固定 2 连接，测试可按配置模拟主 pool 耗尽。
+
+验证：
+
+```text
+postgres_usage_pool_isolated_from_exhausted_main_pool_for_three_rounds ... ok
+postgres_dashboard_read_transaction_is_bounded_and_read_only ... ok
+postgres_persists_runtime_config_credentials_stats_usage_and_pricing ... ok
+```
+
+边界：
+
+- 仍使用同一个 PostgreSQL URL，不是物理数据库隔离；
+- 目标是避免慢 dashboard/usage writer 耗尽主业务 sqlx pool；
+- 如果 PostgreSQL 实例整体 CPU/IO/lock 饱和，两个 pool 仍会共同受影响，最终还需要查询限时、索引和 dashboard 聚合优化配合。

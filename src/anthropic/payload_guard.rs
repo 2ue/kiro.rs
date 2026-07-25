@@ -1398,6 +1398,27 @@ pub fn serialize_kiro_request(request: &KiroRequest) -> Result<String, PayloadGu
 }
 
 fn serialize_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
+    let normalized_request;
+    let request = if request
+        .additional_model_request_fields
+        .as_ref()
+        .is_some_and(|fields| {
+            fields.output_config.is_some()
+                && fields
+                    .thinking
+                    .as_ref()
+                    .is_some_and(|thinking| thinking.thinking_type != "adaptive")
+        }) {
+        normalized_request = {
+            let mut request = request.clone();
+            request.normalize_output_config_thinking_compatibility();
+            request
+        };
+        &normalized_request
+    } else {
+        request
+    };
+
     if request.tool_cache_point_insert_after.is_empty() {
         return serde_json::to_string(request)
             .map_err(|err| PayloadGuardError::Serialize(err.to_string()));
@@ -4731,6 +4752,9 @@ mod tests {
         AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
         HistoryUserMessage, KiroImage, ReasoningContent, UserInputMessage, UserInputMessageContext,
     };
+    use crate::kiro::model::requests::kiro::{
+        AdditionalModelRequestFields, KiroOutputConfig, KiroThinkingConfig,
+    };
     use crate::kiro::model::requests::tool::{
         InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
     };
@@ -4773,6 +4797,37 @@ mod tests {
         AnthropicMessage {
             role: role.to_string(),
             content,
+        }
+    }
+
+    #[test]
+    fn serialize_kiro_request_normalizes_output_config_with_non_adaptive_thinking_for_five_rounds()
+    {
+        for round in 0..5 {
+            let mut request = request_with_history(Vec::new());
+            request.additional_model_request_fields = Some(AdditionalModelRequestFields {
+                thinking: Some(KiroThinkingConfig {
+                    thinking_type: "disabled".to_string(),
+                    display: None,
+                }),
+                output_config: Some(KiroOutputConfig {
+                    effort: "max".to_string(),
+                }),
+                reasoning: None,
+            });
+
+            let body = serialize_kiro_request(&request).expect("serialize Kiro request");
+            let value: Value = serde_json::from_str(&body).expect("Kiro body JSON");
+            assert!(
+                value["additionalModelRequestFields"]
+                    .get("thinking")
+                    .is_none(),
+                "round {round}: body={body}"
+            );
+            assert_eq!(
+                value["additionalModelRequestFields"]["output_config"]["effort"], "max",
+                "round {round}"
+            );
         }
     }
 

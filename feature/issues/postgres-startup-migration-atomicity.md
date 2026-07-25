@@ -170,3 +170,35 @@ checksum mismatch、认证失败、配置错误、SQL 语法/约束等错误立�
 若外层 transaction 在特定生产 schema 上产生不可接受的 lock 时间，应先停止自动滚动升级并使用 maintenance 窗口重放同一 migration；不要回退为非原子小事务。代码回滚会重新引入半迁移风险，只能在同时提供等价原子 migration runner 时进行。
 
 当前残余项：最终 tag 二进制绑定、显式大 compression 的独立事务合同、未知 SQLSTATE 分类补充，以及生产规模 catalog/lock 观测。`inline-schema.applied_at` churn 已修复，不再列为接受差异。上述残余不否定当前 P0 correctness 修复，但最终 binary 绑定必须在发布说明中明确。
+
+## 2026-07-26 增量：114+ dashboard/usage 旧表缺列修复
+
+现网 113 升 114 后出现过：
+
+```text
+Dashboard 总览加载失败
+error returned from database
+```
+
+本轮复核确认一个独立迁移缺口：`CREATE TABLE IF NOT EXISTS` 中已经包含 114+ 新增的 usage/dashboard/外部池计费/耗时字段，但既有旧表不会走 create path；对应 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 不完整，导致旧实例升级后 writer 或 dashboard 查询在运行期碰到缺列。
+
+当前工作树补齐：
+
+- `usage_records`：补 endpoint/stream/model/status/token/cost/pricing/duration/data 等旧表缺列；
+- `usage_rollup_totals` 与 `usage_rollup_time_buckets`：补 upstream/sticky/fallback、本地 prompt cache、external billing、duration aggregate、updated_at 等列；
+- `usage_credential_cost_summary`：补 requests、estimated/priced/unpriced、updated_at 等列；
+- `REQUIRED_POSTGRES_SCHEMA_COLUMNS` 增加 dashboard/usage 必需列，`migrate_on_start=false` 且 schema 不兼容时启动阶段明确失败，不让 dashboard 请求阶段才失败。
+
+验证：
+
+```text
+postgres_startup_migration_repairs_usage_dashboard_upgrade_columns ... ok
+postgres_persists_runtime_config_credentials_stats_usage_and_pricing ... ok
+postgres_dashboard_read_transaction_is_bounded_and_read_only ... ok
+```
+
+生产发布后验证：
+
+- 查看启动日志中是否有 schema compatibility fail-fast；
+- 对 113/114 历史升级机器，访问 dashboard 不应再出现 `error returned from database`；
+- usage writer 不应因 `duration_ms_sum`、`external_pool_reported_cost_usd`、`pricing_available` 等缺列失败。

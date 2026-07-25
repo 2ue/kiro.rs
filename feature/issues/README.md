@@ -62,6 +62,10 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [生产证据 skill 校验与脱敏](evidence-skill-validation-and-redaction.md)
 - [协议能力回归矩阵](protocol-capability-regression-matrix.md)
 - [WebSearch/MCP 协议、错误、usage、attempt 与隐私边界](websearch-mcp-protocol-usage-and-privacy.md)
+- [Native WebSearch 与 normalized 外部池 fallback 断路](websearch-normalized-external-fallback-preflight.md)
+- [159/170 Native WebSearch MCP 错误聚类](prod-websearch-mcp-error-clusters-159-170-20260725.md)
+- [Thinking signature retry 第二响应 transient 被误归类](thinking-signature-retry-transient-response.md)
+- [凭据卡片 mcp_completion runtime 错误来源追踪](mcp-completion-runtime-card-error-source.md)
 - [企业/API-key 200 EventStream EOF 被误判 api_error](enterprise-eventstream-usage-only-tool-eof.md)
 - [运行时栈溢出与 handler future 大小](runtime-stack-overflow-and-handler-future-size.md)
 - [上游错误诊断隐私与响应体边界](upstream-error-diagnostic-privacy-and-bounds.md)
@@ -70,3 +74,14 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [Endpoint body 重写的字节语义与重复序列化成本](endpoint-body-rewrite-byte-semantics-and-cost.md)
 - [验证构建产物生命周期与磁盘安全](validation-build-artifact-lifecycle-and-disk-safety.md)
 - [Usage Dashboard P95 与时间窗语义](usage-dashboard-p95-and-window-semantics.md)
+
+## 2026-07-26 当前工作树增量状态
+
+- WebSearch normalized external fallback：preflight 与后置 fallback 均已实现；本地无凭证/全禁用/容量/Redis degraded 按 `selectionFailure` 精确分类，不再一律映射成 Redis degraded。
+- MCP/WebSearch 辅助失败：普通 MCP completion、429/5xx/body-read/protocol 不再写主模型凭据 cooldown；只在本次请求内换号，避免凭据卡片 `mcp_completion upstream_error` 与主调度假不可用。
+- PgSQL usage/dashboard 隔离：新增 `postgres.usageMaxConnections` 与独立 usage pool；旧表缺 114+ dashboard/usage/计费列的迁移已补齐并加入 schema guard。
+- 已通过聚焦回归：WebSearch 全量 29 tests、thinking/output_config、thinking signature、pricing、PG schema/usage pool、request admission、local_pool fast-fail、scheduler degraded/external fallback、MCP 辅助健康隔离。
+- 已完成冻结候选二进制验证：`kiro-rs` SHA-256 `7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec`。C0 静态/全量 Rust/release build/clippy baseline 已通过且 scoped target 清理完成。
+- 已完成真实 Claude Code CLI fake-upstream 协议验证：bare invoke `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire `60/60`；证据见 [candidate-c0-claude-cli-real-protocol-20260726](../evidence/candidate-c0-claude-cli-real-protocol-20260726.md)。
+- 已完成 fake-upstream 负载/异常恢复验证：L3 `9/9`、L4 `12/12`、L5 `60s soak + recovery` 全部通过；证据见 [candidate-c0-load-chaos-20260726](../evidence/candidate-c0-load-chaos-20260726.md)。
+- 真实上游成功 smoke 当前受环境阻塞：本地 `9022` 的持久化凭据全部处于 disabled/runtime bad state（TemporarilySuspended/Manual/QuotaExceeded），继续真实调用会增加账号风险；不把该环境阻塞伪装为产品 pass。

@@ -2872,6 +2872,12 @@ pub struct PostgresConfig {
     pub url: Option<String>,
     #[serde(default = "default_postgres_max_connections")]
     pub max_connections: u32,
+    /// 独立 usage/dashboard/观测 PgSQL 连接池容量。
+    ///
+    /// 默认仍使用同一个 Postgres URL，但使用单独 sqlx pool，避免慢 usage 写入或
+    /// dashboard 聚合耗尽凭据、运行配置与调度关键路径使用的主业务连接池。
+    #[serde(default = "default_postgres_usage_max_connections")]
+    pub usage_max_connections: u32,
     #[serde(default = "default_true")]
     pub migrate_on_start: bool,
     #[serde(default)]
@@ -2883,6 +2889,7 @@ impl Default for PostgresConfig {
         Self {
             url: None,
             max_connections: default_postgres_max_connections(),
+            usage_max_connections: default_postgres_usage_max_connections(),
             migrate_on_start: true,
             compress_usage_rollups_on_start: false,
         }
@@ -4239,6 +4246,10 @@ fn default_postgres_max_connections() -> u32 {
     10
 }
 
+fn default_postgres_usage_max_connections() -> u32 {
+    4
+}
+
 fn default_redis_key_prefix() -> String {
     "kiro_rs:local".to_string()
 }
@@ -4763,6 +4774,18 @@ impl Config {
                 self.postgres.url = Some(url);
             }
         }
+        if let Some(parsed) = std::env::var("KIRO_RS_POSTGRES_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        {
+            self.postgres.max_connections = parsed.max(1);
+        }
+        if let Some(parsed) = std::env::var("KIRO_RS_POSTGRES_USAGE_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        {
+            self.postgres.usage_max_connections = parsed.max(1);
+        }
         if let Ok(value) = std::env::var("KIRO_RS_POSTGRES_MIGRATE_ON_START") {
             if let Some(parsed) = parse_env_bool(&value) {
                 self.postgres.migrate_on_start = parsed;
@@ -4964,6 +4987,7 @@ mod tests {
             CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
         );
         assert_eq!(config.postgres.max_connections, 10);
+        assert_eq!(config.postgres.usage_max_connections, 4);
         assert!(config.postgres.migrate_on_start);
         assert!(!config.postgres.compress_usage_rollups_on_start);
         assert_eq!(config.redis.key_prefix, "kiro_rs:local");

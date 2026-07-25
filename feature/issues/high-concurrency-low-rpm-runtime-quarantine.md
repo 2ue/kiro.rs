@@ -189,3 +189,83 @@ cleanup.occupiedPorts=[]
 ### 2026-07-23 最终候选复核
 
 v0.0.117 冻结候选再次以 fake-upstream load/chaos 覆盖高并发、低 RPM、突发错误和恢复：L3 burst/recovery 9/9 pass，包含 c40/r100 spike 全 100 成功、错误突发后 recovery 12/12；L4 restart/429/500/invalid-tool/client-drop/mixed-chaos 12/12 pass，所有恢复 case 12/12 成功；L5 60s soak + 60s idle pass，RSS/FD 均回落。第一次 120s soak + 15s idle 的请求和恢复均 pass，但 RSS cold-start threshold false，已记录为短 idle 观测而非隐藏。最终 no-default/default 全量 Rust gate 也包含 40x15/global-500、runtime degraded != persistent disabled、success persistence generation fence 等用例。详见 [最终发布门禁证据](../evidence/final-release-gate-20260723.md)。
+
+### 2026-07-26 当前工作树增量复核
+
+本轮针对生产继续暴露的“并发低/前端慢/usage 聚合慢/凭据卡片 mcp_completion 错误/本地池不可调度后 WebSearch 仍走本地”的组合问题，追加了三类修复与回归：
+
+1. PgSQL 主业务连接池与 usage/dashboard 连接池拆分：
+   - `postgres.usageMaxConnections` 默认 4；
+   - env 支持 `KIRO_RS_POSTGRES_MAX_CONNECTIONS` 与 `KIRO_RS_POSTGRES_USAGE_MAX_CONNECTIONS`；
+   - `main` 中 `PostgresUsageStore` 使用 `PostgresStore::connect_usage()` 的独立 sqlx pool；
+   - 验证 `postgres_usage_pool_isolated_from_exhausted_main_pool_for_three_rounds`：主 pool max=1 被长事务占满时，usage 写入仍通过 usage pool 成功。
+
+2. 旧 schema/dashboard 升级修复：
+   - `usage_records`、`usage_rollup_totals`、`usage_rollup_time_buckets`、`usage_credential_cost_summary` 补齐 114+ dashboard/计费/耗时字段的 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`；
+   - `REQUIRED_POSTGRES_SCHEMA_COLUMNS` 加入 dashboard/usage 必需列，migration disabled 且 schema 不兼容时启动阶段 fail-fast，不让 dashboard 运行时才报 `error returned from database`；
+   - 验证 `postgres_startup_migration_repairs_usage_dashboard_upgrade_columns`：模拟旧表缺列，schema guard 先失败，migration 后 usage 写入与 dashboard 读取成功。
+
+3. MCP/WebSearch 辅助失败不再污染主模型凭据调度：
+   - MCP completion/report failure 不再写 credential runtime cooldown；
+   - `call_mcp_with_retry` 普通发送失败、429/5xx/body-read/protocol 不再写主调度 cooldown，只在本次请求内排除当前 credential 并受 shared attempt budget 限制；
+   - 401/403、明确风控、明确 quota exhausted 仍保持真实凭据状态更新。
+
+本轮已通过的相关测试：
+
+```text
+request_admission 25 tests ... ok
+local_pool_fast_fail 2 tests ... ok
+external_pool_scheduler_redis_fallback_preserves_explicit_boolean_values ... ok
+runtime_config_migration_restores_legacy_scheduler_fallback_intent_once ... ok
+runtime_config_migration_does_not_enable_scheduler_fallback_without_legacy_intent ... ok
+external_capacity_scheduler_error_uses_request_id_and_error_type ... ok
+degraded_fallback_local_lease_is_limited_to_scheduler_degraded_fallback_route ... ok
+external_pool_local_mutation_seed_survives_pg_lock_for_scheduler_degraded_fallback ... ok
+external_pool_static_eligibility_pg_failure_is_negative_cached_without_rpm_fanout ... ok
+dispatch_queue_guard 3 tests ... ok
+scheduler_redis_touch_interval_tracks_lease_ttl_without_chunk_coupling ... ok
+transport_backoff_blocks_redis_calls_without_discarding_new_work ... ok
+mcp_completion_failure_types_release_without_poisoning_core_credentials_for_five_rounds ... ok
+mcp_real_sends_share_request_budget_for_1_20_60_accounts_over_five_rounds ... ok
+mcp_error_response_body_is_bounded_while_reading_for_five_rounds ... ok
+postgres_usage_pool_isolated_from_exhausted_main_pool_for_three_rounds ... ok
+postgres_startup_migration_repairs_usage_dashboard_upgrade_columns ... ok
+postgres_dashboard_read_transaction_is_bounded_and_read_only ... ok
+postgres_persists_runtime_config_credentials_stats_usage_and_pricing ... ok
+```
+
+这些是代码层和 fake/storage 回归，不替代后续冻结二进制的 L3/L4/L5 负载与真实 Claude CLI gate；发布前仍需跑真实 runtime 验证。
+
+### 2026-07-26 当前候选冻结验证
+
+当前冻结候选：
+
+```text
+kiro-rs sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
+```
+
+已补齐发布前 runtime 验证：
+
+- fake-upstream L3 burst/recovery `9/9`：
+  - c1/c5/c10 normal 全成功；
+  - c40/r100 spike `100/100`；
+  - error burst、invalid-tool burst 后 normal recovery 均 `12/12`。
+- fake-upstream L4 chaos `12/12`：
+  - proxy restart、429、500、invalid-tool、client-drop、mixed-chaos 后均有 recovery pass；
+  - mixed chaos 期间出现高延迟是注入故障预期，恢复后回到低延迟。
+- fake-upstream L5 soak：
+  - 60s c20 long-stream `421/421` success；
+  - post-soak recovery `12/12`；
+  - RSS/FD 均回落到阈值内。
+- 真实 Claude Code CLI fake-upstream：
+  - long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`；
+  - bare invoke `20/20`；
+  - thinking-wire `60/60`。
+- 构建产物 gate：`targets=0 reservations=0 target_processes=0 blockers=0`。
+
+证据：
+
+- [candidate-c0-load-chaos-20260726](../evidence/candidate-c0-load-chaos-20260726.md)
+- [candidate-c0-claude-cli-real-protocol-20260726](../evidence/candidate-c0-claude-cli-real-protocol-20260726.md)
+
+当前未做真实上游高压测试，原因是本地真实凭据全部 disabled，继续压测会增加账号风险。生产发布后仍需以只读 usage/Redis/PG 指标验证：调度失败路径不再把下游重试放大成内部 Redis/PG 风暴，且 usage/dashboard 查询不再拖慢主调度。

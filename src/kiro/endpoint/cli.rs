@@ -11,8 +11,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    KiroEndpoint, RequestContext, configured_upstream_url, contains_json_object_key,
-    serialize_json_with_capacity,
+    KiroEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
+    configured_upstream_url, contains_json_object_key,
+    normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
 };
 use crate::kiro::protocol::{
     is_external_idp_credentials, resolve_profile_arn, resolve_streaming_profile_arn,
@@ -226,7 +227,12 @@ fn rewrite_cli_body(body: &str) -> String {
 fn transform_cli_api_body(body: &str, profile_arn: &Option<String>) -> String {
     let has_escaped_target_key =
         body.as_bytes().contains(&b'\\') && contains_json_object_key(body, &["origin"]);
-    if profile_arn.is_none() && !body.contains("\"origin\"") && !has_escaped_target_key {
+    let normalize_reasoning_fields = body_may_need_output_config_thinking_normalization(body);
+    if profile_arn.is_none()
+        && !body.contains("\"origin\"")
+        && !has_escaped_target_key
+        && !normalize_reasoning_fields
+    {
         return body.to_string();
     }
 
@@ -236,7 +242,8 @@ fn transform_cli_api_body(body: &str, profile_arn: &Option<String>) -> String {
 
     let origin_changed = rewrite_origin(&mut json);
     let profile_changed = set_profile_arn(&mut json, profile_arn);
-    if !origin_changed && !profile_changed {
+    let reasoning_fields_changed = normalize_output_config_thinking_compatibility_json(&mut json);
+    if !origin_changed && !profile_changed && !reasoning_fields_changed {
         return body.to_string();
     }
 
@@ -738,6 +745,29 @@ mod tests {
             json["additionalModelRequestFields"]["output_config"]["effort"],
             "xhigh"
         );
+    }
+
+    #[test]
+    fn cli_normalizes_output_config_with_disabled_thinking_even_without_origin_for_five_rounds() {
+        let plain = r#"{"additionalModelRequestFields":{"thinking":{"type":"disabled"},"output_config":{"effort":"max"}}}"#;
+        let escaped = r#"{"additionalModelRequest\u0046ields":{"thinking":{"type":"disabled"},"output_config":{"effort":"max"}}}"#;
+
+        for round in 0..5 {
+            for body in [plain, escaped] {
+                let result = transform_cli_api_body(body, &None);
+                let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+                assert!(
+                    json["additionalModelRequestFields"]
+                        .get("thinking")
+                        .is_none(),
+                    "round {round}: {body}"
+                );
+                assert_eq!(
+                    json["additionalModelRequestFields"]["output_config"]["effort"], "max",
+                    "round {round}: {body}"
+                );
+            }
+        }
     }
 
     #[test]

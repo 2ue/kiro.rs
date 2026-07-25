@@ -309,18 +309,11 @@ impl McpCallFailureKind {
         }
     }
 
-    fn transient_failure_kind(self) -> Option<TransientFailureKind> {
-        match self {
-            Self::Scheduler
-            | Self::InvalidRequest
-            | Self::AttemptLimit
-            | Self::AuxiliaryAttemptLimit
-            | Self::AuxiliaryConcurrency => None,
-            Self::RateLimit => Some(TransientFailureKind::RateLimit),
-            Self::Timeout | Self::BodyRead => Some(TransientFailureKind::Network),
-            Self::ResponseTooLarge | Self::Protocol => Some(TransientFailureKind::Protocol),
-            Self::Upstream => Some(TransientFailureKind::Server),
-        }
+    fn should_retry_mcp_with_alternate_credential(self) -> bool {
+        matches!(
+            self,
+            Self::RateLimit | Self::Timeout | Self::BodyRead | Self::Upstream
+        )
     }
 }
 
@@ -688,22 +681,13 @@ impl McpCallCompletion {
             attempts,
         );
 
-        if let Some(transient_kind) = kind.transient_failure_kind() {
-            if let Err(error) = self.token_manager.report_transient_failure_kind(
-                self.credential_id,
-                None,
-                transient_kind,
-                None,
-                format!("mcp_completion {}", kind.scheduler_reason()),
-            ) {
-                tracing::warn!(
-                    credential_id = self.credential_id,
-                    failure_kind = kind.as_error_type(),
-                    error = %error,
-                    "failed to record MCP completion failure"
-                );
-            }
-        }
+        // MCP/WebSearch is an auxiliary path. Its failures often come from the MCP/search
+        // service, response-shape compatibility, or client cancellation after the model request
+        // has already been admitted. Applying a global credential cooldown here can incorrectly
+        // remove otherwise healthy model credentials from the main scheduler and produce
+        // local_all_disabled/local_error_no_fallback waves. The usage record and attribution
+        // still keep the MCP failure visible; request admission and auxiliary attempt budgets
+        // bound retry pressure without poisoning core model account health.
         self.in_flight_lease.lock().take();
     }
 
@@ -1662,9 +1646,26 @@ mod tests {
                 )
                     .into_response();
             }
+            "thinking_signature_json_header_stream_success" if !has_history_reasoning_content => {
+                let first = Bytes::from_static(b"\0\0\0\x10json-labeled-eventstream");
+                let chunks = futures::stream::once(async move { Ok::<_, std::io::Error>(first) })
+                    .chain(futures::stream::pending());
+                return axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from_stream(chunks))
+                    .expect("json-labeled signature retry eventstream response");
+            }
             "thinking_signature_unexpected_second" if !has_history_reasoning_content => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"message": secret_marker})),
+                )
+                    .into_response();
+            }
+            "thinking_signature_rate_limited_second" if !has_history_reasoning_content => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
                     Json(serde_json::json!({"message": secret_marker})),
                 )
                     .into_response();
@@ -1724,8 +1725,10 @@ mod tests {
                 "reason": "REQUEST_BODY_INVALID"
             }),
             "thinking_signature_root_success"
+            | "thinking_signature_json_header_stream_success"
             | "thinking_signature_repeat"
             | "thinking_signature_unexpected_second"
+            | "thinking_signature_rate_limited_second"
             | "thinking_signature_read_failure"
             | "thinking_signature_root_without_builder" => serde_json::json!({
                 "message": "Historical reasoning signature is no longer valid.",
@@ -4367,6 +4370,7 @@ mod tests {
         for scenario in [
             "thinking_signature_root_success",
             "thinking_signature_nested_success",
+            "thinking_signature_json_header_stream_success",
         ] {
             for is_stream in [false, true] {
                 let (provider, manager) = fake_thinking_signature_provider(&server.base_url, 3);
@@ -4643,10 +4647,6 @@ mod tests {
                 KiroCallFailureKind::ThinkingSignatureInvalid,
             ),
             (
-                "thinking_signature_unexpected_second",
-                KiroCallFailureKind::ThinkingSignatureRetryFailed,
-            ),
-            (
                 "thinking_signature_read_failure",
                 KiroCallFailureKind::ThinkingSignatureRetryFailed,
             ),
@@ -4693,6 +4693,108 @@ mod tests {
                     assert_signature_retry_did_not_cool_down(
                         &manager,
                         &format!("{scenario} stream={is_stream} round {round}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_signature_retry_retryable_second_response_is_transient_for_five_rounds() {
+        let server = FakeBadRequestServer::start().await;
+        for (scenario, expected_class, expected_status, cooldown_reason) in [
+            (
+                "thinking_signature_unexpected_second",
+                "server_error",
+                500,
+                "api_server_error",
+            ),
+            (
+                "thinking_signature_rate_limited_second",
+                "rate_limit",
+                429,
+                "api_rate_limit",
+            ),
+        ] {
+            for is_stream in [false, true] {
+                let (provider, manager) = fake_thinking_signature_provider(&server.base_url, 20);
+                for round in 1..=5 {
+                    let request_body = thinking_signature_request_body(scenario, round);
+                    let retry_body = strip_reasoning_content_for_provider_test(&request_body);
+                    let builder_calls = Arc::new(AtomicUsize::new(0));
+                    let builder_counter = builder_calls.clone();
+                    let budget = Arc::new(InferenceAttemptBudget::new(4));
+                    let hits_before = server.state.scenario_hits(scenario);
+                    let error = call_thinking_signature_retry(
+                        &provider,
+                        &request_body,
+                        is_stream,
+                        budget.clone(),
+                        false,
+                        None,
+                        move || {
+                            builder_counter.fetch_add(1, Ordering::SeqCst);
+                            Ok(retry_body)
+                        },
+                    )
+                    .await
+                    .expect_err("retryable second response must surface as transient failure");
+
+                    assert_eq!(server.state.scenario_hits(scenario) - hits_before, 2);
+                    assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("class={expected_class}")),
+                        "{scenario} stream={is_stream} round={round}: {}",
+                        error
+                    );
+                    assert!(
+                        !error
+                            .to_string()
+                            .contains("thinking_signature_retry_failed"),
+                        "{scenario} stream={is_stream} round={round}: {}",
+                        error
+                    );
+                    assert!(
+                        !error.to_string().contains("PRIVATE_SIGNATURE_RESPONSE"),
+                        "{scenario} stream={is_stream} round={round}: {}",
+                        error
+                    );
+                    assert_eq!(KiroProvider::call_failure_kind_from_error(&error), None);
+                    let attempts = KiroProvider::attempts_from_error(&error);
+                    assert_eq!(attempts.len(), 2);
+                    assert_eq!(
+                        attempts[0].error_type.as_deref(),
+                        Some("thinking_signature_invalid")
+                    );
+                    assert_eq!(attempts[1].status, Some(expected_status));
+                    assert_eq!(attempts[1].error_type.as_deref(), Some(expected_class));
+                    assert_eq!(attempts[0].credential_id, attempts[1].credential_id);
+                    let snapshot = budget.snapshot();
+                    assert_eq!(snapshot.consumed, 2);
+                    assert_eq!(snapshot.local_attempts, 2);
+                    assert_eq!(snapshot.external_attempts, 0);
+                    let manager_snapshot = manager.snapshot();
+                    assert!(
+                        manager_snapshot
+                            .entries
+                            .iter()
+                            .any(|entry| entry.cooled_down),
+                        "{scenario} stream={is_stream} round={round}: expected transient cooldown"
+                    );
+                    let cooldown_reasons = manager_snapshot
+                        .entries
+                        .iter()
+                        .flat_map(|entry| entry.cooldowns.iter())
+                        .filter_map(|cooldown| cooldown.reason.as_deref())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        cooldown_reasons
+                            .iter()
+                            .any(|reason| reason.contains(cooldown_reason)),
+                        "{scenario} stream={is_stream} round={round}: {:?}",
+                        cooldown_reasons
                     );
                 }
             }
@@ -5938,16 +6040,19 @@ mod tests {
     }
 
     #[test]
-    fn mcp_completion_failure_types_release_and_apply_expected_cooldown_for_five_rounds() {
-        for (kind, expected_transient_kind) in [
-            (McpCallFailureKind::InvalidRequest, None),
-            (McpCallFailureKind::AttemptLimit, None),
-            (McpCallFailureKind::RateLimit, Some("rate_limit")),
-            (McpCallFailureKind::Timeout, Some("network")),
-            (McpCallFailureKind::ResponseTooLarge, Some("protocol")),
-            (McpCallFailureKind::BodyRead, Some("network")),
-            (McpCallFailureKind::Protocol, Some("protocol")),
-            (McpCallFailureKind::Upstream, Some("server")),
+    fn mcp_completion_failure_types_release_without_poisoning_core_credentials_for_five_rounds() {
+        for kind in [
+            McpCallFailureKind::Scheduler,
+            McpCallFailureKind::InvalidRequest,
+            McpCallFailureKind::AttemptLimit,
+            McpCallFailureKind::AuxiliaryAttemptLimit,
+            McpCallFailureKind::AuxiliaryConcurrency,
+            McpCallFailureKind::RateLimit,
+            McpCallFailureKind::Timeout,
+            McpCallFailureKind::ResponseTooLarge,
+            McpCallFailureKind::BodyRead,
+            McpCallFailureKind::Protocol,
+            McpCallFailureKind::Upstream,
         ] {
             for _ in 0..5 {
                 let mut config = Config::default();
@@ -5988,17 +6093,9 @@ mod tests {
                 let snapshot = manager.snapshot();
                 assert_eq!(snapshot.entries[0].in_flight_requests, 0);
                 assert_eq!(snapshot.entries[0].success_count, 0);
-                assert_eq!(
-                    snapshot.entries[0].cooled_down,
-                    expected_transient_kind.is_some()
-                );
-                assert_eq!(
-                    snapshot.entries[0].last_error_kind.as_deref(),
-                    expected_transient_kind
-                );
-                assert!(snapshot.entries[0].last_error_reason.as_deref().is_none_or(
-                    |reason| reason == format!("mcp_completion {}", kind.scheduler_reason())
-                ));
+                assert!(!snapshot.entries[0].cooled_down);
+                assert_eq!(snapshot.entries[0].last_error_kind.as_deref(), None);
+                assert_eq!(snapshot.entries[0].last_error_reason.as_deref(), None);
             }
         }
     }
@@ -6197,7 +6294,7 @@ mod tests {
                 let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
                 let provider =
-                    KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
                 let budget = Arc::new(InferenceAttemptBudget::new(4));
                 let hits_before = server.state.mcp_hits.load(Ordering::Relaxed);
 
@@ -6232,6 +6329,21 @@ mod tests {
                     attempt.attempt <= 4
                         && attempt.error_message.as_deref() == Some("upstream_error")
                 }));
+                let scheduler_snapshot = manager.snapshot();
+                assert!(
+                    scheduler_snapshot
+                        .entries
+                        .iter()
+                        .all(|entry| !entry.cooled_down),
+                    "pool {pool_size} round {round}: MCP auxiliary failures must not globally cool model credentials"
+                );
+                assert!(
+                    scheduler_snapshot
+                        .entries
+                        .iter()
+                        .all(|entry| entry.last_error_kind.is_none()),
+                    "pool {pool_size} round {round}: MCP auxiliary failures must not write model scheduler errors"
+                );
             }
         }
     }
@@ -6268,7 +6380,7 @@ mod tests {
                 let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
                 let provider =
-                    KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
                 let budget = Arc::new(InferenceAttemptBudget::new(4));
                 let started = Instant::now();
                 let error = provider
@@ -6301,6 +6413,18 @@ mod tests {
                     Some(expected_kind.as_error_type())
                 );
                 assert!(!format!("{:?}", attribution).contains("misleading private body"));
+                let snapshot = manager.snapshot();
+                assert!(
+                    snapshot.entries.iter().all(|entry| !entry.cooled_down),
+                    "{scenario} round {round}: MCP error body handling must not cool model credentials"
+                );
+                assert!(
+                    snapshot
+                        .entries
+                        .iter()
+                        .all(|entry| entry.last_error_kind.is_none()),
+                    "{scenario} round {round}: MCP error body handling must not write model scheduler errors"
+                );
             }
         }
     }
@@ -9104,25 +9228,6 @@ impl KiroProvider {
                         failure_kind,
                         format!("MCP 请求发送失败（{}）: {}", credential_context, e),
                     ));
-                    if let Err(err) = self.token_manager.report_transient_failure_kind(
-                        ctx.id,
-                        None,
-                        TransientFailureKind::Network,
-                        None,
-                        format!("send_error {}", e),
-                    ) {
-                        self.finish_attempt(&mut ctx);
-                        return Err(Self::mcp_failure_error_with_attribution(
-                            McpCallFailureKind::Upstream,
-                            format!(
-                                "MCP 请求发送失败（{}，调度状态写入失败）: {}",
-                                credential_context, err
-                            ),
-                            Some(ctx.id),
-                            Some(credential_label),
-                            attempts,
-                        ));
-                    }
                     let retry_target_available = self.maybe_exclude_after_transient_failure(
                         None,
                         ctx.id,
@@ -9153,8 +9258,6 @@ impl KiroProvider {
             };
 
             let status = response.status();
-            let retry_after = Self::retry_after_duration(response.headers());
-
             // 成功响应
             if status.is_success() {
                 return Ok(McpCallResponse {
@@ -9229,43 +9332,18 @@ impl KiroProvider {
                         ));
                     }
 
-                    let Some(transient_kind) = failure_kind.transient_failure_kind() else {
-                        return Err(Self::mcp_failure_error_with_attribution(
-                            failure_kind,
-                            format!("MCP 响应正文读取失败（{}）", credential_context),
-                            Some(ctx.id),
-                            Some(credential_label),
-                            attempts,
-                        ));
-                    };
-                    if let Err(record_error) = self.token_manager.report_transient_failure_kind(
-                        ctx.id,
-                        None,
-                        transient_kind,
-                        retry_after,
-                        format!("mcp_response_body {}", failure_kind.scheduler_reason()),
-                    ) {
-                        return Err(Self::mcp_failure_error_with_attribution(
-                            McpCallFailureKind::Upstream,
-                            format!(
-                                "MCP 响应正文读取失败（{}，调度状态写入失败）: {}",
-                                credential_context, record_error
-                            ),
-                            Some(ctx.id),
-                            Some(credential_label),
-                            attempts,
-                        ));
-                    }
-                    let retry_target_available = self.maybe_exclude_after_transient_failure(
-                        None,
-                        ctx.id,
-                        &credential_label,
-                        &mut excluded_ids,
-                    );
                     last_error = Some(Self::mcp_failure_error(
                         failure_kind,
                         format!("MCP 响应正文读取失败（{}）", credential_context),
                     ));
+                    let retry_target_available = failure_kind
+                        .should_retry_mcp_with_alternate_credential()
+                        && self.maybe_exclude_after_transient_failure(
+                            None,
+                            ctx.id,
+                            &credential_label,
+                            &mut excluded_ids,
+                        );
                     if attempt + 1 < max_retries && retry_target_available {
                         sleep(Self::retry_delay(attempt)).await;
                         continue;
@@ -9324,25 +9402,6 @@ impl KiroProvider {
                         attempt_started_at,
                         None,
                     );
-                    if let Err(err) = self.token_manager.report_transient_failure_kind(
-                        ctx.id,
-                        None,
-                        TransientFailureKind::RateLimit,
-                        retry_after,
-                        format!("rate_limit_risk_control status={status}"),
-                    ) {
-                        self.finish_attempt(&mut ctx);
-                        return Err(Self::mcp_failure_error_with_attribution(
-                            McpCallFailureKind::Upstream,
-                            format!(
-                                "MCP 请求失败（{}，调度状态写入失败）: {}",
-                                credential_context, err
-                            ),
-                            Some(ctx.id),
-                            Some(credential_label),
-                            attempts,
-                        ));
-                    }
                     last_error = Some(Self::mcp_failure_error(
                         failure_kind,
                         format!("MCP 请求失败（{}）: {}", credential_context, status),
@@ -9512,25 +9571,6 @@ impl KiroProvider {
                         credential_context, status
                     ),
                 ));
-                if let Err(err) = self.token_manager.report_transient_failure_kind(
-                    ctx.id,
-                    None,
-                    TransientFailureKind::RateLimit,
-                    retry_after,
-                    format!("payment_required status={status}"),
-                ) {
-                    self.finish_attempt(&mut ctx);
-                    return Err(Self::mcp_failure_error_with_attribution(
-                        McpCallFailureKind::Upstream,
-                        format!(
-                            "MCP 请求失败（{}，调度状态写入失败）: {}",
-                            credential_context, err
-                        ),
-                        Some(ctx.id),
-                        Some(credential_label),
-                        attempts,
-                    ));
-                }
                 let retry_target_available = self.maybe_exclude_after_transient_failure(
                     None,
                     ctx.id,
@@ -9723,30 +9763,6 @@ impl KiroProvider {
                     failure_kind,
                     format!("MCP 请求失败（{}）: {}", credential_context, status),
                 ));
-                let kind = if status.as_u16() == 429 {
-                    TransientFailureKind::RateLimit
-                } else {
-                    TransientFailureKind::Server
-                };
-                if let Err(err) = self.token_manager.report_transient_failure_kind(
-                    ctx.id,
-                    None,
-                    kind,
-                    retry_after,
-                    format!("status={status}"),
-                ) {
-                    self.finish_attempt(&mut ctx);
-                    return Err(Self::mcp_failure_error_with_attribution(
-                        McpCallFailureKind::Upstream,
-                        format!(
-                            "MCP 请求失败（{}，调度状态写入失败）: {}",
-                            credential_context, err
-                        ),
-                        Some(ctx.id),
-                        Some(credential_label),
-                        attempts,
-                    ));
-                }
                 let retry_target_available = self.maybe_exclude_after_transient_failure(
                     None,
                     ctx.id,
@@ -9834,31 +9850,13 @@ impl KiroProvider {
                 failure_kind,
                 format!("MCP 请求失败（{}）: {}", credential_context, status),
             ));
-            if let Err(err) = self.token_manager.report_transient_failure_kind(
-                ctx.id,
-                None,
-                TransientFailureKind::Protocol,
-                retry_after,
-                format!("unknown_error status={status}"),
-            ) {
-                self.finish_attempt(&mut ctx);
-                return Err(Self::mcp_failure_error_with_attribution(
-                    McpCallFailureKind::Upstream,
-                    format!(
-                        "MCP 请求失败（{}，调度状态写入失败）: {}",
-                        credential_context, err
-                    ),
-                    Some(ctx.id),
-                    Some(credential_label),
-                    attempts,
-                ));
-            }
-            let retry_target_available = self.maybe_exclude_after_transient_failure(
-                None,
-                ctx.id,
-                &credential_label,
-                &mut excluded_ids,
-            );
+            let retry_target_available = failure_kind.should_retry_mcp_with_alternate_credential()
+                && self.maybe_exclude_after_transient_failure(
+                    None,
+                    ctx.id,
+                    &credential_label,
+                    &mut excluded_ids,
+                );
             self.finish_attempt(&mut ctx);
             if attempt + 1 < max_retries && retry_target_available {
                 sleep(Self::retry_delay(attempt)).await;
@@ -10971,9 +10969,18 @@ impl KiroProvider {
                     }
                 };
                 let retry_status = retry_response.status();
+                let retry_after = Self::retry_after_duration(retry_response.headers());
                 let retry_content_kind = Self::upstream_content_kind(&retry_response);
+                // Keep the signature-retry success gate aligned with the normal provider
+                // success gate above. The legacy Kiro IDE endpoint can return a binary
+                // AWS EventStream while labeling the response as application/json; handlers
+                // sniff the body and still reject real JSON error envelopes before committing
+                // downstream success.
                 if retry_status.is_success()
-                    && retry_content_kind == UpstreamContentKind::EventStream
+                    && matches!(
+                        retry_content_kind,
+                        UpstreamContentKind::EventStream | UpstreamContentKind::Json
+                    )
                 {
                     Self::push_attempt(
                         &mut attempts,
@@ -11073,6 +11080,108 @@ impl KiroProvider {
                         &attempts,
                         KiroCallFailureKind::ThinkingSignatureInvalid,
                     ));
+                }
+
+                if matches!(retry_status.as_u16(), 408 | 429) || retry_status.is_server_error() {
+                    let failure_kind = match retry_status.as_u16() {
+                        408 => ApiUpstreamFailureKind::Timeout,
+                        429 => ApiUpstreamFailureKind::RateLimit,
+                        _ => ApiUpstreamFailureKind::Server,
+                    };
+                    let message = Self::api_failure_diagnostic(
+                        failure_kind,
+                        retry_status,
+                        Some(retry_upstream_body.bytes),
+                        retry_after,
+                        Some(retry_content_kind),
+                        Some("thinking_signature_retry"),
+                    );
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        failure_class = failure_kind.as_error_type(),
+                        upstream_status = retry_status.as_u16(),
+                        body_bytes = retry_upstream_body.bytes,
+                        attempt = attempt + 2,
+                        max_retries,
+                        "Kiro API thinking-signature retry returned a retryable upstream status"
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt.saturating_add(1),
+                        ctx.id,
+                        &credential_label,
+                        Some(retry_status),
+                        "fail",
+                        Some(failure_kind.as_error_type()),
+                        Some(message.clone()),
+                        retry_started_at,
+                        model.as_deref(),
+                    );
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        model.as_deref(),
+                        failure_kind
+                            .transient_failure_kind()
+                            .expect("retryable status has a transient failure kind"),
+                        retry_after,
+                        failure_kind.scheduler_reason(),
+                    ) {
+                        let final_message = format!(
+                            "{} API thinking-signature retry 失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
+                    }
+                    self.maybe_exclude_after_soft_failure(
+                        conversation_id.as_deref(),
+                        model.as_deref(),
+                        ctx.id,
+                        &credential_label,
+                        &mut excluded_ids,
+                    );
+                    self.maybe_exclude_after_transient_failure(
+                        model.as_deref(),
+                        ctx.id,
+                        &credential_label,
+                        &mut excluded_ids,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(message, &attempts));
+                }
+
+                if retry_status.is_client_error() {
+                    let message = Self::api_failure_diagnostic(
+                        ApiUpstreamFailureKind::InvalidRequest,
+                        retry_status,
+                        Some(retry_upstream_body.bytes),
+                        retry_after,
+                        Some(retry_content_kind),
+                        Some("thinking_signature_retry"),
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt.saturating_add(1),
+                        ctx.id,
+                        &credential_label,
+                        Some(retry_status),
+                        "fail",
+                        Some(ApiUpstreamFailureKind::InvalidRequest.as_error_type()),
+                        Some(message.clone()),
+                        retry_started_at,
+                        model.as_deref(),
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(message, &attempts));
                 }
 
                 let message = Self::thinking_signature_retry_failure_diagnostic(

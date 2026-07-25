@@ -96,7 +96,10 @@ use crate::external_pool::{
     ExternalPoolRequestBodyMode, ExternalRouteRequest, ExternalRouteRequestPreparationCache,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
-use crate::kiro::call_trace::{KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink};
+use crate::kiro::call_trace::{
+    AccountRejectReason, KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink,
+    SelectionFailureStage,
+};
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion, McpCallAttribution};
 use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteStateKind};
 
@@ -5642,6 +5645,29 @@ async fn post_messages_inner(
         }
         tracing::info!("detected native WebSearch tool request");
 
+        if let Some(external) = external_fallback.as_ref() {
+            let request_id = envelope::request_id();
+            let preflight_model = model_resolution
+                .upstream_model
+                .as_deref()
+                .unwrap_or(payload.model.as_str());
+            if let Some(response) = maybe_local_pool_preflight_external_response(
+                Some(external),
+                &request_id,
+                Some(preflight_model),
+            )
+            .await
+            {
+                tracing::warn!(
+                    request_id,
+                    model = %payload.model,
+                    upstream_model = %preflight_model,
+                    "native WebSearch MCP skipped because local pool preflight routed request to external pool"
+                );
+                return response;
+            }
+        }
+
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
             &payload.model,
@@ -5727,6 +5753,17 @@ async fn post_messages_inner(
                 internal_reason,
                 attribution,
             } => {
+                if let Some(external_response) =
+                    maybe_external_fallback_after_websearch_mcp_failure(
+                        external_fallback.as_ref(),
+                        &request_id,
+                        internal_reason,
+                        &attribution,
+                    )
+                    .await
+                {
+                    return external_response;
+                }
                 let error_metadata = websearch_error_metadata(&attribution, internal_reason);
                 let usage_context = usage_context.attach_credential(
                     attribution.credential_id,
@@ -6031,6 +6068,85 @@ async fn maybe_local_pool_preflight_external_response(
     let outcome = external_fallback?
         .local_pool_preflight_outcome(request_id, model)
         .await?;
+    Some(match outcome {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(err) => err.into_response(request_id),
+    })
+}
+
+fn websearch_mcp_external_fallback_signal(
+    internal_reason: &str,
+    attribution: &McpCallAttribution,
+) -> Option<(&'static str, Option<KiroCallFailureKind>)> {
+    if internal_reason == "websearch_mcp_scheduler_unavailable" {
+        if let Some(selection_failure) = attribution.selection_failure.as_ref() {
+            return match selection_failure.primary_reason {
+                AccountRejectReason::NoAccounts => Some(("无可用凭据", None)),
+                AccountRejectReason::Disabled
+                | AccountRejectReason::MissingAuth
+                | AccountRejectReason::HealthBlocked => Some(("所有账号已禁用", None)),
+                AccountRejectReason::ModelNotSupported | AccountRejectReason::RouteNotAllowed => {
+                    Some(("模型不支持", None))
+                }
+                AccountRejectReason::ProxyUnavailable => Some(("所有账号代理不可用", None)),
+                AccountRejectReason::RpmLimited => Some(("429 rate limit", None)),
+                AccountRejectReason::AccountConcurrencyFull
+                | AccountRejectReason::GlobalConcurrencyFull => Some(("并发槽位已满", None)),
+                AccountRejectReason::CooldownActive
+                | AccountRejectReason::RefreshInProgress
+                | AccountRejectReason::RefreshFailed => Some(("临时冷却", None)),
+                AccountRejectReason::RiskCircuitOpen => Some((
+                    "本地账号池风险保护已打开",
+                    Some(KiroCallFailureKind::LocalPoolRiskCircuitOpen),
+                )),
+                AccountRejectReason::StickyTargetUnavailable => Some(("临时排除", None)),
+                AccountRejectReason::Unknown
+                    if selection_failure.stage == SelectionFailureStage::DispatchQueue =>
+                {
+                    Some(("Redis 调度协调状态不可用", None))
+                }
+                AccountRejectReason::Unknown => Some(("本地账号调度容量暂不可用", None)),
+            };
+        }
+        return Some(("Redis 调度协调状态不可用", None));
+    }
+    match internal_reason {
+        "websearch_auxiliary_attempt_limit" => Some((
+            "WebSearch MCP auxiliary attempts exhausted",
+            Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted),
+        )),
+        "websearch_auxiliary_concurrency" => Some((
+            "WebSearch MCP auxiliary concurrency saturated",
+            Some(KiroCallFailureKind::AuxiliaryConcurrencySaturated),
+        )),
+        "websearch_mcp_rate_limit" => Some(("WebSearch MCP 429 rate limit", None)),
+        "websearch_mcp_timeout" | "websearch_mcp_body_timeout" => {
+            Some(("WebSearch MCP 504 timeout", None))
+        }
+        "websearch_mcp_body_read" => Some(("WebSearch MCP network body read failure", None)),
+        "websearch_mcp_upstream_error" => Some(("WebSearch MCP 503 upstream_error", None)),
+        _ => None,
+    }
+}
+
+async fn maybe_external_fallback_after_websearch_mcp_failure(
+    external_fallback: Option<&ExternalFallbackContext>,
+    request_id: &str,
+    internal_reason: &str,
+    attribution: &McpCallAttribution,
+) -> Option<Response> {
+    let (message, call_failure_kind) =
+        websearch_mcp_external_fallback_signal(internal_reason, attribution)?;
+    let attempts = attribution.attempts.clone();
+    let outcome = maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+        external_fallback,
+        request_id,
+        message,
+        call_failure_kind,
+        attempts.clone(),
+        attempts,
+    )
+    .await?;
     Some(match outcome {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(err) => err.into_response(request_id),

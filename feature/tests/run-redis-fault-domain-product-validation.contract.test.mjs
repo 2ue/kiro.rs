@@ -246,7 +246,7 @@ test('configuration rejects DB or prefix only Redis separation and supports obse
   const validator = sourceWindow(source, 'pub fn validate_redis_fault_domains', 1_500)
   assert.match(validator, /changing DB or keyPrefix is not sufficient/)
   assert.match(validator, /business == observability/)
-  const envOverrides = sourceWindow(source, 'fn apply_env_overrides', 1_500)
+  const envOverrides = sourceWindow(source, 'fn apply_env_overrides', 2_500)
   assert.match(envOverrides, /KIRO_RS_OBSERVABILITY_REDIS_URL/)
   assert.match(envOverrides, /KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX/)
 })

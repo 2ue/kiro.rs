@@ -9,7 +9,10 @@
 use reqwest::RequestBuilder;
 use uuid::Uuid;
 
-use super::{KiroEndpoint, RequestContext, serialize_json_with_capacity};
+use super::{
+    KiroEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
+    normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
+};
 use crate::kiro::protocol::{
     is_external_idp_credentials, resolve_agent_mode, resolve_profile_arn,
     resolve_streaming_profile_arn,
@@ -184,14 +187,16 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
 }
 
 fn transform_ide_api_body(body: &str, profile_arn: &Option<String>) -> String {
-    if profile_arn.is_none() {
+    let normalize_reasoning_fields = body_may_need_output_config_thinking_normalization(body);
+    if profile_arn.is_none() && !normalize_reasoning_fields {
         return body.to_string();
     }
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
         return body.to_string();
     };
     let profile_changed = set_profile_arn(&mut json, profile_arn);
-    if !profile_changed {
+    let reasoning_fields_changed = normalize_output_config_thinking_compatibility_json(&mut json);
+    if !profile_changed && !reasoning_fields_changed {
         return body.to_string();
     }
     let profile_allowance = profile_arn
@@ -316,18 +321,42 @@ mod tests {
     }
 
     #[test]
-    fn test_ide_preserves_existing_schema_owned_thinking_field() {
-        let body = r#"{"additionalModelRequestFields":{"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}}"#;
+    fn test_ide_preserves_existing_adaptive_schema_owned_thinking_field() {
+        let body = r#"{"additionalModelRequestFields":{"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"low"}}}"#;
         let result = transform_ide_api_body(body, &None);
         let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             json["additionalModelRequestFields"]["thinking"]["type"],
-            "disabled"
+            "adaptive"
+        );
+        assert_eq!(
+            json["additionalModelRequestFields"]["thinking"]["display"],
+            "summarized"
         );
         assert_eq!(
             json["additionalModelRequestFields"]["output_config"]["effort"],
             "low"
         );
+    }
+
+    #[test]
+    fn ide_normalizes_output_config_with_disabled_thinking_for_five_rounds() {
+        let body = r#"{"additionalModelRequestFields":{"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}}"#;
+
+        for round in 0..5 {
+            let result = transform_ide_api_body(body, &None);
+            let json: Value = serde_json::from_str(&result).unwrap();
+            assert!(
+                json["additionalModelRequestFields"]
+                    .get("thinking")
+                    .is_none(),
+                "round {round}: output_config must not be sent with non-adaptive thinking"
+            );
+            assert_eq!(
+                json["additionalModelRequestFields"]["output_config"]["effort"], "low",
+                "round {round}"
+            );
+        }
     }
 
     #[test]

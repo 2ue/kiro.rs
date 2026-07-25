@@ -1,10 +1,12 @@
 # 当前代码重新验证矩阵
 
-Date: 2026-07-23
+Date: 2026-07-26
 
 Role: 修复前复现、修复后回归和发布门禁的可执行合同
 
-Status: `execute-ready / final-release-gate-pass / explicit-limits-recorded`
+Status: `execute-ready / current-candidate-cli-and-load-pass / explicit-limits-recorded`
+
+2026-07-26 当前候选追加验证：仓库外 `kiro-rs` SHA-256 `7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec`。真实 Claude Code CLI fake-upstream gate 已通过：bare invoke `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire `60/60`（CLI/IDE × absent/low/medium/high/xhigh/max × 5，`violations=0`）。fake-upstream load/chaos 已通过：L3 `9/9`、L4 `12/12`、L5 `421/421` long-stream success + `12/12` recovery，RSS/FD 回落。release profile 本地复核已通过：Rust 1.92 下 fmt、clippy baseline（实际 `815` / baseline `849`，未更新 baseline）、no-default check、PG usage/pricing/dashboard smoke。Node/文档/inventory gate 已通过且 `targets=0 reservations=0 target_processes=0 blockers=0`。证据见 [candidate-c0-claude-cli-real-protocol-20260726](../evidence/candidate-c0-claude-cli-real-protocol-20260726.md) 与 [candidate-c0-load-chaos-20260726](../evidence/candidate-c0-load-chaos-20260726.md)。真实上游成功 smoke 当前受本地 `9022` disabled credentials 阻塞，不计 pass。
 
 2026-07-23 v0.0.117 最终统一候选已完成 release gate：仓库外 `kiro-rs` SHA `760345d76b3d2ea70694cc420cfde5078ebc8056c7a31a6d7df135d714509839`，`kiro_loadtest` SHA `3fbaa97a1e0556f38546393068b3afd47caaa48280620c6c8dec3d55d7828ada`。no-default `cargo test --locked --all-targets --no-default-features` 与 default `cargo test --locked --all-targets` 均通过（main `1757 passed / 0 failed / 6 ignored`，`kiro_loadtest 31/31`），`cargo fmt --all -- --check`、clippy baseline `849/849`、release build、feature docs 48 issue docs / 122 links、`node --test feature/tests/*.test.mjs`（`283 tests / 261 pass / 22 explicit skips / 0 fail`）和 `git diff --check` 通过。真实 Claude CLI final gates：raw thinking capture 30/30、Kiro thinking wire 60/60、bare invoke 20/20、long-session 5 × 20 tool cycles（110 turns、100/100 tool pairs、leakMatches=0）。Frozen load/chaos：L3 9/9 pass、L4 12/12 pass、L5 60s soak + 60s idle pass；120s/15s 首轮 request/recovery pass 但 RSS cold-start threshold false，作为短 idle 观测记录。该批证据见 [final release gate evidence](../evidence/final-release-gate-20260723.md)。Docker 动态验证按用户要求豁免，不计 pass；真实生产 `9022` 未被停止、重启、迁移或压测。
 

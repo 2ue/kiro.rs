@@ -2,15 +2,56 @@
 
 Role: 本轮问题、复现、修复、验证、残余风险与发布结果的最终汇总入口
 
-Status: `release-gate-pass-with-local-9022-inventory-exception / v0.0.117 publish-pending`
+Status: `current-candidate-validated / publish-pending`
 
-Last updated: 2026-07-23
+Last updated: 2026-07-26
 
 ## 1. 使用口径
 
 本报告最终必须回答六个问题：实际发生了什么；为什么发生；如何稳定复现；选择了什么修复；修复后哪些正常、异常、长对话和负载场景已被当前构建证明；哪些风险仍未覆盖。任何结论都必须回链到专题文档、可重复命令或脚本、报告和构建身份。
 
 以下内容不能单独构成“已修复”：源码看起来合理、单个关键词不再出现、单轮 happy path、单元测试总数全绿、旧版本报告、没有运行到的 skipped 集成测试、没有真实执行 Claude Code CLI 的 curl 结果。
+
+## 1.0 2026-07-26 当前候选判定
+
+当前工作树在 2026-07-25/26 继续处理生产复发问题后，形成新的待发布候选。Rust 源码层修复范围包括：
+
+- Native WebSearch 在 typed parse 后绕过 normalized external fallback 的断路；
+- MCP/WebSearch 辅助失败污染主模型凭据 runtime health；
+- `thinking.disabled + output_config` 等 Claude CLI/Kiro wire 不兼容组合；
+- thinking signature retry 第二响应把 2xx JSON-labeled EventStream 或 429/5xx transient 误归类；
+- personal/social 账号 `2xx + application/json` 过早按 header 判定为 `api_protocol_error`，未交给 handler sniff body；
+- 114+ dashboard/usage/计费旧 schema 缺列导致运行时 `error returned from database`；
+- PostgreSQL 主业务 pool 与 usage/dashboard 写入/聚合 pool 未隔离；
+- PostgreSQL cleanup advisory lock 测试跨 schema 互相干扰导致 CI flake；
+- dashed/dotted pricing alias，例如 `claude-opus-4-8` 计价匹配 `claude-opus-4.8`。
+
+当前冻结候选二进制：
+
+```text
+kiro-rs sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
+```
+
+已完成验证：
+
+- C0 静态/全量 Rust/release build/clippy baseline：已通过，scoped Cargo target 已清理。
+- fake-upstream load/chaos：L3 `9/9`、L4 `12/12`、L5 `60s soak + recovery` 通过，RSS/FD 回落；证据见 [candidate-c0-load-chaos-20260726](evidence/candidate-c0-load-chaos-20260726.md)。
+- 真实 Claude Code CLI fake-upstream 协议：
+  - bare invoke `20/20`；
+  - long session `5 sessions / 110 CLI turns / 100 tool_use-tool_result pairs / leakMatches=0`；
+  - thinking wire `60/60`，CLI/IDE × absent/low/medium/high/xhigh/max × 5，`violations=0`；
+  - 证据见 [candidate-c0-claude-cli-real-protocol-20260726](evidence/candidate-c0-claude-cli-real-protocol-20260726.md)。
+- 构建产物 gate：验证后 `targets=0 reservations=0 target_processes=0 blockers=0`。
+
+真实上游成功 smoke 当前不能记为 pass：本地 `9022` 的持久化凭据全部处于 disabled/runtime bad state（TemporarilySuspended/Manual/QuotaExceeded），继续调用会增加账号风险；现网只读证据也显示部分实例账号池已被风控或外部池接管。当前结论只能保证已列明的本地协议转换、body sniff、调度/异常恢复和 fake-upstream 行为；不承诺失效账号在真实上游立即恢复。
+
+当前判定：可进入 Git 发布流程。发布后必须按生产 SQL/usage 指纹复核：
+
+- `websearch_mcp_scheduler_unavailable` 在 normalized external 可用且本地池不可调度时不再新增；
+- `mcp_completion upstream_error` 不再写入主模型凭据卡片最近错误；
+- 114+ dashboard/usage 聚合不再因缺列直接失败；
+- external pool 成功请求的 `pricing_available/pricing_model/totalCostUsd` 不再因为 dashed/dotted alias 变成 0；
+- 若仍出现 `2xx JSON api_protocol_error`，用新增/后续 body fingerprint 判断是真 JSON error envelope 还是 JSON-labeled EventStream。
 
 ## 1.1 2026-07-23 当前候选判定
 

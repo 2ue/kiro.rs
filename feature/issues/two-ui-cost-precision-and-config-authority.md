@@ -12,6 +12,8 @@ Severity: P1
 
 两 UI 还会在保存 prompt 配置时把 prompt 子开关镜像到独立 `bodyConversion.*` 字段，造成后端 API 设置被下一次 UI 保存静默覆盖。
 
+2026-07-25 生产取证又暴露一个容易误解的费用口径：多条 `status=error`、`usageSource=none`、`kiroMeteringUsage=0` 的本地错误行仍显示 `estimatedCostUsd/originalCostUsd > 0`。源码原因是 local usage recorder 会按请求输入 token 做“诊断估价”，即使没有成功 usage/metering event。这个值适合做“如果按该输入量计价的估算暴露量”，但 UI 当前直接以 warning 形式展示为费用，容易让用户理解成错误请求已经真实计费。该问题不应通过临时清零历史 rollup 解决；需要在明细和汇总 UI 中明确区分 `usageSource=none` 的诊断估价、真实上游 reported usage、Kiro metering usage 和外部池 billing。
+
 ## 根因
 
 费用展示曾由各页面各自调用 `toFixed` 或直接序列化 number，没有每种 UI surface 的单一精度合同；汇总用正向 `value >= 1` 判断而不是绝对值。配置侧则把 prompt 子开关和 body conversion 视为同一表单状态，在 load/save normalization 中双向镜像，破坏后端独立字段权威。
@@ -29,6 +31,7 @@ Severity: P1
 - 建立共享的展示合同和各前端本地单一 formatter 源；明细固定 8 位，汇总精度由明确决策控制，不能页面各自实现。
 - promptSteering 与 bodyConversion 独立 round-trip；只修改用户实际编辑的字段。
 - UI 文案将 operator prompt 与协议转换分区，不再称一个开关为所有优化的“总开关”。
+- 对 `status != success` 且 `usageSource=none` 的本地错误行，UI 应把 `estimatedCostUsd/originalCostUsd` 标注为“诊断估价/输入暴露估算”，不纳入“真实计费成功”语义；汇总卡片需要显示 `Kiro计量=0` 与 `usageSource=none`，避免把错误行估价误认为真实扣费。若未来要从汇总费用中排除这类错误诊断估价，必须同步调整 PgSQL/Redis rollup、CSV、详情和历史迁移口径，不能只改前端显示。
 
 ## 验收
 
