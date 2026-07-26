@@ -660,10 +660,6 @@ fn storage_fallback_runtime() -> &'static Runtime {
 }
 
 fn storage_executor_handle() -> Handle {
-    #[cfg(not(test))]
-    if let Ok(handle) = Handle::try_current() {
-        return handle;
-    }
     storage_fallback_runtime().handle().clone()
 }
 
@@ -685,7 +681,9 @@ pub(crate) fn block_on_storage<T: Send>(
     let started_at = Instant::now();
     let result = if let Ok(handle) = Handle::try_current() {
         match handle.runtime_flavor() {
-            RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| handle.block_on(future)),
+            RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| storage_fallback_runtime().block_on(future))
+            }
             _ => std::thread::scope(|scope| {
                 scope
                     .spawn(move || storage_fallback_runtime().block_on(future))
@@ -694,10 +692,7 @@ pub(crate) fn block_on_storage<T: Send>(
             }),
         }
     } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(future)
+        storage_fallback_runtime().block_on(future)
     };
     let elapsed = started_at.elapsed();
     if elapsed >= StdDuration::from_millis(100) {

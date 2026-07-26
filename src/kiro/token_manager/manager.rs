@@ -1006,6 +1006,13 @@ enum SchedulerRedisHotOutcome<T> {
     Failed { commit_unknown: bool },
 }
 
+struct SuccessReportOutcome {
+    expected_generation: u64,
+    last_used_at: String,
+    runtime_state_changed: bool,
+    alpha: f64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SchedulerRedisUnavailableError {
     retry_after_secs: u64,
@@ -5255,6 +5262,7 @@ impl MultiTokenManager {
         sticky_bound_credential_id(&self.session_bindings, session_id)
     }
 
+    #[allow(dead_code)]
     fn bound_credential_id(&self, session_id: &str) -> Option<u64> {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -5335,6 +5343,7 @@ impl MultiTokenManager {
     }
 
     /// 仅当指定会话当前绑定到该凭据时清理绑定。
+    #[allow(dead_code)]
     pub fn unbind_session_if_bound_to(&self, session_id: &str, credential_id: u64) {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -5361,6 +5370,24 @@ impl MultiTokenManager {
         unbind_sticky_session_if_bound_to(&self.session_bindings, session_id, credential_id);
     }
 
+    /// 请求热路径使用的会话解绑：本地 sticky cache 先行，Redis affinity 异步 best-effort。
+    ///
+    /// 同步版 [`Self::unbind_session_if_bound_to`] 仍保留给管理/测试/需要读取 Redis
+    /// 实际结果的路径；真实 API 请求不应因为 Redis affinity 抖动阻塞 terminal/retry path。
+    pub fn unbind_session_if_bound_to_deferred(&self, session_id: &str, credential_id: u64) {
+        unbind_sticky_session_if_bound_to(&self.session_bindings, session_id, credential_id);
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            spawn_best_effort_storage_task("异步按凭据删除 Redis 会话绑定", async move {
+                redis
+                    .delete_session_binding_if_bound_to(&session_id_owned, credential_id)
+                    .await?;
+                Ok(())
+            });
+        }
+    }
+
     /// 清理某个凭据关联的所有会话绑定。
     pub fn unbind_sessions_for_credential(&self, credential_id: u64) {
         if let Some(redis) = &self.redis_store {
@@ -5374,6 +5401,7 @@ impl MultiTokenManager {
     }
 
     /// 记录绑定账号的一次软失败。返回 true 表示本次请求可以临时 fallback。
+    #[allow(dead_code)]
     pub fn record_session_soft_failure(&self, session_id: &str, credential_id: u64) -> bool {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -5399,6 +5427,30 @@ impl MultiTokenManager {
         record_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id)
     }
 
+    pub fn record_session_soft_failure_deferred(
+        &self,
+        session_id: &str,
+        credential_id: u64,
+    ) -> bool {
+        let should_fallback =
+            record_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id);
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            spawn_best_effort_storage_task("异步记录 Redis 会话软失败", async move {
+                redis
+                    .record_session_soft_failure_with_state(
+                        &session_id_owned,
+                        credential_id,
+                        SESSION_BINDING_TTL_SECS as usize,
+                    )
+                    .await?;
+                Ok(())
+            });
+        }
+        should_fallback
+    }
+
     /// 清理绑定账号的软失败计数。
     pub fn clear_session_soft_failure(&self, session_id: &str, credential_id: u64) {
         if let Some(redis) = &self.redis_store {
@@ -5420,6 +5472,24 @@ impl MultiTokenManager {
             }
         }
         clear_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id);
+    }
+
+    pub fn clear_session_soft_failure_deferred(&self, session_id: &str, credential_id: u64) {
+        clear_sticky_session_soft_failure(&self.session_bindings, session_id, credential_id);
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let session_id_owned = session_id.to_string();
+            spawn_best_effort_storage_task("异步清理 Redis 会话软失败", async move {
+                redis
+                    .clear_session_soft_failure_with_state(
+                        &session_id_owned,
+                        credential_id,
+                        SESSION_BINDING_TTL_SECS as usize,
+                    )
+                    .await?;
+                Ok(())
+            });
+        }
     }
 
     /// 获取 API 调用上下文
@@ -9454,73 +9524,119 @@ impl MultiTokenManager {
         model: Option<&str>,
         latency: Option<StdDuration>,
     ) {
-        let mut success: Option<(u64, String, bool)> = None;
-        let alpha = self
-            .config
-            .lock()
-            .scheduler_error_ewma_alpha
-            .clamp(0.01, 1.0);
-        {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let runtime_state_changed = entry.failure_count > 0
-                    || entry.refresh_failure_count > 0
-                    || entry.warmup_remaining > 0
-                    || entry.runtime_persistence_degraded
-                    || entry.disabled;
-                entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
-                let expected_generation = entry.runtime_generation;
-                if entry.warmup_remaining > 0 {
-                    entry.warmup_remaining -= 1;
-                }
-                entry.success_count += 1;
-                let now = Utc::now().to_rfc3339();
-                entry.last_used_at = Some(now.clone());
-                {
-                    let health = entry_effective_health_mut(entry, model);
-                    health.recent_error_rate *= 1.0 - alpha;
-                    health.transient_failure_streak =
-                        health.transient_failure_streak.saturating_sub(1);
-                    if let Some(latency) = latency {
-                        let latency_ms = latency.as_millis() as f64;
-                        health.latency_ewma_ms = Some(
-                            health
-                                .latency_ewma_ms
-                                .map(|previous| previous + alpha * (latency_ms - previous))
-                                .unwrap_or(latency_ms),
-                        );
-                    }
-                }
-                success = Some((expected_generation, now, runtime_state_changed));
-                tracing::debug!(
-                    "凭据 #{} API 调用成功（累计 {} 次）",
-                    id,
-                    entry.success_count
-                );
-            }
-        }
-        let disabled = match success {
-            Some((expected_generation, last_used_at, true)) => {
-                self.persist_success_state(id, expected_generation, &last_used_at)
-            }
-            Some((expected_generation, last_used_at, false)) => {
-                if self.has_pending_runtime_mutations(id)
-                    || self.should_probe_persisted_runtime_success_state(id)
-                {
-                    self.persist_success_state(id, expected_generation, &last_used_at)
-                } else {
-                    self.record_success_stats_delta(id, &last_used_at);
-                    false
-                }
-            }
-            None => false,
+        let Some(success) = self.record_success_local(id, model, latency) else {
+            return;
+        };
+        let should_persist = success.runtime_state_changed
+            || self.has_pending_runtime_mutations(id)
+            || self.should_probe_persisted_runtime_success_state(id);
+        let disabled = if should_persist {
+            self.persist_success_state(id, success.expected_generation, &success.last_used_at)
+        } else {
+            self.record_success_stats_delta(id, &success.last_used_at);
+            false
         };
         if disabled {
             self.select_highest_priority();
             self.unbind_sessions_for_credential(id);
             self.clear_scheduler_state_for_credential(id, false);
         }
+        self.record_scheduler_success_health(id, model, latency, success.alpha);
+        self.notify_dispatch_state_changed();
+    }
+
+    /// Request/stream completion path variant: update local scheduling state immediately and
+    /// enqueue durable PgSQL/Redis side effects. This keeps stream terminal and response body
+    /// cleanup independent from PgSQL/Redis latency spikes.
+    pub fn report_success_with_latency_deferred(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        latency: Option<StdDuration>,
+    ) {
+        let Some(success) = self.record_success_local(id, model, latency) else {
+            return;
+        };
+        if success.runtime_state_changed
+            || self.has_pending_runtime_mutations(id)
+            || self.should_probe_persisted_runtime_success_state(id)
+        {
+            let operation_id = uuid::Uuid::new_v4();
+            self.enqueue_pending_runtime_mutation(
+                id,
+                PendingCredentialRuntimeMutation::Success {
+                    operation_id,
+                    expected_generation: success.expected_generation,
+                    success_count: 1,
+                },
+            );
+        }
+        self.record_success_stats_delta(id, &success.last_used_at);
+        self.record_scheduler_success_health(id, model, latency, success.alpha);
+        self.notify_dispatch_state_changed();
+    }
+
+    fn record_success_local(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        latency: Option<StdDuration>,
+    ) -> Option<SuccessReportOutcome> {
+        let alpha = self
+            .config
+            .lock()
+            .scheduler_error_ewma_alpha
+            .clamp(0.01, 1.0);
+        let mut entries = self.entries.lock();
+        let entry = entries.iter_mut().find(|e| e.id == id)?;
+        let runtime_state_changed = entry.failure_count > 0
+            || entry.refresh_failure_count > 0
+            || entry.warmup_remaining > 0
+            || entry.runtime_persistence_degraded
+            || entry.disabled;
+        entry.failure_count = 0;
+        entry.refresh_failure_count = 0;
+        let expected_generation = entry.runtime_generation;
+        if entry.warmup_remaining > 0 {
+            entry.warmup_remaining -= 1;
+        }
+        entry.success_count += 1;
+        let now = Utc::now().to_rfc3339();
+        entry.last_used_at = Some(now.clone());
+        {
+            let health = entry_effective_health_mut(entry, model);
+            health.recent_error_rate *= 1.0 - alpha;
+            health.transient_failure_streak = health.transient_failure_streak.saturating_sub(1);
+            if let Some(latency) = latency {
+                let latency_ms = latency.as_millis() as f64;
+                health.latency_ewma_ms = Some(
+                    health
+                        .latency_ewma_ms
+                        .map(|previous| previous + alpha * (latency_ms - previous))
+                        .unwrap_or(latency_ms),
+                );
+            }
+        }
+        tracing::debug!(
+            "凭据 #{} API 调用成功（累计 {} 次）",
+            id,
+            entry.success_count
+        );
+        Some(SuccessReportOutcome {
+            expected_generation,
+            last_used_at: now,
+            runtime_state_changed,
+            alpha,
+        })
+    }
+
+    fn record_scheduler_success_health(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        latency: Option<StdDuration>,
+        alpha: f64,
+    ) {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let model_for_redis = model.map(str::to_string);
@@ -9531,7 +9647,6 @@ impl MultiTokenManager {
                 Ok(())
             });
         }
-        self.notify_dispatch_state_changed();
     }
 
     /// 报告指定凭据遇到上游瞬态错误，按 Retry-After 或默认值临时冷却。
@@ -9744,6 +9859,19 @@ impl MultiTokenManager {
         self.report_success_with_latency(id, model, latency);
         if let Some(sid) = session_id {
             self.clear_session_soft_failure(sid, id);
+        }
+    }
+
+    pub fn report_success_for_session_with_latency_deferred(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        latency: Option<StdDuration>,
+    ) {
+        self.report_success_with_latency_deferred(id, model, latency);
+        if let Some(sid) = session_id {
+            self.clear_session_soft_failure_deferred(sid, id);
         }
     }
 

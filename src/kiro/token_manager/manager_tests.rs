@@ -4331,6 +4331,83 @@ async fn postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_deferred_success_does_not_wait_for_pgsql_pool_pressure_for_five_rounds() {
+    run_isolated_postgres_fixture(|store| async move {
+        let mut credential = api_key_credential("ksk_pool_pressure_terminal");
+        credential.id = Some(1);
+        store.save_credentials(&[credential.clone()]).await.unwrap();
+        let manager = MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+            Some(store.clone()),
+            None,
+        )
+        .unwrap();
+
+        for round in 1..=5 {
+            {
+                let mut entries = manager.entries.lock();
+                let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+                entry.failure_count = 1;
+                assert!(!entry.disabled, "round {round}");
+            }
+
+            let first_connection = store.pool().acquire().await.unwrap();
+            let second_connection = store.pool().acquire().await.unwrap();
+            let started_at = Instant::now();
+            manager.report_success_for_session_with_latency_deferred(
+                1,
+                Some("claude-sonnet-4.5"),
+                Some("terminal-session"),
+                Some(StdDuration::from_millis(123)),
+            );
+            let elapsed = started_at.elapsed();
+            assert!(
+                elapsed < StdDuration::from_millis(500),
+                "round {round}: terminal success must not wait for PgSQL pool pressure, elapsed={elapsed:?}"
+            );
+
+            assert_eq!(manager.runtime_mutation_backlog(), (1, 0), "round {round}");
+            {
+                let entries = manager.entries.lock();
+                let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+                assert!(entry.runtime_persistence_degraded, "round {round}");
+                assert!(!entry.runtime_persistence_quarantined, "round {round}");
+                assert!(!entry.disabled, "round {round}");
+                assert!(entry.disabled_reason.is_none(), "round {round}");
+                assert_eq!(entry.failure_count, 0, "round {round}");
+                assert_eq!(entry.success_count, round, "round {round}");
+            }
+            let route_state = manager.local_pool_route_state(None);
+            assert_eq!(route_state.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+            assert_eq!(route_state.available, 1, "round {round}");
+            assert_eq!(route_state.dispatchable, 1, "round {round}");
+
+            drop(second_connection);
+            drop(first_connection);
+            manager.flush_pending_runtime_mutations();
+
+            assert_eq!(manager.runtime_mutation_backlog(), (0, 0), "round {round}");
+            {
+                let entries = manager.entries.lock();
+                let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+                assert!(!entry.runtime_persistence_degraded, "round {round}");
+                assert!(!entry.runtime_persistence_quarantined, "round {round}");
+                assert!(!entry.disabled, "round {round}");
+                assert_eq!(entry.failure_count, 0, "round {round}");
+                assert_eq!(entry.runtime_revision, round, "round {round}");
+            }
+        }
+
+        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+    })
+    .await;
+}
+
 #[test]
 fn runtime_patch_quarantine_is_field_semantic_for_five_rounds() {
     for round in 1..=5 {
@@ -4910,12 +4987,8 @@ fn finite_dispatch_queue_lease_covers_actual_wait_and_unlimited_wait_renews() {
 #[tokio::test]
 async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
     let config = Config::default();
-    let mut cred1 = KiroCredentials::default();
-    cred1.access_token = Some("t1".to_string());
-    cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
-    cred2.access_token = Some("t2".to_string());
-    cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+    let cred1 = test_access_token_credential("t1", "Pro");
+    let cred2 = test_access_token_credential("t2", "Pro");
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -10795,6 +10868,52 @@ async fn test_only_available_credential_is_not_an_alternate_after_soft_failure()
     assert!(!manager.record_session_soft_failure("session-only", ctx.id));
     assert!(manager.record_session_soft_failure("session-only", ctx.id));
     assert!(!manager.has_alternate_usable_credential(None, &empty, ctx.id));
+}
+
+#[tokio::test]
+async fn test_deferred_session_soft_failure_and_unbind_use_local_state() {
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+
+    let mut cred1 = KiroCredentials::default();
+    cred1.access_token = Some("t1".to_string());
+    cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+    let mut cred2 = KiroCredentials::default();
+    cred2.access_token = Some("t2".to_string());
+    cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+    let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+    let empty = HashSet::new();
+
+    let mut bound = manager
+        .acquire_context_for_session(None, Some("deferred-session"), &empty)
+        .await
+        .unwrap();
+    assert!(!manager.record_session_soft_failure_deferred("deferred-session", bound.id));
+    assert!(manager.record_session_soft_failure_deferred("deferred-session", bound.id));
+
+    let mut excluded = HashSet::new();
+    excluded.insert(bound.id);
+    let mut fallback = manager
+        .acquire_context_for_session(None, Some("deferred-session"), &excluded)
+        .await
+        .unwrap();
+    assert_ne!(bound.id, fallback.id);
+
+    manager.unbind_session_if_bound_to_deferred("deferred-session", fallback.id);
+    fallback.release_in_flight();
+
+    let mut rebound = manager
+        .acquire_context_for_session(None, Some("deferred-session"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        bound.id, rebound.id,
+        "deferred unbind must not remove a sticky binding owned by another credential"
+    );
+
+    rebound.release_in_flight();
+    bound.release_in_flight();
 }
 
 #[test]

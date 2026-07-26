@@ -68,6 +68,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [凭据卡片 mcp_completion runtime 错误来源追踪](mcp-completion-runtime-card-error-source.md)
 - [企业/API-key 200 EventStream EOF 被误判 api_error](enterprise-eventstream-usage-only-tool-eof.md)
 - [运行时栈溢出与 handler future 大小](runtime-stack-overflow-and-handler-future-size.md)
+- [Runtime completion storage bridge starvation](runtime-completion-storage-bridge-starvation.md)
 - [上游错误诊断隐私与响应体边界](upstream-error-diagnostic-privacy-and-bounds.md)
 - [运行时饥饿下的上游 HTTP deadline](upstream-http-deadline-runtime-starvation.md)
 - [JSON 空白压缩的逐字节语义与性能](json-whitespace-compression-byte-semantics.md)

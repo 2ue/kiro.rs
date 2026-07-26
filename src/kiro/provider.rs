@@ -647,7 +647,7 @@ impl McpCallCompletion {
             attempts,
         );
         if self.in_flight_lease.lock().take().is_some() {
-            self.token_manager.report_success_with_latency(
+            self.token_manager.report_success_with_latency_deferred(
                 self.credential_id,
                 None,
                 Some(self.started_at.elapsed()),
@@ -787,12 +787,13 @@ impl KiroApiCompletion {
             return;
         }
         if self.in_flight_lease.lock().take().is_some() {
-            self.token_manager.report_success_for_session_with_latency(
-                self.credential_id,
-                self.model.as_deref(),
-                self.session_id.as_deref(),
-                Some(self.started_at.elapsed()),
-            );
+            self.token_manager
+                .report_success_for_session_with_latency_deferred(
+                    self.credential_id,
+                    self.model.as_deref(),
+                    self.session_id.as_deref(),
+                    Some(self.started_at.elapsed()),
+                );
         }
     }
 
@@ -899,13 +900,14 @@ impl KiroStreamCompletion {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.token_manager.report_success_for_session_with_latency(
-            self.credential_id,
-            self.model.as_deref(),
-            self.session_id.as_deref(),
-            Some(self.started_at.elapsed()),
-        );
         self.in_flight_lease.lock().take();
+        self.token_manager
+            .report_success_for_session_with_latency_deferred(
+                self.credential_id,
+                self.model.as_deref(),
+                self.session_id.as_deref(),
+                Some(self.started_at.elapsed()),
+            );
     }
 
     /// 上游流中断、idle timeout 或上游错误事件时调用。
@@ -915,11 +917,11 @@ impl KiroStreamCompletion {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.in_flight_lease.lock().take();
         if let Some(session_id) = self.session_id.as_deref() {
             self.token_manager
-                .record_session_soft_failure(session_id, self.credential_id);
+                .record_session_soft_failure_deferred(session_id, self.credential_id);
         }
-        self.in_flight_lease.lock().take();
     }
 
     /// 上游流读取错误、idle timeout 或上游错误事件时调用，并让调度器短暂避开该凭据。
@@ -927,6 +929,7 @@ impl KiroStreamCompletion {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.in_flight_lease.lock().take();
         let reason = reason.into();
         if let Err(err) = self.token_manager.report_transient_failure_kind(
             self.credential_id,
@@ -943,9 +946,8 @@ impl KiroStreamCompletion {
         }
         if let Some(session_id) = self.session_id.as_deref() {
             self.token_manager
-                .record_session_soft_failure(session_id, self.credential_id);
+                .record_session_soft_failure_deferred(session_id, self.credential_id);
         }
-        self.in_flight_lease.lock().take();
     }
 
     pub fn touch(&self) {
@@ -7806,7 +7808,7 @@ impl KiroProvider {
         };
         if !self
             .token_manager
-            .record_session_soft_failure(session_id, credential_id)
+            .record_session_soft_failure_deferred(session_id, credential_id)
         {
             return;
         }
@@ -7971,7 +7973,7 @@ impl KiroProvider {
                     excluded_ids.insert(ctx.id);
                     if let Some(session_id) = session_id {
                         self.token_manager
-                            .unbind_session_if_bound_to(session_id, ctx.id);
+                            .unbind_session_if_bound_to_deferred(session_id, ctx.id);
                     }
                     if !has_available {
                         return Ok(CredentialAuthFailureDecision::Exhausted);
@@ -7994,7 +7996,7 @@ impl KiroProvider {
         let has_available = self.token_manager.report_failure(ctx.id);
         if let Some(session_id) = session_id {
             self.token_manager
-                .unbind_session_if_bound_to(session_id, ctx.id);
+                .unbind_session_if_bound_to_deferred(session_id, ctx.id);
         }
 
         if !has_available {
@@ -10145,7 +10147,7 @@ impl KiroProvider {
                     last_error = Some(anyhow::anyhow!(message.clone()));
                     if let Some(session_id) = conversation_id.as_deref() {
                         self.token_manager
-                            .unbind_session_if_bound_to(session_id, ctx.id);
+                            .unbind_session_if_bound_to_deferred(session_id, ctx.id);
                     }
                     tracing::warn!(
                         credential_id = ctx.id,
@@ -10696,7 +10698,7 @@ impl KiroProvider {
                 );
                 if let Some(session_id) = conversation_id.as_deref() {
                     self.token_manager
-                        .unbind_session_if_bound_to(session_id, ctx.id);
+                        .unbind_session_if_bound_to_deferred(session_id, ctx.id);
                 }
                 if !risk_outcome.can_retry_local() {
                     let final_message = if risk_outcome.circuit_open {
@@ -10785,7 +10787,7 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if let Some(session_id) = conversation_id.as_deref() {
                     self.token_manager
-                        .unbind_session_if_bound_to(session_id, ctx.id);
+                        .unbind_session_if_bound_to_deferred(session_id, ctx.id);
                 }
                 if !has_available {
                     let final_message =
@@ -11395,7 +11397,7 @@ impl KiroProvider {
                     }
                     if let Some(session_id) = conversation_id.as_deref() {
                         self.token_manager
-                            .unbind_session_if_bound_to(session_id, ctx.id);
+                            .unbind_session_if_bound_to_deferred(session_id, ctx.id);
                     }
                     excluded_ids.insert(ctx.id);
                     last_error = Some(anyhow::anyhow!(message));
@@ -11464,7 +11466,7 @@ impl KiroProvider {
                     }
                     if let Some(session_id) = conversation_id.as_deref() {
                         self.token_manager
-                            .unbind_session_if_bound_to(session_id, ctx.id);
+                            .unbind_session_if_bound_to_deferred(session_id, ctx.id);
                     }
                     if self.token_manager.has_alternate_usable_credential(
                         model.as_deref(),
