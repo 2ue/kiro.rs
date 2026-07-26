@@ -4385,6 +4385,21 @@ fn json_stream_sniffer_detects_request_body_invalid_exception() {
                 );
                 assert_eq!(error.body_bytes, raw.len());
                 assert!(!error.internal_detail.contains(&marker));
+                let diagnostics = error.diagnostics.as_ref().expect("body diagnostics");
+                assert_eq!(diagnostics["bodyKind"], "json_error_envelope");
+                assert_eq!(diagnostics["firstNonWhitespace"], "json_object");
+                assert_eq!(diagnostics["jsonErrorFields"]["reasonPresent"], true);
+                assert_eq!(diagnostics["jsonErrorFields"]["messagePresent"], true);
+                assert!(
+                    diagnostics["bodyFingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("sha256:")
+                );
+                assert!(
+                    !diagnostics.to_string().contains(&marker),
+                    "diagnostics must not contain raw body values"
+                );
             }
             _ => panic!("round {round}: expected JSON stream error"),
         }
@@ -4434,6 +4449,13 @@ fn json_stream_sniffer_accumulates_split_json_exception() {
                 );
                 assert_eq!(error.body_bytes, expected_body_bytes);
                 assert!(!error.internal_detail.contains(&marker));
+                let diagnostics = error.diagnostics.as_ref().expect("body diagnostics");
+                assert_eq!(diagnostics["bodyKind"], "json_error_envelope");
+                assert_eq!(diagnostics["jsonErrorFields"]["codePresent"], true);
+                assert!(
+                    !diagnostics.to_string().contains(&marker),
+                    "diagnostics must not contain raw body values"
+                );
             }
             _ => panic!("round {round}: expected split JSON stream error"),
         }
@@ -4459,6 +4481,13 @@ fn complete_upstream_body_rejects_json_exception_without_copying_eventstream() {
         );
         assert_eq!(error.body_bytes, raw.len());
         assert!(!error.internal_detail.contains(&marker));
+        let diagnostics = error.diagnostics.as_ref().expect("body diagnostics");
+        assert_eq!(diagnostics["bodyKind"], "json_error_envelope");
+        assert_eq!(diagnostics["jsonErrorFields"]["codePresent"], true);
+        assert!(
+            !diagnostics.to_string().contains(&marker),
+            "diagnostics must not contain raw body values"
+        );
     }
 
     let frame = eventstream_test_frame(
@@ -6137,6 +6166,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         simulated_source: Some(UsageSource::LocalPromptCache),
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6247,6 +6277,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         simulated_source: None,
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6343,6 +6374,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         simulated_source: Some(UsageSource::LocalPromptCache),
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6454,6 +6486,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         simulated_source: None,
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6546,6 +6579,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         simulated_source: Some(UsageSource::LocalPromptCache),
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6668,6 +6702,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         simulated_source: None,
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7004,6 +7039,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         simulated_source: Some(UsageSource::LocalPromptCache),
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7176,6 +7212,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         simulated_source: Some(UsageSource::LocalPromptCache),
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7266,6 +7303,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         simulated_source: None,
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7818,6 +7856,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         simulated_source: Some(UsageSource::LocalPromptCache),
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7919,6 +7958,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         simulated_source: Some(UsageSource::LocalPromptCache),
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,

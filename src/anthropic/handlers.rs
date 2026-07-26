@@ -275,6 +275,7 @@ struct RequestUsageContext {
     simulated_source: Option<UsageSource>,
     payload_breakdown: Option<PayloadByteBreakdown>,
     payload_guard_report: Option<PayloadGuardReport>,
+    error_metadata: Arc<Mutex<Option<serde_json::Value>>>,
     route_subtype_override: Option<UsageRouteSubtype>,
     fallback_reason: Option<String>,
     local_preflight: Option<serde_json::Value>,
@@ -2237,6 +2238,14 @@ impl RequestUsageContext {
         self.latency.payload_guard_ms = Some(elapsed.as_millis().max(1) as u64);
     }
 
+    fn merge_error_metadata(&self, metadata: Option<serde_json::Value>) {
+        let Some(metadata) = metadata else {
+            return;
+        };
+        let mut current = self.error_metadata.lock();
+        *current = merge_error_metadata_values(current.take(), Some(metadata));
+    }
+
     fn set_capacity_weight_units(&self, units: u32) {
         self.capacity_weight_units
             .store(units.clamp(1, 64), Ordering::Release);
@@ -3854,6 +3863,10 @@ impl CredentialUsageContext {
                 .find_map(|attempt| attempt.status)
         });
         let error_id = error_source.as_ref().map(|_| self.request.error_id.clone());
+        let error_metadata = merge_error_metadata_values(
+            self.error_metadata.clone(),
+            self.request.error_metadata.lock().clone(),
+        );
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -3923,7 +3936,7 @@ impl CredentialUsageContext {
             error_status_code,
             error_source,
             error_id,
-            error_metadata: self.error_metadata.clone(),
+            error_metadata,
             public_error_status_code: public_error.as_ref().map(|error| error.status_code),
             public_error_type: public_error.as_ref().map(|error| error.error_type.clone()),
             public_error_message: public_error.map(|error| error.message),
@@ -3936,14 +3949,36 @@ impl CredentialUsageContext {
 fn provider_error_metadata(err: &Error) -> Option<serde_json::Value> {
     let selection_failure = KiroProvider::selection_failure_from_error(err);
     let call_failure_kind = KiroProvider::call_failure_kind_from_error(err);
-    if selection_failure.is_none() && call_failure_kind.is_none() {
+    let upstream_body_metadata = KiroProvider::error_metadata_from_error(err);
+    if selection_failure.is_none()
+        && call_failure_kind.is_none()
+        && upstream_body_metadata.is_none()
+    {
         return None;
     }
-    serde_json::to_value(json!({
+    let base = serde_json::to_value(json!({
         "selectionFailure": selection_failure,
         "callFailureKind": call_failure_kind,
     }))
-    .ok()
+    .ok();
+    merge_error_metadata_values(base, upstream_body_metadata)
+}
+
+fn merge_error_metadata_values(
+    base: Option<serde_json::Value>,
+    addition: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (base, addition) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(addition))) => {
+            for (key, value) in addition {
+                base.insert(key, value);
+            }
+            Some(serde_json::Value::Object(base))
+        }
+        (_base, Some(addition)) => Some(addition),
+    }
 }
 
 fn websearch_error_metadata(
@@ -4310,6 +4345,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         simulated_source,
         payload_breakdown: None,
         payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7108,6 +7144,7 @@ struct JsonStreamError {
     error_type: &'static str,
     internal_detail: String,
     body_bytes: usize,
+    diagnostics: Option<serde_json::Value>,
 }
 
 enum JsonStreamSniffResult {
@@ -7119,6 +7156,7 @@ enum JsonStreamSniffResult {
 struct JsonStreamErrorSniffer {
     enabled: bool,
     decided: bool,
+    content_type: Option<String>,
     buffer: Vec<u8>,
 }
 
@@ -7127,6 +7165,7 @@ impl JsonStreamErrorSniffer {
         Self {
             enabled: content_type.is_some_and(is_json_media_type),
             decided: false,
+            content_type: content_type.map(|value| value.chars().take(128).collect()),
             buffer: Vec::new(),
         }
     }
@@ -7184,13 +7223,25 @@ impl JsonStreamErrorSniffer {
         match serde_json::from_slice::<Value>(trimmed) {
             Ok(value) => {
                 self.decided = true;
-                JsonStreamSniffResult::Error(classify_json_stream_error(&value, trimmed))
+                JsonStreamSniffResult::Error(classify_json_stream_error(
+                    &value,
+                    trimmed,
+                    self.content_type.as_deref(),
+                ))
             }
             Err(err) if err.is_eof() => JsonStreamSniffResult::Pending,
             Err(err) => JsonStreamSniffResult::Error(JsonStreamError {
                 error_type: "api_error",
                 internal_detail: format!("json_stream_malformed_json: {}", err),
                 body_bytes: trimmed.len(),
+                diagnostics: Some(upstream_body_diagnostics(
+                    "json_stream_sniffer",
+                    self.content_type.as_deref(),
+                    trimmed,
+                    "json_malformed",
+                    None,
+                    false,
+                )),
             }),
         }
     }
@@ -7207,6 +7258,14 @@ impl JsonStreamErrorSniffer {
                 error_type: "api_error",
                 internal_detail: "json_stream_empty_body".to_string(),
                 body_bytes: 0,
+                diagnostics: Some(upstream_body_diagnostics(
+                    "json_stream_sniffer",
+                    self.content_type.as_deref(),
+                    trimmed,
+                    "empty",
+                    None,
+                    false,
+                )),
             });
         }
 
@@ -7214,14 +7273,36 @@ impl JsonStreamErrorSniffer {
             error_type: "api_error",
             internal_detail: "json_stream_incomplete_json".to_string(),
             body_bytes: trimmed.len(),
+            diagnostics: Some(upstream_body_diagnostics(
+                "json_stream_sniffer",
+                self.content_type.as_deref(),
+                trimmed,
+                "json_incomplete",
+                None,
+                false,
+            )),
         })
     }
 
     fn protocol_error(&self, reason: &str) -> JsonStreamError {
+        let trimmed = trim_ascii_whitespace(&self.buffer);
+        let body_kind = if reason == "json_stream_error_body_too_large" {
+            "json_too_large"
+        } else {
+            "json_protocol_error"
+        };
         JsonStreamError {
             error_type: "api_error",
             internal_detail: reason.to_string(),
-            body_bytes: trim_ascii_whitespace(&self.buffer).len(),
+            body_bytes: trimmed.len(),
+            diagnostics: Some(upstream_body_diagnostics(
+                "json_stream_sniffer",
+                self.content_type.as_deref(),
+                trimmed,
+                body_kind,
+                None,
+                true,
+            )),
         }
     }
 }
@@ -7254,7 +7335,100 @@ fn json_string_at<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
         .filter(|text| !text.trim().is_empty())
 }
 
-fn classify_json_stream_error(value: &Value, raw_body: &[u8]) -> JsonStreamError {
+fn upstream_body_diagnostics(
+    trigger: &'static str,
+    content_type: Option<&str>,
+    raw_body: &[u8],
+    body_kind: &'static str,
+    parsed_json: Option<&Value>,
+    partial: bool,
+) -> serde_json::Value {
+    let digest = hex::encode(Sha256::digest(raw_body));
+    let first_non_whitespace = raw_body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| match byte {
+            b'{' => "json_object",
+            b'[' => "json_array",
+            byte if byte.is_ascii() && !byte.is_ascii_control() => "text",
+            _ => "binary",
+        })
+        .unwrap_or("empty");
+    let eventstream_prelude_like = first_non_whitespace == "binary" && raw_body.len() >= 12;
+    let mut json_top_level_keys: Vec<String> = parsed_json
+        .and_then(Value::as_object)
+        .map(|object| {
+            let mut keys = object
+                .keys()
+                .take(16)
+                .map(|key| key.chars().take(64).collect::<String>())
+                .collect::<Vec<_>>();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default();
+    json_top_level_keys.dedup();
+    let code_present = parsed_json.is_some_and(|value| {
+        json_string_at(
+            value,
+            &[
+                "/__type",
+                "/code",
+                "/Code",
+                "/type",
+                "/error/type",
+                "/error/code",
+                "/error/Code",
+            ],
+        )
+        .is_some()
+    });
+    let reason_present = parsed_json.is_some_and(|value| {
+        json_string_at(
+            value,
+            &["/reason", "/Reason", "/error/reason", "/error/Reason"],
+        )
+        .is_some()
+    });
+    let message_present = parsed_json.is_some_and(|value| {
+        json_string_at(
+            value,
+            &[
+                "/message",
+                "/Message",
+                "/error/message",
+                "/error/Message",
+                "/error",
+            ],
+        )
+        .is_some()
+    });
+
+    json!({
+        "trigger": trigger,
+        "bodyBytes": raw_body.len(),
+        "contentType": content_type.unwrap_or("unknown"),
+        "firstNonWhitespace": first_non_whitespace,
+        "bodyKind": body_kind,
+        "bodyFingerprint": format!("sha256:{}", &digest[..16]),
+        "jsonTopLevelKeys": json_top_level_keys,
+        "jsonErrorFields": {
+            "codePresent": code_present,
+            "reasonPresent": reason_present,
+            "messagePresent": message_present
+        },
+        "eventstreamPreludeLike": eventstream_prelude_like,
+        "eventstreamDecoded": false,
+        "partial": partial
+    })
+}
+
+fn classify_json_stream_error(
+    value: &Value,
+    raw_body: &[u8],
+    content_type: Option<&str>,
+) -> JsonStreamError {
     let code = json_string_at(
         value,
         &[
@@ -7323,6 +7497,18 @@ fn classify_json_stream_error(value: &Value, raw_body: &[u8]) -> JsonStreamError
         error_type,
         internal_detail,
         body_bytes: raw_body.len(),
+        diagnostics: Some(upstream_body_diagnostics(
+            "json_stream_sniffer",
+            content_type,
+            raw_body,
+            if code.is_none() && reason.is_none() && message.is_none() {
+                "json_unexpected_body"
+            } else {
+                "json_error_envelope"
+            },
+            Some(value),
+            false,
+        )),
     }
 }
 
@@ -7339,6 +7525,14 @@ fn inspect_complete_upstream_body(
                 error_type: "api_error",
                 internal_detail: "json_stream_incomplete_body".to_string(),
                 body_bytes: 0,
+                diagnostics: Some(upstream_body_diagnostics(
+                    "json_stream_sniffer",
+                    content_type,
+                    &[],
+                    "json_incomplete",
+                    None,
+                    false,
+                )),
             }))
         }
     }
@@ -7683,6 +7877,11 @@ fn create_sse_stream(
                                     state
                                         .completion
                                         .report_upstream_stream_failure(error.internal_detail.clone());
+                                    state.usage_guard.context().request.merge_error_metadata(
+                                        error.diagnostics.clone().map(|diagnostics| {
+                                            json!({ "upstreamBodyDiagnostics": diagnostics })
+                                        }),
+                                    );
                                     state.ctx.record_stream_error(error.error_type, error.internal_detail);
                                     let bytes = finish_stream_with_recorded_error(
                                         &mut state.ctx,
@@ -7966,6 +8165,11 @@ fn create_sse_stream(
                                 state
                                     .completion
                                     .report_upstream_stream_failure(error.internal_detail.clone());
+                                state.usage_guard.context().request.merge_error_metadata(
+                                    error.diagnostics.clone().map(|diagnostics| {
+                                        json!({ "upstreamBodyDiagnostics": diagnostics })
+                                    }),
+                                );
                                 state.ctx.record_stream_error(error.error_type, error.internal_detail);
                                 let bytes = finish_stream_with_recorded_error(
                                     &mut state.ctx,
@@ -8911,6 +9115,12 @@ async fn handle_non_stream_request(
                 } else {
                     envelope::PUBLIC_PROCESSING_FAILED_MESSAGE
                 };
+                credential_usage.request.merge_error_metadata(
+                    error
+                        .diagnostics
+                        .clone()
+                        .map(|diagnostics| json!({ "upstreamBodyDiagnostics": diagnostics })),
+                );
                 credential_usage.record_failure_with_public_error(
                     UsageRecordStatus::Error,
                     error.error_type,

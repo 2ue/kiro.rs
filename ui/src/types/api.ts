@@ -562,6 +562,7 @@ export interface AddCredentialRequest {
   kiroApiKey?: string
   endpoint?: string
   supportedModels?: string[]
+  autoDiscoverSupportedModels?: boolean | null
 }
 
 export interface AddCredentialResponse {

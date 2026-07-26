@@ -585,6 +585,7 @@ export interface AddCredentialRequest {
   kiroApiKey?: string
   endpoint?: string
   supportedModels?: string[]
+  autoDiscoverSupportedModels?: boolean | null
 }
 
 // 添加凭据响应

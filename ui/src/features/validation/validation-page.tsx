@@ -361,7 +361,7 @@ function initialExternalOptions(): ExternalOptions {
   return {
     querySubscription: true,
     queryUsage: true,
-    checkLiveness: false,
+    checkLiveness: true,
     livenessModel: DEFAULT_TEST_MODEL,
     livenessPrompt: DEFAULT_TEST_PROMPT,
   }

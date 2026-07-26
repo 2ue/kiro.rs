@@ -846,6 +846,12 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub supported_models: Vec<String>,
 
+    /// API Key 凭据新增时是否自动请求上游模型列表并写入 supported_models。
+    ///
+    /// None 表示使用调用入口的默认行为；单账号新增保持旧行为自动发现，批量导入默认关闭。
+    #[serde(default, alias = "auto_discover_supported_models")]
+    pub auto_discover_supported_models: Option<bool>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
@@ -970,6 +976,9 @@ pub struct BatchCredentialImportRequest {
     pub duplicate_mode: BatchCredentialImportDuplicateMode,
     #[serde(default)]
     pub continue_on_error: bool,
+    /// 批量导入时是否自动发现 API Key 支持模型并写入模型白名单。默认关闭，避免导入后意外加模型限制。
+    #[serde(default)]
+    pub auto_discover_supported_models: bool,
     pub credentials: Vec<AddCredentialRequest>,
 }
 
@@ -1300,8 +1309,8 @@ pub struct ValidateExternalCredentialsRequest {
     /// 是否查询当前用量/额度。默认保持旧行为：查询。
     #[serde(default = "default_true")]
     pub query_usage: bool,
-    /// 是否发送一次最小模型请求做验活。默认不发送模型请求。
-    #[serde(default)]
+    /// 是否发送一次最小模型请求做验活。默认发送模型请求。
+    #[serde(default = "default_true")]
     pub check_liveness: bool,
     /// 验活模型；为空时使用管理端默认验活模型。
     #[serde(default)]
@@ -1954,6 +1963,7 @@ mod tests {
         assert_eq!(req.api_region.as_deref(), Some("eu-west-1"));
         assert_eq!(req.machine_id.as_deref(), Some("fake-machine-id"));
         assert_eq!(req.max_concurrent_requests, Some(3));
+        assert_eq!(req.auto_discover_supported_models, None);
     }
 
     #[test]
@@ -2005,6 +2015,51 @@ mod tests {
         assert_eq!(req.api_region.as_deref(), Some("eu-west-1"));
         assert_eq!(req.machine_id.as_deref(), Some("fake-machine-id"));
         assert_eq!(req.max_concurrent_requests, Some(3));
+        assert_eq!(req.auto_discover_supported_models, None);
+    }
+
+    #[test]
+    fn import_requests_default_model_autodiscovery_off_but_accept_override() {
+        let add_req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "kiroApiKey": "ksk_fake",
+            "autoDiscoverSupportedModels": true
+        }))
+        .unwrap();
+        assert_eq!(add_req.auto_discover_supported_models, Some(true));
+
+        let batch_req: BatchCredentialImportRequest = serde_json::from_value(serde_json::json!({
+            "credentials": [{ "kiroApiKey": "ksk_fake" }]
+        }))
+        .unwrap();
+        assert!(!batch_req.auto_discover_supported_models);
+
+        let batch_override: BatchCredentialImportRequest =
+            serde_json::from_value(serde_json::json!({
+                "autoDiscoverSupportedModels": true,
+                "credentials": [{ "kiroApiKey": "ksk_fake" }]
+            }))
+            .unwrap();
+        assert!(batch_override.auto_discover_supported_models);
+    }
+
+    #[test]
+    fn validate_external_credentials_defaults_liveness_on_but_accepts_override() {
+        let default_req: ValidateExternalCredentialsRequest =
+            serde_json::from_value(serde_json::json!({
+                "credentials": [{ "kiroApiKey": "ksk_fake" }]
+            }))
+            .unwrap();
+        assert!(default_req.query_subscription);
+        assert!(default_req.query_usage);
+        assert!(default_req.check_liveness);
+
+        let override_req: ValidateExternalCredentialsRequest =
+            serde_json::from_value(serde_json::json!({
+                "checkLiveness": false,
+                "credentials": [{ "kiroApiKey": "ksk_fake" }]
+            }))
+            .unwrap();
+        assert!(!override_req.check_liveness);
     }
 
     #[test]

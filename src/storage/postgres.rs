@@ -5934,10 +5934,17 @@ impl PostgresUsageStore {
         let (timezone, offset) = usage_dashboard_timezone(timezone);
         let window_specs = usage_dashboard_windows(now, offset);
         let mut windows = self
-            .dashboard_windows(&window_specs, high_cache_threshold)
+            .dashboard_windows_with_basic_fallback(&window_specs, high_cache_threshold)
             .await?;
-        self.populate_dashboard_window_details(&window_specs, &mut windows)
-            .await?;
+        if let Err(err) = self
+            .populate_dashboard_window_details(&window_specs, &mut windows)
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                "usage dashboard 窗口明细聚合失败，保留基础窗口数据"
+            );
+        }
         let (_, _, series) = self.dashboard_series_only(Some(&timezone)).await?;
         let (_, top) = self.dashboard_top_only().await?;
         Ok(UsageDashboardResponse {
@@ -5958,7 +5965,7 @@ impl PostgresUsageStore {
         let (timezone, offset) = usage_dashboard_timezone(timezone);
         let window_specs = usage_dashboard_windows(now, offset);
         let windows = self
-            .dashboard_windows(&window_specs, high_cache_threshold)
+            .dashboard_windows_with_basic_fallback(&window_specs, high_cache_threshold)
             .await?;
         Ok((now.to_rfc3339(), timezone, windows))
     }
@@ -6268,6 +6275,34 @@ impl PostgresUsageStore {
         rows.into_iter()
             .map(dashboard_window_from_row)
             .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn dashboard_windows_with_basic_fallback(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<Vec<UsageDashboardWindow>> {
+        match self.dashboard_windows(specs, high_cache_threshold).await {
+            Ok(windows) => Ok(windows),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "usage dashboard 精确窗口聚合失败，降级为基础窗口聚合"
+                );
+                self.dashboard_windows_basic_from_series(specs).await
+            }
+        }
+    }
+
+    async fn dashboard_windows_basic_from_series(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+    ) -> anyhow::Result<Vec<UsageDashboardWindow>> {
+        let points = self.dashboard_series(specs).await?;
+        Ok(points
+            .into_iter()
+            .map(usage_dashboard_window_from_series_point)
+            .collect())
     }
 
     async fn populate_dashboard_window_details(
@@ -8713,6 +8748,46 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
     })
 }
 
+fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDashboardWindow {
+    let total_requests = point.requests;
+    let error_requests = point.error_requests;
+    UsageDashboardWindow {
+        key: point.key,
+        label: point.label,
+        from: point.from,
+        to: point.to,
+        summary: UsageDashboardSummary {
+            total_requests,
+            success_requests: point.success_requests,
+            error_requests,
+            error_rate: usage_ratio(error_requests, total_requests),
+            stream_requests: 0,
+            non_stream_requests: 0,
+            high_cache_requests: 0,
+            total_input_tokens: point.total_input_tokens,
+            billable_input_tokens: point.billable_input_tokens,
+            total_output_tokens: point.total_output_tokens,
+            total_cache_read_input_tokens: 0,
+            total_cache_creation_input_tokens: 0,
+            cache_read_ratio: 0.0,
+            total_estimated_cost_usd: point.total_estimated_cost_usd,
+            total_original_cost_usd: point.total_original_cost_usd,
+            priced_requests: 0,
+            unpriced_requests: 0,
+            average_duration_ms: 0.0,
+            p95_duration_ms: 0,
+            sticky_bound_requests: 0,
+            fallback_from_sticky_requests: 0,
+            simulated_requests: 0,
+            upstream_metadata_requests: 0,
+            external_pool_billing: UsageExternalPoolBillingSummary::default(),
+            external_pool_billing_by_pool: Vec::new(),
+            status_breakdown: Vec::new(),
+            usage_source_breakdown: Vec::new(),
+        },
+    }
+}
+
 fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
     let from: DateTime<Utc> = row.try_get("from_at")?;
     let to: DateTime<Utc> = row.try_get("to_at")?;
@@ -10697,6 +10772,35 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .expect("fixed test timestamp")
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn dashboard_window_basic_fallback_preserves_core_series_metrics() {
+        let window = usage_dashboard_window_from_series_point(UsageSeriesPoint {
+            key: "today".to_string(),
+            label: "今日".to_string(),
+            from: "2026-07-26T00:00:00Z".to_string(),
+            to: "2026-07-26T01:00:00Z".to_string(),
+            requests: 100,
+            success_requests: 97,
+            error_requests: 3,
+            total_input_tokens: 12_345,
+            billable_input_tokens: 2_345,
+            total_output_tokens: 678,
+            total_estimated_cost_usd: 1.25,
+            total_original_cost_usd: 2.5,
+        });
+
+        assert_eq!(window.key, "today");
+        assert_eq!(window.summary.total_requests, 100);
+        assert_eq!(window.summary.success_requests, 97);
+        assert_eq!(window.summary.error_requests, 3);
+        assert!((window.summary.error_rate - 0.03).abs() < f64::EPSILON);
+        assert_eq!(window.summary.total_input_tokens, 12_345);
+        assert_eq!(window.summary.billable_input_tokens, 2_345);
+        assert_eq!(window.summary.total_output_tokens, 678);
+        assert_eq!(window.summary.p95_duration_ms, 0);
+        assert_eq!(window.summary.high_cache_requests, 0);
     }
 
     fn postgres_timestamp_precision(value: DateTime<Utc>) -> DateTime<Utc> {

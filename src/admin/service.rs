@@ -2838,6 +2838,16 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        let auto_discover_supported_models = req.auto_discover_supported_models.unwrap_or(true);
+        self.add_credential_with_model_discovery(req, auto_discover_supported_models)
+            .await
+    }
+
+    async fn add_credential_with_model_discovery(
+        &self,
+        req: AddCredentialRequest,
+        auto_discover_supported_models: bool,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
         let _import_guard = self.credential_import_lock.lock().await;
         let email = req.email.clone();
         let warmup_remaining = req.warmup_remaining;
@@ -2847,7 +2857,10 @@ impl AdminService {
         self.reject_duplicate_credential_before_auxiliary_calls(&new_cred)?;
         let mut api_key_supported_models_autodiscovered = false;
 
-        if new_cred.is_api_key_credential() && new_cred.supported_models.is_empty() {
+        if auto_discover_supported_models
+            && new_cred.is_api_key_credential()
+            && new_cred.supported_models.is_empty()
+        {
             match self
                 .discover_supported_models_for_external_credential(new_cred.clone())
                 .await
@@ -2892,7 +2905,10 @@ impl AdminService {
                 supported_models_count = new_cred_supported_models_count,
                 "API Key 凭据支持模型已自动写入"
             );
-        } else if new_cred_is_api_key && new_cred_supported_models_count == 0 {
+        } else if auto_discover_supported_models
+            && new_cred_is_api_key
+            && new_cred_supported_models_count == 0
+        {
             warning =
                 Some("API Key 凭据未自动发现支持模型，请在保存后手动同步支持模型".to_string());
         }
@@ -3049,11 +3065,24 @@ impl AdminService {
 
         let total = req.credentials.len();
         let mut items = Vec::with_capacity(total);
+        let auto_discover_supported_models = req.auto_discover_supported_models;
         for (index, credential) in req.credentials.into_iter().enumerate() {
             let import_index = index + 1;
-            let credential = apply_batch_import_defaults(credential, &req.defaults);
+            let mut credential = apply_batch_import_defaults(credential, &req.defaults);
+            if credential.auto_discover_supported_models.is_none() {
+                credential.auto_discover_supported_models = Some(auto_discover_supported_models);
+            }
+            let credential_auto_discover_supported_models = credential
+                .auto_discover_supported_models
+                .unwrap_or(auto_discover_supported_models);
             let email = credential.email.clone();
-            match self.add_credential(credential).await {
+            match self
+                .add_credential_with_model_discovery(
+                    credential,
+                    credential_auto_discover_supported_models,
+                )
+                .await
+            {
                 Ok(response) => items.push(BatchCredentialImportItem {
                     index: import_index,
                     ok: true,

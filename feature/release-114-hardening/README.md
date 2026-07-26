@@ -13,6 +13,8 @@
 | P3 | Usage 中出现 `sampled request rejection` | 已优化文案/保留采样语义 | request API key admission 采样诊断记录不代表上游失败；文案改为 `request rejected before upstream dispatch`，采样细节仍在 metadata | usage 采样单测、realtime 成功/错误细分测试 |
 | P4 | 生产 Redis 调度退化后高 RPM 快速失败，并最终触发/暴露整池 `TEMPORARILY_SUSPENDED` 风控禁用 | 已完成核心防放大修复，待隔离高并发矩阵继续验证 | local-pool risk circuit；circuit 打开后 acquire/preflight 不先碰 Redis；风险控制后不继续烧剩余账号；单凭据/全局容量变化 warmup | 风险熔断、warmup、runtime migration、public error 聚焦测试通过 |
 | P5 | 并发低、RPM 高、页面卡与调度观测口径 | 已完成源码复核、观测补强和入口防放大，待负载矩阵验证 | 区分 admission 并发、本地账号 lease、usage 完成 RPM、dashboard 聚合；新增 realtime success/error 细分；本地临时调度失败反馈到 per-key admission backoff | usage memory/Redis/PgSQL summary 聚焦测试、request admission backoff 测试和 handler 分类器测试通过 |
+| P6 | Claude Code CLI / `thinking` / `output_config` 兼容性分叉与 body 归一化 | 已分析并补齐回归验证 | Kiro-native 序列化、CLI/IDE body transform、Anthropic converter/request_facts 的组合矩阵对齐；`max` 不被压成 `high`，`thinking=disabled` 时由 native wire 侧去掉不兼容 sibling 字段 | `cargo test --bin kiro-rs output_config -- --nocapture`、`cargo test --bin kiro-rs thinking -- --nocapture`、真实 Claude CLI capture gate 通过 |
+| P7 | 159 机器 `/usage-dashboard/windows` 总览超时、页面 500 | 已加精确窗口降级保护，待索引维护补精确值 | 精确 `dashboard_windows` 失败时回退到 series-based basic windows；窗口明细失败只降级不再整页 500；精确统计仍依赖缺失索引后续维护 | `dashboard_window_basic_fallback_preserves_core_series_metrics` 通过；生产证据仍显示 exact query 需要索引维护 |
 
 ## 本轮代码改动范围
 
@@ -20,6 +22,20 @@
   - 启动后执行轻量 schema compatibility check。
   - 覆盖 114 后立即会被运行路径使用的关键表/列，例如 `external_upstream_pools.revision`、`usage_records.rollup_active`、`model_capabilities_sync_status.reasoning_fields`、credential revision/generation、usage cost rollup 字段等。
   - `/usage-dashboard` 后端总接口不再给所有窗口附带高成本 breakdown/外部池逐池拆分，改为复用基础窗口、series、top。
+  - 精确 `dashboard_windows` 超时后，窗口层自动降级为 series-based basic window，避免看板级 500。
+
+- `src/admin/types.rs`、`src/admin/service.rs`、`admin-ui/src/components/batch-import-dialog.tsx`、`ui/src/features/credentials/credential-dialogs.tsx`
+  - 批量导入默认不自动发现模型限制，且默认开启活性校验。
+  - 选文件后仍可继续编辑输入框，不会把表单锁死在只读预览状态。
+  - 单条新增仍保留显式模型自动发现开关，兼容旧行为。
+
+- `src/kiro/model/requests/kiro.rs`、`src/kiro/endpoint/cli.rs`、`src/kiro/endpoint/ide.rs`
+  - CLI / IDE / Kiro-native 三条路径都保持 `output_config.effort` 的显式值，不把 `max` 静默压成 `high`。
+  - `thinking.type=disabled` 时，native wire 会在需要时移除不兼容 sibling `thinking`，避免把错误组合送给上游。
+
+- `src/anthropic/converter.rs`、`src/anthropic/request_facts.rs`、`src/anthropic/payload_guard.rs`、`src/anthropic/handlers/request_entry.rs`
+  - 原始 Anthropic 协议、转换器、payload guard 与请求入口对 `thinking/output_config` 的解析口径一致。
+  - `disabled + explicit effort`、`enabled + explicit effort`、`adaptive + omitted effort` 都有单测覆盖。
 
 - `docker-compose.database.yml`
   - app 环境显式增加 `KIRO_RS_POSTGRES_MIGRATE_ON_START: ${KIRO_RS_POSTGRES_MIGRATE_ON_START:-true}`。
@@ -55,7 +71,20 @@
 - `cargo test --locked --all-targets stream_output_token_estimator_counts_text_thinking_and_tool_events` 通过。
 - `cargo test --locked --all-targets --no-default-features required_postgres_schema` 通过。
 - `cargo test --locked --all-targets estimate_matches` 通过，覆盖 `claude-opus-4-8` 与 `claude-opus-4.8` 的计价 alias 互配。
+- `cargo test --bin kiro-rs output_config -- --nocapture` 通过，覆盖 `max/high/low` 显式 effort、disabled thinking、native reasoning、IDE/CLI/body guard 组合。
+- `cargo test --bin kiro-rs thinking -- --nocapture` 通过，覆盖 signed/unsigned/redacted thinking、CLI/IDE 转换、prompt steering、payload guard、stream 事件与 provider 重试。
 - `git diff --check` 通过。
+
+### 真实 Claude Code CLI
+
+- `claude --version` 为 `2.1.197 (Claude Code)`。
+- `node feature/tests/thinking-effort-claude-cli-capture.mjs` 通过：
+  - 30/30 个真实 CLI session 完成；
+  - `output_config.effort` 的显式值在 `low/medium/high/xhigh/max` 中都被保留；
+  - `thinking` 侧保持 `adaptive`；
+  - 没有把 `max` 静默压成 `high`；
+  - 没有命中 `9022`；
+  - cleanup 通过。
 
 ## 后续发版注意点
 

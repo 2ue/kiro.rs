@@ -6745,6 +6745,11 @@ impl KiroProvider {
             .and_then(KiroCallError::failure_kind)
     }
 
+    pub fn error_metadata_from_error(err: &anyhow::Error) -> Option<serde_json::Value> {
+        err.downcast_ref::<KiroCallError>()
+            .and_then(|err| err.error_metadata().cloned())
+    }
+
     fn auxiliary_call_failure_kind(err: &anyhow::Error) -> Option<KiroCallFailureKind> {
         if err
             .downcast_ref::<AuxiliaryAttemptBudgetExhausted>()
@@ -6805,6 +6810,16 @@ impl KiroProvider {
         attempts: &[KiroCredentialAttempt],
     ) -> anyhow::Error {
         KiroCallError::new(message, attempts.to_vec()).into()
+    }
+
+    fn traced_error_with_metadata(
+        message: impl Into<String>,
+        attempts: &[KiroCredentialAttempt],
+        error_metadata: Option<serde_json::Value>,
+    ) -> anyhow::Error {
+        KiroCallError::new(message, attempts.to_vec())
+            .with_error_metadata(error_metadata)
+            .into()
     }
 
     fn traced_error_with_failure_kind(
@@ -6923,6 +6938,94 @@ impl KiroProvider {
                 .unwrap_or("unknown"),
             reason.unwrap_or(kind.scheduler_reason())
         )
+    }
+
+    fn upstream_body_diagnostics_metadata(
+        trigger: &'static str,
+        content_kind: UpstreamContentKind,
+        body: &str,
+        body_kind: &'static str,
+    ) -> Option<serde_json::Value> {
+        let raw = body.as_bytes();
+        let digest = hex::encode(Sha256::digest(raw));
+        let first_non_whitespace = raw
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .map(|byte| match byte {
+                b'{' => "json_object",
+                b'[' => "json_array",
+                byte if byte.is_ascii() && !byte.is_ascii_control() => "text",
+                _ => "binary",
+            })
+            .unwrap_or("empty");
+        let mut json_top_level_keys: Vec<String> = Vec::new();
+        let mut code_present = false;
+        let mut reason_present = false;
+        let mut message_present = false;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(object) = value.as_object() {
+                json_top_level_keys = object
+                    .keys()
+                    .take(16)
+                    .map(|key| key.chars().take(64).collect::<String>())
+                    .collect();
+                json_top_level_keys.sort();
+            }
+            code_present = Self::json_value_has_string_at(
+                &value,
+                &[
+                    "/__type",
+                    "/code",
+                    "/Code",
+                    "/type",
+                    "/error/type",
+                    "/error/code",
+                    "/error/Code",
+                ],
+            );
+            reason_present = Self::json_value_has_string_at(
+                &value,
+                &["/reason", "/Reason", "/error/reason", "/error/Reason"],
+            );
+            message_present = Self::json_value_has_string_at(
+                &value,
+                &[
+                    "/message",
+                    "/Message",
+                    "/error/message",
+                    "/error/Message",
+                    "/error",
+                ],
+            );
+        }
+        Some(serde_json::json!({
+            "upstreamBodyDiagnostics": {
+                "trigger": trigger,
+                "bodyBytes": raw.len(),
+                "contentType": content_kind.as_str(),
+                "firstNonWhitespace": first_non_whitespace,
+                "bodyKind": body_kind,
+                "bodyFingerprint": format!("sha256:{}", &digest[..16]),
+                "jsonTopLevelKeys": json_top_level_keys,
+                "jsonErrorFields": {
+                    "codePresent": code_present,
+                    "reasonPresent": reason_present,
+                    "messagePresent": message_present
+                },
+                "eventstreamPreludeLike": false,
+                "eventstreamDecoded": false
+            }
+        }))
+    }
+
+    fn json_value_has_string_at(value: &serde_json::Value, pointers: &[&str]) -> bool {
+        pointers.iter().any(|pointer| {
+            value
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+        })
     }
 
     fn send_failure_kind(error: &HttpSendError) -> ApiUpstreamFailureKind {
@@ -10385,6 +10488,19 @@ impl KiroProvider {
 
             if status.is_success() {
                 let failure_kind = Self::classify_non_eventstream_body(&body, content_kind);
+                let body_kind = if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
+                    "json_unexpected_body"
+                } else if body.trim().is_empty() {
+                    "empty"
+                } else {
+                    "non_eventstream_success_body"
+                };
+                let error_metadata = Self::upstream_body_diagnostics_metadata(
+                    "provider_2xx_non_eventstream",
+                    content_kind,
+                    &body,
+                    body_kind,
+                );
                 let message = Self::api_failure_diagnostic(
                     failure_kind,
                     status,
@@ -10465,7 +10581,11 @@ impl KiroProvider {
                     }
                 }
                 Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
-                return Err(Self::traced_error(message, &attempts));
+                return Err(Self::traced_error_with_metadata(
+                    message,
+                    &attempts,
+                    error_metadata,
+                ));
             }
 
             if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {

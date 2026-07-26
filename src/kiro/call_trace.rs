@@ -225,6 +225,7 @@ pub struct KiroCallError {
     attempts: Vec<KiroCredentialAttempt>,
     selection_failure: Option<SelectionFailureSummary>,
     failure_kind: Option<KiroCallFailureKind>,
+    error_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -247,6 +248,7 @@ impl KiroCallError {
             attempts,
             selection_failure: None,
             failure_kind: None,
+            error_metadata: None,
         }
     }
 
@@ -270,6 +272,15 @@ impl KiroCallError {
 
     pub fn failure_kind(&self) -> Option<KiroCallFailureKind> {
         self.failure_kind
+    }
+
+    pub fn with_error_metadata(mut self, metadata: Option<serde_json::Value>) -> Self {
+        self.error_metadata = metadata;
+        self
+    }
+
+    pub fn error_metadata(&self) -> Option<&serde_json::Value> {
+        self.error_metadata.as_ref()
     }
 }
 

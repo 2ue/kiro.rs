@@ -595,8 +595,9 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const [text, setText] = useState('')
   const [defaults, setDefaults] = useState(initialParameterDefaults)
   const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
-  const [skipVerify, setSkipVerify] = useState(true)
+  const [skipVerify, setSkipVerify] = useState(false)
   const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
+  const [autoDiscoverSupportedModels, setAutoDiscoverSupportedModels] = useState(false)
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
   const [parsed, setParsed] = useState<AddCredentialRequest[]>([])
@@ -612,7 +613,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const cancelRef = useRef(false)
 
   useEffect(() => {
-    if (!open) { setText(''); setDefaults(initialParameterDefaults()); setVerifyMode('subscription_only'); setSkipVerify(true); setRefreshInfoAfterModelTest(false); setResults([]); setParsed([]); setParseError(''); setRunning(false) }
+    if (!open) { setText(''); setDefaults(initialParameterDefaults()); setVerifyMode('subscription_only'); setSkipVerify(false); setRefreshInfoAfterModelTest(false); setAutoDiscoverSupportedModels(false); setResults([]); setParsed([]); setParseError(''); setRunning(false) }
   }, [open])
 
   const handleParse = () => {
@@ -634,11 +635,10 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
     if (!files.length) return
     const result = await parseCredentialImportFiles(files)
     if (!result.credentials.length) { toast.error(result.errors[0] || '文件中没有有效账号'); return }
-    const merged = result.credentials.map((c) => mergeCredentialDefaults(c, defaults))
-    setParsed(merged)
-    setResults(merged.map((_, i) => ({ index: i, status: 'pending' })))
-    setText(merged.map((c) => JSON.stringify(c)).join('\n'))
-    toast.success(`已解析 ${merged.length} 条账号`)
+    setParsed([])
+    setResults([])
+    setText(result.credentials.map((c) => JSON.stringify(c)).join('\n'))
+    toast.success(`已读取 ${result.credentials.length} 条账号`)
     if (result.errors.length) toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
   }
 
@@ -676,7 +676,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
       try {
         const dup = !isRetry && await isDuplicate(cred)
         if (dup) { newResults[i] = { ...newResults[i], status: 'skipped', error: '重复账号' }; if (!isRetry) setResults([...newResults]); continue }
-        const res = await addCredential(cred)
+        const res = await addCredential({ ...cred, autoDiscoverSupportedModels })
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
         if (!skipVerify) {
           newResults[i].status = 'verifying'
@@ -743,6 +743,10 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
             />
             {parseError && <div className="text-xs text-destructive">{parseError}</div>}
             <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} />
+            <div className="flex items-center gap-3 rounded-lg bg-muted/30 p-3">
+              <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="batch-auto-discover-models" />
+              <label htmlFor="batch-auto-discover-models" className="text-sm cursor-pointer">自动发现模型限制</label>
+            </div>
             <div className="rounded-lg bg-muted/30 p-3 space-y-2">
               <div className="text-sm font-semibold">验活方式</div>
               <div className="flex items-center gap-3">
@@ -818,8 +822,9 @@ export function KamImportModal({ open, onClose, onDone }: {
   const [accounts, setAccounts] = useState<KamAccount[]>([])
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
-  const [skipVerify, setSkipVerify] = useState(true)
+  const [skipVerify, setSkipVerify] = useState(false)
   const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
+  const [autoDiscoverSupportedModels, setAutoDiscoverSupportedModels] = useState(false)
   const [defaults, setDefaults] = useState(initialParameterDefaults)
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
@@ -838,7 +843,7 @@ export function KamImportModal({ open, onClose, onDone }: {
     if (!open) {
       setText(''); setAccounts([]); setResults([])
       setDefaults(initialParameterDefaults()); setRunning(false)
-      setSkipErrorAccounts(true); setVerifyMode('subscription_only'); setSkipVerify(true); setRefreshInfoAfterModelTest(false)
+      setSkipErrorAccounts(true); setVerifyMode('subscription_only'); setSkipVerify(false); setRefreshInfoAfterModelTest(false); setAutoDiscoverSupportedModels(false)
     }
   }, [open])
 
@@ -859,8 +864,9 @@ export function KamImportModal({ open, onClose, onDone }: {
     try {
       const result = await parseKamFiles(files)
       if (!result.accounts.length) { toast.error('文件中未找到有效 KAM 账号'); return }
-      setAccounts(result.accounts)
-      setResults(result.accounts.map((_acc, i) => ({ index: i, status: 'pending' })))
+      setText(JSON.stringify(result.accounts, null, 2))
+      setAccounts([])
+      setResults([])
       toast.success(`从文件解析到 ${result.accounts.length} 个账号`)
     } catch (e) { toast.error(`文件解析失败: ${extractErrorMessage(e)}`) }
   }
@@ -899,7 +905,7 @@ export function KamImportModal({ open, onClose, onDone }: {
           email: optionalTrimmed(acc.email),
           machineId: optionalTrimmed(acc.machineId),
         }, defaults)
-        const res = await addCredential(cred)
+        const res = await addCredential({ ...cred, autoDiscoverSupportedModels })
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
         if (skipVerify) {
           newResults[i] = { ...newResults[i], status: 'success' }
@@ -955,6 +961,10 @@ export function KamImportModal({ open, onClose, onDone }: {
             </div>
             <Textarea className="min-h-[120px] font-mono text-xs" placeholder='粘贴 KAM JSON...' value={text} onChange={(e) => setText(e.target.value)} />
             <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} />
+            <div className="flex items-center gap-3 rounded-lg bg-muted/30 p-3">
+              <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="kam-auto-discover-models" />
+              <label htmlFor="kam-auto-discover-models" className="text-sm cursor-pointer">自动发现模型限制</label>
+            </div>
             <div className="flex justify-end gap-2">
               <Button variant="ghost" size="sm" onClick={onClose}>取消</Button>
               <Button size="sm" onClick={handleParse} disabled={!text.trim()}>解析预览</Button>

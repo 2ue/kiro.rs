@@ -76,8 +76,9 @@ async function verifyImportedCredential(
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
-  const [skipVerification, setSkipVerification] = useState(true)
+  const [skipVerification, setSkipVerification] = useState(false)
   const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
+  const [autoDiscoverSupportedModels, setAutoDiscoverSupportedModels] = useState(false)
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
@@ -118,8 +119,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
     setDefaults(initialParameterDefaults())
     setVerificationMode('subscription_only')
-    setSkipVerification(true)
+    setSkipVerification(false)
     setRefreshInfoAfterModelTest(false)
+    setAutoDiscoverSupportedModels(false)
   }
 
   const appendCredentialsToInput = (credentials: AddCredentialRequest[]) => {
@@ -327,6 +329,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyResourceId: cred.proxyResourceId || undefined,
               endpoint: optionalTrimmed(cred.endpoint),
               enableOverageAfterImport: cred.enableOverageAfterImport ?? undefined,
+              autoDiscoverSupportedModels,
             })
 
             addedCredId = addedCred.credentialId
@@ -423,6 +426,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             proxyResourceId: cred.proxyResourceId || undefined,
             endpoint: optionalTrimmed(cred.endpoint),
             enableOverageAfterImport: cred.enableOverageAfterImport ?? undefined,
+            autoDiscoverSupportedModels,
           })
 
           addedCredId = addedCred.credentialId
@@ -677,6 +681,19 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                 )}
               </div>
             )}
+          </div>
+
+          <div className="rounded-md border bg-muted/20 p-3">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={autoDiscoverSupportedModels}
+                onChange={(event) => setAutoDiscoverSupportedModels(event.target.checked)}
+                disabled={importing}
+                className="rounded border-gray-300"
+              />
+              自动发现模型限制
+            </label>
           </div>
 
           {(importing || results.length > 0) && (
