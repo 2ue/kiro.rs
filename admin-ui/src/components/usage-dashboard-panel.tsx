@@ -24,6 +24,7 @@ import {
   useUsageDashboardSeries,
   useUsageDashboardTop,
   useUsageDashboardWindows,
+  useUsageWriterStats,
 } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatUsd } from '@/lib/format'
@@ -33,6 +34,7 @@ import type {
   UsageDashboardWindow,
   UsageExternalPoolBillingByPool,
   UsageExternalPoolBillingSummary,
+  UsageRecorderStats,
   UsageSeriesPoint,
   UsageTopAggregate,
 } from '@/types/api'
@@ -520,6 +522,35 @@ function OperationsPanel({
   )
 }
 
+function WriterHealthPanel({ stats }: { stats?: UsageRecorderStats }) {
+  if (!stats) {
+    return (
+      <Panel title="统计健康" subtitle="usage writer 与统计持久化状态">
+        <div className="py-6 text-sm text-muted-foreground">暂无统计健康数据。</div>
+      </Panel>
+    )
+  }
+
+  const persistCapacity = stats.writerQueueCapacity || 0
+  const persistAvailable = stats.writerQueueAvailable || 0
+  const persistUsed = Math.max(0, persistCapacity - persistAvailable)
+  const redisCapacity = stats.redisQueueCapacity || 0
+  const redisAvailable = stats.redisQueueAvailable || 0
+  const redisUsed = Math.max(0, redisCapacity - redisAvailable)
+  const dropped = (stats.droppedPersistRecords || 0) + (stats.droppedRedisRecords || 0)
+
+  return (
+    <Panel title="统计健康" subtitle="观测写入异常不应阻塞主业务">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard title="PgSQL 队列" value={`${formatNumber(persistUsed)} / ${formatNumber(persistCapacity)}`} icon={<Database className="h-5 w-5" />} />
+        <MetricCard title="Redis 队列" value={`${formatNumber(redisUsed)} / ${formatNumber(redisCapacity)}`} icon={<Database className="h-5 w-5" />} />
+        <MetricCard title="内存记录" value={`${formatNumber(stats.inMemoryRecords)} / ${formatNumber(stats.inMemoryLimit)}`} icon={<Database className="h-5 w-5" />} />
+        <MetricCard title="已丢弃统计" value={formatNumber(dropped)} icon={<ShieldAlert className="h-5 w-5" />} tone={dropped > 0 ? 'warning' : 'success'} />
+      </div>
+    </Panel>
+  )
+}
+
 function ExternalPoolBillingPanel({
   billing,
   billingByPool,
@@ -660,6 +691,7 @@ export function UsageDashboardPanel() {
     effectiveWindowKey,
     autoRefresh.refetchInterval
   )
+  const writerStatsQuery = useUsageWriterStats(autoRefresh.refetchInterval)
 
   if (windowsQuery.isLoading) {
     return <div className="py-12 text-center text-sm text-muted-foreground">正在加载用量总览...</div>
@@ -688,6 +720,7 @@ export function UsageDashboardPanel() {
   const statusBreakdown = breakdownQuery.data?.statusBreakdown || summary.statusBreakdown || []
   const usageSourceBreakdown = breakdownQuery.data?.usageSourceBreakdown || summary.usageSourceBreakdown || []
   const partialErrors = [
+    writerStatsQuery.error ? `统计健康：${extractErrorMessage(writerStatsQuery.error)}` : '',
     seriesQuery.error ? `趋势：${extractErrorMessage(seriesQuery.error)}` : '',
     topQuery.error ? `排行：${extractErrorMessage(topQuery.error)}` : '',
     breakdownQuery.error ? `分布：${extractErrorMessage(breakdownQuery.error)}` : '',
@@ -746,6 +779,8 @@ export function UsageDashboardPanel() {
         />
         <ErrorFocusPanel totalErrors={summary.errorRequests} items={top.errors || []} />
       </div>
+
+      <WriterHealthPanel stats={writerStatsQuery.data} />
 
       <ExternalPoolBillingPanel billing={externalPoolBilling} billingByPool={externalPoolBillingByPool} />
 

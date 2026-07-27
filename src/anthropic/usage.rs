@@ -3175,14 +3175,9 @@ fn block_on_usage_runtime<T: Send>(
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         match handle.runtime_flavor() {
             RuntimeFlavor::MultiThread => {
-                Ok(tokio::task::block_in_place(|| handle.block_on(future)))
+                tokio::task::block_in_place(|| block_on_usage_fallback_thread(future))
             }
-            _ => std::thread::scope(|scope| {
-                scope
-                    .spawn(move || usage_fallback_runtime().block_on(future))
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("usage 存储线程异常退出"))
-            }),
+            _ => block_on_usage_fallback_thread(future),
         }
     } else {
         Ok(tokio::runtime::Builder::new_current_thread()
@@ -3190,6 +3185,17 @@ fn block_on_usage_runtime<T: Send>(
             .build()?
             .block_on(future))
     }
+}
+
+fn block_on_usage_fallback_thread<T: Send>(
+    future: impl std::future::Future<Output = T> + Send,
+) -> anyhow::Result<T> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || usage_fallback_runtime().block_on(future))
+            .join()
+            .map_err(|_| anyhow::anyhow!("usage 存储线程异常退出"))
+    })
 }
 
 fn usage_fallback_runtime() -> &'static Runtime {
@@ -3665,6 +3671,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_store_bridge_does_not_drive_future_on_current_tokio_worker() {
+        let caller_thread = std::thread::current().id();
+        let future_thread = block_on_usage_runtime(async move { std::thread::current().id() })
+            .expect("usage runtime bridge should run");
+
+        assert_ne!(
+            future_thread, caller_thread,
+            "usage/dashboard storage futures must not be driven on the HTTP Tokio worker"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

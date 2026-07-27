@@ -1,12 +1,12 @@
 # Dashboard / UI observability redesign
 
-Status: `analysis-reset / implementation-not-ready`
+Status: `analysis-complete / implementation-in-progress`
 
 Severity: `P1`
 
 Owner intent: dashboard 不是把 usage 字段堆在页面上，也不是简单拆接口、换 Tab、加几张卡片。它必须让维护者在服务出问题时快速回答：系统现在是否健康、流量是否异常、调度是否卡住、费用/积分是否正常、哪些账号/外部池质量差、错误根因集中在哪里、统计系统本身是否在拖垮主业务。
 
-Last reviewed: 2026-07-27 Asia/Shanghai
+Last reviewed: 2026-07-28 Asia/Shanghai
 
 ## 0. 结论
 
@@ -686,10 +686,14 @@ Dashboard/Usage 统计不能影响主业务。
 - 分接口加载比原来的大接口更好。
 - Kiro metering/积分进入 summary/series/top 是必要的。
 - 外部池计费拆分应该保留。
+- 新 UI 已经从单页堆叠收敛为 5 个明确区块：实时、流量、费用、账号质量、异常诊断。
+- 新 UI 已补 `usage-writer-stats` 统计健康入口，避免 dashboard 完全看不到观测持久化状态。
+- 旧 UI 也至少补了统计健康的最小对齐，不再只显示费用/排行。
+- `block_on_usage_runtime` 已改为在 usage 专用 runtime/线程执行 usage/dashboard Future，避免由 HTTP Tokio worker 直接驱动统计查询。
 
 必须重做/补齐：
 
-- 页面信息架构需要按本文件重新规划，不能只是四个 Tab。
+- 页面信息架构需要按本文件重新规划，不能只是简单加几个 Tab。
 - 时间窗口语义必须在 UI 和 API 层明确。
 - 趋势范围要独立，或明确绑定当前窗口，不能现在这样隐式固定。
 - 账号质量要合并运行态、窗口质量、余额库存，而不是 Top credentials 表。
@@ -698,6 +702,7 @@ Dashboard/Usage 统计不能影响主业务。
 - 积分刷新必须统一 query/cache contract。
 - Dashboard 查询失败要返回可解释原因和 partial/stale state。
 - 新旧 UI 要有明确 parity/兼容策略。
+- 后端 dashboard response 仍需补 scope/freshness 元信息，当前前端已经按“区块语义”开始收敛，但 API 合同还未完全显式化。
 
 ## 10. 实施计划
 

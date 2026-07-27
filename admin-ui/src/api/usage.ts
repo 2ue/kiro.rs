@@ -16,6 +16,7 @@ import type {
   UsageCleanupPreviewResponse,
   UsageCleanupRequest,
   UsageCleanupStatusResponse,
+  UsageRecorderStats,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
   UsageRecordsQuery,
@@ -72,6 +73,11 @@ export async function getUsageRecordsPage(
 
 export async function getUsageSummary(): Promise<UsageSummary> {
   const { data } = await api.get<UsageSummary>('/usage-summary')
+  return data
+}
+
+export async function getUsageWriterStats(): Promise<UsageRecorderStats> {
+  const { data } = await api.get<UsageRecorderStats>('/usage-writer-stats')
   return data
 }
 

@@ -20,6 +20,7 @@ import {
   useUsageDashboardTop,
   useUsageDashboardWindows,
   useUsageSummary,
+  useUsageWriterStats,
 } from '@/hooks/use-usage'
 import { useCredentialSummary, useCredentialUsageSummary } from '@/hooks/use-credentials'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
@@ -32,6 +33,7 @@ import type {
   UsageSeriesPoint,
   UsageTopAggregate,
   CredentialUsageSummaryItem,
+  UsageRecorderStats,
 } from '@/types/api'
 import {
   PageContainer,
@@ -87,7 +89,7 @@ const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
 }
 
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'
-type DashboardSection = 'operations' | 'traffic' | 'billing' | 'quality'
+type DashboardSection = 'operations' | 'traffic' | 'billing' | 'accounts' | 'errors'
 
 const rankDimensions: Array<{ key: RankDimension; label: string }> = [
   { key: 'models', label: '模型' },
@@ -145,8 +147,8 @@ function TrendSection({
   return (
     <div className="grid gap-3 xl:grid-cols-2">
       <SectionCard
-        title="最近 24 小时"
-        description="按小时聚合的请求量与错误"
+        title="最近 24 小时趋势"
+        description="按小时聚合；不受当前窗口切换影响"
         actions={
           hourlyErrors > 0
             ? <Badge tone="error" title={formatNumber(hourlyErrors)}>错误 {formatCompact(hourlyErrors)}</Badge>
@@ -169,8 +171,8 @@ function TrendSection({
         )}
       </SectionCard>
       <SectionCard
-        title="最近 7 天"
-        description="按天聚合的请求量与错误"
+        title="最近 7 天趋势"
+        description="按天聚合；不受当前窗口切换影响"
         actions={
           dailyErrors > 0
             ? <Badge tone="error" title={formatNumber(dailyErrors)}>错误 {formatCompact(dailyErrors)}</Badge>
@@ -457,6 +459,160 @@ function RunSignalsPanel({
           barColor="bg-primary/65"
           title="该窗口内用量直接由上游服务返回（upstream_metadata），精度最高"
         />
+      </div>
+    </SectionCard>
+  )
+}
+
+function ScopeNote({
+  label,
+  text,
+}: {
+  label: string
+  text: string
+}) {
+  return (
+    <div className="inline-flex items-center gap-1 rounded-full bg-muted/50 px-2 py-1 text-[0.68rem] text-muted-foreground">
+      <span className="font-semibold text-foreground/70">{label}</span>
+      <span>{text}</span>
+    </div>
+  )
+}
+
+function CostRelationshipPanel({
+  summary,
+}: {
+  summary: UsageDashboardWindow['summary']
+}) {
+  const external = summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING
+  const delta = summary.totalEstimatedCostUsd - summary.totalOriginalCostUsd
+
+  return (
+    <SectionCard
+      title="费用关系"
+      description="当前窗口内本地账号、Kiro 积分与外部池成本口径"
+      icon={<DollarSign />}
+    >
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        <SignalRow
+          label="本地估算费用"
+          value={formatUsdFixed2(summary.totalEstimatedCostUsd)}
+          ratio={summary.totalEstimatedCostUsd > 0 ? 1 : 0}
+          title="系统按价格表和最终 usage 估算的费用"
+        />
+        <SignalRow
+          label="原始/实际费用"
+          value={formatUsdFixed2(summary.totalOriginalCostUsd)}
+          ratio={summary.totalEstimatedCostUsd > 0 ? summary.totalOriginalCostUsd / summary.totalEstimatedCostUsd : 0}
+          barColor="bg-warning/80"
+          title="按上游原始 usage 或原始成本口径估算，用于对账"
+        />
+        <SignalRow
+          label="估算差额"
+          value={formatUsdFixed2(delta)}
+          ratio={summary.totalEstimatedCostUsd > 0 ? Math.abs(delta) / summary.totalEstimatedCostUsd : 0}
+          barColor={delta < 0 ? 'bg-destructive/75' : 'bg-success/70'}
+          title="本地估算费用减去原始/实际费用"
+        />
+        <SignalRow
+          label="Kiro 积分"
+          value={<span title={formatNumber(summary.totalKiroMeteringUsage ?? 0)}>{formatCompact(summary.totalKiroMeteringUsage ?? 0)}</span>}
+          ratio={(summary.totalKiroMeteringUsage ?? 0) > 0 ? 1 : 0}
+          barColor="bg-info/70"
+          title="上游 meteringEvent / 积分消耗统计"
+        />
+        <SignalRow
+          label="外部池原始成本"
+          value={formatUsdFixed2(external.rawCostUsd)}
+          ratio={external.billableCostUsd > 0 ? external.rawCostUsd / external.billableCostUsd : 0}
+          barColor="bg-warning/80"
+          title="外部池上游真实或原始成本"
+        />
+        <SignalRow
+          label="外部池可计费"
+          value={formatUsdFixed2(external.billableCostUsd)}
+          ratio={external.billableCostUsd > 0 ? 1 : 0}
+          title="外部池最终 billable 口径"
+        />
+      </div>
+    </SectionCard>
+  )
+}
+
+function UsageWriterHealthPanel({
+  stats,
+  error,
+}: {
+  stats?: UsageRecorderStats
+  error?: unknown
+}) {
+  if (error) {
+    return (
+      <SectionCard title="统计健康" description="usage writer 与统计持久化状态" icon={<Database />}>
+        <ErrorState title="统计健康加载失败" message={extractErrorMessage(error)} />
+      </SectionCard>
+    )
+  }
+
+  if (!stats) {
+    return (
+      <SectionCard title="统计健康" description="usage writer 与统计持久化状态" icon={<Database />}>
+        <LoadingState text="加载统计健康..." className="py-6" />
+      </SectionCard>
+    )
+  }
+
+  const persistCapacity = stats.writerQueueCapacity ?? 0
+  const persistAvailable = stats.writerQueueAvailable ?? 0
+  const persistUsed = Math.max(0, persistCapacity - persistAvailable)
+  const persistRatio = persistCapacity > 0 ? persistUsed / persistCapacity : 0
+  const redisCapacity = stats.redisQueueCapacity ?? 0
+  const redisAvailable = stats.redisQueueAvailable ?? 0
+  const redisUsed = Math.max(0, redisCapacity - redisAvailable)
+  const redisRatio = redisCapacity > 0 ? redisUsed / redisCapacity : 0
+  const dropped = (stats.droppedPersistRecords ?? 0) + (stats.droppedRedisRecords ?? 0)
+
+  return (
+    <SectionCard
+      title="统计健康"
+      description="观测写入状态；异常只应影响统计，不应阻塞模型请求"
+      icon={<Database />}
+      actions={
+        dropped > 0
+          ? <Badge tone="warning" title={formatNumber(dropped)}>已丢弃统计</Badge>
+          : <Badge tone="success">无丢弃</Badge>
+      }
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <SignalRow
+          label="PgSQL writer 队列"
+          value={`${formatCompact(persistUsed)} / ${formatCompact(persistCapacity)}`}
+          ratio={persistRatio}
+          barColor={persistRatio > 0.8 ? 'bg-warning/80' : 'bg-primary/70'}
+        />
+        <SignalRow
+          label="Redis writer 队列"
+          value={`${formatCompact(redisUsed)} / ${formatCompact(redisCapacity)}`}
+          ratio={redisRatio}
+          barColor={redisRatio > 0.8 ? 'bg-warning/80' : 'bg-info/70'}
+        />
+        <SignalRow
+          label="内存保留记录"
+          value={`${formatCompact(stats.inMemoryRecords)} / ${formatCompact(stats.inMemoryLimit)}`}
+          ratio={stats.inMemoryLimit > 0 ? stats.inMemoryRecords / stats.inMemoryLimit : 0}
+        />
+        <SignalRow
+          label="丢弃统计记录"
+          value={formatCompact(dropped)}
+          ratio={dropped > 0 ? 1 : 0}
+          barColor={dropped > 0 ? 'bg-warning/80' : 'bg-success/70'}
+          title="包括 PgSQL/Redis 统计队列满时被保护性丢弃的记录"
+        />
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2 text-[0.68rem] text-muted-foreground">
+        <ScopeNote label="PgSQL" text={stats.postgresEnabled ? '启用' : '未启用'} />
+        <ScopeNote label="Redis" text={stats.redisEnabled ? '启用' : '未启用'} />
+        <ScopeNote label="Redis队列" text={stats.redisQueueEnabled ? '启用' : '未启用'} />
       </div>
     </SectionCard>
   )
@@ -842,6 +998,7 @@ export function OverviewPage() {
   )
   const effectiveWindowKey = selectedWindow?.key ?? selectedWindowKey
   const usageSummaryQuery = useUsageSummary(autoRefresh.refetchInterval)
+  const writerStatsQuery = useUsageWriterStats(autoRefresh.refetchInterval)
   const seriesQuery = useUsageDashboardSeries(
     OVERVIEW_TIMEZONE,
     autoRefresh.refetchInterval,
@@ -851,13 +1008,13 @@ export function OverviewPage() {
     OVERVIEW_TIMEZONE,
     effectiveWindowKey,
     autoRefresh.refetchInterval,
-    activeSection === 'traffic' || activeSection === 'quality' || activeSection === 'billing'
+    activeSection === 'traffic' || activeSection === 'accounts' || activeSection === 'errors'
   )
   const breakdownQuery = useUsageDashboardBreakdown(
     OVERVIEW_TIMEZONE,
     effectiveWindowKey,
     autoRefresh.refetchInterval,
-    activeSection === 'quality'
+    activeSection === 'errors'
   )
   const externalPoolBillingQuery = useUsageDashboardExternalPoolBilling(
     OVERVIEW_TIMEZONE,
@@ -872,7 +1029,7 @@ export function OverviewPage() {
     [topQuery.data?.top.credentials]
   )
   const credentialUsageSummaryQuery = useCredentialUsageSummary(topCredentialIds, {
-    enabled: activeSection === 'billing' && topCredentialIds.length > 0,
+    enabled: activeSection === 'accounts' && topCredentialIds.length > 0,
     refetchInterval: autoRefresh.refetchInterval,
   })
 
@@ -922,6 +1079,7 @@ export function OverviewPage() {
   const latencyTone: 'warning' | 'info' = summary.p95DurationMs >= 60_000 ? 'warning' : 'info'
   const partialErrors = [
     usageSummaryQuery.error ? `实时：${extractErrorMessage(usageSummaryQuery.error)}` : '',
+    writerStatsQuery.error ? `统计健康：${extractErrorMessage(writerStatsQuery.error)}` : '',
     seriesQuery.error ? `趋势：${extractErrorMessage(seriesQuery.error)}` : '',
     topQuery.error ? `排行：${extractErrorMessage(topQuery.error)}` : '',
     credentialUsageSummaryQuery.error ? `账号质量：${extractErrorMessage(credentialUsageSummaryQuery.error)}` : '',
@@ -969,6 +1127,7 @@ export function OverviewPage() {
         />
         <span className="text-xs text-muted-foreground">秒</span>
       </div>
+      <ScopeNote label="时间窗口" text="只控制窗口统计，不控制实时/累计/统计健康" />
       {(windowsQuery.isFetching ||
         seriesQuery.isFetching ||
         topQuery.isFetching ||
@@ -981,7 +1140,7 @@ export function OverviewPage() {
 
   return (
     <PageContainer>
-      <PageHeader title="总览" subtitle="实时健康、关键指标与异常" actions={headerActions} />
+      <PageHeader title="总览" subtitle="实时健康、流量、费用、账号质量与异常诊断" actions={headerActions} />
 
       {partialErrors.length > 0 && (
         <Callout tone="warning">
@@ -994,7 +1153,8 @@ export function OverviewPage() {
           <TabsTrigger value="operations">实时</TabsTrigger>
           <TabsTrigger value="traffic">流量</TabsTrigger>
           <TabsTrigger value="billing">费用</TabsTrigger>
-          <TabsTrigger value="quality">异常</TabsTrigger>
+          <TabsTrigger value="accounts">账号质量</TabsTrigger>
+          <TabsTrigger value="errors">异常诊断</TabsTrigger>
         </TabsList>
 
         <TabsContent value="operations" className="space-y-3">
@@ -1012,7 +1172,7 @@ export function OverviewPage() {
               simulated={summary.simulatedRequests}
               upstreamMeta={summary.upstreamMetadataRequests}
             />
-            <SectionCard title="当前窗口摘要" description="用于快速判断是否需要切换到费用、流量或异常视图" icon={<CheckCircle2 />}>
+            <SectionCard title="当前窗口摘要" description="当前窗口控制的汇总；实时、累计和统计健康不受其影响" icon={<CheckCircle2 />}>
               <div className="grid gap-3 sm:grid-cols-2">
                 <SignalRow label="请求量" value={formatCompact(summary.totalRequests)} ratio={summary.totalRequests > 0 ? 1 : 0} />
                 <SignalRow label="错误率" value={formatPercent(summary.errorRate)} ratio={summary.errorRate} barColor={summary.errorRate > 0 ? 'bg-destructive/75' : 'bg-success/70'} />
@@ -1022,6 +1182,10 @@ export function OverviewPage() {
               </div>
             </SectionCard>
           </div>
+          <UsageWriterHealthPanel
+            stats={writerStatsQuery.data}
+            error={writerStatsQuery.error}
+          />
         </TabsContent>
 
         <TabsContent value="traffic" className="space-y-3">
@@ -1079,11 +1243,7 @@ export function OverviewPage() {
             <StatCard title="未计价请求" value={formatCompact(summary.unpricedRequests)} valueTitle={formatNumber(summary.unpricedRequests)} desc={`已计价 ${formatCompact(summary.pricedRequests)}`} icon={<DollarSign />} tone={summary.unpricedRequests > 0 ? 'warning' : 'success'} />
             <StatCard title="外部池请求" value={formatCompact(summary.externalPoolBilling?.requests ?? 0)} valueTitle={formatNumber(summary.externalPoolBilling?.requests ?? 0)} desc={`billable ${formatUsdFixed2(summary.externalPoolBilling?.billableCostUsd ?? 0)}`} icon={<DollarSign />} tone="info" />
           </div>
-          <AccountQualityPanel
-            credentials={top.credentials ?? []}
-            usageItems={credentialUsageSummaryQuery.data?.items ?? []}
-            loading={topQuery.isLoading || credentialUsageSummaryQuery.isLoading}
-          />
+          <CostRelationshipPanel summary={summary} />
           {externalPoolBillingQuery.isLoading ? (
             <SectionCard title="外部池计费" description="按当前窗口拆分">
               <LoadingState text="加载外部池计费..." className="py-8" />
@@ -1096,7 +1256,21 @@ export function OverviewPage() {
           )}
         </TabsContent>
 
-        <TabsContent value="quality" className="space-y-3">
+        <TabsContent value="accounts" className="space-y-3">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard title="Top 账号数" value={formatCompact(top.credentials?.length ?? 0)} desc="当前窗口参与排行的账号" icon={<Users />} tone="primary" />
+            <StatCard title="账号请求" value={formatCompact(summary.successRequests + summary.errorRequests)} valueTitle={formatNumber(summary.successRequests + summary.errorRequests)} desc={`当前窗口总请求 ${formatCompact(summary.totalRequests)}`} icon={<DollarSign />} tone="info" />
+            <StatCard title="未计价请求" value={formatCompact(summary.unpricedRequests)} valueTitle={formatNumber(summary.unpricedRequests)} desc={`已计价 ${formatCompact(summary.pricedRequests)}`} icon={<ShieldAlert />} tone={summary.unpricedRequests > 0 ? 'warning' : 'success'} />
+            <StatCard title="高风险账号" value={formatCompact((top.credentials ?? []).filter((item) => item.requests > 0 && item.errorRequests / item.requests >= 0.1).length)} desc="错误率 ≥ 10%" icon={<Users />} />
+          </div>
+          <AccountQualityPanel
+            credentials={top.credentials ?? []}
+            usageItems={credentialUsageSummaryQuery.data?.items ?? []}
+            loading={topQuery.isLoading || credentialUsageSummaryQuery.isLoading}
+          />
+        </TabsContent>
+
+        <TabsContent value="errors" className="space-y-3">
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
             <StatCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需查看 Top 错误' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert /> : <CheckCircle2 />} tone={summary.errorRate >= 0.2 ? 'error' : summary.errorRate > 0 ? 'warning' : 'success'} />
             <StatCard title="错误请求" value={formatCompact(summary.errorRequests)} valueTitle={formatNumber(summary.errorRequests)} desc={`成功 ${formatCompact(summary.successRequests)}`} icon={<ShieldAlert />} tone={summary.errorRequests > 0 ? 'warning' : 'success'} />

@@ -17,6 +17,7 @@ import {
   getUsageRecords,
   getUsageRecordsPage,
   getUsageSummary,
+  getUsageWriterStats,
   previewUsageCleanup,
   resumeUsageCleanup,
   startUsageCleanup,
@@ -49,6 +50,14 @@ export function useUsageSummary(refetchInterval: RefetchInterval = false) {
   return useQuery({
     queryKey: ['usage-summary'],
     queryFn: getUsageSummary,
+    refetchInterval,
+  })
+}
+
+export function useUsageWriterStats(refetchInterval: RefetchInterval = false) {
+  return useQuery({
+    queryKey: ['usage-writer-stats'],
+    queryFn: getUsageWriterStats,
     refetchInterval,
   })
 }
@@ -131,6 +140,7 @@ function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQuery
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-top'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-breakdown'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-billing'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-writer-stats'] })
 }
 
 export function useClearUsageRecords() {
