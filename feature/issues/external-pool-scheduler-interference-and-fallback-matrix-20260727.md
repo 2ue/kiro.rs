@@ -1,10 +1,15 @@
 # 外部池调度影响本地凭据与 fallback 矩阵缺失
 
-Status: `recorded / post-release-analysis-pending`
+Status: `implemented / validation-in-progress / release-pending`
 
 Severity: `P0`
 
-Last reviewed: 2026-07-27 Asia/Shanghai
+Last reviewed: 2026-07-28 Asia/Shanghai
+
+Evidence root:
+
+- `tmp/prod-evidence/20260728-024841-external-pool-scheduler/`
+- Redacted archive: `tmp/prod-evidence/20260728-024841-external-pool-scheduler/20260728-024841-external-pool-scheduler-redacted.tar.gz`
 
 Related production machines:
 
@@ -15,7 +20,7 @@ Related production machines:
 
 ## 0. 结论与影响
 
-这是一个后续必须单独分析和修复的生产级问题。当前先登记，不在 runtime/storage 发布前展开修复，避免打断已验证候选。
+这是一个生产级调度耦合问题。runtime/storage 主线已先发 `v0.0.121`，随后本问题已完成只读生产复核并进入代码修复。
 
 用户侧现象：
 
@@ -40,9 +45,36 @@ Related production machines:
 
 ## 2. 根因假设
 
-当前只登记假设，不做最终定性。
+当前根因分两层。
 
-主要假设：
+第一层，生产证据支持外部池是 159 调度异常的强触发器/放大器：
+
+- 159 当前 `externalPools.externalPoolsEnabled=true`。
+- 170 当前 `externalPools.externalPoolsEnabled=false`，更新时间 `2026-07-27 09:13:48Z`。
+- 142 当前 `externalPools.externalPoolsEnabled=false`。
+- 159 近 12 小时 usage 聚合同时出现：
+  - `local_credential | local_success`: `56284`
+  - `local_credential | local_error_no_fallback | queue full`: `370`
+  - `local_credential | local_rescue_after_external | queue full`: `31`
+  - `external_pool | external_fallback_preflight | success`: `24`
+  - `external_pool | external_fallback_after_local_attempts | success`: `3`
+  - 多条 Redis 调度协调不可用并等待约 `300s` 的记录。
+- 142 在 external pools 关闭时承接更多本地成功请求，近 12 小时 `local_success=72177`，未出现同类 external route 和 queue full 聚合。
+
+第二层，源码根因是外部池“静态资格”被错误用于改变本地凭据排队语义：
+
+- `ExternalFallbackContext::local_attempt_policy()` 在本地凭据选择前调用 `has_eligible_external_pool_for_model()`。
+- 该函数只证明外部池静态配置/模型/body mode 合格，不证明外部池当前有容量、未冷却、Redis coordinator 可用、dispatch fence 可用。
+- 一旦静态资格为 true，本地 acquire mode 会变为 `FailFastOnCapacityWaitForRedis`。
+- 因此本地容量/RPM/冷却/Redis degraded 本应按本地队列或本地错误处理的请求，会被推入 external fallback/preflight。
+- 如果外部池实际不可接管，又会触发 external capacity failure / local rescue，再次回到本地调度，形成“本地 → 外部池 → 本地 rescue”的放大链。
+- `fallback_after_local_error` 旧逻辑还会在确认外部池可接管前记录 `local_pool_failure`，可能提前污染 local pool circuit。
+
+所以最终定性：
+
+> 外部池不是完全独立旁路。开启外部池后，旧逻辑用“静态存在/模型合格”改变本地凭据调度策略，导致外部池容量不足、冷却、Redis/PgSQL 慢或坏数据时，仍能把本地请求推入更重的 fallback/rescue 链路，并把压力反向打回本地调度。
+
+仍需继续复核的假设：
 
 1. 外部池开启后，每个请求额外进入外部池资格判断、snapshot、preflight、fallback capacity 协调路径。
 2. 外部池 snapshot 可能依赖 PgSQL，scheduler/capacity 可能依赖 Redis，与本地 token manager/scheduler 共用故障域。
@@ -112,7 +144,37 @@ Related production machines:
 
 ## 4. 方案方向
 
-后续设计必须满足：
+已选定并实现的第一阶段修复：
+
+1. 新增 external pool 当前可用性判断：
+   - `ExternalPoolManager::has_immediately_available_pool_for_model`
+   - `ExternalPoolManager::has_immediately_available_pool_for_body_mode_and_model`
+   - 该判断在短预算内检查 authoritative snapshot、Redis runtime、并发容量、global capacity、cooldown 和模型/body mode。
+   - 超过预算或无法快速证明可接管时返回 false，保持本地原始排队语义。
+2. 本地请求策略改为：
+   - 只有外部池当前可立即接管时，`local_attempt_policy()` 才使用 `FailFastOnCapacityWaitForRedis`。
+   - 如果外部池只是静态合格但容量满/冷却/协调不可用，本地凭据继续按 `WaitForCapacity` 运行。
+3. preflight/fallback 按 route reason 分流：
+   - `local_capacity_full`
+   - `local_scheduler_redis_degraded`
+   - `local_all_cooling_down`
+   - `local_pool_risk_circuit_open`
+   - `local_transient_exhausted`
+   - `local_auxiliary_attempts_exhausted`
+   - `local_auxiliary_concurrency_saturated`
+   - `local_attempt_reserved_for_fallback`
+
+   这些只是本地临时调度问题，只有外部池能立即接管时才 fallback。
+4. 无本地可行路线的原因仍允许走外部池自身容量策略：
+   - `local_no_credentials`
+   - `local_all_disabled`
+   - `local_proxy_blocked`
+   - `local_no_model_compatible`
+   - `no_available_credentials`
+   - `unsupported_model`
+5. `record_local_pool_failure` 移到确认外部池 ready 之后，避免“外部池不可接管但先污染 local pool circuit”。
+
+后续设计仍必须满足：
 
 1. 外部池资格 snapshot 单飞、缓存、有 TTL，有坏记录隔离；坏记录不能每个请求重复解析和告警。
 2. 外部池调度 Redis/PgSQL 与本地凭据主调度故障域隔离；外部池慢不能拖住本地凭据选择。
@@ -139,12 +201,32 @@ Related production machines:
 - 真实协议测试：Claude Code CLI 多轮、tools、stream、non-stream 在外部池开启/关闭下都正常。
 - 指标验证：usage 中 routeKind/routeSubtype/selectionFailure 能准确解释每次路由，不出现“本地有容量但被外部池拖死”的不可解释状态。
 
+当前已完成验证：
+
+- `external_pool::tests::external_pool_immediate_availability_requires_current_capacity_and_recovers`
+  - 有健康外部池时即时可用为 true。
+  - 外部池并发槽被占满后即时可用为 false。
+  - 外部池 lease 释放并 drain 后即时可用恢复 true。
+- `anthropic::handlers::tests::local_external_fallback_capacity_gate_reason_matrix_is_explicit`
+  - 明确哪些 route reason 必须要求外部池当前有容量。
+  - 明确无本地可行路线的 reason 仍可进入外部池自身容量策略。
+- 旧回归：
+  - `external_fallback_classifier_*`: `5/5` 通过。
+  - `local_pool_preflight_*`: `2/2` 通过。
+
+仍需完成验证：
+
+- full Rust/default + no-default。
+- clippy baseline。
+- load/chaos 中外部池容量满、Redis coordinator 慢、local rescue enabled 的矩阵。
+- 必要时跑真实 Claude Code CLI fake-upstream smoke，确认协议行为未受影响。
+
 ## 6. 残余风险与回滚
 
 残余风险：
 
-- 当前文档只是问题登记，未完成源码级根因闭环。
-- 用户提供的 159 分析结论需要在当前仓库和现网证据上重新复核，不能直接当成最终修复依据。
+- 当前第一阶段修复降低外部池对本地调度的反向污染，但还没有完成所有外部池 fallback 组合的 load/chaos 矩阵。
+- 用户提供的 159 分析结论已用只读生产证据复核一部分，但 170 事故发生时的历史 `externalPoolsEnabled` 状态仍需从更早 audit/runtime config 证据确认。
 - 外部池和本地凭据调度耦合可能跨越 provider、external_pool、token_manager、storage、Redis cache 多个模块，修复需要完整矩阵验证。
 
 临时回滚/止血：

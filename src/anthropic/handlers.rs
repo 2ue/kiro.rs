@@ -118,6 +118,8 @@ const SLOW_STREAM_GAP_MS: u64 = 10_000;
 const SLOW_RESPONSE_MS: u64 = 60_000;
 const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
 const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const EXTERNAL_FALLBACK_LOCAL_POLICY_AVAILABILITY_WAIT: Duration = Duration::from_millis(50);
+const EXTERNAL_FALLBACK_PREFLIGHT_AVAILABILITY_WAIT: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy)]
 struct LocalStreamRetryConfig {
@@ -1572,7 +1574,10 @@ impl ExternalFallbackContext {
             || self.config.fallback_on_unsupported_model;
         if !fallback_enabled
             || !self
-                .has_eligible_external_pool_for_model(&self.payload.model)
+                .has_immediately_available_external_pool_for_model(
+                    &self.payload.model,
+                    EXTERNAL_FALLBACK_LOCAL_POLICY_AVAILABILITY_WAIT,
+                )
                 .await
         {
             return (AcquireMode::WaitForCapacity, false);
@@ -1593,6 +1598,42 @@ impl ExternalFallbackContext {
                     .has_eligible_pool_for_model(&self.config, model)
                     .await
             }
+        }
+    }
+
+    async fn has_immediately_available_external_pool_for_model(
+        &self,
+        model: &str,
+        max_wait: Duration,
+    ) -> bool {
+        match external_fallback_body_mode_filter(self.requires_normalized_body) {
+            Some(body_mode) => {
+                self.manager
+                    .has_immediately_available_pool_for_body_mode_and_model(
+                        &self.config,
+                        body_mode,
+                        Some(model),
+                        max_wait,
+                    )
+                    .await
+            }
+            None => {
+                self.manager
+                    .has_immediately_available_pool_for_model(&self.config, model, max_wait)
+                    .await
+            }
+        }
+    }
+
+    async fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
+        if local_route_reason_requires_immediate_external_capacity(route_reason) {
+            self.has_immediately_available_external_pool_for_model(
+                model,
+                EXTERNAL_FALLBACK_PREFLIGHT_AVAILABILITY_WAIT,
+            )
+            .await
+        } else {
+            self.has_eligible_external_pool_for_model(model).await
         }
     }
 
@@ -1637,7 +1678,10 @@ impl ExternalFallbackContext {
             return None;
         };
         let route_model = model.unwrap_or(&self.payload.model);
-        if !self.has_eligible_external_pool_for_model(route_model).await {
+        if !self
+            .external_pool_ready_for_route_reason(reason, route_model)
+            .await
+        {
             return None;
         }
 
@@ -1769,6 +1813,20 @@ impl ExternalFallbackContext {
             return None;
         };
         let route_reason = route_reason.to_string();
+        if !self
+            .external_pool_ready_for_route_reason(&route_reason, &self.payload.model)
+            .await
+        {
+            tracing::warn!(
+                request_id,
+                classified_reason,
+                route_reason,
+                local_state = ?local_state.kind,
+                local_dispatchable = local_state.dispatchable,
+                "fresh local state permits fallback but no external pool is ready for this route reason"
+            );
+            return None;
+        }
         if self.config.local_pool_circuit_enabled {
             let mut seen_credentials = HashSet::new();
             let mut recorded = false;
@@ -1791,20 +1849,6 @@ impl ExternalFallbackContext {
                     .record_local_pool_failure(&self.config, None, &classified_reason)
                     .await;
             }
-        }
-        if !self
-            .has_eligible_external_pool_for_model(&self.payload.model)
-            .await
-        {
-            tracing::warn!(
-                request_id,
-                classified_reason,
-                route_reason,
-                local_state = ?local_state.kind,
-                local_dispatchable = local_state.dispatchable,
-                "fresh local state permits fallback but no external pool is eligible"
-            );
-            return None;
         }
         tracing::warn!(
             request_id,
@@ -2005,6 +2049,20 @@ fn local_pool_fallback_reason_for_fresh_state(
         return None;
     }
     local_pool_route_fallback_reason(kind, config)
+}
+
+fn local_route_reason_requires_immediate_external_capacity(reason: &str) -> bool {
+    matches!(
+        reason,
+        "local_capacity_full"
+            | "local_scheduler_redis_degraded"
+            | "local_all_cooling_down"
+            | "local_pool_risk_circuit_open"
+            | "local_transient_exhausted"
+            | "local_auxiliary_attempts_exhausted"
+            | "local_auxiliary_concurrency_saturated"
+            | "local_attempt_reserved_for_fallback"
+    )
 }
 
 fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {

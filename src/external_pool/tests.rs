@@ -1529,9 +1529,11 @@ async fn external_pool_manager_selects_multiple_pools_by_priority_and_capacity()
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pools_enabled = true;
-    config.external_pool_global_max_concurrent_requests = 0;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 0,
+        ..ExternalPoolsConfig::default()
+    };
 
     let primary = postgres
         .create_external_pool(create_pool_request("external-primary", 1, true))
@@ -1682,6 +1684,69 @@ async fn external_pool_manager_uncached_snapshot_detects_full_pool_after_availab
     );
 
     drop(lease);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_immediate_availability_requires_current_capacity_and_recovers() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pools_enabled = true;
+    config.external_pool_global_max_concurrent_requests = 0;
+
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-immediate-capacity", 1, true))
+        .await
+        .unwrap();
+
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "a healthy pool with an open lease slot can immediately take local fallback traffic"
+    );
+
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "pool lease should be acquired, got {:?}",
+                unavailable.reason
+            )
+        }
+    };
+    assert!(
+        !manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "a full external pool must not change local credential dispatch into fail-fast fallback"
+    );
+
+    drop(lease);
+    let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+    assert!(drained.drained, "external release should drain");
+
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "external immediate availability must recover after the external lease is released"
+    );
+
     postgres.drop_test_schema().await.unwrap();
 }
 

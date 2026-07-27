@@ -4207,6 +4207,39 @@ impl ExternalPoolManager {
             .await
     }
 
+    pub async fn has_immediately_available_pool_for_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        model: &str,
+        max_wait: Duration,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_immediately_available_pool_matching(
+            config,
+            None,
+            Some(&model_candidates),
+            max_wait,
+        )
+        .await
+    }
+
+    pub async fn has_immediately_available_pool_for_body_mode_and_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode: ExternalPoolRequestBodyMode,
+        model: Option<&str>,
+        max_wait: Duration,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates(model);
+        self.has_immediately_available_pool_matching(
+            config,
+            Some(body_mode),
+            Some(&model_candidates),
+            max_wait,
+        )
+        .await
+    }
+
     async fn has_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
@@ -4224,6 +4257,55 @@ impl ExternalPoolManager {
                 && body_mode_filter.is_none_or(|mode| pool.request_body_mode == mode)
                 && external_pool_eligibility_matches_supported_models(pool, model_candidates)
         })
+    }
+
+    async fn has_immediately_available_pool_matching(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+        model_candidates: Option<&[String]>,
+        max_wait: Duration,
+    ) -> bool {
+        if !config.external_pools_enabled {
+            return false;
+        }
+        let max_wait = max_wait.max(Duration::from_millis(1));
+        let check = async {
+            let authoritative_pools = match self.load_authoritative_pool_snapshot().await {
+                Ok(pools) => pools,
+                Err(err) => {
+                    tracing::debug!(
+                        unavailable_kind = err.kind.as_str(),
+                        retry_after_ms = err.retry_after.as_millis() as u64,
+                        "外部池当前可用性检查未能快速加载权威快照"
+                    );
+                    return false;
+                }
+            };
+            let cooldown_candidates = model_candidates.unwrap_or(&[]);
+            let selection = self
+                .scan_pool_availability_from_snapshot(
+                    &authoritative_pools,
+                    &HashSet::new(),
+                    config,
+                    true,
+                    body_mode_filter,
+                    model_candidates,
+                    Some(cooldown_candidates),
+                )
+                .await;
+            selection.selected_pool.is_some() || selection.availability.available_pools > 0
+        };
+        match timeout(max_wait, check).await {
+            Ok(available) => available,
+            Err(_) => {
+                tracing::debug!(
+                    max_wait_ms = max_wait.as_millis() as u64,
+                    "外部池当前可用性检查超过本地调度保护预算，保持本地原始排队语义"
+                );
+                false
+            }
+        }
     }
 
     pub async fn record_local_pool_failure(

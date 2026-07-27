@@ -9149,6 +9149,39 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
 }
 
 #[test]
+fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
+    for reason in [
+        "local_capacity_full",
+        "local_scheduler_redis_degraded",
+        "local_all_cooling_down",
+        "local_pool_risk_circuit_open",
+        "local_transient_exhausted",
+        "local_auxiliary_attempts_exhausted",
+        "local_auxiliary_concurrency_saturated",
+        "local_attempt_reserved_for_fallback",
+    ] {
+        assert!(
+            local_route_reason_requires_immediate_external_capacity(reason),
+            "{reason} must not push local requests into external fallback unless an external pool can immediately accept"
+        );
+    }
+
+    for reason in [
+        "local_no_credentials",
+        "local_all_disabled",
+        "local_proxy_blocked",
+        "local_no_model_compatible",
+        "no_available_credentials",
+        "unsupported_model",
+    ] {
+        assert!(
+            !local_route_reason_requires_immediate_external_capacity(reason),
+            "{reason} has no viable local route, so external fallback may use the external pool's own capacity policy"
+        );
+    }
+}
+
+#[test]
 fn fresh_local_pool_state_blocks_external_while_any_local_account_is_dispatchable() {
     let mut config = ExternalPoolsConfig::default();
 
