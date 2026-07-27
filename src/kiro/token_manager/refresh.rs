@@ -26,7 +26,8 @@ use crate::model::config::Config;
 
 use super::auxiliary::{
     AuxiliaryConcurrencyController, AuxiliaryConcurrencyKind, AuxiliaryConcurrencyPermit,
-    TokenRefreshAdmissionController,
+    TokenRefreshAdmissionController, TokenRefreshAdmissionRejected,
+    TokenRefreshAdmissionRejectionKind,
 };
 
 const TOKEN_SERVICE_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
@@ -181,6 +182,24 @@ impl fmt::Display for RefreshFailure {
 
 impl std::error::Error for RefreshFailure {}
 
+fn refresh_failure_from_token_refresh_admission(
+    rejection: TokenRefreshAdmissionRejected,
+) -> RefreshFailure {
+    let kind = match rejection.kind {
+        TokenRefreshAdmissionRejectionKind::RateLimited => RefreshFailureKind::RateLimited,
+        TokenRefreshAdmissionRejectionKind::CoordinationUnavailable => {
+            RefreshFailureKind::Coordination
+        }
+    };
+    RefreshFailure::new(
+        RefreshFailureStage::Coordination,
+        kind,
+        None,
+        Some(rejection.retry_after),
+        false,
+    )
+}
+
 pub(crate) struct RefreshSendAdmission {
     auxiliary_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     concurrency: Arc<AuxiliaryConcurrencyController>,
@@ -223,7 +242,10 @@ impl RefreshSendAdmission {
         let concurrency_permit = self
             .concurrency
             .try_acquire(AuxiliaryConcurrencyKind::TokenRefresh)?;
-        self.token_refresh_admission.reserve().await?;
+        self.token_refresh_admission
+            .reserve()
+            .await
+            .map_err(refresh_failure_from_token_refresh_admission)?;
         if let Some(budget) = &self.auxiliary_budget {
             budget.reserve(AuxiliaryAttemptKind::TokenRefresh)?;
         }
@@ -1073,13 +1095,46 @@ mod tests {
 
     use super::{
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, RefreshFailure, RefreshFailureKind,
-        RefreshFailureStage, get_usage_limits, refresh_token,
+        RefreshFailureStage, get_usage_limits, refresh_failure_from_token_refresh_admission,
+        refresh_token,
     };
     use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::token_manager::auxiliary::{
+        TokenRefreshAdmissionAuthority, TokenRefreshAdmissionRejected,
+        TokenRefreshAdmissionRejectionKind,
+    };
     use crate::kiro::token_manager::{
         AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind, MultiTokenManager,
     };
     use crate::model::config::{Config, TlsBackend};
+
+    #[test]
+    fn token_refresh_admission_rejections_are_typed_pre_send_failures() {
+        let rate_limited =
+            refresh_failure_from_token_refresh_admission(TokenRefreshAdmissionRejected {
+                kind: TokenRefreshAdmissionRejectionKind::RateLimited,
+                authority: TokenRefreshAdmissionAuthority::ProcessLocal,
+                retry_after: StdDuration::from_millis(250),
+            });
+        assert_eq!(rate_limited.stage, RefreshFailureStage::Coordination);
+        assert_eq!(rate_limited.kind, RefreshFailureKind::RateLimited);
+        assert_eq!(
+            rate_limited.retry_after,
+            Some(StdDuration::from_millis(250))
+        );
+        assert!(!rate_limited.send_committed);
+
+        let degraded =
+            refresh_failure_from_token_refresh_admission(TokenRefreshAdmissionRejected {
+                kind: TokenRefreshAdmissionRejectionKind::CoordinationUnavailable,
+                authority: TokenRefreshAdmissionAuthority::RedisGlobalDegraded,
+                retry_after: StdDuration::from_secs(1),
+            });
+        assert_eq!(degraded.stage, RefreshFailureStage::Coordination);
+        assert_eq!(degraded.kind, RefreshFailureKind::Coordination);
+        assert_eq!(degraded.retry_after, Some(StdDuration::from_secs(1)));
+        assert!(!degraded.send_committed);
+    }
 
     fn refresh_test_tls_backend() -> TlsBackend {
         #[cfg(feature = "native-tls")]
@@ -2814,6 +2869,7 @@ mod tests {
                     let mut disabled = 0_usize;
                     let mut refresh_failures = 0_usize;
                     let mut auth_health_failures = 0_usize;
+                    let mut expected_kind_health_failures = 0_usize;
                     for task in tasks {
                         let (result, snapshot) = task.await.expect("burst request task joins");
                         assert!(result.is_err(), "controlled OAuth burst must fail");
@@ -2838,6 +2894,15 @@ mod tests {
                             .iter()
                             .filter(|entry| entry.last_error_kind.as_deref() == Some("auth"))
                             .count();
+                        if let Some(expected_kind) = scenario.expected_health_kind() {
+                            expected_kind_health_failures += snapshot
+                                .entries
+                                .iter()
+                                .filter(|entry| {
+                                    entry.last_error_kind.as_deref() == Some(expected_kind)
+                                })
+                                .count();
+                        }
                     }
                     let elapsed_ms = started_at.elapsed().as_millis();
                     let hits = server.state.hits();
@@ -2862,8 +2927,12 @@ mod tests {
 
                     assert!(server.state.distinct_request_bodies() <= hits);
                     assert_eq!(refresh_failures, 0);
-                    let health_mutating = scenario.expected_health_kind().is_some();
-                    assert_eq!(cooled, if health_mutating { hits } else { 0 });
+                    if scenario.expected_health_kind().is_some() {
+                        assert_eq!(expected_kind_health_failures, hits);
+                        assert!(cooled <= hits);
+                    } else {
+                        assert_eq!(cooled, 0);
+                    }
                     assert_eq!(
                         auth_health_failures,
                         if scenario.expected_health_kind() == Some("auth") {
@@ -2990,6 +3059,14 @@ mod tests {
                         .iter()
                         .filter(|entry| entry.last_error_kind.as_deref() == Some("auth"))
                         .count();
+                    let expected_kind_health_failures =
+                        scenario.expected_health_kind().map(|kind| {
+                            snapshot
+                                .entries
+                                .iter()
+                                .filter(|entry| entry.last_error_kind.as_deref() == Some(kind))
+                                .count()
+                        });
                     let expected_send_cap = concurrency * EXPECTED_REQUEST_AUXILIARY_MAX_ATTEMPTS;
 
                     eprintln!(
@@ -3012,10 +3089,17 @@ mod tests {
                     assert!(distinct <= hits);
                     assert_eq!(refresh_failures, 0);
                     if let Some(expected_kind) = scenario.expected_health_kind() {
-                        assert!(cooled > 0 && cooled <= hits);
+                        let health_failures = expected_kind_health_failures
+                            .expect("checked expected health failure kind");
+                        assert!(health_failures > 0 && health_failures <= hits);
+                        assert!(cooled <= hits);
                         assert_eq!(
                             auth_health_failures,
-                            if expected_kind == "auth" { cooled } else { 0 }
+                            if expected_kind == "auth" {
+                                health_failures
+                            } else {
+                                0
+                            }
                         );
                     } else {
                         assert_eq!(cooled, 0);

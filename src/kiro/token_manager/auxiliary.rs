@@ -954,18 +954,44 @@ mod tests {
             let mut config = Config::default();
             config.tls_backend = TlsBackend::Rustls;
             let runtime = AuxiliaryRuntime::new(&config, None, false).unwrap();
-            let mut overflow_proxy = None;
-            for index in 0..=REFRESH_CLIENT_CACHE_MAX_ENTRIES {
-                let proxy = ProxyConfig::new(format!(
-                    "http://127.0.0.1:{}",
-                    10_000 + round * 1_000 + index
-                ));
-                runtime
-                    .refresh_client(TlsBackend::Rustls, Some(&proxy))
-                    .await
-                    .unwrap();
-                overflow_proxy = Some(proxy);
+            let prebuilt_client = Arc::new(
+                build_client(None, REFRESH_CLIENT_TIMEOUT_SECS, TlsBackend::Rustls).unwrap(),
+            );
+            {
+                let mut entries = runtime.refresh_clients.entries.lock();
+                for index in 0..REFRESH_CLIENT_CACHE_MAX_ENTRIES {
+                    let proxy = ProxyConfig::new(format!(
+                        "http://127.0.0.1:{}",
+                        10_000 + round * 1_000 + index
+                    ));
+                    let cell = Arc::new(OnceCell::new());
+                    cell.set(prebuilt_client.clone()).unwrap();
+                    entries.insert(
+                        RefreshClientKey {
+                            tls_backend: TlsBackend::Rustls,
+                            proxy: Some(proxy),
+                        },
+                        cell,
+                    );
+                }
             }
+            runtime
+                .refresh_clients
+                .builds
+                .store(REFRESH_CLIENT_CACHE_MAX_ENTRIES as u64, Ordering::Release);
+            runtime
+                .refresh_clients
+                .misses
+                .store(REFRESH_CLIENT_CACHE_MAX_ENTRIES as u64, Ordering::Release);
+
+            let overflow_proxy = ProxyConfig::new(format!(
+                "http://127.0.0.1:{}",
+                10_000 + round * 1_000 + REFRESH_CLIENT_CACHE_MAX_ENTRIES
+            ));
+            runtime
+                .refresh_client(TlsBackend::Rustls, Some(&overflow_proxy))
+                .await
+                .unwrap();
 
             let after_pressure = runtime.refresh_client_cache_snapshot();
             assert_eq!(after_pressure.entries, REFRESH_CLIENT_CACHE_MAX_ENTRIES);
@@ -976,7 +1002,7 @@ mod tests {
             assert_eq!(after_pressure.saturated, 1);
 
             runtime
-                .refresh_client(TlsBackend::Rustls, overflow_proxy.as_ref())
+                .refresh_client(TlsBackend::Rustls, Some(&overflow_proxy))
                 .await
                 .unwrap();
             let after_reuse = runtime.refresh_client_cache_snapshot();

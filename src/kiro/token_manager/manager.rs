@@ -713,6 +713,9 @@ pub(crate) enum AutomaticTokenRecoveryOutcome {
 }
 
 fn refresh_failure_requires_health_action(failure: &RefreshFailure) -> bool {
+    if !failure.send_committed {
+        return false;
+    }
     matches!(
         failure.kind,
         RefreshFailureKind::InvalidGrant
@@ -726,16 +729,6 @@ fn refresh_failure_is_shareable(failure: &RefreshFailure) -> bool {
         return false;
     }
     failure.send_committed
-        || (failure.stage == RefreshFailureStage::Coordination
-            && matches!(
-                failure.kind,
-                RefreshFailureKind::Coordination | RefreshFailureKind::Timeout
-            ))
-        || (failure.stage == RefreshFailureStage::RequestSend
-            && matches!(
-                failure.kind,
-                RefreshFailureKind::Network | RefreshFailureKind::Timeout
-            ))
 }
 
 fn redis_refresh_failure_stage(stage: RefreshFailureStage) -> RedisRefreshFailureStage {
@@ -961,7 +954,7 @@ const RUNTIME_MUTATION_FLUSH_LIMIT: usize = 256;
 const RUNTIME_MUTATION_FLUSH_BUDGET: StdDuration = StdDuration::from_secs(10);
 const CREDENTIAL_PGSQL_SYNC_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(15);
-const REFRESH_REDIS_LOCK_OP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const REFRESH_REDIS_LOCK_OP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const TOKEN_REFRESH_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 const TOKEN_REFRESH_COORDINATION_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const TOKEN_REFRESH_RECONCILIATION_RESERVE: StdDuration = StdDuration::from_secs(15);
@@ -1770,24 +1763,17 @@ impl Drop for RedisRefreshLeaseDropGuard {
                 }
                 if persisted_storage_revision == 0 && send_committed {
                     if let Some(postgres) = postgres {
-                        if let Ok(Ok(credentials)) = tokio::time::timeout(
+                        if let Ok(Ok(Some(authoritative))) = tokio::time::timeout(
                             CREDENTIAL_PGSQL_SYNC_TIMEOUT,
-                            postgres.load_credentials(),
+                            postgres.load_credential(credential_id),
                         )
                         .await
                         {
-                            if let Some(authoritative) =
-                                credentials.into_iter().find(|credential| {
-                                    let token_changed =
-                                        rejected_access_token.as_deref().map_or_else(
-                                            || credential.access_token.is_some(),
-                                            |rejected| {
-                                                credential.access_token.as_deref() != Some(rejected)
-                                            },
-                                        );
-                                    credential.id == Some(credential_id) && token_changed
-                                })
-                            {
+                            let token_changed = rejected_access_token.as_deref().map_or_else(
+                                || authoritative.access_token.is_some(),
+                                |rejected| authoritative.access_token.as_deref() != Some(rejected),
+                            );
+                            if token_changed {
                                 persisted_storage_revision = authoritative.storage_revision;
                             }
                         }
@@ -3683,7 +3669,7 @@ impl MultiTokenManager {
         // but a stale owner can never apply it to a newer credential generation.
         match failure.kind {
             RefreshFailureKind::InvalidGrant => {
-                self.report_refresh_token_invalid(id);
+                self.report_refresh_token_invalid_deferred(id);
             }
             RefreshFailureKind::CredentialAuth => {
                 self.report_transient_failure_kind(
@@ -3724,6 +3710,7 @@ impl MultiTokenManager {
                 false,
             ))
         })?;
+        let mut observed_generation = None;
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(RefreshFailure::new(
@@ -3737,7 +3724,12 @@ impl MultiTokenManager {
             }
             let begin = tokio::time::timeout_at(
                 deadline,
-                redis.begin_token_refresh(id, identity.0, caller_can_claim_health),
+                redis.begin_token_refresh_after_observed_generation(
+                    id,
+                    identity.0,
+                    caller_can_claim_health,
+                    observed_generation,
+                ),
             )
             .await
             .map_err(|_| {
@@ -3762,7 +3754,16 @@ impl MultiTokenManager {
                 RedisRefreshBegin::Leader(lease) => {
                     return Ok(DistributedRefreshDecision::Leader(lease));
                 }
-                RedisRefreshBegin::Wait { poll_after, .. } => {
+                RedisRefreshBegin::Wait {
+                    generation,
+                    poll_after,
+                } => {
+                    if let Some(generation) = generation {
+                        observed_generation = Some(
+                            observed_generation
+                                .map_or(generation, |current: u64| current.max(generation)),
+                        );
+                    }
                     let wake_at = (tokio::time::Instant::now() + poll_after).min(deadline);
                     tokio::time::sleep_until(wake_at).await;
                 }
@@ -3857,6 +3858,77 @@ impl MultiTokenManager {
         Ok(committed_failure.into_shared_failure_wave())
     }
 
+    async fn cancel_distributed_refresh_until(
+        &self,
+        lease: &RedisRefreshLease,
+        send_committed: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        let redis = self.redis_store.as_ref().ok_or_else(|| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                send_committed,
+            ))
+        })?;
+        let cancelled = tokio::time::timeout_at(deadline, redis.cancel_token_refresh(lease))
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Timeout,
+                    None,
+                    None,
+                    send_committed,
+                ))
+            })?
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Coordination,
+                    None,
+                    None,
+                    send_committed,
+                ))
+            })?;
+        if !cancelled {
+            return Err(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                send_committed,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn complete_or_cancel_distributed_refresh_failure_until(
+        &self,
+        lease: &RedisRefreshLease,
+        failure: &RefreshFailure,
+        leader_can_claim_health: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<RefreshFailure> {
+        if refresh_failure_is_shareable(failure) {
+            return self
+                .complete_distributed_refresh_failure_until(
+                    lease,
+                    failure,
+                    leader_can_claim_health,
+                    deadline,
+                )
+                .await;
+        }
+
+        self.cancel_distributed_refresh_until(lease, failure.send_committed, deadline)
+            .await?;
+        Ok(failure.clone())
+    }
+
     async fn complete_distributed_refresh_success_until(
         &self,
         lease: &RedisRefreshLease,
@@ -3920,45 +3992,8 @@ impl MultiTokenManager {
                 .await;
         }
 
-        let redis = self.redis_store.as_ref().ok_or_else(|| {
-            anyhow::Error::new(RefreshFailure::new(
-                RefreshFailureStage::Coordination,
-                RefreshFailureKind::Coordination,
-                None,
-                None,
-                true,
-            ))
-        })?;
-        let cancelled = tokio::time::timeout_at(deadline, redis.cancel_token_refresh(lease))
-            .await
-            .map_err(|_| {
-                anyhow::Error::new(RefreshFailure::new(
-                    RefreshFailureStage::Coordination,
-                    RefreshFailureKind::Timeout,
-                    None,
-                    None,
-                    true,
-                ))
-            })?
-            .map_err(|_| {
-                anyhow::Error::new(RefreshFailure::new(
-                    RefreshFailureStage::Coordination,
-                    RefreshFailureKind::Coordination,
-                    None,
-                    None,
-                    true,
-                ))
-            })?;
-        if !cancelled {
-            return Err(RefreshFailure::new(
-                RefreshFailureStage::Coordination,
-                RefreshFailureKind::Coordination,
-                None,
-                None,
-                true,
-            )
-            .into());
-        }
+        self.cancel_distributed_refresh_until(lease, true, deadline)
+            .await?;
         tracing::debug!(
             credential_id = lease.credential_id,
             refresh_generation = lease.generation,
@@ -5400,6 +5435,24 @@ impl MultiTokenManager {
         unbind_sticky_sessions_for_credential(&self.session_bindings, credential_id);
     }
 
+    /// 请求热路径使用的凭据级会话解绑：本地 sticky cache 先行，Redis 异步清理。
+    fn unbind_sessions_for_credential_deferred(&self, credential_id: u64) {
+        unbind_sticky_sessions_for_credential(&self.session_bindings, credential_id);
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            spawn_best_effort_storage_task("异步删除 Redis 凭据会话绑定", async move {
+                redis.delete_sessions_for_credential(credential_id).await?;
+                Ok(())
+            });
+        }
+    }
+
+    /// 请求热路径禁用凭据后的调度清理：本地调度状态立即清理，Redis best-effort。
+    fn clear_disabled_credential_request_state(&self, credential_id: u64) {
+        self.unbind_sessions_for_credential_deferred(credential_id);
+        self.clear_scheduler_state_for_credential(credential_id, false);
+    }
+
     /// 记录绑定账号的一次软失败。返回 true 表示本次请求可以临时 fallback。
     #[allow(dead_code)]
     pub fn record_session_soft_failure(&self, session_id: &str, credential_id: u64) -> bool {
@@ -6523,10 +6576,18 @@ impl MultiTokenManager {
                         local_excluded_ids.insert(id);
                         health_neutral_refresh_error = Some(failure.into());
                         self.entries.lock().iter().any(|entry| !entry.disabled)
+                    } else if !refresh_failure_requires_health_action(&failure) {
+                        // Local coordination/admission/persistence failures before the refresh
+                        // request is committed do not describe credential health. They are
+                        // request-local retry signals only; recording them as credential failures
+                        // turns Redis/PgSQL jitter into account disable/cooldown amplification.
+                        local_excluded_ids.insert(id);
+                        health_neutral_refresh_error = Some(failure.into());
+                        self.entries.lock().iter().any(|entry| !entry.disabled)
                     } else {
                         match failure.kind {
                             RefreshFailureKind::InvalidGrant => {
-                                self.report_refresh_token_invalid(id)
+                                self.report_refresh_token_invalid_deferred(id)
                             }
                             RefreshFailureKind::CredentialAuth => self
                                 .report_transient_failure_kind(
@@ -6550,11 +6611,6 @@ impl MultiTokenManager {
                                 ),
                             )?,
                             _ => {
-                                // Infrastructure, upstream availability, transport, and response
-                                // integrity failures do not describe credential health. Exclude
-                                // this credential only for the current request so it cannot be
-                                // retried in a tight loop, while leaving global health and
-                                // persisted failure counts unchanged for natural recovery.
                                 local_excluded_ids.insert(id);
                                 health_neutral_refresh_error = Some(failure.into());
                                 self.entries.lock().iter().any(|entry| !entry.disabled)
@@ -6624,10 +6680,10 @@ impl MultiTokenManager {
                     ))
                 });
         };
-        let (credentials, runtime_states) = credential_pgsql_sync_until(
+        let authoritative = credential_pgsql_sync_until(
             "等待跨实例刷新时读取 PgSQL 权威凭据",
             deadline,
-            store.load_credentials_with_runtime_state(),
+            store.load_credential_with_runtime_state(id),
         )
         .await
         .map_err(|_| {
@@ -6644,18 +6700,15 @@ impl MultiTokenManager {
                 false,
             ))
         })?;
-        let latest = credentials
-            .into_iter()
-            .find(|credential| credential.id == Some(id))
-            .ok_or_else(|| {
-                anyhow::Error::new(RefreshFailure::new(
-                    RefreshFailureStage::Coordination,
-                    RefreshFailureKind::Coordination,
-                    None,
-                    None,
-                    false,
-                ))
-            })?;
+        let (latest, runtime_state) = authoritative.ok_or_else(|| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                false,
+            ))
+        })?;
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
@@ -6673,7 +6726,7 @@ impl MultiTokenManager {
             entry.credentials = latest;
             Self::recompute_entry_disabled(entry);
         }
-        if let Some(state) = runtime_states.get(&id) {
+        if let Some(state) = runtime_state.as_ref() {
             Self::apply_runtime_state_if_newer(entry, state);
         }
         Ok(entry.credentials.clone())
@@ -6931,7 +6984,7 @@ impl MultiTokenManager {
                                     false,
                                 );
                                 let failure = self
-                                    .complete_distributed_refresh_failure_until(
+                                    .complete_or_cancel_distributed_refresh_failure_until(
                                         lease,
                                         &failure,
                                         false,
@@ -7076,7 +7129,7 @@ impl MultiTokenManager {
                                 .downcast_ref::<RefreshFailure>()
                                 .unwrap_or(&synthetic_failure);
                             let shared = self
-                                .complete_distributed_refresh_failure_until(
+                                .complete_or_cancel_distributed_refresh_failure_until(
                                     lease,
                                     failure,
                                     update_refresh_health,
@@ -7481,11 +7534,9 @@ impl MultiTokenManager {
                         let current = credential_pgsql_sync_until(
                             "Token 刷新 CAS 未知提交后读取 PgSQL 权威凭据",
                             reconciliation_deadline,
-                            store.load_credentials(),
+                            store.load_credential(id),
                         )
-                        .await?
-                        .into_iter()
-                        .find(|credential| credential.id == Some(id));
+                        .await?;
                         if let Some(current) = current {
                             if Self::refresh_fields_match(&current, &patch) {
                                 return Ok(current);
@@ -7643,11 +7694,9 @@ impl MultiTokenManager {
                             let current = credential_pgsql_sync_until(
                                 "凭据 CAS 未知提交后读取 PgSQL 权威值",
                                 deadline,
-                                store.load_credentials(),
+                                store.load_credential(id),
                             )
                             .await?
-                            .into_iter()
-                            .find(|credential| credential.id == Some(id))
                             .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
                             if Self::credential_update_is_applied(&base, &requested, &current)? {
                                 return Ok(current);
@@ -7684,6 +7733,68 @@ impl MultiTokenManager {
         }
         self.invalidate_model_capability_cohorts();
         Ok(saved)
+    }
+
+    fn persist_credential_update_best_effort(
+        &self,
+        operation: &'static str,
+        base: KiroCredentials,
+        requested: KiroCredentials,
+    ) {
+        let Some(store) = &self.postgres_store else {
+            return;
+        };
+        let Some(id) = base.id.filter(|id| requested.id == Some(*id)) else {
+            tracing::warn!("跳过异步凭据持久化：CAS 更新缺少一致的 id");
+            return;
+        };
+        let store = store.clone();
+        spawn_best_effort_storage_task(operation, async move {
+            let deadline = tokio::time::Instant::now() + CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT;
+            let mut candidate = requested.clone();
+            let mut last_error = None;
+            for attempt in 1..=4 {
+                match credential_pgsql_sync_until(
+                    operation,
+                    deadline,
+                    store.upsert_credential(&candidate),
+                )
+                .await
+                {
+                    Ok(CredentialUpsertCasOutcome::Applied(_saved)) => return Ok(()),
+                    Ok(CredentialUpsertCasOutcome::Conflict { current }) => {
+                        if Self::credential_update_is_applied(&base, &requested, &current)? {
+                            return Ok(());
+                        }
+                        candidate = Self::merge_credential_update(&base, &requested, &current)?;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            credential_id = id,
+                            attempt,
+                            "异步凭据 CAS 写入结果不确定，读取 PgSQL 权威值后重试: {}",
+                            err
+                        );
+                        last_error = Some(err);
+                        let current = credential_pgsql_sync_until(
+                            "异步凭据 CAS 未知提交后读取 PgSQL 权威值",
+                            deadline,
+                            store.load_credential(id),
+                        )
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
+                        if Self::credential_update_is_applied(&base, &requested, &current)? {
+                            return Ok(());
+                        }
+                        candidate = Self::merge_credential_update(&base, &requested, &current)?;
+                    }
+                }
+            }
+            if let Some(err) = last_error {
+                anyhow::bail!("凭据 #{} 异步 CAS 在总期限内未确认: {}", id, err);
+            }
+            anyhow::bail!("凭据 #{} 异步 CAS 冲突重试耗尽或超过总期限", id)
+        });
     }
 
     fn persist_credential_update_with_runtime_patch(
@@ -7813,29 +7924,24 @@ impl MultiTokenManager {
                 } else {
                     remaining
                 };
-                let (credentials, runtime_states) = credential_pgsql_sync_with_timeout(
+                let (current, runtime) = credential_pgsql_sync_with_timeout(
                     "原子凭据 CAS 后一致读取权威值",
                     read_timeout,
-                    store.load_credentials_with_runtime_state(),
+                    store.load_credential_with_runtime_state(id),
                 )
-                .await?;
-                let current = credentials
-                    .into_iter()
-                    .find(|credential| credential.id == Some(id))
-                    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
-                let runtime = runtime_states.get(&id);
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已删除", id))?;
                 if Self::credential_runtime_patch_is_applied(
                     &base,
                     &requested,
                     &current,
-                    runtime,
+                    runtime.as_ref(),
                     &patch_for_store,
                 )? {
                     return Ok((
                         current.clone(),
                         CredentialRuntimeStateMutationResult {
                             state: runtime
-                                .cloned()
                                 .ok_or_else(|| anyhow::anyhow!("凭据 #{} 缺少运行态", id))?,
                             credential_disabled: current.disabled,
                             applied: true,
@@ -8920,6 +9026,7 @@ impl MultiTokenManager {
         self.mark_stats_dirty();
     }
 
+    #[allow(dead_code)]
     fn persist_disabled_state(
         &self,
         id: u64,
@@ -8982,6 +9089,32 @@ impl MultiTokenManager {
         }
     }
 
+    /// 请求热路径使用的禁用持久化：本地状态已经生效，PgSQL durable mutation 进入 FIFO。
+    fn persist_disabled_state_deferred(
+        &self,
+        id: u64,
+        expected_generation: u64,
+        reason: DisabledReason,
+        failure_count: Option<u32>,
+        refresh_failure_count: Option<u32>,
+        last_used_at: &str,
+    ) {
+        if self.postgres_store.is_none() {
+            return;
+        }
+        self.enqueue_pending_runtime_mutation(
+            id,
+            PendingCredentialRuntimeMutation::Disable {
+                operation_id: uuid::Uuid::new_v4(),
+                expected_generation,
+                reason: reason.as_str().to_string(),
+                failure_count,
+                refresh_failure_count,
+                last_used_at: last_used_at.to_string(),
+            },
+        );
+    }
+
     fn apply_runtime_mutation_result(
         &self,
         id: u64,
@@ -9012,7 +9145,11 @@ impl MultiTokenManager {
         Self::apply_authoritative_runtime_state_to_entry(
             entry,
             &persisted.state,
-            persisted.credential_disabled,
+            if persisted.applied {
+                persisted.credential_disabled
+            } else {
+                None
+            },
         );
     }
 
@@ -9882,6 +10019,7 @@ impl MultiTokenManager {
     ///
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
+    #[allow(dead_code)]
     pub fn report_failure(&self, id: u64) -> bool {
         let expected_generation = {
             let entries = self.entries.lock();
@@ -10013,12 +10151,97 @@ impl MultiTokenManager {
         result
     }
 
+    /// 请求热路径版本：只更新本地调度状态并把 PgSQL mutation 放入 FIFO，绝不等待 PgSQL。
+    pub fn report_failure_deferred(&self, id: u64) -> bool {
+        let expected_generation = {
+            let entries = self.entries.lock();
+            let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
+                return entries.iter().any(|entry| !entry.disabled);
+            };
+            if entry.disabled && !entry.runtime_persistence_degraded {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+            entry.runtime_generation
+        };
+
+        let last_used_at = Utc::now().to_rfc3339();
+        let operation_id = uuid::Uuid::new_v4();
+        let (failure_count, disabled, auto_disabled) = {
+            let mut entries = self.entries.lock();
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => return entries.iter().any(|entry| !entry.disabled),
+            };
+            if entry.disabled && !entry.runtime_persistence_degraded {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+
+            entry.failure_count = entry.failure_count.saturating_add(1);
+            if entry.failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+            }
+            entry.last_used_at = Some(last_used_at.clone());
+            let failure_count = entry.failure_count;
+            let disabled = entry.disabled;
+            let auto_disabled = entry.disabled_reason == Some(DisabledReason::TooManyFailures);
+
+            tracing::warn!(
+                "凭据 #{} API 调用失败（{}/{}）",
+                id,
+                failure_count,
+                MAX_FAILURES_PER_CREDENTIAL
+            );
+            if disabled {
+                tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
+            }
+            (failure_count, disabled, auto_disabled)
+        };
+
+        if self.postgres_store.is_some() {
+            self.enqueue_pending_runtime_mutation(
+                id,
+                PendingCredentialRuntimeMutation::ApiFailure {
+                    operation_id,
+                    expected_generation,
+                    last_used_at: last_used_at.clone(),
+                },
+            );
+        }
+
+        if disabled {
+            self.select_highest_priority();
+            self.clear_disabled_credential_request_state(id);
+        }
+        if auto_disabled {
+            self.record_scheduler_credential_audit(
+                "auto_disable_credential",
+                id,
+                DisabledReason::TooManyFailures,
+                "api_failure_threshold",
+                "连续 API 调用失败达到阈值，已自动禁用凭据",
+                serde_json::json!({ "failureCount": failure_count }),
+            );
+        }
+        let result = {
+            let entries = self.entries.lock();
+            entries.iter().any(|entry| !entry.disabled)
+        };
+        if auto_disabled {
+            self.publish_credentials_changed("credential_failure_reported");
+            self.invalidate_model_capability_cohorts();
+        }
+        self.notify_dispatch_state_changed();
+        result
+    }
+
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 表示额度用尽的场景：
     /// - 立即禁用该凭据（不等待连续失败阈值）
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
+    #[allow(dead_code)]
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
         let last_used_at: String;
         let expected_generation: u64;
@@ -10090,10 +10313,80 @@ impl MultiTokenManager {
         result
     }
 
+    /// 请求热路径版本：额度耗尽先本地禁用并切换，PgSQL 禁用 mutation 异步重放。
+    pub fn report_quota_exhausted_deferred(&self, id: u64) -> bool {
+        let last_used_at: String;
+        let expected_generation: u64;
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => return entries.iter().any(|entry| !entry.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+            expected_generation = entry.runtime_generation;
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            let now = Utc::now().to_rfc3339();
+            entry.last_used_at = Some(now.clone());
+            last_used_at = now;
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!("凭据 #{} 额度已用尽，已被禁用", id);
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .min_by_key(|entry| entry.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.clear_disabled_credential_request_state(id);
+        self.persist_disabled_state_deferred(
+            id,
+            expected_generation,
+            DisabledReason::QuotaExceeded,
+            Some(MAX_FAILURES_PER_CREDENTIAL),
+            None,
+            &last_used_at,
+        );
+        self.record_scheduler_credential_audit(
+            "auto_disable_credential",
+            id,
+            DisabledReason::QuotaExceeded,
+            "upstream_quota_exhausted",
+            "上游返回额度耗尽，已自动禁用凭据并切换调度",
+            serde_json::json!({
+                "failureCountSetTo": MAX_FAILURES_PER_CREDENTIAL,
+            }),
+        );
+        self.publish_credentials_changed("credential_quota_exhausted");
+        self.invalidate_model_capability_cohorts();
+        self.notify_dispatch_state_changed();
+        result
+    }
+
     /// 报告指定凭据被上游明确风控、暂停或锁定。
     ///
     /// 这类错误不是普通瞬态 429，也不是连续失败阈值问题；继续调度该凭据通常只会
     /// 放大风控。这里立即禁用并记录独立原因，后台可通过 reset/enable 人工恢复。
+    #[allow(dead_code)]
     pub(crate) fn report_risk_controlled_outcome(
         &self,
         id: u64,
@@ -10172,6 +10465,133 @@ impl MultiTokenManager {
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
         self.persist_disabled_state(
+            id,
+            expected_generation,
+            disabled_reason,
+            Some(MAX_FAILURES_PER_CREDENTIAL),
+            None,
+            &last_used_at,
+        );
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let event_reason = reason.event_reason().to_string();
+            let detail_value = serde_json::json!({
+                "reason": event_reason,
+                "detail": detail,
+            });
+            spawn_best_effort_storage_task("记录凭据风控事件到 PgSQL", async move {
+                store
+                    .record_credential_event(
+                        Some(id),
+                        "credential_risk_controlled",
+                        Some(&event_reason),
+                        detail_value,
+                    )
+                    .await
+            });
+        }
+        self.record_scheduler_credential_audit(
+            "auto_disable_credential",
+            id,
+            disabled_reason,
+            "upstream_risk_controlled",
+            "上游返回风控、暂停或锁定状态，已自动禁用凭据并切换调度",
+            serde_json::json!({
+                "riskReason": reason.event_reason(),
+                "upstreamErrorSummary": detail_summary,
+                "failureCountSetTo": MAX_FAILURES_PER_CREDENTIAL,
+            }),
+        );
+        self.publish_credentials_changed("credential_risk_controlled");
+        self.invalidate_model_capability_cohorts();
+        self.notify_dispatch_state_changed();
+        RiskControlReportOutcome {
+            has_available_credentials: result,
+            circuit_open: circuit.open,
+            retry_after_secs: circuit
+                .retry_after
+                .map(|duration| duration.as_secs().saturating_add(1).max(1)),
+        }
+    }
+
+    /// 请求热路径版本：本地风险禁用立即生效，PgSQL/Redis 副作用全部异步执行。
+    pub(crate) fn report_risk_controlled_outcome_deferred(
+        &self,
+        id: u64,
+        reason: CredentialRiskControlReason,
+        detail: impl Into<String>,
+    ) -> RiskControlReportOutcome {
+        let detail = detail.into();
+        let detail_summary = truncate_for_audit(&detail, 500);
+        let disabled_reason = reason.disabled_reason();
+        let last_used_at: String;
+        let expected_generation: u64;
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => {
+                    let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                    return RiskControlReportOutcome {
+                        has_available_credentials: entries.iter().any(|entry| !entry.disabled),
+                        circuit_open: circuit.open,
+                        retry_after_secs: circuit
+                            .retry_after
+                            .map(|duration| duration.as_secs().saturating_add(1).max(1)),
+                    };
+                }
+            };
+
+            if entry.disabled {
+                let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+                return RiskControlReportOutcome {
+                    has_available_credentials: entries.iter().any(|entry| !entry.disabled),
+                    circuit_open: circuit.open,
+                    retry_after_secs: circuit
+                        .retry_after
+                        .map(|duration| duration.as_secs().saturating_add(1).max(1)),
+                };
+            }
+            expected_generation = entry.runtime_generation;
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(disabled_reason);
+            let now = Utc::now().to_rfc3339();
+            entry.last_used_at = Some(now.clone());
+            last_used_at = now;
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!(
+                credential_id = id,
+                reason = reason.event_reason(),
+                detail = %detail,
+                "凭据 #{} 命中上游{}，已被禁用",
+                id,
+                reason.label()
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .min_by_key(|entry| entry.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
+        self.clear_disabled_credential_request_state(id);
+        self.persist_disabled_state_deferred(
             id,
             expected_generation,
             disabled_reason,
@@ -10363,6 +10783,7 @@ impl MultiTokenManager {
     ///
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
+    #[allow(dead_code)]
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
         let last_used_at: String;
         let expected_generation: u64;
@@ -10411,6 +10832,77 @@ impl MultiTokenManager {
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
         self.persist_disabled_state(
+            id,
+            expected_generation,
+            DisabledReason::InvalidRefreshToken,
+            None,
+            None,
+            &last_used_at,
+        );
+        self.record_scheduler_credential_audit(
+            "auto_disable_credential",
+            id,
+            DisabledReason::InvalidRefreshToken,
+            "refresh_token_invalid_grant",
+            "refreshToken 永久失效，已自动禁用凭据并切换调度",
+            serde_json::json!({
+                "upstreamReason": "invalid_grant",
+            }),
+        );
+        self.publish_credentials_changed("credential_refresh_token_invalid");
+        self.invalidate_model_capability_cohorts();
+        self.notify_dispatch_state_changed();
+        result
+    }
+
+    /// 请求热路径版本：invalid_grant 先本地禁用，durable disable 进入 FIFO。
+    pub fn report_refresh_token_invalid_deferred(&self, id: u64) -> bool {
+        let last_used_at: String;
+        let expected_generation: u64;
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => return entries.iter().any(|entry| !entry.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|entry| !entry.disabled);
+            }
+            expected_generation = entry.runtime_generation;
+
+            let now = Utc::now().to_rfc3339();
+            entry.last_used_at = Some(now.clone());
+            last_used_at = now;
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+
+            tracing::error!(
+                "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|entry| !entry.disabled)
+                .min_by_key(|entry| entry.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.clear_disabled_credential_request_state(id);
+        self.persist_disabled_state_deferred(
             id,
             expected_generation,
             DisabledReason::InvalidRefreshToken,
@@ -11131,6 +11623,7 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn update_credential_profile_arn(
         &self,
         id: u64,
@@ -11143,6 +11636,39 @@ impl MultiTokenManager {
             credential.profile_arn = profile_arn;
             Ok(())
         })?;
+        self.publish_credentials_changed("credential_profile_arn_updated");
+        Ok(())
+    }
+
+    /// 请求热路径版本：本地 profileArn 立即生效，PgSQL 凭据 CAS 异步持久化。
+    pub fn update_credential_profile_arn_deferred(
+        &self,
+        id: u64,
+        profile_arn: Option<String>,
+    ) -> anyhow::Result<()> {
+        let profile_arn = profile_arn
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let (base, requested) = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let base = Self::credential_from_entry(entry);
+            if entry.credentials.profile_arn == profile_arn {
+                return Ok(());
+            }
+            entry.credentials.profile_arn = profile_arn;
+            let requested = Self::credential_from_entry(entry);
+            (base, requested)
+        };
+        self.invalidate_model_capability_cohorts();
+        self.persist_credential_update_best_effort(
+            "异步保存凭据 profileArn 到 PgSQL",
+            base,
+            requested,
+        );
         self.publish_credentials_changed("credential_profile_arn_updated");
         Ok(())
     }
@@ -11909,7 +12435,7 @@ impl MultiTokenManager {
                             false,
                         );
                         let failure = self
-                            .complete_distributed_refresh_failure_until(
+                            .complete_or_cancel_distributed_refresh_failure_until(
                                 &lease,
                                 &failure,
                                 false,
@@ -11952,7 +12478,7 @@ impl MultiTokenManager {
                             false,
                         );
                         let failure = self
-                            .complete_distributed_refresh_failure_until(
+                            .complete_or_cancel_distributed_refresh_failure_until(
                                 &lease,
                                 &failure,
                                 false,
@@ -12027,7 +12553,7 @@ impl MultiTokenManager {
                         .downcast_ref::<RefreshFailure>()
                         .unwrap_or(&synthetic_failure);
                     let shared = self
-                        .complete_distributed_refresh_failure_until(
+                        .complete_or_cancel_distributed_refresh_failure_until(
                             lease,
                             failure,
                             true,
@@ -12072,7 +12598,7 @@ impl MultiTokenManager {
             );
             if let Some(lease) = redis_refresh_lease.as_ref() {
                 let shared = self
-                    .complete_distributed_refresh_failure_until(
+                    .complete_or_cancel_distributed_refresh_failure_until(
                         lease,
                         &failure,
                         false,
@@ -12120,7 +12646,7 @@ impl MultiTokenManager {
             );
             if let Some(lease) = redis_refresh_lease.as_ref() {
                 let shared = self
-                    .complete_distributed_refresh_failure_until(
+                    .complete_or_cancel_distributed_refresh_failure_until(
                         lease,
                         &failure,
                         false,

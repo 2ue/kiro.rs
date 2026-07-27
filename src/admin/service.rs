@@ -3758,9 +3758,11 @@ impl AdminService {
 
     pub fn get_usage_dashboard_top(
         &self,
+        timezone: Option<String>,
+        window_key: Option<String>,
     ) -> Result<crate::anthropic::usage::UsageDashboardTopResponse, AdminServiceError> {
         self.usage_recorder
-            .dashboard_top()
+            .dashboard_top(timezone.as_deref(), window_key.as_deref())
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 

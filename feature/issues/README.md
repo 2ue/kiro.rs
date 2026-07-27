@@ -69,6 +69,9 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [企业/API-key 200 EventStream EOF 被误判 api_error](enterprise-eventstream-usage-only-tool-eof.md)
 - [运行时栈溢出与 handler future 大小](runtime-stack-overflow-and-handler-future-size.md)
 - [Runtime completion storage bridge starvation](runtime-completion-storage-bridge-starvation.md)
+- [159/170/142 生产实例运行时卡死：请求完成路径与存储/调度耦合](prod-runtime-completion-storage-coupling-159-170-142-20260727.md)
+- [外部池调度影响本地凭据与 fallback 矩阵缺失](external-pool-scheduler-interference-and-fallback-matrix-20260727.md)
+- [Dashboard observability redesign](dashboard-observability-redesign.md)
 - [上游错误诊断隐私与响应体边界](upstream-error-diagnostic-privacy-and-bounds.md)
 - [运行时饥饿下的上游 HTTP deadline](upstream-http-deadline-runtime-starvation.md)
 - [JSON 空白压缩的逐字节语义与性能](json-whitespace-compression-byte-semantics.md)
@@ -86,3 +89,12 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - 已完成真实 Claude Code CLI fake-upstream 协议验证：bare invoke `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire `60/60`；证据见 [candidate-c0-claude-cli-real-protocol-20260726](../evidence/candidate-c0-claude-cli-real-protocol-20260726.md)。
 - 已完成 fake-upstream 负载/异常恢复验证：L3 `9/9`、L4 `12/12`、L5 `60s soak + recovery` 全部通过；证据见 [candidate-c0-load-chaos-20260726](../evidence/candidate-c0-load-chaos-20260726.md)。
 - 真实上游成功 smoke 当前受环境阻塞：本地 `9022` 的持久化凭据全部处于 disabled/runtime bad state（TemporarilySuspended/Manual/QuotaExceeded），继续真实调用会增加账号风险；不把该环境阻塞伪装为产品 pass。
+
+## 2026-07-27 runtime/storage 发布候选状态
+
+- 当前冻结候选：`kiro-rs` SHA-256 `40ec70c7036826807f3d59701fe02de8eada7c8d88f265ad4a68fde55ff3c9d3`，`kiro_loadtest` SHA-256 `a9b03d0dbe3f4456939641b434fcc3781ea6f6909a31dff393100d2bcbcc81c8`。
+- 已通过 full Rust all-target：main `1816 passed / 0 failed / 6 ignored`，loadtest `31 passed / 0 failed`。
+- 已通过真实 Claude Code CLI fake-upstream：bare `20` cases，long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`，thinking-wire `60/60`，Claude Code CLI `2.1.220`。
+- 已通过负载/异常：L3 `9/9`、L4 `12/12`、L5 第二轮 `461/461` 长流 + recovery `12/12`，RSS/FD 在 60 秒 idle 后回落。
+- 已通过本地 9022 health/readiness/dashboard split endpoint smoke；真实账号成功路径未验证，原因是本地 PgSQL 权威凭据全 disabled，未强行启用。
+- 当前发布前剩余：最终 diff/artifact gate、清理 raw 临时产物、按发布技能提交/打 tag/推送。

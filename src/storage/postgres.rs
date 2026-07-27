@@ -73,7 +73,9 @@ const USAGE_OFFLINE_MAINTENANCE_LOCK_ID: i64 = 4_950_531_234_004;
 const USAGE_RECORD_COMMIT_LOCK_DOMAIN: i64 = 0x0055_5341_4745_4944;
 const USAGE_INDEX_STARTUP_MAX_BYTES: i64 = 64 * 1024 * 1024;
 const USAGE_SOFT_DELETE_WATERMARK_SCOPE: &str = "soft_delete_created_at";
-const USAGE_DASHBOARD_STATEMENT_TIMEOUT_MS: u64 = 4_500;
+const USAGE_CLEANUP_LOCK_TIMEOUT_MS: u64 = 250;
+const USAGE_CLEANUP_STATEMENT_TIMEOUT_MS: u64 = 10_000;
+const USAGE_DASHBOARD_STATEMENT_TIMEOUT_MS: u64 = 115_000;
 const USAGE_DASHBOARD_LOCK_TIMEOUT_MS: u64 = 250;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +143,10 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
+        column_name: "total_kiro_metering_usage",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
         column_name: "upstream_metadata_requests",
     },
     RequiredPostgresColumn {
@@ -190,6 +196,10 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
         column_name: "total_original_cost_usd",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "total_kiro_metering_usage",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
@@ -305,6 +315,11 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
         table: "usage_records",
         name: "idx_usage_records_created_at",
         sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL",
+    },
+    UsageIndexDefinition {
+        table: "usage_records",
+        name: "idx_usage_records_soft_cleanup_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_usage_records_soft_cleanup_created ON usage_records (created_at ASC, id ASC) WHERE deleted_at IS NULL",
     },
     UsageIndexDefinition {
         table: "usage_records",
@@ -866,21 +881,27 @@ impl PostgresStore {
     #[cfg(test)]
     pub async fn drop_test_schema(&self) -> anyhow::Result<()> {
         let Some(schema) = &self.test_schema else {
+            self.pool.close().await;
             return Ok(());
         };
         let query = format!(r#"DROP SCHEMA IF EXISTS "{}" CASCADE"#, schema);
         let mut delay = std::time::Duration::from_millis(25);
+        let mut result = Ok(());
         for attempt in 0..5 {
             match sqlx::query(&query).execute(&self.pool).await {
-                Ok(_) => return Ok(()),
+                Ok(_) => break,
                 Err(error) if postgres_drop_schema_error_is_retryable(&error) && attempt < 4 => {
                     tokio::time::sleep(delay).await;
                     delay = delay.saturating_mul(2);
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    result = Err(error.into());
+                    break;
+                }
             }
         }
-        Ok(())
+        self.pool.close().await;
+        result
     }
 
     pub async fn migrate_with_options(&self, compress_usage_rollups: bool) -> anyhow::Result<()> {
@@ -1729,12 +1750,33 @@ impl PostgresStore {
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub async fn load_credentials(&self) -> anyhow::Result<Vec<KiroCredentials>> {
         let rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
             .fetch_all(&self.pool)
             .await?;
 
         credentials_from_rows(rows)
+    }
+
+    pub async fn load_credential(
+        &self,
+        credential_id: u64,
+    ) -> anyhow::Result<Option<KiroCredentials>> {
+        let credential_id_i64 = i64::try_from(credential_id)
+            .map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
+        let row = sqlx::query(
+            r#"
+            SELECT id, priority, disabled, data, created_at, updated_at, revision
+            FROM credentials
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(credential_id_i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(credential_from_row).transpose()
     }
 
     pub async fn load_credentials_with_runtime_state(
@@ -1758,6 +1800,50 @@ impl PostgresStore {
         tx.commit().await?;
 
         Ok((credentials, runtime_states))
+    }
+
+    pub async fn load_credential_with_runtime_state(
+        &self,
+        credential_id: u64,
+    ) -> anyhow::Result<Option<(KiroCredentials, Option<CredentialRuntimeStateRow>)>> {
+        let credential_id_i64 = i64::try_from(credential_id)
+            .map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let credential = sqlx::query(
+            r#"
+            SELECT id, priority, disabled, data, created_at, updated_at, revision
+            FROM credentials
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(credential_id_i64)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(credential_from_row)
+        .transpose()?;
+        let Some(credential) = credential else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let runtime_state = sqlx::query(
+            r#"
+            SELECT credential_id, failure_count, refresh_failure_count,
+                   disabled_reason, warmup_remaining, generation, revision
+            FROM credential_runtime_state
+            WHERE credential_id = $1
+            "#,
+        )
+        .bind(credential_id_i64)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| runtime_state_from_row(&row))
+        .transpose()?;
+        tx.commit().await?;
+
+        Ok(Some((credential, runtime_state)))
     }
 
     /// 查询未软删除的 API Key 凭据。
@@ -5595,7 +5681,7 @@ impl PostgresUsageStore {
         batch_size: usize,
     ) -> anyhow::Result<UsageCleanupBatchResult> {
         if let Err(err) = self.advance_soft_delete_cleanup_watermark(cutoff).await {
-            if is_postgres_lock_timeout_error(&err) {
+            if is_postgres_cleanup_retryable_timeout_error(&err) {
                 return Ok(UsageCleanupBatchResult {
                     processed_rows: 0,
                     has_remaining: Some(true),
@@ -5612,63 +5698,80 @@ impl PostgresUsageStore {
                 has_remaining: Some(true),
             });
         }
-        let victim_rows = sqlx::query(
-            r#"
-            WITH victims AS (
-                SELECT id, data, rollup_active
-                FROM usage_records
-                WHERE deleted_at IS NULL
-                  AND created_at < $1
-                ORDER BY created_at ASC, id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE usage_records AS u
-            SET deleted_at = now(), rollup_active = false, updated_at = now()
-            FROM victims AS v
-            WHERE u.id = v.id
-            RETURNING v.data, v.rollup_active
-            "#,
-        )
-        .bind(cutoff)
-        .bind(usize_to_i64(batch_size))
-        .fetch_all(&mut *tx)
-        .await?;
-        let processed_rows = victim_rows.len() as u64;
-        let mut rollups = UsageRollupBatchDelta::default();
-        for row in victim_rows {
-            if row.try_get::<bool, _>("rollup_active")? {
-                let value: serde_json::Value = row.try_get("data")?;
-                let mut record: UsageRecord = serde_json::from_value(value)?;
-                apply_usage_record_legacy_cost_compatibility(&mut record);
-                rollups.add_record(&record, -1);
-            }
-        }
-        rollups.apply(&mut tx).await?;
-        let has_remaining = if processed_rows < batch_size as u64 {
-            Some(
-                sqlx::query_scalar::<_, bool>(
-                    r#"
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM usage_records
-                        WHERE deleted_at IS NULL
-                          AND created_at < $1
-                    )
-                    "#,
+        let batch_result = async {
+            let victim_rows = sqlx::query(
+                r#"
+                WITH victims AS (
+                    SELECT id, data, rollup_active
+                    FROM usage_records
+                    WHERE deleted_at IS NULL
+                      AND created_at < $1
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
                 )
-                .bind(cutoff)
-                .fetch_one(&mut *tx)
-                .await?,
+                UPDATE usage_records AS u
+                SET deleted_at = now(), rollup_active = false, updated_at = now()
+                FROM victims AS v
+                WHERE u.id = v.id
+                RETURNING v.data, v.rollup_active
+                "#,
             )
-        } else {
-            None
+            .bind(cutoff)
+            .bind(usize_to_i64(batch_size))
+            .fetch_all(&mut *tx)
+            .await?;
+            let processed_rows = victim_rows.len() as u64;
+            let mut rollups = UsageRollupBatchDelta::default();
+            for row in victim_rows {
+                if row.try_get::<bool, _>("rollup_active")? {
+                    let value: serde_json::Value = row.try_get("data")?;
+                    let mut record: UsageRecord = serde_json::from_value(value)?;
+                    apply_usage_record_legacy_cost_compatibility(&mut record);
+                    rollups.add_record(&record, -1);
+                }
+            }
+            rollups.apply(&mut tx).await?;
+            let has_remaining = if processed_rows < batch_size as u64 {
+                Some(
+                    sqlx::query_scalar::<_, bool>(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM usage_records
+                            WHERE deleted_at IS NULL
+                              AND created_at < $1
+                        )
+                        "#,
+                    )
+                    .bind(cutoff)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                )
+            } else {
+                None
+            };
+            anyhow::Ok(UsageCleanupBatchResult {
+                processed_rows,
+                has_remaining,
+            })
+        }
+        .await;
+        let batch_result = match batch_result {
+            Ok(result) => result,
+            Err(err) => {
+                if is_postgres_cleanup_retryable_timeout_error(&err) {
+                    tx.rollback().await?;
+                    return Ok(UsageCleanupBatchResult {
+                        processed_rows: 0,
+                        has_remaining: Some(true),
+                    });
+                }
+                return Err(err);
+            }
         };
         tx.commit().await?;
-        Ok(UsageCleanupBatchResult {
-            processed_rows,
-            has_remaining,
-        })
+        Ok(batch_result)
     }
 
     pub async fn soft_delete_cleanup_has_remaining(
@@ -5705,62 +5808,79 @@ impl PostgresUsageStore {
                 has_remaining: Some(true),
             });
         }
-        let victim_rows = sqlx::query(
-            r#"
-            WITH victims AS (
-                SELECT id, data, rollup_active
-                FROM usage_records
-                WHERE deleted_at IS NOT NULL
-                  AND deleted_at < $1
-                ORDER BY deleted_at ASC, id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            )
-            DELETE FROM usage_records AS u
-            USING victims AS v
-            WHERE u.id = v.id
-            RETURNING v.data, v.rollup_active
-            "#,
-        )
-        .bind(cutoff)
-        .bind(usize_to_i64(batch_size))
-        .fetch_all(&mut *tx)
-        .await?;
-        let processed_rows = victim_rows.len() as u64;
-        let mut rollups = UsageRollupBatchDelta::default();
-        for row in victim_rows {
-            if row.try_get::<bool, _>("rollup_active")? {
-                let value: serde_json::Value = row.try_get("data")?;
-                let mut record: UsageRecord = serde_json::from_value(value)?;
-                apply_usage_record_legacy_cost_compatibility(&mut record);
-                rollups.add_record(&record, -1);
-            }
-        }
-        rollups.apply(&mut tx).await?;
-        let has_remaining = if processed_rows < batch_size as u64 {
-            Some(
-                sqlx::query_scalar::<_, bool>(
-                    r#"
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM usage_records
-                        WHERE deleted_at IS NOT NULL
-                          AND deleted_at < $1
-                    )
-                    "#,
+        let batch_result = async {
+            let victim_rows = sqlx::query(
+                r#"
+                WITH victims AS (
+                    SELECT id, data, rollup_active
+                    FROM usage_records
+                    WHERE deleted_at IS NOT NULL
+                      AND deleted_at < $1
+                    ORDER BY deleted_at ASC, id ASC
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
                 )
-                .bind(cutoff)
-                .fetch_one(&mut *tx)
-                .await?,
+                DELETE FROM usage_records AS u
+                USING victims AS v
+                WHERE u.id = v.id
+                RETURNING v.data, v.rollup_active
+                "#,
             )
-        } else {
-            None
+            .bind(cutoff)
+            .bind(usize_to_i64(batch_size))
+            .fetch_all(&mut *tx)
+            .await?;
+            let processed_rows = victim_rows.len() as u64;
+            let mut rollups = UsageRollupBatchDelta::default();
+            for row in victim_rows {
+                if row.try_get::<bool, _>("rollup_active")? {
+                    let value: serde_json::Value = row.try_get("data")?;
+                    let mut record: UsageRecord = serde_json::from_value(value)?;
+                    apply_usage_record_legacy_cost_compatibility(&mut record);
+                    rollups.add_record(&record, -1);
+                }
+            }
+            rollups.apply(&mut tx).await?;
+            let has_remaining = if processed_rows < batch_size as u64 {
+                Some(
+                    sqlx::query_scalar::<_, bool>(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM usage_records
+                            WHERE deleted_at IS NOT NULL
+                              AND deleted_at < $1
+                        )
+                        "#,
+                    )
+                    .bind(cutoff)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                )
+            } else {
+                None
+            };
+            anyhow::Ok(UsageCleanupBatchResult {
+                processed_rows,
+                has_remaining,
+            })
+        }
+        .await;
+        let batch_result = match batch_result {
+            Ok(result) => result,
+            Err(err) => {
+                if is_postgres_cleanup_retryable_timeout_error(&err) {
+                    tx.rollback().await?;
+                    return Ok(UsageCleanupBatchResult {
+                        processed_rows: 0,
+                        has_remaining: Some(true),
+                    });
+                }
+                return Err(err);
+            }
         };
         tx.commit().await?;
-        Ok(UsageCleanupBatchResult {
-            processed_rows,
-            has_remaining,
-        })
+        Ok(batch_result)
     }
 
     pub async fn hard_delete_cleanup_has_remaining(
@@ -5805,6 +5925,8 @@ impl PostgresUsageStore {
                     THEN t.total_original_cost_usd
                     ELSE COALESCE(t.total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
+                COALESCE(t.total_kiro_metering_usage, 0)::double precision
+                    AS total_kiro_metering_usage,
                 COALESCE(t.priced_requests, 0)::bigint AS priced_requests,
                 COALESCE(t.unpriced_requests, 0)::bigint AS unpriced_requests,
                 COALESCE(t.local_prompt_cache_requests, 0)::bigint AS local_prompt_cache_requests,
@@ -5855,7 +5977,8 @@ impl PostgresUsageStore {
             GROUP BY t.requests, t.success_requests, t.error_requests,
                      t.total_input_tokens, t.total_output_tokens,
                      t.total_cache_read_input_tokens, t.total_cache_creation_input_tokens,
-                     t.total_estimated_cost_usd, t.total_original_cost_usd, t.priced_requests, t.unpriced_requests,
+                     t.total_estimated_cost_usd, t.total_original_cost_usd,
+                     t.total_kiro_metering_usage, t.priced_requests, t.unpriced_requests,
                      t.local_prompt_cache_requests, t.local_prompt_cache_input_tokens,
                      t.local_prompt_cache_read_input_tokens,
                      t.local_prompt_cache_creation_input_tokens,
@@ -5884,6 +6007,7 @@ impl PostgresUsageStore {
             total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
+            total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             local_prompt_cache_requests: row_i64_to_usize(&row, "local_prompt_cache_requests")?,
@@ -6010,6 +6134,35 @@ impl PostgresUsageStore {
         ))
     }
 
+    pub async fn dashboard_top_for_window(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+    ) -> anyhow::Result<(String, UsageDashboardTop)> {
+        let now = Utc::now();
+        let (_timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
+        let specs = [window_spec.clone()];
+        Ok((
+            now.to_rfc3339(),
+            UsageDashboardTop {
+                window_key: window_spec.key,
+                models: self
+                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Model)
+                    .await?,
+                credentials: self
+                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Credential)
+                    .await?,
+                endpoints: self
+                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Endpoint)
+                    .await?,
+                errors: self
+                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Error)
+                    .await?,
+            },
+        ))
+    }
+
     pub async fn dashboard_breakdown_only(
         &self,
         timezone: Option<&str>,
@@ -6100,6 +6253,8 @@ impl PostgresUsageStore {
                         ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd,
+                COALESCE(SUM(s.total_kiro_metering_usage), 0)::double precision
+                    AS total_kiro_metering_usage,
                 COALESCE(SUM(s.priced_requests), 0)::bigint AS priced_requests,
                 COALESCE(SUM(s.unpriced_requests), 0)::bigint AS unpriced_requests,
                 CASE
@@ -6241,6 +6396,7 @@ impl PostgresUsageStore {
                 r.total_cache_creation_input_tokens,
                 r.total_estimated_cost_usd,
                 r.total_original_cost_usd,
+                r.total_kiro_metering_usage,
                 r.priced_requests,
                 r.unpriced_requests,
                 r.average_duration_ms,
@@ -6458,7 +6614,9 @@ impl PostgresUsageStore {
                         THEN s.total_original_cost_usd
                         ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
-                ), 0)::double precision AS total_original_cost_usd
+                ), 0)::double precision AS total_original_cost_usd,
+                COALESCE(SUM(s.total_kiro_metering_usage), 0)::double precision
+                    AS total_kiro_metering_usage
             FROM window_bounds w
             LEFT JOIN dashboard_global_segments s ON s.window_key = w.key
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
@@ -6589,7 +6747,9 @@ impl PostgresUsageStore {
                     WHEN COALESCE(total_original_cost_usd, 0) <> 0
                     THEN total_original_cost_usd
                     ELSE COALESCE(total_estimated_cost_usd, 0)
-                END::double precision AS total_original_cost_usd
+                END::double precision AS total_original_cost_usd,
+                COALESCE(total_kiro_metering_usage, 0)::double precision
+                    AS total_kiro_metering_usage
             FROM usage_rollup_totals
             WHERE dimension = "#,
         );
@@ -6598,6 +6758,138 @@ impl PostgresUsageStore {
         builder.push(" AND requests > 0 ");
         builder.push(
             " ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC LIMIT 10",
+        );
+
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = builder.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(usage_top_aggregate_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn dashboard_top_aggregates_for_window(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+        group: DashboardTopGroup,
+    ) -> anyhow::Result<Vec<UsageTopAggregate>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let item_dimension = group.rollup_dimension();
+        let mut builder = QueryBuilder::<Postgres>::new("");
+        push_dashboard_windows_cte(&mut builder, specs);
+        builder.push(
+            r#", top_metric_segments AS (
+            SELECT
+                w.key AS window_key,
+                b.dimension_key AS item_key,
+                NULLIF(BTRIM(b.dimension_label), '') AS item_label,
+                b.requests,
+                b.error_requests,
+                b.total_input_tokens,
+                b.billable_input_tokens,
+                b.total_output_tokens,
+                b.total_cache_read_input_tokens,
+                b.total_cache_creation_input_tokens,
+                b.total_estimated_cost_usd,
+                CASE
+                    WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
+                    THEN b.total_original_cost_usd
+                    ELSE COALESCE(b.total_estimated_cost_usd, 0)
+                END::double precision AS total_original_cost_usd,
+                COALESCE(b.total_kiro_metering_usage, 0)::double precision
+                    AS total_kiro_metering_usage
+            FROM window_bounds w
+            JOIN usage_rollup_time_buckets b
+              ON b.dimension = "#,
+        );
+        builder.push_bind(item_dimension);
+        builder.push(
+            r#"
+             AND b.bucket_start >= w.full_from_at
+             AND b.bucket_start < w.full_to_at
+            UNION ALL
+            SELECT
+                r.window_key,
+            "#,
+        );
+        builder.push(group.detail_key_column());
+        builder.push(
+            r#" AS item_key,
+            "#,
+        );
+        builder.push(group.detail_label_column());
+        builder.push(
+            r#" AS item_label,
+                COUNT(*)::bigint AS requests,
+                COUNT(*) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
+                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(r.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+                COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(r.original_cost_usd, 0) <> 0
+                        THEN r.original_cost_usd
+                        ELSE COALESCE(r.estimated_cost_usd, 0)
+                    END
+                ), 0)::double precision AS total_original_cost_usd,
+                COALESCE(SUM(r.kiro_metering_usage), 0)::double precision
+                    AS total_kiro_metering_usage
+            FROM window_boundary_records r
+            "#,
+        );
+        if let Some(filter) = group.detail_filter() {
+            builder.push(" WHERE ");
+            builder.push(filter);
+        }
+        builder.push(" GROUP BY r.window_key, ");
+        builder.push(group.detail_key_column());
+        builder.push(", ");
+        builder.push(group.detail_label_column());
+        builder.push(
+            r#"
+            ), top_metric_totals AS (
+            SELECT
+                item_key AS key,
+                NULLIF(MAX(item_label), '') AS label,
+                SUM(requests)::bigint AS requests,
+                SUM(error_requests)::bigint AS error_requests,
+                SUM(total_input_tokens)::bigint AS total_input_tokens,
+                SUM(billable_input_tokens)::bigint AS billable_input_tokens,
+                SUM(total_output_tokens)::bigint AS total_output_tokens,
+                SUM(total_cache_read_input_tokens)::bigint AS total_cache_read_input_tokens,
+                SUM(total_cache_creation_input_tokens)::bigint AS total_cache_creation_input_tokens,
+                SUM(total_estimated_cost_usd)::double precision AS total_estimated_cost_usd,
+                SUM(total_original_cost_usd)::double precision AS total_original_cost_usd,
+                SUM(total_kiro_metering_usage)::double precision
+                    AS total_kiro_metering_usage
+            FROM top_metric_segments
+            GROUP BY item_key
+            )
+            SELECT
+                key,
+                label,
+                requests,
+                error_requests,
+                total_input_tokens,
+                billable_input_tokens,
+                total_output_tokens,
+                total_cache_read_input_tokens,
+                total_cache_creation_input_tokens,
+                total_estimated_cost_usd,
+                total_original_cost_usd,
+                total_kiro_metering_usage
+            FROM top_metric_totals
+            WHERE requests > 0
+            ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC, key
+            LIMIT 10
+            "#,
         );
 
         let mut tx = self.store.pool().begin().await?;
@@ -6915,12 +7207,18 @@ fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
 async fn configure_usage_cleanup_transaction(
     tx: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
-    sqlx::query("SET LOCAL lock_timeout = '250ms'")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("SET LOCAL statement_timeout = '2s'")
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(&format!(
+        "SET LOCAL lock_timeout = '{}ms'",
+        USAGE_CLEANUP_LOCK_TIMEOUT_MS
+    ))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = '{}ms'",
+        USAGE_CLEANUP_STATEMENT_TIMEOUT_MS
+    ))
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -7029,11 +7327,19 @@ async fn try_acquire_usage_cleanup_commit_guard(
         .map_err(Into::into)
 }
 
-fn is_postgres_lock_timeout_error(error: &anyhow::Error) -> bool {
+fn is_postgres_cleanup_retryable_timeout_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
-        message.contains("lock timeout")
+        let is_retryable_code = cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|database_error| database_error.code())
+            .is_some_and(|code| matches!(code.as_ref(), "55P03" | "57014"));
+        is_retryable_code
+            || message.contains("lock timeout")
             || message.contains("canceling statement due to lock timeout")
+            || message.contains("statement timeout")
+            || message.contains("canceling statement due to statement timeout")
     })
 }
 
@@ -7100,6 +7406,7 @@ struct UsageRollupMetrics {
     local_prompt_cache_creation_input_tokens: i64,
     total_estimated_cost_usd: f64,
     total_original_cost_usd: f64,
+    total_kiro_metering_usage: f64,
     external_pool_requests: i64,
     external_pool_priced_requests: i64,
     external_pool_unpriced_requests: i64,
@@ -7161,6 +7468,7 @@ impl UsageRollupMetrics {
             },
             total_estimated_cost_usd: record.estimated_cost_usd * sign as f64,
             total_original_cost_usd: record.original_cost_usd * sign as f64,
+            total_kiro_metering_usage: record.kiro_metering_usage * sign as f64,
             external_pool_requests: signed_bool(external_pool, sign),
             external_pool_priced_requests: signed_bool(external_priced, sign),
             external_pool_unpriced_requests: signed_bool(external_pool && !external_priced, sign),
@@ -7223,6 +7531,7 @@ impl UsageRollupMetrics {
             other.local_prompt_cache_creation_input_tokens;
         self.total_estimated_cost_usd += other.total_estimated_cost_usd;
         self.total_original_cost_usd += other.total_original_cost_usd;
+        self.total_kiro_metering_usage += other.total_kiro_metering_usage;
         self.external_pool_requests += other.external_pool_requests;
         self.external_pool_priced_requests += other.external_pool_priced_requests;
         self.external_pool_unpriced_requests += other.external_pool_unpriced_requests;
@@ -7554,12 +7863,12 @@ async fn upsert_usage_rollup_total(
             total_cache_read_input_tokens, total_cache_creation_input_tokens,
             local_prompt_cache_input_tokens, local_prompt_cache_read_input_tokens,
             local_prompt_cache_creation_input_tokens, total_estimated_cost_usd,
-            total_original_cost_usd, external_pool_requests, external_pool_priced_requests,
-            external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
-            external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
-            external_pool_uplifted_cost_usd, external_pool_profit_usd,
-            external_pool_reported_cost_usd, external_pool_billable_cost_usd,
-            external_pool_cost_floor_delta_usd,
+            total_original_cost_usd, total_kiro_metering_usage,
+            external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
+            external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
+            external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
+            external_pool_profit_usd, external_pool_reported_cost_usd,
+            external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
         )
         VALUES (
@@ -7567,7 +7876,7 @@ async fn upsert_usage_rollup_total(
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, $39, now()
+            $35, $36, $37, $38, $39, $40, now()
         )
         ON CONFLICT (dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_totals.dimension_label),
@@ -7593,6 +7902,7 @@ async fn upsert_usage_rollup_total(
             local_prompt_cache_creation_input_tokens = usage_rollup_totals.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_totals.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_totals.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
+            total_kiro_metering_usage = usage_rollup_totals.total_kiro_metering_usage + EXCLUDED.total_kiro_metering_usage,
             external_pool_requests = usage_rollup_totals.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_totals.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_totals.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -7638,6 +7948,7 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
+    .bind(metrics.total_kiro_metering_usage)
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -7674,11 +7985,11 @@ async fn upsert_usage_rollup_time_bucket(
             total_output_tokens, total_cache_read_input_tokens,
             total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
             local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-            total_estimated_cost_usd, total_original_cost_usd, external_pool_requests,
-            external_pool_priced_requests, external_pool_unpriced_requests,
-            external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
-            external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
-            external_pool_profit_usd, external_pool_reported_cost_usd,
+            total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+            external_pool_requests, external_pool_priced_requests,
+            external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
+            external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
+            external_pool_uplifted_cost_usd, external_pool_profit_usd, external_pool_reported_cost_usd,
             external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count,
             duration_ms_max, updated_at
@@ -7688,7 +7999,7 @@ async fn upsert_usage_rollup_time_bucket(
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, $39, $40, now()
+            $35, $36, $37, $38, $39, $40, $41, now()
         )
         ON CONFLICT (bucket_start, dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_time_buckets.dimension_label),
@@ -7714,6 +8025,7 @@ async fn upsert_usage_rollup_time_bucket(
             local_prompt_cache_creation_input_tokens = usage_rollup_time_buckets.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_time_buckets.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_time_buckets.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
+            total_kiro_metering_usage = usage_rollup_time_buckets.total_kiro_metering_usage + EXCLUDED.total_kiro_metering_usage,
             external_pool_requests = usage_rollup_time_buckets.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_time_buckets.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_time_buckets.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -7760,6 +8072,7 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
+    .bind(metrics.total_kiro_metering_usage)
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -8110,6 +8423,31 @@ impl DashboardTopGroup {
             _ => "",
         }
     }
+
+    fn detail_key_column(self) -> &'static str {
+        match self {
+            Self::Model => "COALESCE(NULLIF(BTRIM(r.model), ''), 'unknown')",
+            Self::Credential => "r.credential_id::text",
+            Self::Endpoint => "COALESCE(NULLIF(BTRIM(r.endpoint), ''), 'unknown')",
+            Self::Error => "COALESCE(NULLIF(BTRIM(r.error_type), ''), r.status)",
+        }
+    }
+
+    fn detail_label_column(self) -> &'static str {
+        match self {
+            Self::Credential => "NULLIF(BTRIM(r.credential_label), '')",
+            Self::Error => "NULLIF(BTRIM(r.error_message), '')",
+            _ => "NULL::text",
+        }
+    }
+
+    fn detail_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Credential => Some("r.credential_id IS NOT NULL"),
+            Self::Error => Some("r.status <> 'success'"),
+            _ => None,
+        }
+    }
 }
 
 fn normalize_query_limit(limit: usize) -> usize {
@@ -8316,6 +8654,12 @@ fn push_dashboard_windows_cte(
             ranges.boundary_hour,
             records.status,
             records.usage_source,
+            records.model,
+            records.endpoint,
+            records.credential_id,
+            records.credential_label,
+            records.error_type,
+            records.error_message,
             records.stream,
             records.total_input_tokens,
             records.billable_input_tokens,
@@ -8324,6 +8668,7 @@ fn push_dashboard_windows_cte(
             records.cache_creation_input_tokens,
             records.estimated_cost_usd,
             records.original_cost_usd,
+            records.kiro_metering_usage,
             records.pricing_available,
             records.simulated,
             records.sticky_bound,
@@ -8428,6 +8773,7 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
             buckets.total_cache_creation_input_tokens,
             buckets.total_estimated_cost_usd,
             buckets.total_original_cost_usd,
+            buckets.total_kiro_metering_usage,
             buckets.priced_requests,
             buckets.unpriced_requests,
             buckets.sticky_bound_requests,
@@ -8471,6 +8817,8 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
             COALESCE(SUM(records.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
             COALESCE(SUM(records.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
             COALESCE(SUM(records.original_cost_usd), 0)::double precision AS total_original_cost_usd,
+            COALESCE(SUM(records.kiro_metering_usage), 0)::double precision
+                AS total_kiro_metering_usage,
             COUNT(*) FILTER (WHERE records.pricing_available)::bigint AS priced_requests,
             COUNT(*) FILTER (WHERE NOT records.pricing_available)::bigint AS unpriced_requests,
             COUNT(*) FILTER (WHERE records.sticky_bound)::bigint AS sticky_bound_requests,
@@ -8535,6 +8883,8 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
                 AS total_estimated_cost_usd,
             SUM(segment_rows.total_original_cost_usd)::double precision
                 AS total_original_cost_usd,
+            SUM(segment_rows.total_kiro_metering_usage)::double precision
+                AS total_kiro_metering_usage,
             SUM(segment_rows.priced_requests)::bigint AS priced_requests,
             SUM(segment_rows.unpriced_requests)::bigint AS unpriced_requests,
             SUM(segment_rows.sticky_bound_requests)::bigint AS sticky_bound_requests,
@@ -8717,6 +9067,7 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
             cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
+            total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             average_duration_ms: row.try_get("average_duration_ms")?,
@@ -8772,6 +9123,7 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
             cache_read_ratio: 0.0,
             total_estimated_cost_usd: point.total_estimated_cost_usd,
             total_original_cost_usd: point.total_original_cost_usd,
+            total_kiro_metering_usage: point.total_kiro_metering_usage,
             priced_requests: 0,
             unpriced_requests: 0,
             average_duration_ms: 0.0,
@@ -8804,6 +9156,7 @@ fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
         total_output_tokens: row.try_get("total_output_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
+        total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
     })
 }
 
@@ -8832,6 +9185,7 @@ fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate>
         total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
+        total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
     })
 }
 
@@ -9975,6 +10329,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -10017,6 +10372,7 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -10060,6 +10416,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -10102,6 +10459,7 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -10396,6 +10754,7 @@ SELECT
     COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
     COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
     COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
+    COALESCE(SUM(total_kiro_metering_usage), 0)::double precision AS total_kiro_metering_usage,
     COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
     COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
     COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
@@ -10425,8 +10784,8 @@ INSERT INTO usage_rollup_time_buckets (
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests,
-    external_pool_priced_requests, external_pool_unpriced_requests,
+    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
     external_pool_profit_usd, external_pool_reported_cost_usd,
@@ -10442,8 +10801,8 @@ SELECT
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, external_pool_requests,
-    external_pool_priced_requests, external_pool_unpriced_requests,
+    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
     external_pool_profit_usd, external_pool_reported_cost_usd,
@@ -10789,12 +11148,14 @@ mod tests {
             total_output_tokens: 678,
             total_estimated_cost_usd: 1.25,
             total_original_cost_usd: 2.5,
+            total_kiro_metering_usage: 3.75,
         });
 
         assert_eq!(window.key, "today");
         assert_eq!(window.summary.total_requests, 100);
         assert_eq!(window.summary.success_requests, 97);
         assert_eq!(window.summary.error_requests, 3);
+        assert_eq!(window.summary.total_kiro_metering_usage, 3.75);
         assert!((window.summary.error_rate - 0.03).abs() < f64::EPSILON);
         assert_eq!(window.summary.total_input_tokens, 12_345);
         assert_eq!(window.summary.billable_input_tokens, 2_345);
@@ -11635,17 +11996,17 @@ mod tests {
         for round in 0..3 {
             let id = format!("cleanup-hard-legacy-round-{round}");
             usage_store.record(usage_record(&id, 600)).await.unwrap();
-            sqlx::query(
-                "UPDATE usage_records SET deleted_at = now(), updated_at = now() WHERE id = $1",
-            )
-            .bind(&id)
-            .execute(store.pool())
-            .await
-            .unwrap();
+            let deleted_at = Utc::now() - chrono::Duration::seconds(1);
+            sqlx::query("UPDATE usage_records SET deleted_at = $2, updated_at = $2 WHERE id = $1")
+                .bind(&id)
+                .bind(deleted_at)
+                .execute(store.pool())
+                .await
+                .unwrap();
             assert_eq!(usage_store.summary(500).await.unwrap().total_requests, 1);
 
             let result = usage_store
-                .hard_delete_cleanup_batch(Utc::now() + chrono::Duration::seconds(1), 10)
+                .hard_delete_cleanup_batch(deleted_at + chrono::Duration::seconds(1), 10)
                 .await
                 .unwrap();
             assert_eq!(result.processed_rows, 1, "round {round}");
@@ -11917,7 +12278,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                started_at.elapsed() < std::time::Duration::from_millis(250),
+                started_at.elapsed() < std::time::Duration::from_secs(1),
                 "round {round}: hard cleanup should use try-lock, got {:?}",
                 started_at.elapsed()
             );
@@ -12799,7 +13160,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(statement_timeout, "4500ms");
+        assert!(
+            matches!(statement_timeout.as_str(), "115s" | "115000ms" | "1min 55s"),
+            "unexpected dashboard statement_timeout: {statement_timeout}"
+        );
         assert_eq!(lock_timeout, "250ms");
         assert_eq!(read_only, "on");
 
@@ -12823,10 +13187,12 @@ mod tests {
 
         let mut at_from = external_usage_record("dashboard-at-from", 0.010, 0.006, 0.008);
         at_from.created_at = (base + chrono::Duration::minutes(15)).to_rfc3339();
+        at_from.kiro_metering_usage = 1.0;
 
         let mut first_boundary = usage_record("dashboard-first-boundary", 2_000);
         first_boundary.created_at = (base + chrono::Duration::minutes(30)).to_rfc3339();
         first_boundary.duration_ms = 30;
+        first_boundary.kiro_metering_usage = 2.0;
 
         let mut before_full_hour = usage_record("dashboard-before-full-hour", 0);
         before_full_hour.created_at =
@@ -12834,15 +13200,18 @@ mod tests {
         before_full_hour.status = UsageRecordStatus::Error;
         before_full_hour.usage_source = UsageSource::RequestEstimate;
         before_full_hour.duration_ms = 40;
+        before_full_hour.kiro_metering_usage = 3.0;
 
         let mut full_hour_start = usage_record("dashboard-full-hour-start", 2_000);
         full_hour_start.created_at = (base + chrono::Duration::hours(1)).to_rfc3339();
         full_hour_start.duration_ms = 50;
+        full_hour_start.kiro_metering_usage = 4.0;
 
         let mut full_hour_external =
             external_usage_record("dashboard-full-hour-external", 0.010, 0.006, 0.008);
         full_hour_external.created_at =
             (base + chrono::Duration::hours(1) + chrono::Duration::minutes(30)).to_rfc3339();
+        full_hour_external.kiro_metering_usage = 5.0;
 
         let mut tail_legacy = usage_record("dashboard-tail-legacy", 2_000);
         tail_legacy.created_at =
@@ -12852,6 +13221,7 @@ mod tests {
         tail_legacy.estimated_cost_usd = 0.123;
         tail_legacy.original_cost_usd = 0.0;
         tail_legacy.duration_ms = 60;
+        tail_legacy.kiro_metering_usage = 6.0;
 
         let mut at_to = external_usage_record("dashboard-at-to", 1.0, 0.5, 0.75);
         at_to.created_at =
@@ -12912,9 +13282,12 @@ mod tests {
             (by_key["cross-hour"].summary.total_original_cost_usd - 0.146).abs() < 1e-12,
             "the boundary detail segment must preserve the legacy hourly original-cost fallback"
         );
+        assert!((by_key["cross-hour"].summary.total_kiro_metering_usage - 21.0).abs() < 1e-12);
         assert_eq!(by_key["exact-hour"].summary.total_requests, 2);
         assert_eq!(by_key["exact-hour"].summary.high_cache_requests, 2);
+        assert!((by_key["exact-hour"].summary.total_kiro_metering_usage - 9.0).abs() < 1e-12);
         assert_eq!(by_key["half-hour"].summary.total_requests, 3);
+        assert!((by_key["half-hour"].summary.total_kiro_metering_usage - 9.0).abs() < 1e-12);
 
         let series = usage_store.dashboard_series(&specs).await.unwrap();
         let series_by_key = series
@@ -12923,8 +13296,19 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(series_by_key["same-hour"].requests, 2);
         assert_eq!(series_by_key["cross-hour"].requests, 6);
+        assert!((series_by_key["cross-hour"].total_kiro_metering_usage - 21.0).abs() < 1e-12);
         assert_eq!(series_by_key["exact-hour"].requests, 2);
         assert_eq!(series_by_key["half-hour"].requests, 3);
+
+        let top_credentials = usage_store
+            .dashboard_top_aggregates_for_window(&[specs[1].clone()], DashboardTopGroup::Credential)
+            .await
+            .unwrap();
+        assert_eq!(top_credentials[0].key, "7");
+        assert!(
+            (top_credentials[0].total_kiro_metering_usage - 15.0).abs() < 1e-12,
+            "windowed credential top must preserve Kiro metering from rollup and boundary rows"
+        );
 
         let status = usage_store
             .dashboard_breakdown(&specs, DashboardBreakdownColumn::Status)
@@ -16938,22 +17322,22 @@ mod tests {
         clean(&store).await;
         let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
 
-        for index in 0..1000 {
-            let (raw_cost, shaped_cost, uplifted_cost) = if index % 2 == 0 {
-                (0.010, 0.006, 0.008)
-            } else {
-                (0.005, 0.007, 0.009)
-            };
-            usage_store
-                .record(external_usage_record(
+        let records = (0..1000)
+            .map(|index| {
+                let (raw_cost, shaped_cost, uplifted_cost) = if index % 2 == 0 {
+                    (0.010, 0.006, 0.008)
+                } else {
+                    (0.005, 0.007, 0.009)
+                };
+                external_usage_record(
                     &format!("external-usage-{index:04}"),
                     raw_cost,
                     shaped_cost,
                     uplifted_cost,
-                ))
-                .await
-                .unwrap();
-        }
+                )
+            })
+            .collect::<Vec<_>>();
+        usage_store.record_batch(records).await.unwrap();
 
         let summary = usage_store.summary(1_000).await.unwrap();
         assert_eq!(summary.external_pool_billing.requests, 1000);

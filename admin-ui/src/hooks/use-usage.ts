@@ -69,45 +69,58 @@ export function useUsageDashboardWindows(timezone = 'Asia/Shanghai', refetchInte
   })
 }
 
-export function useUsageDashboardSeries(timezone = 'Asia/Shanghai', refetchInterval: RefetchInterval = false) {
+export function useUsageDashboardSeries(
+  timezone = 'Asia/Shanghai',
+  refetchInterval: RefetchInterval = false,
+  enabled = true
+) {
   return useQuery({
     queryKey: ['usage-dashboard-series', timezone],
     queryFn: () => getUsageDashboardSeries(timezone),
     refetchInterval,
+    enabled,
   })
 }
 
-export function useUsageDashboardTop(refetchInterval: RefetchInterval = false) {
+export function useUsageDashboardTop(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'lifetime',
+  refetchInterval: RefetchInterval = false,
+  enabled = true
+) {
   return useQuery({
-    queryKey: ['usage-dashboard-top'],
-    queryFn: getUsageDashboardTop,
+    queryKey: ['usage-dashboard-top', timezone, windowKey],
+    queryFn: () => getUsageDashboardTop(timezone, windowKey),
     refetchInterval,
+    enabled,
   })
 }
 
 export function useUsageDashboardBreakdown(
   timezone = 'Asia/Shanghai',
   windowKey = 'today',
-  refetchInterval: RefetchInterval = false
+  refetchInterval: RefetchInterval = false,
+  enabled = true
 ) {
   return useQuery({
     queryKey: ['usage-dashboard-breakdown', timezone, windowKey],
     queryFn: () => getUsageDashboardBreakdown(timezone, windowKey),
     refetchInterval,
-    enabled: Boolean(windowKey),
+    enabled: Boolean(windowKey) && enabled,
   })
 }
 
 export function useUsageDashboardExternalPoolBilling(
   timezone = 'Asia/Shanghai',
   windowKey = 'today',
-  refetchInterval: RefetchInterval = false
+  refetchInterval: RefetchInterval = false,
+  enabled = true
 ) {
   return useQuery({
     queryKey: ['usage-dashboard-external-pool-billing', timezone, windowKey],
     queryFn: () => getUsageDashboardExternalPoolBilling(timezone, windowKey),
     refetchInterval,
-    enabled: Boolean(windowKey),
+    enabled: Boolean(windowKey) && enabled,
   })
 }
 

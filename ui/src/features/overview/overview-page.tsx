@@ -19,8 +19,9 @@ import {
   useUsageDashboardSeries,
   useUsageDashboardTop,
   useUsageDashboardWindows,
+  useUsageSummary,
 } from '@/hooks/use-usage'
-import { useCredentialSummary } from '@/hooks/use-credentials'
+import { useCredentialSummary, useCredentialUsageSummary } from '@/hooks/use-credentials'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import { ExternalPoolBillingPanel } from '../usage/usage-billing'
@@ -30,6 +31,7 @@ import type {
   UsageExternalPoolBillingSummary,
   UsageSeriesPoint,
   UsageTopAggregate,
+  CredentialUsageSummaryItem,
 } from '@/types/api'
 import {
   PageContainer,
@@ -52,6 +54,10 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
 } from '@/components/ui'
 import {
   TrendAreaChart,
@@ -81,6 +87,7 @@ const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
 }
 
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'
+type DashboardSection = 'operations' | 'traffic' | 'billing' | 'quality'
 
 const rankDimensions: Array<{ key: RankDimension; label: string }> = [
   { key: 'models', label: '模型' },
@@ -111,6 +118,7 @@ function seriesPointToChartRow(p: UsageSeriesPoint): Record<string, number | str
     originalCost: p.totalOriginalCostUsd,
     inputTokens: p.totalInputTokens,
     outputTokens: p.totalOutputTokens,
+    kiroMetering: p.totalKiroMeteringUsage ?? 0,
   }
 }
 
@@ -644,6 +652,180 @@ function BreakdownTabPanel({
   )
 }
 
+// ─── 子组件：轻量实时状态 ──────────────────────────────────────────────────────
+
+function LoadingSkeletonCard() {
+  return (
+    <div className="min-h-[6.5rem] animate-pulse rounded-xl bg-card p-4 shadow-sm">
+      <div className="h-3 w-20 rounded bg-muted" />
+      <div className="mt-4 h-7 w-24 rounded bg-muted" />
+      <div className="mt-5 h-2 w-full rounded bg-muted" />
+      <div className="mt-2 h-2 w-2/3 rounded bg-muted" />
+    </div>
+  )
+}
+
+function DashboardLoadingSkeleton() {
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <LoadingSkeletonCard key={index} />
+        ))}
+      </div>
+      <div className="grid gap-3 xl:grid-cols-2">
+        <SectionCard title="运行状态" description="正在加载实时状态">
+          <LoadingState text="加载实时状态..." className="py-6" />
+        </SectionCard>
+        <SectionCard title="账号池" description="正在加载账号池状态">
+          <LoadingState text="加载账号池..." className="py-6" />
+        </SectionCard>
+      </div>
+    </div>
+  )
+}
+
+function RealtimeUsagePanel({
+  summary,
+  error,
+}: {
+  summary?: ReturnType<typeof useUsageSummary>['data']
+  error?: unknown
+}) {
+  if (error) {
+    return (
+      <SectionCard title="实时负载" description="最近 60 秒请求、错误、Token 速率" icon={<Activity />}>
+        <ErrorState title="实时负载加载失败" message={extractErrorMessage(error)} />
+      </SectionCard>
+    )
+  }
+
+  if (!summary) {
+    return (
+      <SectionCard title="实时负载" description="最近 60 秒请求、错误、Token 速率" icon={<Activity />}>
+        <LoadingState text="加载实时负载..." className="py-6" />
+      </SectionCard>
+    )
+  }
+
+  const realtime = summary.realtime
+  const errorRate = realtime.requests > 0 ? (realtime.errorRequests ?? 0) / realtime.requests : 0
+
+  return (
+    <SectionCard
+      title="实时负载"
+      description={`最近 ${realtime.windowSeconds} 秒，判断是否正在被打爆或错误放大`}
+      icon={<Activity />}
+      actions={
+        errorRate > 0.2
+          ? <Badge tone="error">错误偏高</Badge>
+          : realtime.rpm > 0
+            ? <Badge tone="success">有流量</Badge>
+            : <Badge tone="secondary">空闲</Badge>
+      }
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <SignalRow label="RPM" value={formatNumber(realtime.rpm)} ratio={realtime.rpm > 0 ? 1 : 0} barColor="bg-primary/70" />
+        <SignalRow label="错误 RPM" value={formatNumber(realtime.errorRpm ?? 0)} ratio={errorRate} barColor={errorRate > 0 ? 'bg-destructive/75' : 'bg-muted-foreground/30'} />
+        <SignalRow label="总 TPM" value={formatNumber(realtime.totalTpm)} ratio={realtime.totalTpm > 0 ? 1 : 0} barColor="bg-info/70" />
+        <SignalRow label="计费 TPM" value={formatNumber(realtime.billableTpm)} ratio={realtime.totalTpm > 0 ? realtime.billableTpm / realtime.totalTpm : 0} barColor="bg-success/70" />
+      </div>
+      <div className="mt-3 rounded-lg bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        请求 {formatNumber(realtime.requests)} · 成功 {formatNumber(realtime.successRequests ?? 0)} · 错误 {formatNumber(realtime.errorRequests ?? 0)}
+      </div>
+    </SectionCard>
+  )
+}
+
+function AccountQualityPanel({
+  credentials,
+  usageItems,
+  loading,
+}: {
+  credentials: UsageTopAggregate[]
+  usageItems: CredentialUsageSummaryItem[]
+  loading: boolean
+}) {
+  const usageById = new Map(usageItems.map((item) => [item.id, item]))
+
+  return (
+    <SectionCard
+      title="本地账号质量"
+      description="当前窗口账号贡献、计费与 Kiro 积分；用于发现高成本、低成功率或未计价账号"
+      icon={<Users />}
+      noPadding
+    >
+      {loading ? (
+        <div className="p-4">
+          <LoadingState text="加载账号质量..." className="py-8" />
+        </div>
+      ) : credentials.length === 0 ? (
+        <div className="p-4">
+          <EmptyState title="暂无本地账号用量" className="py-8" />
+        </div>
+      ) : (
+        <div className="scrollbar-thin overflow-x-auto">
+          <Table className="min-w-[980px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead>账号</TableHead>
+                <TableHead className="text-right">当前请求</TableHead>
+                <TableHead className="text-right">错误率</TableHead>
+                <TableHead className="text-right">当前估算</TableHead>
+                <TableHead className="text-right">当前实际</TableHead>
+                <TableHead className="text-right">当前积分</TableHead>
+                <TableHead className="text-right">累计估算</TableHead>
+                <TableHead className="text-right">累计实际</TableHead>
+                <TableHead className="text-right">累计积分</TableHead>
+                <TableHead className="text-right">未计价</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {credentials.slice(0, 10).map((credential) => {
+                const id = Number(credential.key)
+                const cumulative = Number.isFinite(id) ? usageById.get(id) : undefined
+                const errorRate = credential.requests > 0 ? credential.errorRequests / credential.requests : 0
+                return (
+                  <TableRow key={credential.key}>
+                    <TableCell>
+                      <div className="max-w-[220px] truncate text-xs font-semibold" title={credential.label ?? credential.key}>
+                        #{credential.key} {credential.label ?? '未命名账号'}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs" title={formatNumber(credential.requests)}>
+                      {formatCompact(credential.requests)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      <span className={errorRate > 0.1 ? 'text-destructive' : errorRate > 0 ? 'text-warning' : 'text-success'}>
+                        {formatPercent(errorRate)}
+                      </span>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(credential.totalEstimatedCostUsd)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(credential.totalOriginalCostUsd)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs" title={formatNumber(credential.totalKiroMeteringUsage ?? 0)}>
+                      {formatCompact(credential.totalKiroMeteringUsage ?? 0)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulative?.estimatedCostUsd ?? 0)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulative?.originalCostUsd ?? 0)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs" title={formatNumber(cumulative?.kiroMeteringUsage ?? 0)}>
+                      {formatCompact(cumulative?.kiroMeteringUsage ?? 0)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      <span className={(cumulative?.unpricedRequests ?? 0) > 0 ? 'text-warning' : 'text-muted-foreground'}>
+                        {formatCompact(cumulative?.unpricedRequests ?? 0)}
+                      </span>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </SectionCard>
+  )
+}
+
 // ─── 主页 ──────────────────────────────────────────────────────────────────────
 
 export function OverviewPage() {
@@ -651,6 +833,7 @@ export function OverviewPage() {
   const windowsQuery = useUsageDashboardWindows(OVERVIEW_TIMEZONE, autoRefresh.refetchInterval)
   const [selectedWindowKey, setSelectedWindowKey] = useState('today')
   const [rankDimension, setRankDimension] = useState<RankDimension>('credentials')
+  const [activeSection, setActiveSection] = useState<DashboardSection>('operations')
 
   const data = windowsQuery.data
   const selectedWindow = useMemo(
@@ -658,25 +841,47 @@ export function OverviewPage() {
     [data?.windows, selectedWindowKey]
   )
   const effectiveWindowKey = selectedWindow?.key ?? selectedWindowKey
-  const seriesQuery = useUsageDashboardSeries(OVERVIEW_TIMEZONE, autoRefresh.refetchInterval)
-  const topQuery = useUsageDashboardTop(autoRefresh.refetchInterval)
+  const usageSummaryQuery = useUsageSummary(autoRefresh.refetchInterval)
+  const seriesQuery = useUsageDashboardSeries(
+    OVERVIEW_TIMEZONE,
+    autoRefresh.refetchInterval,
+    activeSection === 'traffic'
+  )
+  const topQuery = useUsageDashboardTop(
+    OVERVIEW_TIMEZONE,
+    effectiveWindowKey,
+    autoRefresh.refetchInterval,
+    activeSection === 'traffic' || activeSection === 'quality' || activeSection === 'billing'
+  )
   const breakdownQuery = useUsageDashboardBreakdown(
     OVERVIEW_TIMEZONE,
     effectiveWindowKey,
-    autoRefresh.refetchInterval
+    autoRefresh.refetchInterval,
+    activeSection === 'quality'
   )
   const externalPoolBillingQuery = useUsageDashboardExternalPoolBilling(
     OVERVIEW_TIMEZONE,
     effectiveWindowKey,
-    autoRefresh.refetchInterval
+    autoRefresh.refetchInterval,
+    activeSection === 'billing'
   )
+  const topCredentialIds = useMemo(
+    () => (topQuery.data?.top.credentials ?? [])
+      .map((item) => Number(item.key))
+      .filter((id) => Number.isInteger(id) && id > 0),
+    [topQuery.data?.top.credentials]
+  )
+  const credentialUsageSummaryQuery = useCredentialUsageSummary(topCredentialIds, {
+    enabled: activeSection === 'billing' && topCredentialIds.length > 0,
+    refetchInterval: autoRefresh.refetchInterval,
+  })
 
   // 加载态
   if (windowsQuery.isLoading) {
     return (
       <PageContainer>
         <PageHeader title="总览" subtitle="实时健康、关键指标与异常" />
-        <LoadingState text="正在加载总览数据..." />
+        <DashboardLoadingSkeleton />
       </PageContainer>
     )
   }
@@ -715,6 +920,14 @@ export function OverviewPage() {
   const streamRatio = summary.totalRequests > 0 ? summary.streamRequests / summary.totalRequests : 0
   const totalTokens = summary.totalInputTokens + summary.totalOutputTokens
   const latencyTone: 'warning' | 'info' = summary.p95DurationMs >= 60_000 ? 'warning' : 'info'
+  const partialErrors = [
+    usageSummaryQuery.error ? `实时：${extractErrorMessage(usageSummaryQuery.error)}` : '',
+    seriesQuery.error ? `趋势：${extractErrorMessage(seriesQuery.error)}` : '',
+    topQuery.error ? `排行：${extractErrorMessage(topQuery.error)}` : '',
+    credentialUsageSummaryQuery.error ? `账号质量：${extractErrorMessage(credentialUsageSummaryQuery.error)}` : '',
+    breakdownQuery.error ? `分布：${extractErrorMessage(breakdownQuery.error)}` : '',
+    externalPoolBillingQuery.error ? `外部池计费：${extractErrorMessage(externalPoolBillingQuery.error)}` : '',
+  ].filter(Boolean)
 
   // 为 StatCard 准备 Sparkline 数据（用 hourly24h 序列）
   const sparkData = (series.hourly24h ?? []).map(seriesPointToChartRow)
@@ -770,134 +983,132 @@ export function OverviewPage() {
     <PageContainer>
       <PageHeader title="总览" subtitle="实时健康、关键指标与异常" actions={headerActions} />
 
-      {/* 1. 关键指标卡 */}
-      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
-        {/* 请求量 + Sparkline */}
-        <div className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md">
-          <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-primary" />
-          <div className="flex items-start justify-between gap-2 pl-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="text-[0.72rem] font-semibold text-muted-foreground">请求量</div>
-              <div className="mt-1 text-2xl font-semibold tracking-tight tabular-nums text-primary" title={formatNumber(summary.totalRequests)}>
-                {formatCompact(summary.totalRequests)}
+      {partialErrors.length > 0 && (
+        <Callout tone="warning">
+          部分 dashboard 数据加载失败：{partialErrors.join('；')}
+        </Callout>
+      )}
+
+      <Tabs value={activeSection} onValueChange={(value) => setActiveSection(value as DashboardSection)}>
+        <TabsList className="flex h-auto flex-wrap justify-start">
+          <TabsTrigger value="operations">实时</TabsTrigger>
+          <TabsTrigger value="traffic">流量</TabsTrigger>
+          <TabsTrigger value="billing">费用</TabsTrigger>
+          <TabsTrigger value="quality">异常</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="operations" className="space-y-3">
+          <div className="grid gap-3 xl:grid-cols-2">
+            <RealtimeUsagePanel summary={usageSummaryQuery.data} error={usageSummaryQuery.error} />
+            <CredentialPoolPanel />
+          </div>
+          <div className="grid gap-3 xl:grid-cols-[1.1fr_0.9fr]">
+            <RunSignalsPanel
+              pricedRatio={pricedRatio}
+              streamRatio={streamRatio}
+              cacheReadRatio={summary.cacheReadRatio}
+              stickyBound={summary.stickyBoundRequests}
+              stickyFallback={summary.fallbackFromStickyRequests}
+              simulated={summary.simulatedRequests}
+              upstreamMeta={summary.upstreamMetadataRequests}
+            />
+            <SectionCard title="当前窗口摘要" description="用于快速判断是否需要切换到费用、流量或异常视图" icon={<CheckCircle2 />}>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <SignalRow label="请求量" value={formatCompact(summary.totalRequests)} ratio={summary.totalRequests > 0 ? 1 : 0} />
+                <SignalRow label="错误率" value={formatPercent(summary.errorRate)} ratio={summary.errorRate} barColor={summary.errorRate > 0 ? 'bg-destructive/75' : 'bg-success/70'} />
+                <SignalRow label="P95 耗时" value={formatDuration(summary.p95DurationMs)} ratio={summary.p95DurationMs > 0 ? Math.min(1, summary.p95DurationMs / 60_000) : 0} barColor={latencyTone === 'warning' ? 'bg-warning/80' : 'bg-info/70'} />
+                <SignalRow label="估算费用" value={formatUsdFixed2(summary.totalEstimatedCostUsd)} ratio={summary.totalEstimatedCostUsd > 0 ? 1 : 0} />
+                <SignalRow label="Kiro 积分" value={formatCompact(summary.totalKiroMeteringUsage ?? 0)} ratio={(summary.totalKiroMeteringUsage ?? 0) > 0 ? 1 : 0} />
+              </div>
+            </SectionCard>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="traffic" className="space-y-3">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
+            <div className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md">
+              <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-primary" />
+              <div className="flex items-start justify-between gap-2 pl-2.5">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[0.72rem] font-semibold text-muted-foreground">请求量</div>
+                  <div className="mt-1 text-2xl font-semibold tracking-tight tabular-nums text-primary" title={formatNumber(summary.totalRequests)}>
+                    {formatCompact(summary.totalRequests)}
+                  </div>
+                </div>
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-primary [&_svg]:size-4">
+                  <Activity />
+                </div>
+              </div>
+              <div className="mt-1 pl-2.5">
+                {sparkData.length > 0 && (
+                  <Sparkline data={sparkData} dataKey="requests" color={CHART_COLORS[0]} height={28} />
+                )}
+                <div className="mt-1 truncate text-[0.72rem] text-muted-foreground">
+                  成功 <span title={formatNumber(summary.successRequests)}>{formatCompact(summary.successRequests)}</span> / 错误 <span title={formatNumber(summary.errorRequests)}>{formatCompact(summary.errorRequests)}</span>
+                </div>
               </div>
             </div>
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-primary [&_svg]:size-4">
-              <Activity />
-            </div>
+            <StatCard title="P95 耗时" value={formatDuration(summary.p95DurationMs)} desc={`均值 ${formatDuration(summary.averageDurationMs)}`} icon={<Clock3 />} tone={latencyTone} />
+            <StatCard title="Token" value={formatCompact(totalTokens)} valueTitle={formatNumber(totalTokens)} desc={`输入 ${formatCompact(summary.totalInputTokens)} / 输出 ${formatCompact(summary.totalOutputTokens)}`} icon={<Database />} tone="primary" />
+            <StatCard title="缓存命中率" value={formatPercent(summary.cacheReadRatio)} desc={`读取 ${formatCompact(summary.totalCacheReadInputTokens)} tokens`} icon={<Zap />} tone="success" />
+            <StatCard title="流式占比" value={formatPercent(streamRatio)} desc={`流式 ${formatCompact(summary.streamRequests)} / 非流式 ${formatCompact(summary.nonStreamRequests)}`} icon={<Activity />} tone="info" />
           </div>
-          <div className="mt-1 pl-2.5">
-            {sparkData.length > 0 && (
-              <Sparkline data={sparkData} dataKey="requests" color={CHART_COLORS[0]} height={28} />
-            )}
-            <div className="mt-1 truncate text-[0.72rem] text-muted-foreground">
-              成功 <span title={formatNumber(summary.successRequests)}>{formatCompact(summary.successRequests)}</span> / 错误 <span title={formatNumber(summary.errorRequests)}>{formatCompact(summary.errorRequests)}</span>
-            </div>
+
+          {seriesQuery.isLoading ? (
+            <SectionCard title="趋势" description="按小时/天聚合">
+              <LoadingState text="加载趋势..." className="py-8" />
+            </SectionCard>
+          ) : (
+            <TrendSection hourly={series.hourly24h ?? []} daily={series.daily7d ?? []} />
+          )}
+
+          {topQuery.isLoading ? (
+            <SectionCard title="维度排行" description="按当前窗口聚合">
+              <LoadingState text="加载排行..." className="py-8" />
+            </SectionCard>
+          ) : (
+            <DimensionRankPanel top={top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
+          )}
+        </TabsContent>
+
+        <TabsContent value="billing" className="space-y-3">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+            <StatCard title="估算费用" value={formatUsdFixed2(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign />} tone="primary" />
+            <StatCard title="原始计费" value={formatUsdFixed2(summary.totalOriginalCostUsd)} desc="按原始 usage 估算" icon={<DollarSign />} tone="warning" />
+            <StatCard title="Kiro 积分" value={formatCompact(summary.totalKiroMeteringUsage ?? 0)} valueTitle={formatNumber(summary.totalKiroMeteringUsage ?? 0)} desc="当前窗口积分消耗" icon={<DollarSign />} tone="info" />
+            <StatCard title="未计价请求" value={formatCompact(summary.unpricedRequests)} valueTitle={formatNumber(summary.unpricedRequests)} desc={`已计价 ${formatCompact(summary.pricedRequests)}`} icon={<DollarSign />} tone={summary.unpricedRequests > 0 ? 'warning' : 'success'} />
+            <StatCard title="外部池请求" value={formatCompact(summary.externalPoolBilling?.requests ?? 0)} valueTitle={formatNumber(summary.externalPoolBilling?.requests ?? 0)} desc={`billable ${formatUsdFixed2(summary.externalPoolBilling?.billableCostUsd ?? 0)}`} icon={<DollarSign />} tone="info" />
           </div>
-        </div>
+          <AccountQualityPanel
+            credentials={top.credentials ?? []}
+            usageItems={credentialUsageSummaryQuery.data?.items ?? []}
+            loading={topQuery.isLoading || credentialUsageSummaryQuery.isLoading}
+          />
+          {externalPoolBillingQuery.isLoading ? (
+            <SectionCard title="外部池计费" description="按当前窗口拆分">
+              <LoadingState text="加载外部池计费..." className="py-8" />
+            </SectionCard>
+          ) : (
+            <ExternalPoolBillingPanel
+              billing={summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING}
+              billingByPool={externalPoolBillingByPool}
+            />
+          )}
+        </TabsContent>
 
-        {/* 错误率 */}
-        <StatCard
-          title="错误率"
-          value={formatPercent(summary.errorRate)}
-          desc={summary.errorRequests > 0 ? '需查看异常摘要' : '当前窗口无错误'}
-          icon={summary.errorRequests > 0 ? <ShieldAlert /> : <CheckCircle2 />}
-          tone={summary.errorRate >= 0.2 ? 'error' : summary.errorRate > 0 ? 'warning' : 'success'}
-        />
-
-        {/* P95 耗时 */}
-        <StatCard
-          title="P95 耗时"
-          value={formatDuration(summary.p95DurationMs)}
-          desc={`均值 ${formatDuration(summary.averageDurationMs)}`}
-          icon={<Clock3 />}
-          tone={latencyTone}
-        />
-
-        {/* Token 用量 */}
-        <StatCard
-          title="Token"
-          value={formatCompact(totalTokens)}
-          valueTitle={formatNumber(totalTokens)}
-          desc={`输入 ${formatCompact(summary.totalInputTokens)} / 输出 ${formatCompact(summary.totalOutputTokens)}`}
-          icon={<Database />}
-          tone="primary"
-        />
-
-        {/* 缓存命中 + Sparkline */}
-        <div className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md">
-          <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-success" />
-          <div className="flex items-start justify-between gap-2 pl-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="text-[0.72rem] font-semibold text-muted-foreground">缓存命中率</div>
-              <div className="mt-1 text-2xl font-semibold tracking-tight tabular-nums text-success">
-                {formatPercent(summary.cacheReadRatio)}
-              </div>
-            </div>
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-success [&_svg]:size-4">
-              <Zap />
-            </div>
+        <TabsContent value="quality" className="space-y-3">
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需查看 Top 错误' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert /> : <CheckCircle2 />} tone={summary.errorRate >= 0.2 ? 'error' : summary.errorRate > 0 ? 'warning' : 'success'} />
+            <StatCard title="错误请求" value={formatCompact(summary.errorRequests)} valueTitle={formatNumber(summary.errorRequests)} desc={`成功 ${formatCompact(summary.successRequests)}`} icon={<ShieldAlert />} tone={summary.errorRequests > 0 ? 'warning' : 'success'} />
+            <StatCard title="计价覆盖" value={formatPercent(pricedRatio)} desc={`未计价 ${formatCompact(summary.unpricedRequests)}`} icon={<DollarSign />} tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'warning' : 'success'} />
+            <StatCard title="Sticky 回退" value={formatCompact(summary.fallbackFromStickyRequests)} valueTitle={formatNumber(summary.fallbackFromStickyRequests)} desc={`绑定 ${formatCompact(summary.stickyBoundRequests)}`} icon={<Zap />} tone={summary.fallbackFromStickyRequests > 0 ? 'warning' : 'success'} />
           </div>
-          <div className="mt-1 pl-2.5 truncate text-[0.72rem] text-muted-foreground" title={`${formatNumber(summary.totalCacheReadInputTokens)} tokens`}>
-            读取 {formatCompact(summary.totalCacheReadInputTokens)} tokens
+          <div className="grid gap-3 xl:grid-cols-[0.9fr_1.1fr]">
+            <ErrorSummaryPanel totalErrors={summary.errorRequests} errorRate={summary.errorRate} items={top.errors ?? []} />
+            <BreakdownTabPanel statusItems={statusBreakdown} sourceItems={usageSourceBreakdown} />
           </div>
-        </div>
-
-        {/* 估算费用 */}
-        <StatCard
-          title="估算费用"
-          value={formatUsdFixed2(summary.totalEstimatedCostUsd)}
-          desc={`计价覆盖 ${formatPercent(pricedRatio)}`}
-          icon={<DollarSign />}
-          tone="primary"
-        />
-        <StatCard
-          title="原始计费"
-          value={formatUsdFixed2(summary.totalOriginalCostUsd)}
-          desc="按原始 usage 估算"
-          icon={<DollarSign />}
-          tone="warning"
-        />
-      </div>
-
-      {/* 2. 账号池状态 */}
-      <CredentialPoolPanel />
-
-      {/* 4. 趋势图区 */}
-      <TrendSection hourly={series.hourly24h ?? []} daily={series.daily7d ?? []} />
-
-      {/* 5. 运行信号 + 异常摘要 */}
-      <div className="grid gap-3 xl:grid-cols-[1.1fr_0.9fr]">
-        <RunSignalsPanel
-          pricedRatio={pricedRatio}
-          streamRatio={streamRatio}
-          cacheReadRatio={summary.cacheReadRatio}
-          stickyBound={summary.stickyBoundRequests}
-          stickyFallback={summary.fallbackFromStickyRequests}
-          simulated={summary.simulatedRequests}
-          upstreamMeta={summary.upstreamMetadataRequests}
-        />
-        <ErrorSummaryPanel
-          totalErrors={summary.errorRequests}
-          errorRate={summary.errorRate}
-          items={top.errors ?? []}
-        />
-      </div>
-
-      {/* 6. 维度排行 */}
-      <DimensionRankPanel top={top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
-
-      {/* 7. 外部账号计费拆分（始终展示，无样本时为持平/0） */}
-      <ExternalPoolBillingPanel
-        billing={summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING}
-        billingByPool={externalPoolBillingByPool}
-      />
-
-      {/* 8. 状态分布 + 用量来源（Tab 切换） */}
-      <BreakdownTabPanel
-        statusItems={statusBreakdown}
-        sourceItems={usageSourceBreakdown}
-      />
+        </TabsContent>
+      </Tabs>
 
       {/* 9. 底部状态栏 */}
       <div className="rounded-xl bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">

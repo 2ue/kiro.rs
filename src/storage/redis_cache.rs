@@ -623,6 +623,7 @@ const TOKEN_REFRESH_BEGIN_SCRIPT: &str = r#"
     local health_claim_ttl_ms = tonumber(ARGV[6])
     local poll_after_ms = tonumber(ARGV[7])
     local streak_reset_ms = tonumber(ARGV[8])
+    local observed_generation = tonumber(ARGV[9] or '0') or 0
 
     local state = redis.call('HGET', KEYS[2], 'state') or ''
     local stored_identity = redis.call('HGET', KEYS[2], 'identity') or ''
@@ -630,7 +631,7 @@ const TOKEN_REFRESH_BEGIN_SCRIPT: &str = r#"
 
     if state == 'failed' and stored_identity == identity then
         local retry_at_ms = tonumber(redis.call('HGET', KEYS[2], 'retry_at_ms') or '0')
-        if retry_at_ms > now_ms then
+        if retry_at_ms > now_ms or (observed_generation > 0 and observed_generation == generation) then
             local claimed_token = ''
             local claim_until_ms = tonumber(redis.call('HGET', KEYS[2], 'health_claim_until_ms') or '0')
             local health_state = redis.call('HGET', KEYS[2], 'health_state') or 'none'
@@ -1721,6 +1722,7 @@ impl RedisStore {
                 total_output_tokens: usage_i64(&totals, "total_output_tokens"),
                 total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
                 total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
+                total_kiro_metering_usage: usage_f64(&totals, "total_kiro_metering_usage"),
             });
         }
         points
@@ -2218,6 +2220,10 @@ impl RedisStore {
             .arg(&totals_key)
             .arg("total_original_cost_usd")
             .arg(record.original_cost_usd)
+            .cmd("HINCRBYFLOAT")
+            .arg(&totals_key)
+            .arg("total_kiro_metering_usage")
+            .arg(record.kiro_metering_usage)
             .cmd("HINCRBY")
             .arg(&totals_key)
             .arg(if record.pricing_available {
@@ -2695,6 +2701,7 @@ impl RedisStore {
             ),
             total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
             total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
+            total_kiro_metering_usage: usage_f64(&totals, "total_kiro_metering_usage"),
             priced_requests: usage_usize(&totals, "priced_requests"),
             unpriced_requests: usage_usize(&totals, "unpriced_requests"),
             local_prompt_cache_requests: usage_usize(&totals, "local_prompt_cache_requests"),
@@ -3195,6 +3202,7 @@ impl RedisStore {
                 ),
                 total_estimated_cost_usd: usage_f64(&metrics, "total_estimated_cost_usd"),
                 total_original_cost_usd: usage_f64(&metrics, "total_original_cost_usd"),
+                total_kiro_metering_usage: usage_f64(&metrics, "total_kiro_metering_usage"),
             });
         }
         items.sort_by_key(|item| {
@@ -5816,11 +5824,28 @@ impl RedisStore {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_token_refresh(
         &self,
         credential_id: u64,
         identity: [u8; 32],
         caller_can_claim_health: bool,
+    ) -> anyhow::Result<RedisRefreshBegin> {
+        self.begin_token_refresh_after_observed_generation(
+            credential_id,
+            identity,
+            caller_can_claim_health,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_token_refresh_after_observed_generation(
+        &self,
+        credential_id: u64,
+        identity: [u8; 32],
+        caller_can_claim_health: bool,
+        observed_generation: Option<u64>,
     ) -> anyhow::Result<RedisRefreshBegin> {
         let owner = uuid::Uuid::new_v4().to_string();
         let health_claim_token = uuid::Uuid::new_v4().to_string();
@@ -5838,6 +5863,7 @@ impl RedisStore {
             .arg(TOKEN_REFRESH_HEALTH_CLAIM_TTL_MS)
             .arg(TOKEN_REFRESH_POLL_AFTER_MS)
             .arg(TOKEN_REFRESH_NEGATIVE_STREAK_RESET_MS)
+            .arg(observed_generation.unwrap_or_default())
             .query_async(&mut manager)
             .await?;
         decode_refresh_begin(
@@ -6182,6 +6208,10 @@ fn append_usage_dashboard_bucket_aggregate(
         .arg(key)
         .arg("total_original_cost_usd")
         .arg(record.original_cost_usd)
+        .cmd("HINCRBYFLOAT")
+        .arg(key)
+        .arg("total_kiro_metering_usage")
+        .arg(record.kiro_metering_usage)
         .cmd("HINCRBY")
         .arg(key)
         .arg(if record.pricing_available {
@@ -6360,7 +6390,11 @@ fn append_usage_dashboard_top_aggregate(
         .cmd("HINCRBYFLOAT")
         .arg(&metrics_key)
         .arg("total_original_cost_usd")
-        .arg(record.original_cost_usd);
+        .arg(record.original_cost_usd)
+        .cmd("HINCRBYFLOAT")
+        .arg(&metrics_key)
+        .arg("total_kiro_metering_usage")
+        .arg(record.kiro_metering_usage);
     if let Some(label) = label.filter(|label| !label.trim().is_empty()) {
         pipe.cmd("HSET").arg(&metrics_key).arg("label").arg(label);
     }
@@ -6445,6 +6479,7 @@ fn dashboard_summary_from_values(
         cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
         total_estimated_cost_usd: usage_f64(values, "total_estimated_cost_usd"),
         total_original_cost_usd: usage_f64(values, "total_original_cost_usd"),
+        total_kiro_metering_usage: usage_f64(values, "total_kiro_metering_usage"),
         priced_requests: usage_usize(values, "priced_requests"),
         unpriced_requests: usage_usize(values, "unpriced_requests"),
         average_duration_ms,
@@ -6559,7 +6594,7 @@ fn push_dashboard_bucket_suffix(
 }
 
 fn usage_hash_field_is_float(key: &str) -> bool {
-    key.ends_with("_usd") || key == "kiro_metering_usage"
+    key.ends_with("_usd") || key == "kiro_metering_usage" || key == "total_kiro_metering_usage"
 }
 
 fn usage_ratio(part: usize, total: usize) -> f64 {
@@ -7587,6 +7622,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_refresh_observed_waiter_replays_same_failed_generation_after_retry_window_for_five_rounds()
+     {
+        run_isolated_redis_fixture(|store| async move {
+            for round in 1_u64..=5 {
+                let credential_id = 25_000 + round;
+                let identity = [round as u8 + 48; 32];
+                let leader = match store
+                    .begin_token_refresh(credential_id, identity, false)
+                    .await
+                    .unwrap()
+                {
+                    RedisRefreshBegin::Leader(lease) => lease,
+                    other => panic!("round {round}: expected leader, got {other:?}"),
+                };
+                let failure = RedisRefreshFailure {
+                    stage: RedisRefreshFailureStage::ResponseStatus,
+                    kind: RedisRefreshFailureKind::UpstreamUnavailable,
+                    status: Some(500),
+                    retry_after: None,
+                    send_committed: true,
+                    health_action_required: false,
+                };
+                let committed = store
+                    .complete_token_refresh_failure(&leader, &failure, false)
+                    .await
+                    .unwrap()
+                    .expect("current leader must commit its failure");
+                assert_eq!(committed.outcome.generation, leader.generation);
+
+                let mut manager = store.scheduler_capacity_manager();
+                let updated: i64 = redis::cmd("HSET")
+                    .arg(store.key(scheduler_refresh_outcome_key(credential_id)))
+                    .arg("retry_at_ms")
+                    .arg("1")
+                    .query_async(&mut manager)
+                    .await
+                    .unwrap();
+                assert!(updated <= 1, "round {round}: Redis HSET reply changed");
+                let deleted: i64 = redis::cmd("DEL")
+                    .arg(store.key(scheduler_refresh_lock_key(credential_id)))
+                    .query_async(&mut manager)
+                    .await
+                    .unwrap();
+                assert_eq!(deleted, 1, "round {round}: failure fence must exist");
+
+                match store
+                    .begin_token_refresh_after_observed_generation(
+                        credential_id,
+                        identity,
+                        false,
+                        Some(leader.generation),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    RedisRefreshBegin::Replay { outcome, .. } => {
+                        assert_eq!(outcome.generation, leader.generation, "round {round}");
+                        assert_eq!(outcome.failure.kind, failure.kind, "round {round}");
+                    }
+                    other => panic!(
+                        "round {round}: a waiter that observed generation {} must replay that wave, got {other:?}",
+                        leader.generation
+                    ),
+                }
+
+                let replacement = match store
+                    .begin_token_refresh(credential_id, identity, false)
+                    .await
+                    .unwrap()
+                {
+                    RedisRefreshBegin::Leader(lease) => lease,
+                    other => panic!(
+                        "round {round}: a fresh caller without observed generation may retry, got {other:?}"
+                    ),
+                };
+                assert!(replacement.generation > leader.generation, "round {round}");
+                assert!(store.cancel_token_refresh(&replacement).await.unwrap());
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn token_refresh_redis_stale_leader_cannot_overwrite_success_for_five_rounds() {
         run_isolated_redis_fixture(|store| async move {
             for round in 1_u64..=5 {
@@ -7904,7 +8022,7 @@ mod tests {
         let store = RedisStore::connect(&config).await.unwrap();
         store.clear_usage_summary().await.unwrap();
 
-        let success = usage_record(
+        let mut success = usage_record(
             "redis-usage-success",
             UsageRecordStatus::Success,
             UsageSource::UpstreamMetadata,
@@ -7912,6 +8030,7 @@ mod tests {
             0.10,
             20,
         );
+        success.kiro_metering_usage = 1.25;
         let mut external = usage_record(
             "redis-usage-external",
             UsageRecordStatus::Success,
@@ -7920,6 +8039,7 @@ mod tests {
             0.42,
             30,
         );
+        external.kiro_metering_usage = 2.50;
         external.route_kind = Some(UsageRouteKind::ExternalPool);
         external.route_subtype = Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts);
         external.credential_id = None;
@@ -7957,6 +8077,7 @@ mod tests {
             0.20,
             50,
         );
+        error.kiro_metering_usage = 3.75;
         error.request_api_key_id = Some("request-key-error".to_string());
 
         store.record_usage_summary(&success).await.unwrap();
@@ -7970,6 +8091,7 @@ mod tests {
         assert_eq!(summary.error_requests, 1);
         assert_eq!(summary.high_cache_requests, 1);
         assert_eq!(summary.total_input_tokens, 300);
+        assert_f64_close(summary.total_kiro_metering_usage, 7.50);
         assert_eq!(summary.realtime.requests, 3);
         assert_eq!(summary.realtime.success_requests, 2);
         assert_eq!(summary.realtime.error_requests, 1);
@@ -8009,6 +8131,7 @@ mod tests {
         assert_eq!(last24h.summary.success_requests, 2);
         assert_eq!(last24h.summary.error_requests, 1);
         assert_eq!(last24h.summary.high_cache_requests, 1);
+        assert_f64_close(last24h.summary.total_kiro_metering_usage, 7.50);
         assert_eq!(last24h.summary.p95_duration_ms, 50);
         assert_eq!(last24h.summary.external_pool_billing.requests, 1);
         assert_f64_close(last24h.summary.external_pool_billing.raw_cost_usd, 0.10);
@@ -8034,13 +8157,15 @@ mod tests {
                 .any(|item| item.key == "local_prompt_cache")
         );
         assert_eq!(dashboard.top.models[0].requests, 3);
+        assert_f64_close(dashboard.top.models[0].total_kiro_metering_usage, 7.50);
         assert_eq!(dashboard.top.errors[0].key, "rate_limit");
         assert!(
             dashboard
                 .series
                 .hourly_24h
                 .iter()
-                .any(|point| point.requests == 3)
+                .any(|point| point.requests == 3
+                    && (point.total_kiro_metering_usage - 7.50).abs() < 1e-12)
         );
 
         let records = store
@@ -8963,11 +9088,11 @@ mod tests {
         assert!(store.get_scheduler_cooldown(3).await.unwrap().is_none());
 
         let first = store
-            .bump_rate_limit_available_at(3, StdDuration::from_millis(50))
+            .bump_rate_limit_available_at(3, StdDuration::from_secs(5))
             .await
             .unwrap();
         let second = store
-            .bump_rate_limit_available_at(3, StdDuration::from_millis(50))
+            .bump_rate_limit_available_at(3, StdDuration::from_secs(5))
             .await
             .unwrap();
         assert!(second > first);

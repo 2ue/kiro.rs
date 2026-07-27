@@ -140,6 +140,7 @@ const EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::fr
 const EXTERNAL_POOL_SELECTION_MAX_IN_FLIGHT: usize = 32;
 const EXTERNAL_POOL_SELECTION_BREAKER_BACKOFF_MILLIS: [u64; 4] = [100, 250, 500, 1_000];
 const EXTERNAL_POOL_SELECTION_BREAKER_JITTER_PERCENT: u8 = 20;
+const EXTERNAL_POOL_SELECTION_RETRY_AFTER: Duration = Duration::from_millis(250);
 const EXTERNAL_POOL_DISPATCH_FENCE_TIMEOUT: Duration = Duration::from_millis(500);
 const EXTERNAL_POOL_DISPATCH_FENCE_SHARED_WAIT_TIMEOUT: Duration = Duration::from_millis(600);
 const EXTERNAL_POOL_LOCAL_MUTATION_AUTHORITATIVE_FRESH_TTL: Duration = Duration::from_secs(5);
@@ -1427,23 +1428,35 @@ struct ExternalPoolSelectionBreaker {
     operation_semaphore: Arc<Semaphore>,
     backoffs: Vec<Duration>,
     jitter_percent: u8,
+    min_failure_backoff: Duration,
 }
 
 impl Default for ExternalPoolSelectionBreaker {
     fn default() -> Self {
-        Self::new(
+        Self::new_with_min_backoff(
             EXTERNAL_POOL_SELECTION_MAX_IN_FLIGHT,
             EXTERNAL_POOL_SELECTION_BREAKER_BACKOFF_MILLIS
                 .into_iter()
                 .map(Duration::from_millis)
                 .collect(),
             EXTERNAL_POOL_SELECTION_BREAKER_JITTER_PERCENT,
+            EXTERNAL_POOL_SELECTION_RETRY_AFTER,
         )
     }
 }
 
 impl ExternalPoolSelectionBreaker {
+    #[cfg(test)]
     fn new(max_in_flight: usize, backoffs: Vec<Duration>, jitter_percent: u8) -> Self {
+        Self::new_with_min_backoff(max_in_flight, backoffs, jitter_percent, Duration::ZERO)
+    }
+
+    fn new_with_min_backoff(
+        max_in_flight: usize,
+        backoffs: Vec<Duration>,
+        jitter_percent: u8,
+        min_failure_backoff: Duration,
+    ) -> Self {
         let backoffs = if backoffs.is_empty() {
             vec![Duration::from_millis(100)]
         } else {
@@ -1458,6 +1471,7 @@ impl ExternalPoolSelectionBreaker {
             operation_semaphore: Arc::new(Semaphore::new(max_in_flight.max(1))),
             backoffs,
             jitter_percent: jitter_percent.min(50),
+            min_failure_backoff,
         }
     }
 
@@ -1473,6 +1487,7 @@ impl ExternalPoolSelectionBreaker {
             self.jitter_percent,
             generation ^ (consecutive_failures as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
         )
+        .max(self.min_failure_backoff)
     }
 
     fn try_begin(
@@ -1507,7 +1522,7 @@ impl ExternalPoolSelectionBreaker {
                     self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
                     return Err(ExternalPoolSelectionUnavailable {
                         kind: ExternalPoolSelectionFailureKind::BreakerOpen,
-                        retry_after: Duration::from_millis(100),
+                        retry_after: EXTERNAL_POOL_SELECTION_RETRY_AFTER,
                     });
                 }
                 state.recovery_probe_in_flight = true;
@@ -3857,14 +3872,14 @@ impl ExternalPoolManager {
                         permit.failure(ExternalPoolSelectionFailureKind::PostgresError);
                         Err(ExternalPoolSelectionUnavailable {
                             kind: ExternalPoolSelectionFailureKind::PostgresError,
-                            retry_after: Duration::from_millis(250),
+                            retry_after: EXTERNAL_POOL_SELECTION_RETRY_AFTER,
                         })
                     }
                     Err(_) => {
                         permit.failure(ExternalPoolSelectionFailureKind::PostgresTimeout);
                         Err(ExternalPoolSelectionUnavailable {
                             kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
-                            retry_after: Duration::from_millis(250),
+                            retry_after: EXTERNAL_POOL_SELECTION_RETRY_AFTER,
                         })
                     }
                 }
@@ -3927,7 +3942,7 @@ impl ExternalPoolManager {
             {
                 return Err(ExternalPoolSelectionUnavailable {
                     kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
-                    retry_after: Duration::from_millis(250),
+                    retry_after: EXTERNAL_POOL_SELECTION_RETRY_AFTER,
                 });
             }
         }
@@ -5932,7 +5947,10 @@ impl ExternalPoolManager {
         }
     }
 
-    async fn validate_pool_dispatch_fence(&self, pool: &ExternalPool) -> PoolDispatchFenceResult {
+    fn validate_pool_dispatch_fence(
+        &self,
+        pool: &ExternalPool,
+    ) -> impl Future<Output = PoolDispatchFenceResult> + Send + 'static {
         let key = (pool.id, pool.revision);
         let (flight, start_query) = {
             let mut flights = self.dispatch_fence_flights.lock();
@@ -5949,6 +5967,7 @@ impl ExternalPoolManager {
             let manager = self.clone();
             let query_flight = flight.clone();
             tokio::spawn(async move {
+                tokio::task::yield_now().await;
                 let result = manager.query_pool_dispatch_fence(key.0, key.1).await;
                 {
                     let mut flights = manager.dispatch_fence_flights.lock();
@@ -5962,18 +5981,20 @@ impl ExternalPoolManager {
                 query_flight.complete(result);
             });
         }
-        match timeout(
-            EXTERNAL_POOL_DISPATCH_FENCE_SHARED_WAIT_TIMEOUT,
-            flight.wait(),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                PoolDispatchFenceResult::CoordinatorUnavailable(ExternalPoolSelectionUnavailable {
-                    kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
-                    retry_after: Duration::from_millis(250),
-                })
+        async move {
+            match timeout(
+                EXTERNAL_POOL_DISPATCH_FENCE_SHARED_WAIT_TIMEOUT,
+                flight.wait(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => PoolDispatchFenceResult::CoordinatorUnavailable(
+                    ExternalPoolSelectionUnavailable {
+                        kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
+                        retry_after: EXTERNAL_POOL_SELECTION_RETRY_AFTER,
+                    },
+                ),
             }
         }
     }
@@ -6013,14 +6034,14 @@ impl ExternalPoolManager {
                 permit.failure(ExternalPoolSelectionFailureKind::PostgresError);
                 PoolDispatchFenceResult::CoordinatorUnavailable(ExternalPoolSelectionUnavailable {
                     kind: ExternalPoolSelectionFailureKind::PostgresError,
-                    retry_after: Duration::from_millis(250),
+                    retry_after: EXTERNAL_POOL_SELECTION_RETRY_AFTER,
                 })
             }
             Err(_) => {
                 permit.failure(ExternalPoolSelectionFailureKind::PostgresTimeout);
                 PoolDispatchFenceResult::CoordinatorUnavailable(ExternalPoolSelectionUnavailable {
                     kind: ExternalPoolSelectionFailureKind::PostgresTimeout,
-                    retry_after: Duration::from_millis(250),
+                    retry_after: EXTERNAL_POOL_SELECTION_RETRY_AFTER,
                 })
             }
         }

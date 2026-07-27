@@ -1008,6 +1008,8 @@ mod tests {
     use axum::{Json, Router};
     use chrono::{Duration, Utc};
     use futures::StreamExt;
+    use once_cell::sync::OnceCell;
+    use reqwest::Client;
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::instrument::WithSubscriber;
@@ -1017,10 +1019,12 @@ mod tests {
         KIRO_CLIENT_CACHE_MAX_ENTRIES, KiroAvailableModel, KiroProvider, KiroStreamCompletion,
         MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS, MODEL_DISCOVERY_MAX_HTTP_SENDS, McpCallCompletion,
         McpCallFailureKind, PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES, ProfileArnDiscoveryPolicy,
+        ProviderClientCacheEntry,
     };
     use crate::anthropic::inference_attempt_budget::{
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, InferenceAttemptBudget, InferenceAttemptKind,
     };
+    use crate::http_client::ProxyConfig;
     use crate::kiro::call_trace::{
         AccountRejectReason, KiroCallFailureKind, SelectionFailureStage,
     };
@@ -3216,26 +3220,47 @@ mod tests {
         for round in 0..5 {
             let (provider, _) =
                 fake_profile_provider(&server.base_url, fake_bad_request_credentials(1), None);
-            let mut last_credential = None;
-            for index in 0..=KIRO_CLIENT_CACHE_MAX_ENTRIES {
-                let mut credential = fake_bad_request_credentials(1).remove(0);
-                credential.proxy_url = Some(format!(
-                    "http://127.0.0.1:{}",
-                    33_000 + round * 1_000 + index
-                ));
-                provider.client_for(&credential).unwrap();
-                last_credential = Some(credential);
+
+            // This test validates cache size, LRU eviction, and OnceCell singleflight semantics.
+            // It does not need to construct hundreds of real TLS clients. On macOS, each
+            // reqwest::Client build can scan the system Keychain; doing that 1,000+ times made the
+            // release gate spend minutes in local certificate loading. Pre-fill the cache with
+            // ready cells and use the production builder only for the hot keys under test.
+            let dummy_client = Client::builder()
+                .no_proxy()
+                .build()
+                .expect("dummy cached client");
+            {
+                let mut cache = provider.client_cache.lock();
+                let missing_entries = KIRO_CLIENT_CACHE_MAX_ENTRIES - cache.entries.len();
+                for index in 0..missing_entries {
+                    let proxy_url = format!("http://127.0.0.1:{}", 33_000 + round * 1_000 + index);
+                    let key = Some(ProxyConfig::new(proxy_url));
+                    let cell = Arc::new(OnceCell::new());
+                    cell.set(dummy_client.clone())
+                        .expect("test cache cell must be empty");
+                    cache.clock = cache.clock.saturating_add(1);
+                    let last_used = cache.clock;
+                    cache.entries.insert(
+                        key,
+                        ProviderClientCacheEntry {
+                            client: cell,
+                            last_used,
+                        },
+                    );
+                }
+                assert_eq!(cache.entries.len(), KIRO_CLIENT_CACHE_MAX_ENTRIES);
             }
+
+            let mut last_credential = fake_bad_request_credentials(1).remove(0);
+            last_credential.proxy_url = Some(format!("http://127.0.0.1:{}", 39_000 + round));
+            provider.client_for(&last_credential).unwrap();
             assert_eq!(
                 provider.client_cache.lock().entries.len(),
                 KIRO_CLIENT_CACHE_MAX_ENTRIES
             );
-            assert_eq!(
-                provider.client_cache_builds.load(Ordering::Acquire),
-                (KIRO_CLIENT_CACHE_MAX_ENTRIES + 2) as u64
-            );
+            assert_eq!(provider.client_cache_builds.load(Ordering::Acquire), 2);
 
-            let last_credential = last_credential.unwrap();
             let key = last_credential.effective_proxy(None);
             let before = provider.client_cache.lock().entries[&key].client.clone();
             provider.client_for(&last_credential).unwrap();
@@ -5235,7 +5260,7 @@ mod tests {
                 "upstream_timeout",
                 Some(500),
                 "api_timeout",
-                5,
+                1,
             ),
             (
                 "provider_body_disconnect",
@@ -7692,19 +7717,19 @@ impl KiroProvider {
                 if ctx.id != EXTERNAL_CREDENTIAL_CONTEXT_ID {
                     if let Err(err) = self
                         .token_manager
-                        .update_credential_profile_arn(ctx.id, Some(profile_arn.clone()))
+                        .update_credential_profile_arn_deferred(ctx.id, Some(profile_arn.clone()))
                     {
                         tracing::warn!(
                             credential_id = ctx.id,
                             profile_arn = %profile_arn,
-                            "Enterprise profileArn 已解析但持久化失败: {}",
+                            "Enterprise profileArn 已解析但本地更新失败: {}",
                             err
                         );
                     } else {
                         tracing::info!(
                             credential_id = ctx.id,
                             profile_arn = %profile_arn,
-                            "Enterprise profileArn 已解析并持久化"
+                            "Enterprise profileArn 已解析，本地已更新并异步持久化"
                         );
                     }
                 }
@@ -7993,7 +8018,7 @@ impl KiroProvider {
             format!("auth_error {} {}", status, recorded_detail),
         )?;
 
-        let has_available = self.token_manager.report_failure(ctx.id);
+        let has_available = self.token_manager.report_failure_deferred(ctx.id);
         if let Some(session_id) = session_id {
             self.token_manager
                 .unbind_session_if_bound_to_deferred(session_id, ctx.id);
@@ -9206,7 +9231,7 @@ impl KiroProvider {
                         credential_context,
                         e
                     );
-                    self.token_manager.report_failure(ctx.id);
+                    self.token_manager.report_failure_deferred(ctx.id);
                     self.finish_attempt(&mut ctx);
                     continue;
                 }
@@ -9549,7 +9574,7 @@ impl KiroProvider {
                     status,
                     response_body_bytes
                 );
-                let risk_outcome = self.token_manager.report_risk_controlled_outcome(
+                let risk_outcome = self.token_manager.report_risk_controlled_outcome_deferred(
                     ctx.id,
                     risk_reason,
                     format!("MCP status={status} risk_control={risk_reason:?}"),
@@ -9614,7 +9639,7 @@ impl KiroProvider {
                     status,
                     response_body_bytes
                 );
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
                 let failure_kind = Self::mcp_failure_kind_for_status(status);
                 Self::push_mcp_attempt(
                     attribution_sink.as_ref(),
@@ -10156,7 +10181,7 @@ impl KiroProvider {
                         credential_context,
                         e
                     );
-                    self.token_manager.report_failure(ctx.id);
+                    self.token_manager.report_failure_deferred(ctx.id);
                     self.finish_attempt(&mut ctx);
                     continue;
                 }
@@ -10691,7 +10716,7 @@ impl KiroProvider {
                     max_retries,
                     "Kiro API credential entered a terminal risk-control state"
                 );
-                let risk_outcome = self.token_manager.report_risk_controlled_outcome(
+                let risk_outcome = self.token_manager.report_risk_controlled_outcome_deferred(
                     ctx.id,
                     risk_reason,
                     message.clone(),
@@ -10784,7 +10809,7 @@ impl KiroProvider {
                     "Kiro API credential quota is exhausted"
                 );
 
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
                 if let Some(session_id) = conversation_id.as_deref() {
                     self.token_manager
                         .unbind_session_if_bound_to_deferred(session_id, ctx.id);
@@ -11429,20 +11454,14 @@ impl KiroProvider {
                     );
                     if let Err(err) = self
                         .token_manager
-                        .update_credential_profile_arn(ctx.id, None)
+                        .update_credential_profile_arn_deferred(ctx.id, None)
                     {
-                        let final_message = format!(
-                            "{} API 请求失败（{}，profileArn 状态清理失败）: {}",
-                            api_type, credential_context, err
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            credential_label = %credential_label,
+                            "profileArn 状态本地清理失败，将继续按请求级重试处理: {}",
+                            err
                         );
-                        if let Some(last) = attempts.last_mut() {
-                            last.action = "fail".to_string();
-                            last.error_type = Some("scheduler_state_error".to_string());
-                            last.error_message = Some(final_message.clone());
-                        }
-                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
-                        self.finish_attempt(&mut ctx);
-                        return Err(Self::traced_error(final_message, &attempts));
                     }
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
                         ctx.id,
@@ -11844,6 +11863,7 @@ impl KiroProvider {
         Self::max_retry_attempts(total_credentials, config)
     }
 
+    #[cfg(not(test))]
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -11853,6 +11873,11 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    #[cfg(test)]
+    fn retry_delay(_attempt: usize) -> Duration {
+        Duration::from_millis(1)
     }
 
     fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {

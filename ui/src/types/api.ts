@@ -918,6 +918,7 @@ export interface UsageSummary {
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   localPromptCacheRequests: number
@@ -1015,6 +1016,7 @@ export interface UsageDashboardSummary {
   cacheReadRatio: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   averageDurationMs: number
@@ -1054,6 +1056,7 @@ export interface UsageSeriesPoint {
   totalOutputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
 }
 
 export interface UsageDashboardTop {
@@ -1076,6 +1079,7 @@ export interface UsageTopAggregate {
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
 }
 
 export interface UsageRecordsQuery {

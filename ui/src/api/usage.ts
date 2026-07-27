@@ -58,8 +58,13 @@ export async function getUsageDashboardSeries(timezone = 'Asia/Shanghai'): Promi
   return data
 }
 
-export async function getUsageDashboardTop(): Promise<UsageDashboardTopResponse> {
-  const { data } = await api.get<UsageDashboardTopResponse>('/usage-dashboard/top')
+export async function getUsageDashboardTop(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'lifetime'
+): Promise<UsageDashboardTopResponse> {
+  const { data } = await api.get<UsageDashboardTopResponse>('/usage-dashboard/top', {
+    params: { timezone, windowKey },
+  })
   return data
 }
 

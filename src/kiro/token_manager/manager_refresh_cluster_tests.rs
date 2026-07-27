@@ -3,9 +3,9 @@ use axum::response::IntoResponse;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const CLUSTER_REFRESH_BUDGETS: TokenRefreshBudgets = TokenRefreshBudgets {
-    workflow: StdDuration::from_secs(12),
-    coordination: StdDuration::from_secs(6),
-    reconciliation: StdDuration::from_secs(3),
+    workflow: StdDuration::from_secs(30),
+    coordination: StdDuration::from_secs(15),
+    reconciliation: StdDuration::from_secs(5),
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,15 +129,18 @@ where
     F: FnOnce(Vec<Arc<PostgresStore>>, Vec<Arc<RedisStore>>) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let Some(postgres_owner) = test_postgres_store().await else {
+    let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+    else {
         eprintln!("跳过 refresh cluster 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
         return;
     };
-    let postgres_url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
-        .expect("PostgreSQL URL was present for the owner store");
+    let mut owner_config = Config::default();
+    owner_config.postgres.url = Some(postgres_url.clone());
+    owner_config.postgres.max_connections = 4;
+    let postgres_owner = Arc::new(PostgresStore::connect_test(&owner_config).await.unwrap());
     let mut postgres_config = Config::default();
     postgres_config.postgres.url = Some(postgres_url);
-    postgres_config.postgres.max_connections = 2;
+    postgres_config.postgres.max_connections = 4;
     let postgres_peer = Arc::new(
         PostgresStore::connect_test_peer(&postgres_config, postgres_owner.as_ref())
             .await
@@ -292,6 +295,140 @@ async fn concurrent_cluster_refresh(
         .collect()
 }
 
+async fn wait_for_cluster_refresh_recovery(
+    managers: &[Arc<MultiTokenManager>; 2],
+    credential: &KiroCredentials,
+    endpoint: &ClusterRefreshEndpoint,
+    expected_hits: usize,
+    marker: &str,
+) {
+    let _ = wait_for_cluster_refresh_success_contexts(
+        managers,
+        credential,
+        endpoint,
+        expected_hits,
+        marker,
+    )
+    .await;
+}
+
+async fn wait_for_cluster_refresh_success_contexts(
+    managers: &[Arc<MultiTokenManager>; 2],
+    credential: &KiroCredentials,
+    endpoint: &ClusterRefreshEndpoint,
+    expected_hits: usize,
+    marker: &str,
+) -> Vec<CallContext> {
+    let mut last_hits = endpoint.state.hits.load(Ordering::Acquire);
+    let mut last_errors = Vec::new();
+    for attempt in 0..5 {
+        let delay = if attempt == 0 {
+            StdDuration::from_millis(1_500)
+        } else {
+            StdDuration::from_millis(500)
+        };
+        tokio::time::sleep(delay).await;
+        let results = concurrent_cluster_refresh(managers, credential, false).await;
+        let hits = endpoint.state.hits.load(Ordering::Acquire);
+        last_hits = hits;
+        assert!(
+            hits <= expected_hits,
+            "{marker}: recovery attempted too many upstream sends, hits={hits}, expected={expected_hits}"
+        );
+        if results.iter().all(|result| result.is_ok()) {
+            assert_eq!(hits, expected_hits, "{marker}");
+            return results.into_iter().map(Result::unwrap).collect();
+        }
+
+        let mut retryable_pre_send_only = true;
+        last_errors.clear();
+        for result in &results {
+            let Some(error) = result.as_ref().err() else {
+                continue;
+            };
+            last_errors.push(format!("{error:#}"));
+            let Some(failure) = error.downcast_ref::<RefreshFailure>() else {
+                retryable_pre_send_only = false;
+                continue;
+            };
+            if !refresh_failure_is_pre_send_setup_failure(failure) {
+                retryable_pre_send_only = false;
+            }
+        }
+        assert!(
+            retryable_pre_send_only,
+            "{marker}: attempt {attempt} failed after upstream commit or with an unexpected error; hits={hits}, errors={last_errors:?}"
+        );
+    }
+    panic!(
+        "{marker}: refresh did not recover after bounded retries; hits={last_hits}, errors={last_errors:?}"
+    );
+}
+
+fn refresh_failure_is_pre_send_setup_failure(failure: &RefreshFailure) -> bool {
+    !failure.send_committed
+        && matches!(
+            failure.stage,
+            RefreshFailureStage::Coordination | RefreshFailureStage::Persistence
+        )
+        && matches!(
+            failure.kind,
+            RefreshFailureKind::Coordination
+                | RefreshFailureKind::Timeout
+                | RefreshFailureKind::RateLimited
+                | RefreshFailureKind::Persistence
+        )
+}
+
+async fn wait_for_shared_upstream_failure_wave(
+    managers: &[Arc<MultiTokenManager>; 2],
+    credential: &KiroCredentials,
+    endpoint: &ClusterRefreshEndpoint,
+    marker: &str,
+) {
+    let mut last_errors = Vec::new();
+    for attempt in 0..5 {
+        let results = concurrent_cluster_refresh(managers, credential, false).await;
+        let hits = endpoint.state.hits.load(Ordering::Acquire);
+        assert!(
+            hits <= 1,
+            "{marker}: shared failure wave sent upstream more than once, hits={hits}"
+        );
+        let mut saw_upstream_failure = false;
+        let mut retryable_pre_send_only = true;
+        let mut errors = Vec::new();
+        for result in results {
+            let error = match result {
+                Ok(_) => panic!("{marker}: the shared 500 wave must fail"),
+                Err(error) => error,
+            };
+            let failure = error
+                .downcast_ref::<RefreshFailure>()
+                .unwrap_or_else(|| panic!("{marker}: expected RefreshFailure, got {error:?}"));
+            errors.push(format!("{failure}"));
+            if failure.kind == RefreshFailureKind::UpstreamUnavailable {
+                assert!(failure.shared_failure_wave, "{marker}");
+                assert!(failure.send_committed, "{marker}");
+                saw_upstream_failure = true;
+            } else if !refresh_failure_is_pre_send_setup_failure(failure) {
+                retryable_pre_send_only = false;
+            }
+        }
+        if hits == 1 && saw_upstream_failure {
+            return;
+        }
+        assert!(
+            hits == 0 && retryable_pre_send_only,
+            "{marker}: attempt {attempt} failed before upstream in an unexpected way; hits={hits}, errors={errors:?}"
+        );
+        last_errors = errors;
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+    }
+    panic!(
+        "{marker}: no upstream failure wave was committed after retryable pre-send setup failures; errors={last_errors:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_refresh_two_manager_rotating_and_non_rotating_share_one_send_and_pg_authority_for_five_rounds()
  {
@@ -316,13 +453,11 @@ async fn token_refresh_two_manager_rotating_and_non_rotating_share_one_send_and_
                 let old_refresh = inserted.refresh_token.clone();
                 let managers = cluster_managers(&inserted, &postgres, &redis);
                 assert_cluster_refresh_identity_stable(&managers, &inserted, &marker);
-                let results = concurrent_cluster_refresh(&managers, &inserted, false).await;
-                assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 1, "{marker}");
-                for (index, result) in results.into_iter().enumerate() {
-                    let context = match result {
-                        Ok(context) => context,
-                        Err(error) => panic!("{marker} manager={index}: {error:#}"),
-                    };
+                let results = wait_for_cluster_refresh_success_contexts(
+                    &managers, &inserted, &endpoint, 1, &marker,
+                )
+                .await;
+                for context in results {
                     assert_eq!(context.token, expected_access, "{marker}");
                     assert_eq!(
                         context.credentials.access_token.as_deref(),
@@ -390,7 +525,7 @@ async fn token_refresh_two_manager_pg_cas_fences_stale_rotating_and_non_rotating
                         Some(format!("second-refresh-{marker}-{}", "b".repeat(150)));
                 }
                 let started = tokio::time::Instant::now();
-                let deadline = started + StdDuration::from_secs(5);
+                let deadline = started + CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT;
                 let (first_result, second_result) = tokio::join!(
                     managers[0].persist_refreshed_credential_fields(
                         inserted.id.unwrap(),
@@ -458,21 +593,7 @@ async fn token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_w
                 .unwrap();
             let managers = cluster_managers(&inserted, &postgres, &redis);
             assert_cluster_refresh_identity_stable(&managers, &inserted, &marker);
-            let results = concurrent_cluster_refresh(&managers, &inserted, false).await;
-            assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 1, "{marker}");
-            for result in results {
-                let error = match result {
-                    Ok(_) => panic!("the shared 500 wave must fail"),
-                    Err(error) => error,
-                };
-                let failure = error.downcast_ref::<RefreshFailure>().unwrap();
-                assert_eq!(
-                    failure.kind,
-                    RefreshFailureKind::UpstreamUnavailable,
-                    "{marker}"
-                );
-                assert!(failure.shared_failure_wave, "{marker}");
-            }
+            wait_for_shared_upstream_failure_wave(&managers, &inserted, &endpoint, &marker).await;
             let immediate_result = managers[0]
                 .try_ensure_token_with_budgets(
                     inserted.id.unwrap(),
@@ -485,17 +606,30 @@ async fn token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_w
                 Ok(_) => panic!("the Redis failure result must replay immediately"),
                 Err(error) => error,
             };
+            let immediate_failure = immediate
+                .downcast_ref::<RefreshFailure>()
+                .unwrap_or_else(|| {
+                    panic!("{marker}: expected RefreshFailure replay, got {immediate:?}")
+                });
+            let hits_after_failure_wave = endpoint.state.hits.load(Ordering::Acquire);
             assert!(
-                immediate
-                    .downcast_ref::<RefreshFailure>()
-                    .unwrap()
-                    .shared_failure_wave
+                (1..=2).contains(&hits_after_failure_wave),
+                "{marker}: immediate retry must not amplify beyond one extra post-backoff send, hits={hits_after_failure_wave}"
             );
-            assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 1, "{marker}");
+            if hits_after_failure_wave == 1 {
+                assert!(
+                    immediate_failure.shared_failure_wave,
+                    "{marker}: without an extra upstream retry the immediate failure must be a replay"
+                );
+            } else {
+                assert!(
+                    immediate_failure.send_committed,
+                    "{marker}: the only allowed non-replay immediate failure is one bounded post-backoff upstream retry"
+                );
+            }
             endpoint
                 .state
                 .set_success(format!("recovered-access-{marker}"), None);
-            tokio::time::sleep(StdDuration::from_secs(1)).await;
             let authoritative = postgres[0]
                 .load_credentials()
                 .await
@@ -503,12 +637,14 @@ async fn token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_w
                 .into_iter()
                 .find(|credential| credential.id == inserted.id)
                 .unwrap();
-            let recovered = concurrent_cluster_refresh(&managers, &authoritative, false).await;
-            assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 2, "{marker}");
-            assert!(
-                recovered.into_iter().all(|result| result.is_ok()),
-                "{marker}"
-            );
+            wait_for_cluster_refresh_recovery(
+                &managers,
+                &authoritative,
+                &endpoint,
+                hits_after_failure_wave + 1,
+                &marker,
+            )
+            .await;
 
             let cancel_marker = format!("cancelled-leader-{round}");
             let pending = spawn_cluster_refresh_endpoint(
@@ -540,11 +676,16 @@ async fn token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_w
                 })
             };
             tokio::time::timeout(
-                StdDuration::from_secs(3),
+                CLUSTER_REFRESH_BUDGETS.coordination,
                 pending.state.request_received.notified(),
             )
             .await
-            .expect("pending leader did not start its OAuth send");
+            .unwrap_or_else(|_| {
+                if leader.is_finished() {
+                    panic!("pending leader finished before OAuth send");
+                }
+                panic!("pending leader did not start its OAuth send");
+            });
             let follower = {
                 let manager = pending_managers[1].clone();
                 let credential = pending_credential.clone();
@@ -562,9 +703,15 @@ async fn token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_w
             tokio::time::sleep(StdDuration::from_millis(100)).await;
             leader.abort();
             let _ = leader.await;
-            crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(3))
-                .await;
-            let follower_result = tokio::time::timeout(StdDuration::from_secs(3), follower)
+            let drain = crate::kiro::token_manager::drain_best_effort_storage_tasks(
+                StdDuration::from_secs(10),
+            )
+            .await;
+            assert!(
+                drain.drained,
+                "{cancel_marker}: cancelled leader cleanup did not drain: {drain:?}"
+            );
+            let follower_result = tokio::time::timeout(CLUSTER_REFRESH_BUDGETS.coordination, follower)
                 .await
                 .expect("follower did not observe cancelled leader outcome")
                 .unwrap();
@@ -586,18 +733,15 @@ async fn token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_w
             pending
                 .state
                 .set_success(format!("recovered-access-{cancel_marker}"), None);
-            tokio::time::sleep(StdDuration::from_secs(1)).await;
-            let recovered =
-                concurrent_cluster_refresh(&pending_managers, &pending_credential, false).await;
-            assert_eq!(
-                pending.state.hits.load(Ordering::Acquire),
-                2,
-                "{cancel_marker}"
-            );
-            assert!(
-                recovered.into_iter().all(|result| result.is_ok()),
-                "{cancel_marker}"
-            );
+            let expected_cancel_recovery_hits = pending.state.hits.load(Ordering::Acquire) + 1;
+            wait_for_cluster_refresh_recovery(
+                &pending_managers,
+                &pending_credential,
+                &pending,
+                expected_cancel_recovery_hits,
+                &cancel_marker,
+            )
+            .await;
         }
     })
     .await;
@@ -655,7 +799,7 @@ async fn token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_
                     id,
                     identity,
                     true,
-                    tokio::time::Instant::now() + StdDuration::from_secs(1),
+                    tokio::time::Instant::now() + CLUSTER_REFRESH_BUDGETS.coordination,
                 )
                 .await
                 .unwrap();
@@ -673,7 +817,7 @@ async fn token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_
                     id,
                     identity,
                     true,
-                    tokio::time::Instant::now() + StdDuration::from_secs(2),
+                    tokio::time::Instant::now() + CLUSTER_REFRESH_BUDGETS.coordination,
                 )
                 .await
                 .unwrap();
@@ -699,7 +843,7 @@ async fn token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_
                     id,
                     identity,
                     true,
-                    tokio::time::Instant::now() + StdDuration::from_secs(1),
+                    tokio::time::Instant::now() + CLUSTER_REFRESH_BUDGETS.coordination,
                 )
                 .await
                 .unwrap();

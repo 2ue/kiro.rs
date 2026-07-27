@@ -214,6 +214,65 @@ fn refresh_negative_result_is_typed_versioned_bounded_and_expires_for_five_round
             .is_none(),
         "local validation failures are not negative-cached"
     );
+    let pre_send_coordination = RefreshFailure::new(
+        RefreshFailureStage::Coordination,
+        RefreshFailureKind::Coordination,
+        None,
+        None,
+        false,
+    );
+    assert!(
+        other_credential_state
+            .record_failure(replacement, &pre_send_coordination, Instant::now(), true)
+            .is_none(),
+        "pre-send local coordination failures must not be shared across callers or instances"
+    );
+    let pre_send_network = RefreshFailure::new(
+        RefreshFailureStage::RequestSend,
+        RefreshFailureKind::Network,
+        None,
+        None,
+        false,
+    );
+    assert!(
+        other_credential_state
+            .record_failure(replacement, &pre_send_network, Instant::now(), true)
+            .is_none(),
+        "pre-send transport failures must not be shared before the upstream request is committed"
+    );
+    let pre_send_admission_rate_limit = RefreshFailure::new(
+        RefreshFailureStage::Coordination,
+        RefreshFailureKind::RateLimited,
+        None,
+        Some(StdDuration::from_secs(1)),
+        false,
+    );
+    assert!(
+        !refresh_failure_requires_health_action(&pre_send_admission_rate_limit),
+        "local token-refresh admission rate limits must not mutate credential health"
+    );
+    assert!(
+        other_credential_state
+            .record_failure(
+                replacement,
+                &pre_send_admission_rate_limit,
+                Instant::now(),
+                true
+            )
+            .is_none(),
+        "pre-send admission rate limits must not be negative-cached"
+    );
+    let committed_upstream_rate_limit = RefreshFailure::new(
+        RefreshFailureStage::ResponseStatus,
+        RefreshFailureKind::RateLimited,
+        Some(429),
+        Some(StdDuration::from_secs(1)),
+        true,
+    );
+    assert!(
+        refresh_failure_requires_health_action(&committed_upstream_rate_limit),
+        "only committed upstream 429 describes credential health"
+    );
     let direct_failure_at = Instant::now();
     assert!(
         other_credential_state
@@ -3865,6 +3924,118 @@ async fn postgres_failure_counts_are_atomic_across_managers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postgres_failure_deferred_queues_before_runtime_flush() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credential = api_key_credential("ksk_deferred_failure_queue");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+
+    assert!(manager.report_failure_deferred(1));
+    let snapshot = manager.snapshot();
+    let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+    assert_eq!(entry.failure_count, 1);
+    assert!(!entry.disabled);
+    assert_eq!(manager.pending_persistence_backlog().runtime_mutations, 1);
+
+    let before_flush = store.load_credential_runtime_state().await.unwrap();
+    assert_eq!(
+        before_flush
+            .get(&1)
+            .map(|state| state.failure_count)
+            .unwrap_or_default(),
+        0
+    );
+
+    manager.save_stats();
+
+    let after_flush = store.load_credential_runtime_state().await.unwrap();
+    assert_eq!(after_flush.get(&1).unwrap().failure_count, 1);
+    assert_eq!(manager.pending_persistence_backlog().runtime_mutations, 0);
+
+    store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_quota_deferred_persists_disable_on_runtime_flush() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credential = api_key_credential("ksk_deferred_quota_disable");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+
+    assert!(!manager.report_quota_exhausted_deferred(1));
+    let snapshot = manager.snapshot();
+    let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+    assert!(entry.disabled);
+    assert_eq!(
+        entry.disabled_reason.as_deref(),
+        Some(DisabledReason::QuotaExceeded.as_str())
+    );
+    assert_eq!(manager.pending_persistence_backlog().runtime_mutations, 1);
+    assert!(
+        manager
+            .pending_runtime_mutations
+            .lock()
+            .get(&1)
+            .and_then(|queue| queue.front())
+            .is_some_and(PendingCredentialRuntimeMutation::requires_dispatch_quarantine)
+    );
+
+    let credentials_before_flush = store.load_credentials().await.unwrap();
+    assert!(
+        credentials_before_flush
+            .iter()
+            .any(|credential| credential.id == Some(1) && !credential.disabled)
+    );
+
+    manager.save_stats();
+
+    let credentials_after_flush = store.load_credentials().await.unwrap();
+    assert!(
+        credentials_after_flush
+            .iter()
+            .any(|credential| credential.id == Some(1) && credential.disabled)
+    );
+    let runtime = store.load_credential_runtime_state().await.unwrap();
+    assert_eq!(
+        runtime.get(&1).unwrap().disabled_reason.as_deref(),
+        Some(DisabledReason::QuotaExceeded.as_str())
+    );
+    assert_eq!(manager.pending_persistence_backlog().runtime_mutations, 0);
+
+    store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_success_reset_is_ordered_before_next_cross_manager_failure() {
     let Some(store) = test_postgres_store().await else {
         eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -4862,6 +5033,144 @@ fn test_multi_token_manager_report_failure() {
     assert!(manager.report_failure(2));
     assert!(!manager.report_failure(2)); // 所有凭据都禁用了
     assert_eq!(manager.available_count(), 0);
+}
+
+#[test]
+fn report_failure_deferred_matches_local_scheduler_semantics() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![KiroCredentials::default(), KiroCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert!(manager.report_failure_deferred(1));
+    assert!(manager.report_failure_deferred(1));
+    assert_eq!(manager.available_count(), 2);
+
+    assert!(manager.report_failure_deferred(1));
+    assert_eq!(manager.available_count(), 1);
+    let snapshot = manager.snapshot();
+    assert_eq!(snapshot.current_id, 2);
+    let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+    assert!(first.disabled);
+    assert_eq!(first.failure_count, MAX_FAILURES_PER_CREDENTIAL);
+    assert_eq!(
+        first.disabled_reason.as_deref(),
+        Some(DisabledReason::TooManyFailures.as_str())
+    );
+
+    assert!(manager.report_failure_deferred(2));
+    assert!(manager.report_failure_deferred(2));
+    assert!(!manager.report_failure_deferred(2));
+    assert_eq!(manager.available_count(), 0);
+}
+
+#[test]
+fn deferred_terminal_disable_variants_update_local_state_without_store() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![
+            KiroCredentials::default(),
+            KiroCredentials::default(),
+            KiroCredentials::default(),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert!(manager.report_quota_exhausted_deferred(1));
+    let quota = manager
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == 1)
+        .unwrap();
+    assert!(quota.disabled);
+    assert_eq!(
+        quota.disabled_reason.as_deref(),
+        Some(DisabledReason::QuotaExceeded.as_str())
+    );
+
+    assert!(
+        manager
+            .report_risk_controlled_outcome_deferred(
+                2,
+                CredentialRiskControlReason::TemporarilySuspended,
+                "TEMPORARILY_SUSPENDED"
+            )
+            .can_retry_local()
+    );
+    let risk = manager
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == 2)
+        .unwrap();
+    assert!(risk.disabled);
+    assert_eq!(
+        risk.disabled_reason.as_deref(),
+        Some(DisabledReason::TemporarilySuspended.as_str())
+    );
+
+    assert!(!manager.report_refresh_token_invalid_deferred(3));
+    let invalid = manager
+        .snapshot()
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == 3)
+        .unwrap();
+    assert!(invalid.disabled);
+    assert_eq!(
+        invalid.disabled_reason.as_deref(),
+        Some(DisabledReason::InvalidRefreshToken.as_str())
+    );
+    assert_eq!(manager.available_count(), 0);
+}
+
+#[test]
+fn profile_arn_deferred_updates_local_state_without_store() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![KiroCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    manager
+        .update_credential_profile_arn_deferred(
+            1,
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/test".to_string()),
+        )
+        .unwrap();
+    assert!(
+        manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|entry| entry.id == 1)
+            .unwrap()
+            .has_profile_arn
+    );
+
+    manager
+        .update_credential_profile_arn_deferred(1, None)
+        .unwrap();
+    assert!(
+        !manager
+            .snapshot()
+            .entries
+            .iter()
+            .find(|entry| entry.id == 1)
+            .unwrap()
+            .has_profile_arn
+    );
 }
 
 #[test]

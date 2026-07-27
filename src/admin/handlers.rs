@@ -1299,8 +1299,14 @@ pub async fn get_usage_dashboard_series(
 
 /// GET /api/admin/usage-dashboard/top
 /// 获取 usage 仪表盘排行数据。
-pub async fn get_usage_dashboard_top(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.get_usage_dashboard_top() {
+pub async fn get_usage_dashboard_top(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardWindowQueryParams>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .get_usage_dashboard_top(params.timezone, params.window_key)
+    {
         Ok(data) => Json(data).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

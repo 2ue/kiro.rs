@@ -1245,7 +1245,7 @@ function createIngressProxy(servicePort, endpoint) {
         ? 'count_tokens'
         : url.pathname.endsWith('/v1/messages')
           ? 'messages'
-          : request.method === 'HEAD' && url.pathname === '/cc'
+          : request.method === 'HEAD' && (url.pathname === '/cc' || url.pathname === '/cc/api/hello')
             ? 'cc_head_probe'
             : 'other'
       if (kind === 'messages') {

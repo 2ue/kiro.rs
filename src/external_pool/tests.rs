@@ -2505,7 +2505,7 @@ async fn external_pool_authoritative_selection_pg_lock_is_typed_bounded_and_reco
     );
 
     unlock_external_pool_table(blocker).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let recovered = manager
         .select_pool_for_route(&HashSet::new(), &config, &route)
         .await;
@@ -2712,7 +2712,7 @@ async fn external_pool_authoritative_pg_timeout_c128_is_one_query_and_recovers_f
         );
         unlock_external_pool_table(blocker).await;
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let recovered = timeout(
             Duration::from_secs(1),
             futures::future::join_all((0..128).map(|_| manager.load_authoritative_pool_snapshot())),
@@ -2945,7 +2945,7 @@ async fn external_pool_dispatch_fence_pg_timeout_c128_is_one_query_and_recovers_
         );
         unlock_external_pool_table(blocker).await;
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let recovered = timeout(
             Duration::from_secs(1),
             futures::future::join_all(

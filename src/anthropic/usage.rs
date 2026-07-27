@@ -30,10 +30,11 @@ const USAGE_REDIS_WRITER_BATCH_MAX: usize = 64;
 const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(10);
 const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
 const USAGE_WRITER_ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_millis(100);
-const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
+const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 120;
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES: usize = 2;
-const USAGE_DASHBOARD_GATE_WAIT_MS: u64 = 100;
+const USAGE_DASHBOARD_GATE_WAIT_MS: u64 = 30_000;
+const USAGE_POSTGRES_FALLBACK_CACHE_TTL: StdDuration = StdDuration::from_secs(1);
 const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
 const ERROR_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 8192;
 const ERROR_DIAGNOSTIC_MAX_STRING_BYTES: usize = 512;
@@ -745,6 +746,8 @@ pub struct UsageSummary {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
+    #[serde(default)]
+    pub total_kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
     pub local_prompt_cache_requests: usize,
@@ -874,6 +877,8 @@ pub struct UsageDashboardSummary {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
+    #[serde(default)]
+    pub total_kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
     pub average_duration_ms: f64,
@@ -921,6 +926,8 @@ pub struct UsageSeriesPoint {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
+    #[serde(default)]
+    pub total_kiro_metering_usage: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -949,6 +956,8 @@ pub struct UsageTopAggregate {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
+    #[serde(default)]
+    pub total_kiro_metering_usage: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1302,6 +1311,30 @@ struct UsageShutdownState {
     changed: Notify,
 }
 
+#[derive(Debug, Clone)]
+struct CachedUsageDashboard {
+    timezone: String,
+    high_cache_threshold: i32,
+    revision: UsagePostgresCacheRevision,
+    stored_at: Instant,
+    response: UsageDashboardResponse,
+}
+
+#[derive(Debug, Clone)]
+struct CachedUsageSummary {
+    high_cache_threshold: i32,
+    revision: UsagePostgresCacheRevision,
+    stored_at: Instant,
+    response: UsageSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsagePostgresCacheRevision {
+    writer_accepted: u64,
+    writer_finished: u64,
+    cleanup_watermark_micros: i64,
+}
+
 pub struct UsageRecorder {
     records: Mutex<VecDeque<UsageRecord>>,
     limit: usize,
@@ -1310,6 +1343,8 @@ pub struct UsageRecorder {
     writer: Option<Arc<UsageWriterControl>>,
     redis_writer: Option<Arc<UsageWriterControl>>,
     dashboard_query_gate: Arc<Semaphore>,
+    postgres_summary_cache: Mutex<Option<CachedUsageSummary>>,
+    postgres_dashboard_cache: Mutex<Option<CachedUsageDashboard>>,
     lifecycle: Arc<RwLock<()>>,
     accepting: Arc<AtomicBool>,
     shutdown: Arc<UsageShutdownState>,
@@ -1556,6 +1591,8 @@ impl UsageRecorder {
             writer: None,
             redis_writer: None,
             dashboard_query_gate: Arc::new(Semaphore::new(USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES)),
+            postgres_summary_cache: Mutex::new(None),
+            postgres_dashboard_cache: Mutex::new(None),
             lifecycle: Arc::new(RwLock::new(())),
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
@@ -1651,6 +1688,8 @@ impl UsageRecorder {
             writer,
             redis_writer,
             dashboard_query_gate: Arc::new(Semaphore::new(USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES)),
+            postgres_summary_cache: Mutex::new(None),
+            postgres_dashboard_cache: Mutex::new(None),
             lifecycle: Arc::new(RwLock::new(())),
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
@@ -2095,12 +2134,19 @@ impl UsageRecorder {
             }
         }
         if let Some(store) = &self.postgres_store {
+            let revision = self.postgres_cache_revision();
+            if let Some(cached) = self.cached_postgres_summary(high_cache_threshold, revision) {
+                return cached;
+            }
             let store = store.clone();
-            return block_on_usage_store(async move { store.summary(high_cache_threshold).await })
-                .unwrap_or_else(|err| {
-                    tracing::warn!("汇总 PgSQL usage records 失败，回退内存记录: {}", err);
-                    self.summary_memory(high_cache_threshold)
-                });
+            let summary =
+                block_on_usage_store(async move { store.summary(high_cache_threshold).await })
+                    .unwrap_or_else(|err| {
+                        tracing::warn!("汇总 PgSQL usage records 失败，回退内存记录: {}", err);
+                        self.summary_memory(high_cache_threshold)
+                    });
+            self.store_postgres_summary_cache(high_cache_threshold, revision, &summary);
+            return summary;
         }
         self.summary_memory(high_cache_threshold)
     }
@@ -2142,6 +2188,87 @@ impl UsageRecorder {
         })
     }
 
+    fn postgres_cache_revision(&self) -> UsagePostgresCacheRevision {
+        let (writer_accepted, writer_finished) = self
+            .writer
+            .as_ref()
+            .map(|writer| (writer.progress.accepted(), writer.progress.finished()))
+            .unwrap_or((0, 0));
+        UsagePostgresCacheRevision {
+            writer_accepted,
+            writer_finished,
+            cleanup_watermark_micros: self.cleanup_watermark_micros.load(Ordering::Acquire),
+        }
+    }
+
+    fn cached_postgres_summary(
+        &self,
+        high_cache_threshold: i32,
+        revision: UsagePostgresCacheRevision,
+    ) -> Option<UsageSummary> {
+        let cached = self.postgres_summary_cache.lock();
+        cached.as_ref().and_then(|cached| {
+            if cached.high_cache_threshold == high_cache_threshold
+                && cached.revision == revision
+                && cached.stored_at.elapsed() <= USAGE_POSTGRES_FALLBACK_CACHE_TTL
+            {
+                Some(cached.response.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn store_postgres_summary_cache(
+        &self,
+        high_cache_threshold: i32,
+        revision: UsagePostgresCacheRevision,
+        response: &UsageSummary,
+    ) {
+        *self.postgres_summary_cache.lock() = Some(CachedUsageSummary {
+            high_cache_threshold,
+            revision,
+            stored_at: Instant::now(),
+            response: response.clone(),
+        });
+    }
+
+    fn cached_postgres_dashboard(
+        &self,
+        timezone: &str,
+        high_cache_threshold: i32,
+        revision: UsagePostgresCacheRevision,
+    ) -> Option<UsageDashboardResponse> {
+        let cached = self.postgres_dashboard_cache.lock();
+        cached.as_ref().and_then(|cached| {
+            if cached.timezone == timezone
+                && cached.high_cache_threshold == high_cache_threshold
+                && cached.revision == revision
+                && cached.stored_at.elapsed() <= USAGE_POSTGRES_FALLBACK_CACHE_TTL
+            {
+                Some(cached.response.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn store_postgres_dashboard_cache(
+        &self,
+        timezone: String,
+        high_cache_threshold: i32,
+        revision: UsagePostgresCacheRevision,
+        response: &UsageDashboardResponse,
+    ) {
+        *self.postgres_dashboard_cache.lock() = Some(CachedUsageDashboard {
+            timezone,
+            high_cache_threshold,
+            revision,
+            stored_at: Instant::now(),
+            response: response.clone(),
+        });
+    }
+
     pub fn dashboard(
         &self,
         timezone: Option<&str>,
@@ -2171,16 +2298,30 @@ impl UsageRecorder {
         }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
-            let timezone = timezone.map(str::to_string);
-            return self.dashboard_query(
+            let timezone_input = timezone.map(str::to_string);
+            let cache_timezone = usage_dashboard_timezone(timezone).0;
+            let revision = self.postgres_cache_revision();
+            if let Some(cached) =
+                self.cached_postgres_dashboard(&cache_timezone, high_cache_threshold, revision)
+            {
+                return Ok(cached);
+            }
+            let dashboard = self.dashboard_query(
                 "PgSQL usage dashboard",
                 USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
                 async move {
                     store
-                        .dashboard(timezone.as_deref(), high_cache_threshold)
+                        .dashboard(timezone_input.as_deref(), high_cache_threshold)
                         .await
                 },
+            )?;
+            self.store_postgres_dashboard_cache(
+                cache_timezone,
+                high_cache_threshold,
+                revision,
+                &dashboard,
             );
+            return Ok(dashboard);
         }
 
         anyhow::bail!("usage dashboard 的精确窗口与 P95 需要 PgSQL 聚合存储")
@@ -2295,7 +2436,34 @@ impl UsageRecorder {
         anyhow::bail!("usage dashboard series 需要 Redis 或 PgSQL 聚合存储")
     }
 
-    pub fn dashboard_top(&self) -> anyhow::Result<UsageDashboardTopResponse> {
+    pub fn dashboard_top(
+        &self,
+        timezone: Option<&str>,
+        window_key: Option<&str>,
+    ) -> anyhow::Result<UsageDashboardTopResponse> {
+        let window_key = window_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("lifetime");
+        if window_key != "lifetime" {
+            if let Some(store) = &self.postgres_store {
+                let store = store.clone();
+                let timezone = timezone.map(str::to_string);
+                let window_key = window_key.to_string();
+                let (generated_at, top) = self.dashboard_query(
+                    "PgSQL usage dashboard window top",
+                    USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                    async move {
+                        store
+                            .dashboard_top_for_window(timezone.as_deref(), &window_key)
+                            .await
+                    },
+                )?;
+                return Ok(UsageDashboardTopResponse { generated_at, top });
+            }
+            anyhow::bail!("usage dashboard window top 需要 PgSQL 聚合存储")
+        }
+
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             match block_on_usage_store(async move {
@@ -2405,6 +2573,7 @@ impl UsageRecorder {
             total_cache_creation_input_tokens: 0,
             total_estimated_cost_usd: 0.0,
             total_original_cost_usd: 0.0,
+            total_kiro_metering_usage: 0.0,
             priced_requests: 0,
             unpriced_requests: 0,
             local_prompt_cache_requests: 0,
@@ -2475,6 +2644,7 @@ impl UsageRecorder {
             summary.total_cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
             summary.total_estimated_cost_usd += record.estimated_cost_usd;
             summary.total_original_cost_usd += record.original_cost_usd;
+            summary.total_kiro_metering_usage += record.kiro_metering_usage;
             if record.pricing_available {
                 summary.priced_requests += 1;
             } else {
@@ -3470,6 +3640,8 @@ mod tests {
             writer: Some(Arc::new(UsageWriterControl::new(sender, task, progress))),
             redis_writer: None,
             dashboard_query_gate: Arc::new(Semaphore::new(USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES)),
+            postgres_summary_cache: Mutex::new(None),
+            postgres_dashboard_cache: Mutex::new(None),
             lifecycle: Arc::new(RwLock::new(())),
             accepting: Arc::new(AtomicBool::new(true)),
             shutdown: Arc::new(UsageShutdownState::default()),
@@ -3528,25 +3700,29 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(5)).await;
         }
 
-        let busy_recorder = recorder.clone();
-        let busy = tokio::task::spawn_blocking(move || {
-            busy_recorder.dashboard_query("test dashboard query", 1, async move {
-                Ok::<_, anyhow::Error>(())
-            })
-        })
-        .await
-        .unwrap();
-        let busy_message = busy.expect_err("third dashboard query must fail fast");
+        let queued_recorder = recorder.clone();
+        let queued_active = active.clone();
+        let queued_peak = peak.clone();
+        let queued = tokio::task::spawn_blocking(move || {
+            queued_recorder
+                .dashboard_query("test dashboard query", 1, async move {
+                    let now_active = queued_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    queued_peak.fetch_max(now_active, Ordering::SeqCst);
+                    queued_active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>(999usize)
+                })
+                .unwrap()
+        });
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
         assert!(
-            busy_message
-                .to_string()
-                .contains("usage dashboard 查询繁忙"),
-            "{busy_message:#}"
+            !queued.is_finished(),
+            "third dashboard query should wait behind the gate instead of bypassing it"
         );
 
         for holder in holders {
             holder.await.unwrap();
         }
+        assert_eq!(queued.await.unwrap(), 999);
         assert_eq!(
             peak.load(Ordering::SeqCst),
             USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES
@@ -3588,6 +3764,8 @@ mod tests {
                 dashboard_query_gate: Arc::new(Semaphore::new(
                     USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES,
                 )),
+                postgres_summary_cache: Mutex::new(None),
+                postgres_dashboard_cache: Mutex::new(None),
                 lifecycle: Arc::new(RwLock::new(())),
                 accepting: Arc::new(AtomicBool::new(true)),
                 shutdown: Arc::new(UsageShutdownState::default()),
