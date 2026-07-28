@@ -1,6 +1,6 @@
 # 外部池调度影响本地凭据与 fallback 矩阵缺失
 
-Status: `implemented / validation-in-progress / release-pending`
+Status: `released / first-stage-fixed / follow-up-chaos-needed`
 
 Severity: `P0`
 
@@ -20,7 +20,7 @@ Related production machines:
 
 ## 0. 结论与影响
 
-这是一个生产级调度耦合问题。runtime/storage 主线已先发 `v0.0.121`，随后本问题已完成只读生产复核并进入代码修复。
+这是一个生产级调度耦合问题。runtime/storage 主线已先发 `v0.0.121`，随后本问题已完成只读生产复核、代码修复和 `v0.0.122` 发布。
 
 用户侧现象：
 
@@ -213,13 +213,24 @@ Related production machines:
 - 旧回归：
   - `external_fallback_classifier_*`: `5/5` 通过。
   - `local_pool_preflight_*`: `2/2` 通过。
+- 外部池完整 Rust 分组：
+  - `cargo test --locked --bin kiro-rs external_pool -- --test-threads=1`
+  - `222 passed / 0 failed`
+  - 覆盖外部池 Redis、capacity、model mapping、billing、raw/normalized、SSE、fallback、release、atomic acquire、coordinator restart/fault 等。
+- 静态质量：
+  - `cargo fmt --all -- --check`: 通过。
+  - `cargo check --locked --all-targets --no-default-features`: 通过。
+  - `scripts/ci/check-clippy-baseline.mjs`: 通过，`813 warnings <= 849 baseline`。
+- 发布：
+  - 修复 commit: `dcff076 fix: gate external fallback on current pool availability`
+  - release commit: `6e4d801 chore(release): 0.0.122`
+  - tag: `v0.0.122`
+  - 后续发布 `v0.0.123` 前已确认 `ghcr.io/2ue/kiro-rs:0.0.122` 镜像存在。
 
 仍需完成验证：
 
-- full Rust/default + no-default。
-- clippy baseline。
-- load/chaos 中外部池容量满、Redis coordinator 慢、local rescue enabled 的矩阵。
-- 必要时跑真实 Claude Code CLI fake-upstream smoke，确认协议行为未受影响。
+- 外部池开启下的真实生产级 load/chaos 长时间矩阵仍需继续补：外部池容量满、Redis coordinator 慢、local rescue enabled、外部池全部冷却、坏配置持续存在、长流集中完成等组合。
+- 真实 Claude Code CLI 多轮 + tools + stream/non-stream + 外部池开启/关闭的端到端回归仍应作为后续发版前的大矩阵验证项目。
 
 ## 6. 残余风险与回滚
 
