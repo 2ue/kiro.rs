@@ -1,6 +1,6 @@
 # kiro-account-manager enhanced implementation log
 
-本文档记录基于 `docs/kiro-account-manager-enhanced-learning-analysis.md` 落地到当前 `kiro.rs` 的每一个具体改动点。
+本文档记录基于 [`kiro-account-manager-enhanced-learning-analysis.md`](kiro-account-manager-enhanced-learning-analysis.md) 落地到当时 `kiro.rs` 的每一个具体改动点。
 
 记录规则：
 

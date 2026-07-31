@@ -1,6 +1,6 @@
 # 图片无法处理触发上游 400 IMAGE_FORMAT_UNSUPPORTED
 
-Status: `structure-validation-and-400-classification-focused-pass / real-cli-image-gate-pending`
+Status: `structure-validation-and-400-classification-focused-pass / local-account-real-cli-image-smoke-passed / broader-image-gate-pending`
 
 Severity: P1
 
@@ -124,6 +124,37 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 - [ ] 真实服务：合法 64×64 / 512×512 PNG 返回 200。
 - [ ] 真实服务：垃圾字节声明 png / 坏 PNG 本地提前返回明确错误，不再打到上游。
 - [x] 通用 `REQUEST_BODY_INVALID` + `Image data cannot be empty` 不再分类为 `tool_use_format_bad_request`；启用 prompt-logic retry 时，1/20/60 账号池各 5 轮均恰好 1 个 provider hit。真实 CLI 的本地 0-hit/上游 1-hit 分层仍待 D05。
+
+## 2026-07-29 本地账号复验
+
+本轮使用本地账号 credential `7` / `8`，只验证 `claude-sonnet-4.5` 相关路径；外部池已关闭，不再用外部池结果判断图片稳定性。
+
+已确认成功：
+
+- 合法 direct inline base64 PNG 连续 3 次成功：
+  - `req_01jnYaBLB8BP5e6zpx9bDHCQ` -> `Red`
+  - `req_01odzpeUcmaWFcH4KgMJv4gu` -> `Red`
+  - `req_01bT5s1FNSz32uaM7PfN1SdY` -> `Red`
+- 声明为 `image/jpeg` 但实际为 PNG 字节的请求成功：
+  - `req_01gVYp4s4LCYp7bsjG9C68AW` -> `Red`
+  - 日志记录 `base64 image media_type mismatches were corrected before upstream routing`
+  - usage/log 记录 `normalized_image_media_types=1`
+- 真实 Claude Code CLI `Read` 图片成功：
+  - 文件 `/tmp/kiro-cli-red.png`
+  - CLI final text `Red`
+  - 第二个请求中有 `current_tool_result_count=1`、`current_image_count=1`
+  - warning header 包含 `tool-result-content-placeholder=1`
+
+已确认拒绝：
+
+- 伪造/无效图片数据被本地预检拒绝：
+  - `req_014x1Q676MomJY5AD4rp1GAP`
+  - HTTP `400`
+  - public error `invalid image data for media_type: image/png`
+  - usage `status=error`、`type=request_rejection`
+  - log reason `local_body_prepare`、stage `handler_preflight`
+
+当前结论：本地账号路径下，合法 base64 PNG 与 Claude CLI `Read` tool_result 图片不是普遍失败；“偶尔不能识别”更可能是输入形态或资源边界触发。后续应分开验证 `file`/`file_id`/remote URL materialization、多个 tool_result image、图文混合 tool_result、大图触发 `current_images_max_bytes`、remote 下载 20 MiB/32 MiB/44 MiB/25s/45s 限制，而不是继续把所有图片失败归为 `IMAGE_FORMAT_UNSUPPORTED`。
 
 ## 关联
 

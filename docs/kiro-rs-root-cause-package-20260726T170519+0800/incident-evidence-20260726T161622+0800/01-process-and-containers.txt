@@ -1,0 +1,11 @@
+host_time=2026-07-26 16:16:49 CST +0800
+NAME                         IMAGE                        COMMAND                  SERVICE    CREATED        STATUS                  PORTS
+kiro-rs-2ue-59137-app        ghcr.io/2ue/kiro-rs:latest   "./kiro-rs -c /app/c…"   kiro-rs    7 hours ago    Up 7 hours (healthy)    0.0.0.0:59137->8990/tcp, [::]:59137->8990/tcp
+kiro-rs-2ue-59137-postgres   postgres:18-alpine           "docker-entrypoint.s…"   postgres   20 hours ago   Up 20 hours (healthy)   5432/tcp
+kiro-rs-2ue-59137-redis      redis:8-alpine               "docker-entrypoint.s…"   redis      20 hours ago   Up 20 hours (healthy)   6379/tcp
+CONTAINER ID   NAME                         CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O         PIDS
+058d2a6424d3   kiro-rs-2ue-59137-app        0.00%     439.3MiB / 15.62GiB   2.75%     15.2GB / 18.7GB   4.1kB / 20.5kB    15
+e2abc5e83f3e   kiro-rs-2ue-59137-postgres   0.01%     225.1MiB / 15.62GiB   1.41%     853MB / 784MB     2.27MB / 3.04GB   21
+bc19fda6a195   kiro-rs-2ue-59137-redis      0.25%     341.3MiB / 15.62GiB   2.13%     1.43GB / 201MB    0B / 40GB         13
+PID                 PPID                STAT                ELAPSED             %CPU                %MEM                COMMAND
+2173106             2173082             Ssl                 06:36:37            52.0                3.1                 ./kiro-rs -c /app/config/config.json --credentials /app/config/credentials.json

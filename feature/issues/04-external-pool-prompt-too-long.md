@@ -62,4 +62,4 @@ Severity: P1
 ## 关联
 
 - 生产证据：`tmp/analysis-usage-llm-errors/root-causes/04-external_pool_prompt_too_long/`。
-- 外部池设计：`docs/external-fallback-pools-design.md`。
+- 外部池设计：`docs/archive/scheduler-state-external-pool-runtime-history/external-fallback-pools-design.md`。

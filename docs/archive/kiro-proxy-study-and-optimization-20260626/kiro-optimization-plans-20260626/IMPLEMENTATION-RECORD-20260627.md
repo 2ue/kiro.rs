@@ -1,6 +1,6 @@
 # Kiro 优化计划实现记录（2026-06-27）
 
-本文记录 `docs/kiro-optimization-plans-20260626/` 中方案与当前代码事实的对照结果，以及本次已实施的改造。它不是测试报告；Claude Code CLI、压测、异常恢复、内存和调度压力测试结果另见 `docs/testing/claude-code-cli-full-regression-20260628.md`。
+本文记录原 `docs/kiro-optimization-plans-20260626/` 中方案与当时代码事实的对照结果，以及当时已实施的改造。它不是当前测试报告；Claude Code CLI、压测、异常恢复、内存和调度压力测试结果另见 [`../../../testing/claude-code-cli-full-regression-20260628.md`](../../../testing/claude-code-cli-full-regression-20260628.md)。
 
 ## 总体原则
 
@@ -189,7 +189,7 @@
 
 ## 已完成验证
 
-本轮已完成以下验证，详细命令、报告路径和结论见 `docs/testing/claude-code-cli-full-regression-20260628.md`。
+本轮已完成以下验证，详细命令、报告路径和结论见 [`../../../testing/claude-code-cli-full-regression-20260628.md`](../../../testing/claude-code-cli-full-regression-20260628.md)。
 
 - `cargo fmt`
 - `cargo test --locked --no-default-features`

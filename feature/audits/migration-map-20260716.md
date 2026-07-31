@@ -18,7 +18,7 @@ Role: 记录本轮最终交付目录的来源、目标、回滚与链接修复�
 | `docs/feature/runtime-usage-error-followup-2026-07-13.md` | `feature/audits/` | 历史运行态跟踪输入 |
 | `docs/analysis-status-index-20260715.md` | `feature/audits/analysis-status-index-20260715.md` | 旧总索引，状态重新核验 |
 | `docs/claude-code-internal-leak-deep-audit-20260715.md` | `feature/audits/claude-code-internal-leak-deep-audit-20260715.md` | 上一轮动态审计输入 |
-| `docs/prompt-injection-inventory-and-centralization-plan-20260715.md` | `feature/plans/` | 候选方案输入，尚非最终实施计划 |
+| `docs/prompt-injection-inventory-and-centralization-plan-20260715.md` | `docs/archive/runtime-correctness-feature-workspace-history/plans/` | 候选方案输入，尚非最终实施计划；2026-07-28 已随旧 feature plan 归档 |
 | `docs/scheduler-dispatch/production-followups-20260715.md` | `feature/audits/scheduler-production-followups-20260715.md` | 生产现象与源码分析输入 |
 
 ## 安全与回滚

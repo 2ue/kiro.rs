@@ -39,7 +39,7 @@ The two prompt-cache drafts and the retained family document entered Git in the 
 
 ## Retained Family Document
 
-Keep `docs/prompt-cache-strategy-family-refactor-analysis-20260701.md` as the final historical prompt-cache strategy analysis from that sequence. It remains a historical source, not current implementation authority. Current behavior comes from source and the dated baseline; accepted target behavior comes from accepted modernization decisions.
+Keep archived [`prompt-cache-strategy-family-refactor-analysis-20260701.md`](../../../../archive/cache-usage-and-production-history/prompt-cache-strategy-family-refactor-analysis-20260701.md) as the final historical prompt-cache strategy analysis from that sequence. It remains a historical source, not current implementation authority. Current behavior comes from source and the dated baseline; accepted target behavior comes from accepted modernization decisions.
 
 ## Git History Rollback
 
@@ -82,8 +82,11 @@ Moving a Keep item later requires updating its active inbound references in the 
 
 - [Request body modularization, 2026-07-06](../../../../archive/request-body-modularization-20260706/README.md): archived on 2026-07-12 as one coherent batch. The collection preserves the original paths, source commits, blobs, inbound-reference audit, current authority, and recovery commands for the request-pipeline analysis and request-body capability companion plan.
 - [Operator UI planning, 2026-06 to 2026-07](../../../../archive/ui-planning-2026-06-to-07/README.md): archived on 2026-07-12 as one coherent frontend-planning batch. The collection preserves eight original paths/blobs, distinguishes landed/partial/superseded/unresolved material, routes unresolved candidates to R8 entry audits, records deleted companion provenance, and retains scoped reversal commands.
+- [Slow first token and stream fluidity analysis, 2026-06-29 to 2026-07-09](../../../../archive/slow-first-token-and-stream-fluidity-20260629-20260709/README.md): archived on 2026-07-28 as historical production/performance analysis under the current Rust runtime/scheduler stabilization plan.
+- [Kiro proxy study and optimization plans, 2026-06-26](../../../../archive/kiro-proxy-study-and-optimization-20260626/README.md): archived on 2026-07-28 as historical external-project comparison plus derived optimization/implementation records.
+- [Scheduler dispatch redesign history](../../../../archive/scheduler-dispatch-redesign-history/README.md): archived on 2026-07-28 as historical implemented local credential scheduler strategy and July follow-up context.
 
-No other `Archive Later` item was moved or deleted in either batch.
+No other `Archive Later` item was moved or deleted by the original 2026-07-12 audit. Later archive passes must continue to preserve source mapping and update inbound links.
 
 ## Archive Later
 
@@ -91,58 +94,24 @@ The remaining 70 unarchived plantree-external documents should be archived rathe
 
 ### Whole Directories Or Evidence Files
 
-- `docs/analysis/*.md`, except the currently retained `prod-slow-first-token-root-cause-20260706.md`;
-- `docs/kiro-optimization-plans-20260626/**`;
-- `docs/kiro-proxy-study-20260626/**`;
-- `docs/scheduler-dispatch/**`;
+- `docs/analysis/*.md`, except current active analysis retained by the Rust runtime/scheduler stabilization plan;
 - `docs/testing/claude-code-cli-full-regression-20260628.md`.
 
 ### Request And Protocol History
 
-- `docs/anthropic-tools-signature-compatibility-analysis.md`;
-- `docs/claude-code-kiro-dialogue-disconnect-investigation-20260630.md`;
-- `docs/claude-code-kiro-dialogue-observability-and-optimization-plan-20260630.md`;
-- `docs/kiro-400-improperly-formed-request-analysis.md`;
-- `docs/kiro-cli-capture-protocol-completeness-analysis-20260702.md`;
-- `docs/kiro-compatible-image-passthrough-analysis-20260705.md`;
-- `docs/kiro-context-window-payload-threshold-full-analysis.md`;
-- `docs/kiro-official-image-5mb-multimage-investigation-20260702.md`;
-- `docs/kiro-protocol-local-before-after-test-runbook.md`;
-- `docs/kiro-small-payload-improperly-formed-fix-plan.md`;
-- `docs/kiro-upstream-protocol-refactor-analysis-and-test-plan.md`;
-- `docs/kiro-upstream-real-protocol-malformed-and-context-20260617.md`;
-- `docs/request-entry-errors-and-missing-max-tokens.md`.
+Moved on 2026-07-28 to [Request And Protocol History Archive](../../../../archive/request-and-protocol-history/README.md).
 
 ### Cache, Usage, And Production Error History
 
-- `docs/cache-behavior-analysis.md`;
-- `docs/current-cache-strategy-issues-readable-20260701.md`;
-- `docs/external-pool-billing-floor-and-cost-analysis.md`;
-- `docs/ha-external-pool-usage-projection-analysis.md`;
-- `docs/high-cache-token-amplification-strategy.md`;
-- `docs/high-cache-upstream-simulation-analysis.md`;
-- `docs/prod-usage-error-evidence-20260630.md`;
-- `docs/production-error-optimization-plan.md`;
-- `docs/prompt-cache-scope-and-kiro-rs-tool-parity.md`;
-- `docs/prompt-cache-simulation-strategy.md`;
-- `docs/prompt-cache-strategy-family-refactor-analysis-20260701.md`.
+Moved on 2026-07-28 to [Cache, Usage, And Production History Archive](../../../../archive/cache-usage-and-production-history/README.md).
 
 ### Scheduler, State, External Pool, And Runtime History
 
-- `docs/credential-list-data-plane-optimization-design.md`;
-- `docs/credential-rate-limit-and-scheduler-optimization.md`;
-- `docs/credential-scheduler-hotpath-performance-analysis.md`;
-- `docs/external-fallback-pools-design.md`;
-- `docs/redis-pgsql-migration-optimization-analysis.md`;
-- `docs/redis-pgsql-state-model-full-analysis.md`;
-- `docs/runtime-usage-scheduler-performance-fix-20260620.md`.
+Moved on 2026-07-28 to [Scheduler, State, External Pool, And Runtime History Archive](../../../../archive/scheduler-state-external-pool-runtime-history/README.md).
 
 ### External Comparison And Implementation History
 
-- `docs/foxfishc-learning-analysis.md`;
-- `docs/kiro-account-manager-enhanced-implementation-log.md`;
-- `docs/kiro-account-manager-enhanced-learning-analysis.md`;
-- `docs/kiro-gateway-account-manager-learning-analysis.md`.
+Moved on 2026-07-28 to [External Project Learning History Archive](../../../../archive/external-project-learning-history/README.md).
 
 `Archive Later` is a preservation requirement, not permission to move the files now. A later archive change must assign an authoritative history/reference index, retain source commit and evidence context, update every inbound Markdown and literal reference, and keep historical statements visibly distinct from current facts and accepted decisions.
 

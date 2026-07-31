@@ -36,6 +36,34 @@ focused 修复与重复测试已经关闭上述 correctness/privacy/client-cance
 
 仍不能标记为最终发布完成：Claude Code CLI 2.1.197 的 native WebSearch 5-session gate 尚未执行；Profile discovery、token refresh、model catalog 的生产 request-scoped auxiliary attribution 尚未完成；当前证据来自共享 dirty tree，而不是冻结 release candidate。
 
+## 2026-07-29 本地账号复验
+
+本轮使用本地账号 credential `7` / `8`，外部池关闭，只验证 `claude-sonnet-4.5` 相关路径。新的结论需要区分三种 WebSearch 形态：
+
+- 纯 Anthropic native server-side WebSearch 可用：
+  - body 只有 `tools: [{"type":"web_search_20250305","name":"web_search","max_uses":1}]`
+  - request `req_01yPTQ3uUhHq89z8FGZQycZ9`
+  - route `local_credential/local_success`
+  - credential `8`
+  - upstream `claude-sonnet-4.5`
+  - response 包含 `server_tool_use` 与 `web_search_tool_result`
+- Claude Code CLI `WebSearch` 当前没有形成真实工具调用：
+  - CLI case `websearch_tool`
+  - model `claude-sonnet-4.5`
+  - exit `0`
+  - `toolUseNames=[]`
+  - `toolResultCount=0`
+  - final usage `server_tool_use.web_search_requests=0`
+  - assistant text 出现 `<search_web><query>...</query></search_web>` 伪 XML，但没有真实执行搜索
+- mixed native WebSearch + 普通 tool 不是已支持路径：
+  - request `req_01H7Q6sMoZEAN7kyan5zLYjL`
+  - body 同时包含 native `web_search_20250305` 与 `echo_value`
+  - route `local_credential/local_success`，credential `8`，upstream `claude-sonnet-4.5`
+  - response `stop_reason="tool_use"`，内容是普通 `tool_use name="web_search" input={}`
+  - 没有 `server_tool_use`，没有 `web_search_tool_result`
+
+源码原因仍是 `src/anthropic/websearch.rs:260` 的 `has_web_search_tool` 只识别 `tools.len() == 1` 的 native WebSearch；`src/anthropic/handlers.rs:5707` 只有在该 predicate 为 true 时才进入 native WebSearch MCP branch。这个选择可以防止普通同名工具被劫持，但也意味着 mixed native WebSearch 需要明确产品决策：要么支持 server-side 执行并继续 turn，要么 fail closed 返回清晰错误，不能把 `web_search` 下发成无人执行的普通 tool。
+
 ## 根因与代码链
 
 修复前链路：

@@ -1,0 +1,146 @@
+  8060	                            let protocol_contamination =
+  8061	                                state.ctx.response_protocol_contamination_detected();
+  8062	                            if protocol_contamination && !state.downstream_committed {
+  8063	                                match retry_stream_before_downstream_commit(
+  8064	                                    state,
+  8065	                                    StreamRetryReason::ProtocolContamination,
+  8066	                                    RESPONSE_PROTOCOL_CONTAMINATION_DETAIL.to_string(),
+  8067	                                )
+  8068	                                .await
+  8069	                                {
+  8070	                                    StreamRetryOutcome::Retried(state) => {
+  8071	                                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+  8072	                                        return Some((stream::iter(bytes), state));
+  8073	                                    }
+  8074	                                    StreamRetryOutcome::NotRetried(next_state) => {
+  8075	                                        state = next_state;
+  8076	                                    }
+  8077	                                }
+  8078	                                if state.ctx.has_stream_error() {
+  8079	                                    let bytes = finish_stream_with_recorded_error(
+  8080	                                        &mut state.ctx,
+  8081	                                        &state.usage_guard,
+  8082	                                        UsageRecordStatus::StreamError,
+  8083	                                        StreamTerminalReason::ProtocolContamination,
+  8084	                                    );
+  8085	                                    let bytes =
+  8086	                                        prepend_initial_bytes_if_needed(&mut state, bytes, true);
+  8087	                                    state.finished = true;
+  8088	                                    return Some((stream::iter(bytes), state));
+  8089	                                }
+  8090	                            }
+  8091	                            let error_detail = state.ctx.stream_error_detail();
+  8092	                            let had_stream_error = error_detail.is_some();
+  8093	                            if let Some((kind, detail)) = error_detail.as_ref() {
+  8094	                                state.completion.report_upstream_stream_failure(format!(
+  8095	                                    "{}: {}",
+  8096	                                    kind, detail
+  8097	                                ));
+  8098	                            } else {
+  8099	                                state.completion.report_success();
+  8100	                            }
+  8101	                            state
+  8102	                                .usage_guard
+  8103	                                .context()
+  8104	                                .request
+  8105	                                .mark_stream_terminal(if had_stream_error {
+  8106	                                    if protocol_contamination {
+  8107	                                        StreamTerminalReason::ProtocolContamination
+  8108	                                    } else {
+  8109	                                        StreamTerminalReason::UpstreamStatusError
+  8110	                                    }
+  8111	                                } else {
+  8112	                                    StreamTerminalReason::Completed
+  8113	                                });
+  8114	                            state
+  8115	                                .usage_guard
+  8116	                                .context()
+  8117	                                .request
+  8118	                                .mark_stream_events(&final_events);
+  8119	                            if had_stream_error {
+  8120	                                state.usage_guard.context().record_stream_failure_from_context(
+  8121	                                    UsageRecordStatus::StreamError,
+  8122	                                    state.ctx.final_usage(),
+  8123	                                    error_detail,
+  8124	                                    state.ctx.metadata_usage(),
+  8125	                                    state.ctx.context_input_tokens,
+  8126	                                    state.ctx.kiro_metering_usage(),
+  8127	                                );
+  8128	                            } else {
+  8129	                                state.usage_guard.context().record_success_from_stream(&state.ctx);
+  8130	                            }
+  8131	                            state.usage_guard.complete();
+  8132	                            let bytes = sse_bytes_from_events_with_initial(
+  8133	                                &mut state,
+  8134	                                final_events,
+  8135	                                true,
+  8136	                            );
+  8137	                            state.finished = true;
+  8138	                            Some((stream::iter(bytes), state))
+  8139	                        }
+  8140	                    }
+  8141	                }
+  8142	                _ = &mut idle_sleep => {
+  8143	                    tracing::error!(
+  8144	                        "上游响应流超过 {} 秒未产生数据，结束流并发送错误事件",
+  8145	                        state.stream_idle_timeout_secs
+  8146	                    );
+  8147	                    let detail = "upstream stream idle timeout".to_string();
+  8148	                    if !state.downstream_committed {
+  8149	                        match retry_stream_before_downstream_commit(
+  8150	                            state,
+  8151	                            StreamRetryReason::IdleTimeout,
+  8152	                            detail.clone(),
+  8153	                        )
+  8154	                        .await
+  8155	                        {
+  8156	                            StreamRetryOutcome::Retried(state) => {
+  8157	                                let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+  8158	                                return Some((stream::iter(bytes), state));
+  8159	                            }
+  8160	                            StreamRetryOutcome::NotRetried(next_state) => {
+  8161	                                state = next_state;
+  8162	                            }
+  8163	                        }
+  8164	                    }
+  8165	                    state.completion.report_upstream_stream_failure(detail.clone());
+  8166	                    state.ctx.record_stream_error("api_error", detail);
+  8167	                    let bytes = finish_stream_with_recorded_error(
+  8168	                        &mut state.ctx,
+  8169	                        &state.usage_guard,
+  8170	                        UsageRecordStatus::UpstreamTimeout,
+  8171	                        StreamTerminalReason::UpstreamIdleTimeout,
+  8172	                    );
+  8173	                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
+  8174	                    state.finished = true;
+  8175	                    Some((stream::iter(bytes), state))
+  8176	                }
+  8177	                _ = state.ping_interval.tick() => {
+  8178	                    if !state.downstream_committed && state.retry_plan.is_some() {
+  8179	                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+  8180	                        return Some((stream::iter(bytes), state));
+  8181	                    }
+  8182	                    let keepalive = if claude_code_noop_delta_keepalive {
+  8183	                        state.ctx.claude_code_noop_delta_keepalive_event()
+  8184	                            .map(|event| Bytes::from(event.to_sse_string()))
+  8185	                    } else {
+  8186	                        None
+  8187	                    };
+  8188	                    let bytes = match keepalive {
+  8189	                        Some(bytes) => {
+  8190	                            tracing::trace!("发送 Claude Code 空 delta 保活事件");
+  8191	                            bytes
+  8192	                        }
+  8193	                        None => {
+  8194	                            tracing::trace!("发送 ping 保活事件");
+  8195	                            create_ping_sse()
+  8196	                        }
+  8197	                    };
+  8198	                    mark_stream_downstream_committed(&mut state);
+  8199	                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(bytes)];
+  8200	                    Some((stream::iter(bytes), state))
+  8201	                }
+  8202	            }
+  8203	        },
+  8204	    )
+  8205	    .flatten()

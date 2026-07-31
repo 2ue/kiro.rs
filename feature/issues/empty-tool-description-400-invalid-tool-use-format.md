@@ -205,7 +205,7 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 
 # 关联
 
-- `docs/kiro-400-improperly-formed-request-analysis.md`、`docs/kiro-small-payload-improperly-formed-fix-plan.md`（同为上游 400，根因不同）。
+- `docs/archive/request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md`、`docs/archive/request-and-protocol-history/kiro-small-payload-improperly-formed-fix-plan.md`（同为上游 400，根因不同）。
 - 生产证据目录：`tmp/analysis-usage-llm-errors/`（app `0.0.101` / revision `737f9f1`）。
 
 ## 残余风险与回滚

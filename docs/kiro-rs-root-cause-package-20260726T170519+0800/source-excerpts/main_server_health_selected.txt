@@ -1,0 +1,152 @@
+   108	        3 => 120,
+   109	        _ => MODEL_CAPABILITY_RETRY_MAX_DELAY.as_secs(),
+   110	    };
+   111	    StdDuration::from_secs(seconds)
+   112	}
+   113	
+   114	#[tokio::main]
+   115	async fn main() {
+   116	    // 解析命令行参数
+   117	    let args = Args::parse();
+   118	
+   119	    // 初始化日志
+   120	    tracing_subscriber::fmt()
+   121	        .with_env_filter(
+   122	            tracing_subscriber::EnvFilter::try_from_default_env()
+   123	                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+   124	        )
+   125	        .init();
+   126	
+   127	    // 加载配置
+   128	    let config_path = args
+   129	        .config
+   130	        .unwrap_or_else(|| Config::default_config_path().to_string());
+   131	    let file_config = Config::load(&config_path).unwrap_or_else(|e| {
+   132	        tracing::error!("加载配置失败: {}", e);
+   133	        std::process::exit(1);
+   134	    });
+   135	
+   136	    if let Some(command) = args.command {
+   137	        let credentials_path = args
+   138	            .credentials
+   139	            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+   140	        if let Err(err) = handle_cli_command(command, &file_config, &credentials_path).await {
+   141	            tracing::error!("{}", err);
+   142	            std::process::exit(1);
+   143	        }
+   144	        return;
+   145	    }
+   146	
+   147	    let postgres_store = Arc::new(
+   727	        tracing::info!("  POST /api/admin/credentials/:index/reset");
+   728	        tracing::info!("  GET  /api/admin/credentials/:index/balance");
+   729	        tracing::info!("Admin UI:");
+   730	        tracing::info!("  GET  /admin");
+   731	        tracing::info!("  GET  /ui");
+   732	    }
+   733	
+   734	    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+   735	    let server_result = serve_until_shutdown(listener, app).await;
+   736	
+   737	    let shutdown_started_at = Instant::now();
+   738	    let shutdown_deadline = shutdown_started_at + BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT;
+   739	    runtime_event_health.mark_disconnected();
+   740	    tokio::join!(
+   741	        abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
+   742	        abort_task_with_timeout("model capability recovery", model_capability_recovery_task),
+   743	        abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
+   744	    );
+   745	
+   746	    let stats_report = stats_flush_worker
+   747	        .shutdown(remaining_shutdown_budget(
+   748	            shutdown_deadline,
+   749	            BACKGROUND_SHUTDOWN_TIMEOUT,
+   750	        ))
+   751	        .await;
+   752	    tracing::info!(
+   753	        signal_sent = stats_report.signal_sent,
+   754	        flushed = stats_report.flushed,
+   755	        timed_out = stats_report.timed_out,
+   756	        task_failed = stats_report.task_failed,
+   757	        pending_stats_batches = stats_report.pending_stats_batches,
+   758	        pending_stats_deltas = stats_report.pending_stats_deltas,
+   759	        pending_runtime_mutations = stats_report.pending_runtime_mutations,
+   760	        overflow_runtime_mutations = stats_report.overflow_runtime_mutations,
+   761	        "凭据统计后台任务已停止"
+   762	    );
+   763	    let stats_shutdown_failed = !stats_report.flushed
+   764	        || stats_report.timed_out
+   765	        || stats_report.task_failed
+   766	        || stats_report.pending_stats_batches > 0
+   767	        || stats_report.pending_stats_deltas > 0
+  1027	    };
+  1028	    let mut deadline_receiver = shutdown_receiver;
+  1029	    let shutdown_deadline = async move {
+  1030	        wait_for_shutdown_request(&mut deadline_receiver).await;
+  1031	        tokio::time::sleep(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT).await;
+  1032	    };
+  1033	
+  1034	    let mut server = Box::pin(
+  1035	        axum::serve(listener, app)
+  1036	            .with_graceful_shutdown(graceful_shutdown)
+  1037	            .into_future(),
+  1038	    );
+  1039	    let result = tokio::select! {
+  1040	        result = &mut server => result,
+  1041	        _ = shutdown_deadline => {
+  1042	            tracing::warn!(
+  1043	                timeout_secs = SERVER_GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+  1044	                "等待 HTTP 连接排空超时，停止剩余连接"
+  1045	            );
+  1046	            Ok(())
+  1047	        }
+  1217	}
+  1218	
+  1219	struct AppHealthState {
+  1220	    postgres_store: Arc<PostgresStore>,
+  1221	    redis_store: Arc<RedisStore>,
+  1222	    runtime_events: Arc<RuntimeEventHealth>,
+  1223	}
+  1224	
+  1225	fn create_health_router(state: Arc<AppHealthState>) -> Router {
+  1226	    Router::new()
+  1227	        .route("/healthz", get(healthz))
+  1228	        .route("/readyz", get(readyz))
+  1229	        .with_state(state)
+  1230	}
+  1231	
+  1232	async fn healthz() -> Json<Value> {
+  1233	    Json(json!({
+  1234	        "status": "ok",
+  1235	        "service": "kiro-rs"
+  1236	    }))
+  1237	}
+  1238	
+  1239	async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
+  1240	    let postgres_ok = state.postgres_store.ping().await.is_ok();
+  1241	    let redis_ok = state.redis_store.ping().await.is_ok();
+  1242	    let redis_events_connected = state
+  1243	        .runtime_events
+  1244	        .redis_events_connected
+  1245	        .load(Ordering::Acquire);
+  1246	    let ready = postgres_ok && redis_ok && redis_events_connected;
+  1247	    let status = if ready {
+  1248	        StatusCode::OK
+  1249	    } else {
+  1250	        StatusCode::SERVICE_UNAVAILABLE
+  1251	    };
+  1252	
+  1253	    (
+  1254	        status,
+  1255	        Json(json!({
+  1256	            "status": if ready { "ready" } else { "not_ready" },
+  1257	            "checks": {
+  1258	                "postgres": postgres_ok,
+  1259	                "redis": redis_ok,
+  1260	                "redisRuntimeEvents": redis_events_connected
+  1261	            },
+  1262	            "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
+  1263	            "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
+  1264	        })),
+  1265	    )
+  1266	}

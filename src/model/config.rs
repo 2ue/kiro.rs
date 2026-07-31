@@ -2677,9 +2677,9 @@ impl ExternalPoolStreamResponseMode {
 pub struct ExternalPoolsConfig {
     #[serde(default)]
     pub external_pools_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_external_pool_global_max_concurrent_requests")]
     pub external_pool_global_max_concurrent_requests: u32,
-    #[serde(default)]
+    #[serde(default = "default_external_pool_max_queued_requests")]
     pub external_pool_max_queued_requests: u32,
     /// 外部池请求输入 token 预检上限。
     ///
@@ -2691,7 +2691,7 @@ pub struct ExternalPoolsConfig {
     pub external_pool_capacity_mode: ExternalPoolCapacityMode,
     #[serde(default = "default_external_pool_dispatch_max_wait_secs")]
     pub external_pool_dispatch_max_wait_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_external_pool_retry_max_attempts")]
     pub external_pool_retry_max_attempts: u32,
     #[serde(default)]
     pub external_direct_policy_enabled: bool,
@@ -2786,12 +2786,13 @@ impl Default for ExternalPoolsConfig {
     fn default() -> Self {
         Self {
             external_pools_enabled: false,
-            external_pool_global_max_concurrent_requests: 0,
-            external_pool_max_queued_requests: 0,
+            external_pool_global_max_concurrent_requests:
+                default_external_pool_global_max_concurrent_requests(),
+            external_pool_max_queued_requests: default_external_pool_max_queued_requests(),
             external_pool_max_input_tokens: default_external_pool_max_input_tokens(),
             external_pool_capacity_mode: ExternalPoolCapacityMode::default(),
             external_pool_dispatch_max_wait_secs: default_external_pool_dispatch_max_wait_secs(),
-            external_pool_retry_max_attempts: 0,
+            external_pool_retry_max_attempts: default_external_pool_retry_max_attempts(),
             external_direct_policy_enabled: false,
             direct_external_on_local_maintenance: false,
             direct_external_model_rules: Vec::new(),
@@ -3211,14 +3212,14 @@ pub struct Config {
     ///
     /// `None` 或 `0` 表示禁用本地凭据级限速；`>0` 会按每个凭据计算最小请求间隔，
     /// 并在调度时优先分流到其他可用凭据。
-    #[serde(default)]
+    #[serde(default = "default_credential_rpm")]
     pub credential_rpm: Option<u32>,
 
     /// 单凭据最大并发请求数。
     ///
     /// `0` 表示不限制；`>0` 时，同一凭据同时在处理的请求达到上限后，
     /// 新请求会优先调度到其他可用凭据。
-    #[serde(default)]
+    #[serde(default = "default_credential_max_concurrent_requests")]
     pub credential_max_concurrent_requests: u32,
 
     /// 上游瞬态错误没有 Retry-After 时，对单个凭据设置的临时冷却秒数。
@@ -3377,12 +3378,12 @@ pub struct Config {
     #[serde(default = "default_credential_in_flight_lease_max_secs")]
     pub credential_in_flight_lease_max_secs: u64,
 
-    /// 全局最大并发调度请求数。`0` 表示不限制。
-    #[serde(default)]
+    /// 全局最大并发调度请求数。默认给新初始化配置一个硬上限；`0` 表示不限制。
+    #[serde(default = "default_dispatch_global_max_concurrent_requests")]
     pub dispatch_global_max_concurrent_requests: u32,
 
-    /// 全局最多允许等待调度容量的请求数。`0` 表示不限制。
-    #[serde(default)]
+    /// 全局最多允许等待调度容量的请求数。默认限制等待放大；`0` 表示不限制。
+    #[serde(default = "default_dispatch_max_queued_requests")]
     pub dispatch_max_queued_requests: u32,
 
     /// 本地凭据调度容量是否按请求 token 量级加权。
@@ -3761,8 +3762,16 @@ fn default_credential_max_cooldown_secs() -> u64 {
     300
 }
 
+fn default_credential_rpm() -> Option<u32> {
+    Some(100)
+}
+
+fn default_credential_max_concurrent_requests() -> u32 {
+    30
+}
+
 fn default_credential_dispatch_max_wait_secs() -> u64 {
-    120
+    5
 }
 
 fn default_kiro_upstream_response_timeout_secs() -> u64 {
@@ -3803,6 +3812,14 @@ pub(crate) fn default_token_refresh_burst() -> u32 {
 
 fn default_credential_in_flight_lease_max_secs() -> u64 {
     900
+}
+
+fn default_dispatch_global_max_concurrent_requests() -> u32 {
+    512
+}
+
+fn default_dispatch_max_queued_requests() -> u32 {
+    30
 }
 
 fn default_weighted_capacity_unit() -> u32 {
@@ -4198,8 +4215,20 @@ fn default_external_pool_auto_disable_window_secs() -> u64 {
     60
 }
 
+fn default_external_pool_global_max_concurrent_requests() -> u32 {
+    512
+}
+
+fn default_external_pool_max_queued_requests() -> u32 {
+    10
+}
+
 fn default_external_pool_dispatch_max_wait_secs() -> u64 {
-    30
+    5
+}
+
+fn default_external_pool_retry_max_attempts() -> u32 {
+    1
 }
 
 fn default_external_pool_max_input_tokens() -> i32 {
@@ -4394,8 +4423,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             request_admission: RequestAdmissionConfig::default(),
-            credential_rpm: None,
-            credential_max_concurrent_requests: 0,
+            credential_rpm: default_credential_rpm(),
+            credential_max_concurrent_requests: default_credential_max_concurrent_requests(),
             credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
             credential_rate_limit_cooldown_secs: default_credential_rate_limit_cooldown_secs(),
             credential_server_error_cooldown_secs: default_credential_server_error_cooldown_secs(),
@@ -4431,8 +4460,9 @@ impl Default for Config {
             credential_prompt_logic_retry_enabled: false,
             credential_prompt_logic_retry_max_attempts: 0,
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
-            dispatch_global_max_concurrent_requests: 0,
-            dispatch_max_queued_requests: 0,
+            dispatch_global_max_concurrent_requests:
+                default_dispatch_global_max_concurrent_requests(),
+            dispatch_max_queued_requests: default_dispatch_max_queued_requests(),
             weighted_capacity: WeightedCapacityConfig::default(),
             credential_warmup_requests: default_credential_warmup_requests(),
             credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
@@ -4991,8 +5021,8 @@ mod tests {
         assert!(config.postgres.migrate_on_start);
         assert!(!config.postgres.compress_usage_rollups_on_start);
         assert_eq!(config.redis.key_prefix, "kiro_rs:local");
-        assert_eq!(config.credential_rpm, None);
-        assert_eq!(config.credential_max_concurrent_requests, 0);
+        assert_eq!(config.credential_rpm, Some(100));
+        assert_eq!(config.credential_max_concurrent_requests, 30);
         assert_eq!(config.credential_transient_cooldown_secs, 10);
         assert_eq!(config.credential_rate_limit_cooldown_secs, 30);
         assert_eq!(config.credential_server_error_cooldown_secs, 5);
@@ -5000,7 +5030,7 @@ mod tests {
         assert_eq!(config.credential_cooldown_backoff_multiplier, 2.0);
         assert_eq!(config.credential_probation_secs, 30);
         assert_eq!(config.credential_max_cooldown_secs, 300);
-        assert_eq!(config.credential_dispatch_max_wait_secs, 120);
+        assert_eq!(config.credential_dispatch_max_wait_secs, 5);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
         assert!(config.kiro_upstream_stream_retry_enabled);
@@ -5011,8 +5041,8 @@ mod tests {
         assert_eq!(config.kiro_upstream_base_url, None);
         assert_eq!(config.credential_retry_max_attempts, 0);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
-        assert_eq!(config.dispatch_global_max_concurrent_requests, 0);
-        assert_eq!(config.dispatch_max_queued_requests, 0);
+        assert_eq!(config.dispatch_global_max_concurrent_requests, 512);
+        assert_eq!(config.dispatch_max_queued_requests, 30);
         assert!(!config.weighted_capacity.enabled);
         assert_eq!(config.credential_warmup_requests, 3);
         assert_eq!(config.credential_warmup_selection_percent, 5);
@@ -5053,9 +5083,16 @@ mod tests {
         );
         assert_eq!(
             config.external_pools.external_pool_dispatch_max_wait_secs,
-            30
+            5
         );
-        assert_eq!(config.external_pools.external_pool_max_queued_requests, 0);
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_global_max_concurrent_requests,
+            512
+        );
+        assert_eq!(config.external_pools.external_pool_max_queued_requests, 10);
+        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 1);
         assert_eq!(
             config.external_pools.external_pool_max_input_tokens,
             1_000_000
@@ -5095,6 +5132,30 @@ mod tests {
                 .reported_usage
                 .policy_for_path("/na/v1/messages")
                 .enabled
+        );
+    }
+
+    #[test]
+    fn initial_config_deserialization_uses_scheduler_safe_defaults() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(config.request_admission, RequestAdmissionConfig::default());
+        assert_eq!(config.credential_rpm, Some(100));
+        assert_eq!(config.credential_max_concurrent_requests, 30);
+        assert_eq!(config.credential_dispatch_max_wait_secs, 5);
+        assert_eq!(config.dispatch_global_max_concurrent_requests, 512);
+        assert_eq!(config.dispatch_max_queued_requests, 30);
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_global_max_concurrent_requests,
+            512
+        );
+        assert_eq!(config.external_pools.external_pool_max_queued_requests, 10);
+        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 1);
+        assert_eq!(
+            config.external_pools.external_pool_dispatch_max_wait_secs,
+            5
         );
     }
 
@@ -5345,7 +5406,7 @@ mod tests {
         );
         assert_eq!(
             config.external_pools.external_pool_dispatch_max_wait_secs,
-            30
+            5
         );
         assert_eq!(
             config.external_pools.external_pool_request_timeout_secs,
@@ -5478,10 +5539,10 @@ mod tests {
     #[test]
     fn external_pool_capacity_wait_is_always_bounded() {
         let mut config = ExternalPoolsConfig::default();
-        assert_eq!(config.effective_dispatch_max_wait_secs(), 30);
+        assert_eq!(config.effective_dispatch_max_wait_secs(), 5);
 
         config.external_pool_dispatch_max_wait_secs = 0;
-        assert_eq!(config.effective_dispatch_max_wait_secs(), 30);
+        assert_eq!(config.effective_dispatch_max_wait_secs(), 5);
 
         config.external_pool_dispatch_max_wait_secs = 7;
         assert_eq!(config.effective_dispatch_max_wait_secs(), 7);
@@ -6882,7 +6943,7 @@ mod tests {
             config.external_pools.external_pool_dispatch_max_wait_secs,
             default_external_pool_dispatch_max_wait_secs()
         );
-        assert_eq!(config.external_pools.effective_dispatch_max_wait_secs(), 30);
+        assert_eq!(config.external_pools.effective_dispatch_max_wait_secs(), 5);
     }
 
     #[test]

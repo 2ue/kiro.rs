@@ -45,6 +45,8 @@ The request could not be completed right now. Please retry shortly.
 }
 ```
 
+2026-07-29 本地账号复验进一步确认：Claude Code CLI `2.1.220` 在当前 `ccman` 本地配置下，`--tools WebSearch --allowedTools WebSearch` 仍没有产生真实 `tool_use` 或 `server_tool_use`，只生成了 `<search_web>` 伪 XML 文本；纯 native `web_search_20250305` 单工具 direct body 可以通过本地账号 credential `8` 成功返回 `server_tool_use` / `web_search_tool_result`；但 native WebSearch 与普通 tool 混用时不会进入本文件修复的 pure native 分支，而是落成普通 `tool_use name="web_search"`。详见 [Claude Code local-account WebSearch/tools/image analysis - 2026-07-29](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md)。
+
 ## 根因
 
 请求入口已有一层 raw external preflight：

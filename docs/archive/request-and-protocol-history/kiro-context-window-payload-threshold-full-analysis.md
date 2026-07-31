@@ -1463,8 +1463,8 @@ src/kiro/provider.rs
 src/http_client.rs
 src/model/config.rs
 README.md
-docs/kiro-400-improperly-formed-request-analysis.md
-docs/anthropic-tools-signature-compatibility-analysis.md
+[`kiro-400-improperly-formed-request-analysis.md`](kiro-400-improperly-formed-request-analysis.md)
+[`anthropic-tools-signature-compatibility-analysis.md`](anthropic-tools-signature-compatibility-analysis.md)
 ```
 
 参考项目：

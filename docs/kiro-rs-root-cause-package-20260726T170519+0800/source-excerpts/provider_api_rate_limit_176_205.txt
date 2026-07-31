@@ -1,0 +1,30 @@
+   176	impl ApiUpstreamFailureKind {
+   177	    fn as_error_type(self) -> &'static str {
+   178	        match self {
+   179	            Self::InvalidRequest => "invalid_request",
+   180	            Self::Auth => "auth_error",
+   181	            Self::RateLimit => "rate_limit",
+   182	            Self::Quota => "quota_exhausted",
+   183	            Self::RiskControl => "risk_control",
+   184	            Self::Server => "server_error",
+   185	            Self::Timeout => "upstream_timeout",
+   186	            Self::ResponseTooLarge => "response_too_large",
+   187	            Self::BodyRead => "body_read_error",
+   188	            Self::Protocol => "protocol_error",
+   189	            Self::Unknown => "unknown_upstream_error",
+   190	        }
+   191	    }
+   192	
+   193	    fn scheduler_reason(self) -> &'static str {
+   194	        match self {
+   195	            Self::InvalidRequest => "api_invalid_request",
+   196	            Self::Auth => "api_auth_error",
+   197	            Self::RateLimit => "api_rate_limit",
+   198	            Self::Quota => "api_quota_exhausted",
+   199	            Self::RiskControl => "api_risk_control",
+   200	            Self::Server => "api_server_error",
+   201	            Self::Timeout => "api_timeout",
+   202	            Self::ResponseTooLarge => "api_response_too_large",
+   203	            Self::BodyRead => "api_body_read_error",
+   204	            Self::Protocol => "api_protocol_error",
+   205	            Self::Unknown => "api_unknown_upstream_error",

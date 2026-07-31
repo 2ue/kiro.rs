@@ -173,7 +173,7 @@
 
 - 根因包：[`tmp/analysis-usage-llm-errors/root-causes/`](../../tmp/analysis-usage-llm-errors/root-causes) 中 `request_body_invalid`、`unsupported_image_format`、`stream_upstream_status_error` 等分类。
 - 7/14 Todo：[`feature/audits/local-todo-for-confirmation-2026-07-14.md`](local-todo-for-confirmation-2026-07-14.md) 第 2 节 P004。
-- 400 malformed 专题：[`docs/kiro-400-improperly-formed-request-analysis.md`](../../docs/kiro-400-improperly-formed-request-analysis.md)。
+- 400 malformed 专题：[`docs/archive/request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md`](../../docs/archive/request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md)。
 
 说明：
 
@@ -257,8 +257,8 @@
 
 证据链：
 
-- 原问题说明：[`docs/current-cache-strategy-issues-readable-20260701.md`](../../docs/current-cache-strategy-issues-readable-20260701.md)。
-- 策略族分析：[`docs/prompt-cache-strategy-family-refactor-analysis-20260701.md`](../../docs/prompt-cache-strategy-family-refactor-analysis-20260701.md)。
+- 原问题说明：[`docs/archive/cache-usage-and-production-history/current-cache-strategy-issues-readable-20260701.md`](../../docs/archive/cache-usage-and-production-history/current-cache-strategy-issues-readable-20260701.md)。
+- 策略族分析：[`docs/archive/cache-usage-and-production-history/prompt-cache-strategy-family-refactor-analysis-20260701.md`](../../docs/archive/cache-usage-and-production-history/prompt-cache-strategy-family-refactor-analysis-20260701.md)。
 - 7/13 修复说明：[`feature/audits/runtime-usage-error-followup-2026-07-13.md`](runtime-usage-error-followup-2026-07-13.md)。
 
 说明：
@@ -385,7 +385,7 @@
 
 - 用户样本：`続けて本体を追記する。`、`让me等一会儿`、葡语/日语/中英混用片段。
 - 本地 JSONL 复核：[`feature/issues/10-stream-end-turn-vs-silent-truncation.md`](../issues/10-stream-end-turn-vs-silent-truncation.md) 第 1.2、6.5、7 节。
-- 注入点审计：[`feature/plans/prompt-injection-inventory-and-centralization-plan-20260715.md`](../plans/prompt-injection-inventory-and-centralization-plan-20260715.md)。
+- 注入点审计：[`docs/archive/runtime-correctness-feature-workspace-history/plans/prompt-injection-inventory-and-centralization-plan-20260715.md`](../../docs/archive/runtime-correctness-feature-workspace-history/plans/prompt-injection-inventory-and-centralization-plan-20260715.md)。
 - 源码：[`src/anthropic/prompt_steering.rs`](../../src/anthropic/prompt_steering.rs)、[`src/model/config.rs`](../../src/model/config.rs)。
 
 说明：
@@ -687,7 +687,7 @@
 
 证据链：
 
-- 协议文档：[`docs/kiro-upstream-protocol-refactor-analysis-and-test-plan.md`](../../docs/kiro-upstream-protocol-refactor-analysis-and-test-plan.md)。
+- 协议文档：[`docs/archive/request-and-protocol-history/kiro-upstream-protocol-refactor-analysis-and-test-plan.md`](../../docs/archive/request-and-protocol-history/kiro-upstream-protocol-refactor-analysis-and-test-plan.md)。
 - 源码搜索显示当前已有 `authMethod=api_key`、`kiroApiKey`、CLI endpoint、API Key model discovery、API Key 不刷新 token 等实现：[`src/kiro/endpoint/cli.rs`](../../src/kiro/endpoint/cli.rs)、[`src/kiro/token_manager/manager.rs`](../../src/kiro/token_manager/manager.rs)、[`src/admin/service.rs`](../../src/admin/service.rs)。
 - 测试中有 API Key 示例：[`src/admin/service_tests.rs`](../../src/admin/service_tests.rs)。
 

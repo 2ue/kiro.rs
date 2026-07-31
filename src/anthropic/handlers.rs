@@ -118,8 +118,6 @@ const SLOW_STREAM_GAP_MS: u64 = 10_000;
 const SLOW_RESPONSE_MS: u64 = 60_000;
 const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
 const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
-const EXTERNAL_FALLBACK_LOCAL_POLICY_AVAILABILITY_WAIT: Duration = Duration::from_millis(50);
-const EXTERNAL_FALLBACK_PREFLIGHT_AVAILABILITY_WAIT: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy)]
 struct LocalStreamRetryConfig {
@@ -1250,17 +1248,6 @@ async fn maybe_raw_external_direct_response(
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
-    if !manager
-        .has_eligible_pool_for_body_mode_and_model(
-            &config,
-            ExternalPoolRequestBodyMode::RawPassthrough,
-            raw_probe.model.as_deref(),
-        )
-        .await
-    {
-        return None;
-    }
-
     let reason = manager
         .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
         .await?;
@@ -1302,16 +1289,6 @@ async fn maybe_raw_external_preflight_response(
     if !config.local_pool_preflight_enabled {
         return None;
     }
-    if !manager
-        .has_eligible_pool_for_body_mode_and_model(
-            &config,
-            ExternalPoolRequestBodyMode::RawPassthrough,
-            raw_probe.model.as_deref(),
-        )
-        .await
-    {
-        return None;
-    }
 
     let local_state = provider.local_pool_route_state_fresh(raw_probe.model.as_deref());
     let Some(reason) = local_pool_fallback_reason_for_fresh_state(
@@ -1321,6 +1298,14 @@ async fn maybe_raw_external_preflight_response(
     ) else {
         return None;
     };
+    if !raw_external_pool_ready_for_route_reason(
+        &manager,
+        &config,
+        reason,
+        raw_probe.model.as_deref(),
+    ) {
+        return None;
+    }
 
     let reason = reason.to_string();
     let request_id = envelope::request_id();
@@ -1357,6 +1342,27 @@ async fn maybe_raw_external_preflight_response(
     );
 
     Some(manager.forward_with_failover(config, route).await)
+}
+
+fn raw_external_pool_ready_for_route_reason(
+    manager: &ExternalPoolManager,
+    config: &ExternalPoolsConfig,
+    route_reason: &str,
+    model: Option<&str>,
+) -> bool {
+    if local_route_reason_requires_immediate_external_capacity(route_reason) {
+        manager.has_cached_immediately_available_pool_for_body_mode_and_model(
+            config,
+            ExternalPoolRequestBodyMode::RawPassthrough,
+            model,
+        )
+    } else {
+        manager.has_cached_eligible_pool_for_body_mode_and_model(
+            config,
+            ExternalPoolRequestBodyMode::RawPassthrough,
+            model,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1573,12 +1579,7 @@ impl ExternalFallbackContext {
             || self.config.fallback_on_local_transient_exhausted
             || self.config.fallback_on_unsupported_model;
         if !fallback_enabled
-            || !self
-                .has_immediately_available_external_pool_for_model(
-                    &self.payload.model,
-                    EXTERNAL_FALLBACK_LOCAL_POLICY_AVAILABILITY_WAIT,
-                )
-                .await
+            || !self.has_immediately_available_external_pool_for_model(&self.payload.model)
         {
             return (AcquireMode::WaitForCapacity, false);
         }
@@ -1586,54 +1587,41 @@ impl ExternalFallbackContext {
         (acquire_mode, true)
     }
 
-    async fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
+    fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
         match external_fallback_body_mode_filter(self.requires_normalized_body) {
-            Some(body_mode) => {
-                self.manager
-                    .has_eligible_pool_for_body_mode_and_model(&self.config, body_mode, Some(model))
-                    .await
-            }
-            None => {
-                self.manager
-                    .has_eligible_pool_for_model(&self.config, model)
-                    .await
-            }
+            Some(body_mode) => self
+                .manager
+                .has_cached_eligible_pool_for_body_mode_and_model(
+                    &self.config,
+                    body_mode,
+                    Some(model),
+                ),
+            None => self
+                .manager
+                .has_cached_eligible_pool_for_model(&self.config, model),
         }
     }
 
-    async fn has_immediately_available_external_pool_for_model(
-        &self,
-        model: &str,
-        max_wait: Duration,
-    ) -> bool {
+    fn has_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
         match external_fallback_body_mode_filter(self.requires_normalized_body) {
-            Some(body_mode) => {
-                self.manager
-                    .has_immediately_available_pool_for_body_mode_and_model(
-                        &self.config,
-                        body_mode,
-                        Some(model),
-                        max_wait,
-                    )
-                    .await
-            }
-            None => {
-                self.manager
-                    .has_immediately_available_pool_for_model(&self.config, model, max_wait)
-                    .await
-            }
+            Some(body_mode) => self
+                .manager
+                .has_cached_immediately_available_pool_for_body_mode_and_model(
+                    &self.config,
+                    body_mode,
+                    Some(model),
+                ),
+            None => self
+                .manager
+                .has_cached_immediately_available_pool_for_model(&self.config, model),
         }
     }
 
-    async fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
+    fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
         if local_route_reason_requires_immediate_external_capacity(route_reason) {
-            self.has_immediately_available_external_pool_for_model(
-                model,
-                EXTERNAL_FALLBACK_PREFLIGHT_AVAILABILITY_WAIT,
-            )
-            .await
+            self.has_immediately_available_external_pool_for_model(model)
         } else {
-            self.has_eligible_external_pool_for_model(model).await
+            self.has_eligible_external_pool_for_model(model)
         }
     }
 
@@ -1678,10 +1666,7 @@ impl ExternalFallbackContext {
             return None;
         };
         let route_model = model.unwrap_or(&self.payload.model);
-        if !self
-            .external_pool_ready_for_route_reason(reason, route_model)
-            .await
-        {
+        if !self.external_pool_ready_for_route_reason(reason, route_model) {
             return None;
         }
 
@@ -1813,10 +1798,7 @@ impl ExternalFallbackContext {
             return None;
         };
         let route_reason = route_reason.to_string();
-        if !self
-            .external_pool_ready_for_route_reason(&route_reason, &self.payload.model)
-            .await
-        {
+        if !self.external_pool_ready_for_route_reason(&route_reason, &self.payload.model) {
             tracing::warn!(
                 request_id,
                 classified_reason,
@@ -2045,7 +2027,11 @@ fn local_pool_fallback_reason_for_fresh_state(
     if matches!(kind, LocalPoolRouteStateKind::Ready) {
         return None;
     }
-    if !matches!(kind, LocalPoolRouteStateKind::RiskCircuitOpen) && dispatchable > 0 {
+    let degraded_state_overrides_dispatchable = matches!(
+        kind,
+        LocalPoolRouteStateKind::RiskCircuitOpen | LocalPoolRouteStateKind::SchedulerRedisDegraded
+    );
+    if !degraded_state_overrides_dispatchable && dispatchable > 0 {
         return None;
     }
     local_pool_route_fallback_reason(kind, config)
@@ -6159,13 +6145,22 @@ async fn maybe_local_pool_preflight_external_response(
     request_id: &str,
     model: Option<&str>,
 ) -> Option<Response> {
-    let outcome = external_fallback?
-        .local_pool_preflight_outcome(request_id, model)
-        .await?;
+    let outcome =
+        maybe_local_pool_preflight_external_outcome(external_fallback, request_id, model).await?;
     Some(match outcome {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(err) => err.into_response(request_id),
     })
+}
+
+async fn maybe_local_pool_preflight_external_outcome(
+    external_fallback: Option<&ExternalFallbackContext>,
+    request_id: &str,
+    model: Option<&str>,
+) -> Option<ExternalPoolForwardOutcome> {
+    external_fallback?
+        .local_pool_preflight_outcome(request_id, model)
+        .await
 }
 
 fn websearch_mcp_external_fallback_signal(
@@ -6579,59 +6574,130 @@ async fn handle_stream_request(
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
     let mut successful_derived_request: Option<(String, KiroRequest)> = None;
-    if let Some(response) = maybe_local_pool_preflight_external_response(
+    let response = if let Some(outcome) = maybe_local_pool_preflight_external_outcome(
         external_fallback.as_ref(),
         &request_id,
         Some(model),
     )
     .await
     {
-        return response;
-    }
-    let response = match call_api_stream_maybe_fail_fast(
-        &provider,
-        request_body,
-        Some(&kiro_request),
-        Some(&request_id),
-        external_fallback.as_ref(),
-        capacity_weight_units,
-        Some(model),
-        usage_context.latency.inference_attempt_budget.clone(),
-    )
-    .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let message = e.to_string();
-            let attempts = KiroProvider::attempts_from_error(&e);
-            log_provider_call_failure(&message, Some(&usage_context.error_id));
-            let endpoint = usage_context.endpoint.clone();
-            attach_and_log_tool_use_format_diagnostics(
-                &message,
-                request_body,
-                &kiro_request,
-                &mut usage_context,
-                &endpoint,
-                model,
-                preflight_model,
-            );
-            let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
-                should_retry_payload_guard_after_error(
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => return response,
+            ExternalPoolForwardOutcome::FinalError(err) => {
+                if let Some(external) = external_fallback.as_ref() {
+                    if let Some(reason) = budgeted_local_rescue_reason_after_external_error(
+                        &external.config,
+                        &err,
+                        Some("local_preflight"),
+                        external.inference_attempt_budget.as_ref(),
+                    ) {
+                        tracing::warn!(
+                            request_id,
+                            reason,
+                            max_wait_secs =
+                                external.config.external_pool_local_rescue_max_wait_secs,
+                            "external preflight fallback failed with a rescuable error; retrying local credentials once"
+                        );
+                        usage_context.mark_local_rescue_after_external(
+                            reason,
+                            Some(external_rescue_preflight(reason, &err)),
+                            err.attempts.clone(),
+                        );
+                        match call_stream_local_rescue_after_external_error(
+                            &provider,
+                            request_body,
+                            Some(&kiro_request),
+                            &request_id,
+                            external,
+                            capacity_weight_units,
+                            Some(model),
+                        )
+                        .await
+                        {
+                            Ok(resp) => resp,
+                            Err(rescue_error) => {
+                                let rescue_message = rescue_error.to_string();
+                                let rescue_attempts =
+                                    KiroProvider::attempts_from_error(&rescue_error);
+                                log_provider_call_failure(
+                                    &rescue_message,
+                                    Some(&usage_context.error_id),
+                                );
+                                let error_id = usage_context.error_id.clone();
+                                usage_context
+                                    .attach_provider_error_credential(
+                                        &provider,
+                                        &rescue_message,
+                                        rescue_attempts,
+                                    )
+                                    .with_error_metadata(provider_error_metadata(&rescue_error))
+                                    .record_failure(
+                                        UsageRecordStatus::Error,
+                                        "api_error",
+                                        rescue_message,
+                                    );
+                                return map_provider_error_with_admission_feedback(
+                                    rescue_error,
+                                    Some(&request_id),
+                                    Some(&error_id),
+                                    Some(provider.as_ref()),
+                                    admission_attribution.as_ref(),
+                                );
+                            }
+                        }
+                    } else {
+                        return err.into_response(&request_id);
+                    }
+                } else {
+                    return err.into_response(&request_id);
+                }
+            }
+        }
+    } else {
+        match call_api_stream_maybe_fail_fast(
+            &provider,
+            request_body,
+            Some(&kiro_request),
+            Some(&request_id),
+            external_fallback.as_ref(),
+            capacity_weight_units,
+            Some(model),
+            usage_context.latency.inference_attempt_budget.clone(),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let message = e.to_string();
+                let attempts = KiroProvider::attempts_from_error(&e);
+                log_provider_call_failure(&message, Some(&usage_context.error_id));
+                let endpoint = usage_context.endpoint.clone();
+                attach_and_log_tool_use_format_diagnostics(
                     &message,
-                    request_body.len(),
-                    retry.config.max_bytes,
-                )
-            });
-            if let Some(retry) = cache_point_retry.filter(|_| {
-                !should_payload_guard_retry
-                    && should_retry_without_cache_point_after_error(&message)
-            }) {
-                retry_attempt_prefix = attempts.clone();
-                let (retry_body, retry_kiro_request) =
-                    match retry.build_retry_body(&message, &mut usage_context) {
-                        Ok(result) => result,
-                        Err(err) => {
-                            usage_context
+                    request_body,
+                    &kiro_request,
+                    &mut usage_context,
+                    &endpoint,
+                    model,
+                    preflight_model,
+                );
+                let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
+                    should_retry_payload_guard_after_error(
+                        &message,
+                        request_body.len(),
+                        retry.config.max_bytes,
+                    )
+                });
+                if let Some(retry) = cache_point_retry.filter(|_| {
+                    !should_payload_guard_retry
+                        && should_retry_without_cache_point_after_error(&message)
+                }) {
+                    retry_attempt_prefix = attempts.clone();
+                    let (retry_body, retry_kiro_request) =
+                        match retry.build_retry_body(&message, &mut usage_context) {
+                            Ok(result) => result,
+                            Err(err) => {
+                                usage_context
                             .attach_provider_error_credential(&provider, &message, attempts)
                             .with_error_metadata(provider_error_metadata(&e))
                             .record_failure(
@@ -6642,251 +6708,67 @@ async fn handle_stream_request(
                                     err
                                 ),
                             );
-                            return payload_guard_error_response(err);
-                        }
-                    };
-                match call_api_stream_maybe_fail_fast(
-                    &provider,
-                    &retry_body,
-                    Some(&retry_kiro_request),
-                    Some(&request_id),
-                    external_fallback.as_ref(),
-                    capacity_weight_units,
-                    Some(model),
-                    usage_context.latency.inference_attempt_budget.clone(),
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        successful_derived_request = Some((retry_body, retry_kiro_request));
-                        resp
-                    }
-                    Err(retry_error) => {
-                        let retry_message = retry_error.to_string();
-                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
-                        let classification_attempts = retry_attempts.clone();
-                        let all_attempts =
-                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
-                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
-                        let endpoint = usage_context.endpoint.clone();
-                        attach_and_log_tool_use_format_diagnostics(
-                            &retry_message,
-                            &retry_body,
-                            &retry_kiro_request,
-                            &mut usage_context,
-                            &endpoint,
-                            model,
-                            preflight_model,
-                        );
-                        if let Some(outcome) =
-                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                external_fallback.as_ref(),
-                                &request_id,
-                                &retry_message,
-                                KiroProvider::call_failure_kind_from_error(&retry_error),
-                                classification_attempts,
-                                all_attempts.clone(),
-                            )
-                            .await
-                        {
-                            match outcome {
-                                ExternalPoolForwardOutcome::Response(response) => return response,
-                                ExternalPoolForwardOutcome::FinalError(err) => {
-                                    return err.into_response(&request_id);
-                                }
+                                return payload_guard_error_response(err);
                             }
+                        };
+                    match call_api_stream_maybe_fail_fast(
+                        &provider,
+                        &retry_body,
+                        Some(&retry_kiro_request),
+                        Some(&request_id),
+                        external_fallback.as_ref(),
+                        capacity_weight_units,
+                        Some(model),
+                        usage_context.latency.inference_attempt_budget.clone(),
+                    )
+                    .await
+                    {
+                        Ok(resp) => {
+                            successful_derived_request = Some((retry_body, retry_kiro_request));
+                            resp
                         }
-                        let error_id = usage_context.error_id.clone();
-                        usage_context
-                            .attach_provider_error_credential(
-                                &provider,
+                        Err(retry_error) => {
+                            let retry_message = retry_error.to_string();
+                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let classification_attempts = retry_attempts.clone();
+                            let all_attempts = merge_credential_attempts(
+                                retry_attempt_prefix.clone(),
+                                retry_attempts,
+                            );
+                            log_provider_call_failure(
                                 &retry_message,
-                                all_attempts,
-                            )
-                            .with_error_metadata(provider_error_metadata(&retry_error))
-                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
-                        return map_provider_error_with_admission_feedback(
-                            retry_error,
-                            Some(&request_id),
-                            Some(&error_id),
-                            Some(provider.as_ref()),
-                            admission_attribution.as_ref(),
-                        );
-                    }
-                }
-            } else if let Some(retry) = too_long_retry.filter(|retry| {
-                should_retry_payload_guard_after_error(
-                    &message,
-                    request_body.len(),
-                    retry.config.max_bytes,
-                )
-            }) {
-                tracing::warn!(
-                    request_id,
-                    "Kiro stream request rejected as too long; applying configured payload guard and retrying once"
-                );
-                retry_attempt_prefix = attempts.clone();
-                let (retry_body, retry_warnings_header, retry_kiro_request) =
-                    match retry.build_retry_body(&mut usage_context) {
-                        Ok(result) => result,
-                        Err(err) => {
-                            usage_context
-                                .attach_provider_error_credential(&provider, &message, attempts)
-                                .with_error_metadata(provider_error_metadata(&e))
-                                .record_failure(
-                                    UsageRecordStatus::Error,
-                                    "payload_guard_error",
-                                    format!(
-                                    "payload guard retry failed after upstream too-long error: {}",
-                                    err
-                                ),
-                                );
-                            return payload_guard_error_response(err);
-                        }
-                    };
-                warnings_header = retry_warnings_header;
-                match call_api_stream_maybe_fail_fast(
-                    &provider,
-                    &retry_body,
-                    Some(&retry_kiro_request),
-                    Some(&request_id),
-                    external_fallback.as_ref(),
-                    capacity_weight_units,
-                    Some(model),
-                    usage_context.latency.inference_attempt_budget.clone(),
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        successful_derived_request = Some((retry_body, retry_kiro_request));
-                        resp
-                    }
-                    Err(retry_error) => {
-                        let retry_message = retry_error.to_string();
-                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
-                        let classification_attempts = retry_attempts.clone();
-                        let all_attempts =
-                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
-                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
-                        let endpoint = usage_context.endpoint.clone();
-                        attach_and_log_tool_use_format_diagnostics(
-                            &retry_message,
-                            &retry_body,
-                            &retry_kiro_request,
-                            &mut usage_context,
-                            &endpoint,
-                            model,
-                            preflight_model,
-                        );
-                        if let Some(outcome) =
-                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                external_fallback.as_ref(),
-                                &request_id,
+                                Some(&usage_context.error_id),
+                            );
+                            let endpoint = usage_context.endpoint.clone();
+                            attach_and_log_tool_use_format_diagnostics(
                                 &retry_message,
-                                KiroProvider::call_failure_kind_from_error(&retry_error),
-                                classification_attempts.clone(),
-                                all_attempts.clone(),
-                            )
-                            .await
-                        {
-                            match outcome {
-                                ExternalPoolForwardOutcome::Response(response) => return response,
-                                ExternalPoolForwardOutcome::FinalError(err) => {
-                                    if let Some(external) = external_fallback.as_ref() {
-                                        let local_fallback_reason =
-                                            classify_local_error_for_external_fallback_with_kind(
-                                                &retry_message,
-                                                &classification_attempts,
-                                                &external.config,
-                                                KiroProvider::call_failure_kind_from_error(
-                                                    &retry_error,
-                                                ),
-                                            );
-                                        if let Some(reason) =
-                                            budgeted_local_rescue_reason_after_external_error(
-                                                &external.config,
-                                                &err,
-                                                local_fallback_reason.as_deref(),
-                                                external.inference_attempt_budget.as_ref(),
-                                            )
-                                        {
-                                            tracing::warn!(
-                                                request_id,
-                                                reason,
-                                                max_wait_secs = external
-                                                    .config
-                                                    .external_pool_local_rescue_max_wait_secs,
-                                                "external fallback failed with a rescuable error; retrying local credentials once"
-                                            );
-                                            usage_context.mark_local_rescue_after_external(
-                                                reason,
-                                                Some(external_rescue_preflight(reason, &err)),
-                                                err.attempts.clone(),
-                                            );
-                                            retry_attempt_prefix = all_attempts.clone();
-                                            match call_stream_local_rescue_after_external_error(
-                                                &provider,
-                                                &retry_body,
-                                                Some(&retry_kiro_request),
-                                                &request_id,
-                                                external,
-                                                capacity_weight_units,
-                                                Some(model),
-                                            )
-                                            .await
-                                            {
-                                                Ok(resp) => {
-                                                    successful_derived_request =
-                                                        Some((retry_body, retry_kiro_request));
-                                                    resp
-                                                }
-                                                Err(rescue_error) => {
-                                                    let rescue_message = rescue_error.to_string();
-                                                    let rescue_attempts =
-                                                        KiroProvider::attempts_from_error(
-                                                            &rescue_error,
-                                                        );
-                                                    let all_attempts = merge_credential_attempts(
-                                                        retry_attempt_prefix.clone(),
-                                                        rescue_attempts,
-                                                    );
-                                                    log_provider_call_failure(
-                                                        &rescue_message,
-                                                        Some(&usage_context.error_id),
-                                                    );
-                                                    let error_id = usage_context.error_id.clone();
-                                                    usage_context
-                                                        .attach_provider_error_credential(
-                                                            &provider,
-                                                            &rescue_message,
-                                                            all_attempts,
-                                                        )
-                                                        .with_error_metadata(
-                                                            provider_error_metadata(&rescue_error),
-                                                        )
-                                                        .record_failure(
-                                                            UsageRecordStatus::Error,
-                                                            "api_error",
-                                                            rescue_message,
-                                                        );
-                                                    return map_provider_error_with_admission_feedback(
-                                                        rescue_error,
-                                                        Some(&request_id),
-                                                        Some(&error_id),
-                                                        Some(provider.as_ref()),
-                                                        admission_attribution.as_ref(),
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            return err.into_response(&request_id);
-                                        }
-                                    } else {
+                                &retry_body,
+                                &retry_kiro_request,
+                                &mut usage_context,
+                                &endpoint,
+                                model,
+                                preflight_model,
+                            );
+                            if let Some(outcome) =
+                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                    external_fallback.as_ref(),
+                                    &request_id,
+                                    &retry_message,
+                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    classification_attempts,
+                                    all_attempts.clone(),
+                                )
+                                .await
+                            {
+                                match outcome {
+                                    ExternalPoolForwardOutcome::Response(response) => {
+                                        return response;
+                                    }
+                                    ExternalPoolForwardOutcome::FinalError(err) => {
                                         return err.into_response(&request_id);
                                     }
                                 }
                             }
-                        } else {
                             let error_id = usage_context.error_id.clone();
                             usage_context
                                 .attach_provider_error_credential(
@@ -6909,119 +6791,329 @@ async fn handle_stream_request(
                             );
                         }
                     }
-                }
-            } else {
-                if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                    external_fallback.as_ref(),
-                    &request_id,
-                    &message,
-                    KiroProvider::call_failure_kind_from_error(&e),
-                    attempts.clone(),
-                )
-                .await
-                {
-                    match outcome {
-                        ExternalPoolForwardOutcome::Response(response) => return response,
-                        ExternalPoolForwardOutcome::FinalError(err) => {
-                            if let Some(external) = external_fallback.as_ref() {
-                                let local_fallback_reason =
-                                    classify_local_error_for_external_fallback_with_kind(
-                                        &message,
-                                        &attempts,
-                                        &external.config,
-                                        KiroProvider::call_failure_kind_from_error(&e),
-                                    );
-                                if let Some(reason) =
-                                    budgeted_local_rescue_reason_after_external_error(
-                                        &external.config,
-                                        &err,
-                                        local_fallback_reason.as_deref(),
-                                        external.inference_attempt_budget.as_ref(),
-                                    )
-                                {
-                                    tracing::warn!(
-                                        request_id,
-                                        reason,
-                                        max_wait_secs = external
-                                            .config
-                                            .external_pool_local_rescue_max_wait_secs,
-                                        "external fallback failed with a rescuable error; retrying local credentials once"
-                                    );
-                                    usage_context.mark_local_rescue_after_external(
-                                        reason,
-                                        Some(external_rescue_preflight(reason, &err)),
-                                        err.attempts.clone(),
-                                    );
-                                    retry_attempt_prefix = attempts.clone();
-                                    match call_stream_local_rescue_after_external_error(
-                                        &provider,
-                                        request_body,
-                                        Some(&kiro_request),
-                                        &request_id,
-                                        external,
-                                        capacity_weight_units,
-                                        Some(model),
-                                    )
-                                    .await
-                                    {
-                                        Ok(resp) => resp,
-                                        Err(rescue_error) => {
-                                            let rescue_message = rescue_error.to_string();
-                                            let rescue_attempts =
-                                                KiroProvider::attempts_from_error(&rescue_error);
-                                            let all_attempts = merge_credential_attempts(
-                                                retry_attempt_prefix.clone(),
-                                                rescue_attempts,
+                } else if let Some(retry) = too_long_retry.filter(|retry| {
+                    should_retry_payload_guard_after_error(
+                        &message,
+                        request_body.len(),
+                        retry.config.max_bytes,
+                    )
+                }) {
+                    tracing::warn!(
+                        request_id,
+                        "Kiro stream request rejected as too long; applying configured payload guard and retrying once"
+                    );
+                    retry_attempt_prefix = attempts.clone();
+                    let (retry_body, retry_warnings_header, retry_kiro_request) =
+                        match retry.build_retry_body(&mut usage_context) {
+                            Ok(result) => result,
+                            Err(err) => {
+                                usage_context
+                                .attach_provider_error_credential(&provider, &message, attempts)
+                                .with_error_metadata(provider_error_metadata(&e))
+                                .record_failure(
+                                    UsageRecordStatus::Error,
+                                    "payload_guard_error",
+                                    format!(
+                                    "payload guard retry failed after upstream too-long error: {}",
+                                    err
+                                ),
+                                );
+                                return payload_guard_error_response(err);
+                            }
+                        };
+                    warnings_header = retry_warnings_header;
+                    match call_api_stream_maybe_fail_fast(
+                        &provider,
+                        &retry_body,
+                        Some(&retry_kiro_request),
+                        Some(&request_id),
+                        external_fallback.as_ref(),
+                        capacity_weight_units,
+                        Some(model),
+                        usage_context.latency.inference_attempt_budget.clone(),
+                    )
+                    .await
+                    {
+                        Ok(resp) => {
+                            successful_derived_request = Some((retry_body, retry_kiro_request));
+                            resp
+                        }
+                        Err(retry_error) => {
+                            let retry_message = retry_error.to_string();
+                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let classification_attempts = retry_attempts.clone();
+                            let all_attempts = merge_credential_attempts(
+                                retry_attempt_prefix.clone(),
+                                retry_attempts,
+                            );
+                            log_provider_call_failure(
+                                &retry_message,
+                                Some(&usage_context.error_id),
+                            );
+                            let endpoint = usage_context.endpoint.clone();
+                            attach_and_log_tool_use_format_diagnostics(
+                                &retry_message,
+                                &retry_body,
+                                &retry_kiro_request,
+                                &mut usage_context,
+                                &endpoint,
+                                model,
+                                preflight_model,
+                            );
+                            if let Some(outcome) =
+                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                    external_fallback.as_ref(),
+                                    &request_id,
+                                    &retry_message,
+                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    classification_attempts.clone(),
+                                    all_attempts.clone(),
+                                )
+                                .await
+                            {
+                                match outcome {
+                                    ExternalPoolForwardOutcome::Response(response) => {
+                                        return response;
+                                    }
+                                    ExternalPoolForwardOutcome::FinalError(err) => {
+                                        if let Some(external) = external_fallback.as_ref() {
+                                            let local_fallback_reason =
+                                            classify_local_error_for_external_fallback_with_kind(
+                                                &retry_message,
+                                                &classification_attempts,
+                                                &external.config,
+                                                KiroProvider::call_failure_kind_from_error(
+                                                    &retry_error,
+                                                ),
                                             );
-                                            log_provider_call_failure(
-                                                &rescue_message,
-                                                Some(&usage_context.error_id),
-                                            );
-                                            let error_id = usage_context.error_id.clone();
-                                            usage_context
-                                                .attach_provider_error_credential(
-                                                    &provider,
-                                                    &rescue_message,
-                                                    all_attempts,
+                                            if let Some(reason) =
+                                                budgeted_local_rescue_reason_after_external_error(
+                                                    &external.config,
+                                                    &err,
+                                                    local_fallback_reason.as_deref(),
+                                                    external.inference_attempt_budget.as_ref(),
                                                 )
-                                                .with_error_metadata(provider_error_metadata(
-                                                    &rescue_error,
-                                                ))
-                                                .record_failure(
-                                                    UsageRecordStatus::Error,
-                                                    "api_error",
-                                                    rescue_message,
+                                            {
+                                                tracing::warn!(
+                                                    request_id,
+                                                    reason,
+                                                    max_wait_secs = external
+                                                        .config
+                                                        .external_pool_local_rescue_max_wait_secs,
+                                                    "external fallback failed with a rescuable error; retrying local credentials once"
                                                 );
-                                            return map_provider_error_with_admission_feedback(
-                                                rescue_error,
-                                                Some(&request_id),
-                                                Some(&error_id),
-                                                Some(provider.as_ref()),
-                                                admission_attribution.as_ref(),
-                                            );
+                                                usage_context.mark_local_rescue_after_external(
+                                                    reason,
+                                                    Some(external_rescue_preflight(reason, &err)),
+                                                    err.attempts.clone(),
+                                                );
+                                                retry_attempt_prefix = all_attempts.clone();
+                                                match call_stream_local_rescue_after_external_error(
+                                                    &provider,
+                                                    &retry_body,
+                                                    Some(&retry_kiro_request),
+                                                    &request_id,
+                                                    external,
+                                                    capacity_weight_units,
+                                                    Some(model),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(resp) => {
+                                                        successful_derived_request =
+                                                            Some((retry_body, retry_kiro_request));
+                                                        resp
+                                                    }
+                                                    Err(rescue_error) => {
+                                                        let rescue_message =
+                                                            rescue_error.to_string();
+                                                        let rescue_attempts =
+                                                            KiroProvider::attempts_from_error(
+                                                                &rescue_error,
+                                                            );
+                                                        let all_attempts =
+                                                            merge_credential_attempts(
+                                                                retry_attempt_prefix.clone(),
+                                                                rescue_attempts,
+                                                            );
+                                                        log_provider_call_failure(
+                                                            &rescue_message,
+                                                            Some(&usage_context.error_id),
+                                                        );
+                                                        let error_id =
+                                                            usage_context.error_id.clone();
+                                                        usage_context
+                                                            .attach_provider_error_credential(
+                                                                &provider,
+                                                                &rescue_message,
+                                                                all_attempts,
+                                                            )
+                                                            .with_error_metadata(
+                                                                provider_error_metadata(
+                                                                    &rescue_error,
+                                                                ),
+                                                            )
+                                                            .record_failure(
+                                                                UsageRecordStatus::Error,
+                                                                "api_error",
+                                                                rescue_message,
+                                                            );
+                                                        return map_provider_error_with_admission_feedback(
+                                                        rescue_error,
+                                                        Some(&request_id),
+                                                        Some(&error_id),
+                                                        Some(provider.as_ref()),
+                                                        admission_attribution.as_ref(),
+                                                    );
+                                                    }
+                                                }
+                                            } else {
+                                                return err.into_response(&request_id);
+                                            }
+                                        } else {
+                                            return err.into_response(&request_id);
                                         }
                                     }
-                                } else {
-                                    return err.into_response(&request_id);
                                 }
                             } else {
-                                return err.into_response(&request_id);
+                                let error_id = usage_context.error_id.clone();
+                                usage_context
+                                    .attach_provider_error_credential(
+                                        &provider,
+                                        &retry_message,
+                                        all_attempts,
+                                    )
+                                    .with_error_metadata(provider_error_metadata(&retry_error))
+                                    .record_failure(
+                                        UsageRecordStatus::Error,
+                                        "api_error",
+                                        retry_message,
+                                    );
+                                return map_provider_error_with_admission_feedback(
+                                    retry_error,
+                                    Some(&request_id),
+                                    Some(&error_id),
+                                    Some(provider.as_ref()),
+                                    admission_attribution.as_ref(),
+                                );
                             }
                         }
                     }
                 } else {
-                    let error_id = usage_context.error_id.clone();
-                    usage_context
-                        .attach_provider_error_credential(&provider, &message, attempts)
-                        .with_error_metadata(provider_error_metadata(&e))
-                        .record_failure(UsageRecordStatus::Error, "api_error", message);
-                    return map_provider_error_with_admission_feedback(
-                        e,
-                        Some(&request_id),
-                        Some(&error_id),
-                        Some(provider.as_ref()),
-                        admission_attribution.as_ref(),
-                    );
+                    if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
+                        external_fallback.as_ref(),
+                        &request_id,
+                        &message,
+                        KiroProvider::call_failure_kind_from_error(&e),
+                        attempts.clone(),
+                    )
+                    .await
+                    {
+                        match outcome {
+                            ExternalPoolForwardOutcome::Response(response) => return response,
+                            ExternalPoolForwardOutcome::FinalError(err) => {
+                                if let Some(external) = external_fallback.as_ref() {
+                                    let local_fallback_reason =
+                                        classify_local_error_for_external_fallback_with_kind(
+                                            &message,
+                                            &attempts,
+                                            &external.config,
+                                            KiroProvider::call_failure_kind_from_error(&e),
+                                        );
+                                    if let Some(reason) =
+                                        budgeted_local_rescue_reason_after_external_error(
+                                            &external.config,
+                                            &err,
+                                            local_fallback_reason.as_deref(),
+                                            external.inference_attempt_budget.as_ref(),
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            request_id,
+                                            reason,
+                                            max_wait_secs = external
+                                                .config
+                                                .external_pool_local_rescue_max_wait_secs,
+                                            "external fallback failed with a rescuable error; retrying local credentials once"
+                                        );
+                                        usage_context.mark_local_rescue_after_external(
+                                            reason,
+                                            Some(external_rescue_preflight(reason, &err)),
+                                            err.attempts.clone(),
+                                        );
+                                        retry_attempt_prefix = attempts.clone();
+                                        match call_stream_local_rescue_after_external_error(
+                                            &provider,
+                                            request_body,
+                                            Some(&kiro_request),
+                                            &request_id,
+                                            external,
+                                            capacity_weight_units,
+                                            Some(model),
+                                        )
+                                        .await
+                                        {
+                                            Ok(resp) => resp,
+                                            Err(rescue_error) => {
+                                                let rescue_message = rescue_error.to_string();
+                                                let rescue_attempts =
+                                                    KiroProvider::attempts_from_error(
+                                                        &rescue_error,
+                                                    );
+                                                let all_attempts = merge_credential_attempts(
+                                                    retry_attempt_prefix.clone(),
+                                                    rescue_attempts,
+                                                );
+                                                log_provider_call_failure(
+                                                    &rescue_message,
+                                                    Some(&usage_context.error_id),
+                                                );
+                                                let error_id = usage_context.error_id.clone();
+                                                usage_context
+                                                    .attach_provider_error_credential(
+                                                        &provider,
+                                                        &rescue_message,
+                                                        all_attempts,
+                                                    )
+                                                    .with_error_metadata(provider_error_metadata(
+                                                        &rescue_error,
+                                                    ))
+                                                    .record_failure(
+                                                        UsageRecordStatus::Error,
+                                                        "api_error",
+                                                        rescue_message,
+                                                    );
+                                                return map_provider_error_with_admission_feedback(
+                                                    rescue_error,
+                                                    Some(&request_id),
+                                                    Some(&error_id),
+                                                    Some(provider.as_ref()),
+                                                    admission_attribution.as_ref(),
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        return err.into_response(&request_id);
+                                    }
+                                } else {
+                                    return err.into_response(&request_id);
+                                }
+                            }
+                        }
+                    } else {
+                        let error_id = usage_context.error_id.clone();
+                        usage_context
+                            .attach_provider_error_credential(&provider, &message, attempts)
+                            .with_error_metadata(provider_error_metadata(&e))
+                            .record_failure(UsageRecordStatus::Error, "api_error", message);
+                        return map_provider_error_with_admission_feedback(
+                            e,
+                            Some(&request_id),
+                            Some(&error_id),
+                            Some(provider.as_ref()),
+                            admission_attribution.as_ref(),
+                        );
+                    }
                 }
             }
         }
@@ -8666,59 +8758,130 @@ async fn handle_non_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
-    if let Some(response) = maybe_local_pool_preflight_external_response(
+    let api_response = if let Some(outcome) = maybe_local_pool_preflight_external_outcome(
         external_fallback.as_ref(),
         &request_id,
         Some(model),
     )
     .await
     {
-        return response;
-    }
-    let api_response = match call_api_maybe_fail_fast(
-        &provider,
-        request_body,
-        Some(kiro_request),
-        Some(&request_id),
-        external_fallback.as_ref(),
-        capacity_weight_units,
-        Some(model),
-        usage_context.latency.inference_attempt_budget.clone(),
-    )
-    .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let message = e.to_string();
-            let attempts = KiroProvider::attempts_from_error(&e);
-            log_provider_call_failure(&message, Some(&usage_context.error_id));
-            let endpoint = usage_context.endpoint.clone();
-            attach_and_log_tool_use_format_diagnostics(
-                &message,
-                request_body,
-                kiro_request,
-                &mut usage_context,
-                &endpoint,
-                model,
-                preflight_model,
-            );
-            let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
-                should_retry_payload_guard_after_error(
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => return response,
+            ExternalPoolForwardOutcome::FinalError(err) => {
+                if let Some(external) = external_fallback.as_ref() {
+                    if let Some(reason) = budgeted_local_rescue_reason_after_external_error(
+                        &external.config,
+                        &err,
+                        Some("local_preflight"),
+                        external.inference_attempt_budget.as_ref(),
+                    ) {
+                        tracing::warn!(
+                            request_id,
+                            reason,
+                            max_wait_secs =
+                                external.config.external_pool_local_rescue_max_wait_secs,
+                            "external preflight fallback failed with a rescuable error; retrying local credentials once"
+                        );
+                        usage_context.mark_local_rescue_after_external(
+                            reason,
+                            Some(external_rescue_preflight(reason, &err)),
+                            err.attempts.clone(),
+                        );
+                        match call_non_stream_local_rescue_after_external_error(
+                            &provider,
+                            request_body,
+                            Some(kiro_request),
+                            &request_id,
+                            external,
+                            capacity_weight_units,
+                            Some(model),
+                        )
+                        .await
+                        {
+                            Ok(resp) => resp,
+                            Err(rescue_error) => {
+                                let rescue_message = rescue_error.to_string();
+                                let rescue_attempts =
+                                    KiroProvider::attempts_from_error(&rescue_error);
+                                log_provider_call_failure(
+                                    &rescue_message,
+                                    Some(&usage_context.error_id),
+                                );
+                                let error_id = usage_context.error_id.clone();
+                                usage_context
+                                    .attach_provider_error_credential(
+                                        &provider,
+                                        &rescue_message,
+                                        rescue_attempts,
+                                    )
+                                    .with_error_metadata(provider_error_metadata(&rescue_error))
+                                    .record_failure(
+                                        UsageRecordStatus::Error,
+                                        "api_error",
+                                        rescue_message,
+                                    );
+                                return map_provider_error_with_admission_feedback(
+                                    rescue_error,
+                                    Some(&request_id),
+                                    Some(&error_id),
+                                    Some(provider.as_ref()),
+                                    admission_attribution.as_ref(),
+                                );
+                            }
+                        }
+                    } else {
+                        return err.into_response(&request_id);
+                    }
+                } else {
+                    return err.into_response(&request_id);
+                }
+            }
+        }
+    } else {
+        match call_api_maybe_fail_fast(
+            &provider,
+            request_body,
+            Some(kiro_request),
+            Some(&request_id),
+            external_fallback.as_ref(),
+            capacity_weight_units,
+            Some(model),
+            usage_context.latency.inference_attempt_budget.clone(),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let message = e.to_string();
+                let attempts = KiroProvider::attempts_from_error(&e);
+                log_provider_call_failure(&message, Some(&usage_context.error_id));
+                let endpoint = usage_context.endpoint.clone();
+                attach_and_log_tool_use_format_diagnostics(
                     &message,
-                    request_body.len(),
-                    retry.config.max_bytes,
-                )
-            });
-            if let Some(retry) = cache_point_retry.filter(|_| {
-                !should_payload_guard_retry
-                    && should_retry_without_cache_point_after_error(&message)
-            }) {
-                retry_attempt_prefix = attempts.clone();
-                let (retry_body, retry_kiro_request) =
-                    match retry.build_retry_body(&message, &mut usage_context) {
-                        Ok(result) => result,
-                        Err(err) => {
-                            usage_context
+                    request_body,
+                    kiro_request,
+                    &mut usage_context,
+                    &endpoint,
+                    model,
+                    preflight_model,
+                );
+                let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
+                    should_retry_payload_guard_after_error(
+                        &message,
+                        request_body.len(),
+                        retry.config.max_bytes,
+                    )
+                });
+                if let Some(retry) = cache_point_retry.filter(|_| {
+                    !should_payload_guard_retry
+                        && should_retry_without_cache_point_after_error(&message)
+                }) {
+                    retry_attempt_prefix = attempts.clone();
+                    let (retry_body, retry_kiro_request) =
+                        match retry.build_retry_body(&message, &mut usage_context) {
+                            Ok(result) => result,
+                            Err(err) => {
+                                usage_context
                             .attach_provider_error_credential(&provider, &message, attempts)
                             .with_error_metadata(provider_error_metadata(&e))
                             .record_failure(
@@ -8729,92 +8892,103 @@ async fn handle_non_stream_request(
                                     err
                                 ),
                             );
-                            return payload_guard_error_response(err);
-                        }
-                    };
-                match call_api_maybe_fail_fast(
-                    &provider,
-                    &retry_body,
-                    Some(&retry_kiro_request),
-                    Some(&request_id),
-                    external_fallback.as_ref(),
-                    capacity_weight_units,
-                    Some(model),
-                    usage_context.latency.inference_attempt_budget.clone(),
-                )
-                .await
-                {
-                    Ok(resp) => resp,
-                    Err(retry_error) => {
-                        let retry_message = retry_error.to_string();
-                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
-                        let classification_attempts = retry_attempts.clone();
-                        let all_attempts =
-                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
-                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
-                        let endpoint = usage_context.endpoint.clone();
-                        attach_and_log_tool_use_format_diagnostics(
-                            &retry_message,
-                            &retry_body,
-                            &retry_kiro_request,
-                            &mut usage_context,
-                            &endpoint,
-                            model,
-                            preflight_model,
-                        );
-                        if let Some(outcome) =
-                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                external_fallback.as_ref(),
-                                &request_id,
+                                return payload_guard_error_response(err);
+                            }
+                        };
+                    match call_api_maybe_fail_fast(
+                        &provider,
+                        &retry_body,
+                        Some(&retry_kiro_request),
+                        Some(&request_id),
+                        external_fallback.as_ref(),
+                        capacity_weight_units,
+                        Some(model),
+                        usage_context.latency.inference_attempt_budget.clone(),
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        Err(retry_error) => {
+                            let retry_message = retry_error.to_string();
+                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let classification_attempts = retry_attempts.clone();
+                            let all_attempts = merge_credential_attempts(
+                                retry_attempt_prefix.clone(),
+                                retry_attempts,
+                            );
+                            log_provider_call_failure(
                                 &retry_message,
-                                KiroProvider::call_failure_kind_from_error(&retry_error),
-                                classification_attempts,
-                                all_attempts.clone(),
-                            )
-                            .await
-                        {
-                            match outcome {
-                                ExternalPoolForwardOutcome::Response(response) => return response,
-                                ExternalPoolForwardOutcome::FinalError(err) => {
-                                    return err.into_response(&request_id);
+                                Some(&usage_context.error_id),
+                            );
+                            let endpoint = usage_context.endpoint.clone();
+                            attach_and_log_tool_use_format_diagnostics(
+                                &retry_message,
+                                &retry_body,
+                                &retry_kiro_request,
+                                &mut usage_context,
+                                &endpoint,
+                                model,
+                                preflight_model,
+                            );
+                            if let Some(outcome) =
+                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                    external_fallback.as_ref(),
+                                    &request_id,
+                                    &retry_message,
+                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    classification_attempts,
+                                    all_attempts.clone(),
+                                )
+                                .await
+                            {
+                                match outcome {
+                                    ExternalPoolForwardOutcome::Response(response) => {
+                                        return response;
+                                    }
+                                    ExternalPoolForwardOutcome::FinalError(err) => {
+                                        return err.into_response(&request_id);
+                                    }
                                 }
                             }
-                        }
-                        let error_id = usage_context.error_id.clone();
-                        usage_context
-                            .attach_provider_error_credential(
-                                &provider,
-                                &retry_message,
-                                all_attempts,
-                            )
-                            .with_error_metadata(provider_error_metadata(&retry_error))
-                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
-                        return map_provider_error_with_admission_feedback(
-                            retry_error,
-                            Some(&request_id),
-                            Some(&error_id),
-                            Some(provider.as_ref()),
-                            admission_attribution.as_ref(),
-                        );
-                    }
-                }
-            } else if let Some(retry) = too_long_retry.filter(|retry| {
-                should_retry_payload_guard_after_error(
-                    &message,
-                    request_body.len(),
-                    retry.config.max_bytes,
-                )
-            }) {
-                tracing::warn!(
-                    request_id,
-                    "Kiro non-stream request rejected as too long; applying configured payload guard and retrying once"
-                );
-                retry_attempt_prefix = attempts.clone();
-                let (retry_body, retry_warnings_header, retry_kiro_request) =
-                    match retry.build_retry_body(&mut usage_context) {
-                        Ok(result) => result,
-                        Err(err) => {
+                            let error_id = usage_context.error_id.clone();
                             usage_context
+                                .attach_provider_error_credential(
+                                    &provider,
+                                    &retry_message,
+                                    all_attempts,
+                                )
+                                .with_error_metadata(provider_error_metadata(&retry_error))
+                                .record_failure(
+                                    UsageRecordStatus::Error,
+                                    "api_error",
+                                    retry_message,
+                                );
+                            return map_provider_error_with_admission_feedback(
+                                retry_error,
+                                Some(&request_id),
+                                Some(&error_id),
+                                Some(provider.as_ref()),
+                                admission_attribution.as_ref(),
+                            );
+                        }
+                    }
+                } else if let Some(retry) = too_long_retry.filter(|retry| {
+                    should_retry_payload_guard_after_error(
+                        &message,
+                        request_body.len(),
+                        retry.config.max_bytes,
+                    )
+                }) {
+                    tracing::warn!(
+                        request_id,
+                        "Kiro non-stream request rejected as too long; applying configured payload guard and retrying once"
+                    );
+                    retry_attempt_prefix = attempts.clone();
+                    let (retry_body, retry_warnings_header, retry_kiro_request) =
+                        match retry.build_retry_body(&mut usage_context) {
+                            Ok(result) => result,
+                            Err(err) => {
+                                usage_context
                                 .attach_provider_error_credential(&provider, &message, attempts)
                                 .with_error_metadata(provider_error_metadata(&e))
                                 .record_failure(
@@ -8825,56 +8999,63 @@ async fn handle_non_stream_request(
                                     err
                                 ),
                                 );
-                            return payload_guard_error_response(err);
-                        }
-                    };
-                warnings_header = retry_warnings_header;
-                match call_api_maybe_fail_fast(
-                    &provider,
-                    &retry_body,
-                    Some(&retry_kiro_request),
-                    Some(&request_id),
-                    external_fallback.as_ref(),
-                    capacity_weight_units,
-                    Some(model),
-                    usage_context.latency.inference_attempt_budget.clone(),
-                )
-                .await
-                {
-                    Ok(resp) => resp,
-                    Err(retry_error) => {
-                        let retry_message = retry_error.to_string();
-                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
-                        let classification_attempts = retry_attempts.clone();
-                        let all_attempts =
-                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
-                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
-                        let endpoint = usage_context.endpoint.clone();
-                        attach_and_log_tool_use_format_diagnostics(
-                            &retry_message,
-                            &retry_body,
-                            &retry_kiro_request,
-                            &mut usage_context,
-                            &endpoint,
-                            model,
-                            preflight_model,
-                        );
-                        if let Some(outcome) =
-                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                external_fallback.as_ref(),
-                                &request_id,
+                                return payload_guard_error_response(err);
+                            }
+                        };
+                    warnings_header = retry_warnings_header;
+                    match call_api_maybe_fail_fast(
+                        &provider,
+                        &retry_body,
+                        Some(&retry_kiro_request),
+                        Some(&request_id),
+                        external_fallback.as_ref(),
+                        capacity_weight_units,
+                        Some(model),
+                        usage_context.latency.inference_attempt_budget.clone(),
+                    )
+                    .await
+                    {
+                        Ok(resp) => resp,
+                        Err(retry_error) => {
+                            let retry_message = retry_error.to_string();
+                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let classification_attempts = retry_attempts.clone();
+                            let all_attempts = merge_credential_attempts(
+                                retry_attempt_prefix.clone(),
+                                retry_attempts,
+                            );
+                            log_provider_call_failure(
                                 &retry_message,
-                                KiroProvider::call_failure_kind_from_error(&retry_error),
-                                classification_attempts.clone(),
-                                all_attempts.clone(),
-                            )
-                            .await
-                        {
-                            match outcome {
-                                ExternalPoolForwardOutcome::Response(response) => return response,
-                                ExternalPoolForwardOutcome::FinalError(err) => {
-                                    if let Some(external) = external_fallback.as_ref() {
-                                        let local_fallback_reason =
+                                Some(&usage_context.error_id),
+                            );
+                            let endpoint = usage_context.endpoint.clone();
+                            attach_and_log_tool_use_format_diagnostics(
+                                &retry_message,
+                                &retry_body,
+                                &retry_kiro_request,
+                                &mut usage_context,
+                                &endpoint,
+                                model,
+                                preflight_model,
+                            );
+                            if let Some(outcome) =
+                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                    external_fallback.as_ref(),
+                                    &request_id,
+                                    &retry_message,
+                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    classification_attempts.clone(),
+                                    all_attempts.clone(),
+                                )
+                                .await
+                            {
+                                match outcome {
+                                    ExternalPoolForwardOutcome::Response(response) => {
+                                        return response;
+                                    }
+                                    ExternalPoolForwardOutcome::FinalError(err) => {
+                                        if let Some(external) = external_fallback.as_ref() {
+                                            let local_fallback_reason =
                                             classify_local_error_for_external_fallback_with_kind(
                                                 &retry_message,
                                                 &classification_attempts,
@@ -8883,29 +9064,29 @@ async fn handle_non_stream_request(
                                                     &retry_error,
                                                 ),
                                             );
-                                        if let Some(reason) =
-                                            budgeted_local_rescue_reason_after_external_error(
-                                                &external.config,
-                                                &err,
-                                                local_fallback_reason.as_deref(),
-                                                external.inference_attempt_budget.as_ref(),
-                                            )
-                                        {
-                                            tracing::warn!(
-                                                request_id,
-                                                reason,
-                                                max_wait_secs = external
-                                                    .config
-                                                    .external_pool_local_rescue_max_wait_secs,
-                                                "external fallback failed with a rescuable error; retrying local credentials once"
-                                            );
-                                            usage_context.mark_local_rescue_after_external(
-                                                reason,
-                                                Some(external_rescue_preflight(reason, &err)),
-                                                err.attempts.clone(),
-                                            );
-                                            retry_attempt_prefix = all_attempts.clone();
-                                            match call_non_stream_local_rescue_after_external_error(
+                                            if let Some(reason) =
+                                                budgeted_local_rescue_reason_after_external_error(
+                                                    &external.config,
+                                                    &err,
+                                                    local_fallback_reason.as_deref(),
+                                                    external.inference_attempt_budget.as_ref(),
+                                                )
+                                            {
+                                                tracing::warn!(
+                                                    request_id,
+                                                    reason,
+                                                    max_wait_secs = external
+                                                        .config
+                                                        .external_pool_local_rescue_max_wait_secs,
+                                                    "external fallback failed with a rescuable error; retrying local credentials once"
+                                                );
+                                                usage_context.mark_local_rescue_after_external(
+                                                    reason,
+                                                    Some(external_rescue_preflight(reason, &err)),
+                                                    err.attempts.clone(),
+                                                );
+                                                retry_attempt_prefix = all_attempts.clone();
+                                                match call_non_stream_local_rescue_after_external_error(
                                                 &provider,
                                                 &retry_body,
                                                 Some(&retry_kiro_request),
@@ -8955,150 +9136,153 @@ async fn handle_non_stream_request(
                                                     );
                                                 }
                                             }
+                                            } else {
+                                                return err.into_response(&request_id);
+                                            }
                                         } else {
                                             return err.into_response(&request_id);
                                         }
-                                    } else {
-                                        return err.into_response(&request_id);
                                     }
-                                }
-                            }
-                        } else {
-                            let error_id = usage_context.error_id.clone();
-                            usage_context
-                                .attach_provider_error_credential(
-                                    &provider,
-                                    &retry_message,
-                                    all_attempts,
-                                )
-                                .with_error_metadata(provider_error_metadata(&retry_error))
-                                .record_failure(
-                                    UsageRecordStatus::Error,
-                                    "api_error",
-                                    retry_message,
-                                );
-                            return map_provider_error_with_admission_feedback(
-                                retry_error,
-                                Some(&request_id),
-                                Some(&error_id),
-                                Some(provider.as_ref()),
-                                admission_attribution.as_ref(),
-                            );
-                        }
-                    }
-                }
-            } else {
-                if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                    external_fallback.as_ref(),
-                    &request_id,
-                    &message,
-                    KiroProvider::call_failure_kind_from_error(&e),
-                    attempts.clone(),
-                )
-                .await
-                {
-                    match outcome {
-                        ExternalPoolForwardOutcome::Response(response) => return response,
-                        ExternalPoolForwardOutcome::FinalError(err) => {
-                            if let Some(external) = external_fallback.as_ref() {
-                                let local_fallback_reason =
-                                    classify_local_error_for_external_fallback_with_kind(
-                                        &message,
-                                        &attempts,
-                                        &external.config,
-                                        KiroProvider::call_failure_kind_from_error(&e),
-                                    );
-                                if let Some(reason) =
-                                    budgeted_local_rescue_reason_after_external_error(
-                                        &external.config,
-                                        &err,
-                                        local_fallback_reason.as_deref(),
-                                        external.inference_attempt_budget.as_ref(),
-                                    )
-                                {
-                                    tracing::warn!(
-                                        request_id,
-                                        reason,
-                                        max_wait_secs = external
-                                            .config
-                                            .external_pool_local_rescue_max_wait_secs,
-                                        "external fallback failed with a rescuable error; retrying local credentials once"
-                                    );
-                                    usage_context.mark_local_rescue_after_external(
-                                        reason,
-                                        Some(external_rescue_preflight(reason, &err)),
-                                        err.attempts.clone(),
-                                    );
-                                    retry_attempt_prefix = attempts.clone();
-                                    match call_non_stream_local_rescue_after_external_error(
-                                        &provider,
-                                        request_body,
-                                        Some(kiro_request),
-                                        &request_id,
-                                        external,
-                                        capacity_weight_units,
-                                        Some(model),
-                                    )
-                                    .await
-                                    {
-                                        Ok(resp) => resp,
-                                        Err(rescue_error) => {
-                                            let rescue_message = rescue_error.to_string();
-                                            let rescue_attempts =
-                                                KiroProvider::attempts_from_error(&rescue_error);
-                                            let all_attempts = merge_credential_attempts(
-                                                retry_attempt_prefix.clone(),
-                                                rescue_attempts,
-                                            );
-                                            log_provider_call_failure(
-                                                &rescue_message,
-                                                Some(&usage_context.error_id),
-                                            );
-                                            let error_id = usage_context.error_id.clone();
-                                            usage_context
-                                                .attach_provider_error_credential(
-                                                    &provider,
-                                                    &rescue_message,
-                                                    all_attempts,
-                                                )
-                                                .with_error_metadata(provider_error_metadata(
-                                                    &rescue_error,
-                                                ))
-                                                .record_failure(
-                                                    UsageRecordStatus::Error,
-                                                    "api_error",
-                                                    rescue_message,
-                                                );
-                                            return map_provider_error_with_admission_feedback(
-                                                rescue_error,
-                                                Some(&request_id),
-                                                Some(&error_id),
-                                                Some(provider.as_ref()),
-                                                admission_attribution.as_ref(),
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    return err.into_response(&request_id);
                                 }
                             } else {
-                                return err.into_response(&request_id);
+                                let error_id = usage_context.error_id.clone();
+                                usage_context
+                                    .attach_provider_error_credential(
+                                        &provider,
+                                        &retry_message,
+                                        all_attempts,
+                                    )
+                                    .with_error_metadata(provider_error_metadata(&retry_error))
+                                    .record_failure(
+                                        UsageRecordStatus::Error,
+                                        "api_error",
+                                        retry_message,
+                                    );
+                                return map_provider_error_with_admission_feedback(
+                                    retry_error,
+                                    Some(&request_id),
+                                    Some(&error_id),
+                                    Some(provider.as_ref()),
+                                    admission_attribution.as_ref(),
+                                );
                             }
                         }
                     }
                 } else {
-                    let error_id = usage_context.error_id.clone();
-                    usage_context
-                        .attach_provider_error_credential(&provider, &message, attempts)
-                        .with_error_metadata(provider_error_metadata(&e))
-                        .record_failure(UsageRecordStatus::Error, "api_error", message);
-                    return map_provider_error_with_admission_feedback(
-                        e,
-                        Some(&request_id),
-                        Some(&error_id),
-                        Some(provider.as_ref()),
-                        admission_attribution.as_ref(),
-                    );
+                    if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
+                        external_fallback.as_ref(),
+                        &request_id,
+                        &message,
+                        KiroProvider::call_failure_kind_from_error(&e),
+                        attempts.clone(),
+                    )
+                    .await
+                    {
+                        match outcome {
+                            ExternalPoolForwardOutcome::Response(response) => return response,
+                            ExternalPoolForwardOutcome::FinalError(err) => {
+                                if let Some(external) = external_fallback.as_ref() {
+                                    let local_fallback_reason =
+                                        classify_local_error_for_external_fallback_with_kind(
+                                            &message,
+                                            &attempts,
+                                            &external.config,
+                                            KiroProvider::call_failure_kind_from_error(&e),
+                                        );
+                                    if let Some(reason) =
+                                        budgeted_local_rescue_reason_after_external_error(
+                                            &external.config,
+                                            &err,
+                                            local_fallback_reason.as_deref(),
+                                            external.inference_attempt_budget.as_ref(),
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            request_id,
+                                            reason,
+                                            max_wait_secs = external
+                                                .config
+                                                .external_pool_local_rescue_max_wait_secs,
+                                            "external fallback failed with a rescuable error; retrying local credentials once"
+                                        );
+                                        usage_context.mark_local_rescue_after_external(
+                                            reason,
+                                            Some(external_rescue_preflight(reason, &err)),
+                                            err.attempts.clone(),
+                                        );
+                                        retry_attempt_prefix = attempts.clone();
+                                        match call_non_stream_local_rescue_after_external_error(
+                                            &provider,
+                                            request_body,
+                                            Some(kiro_request),
+                                            &request_id,
+                                            external,
+                                            capacity_weight_units,
+                                            Some(model),
+                                        )
+                                        .await
+                                        {
+                                            Ok(resp) => resp,
+                                            Err(rescue_error) => {
+                                                let rescue_message = rescue_error.to_string();
+                                                let rescue_attempts =
+                                                    KiroProvider::attempts_from_error(
+                                                        &rescue_error,
+                                                    );
+                                                let all_attempts = merge_credential_attempts(
+                                                    retry_attempt_prefix.clone(),
+                                                    rescue_attempts,
+                                                );
+                                                log_provider_call_failure(
+                                                    &rescue_message,
+                                                    Some(&usage_context.error_id),
+                                                );
+                                                let error_id = usage_context.error_id.clone();
+                                                usage_context
+                                                    .attach_provider_error_credential(
+                                                        &provider,
+                                                        &rescue_message,
+                                                        all_attempts,
+                                                    )
+                                                    .with_error_metadata(provider_error_metadata(
+                                                        &rescue_error,
+                                                    ))
+                                                    .record_failure(
+                                                        UsageRecordStatus::Error,
+                                                        "api_error",
+                                                        rescue_message,
+                                                    );
+                                                return map_provider_error_with_admission_feedback(
+                                                    rescue_error,
+                                                    Some(&request_id),
+                                                    Some(&error_id),
+                                                    Some(provider.as_ref()),
+                                                    admission_attribution.as_ref(),
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        return err.into_response(&request_id);
+                                    }
+                                } else {
+                                    return err.into_response(&request_id);
+                                }
+                            }
+                        }
+                    } else {
+                        let error_id = usage_context.error_id.clone();
+                        usage_context
+                            .attach_provider_error_credential(&provider, &message, attempts)
+                            .with_error_metadata(provider_error_metadata(&e))
+                            .record_failure(UsageRecordStatus::Error, "api_error", message);
+                        return map_provider_error_with_admission_feedback(
+                            e,
+                            Some(&request_id),
+                            Some(&error_id),
+                            Some(provider.as_ref()),
+                            admission_attribution.as_ref(),
+                        );
+                    }
                 }
             }
         }

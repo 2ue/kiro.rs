@@ -716,7 +716,7 @@ kiro_payload_trim_history = true
 
 ### 7.2 P0：增强 Improperly formed request 诊断
 
-当前已经有文档 `docs/kiro-400-improperly-formed-request-analysis.md` 分析 400。
+当前已经有文档 [`../request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md`](../request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md) 分析 400。
 
 下一步建议在运行日志/调用链路里补齐：
 

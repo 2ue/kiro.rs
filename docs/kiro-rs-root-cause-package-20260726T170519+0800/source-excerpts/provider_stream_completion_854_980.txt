@@ -1,0 +1,127 @@
+   854	/// 流式调用完成上报器。
+   855	///
+   856	/// Provider 只能确认上游返回了成功响应头；流式 body 是否完整消费需要
+   857	/// SSE 处理链路在 EOF、读错误或 idle timeout 时回报。
+   858	pub struct KiroStreamCompletion {
+   859	    token_manager: Arc<MultiTokenManager>,
+   860	    credential_id: u64,
+   861	    in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
+   862	    session_id: Option<String>,
+   863	    model: Option<String>,
+   864	    sticky_bound: bool,
+   865	    fallback_from_sticky: bool,
+   866	    attempts: Vec<KiroCredentialAttempt>,
+   867	    reported: AtomicBool,
+   868	    started_at: Instant,
+   869	}
+   870	
+   871	impl KiroStreamCompletion {
+   872	    fn new(
+   873	        token_manager: Arc<MultiTokenManager>,
+   874	        credential_id: u64,
+   875	        in_flight_lease: Option<InFlightLeaseGuard>,
+   876	        session_id: Option<String>,
+   877	        model: Option<String>,
+   878	        sticky_bound: bool,
+   879	        fallback_from_sticky: bool,
+   880	        attempts: Vec<KiroCredentialAttempt>,
+   881	        started_at: Instant,
+   882	    ) -> Self {
+   883	        Self {
+   884	            token_manager,
+   885	            credential_id,
+   886	            in_flight_lease: Mutex::new(in_flight_lease),
+   887	            session_id,
+   888	            model,
+   889	            sticky_bound,
+   890	            fallback_from_sticky,
+   891	            attempts,
+   892	            reported: AtomicBool::new(false),
+   893	            started_at,
+   894	        }
+   895	    }
+   896	
+   897	    /// 上游流正常 EOF 后调用，计入成功并清理 sticky 软失败计数。
+   898	    pub fn report_success(&self) {
+   899	        if self.reported.swap(true, Ordering::AcqRel) {
+   900	            return;
+   901	        }
+   902	        self.token_manager.report_success_for_session_with_latency(
+   903	            self.credential_id,
+   904	            self.model.as_deref(),
+   905	            self.session_id.as_deref(),
+   906	            Some(self.started_at.elapsed()),
+   907	        );
+   908	        self.in_flight_lease.lock().take();
+   909	    }
+   910	
+   911	    /// 上游流中断、idle timeout 或上游错误事件时调用。
+   912	    ///
+   913	    /// 这里不调用 `report_failure`，避免瞬态流读取问题直接禁用账号。
+   914	    pub fn report_soft_failure(&self) {
+   915	        if self.reported.swap(true, Ordering::AcqRel) {
+   916	            return;
+   917	        }
+   918	        if let Some(session_id) = self.session_id.as_deref() {
+   919	            self.token_manager
+   920	                .record_session_soft_failure(session_id, self.credential_id);
+   921	        }
+   922	        self.in_flight_lease.lock().take();
+   923	    }
+   924	
+   925	    /// 上游流读取错误、idle timeout 或上游错误事件时调用，并让调度器短暂避开该凭据。
+   926	    pub fn report_upstream_stream_failure(&self, reason: impl Into<String>) {
+   927	        if self.reported.swap(true, Ordering::AcqRel) {
+   928	            return;
+   929	        }
+   930	        let reason = reason.into();
+   931	        if let Err(err) = self.token_manager.report_transient_failure_kind(
+   932	            self.credential_id,
+   933	            self.model.as_deref(),
+   934	            TransientFailureKind::Stream,
+   935	            None,
+   936	            format!("stream_error {}", reason),
+   937	        ) {
+   938	            tracing::warn!(
+   939	                credential_id = self.credential_id,
+   940	                "记录上游流式失败冷却失败: {}",
+   941	                err
+   942	            );
+   943	        }
+   944	        if let Some(session_id) = self.session_id.as_deref() {
+   945	            self.token_manager
+   946	                .record_session_soft_failure(session_id, self.credential_id);
+   947	        }
+   948	        self.in_flight_lease.lock().take();
+   949	    }
+   950	
+   951	    pub fn touch(&self) {
+   952	        if let Some(lease) = self.in_flight_lease.lock().as_ref() {
+   953	            lease.touch();
+   954	        }
+   955	    }
+   956	
+   957	    pub fn credential_id(&self) -> u64 {
+   958	        self.credential_id
+   959	    }
+   960	
+   961	    pub fn sticky_bound(&self) -> bool {
+   962	        self.sticky_bound
+   963	    }
+   964	
+   965	    pub fn fallback_from_sticky(&self) -> bool {
+   966	        self.fallback_from_sticky
+   967	    }
+   968	
+   969	    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+   970	        &self.attempts
+   971	    }
+   972	}
+   973	
+   974	impl Drop for KiroStreamCompletion {
+   975	    fn drop(&mut self) {
+   976	        if self.reported.load(Ordering::Acquire) {
+   977	            return;
+   978	        }
+   979	        self.report_soft_failure();
+   980	    }

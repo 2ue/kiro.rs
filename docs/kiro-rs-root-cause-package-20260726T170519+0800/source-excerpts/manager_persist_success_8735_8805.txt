@@ -1,0 +1,71 @@
+  8735	        let mut changed = false;
+  8736	        for entry in entries.iter_mut() {
+  8737	            if entry.runtime_persistence_degraded {
+  8738	                continue;
+  8739	            }
+  8740	            if let Some(state) = states.get(&entry.id) {
+  8741	                changed |= Self::apply_runtime_state_if_newer(entry, state);
+  8742	            }
+  8743	        }
+  8744	        changed
+  8745	    }
+  8746	
+  8747	    fn persist_success_state(&self, id: u64, expected_generation: u64, last_used_at: &str) -> bool {
+  8748	        let operation_id = uuid::Uuid::new_v4();
+  8749	        let queue_without_attempt = self.postgres_store.is_some()
+  8750	            && (self.has_pending_runtime_mutations(id)
+  8751	                || self
+  8752	                    .entries
+  8753	                    .lock()
+  8754	                    .iter()
+  8755	                    .find(|entry| entry.id == id)
+  8756	                    .is_some_and(|entry| entry.runtime_persistence_degraded));
+  8757	        if queue_without_attempt {
+  8758	            self.enqueue_pending_runtime_mutation(
+  8759	                id,
+  8760	                PendingCredentialRuntimeMutation::Success {
+  8761	                    operation_id,
+  8762	                    expected_generation,
+  8763	                    success_count: 1,
+  8764	                },
+  8765	            );
+  8766	        }
+  8767	        if !queue_without_attempt {
+  8768	            if let Some(store) = &self.postgres_store {
+  8769	                let store = store.clone();
+  8770	                match block_on_credential_pgsql("原子记录 PgSQL 凭据调用成功", async move {
+  8771	                    store
+  8772	                        .record_credential_success_if_runtime_dirty_at_generation(
+  8773	                            id,
+  8774	                            operation_id,
+  8775	                            expected_generation,
+  8776	                        )
+  8777	                        .await
+  8778	                }) {
+  8779	                    Ok(result) => {
+  8780	                        let disabled = {
+  8781	                            let mut entries = self.entries.lock();
+  8782	                            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id)
+  8783	                            else {
+  8784	                                return false;
+  8785	                            };
+  8786	                            Self::apply_runtime_mutation_result_to_entry(entry, &result);
+  8787	                            entry.disabled
+  8788	                        };
+  8789	                        self.record_success_stats_delta(id, last_used_at);
+  8790	                        return disabled;
+  8791	                    }
+  8792	                    Err(err) => {
+  8793	                        tracing::warn!(
+  8794	                            credential_id = id,
+  8795	                            %operation_id,
+  8796	                            "{}；保留相同 operation ID 等待 PgSQL 恢复后重放",
+  8797	                            err
+  8798	                        );
+  8799	                        self.enqueue_pending_runtime_mutation(
+  8800	                            id,
+  8801	                            PendingCredentialRuntimeMutation::Success {
+  8802	                                operation_id,
+  8803	                                expected_generation,
+  8804	                                success_count: 1,
+  8805	                            },

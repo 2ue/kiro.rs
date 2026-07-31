@@ -4701,16 +4701,26 @@ fn all_parsed_external_fallback_entrypoints_share_model_and_body_mode_eligibilit
     let source = include_str!("../handlers.rs");
     assert_eq!(
         source
-            .matches(".has_eligible_external_pool_for_model(")
+            .matches("fn has_eligible_external_pool_for_model")
             .count(),
-        3,
-        "local attempt policy, parsed preflight and local-error fallback must share one route eligibility query"
+        1
     );
     assert_eq!(
         source
-            .matches("async fn has_eligible_external_pool_for_model")
+            .matches("fn has_immediately_available_external_pool_for_model")
             .count(),
         1
+    );
+    assert_eq!(
+        source
+            .matches(".external_pool_ready_for_route_reason(")
+            .count(),
+        2,
+        "parsed preflight and local-error fallback must share the route-reason availability gate"
+    );
+    assert!(
+        source.contains(".has_cached_immediately_available_pool_for_model("),
+        "local attempt policy must only switch to fail-fast when cached external capacity is immediately available"
     );
     assert!(
         source.contains("match external_fallback_body_mode_filter(self.requires_normalized_body)")
@@ -9182,7 +9192,7 @@ fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
 }
 
 #[test]
-fn fresh_local_pool_state_blocks_external_while_any_local_account_is_dispatchable() {
+fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_states() {
     let mut config = ExternalPoolsConfig::default();
 
     assert_eq!(
@@ -9236,8 +9246,8 @@ fn fresh_local_pool_state_blocks_external_while_any_local_account_is_dispatchabl
             1,
             &config,
         ),
-        None,
-        "when local memory still has dispatchable accounts, Redis degraded must be handled by the bounded local acquire path instead of preflight-routing the whole burst to external"
+        Some("local_scheduler_redis_degraded"),
+        "Redis scheduler degraded means distributed lease state is not trustworthy; stale in-memory dispatchable capacity must not suppress external fallback"
     );
 
     config.fallback_on_unsupported_model = true;
@@ -9524,6 +9534,149 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
             ),
             None,
             "round {round}: exhausted budget must skip rescue before logging or waiting"
+        );
+    }
+}
+
+#[test]
+fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_rounds() {
+    use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_direct_policy_enabled: true,
+        ..Default::default()
+    };
+
+    let errors = [
+        ExternalPoolFinalError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            response_error_type: "rate_limit_error".to_string(),
+            route_error_type: "rate_limit".to_string(),
+            message: "external rate limit".to_string(),
+            error_id: "req_direct_rate".to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("direct".to_string()),
+        },
+        ExternalPoolFinalError {
+            status: StatusCode::BAD_GATEWAY,
+            response_error_type: "api_error".to_string(),
+            route_error_type: "network_error".to_string(),
+            message: "external timeout".to_string(),
+            error_id: "req_direct_timeout".to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("direct".to_string()),
+        },
+        ExternalPoolFinalError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            response_error_type: "api_error".to_string(),
+            route_error_type: "external_pool_capacity_full".to_string(),
+            message: "external capacity full".to_string(),
+            error_id: "req_direct_capacity".to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: None,
+            pool_name: None,
+        },
+        ExternalPoolFinalError {
+            status: StatusCode::BAD_REQUEST,
+            response_error_type: "invalid_request_error".to_string(),
+            route_error_type: "client_error".to_string(),
+            message: "external bad request".to_string(),
+            error_id: "req_direct_bad_request".to_string(),
+            retryable: false,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("direct".to_string()),
+        },
+        ExternalPoolFinalError {
+            status: StatusCode::BAD_GATEWAY,
+            response_error_type: "api_error".to_string(),
+            route_error_type: "server_error".to_string(),
+            message: "external server error".to_string(),
+            error_id: "req_direct_server".to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("direct".to_string()),
+        },
+    ];
+
+    for round in 1..=5 {
+        for err in &errors {
+            assert_eq!(
+                local_rescue_reason_after_external_error(&config, err, Some("local_preflight")),
+                None,
+                "round {round}: direct external policy must not route external failures back to local"
+            );
+
+            let budget = InferenceAttemptBudget::new(4);
+            budget
+                .reserve(InferenceAttemptKind::ExternalPool, 0)
+                .unwrap();
+            assert_eq!(
+                budgeted_local_rescue_reason_after_external_error(
+                    &config,
+                    err,
+                    Some("local_preflight"),
+                    &budget,
+                ),
+                None,
+                "round {round}: direct external policy must ignore remaining attempt budget"
+            );
+        }
+    }
+}
+
+#[test]
+fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds() {
+    use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
+
+    let config = ExternalPoolsConfig::default();
+    let capacity = ExternalPoolFinalError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        response_error_type: "api_error".to_string(),
+        route_error_type: "external_pool_capacity_full".to_string(),
+        message: "No available external fallback pools".to_string(),
+        error_id: "req_preflight_capacity".to_string(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: None,
+        pool_name: None,
+    };
+
+    for round in 1..=5 {
+        let budget = InferenceAttemptBudget::new(2);
+        budget
+            .reserve(InferenceAttemptKind::ExternalPool, 0)
+            .unwrap();
+        assert_eq!(
+            budgeted_local_rescue_reason_after_external_error(
+                &config,
+                &capacity,
+                Some("local_preflight"),
+                &budget,
+            ),
+            Some("external_capacity"),
+            "round {round}: preflight external capacity failure may wait for one local rescue"
+        );
+
+        budget
+            .reserve(InferenceAttemptKind::LocalCredential, 0)
+            .unwrap();
+        assert_eq!(
+            budgeted_local_rescue_reason_after_external_error(
+                &config,
+                &capacity,
+                Some("local_preflight"),
+                &budget,
+            ),
+            None,
+            "round {round}: once external+local rescue consumed the two-send budget, no second external/local cycle is permitted"
         );
     }
 }

@@ -57,8 +57,8 @@ fn finite_external_queue_lease_covers_wait_without_periodic_renewal() {
         let default_wait = ExternalPoolsConfig::default().effective_dispatch_max_wait_secs();
         let default_policy =
             external_pool_queue_lease_policy(Some(Duration::from_secs(default_wait)));
-        assert_eq!(default_wait, 30, "round {round}");
-        assert_eq!(default_policy.ttl_secs, 90, "round {round}");
+        assert_eq!(default_wait, 5, "round {round}");
+        assert_eq!(default_policy.ttl_secs, 65, "round {round}");
         assert!(!default_policy.renewal_required, "round {round}");
 
         let long_policy = external_pool_queue_lease_policy(Some(Duration::from_secs(120)));
@@ -1651,9 +1651,11 @@ async fn external_pool_manager_uncached_snapshot_detects_full_pool_after_availab
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pools_enabled = true;
-    config.external_pool_global_max_concurrent_requests = 0;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 0,
+        ..ExternalPoolsConfig::default()
+    };
 
     let pool = postgres
         .create_external_pool(create_pool_request("external-stale-cache", 1, true))
@@ -1692,9 +1694,11 @@ async fn external_pool_immediate_availability_requires_current_capacity_and_reco
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pools_enabled = true;
-    config.external_pool_global_max_concurrent_requests = 0;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 0,
+        ..ExternalPoolsConfig::default()
+    };
 
     let pool = postgres
         .create_external_pool(create_pool_request("external-immediate-capacity", 1, true))
@@ -1745,6 +1749,153 @@ async fn external_pool_immediate_availability_requires_current_capacity_and_reco
             )
             .await,
         "external immediate availability must recover after the external lease is released"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_cached_immediate_availability_is_no_wait_under_pg_lock_for_five_rounds() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 0,
+        ..ExternalPoolsConfig::default()
+    };
+
+    postgres
+        .create_external_pool(create_pool_request("external-cached-no-wait", 1, true))
+        .await
+        .unwrap();
+
+    for round in 1..=5 {
+        manager.invalidate_static_pool_snapshot();
+        let blocker = lock_external_pool_table(&postgres).await;
+        let loads_before = manager.authoritative_pool_snapshot_pg_loads_for_test();
+        let wave_manager = manager.clone();
+        let wave_config = config.clone();
+        let started = Instant::now();
+        let wave = tokio::spawn(async move {
+            futures::future::join_all((0..128).map(|_| {
+                let manager = wave_manager.clone();
+                let config = wave_config.clone();
+                async move {
+                    manager
+                        .has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4")
+                }
+            }))
+            .await
+        });
+        let results = timeout(Duration::from_millis(250), wave)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("round {round}: cached local gate waited for locked Postgres")
+            })
+            .unwrap();
+        assert!(
+            results.iter().all(|available| !*available),
+            "round {round}: cold cached gate must preserve local semantics until a snapshot is ready"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "round {round}: cached local gate must not wait for authoritative refresh"
+        );
+        assert!(
+            manager.authoritative_pool_snapshot_pg_loads_for_test() <= loads_before + 1,
+            "round {round}: c128 cached local gate may start at most one background PG refresh"
+        );
+
+        unlock_external_pool_table(blocker).await;
+        let snapshot = timeout(
+            Duration::from_secs(2),
+            manager.load_authoritative_pool_snapshot(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: background refresh did not recover"))
+        .expect("authoritative snapshot should recover after table unlock");
+        assert!(
+            !snapshot.is_empty(),
+            "round {round}: recovered authoritative snapshot should contain the pool"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_cached_immediate_availability_uses_cached_runtime_capacity() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 0,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-cached-runtime", 1, true))
+        .await
+        .unwrap();
+
+    assert!(
+        !manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cold cached route gate must not synchronously read Redis/PgSQL"
+    );
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "authoritative availability should populate the runtime cache"
+    );
+    assert!(
+        manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cached route gate should use the warmed authoritative/runtime snapshots"
+    );
+
+    let lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!("pool lease should be acquired: {}", unavailable.detail)
+        }
+    };
+    assert!(
+        !manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "authoritative availability should observe the full external pool"
+    );
+    assert!(
+        !manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cached route gate must not steer local traffic to a full external pool"
+    );
+
+    drop(lease);
+    let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
+    assert!(drained.drained, "external release should drain");
+    assert!(
+        manager
+            .has_immediately_available_pool_for_model(
+                &config,
+                "claude-sonnet-4",
+                Duration::from_secs(2),
+            )
+            .await,
+        "authoritative availability should recover after release"
+    );
+    assert!(
+        manager.has_cached_immediately_available_pool_for_model(&config, "claude-sonnet-4"),
+        "cached route gate should recover after release and runtime cache refresh"
     );
 
     postgres.drop_test_schema().await.unwrap();
@@ -3916,7 +4067,7 @@ async fn legacy_zero_external_wait_reaches_a_bounded_final_error() {
         external_pool_dispatch_max_wait_secs: 0,
         ..ExternalPoolsConfig::default()
     };
-    assert_eq!(config.effective_dispatch_max_wait_secs(), 30);
+    assert_eq!(config.effective_dispatch_max_wait_secs(), 5);
 
     let route = test_route("claude-sonnet-4-5");
     let mut queue_guard = None;

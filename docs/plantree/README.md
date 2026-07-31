@@ -2,7 +2,7 @@
 
 Role: Durable planning registry and authority entrypoint
 
-Status: Current as of 2026-07-21
+Status: Current as of 2026-07-28
 
 Authority: Defines how project-wide facts, accepted decisions, plan state, and historical evidence are retrieved
 
@@ -36,6 +36,7 @@ Current-state facts and target-state decisions answer different questions and mu
 
 | Plan | Status | Current Phase | Last Landed | Next Target |
 | --- | --- | --- | --- | --- |
+| [Rust Runtime Scheduler Stabilization](plans/rust-runtime-scheduler-stabilization/README.md) | In Progress | Current Rust runtime/scheduler production stabilization: external-pool hot path fixed; scheduler architecture, cooldown policy, thinking signature, validation gates and document disposition remain active | 2026-07-28: cached/no-wait external-pool local-route gate implemented and locally validated with real PgSQL/Redis focused tests; active TODOs migrated from `feature/todo` into this plan | Finish first documentation archive batch, then implement explicit local capacity overflow policy and scheduler/external-pool chaos matrix |
 | [Greenfield AI Gateway](plans/greenfield-ai-gateway/README.md) | Architecture Plan Ready For Review | New-repository Go/React target, module contracts, Kiro V1 scope, technology stack, references, complete work graph and acceptance gates documented; implementation Not Started | 2026-07-13: [complete reconstruction plan](plans/greenfield-ai-gateway/topics/complete-reconstruction-plan.md), [reference review](plans/greenfield-ai-gateway/topics/reference-projects-and-template-selection.md) and [decision 001](plans/greenfield-ai-gateway/decisions/001-greenfield-go-modular-ai-gateway.md) created | Accept the plan, choose the new repository name/location and create the target repository |
 | [System architecture modernization](plans/system-architecture-modernization/README.md) | Superseded / Historical Reference | Rust target implementation never started; findings and selected invariants remain reference inputs for the greenfield plan | 2026-07-13: [supersession record](plans/system-architecture-modernization/history/superseded-by-greenfield-ai-gateway-2026-07-13.md) maps retained evidence and rejected target topology | No target implementation; preserve until a link-safe archive pass |
 | [Runtime correctness and release gates](plans/runtime-correctness-and-release-gates/README.md) | Released / v0.0.114 | v0.0.114 runtime protocol, retry, scheduler, storage, UI, upgrade and release hardening | 2026-07-23: [final release gate](../../feature/evidence/final-release-gate-20260723.md) passed Rust scoped C0/release, Node contracts, feature docs, diff and inventory for frozen `kiro-rs` SHA `925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee`; [release log](../../feature/releases/README.md) records work commit `b528ead`, release commit `beb9b34`, tag `v0.0.114`; 2026-07-22 [regression rerun](../../feature/evidence/final-regression-rerun-20260722.md) covers real Claude CLI long session, thinking wire, body/reasoning, scheduler/Redis/external takeover and fault-domain checks | Post-release observation; keep deferred Docker/production/native-upstream gaps explicit |

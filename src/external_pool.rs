@@ -3678,6 +3678,7 @@ impl ExternalPoolManager {
         self.publish_static_pool_snapshot_success(generation, pools)
     }
 
+    #[cfg(test)]
     async fn load_static_pool_snapshot(&self) -> Arc<Vec<ExternalPoolEligibility>> {
         let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
         match self.static_pool_snapshot_state(generation) {
@@ -3846,6 +3847,46 @@ impl ExternalPoolManager {
             return;
         };
         self.spawn_authoritative_pool_snapshot_refresh(generation, refresh_guard);
+    }
+
+    fn cached_static_pool_snapshot_for_local_route(
+        &self,
+    ) -> Option<Arc<Vec<ExternalPoolEligibility>>> {
+        let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
+        match self.static_pool_snapshot_state(generation) {
+            Some(CachedStaticPoolSnapshotState::Fresh(pools)) => Some(pools),
+            Some(CachedStaticPoolSnapshotState::Stale(pools)) => {
+                self.maybe_spawn_static_pool_snapshot_refresh(generation);
+                Some(pools)
+            }
+            None => {
+                self.maybe_spawn_static_pool_snapshot_refresh(generation);
+                None
+            }
+        }
+    }
+
+    fn cached_authoritative_pool_snapshot_for_local_route(&self) -> Option<Arc<Vec<ExternalPool>>> {
+        let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
+        match self.cached_authoritative_pool_snapshot(generation) {
+            Some(CachedAuthoritativePoolSnapshotState::Fresh(Ok(pools))) => Some(pools),
+            Some(CachedAuthoritativePoolSnapshotState::Fresh(Err(err))) => {
+                tracing::debug!(
+                    unavailable_kind = err.kind.as_str(),
+                    retry_after_ms = err.retry_after.as_millis() as u64,
+                    "外部池权威快照当前不可用；本地主路径保持本地调度语义"
+                );
+                None
+            }
+            Some(CachedAuthoritativePoolSnapshotState::Stale(pools)) => {
+                self.maybe_spawn_authoritative_pool_snapshot_refresh(generation);
+                Some(pools)
+            }
+            None => {
+                self.maybe_spawn_authoritative_pool_snapshot_refresh(generation);
+                None
+            }
+        }
     }
 
     async fn refresh_authoritative_pool_snapshot(
@@ -4186,6 +4227,7 @@ impl ExternalPoolManager {
         self.has_eligible_pool_matching(config, None, None).await
     }
 
+    #[cfg(test)]
     pub async fn has_eligible_pool_for_model(
         &self,
         config: &ExternalPoolsConfig,
@@ -4196,6 +4238,7 @@ impl ExternalPoolManager {
             .await
     }
 
+    #[cfg(test)]
     pub async fn has_eligible_pool_for_body_mode_and_model(
         &self,
         config: &ExternalPoolsConfig,
@@ -4207,6 +4250,47 @@ impl ExternalPoolManager {
             .await
     }
 
+    pub fn has_cached_eligible_pool_for_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        model: &str,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_cached_eligible_pool_matching(config, None, Some(&model_candidates))
+    }
+
+    pub fn has_cached_eligible_pool_for_body_mode_and_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode: ExternalPoolRequestBodyMode,
+        model: Option<&str>,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates(model);
+        self.has_cached_eligible_pool_matching(config, Some(body_mode), Some(&model_candidates))
+    }
+
+    fn has_cached_eligible_pool_matching(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+        model_candidates: Option<&[String]>,
+    ) -> bool {
+        if !config.external_pools_enabled {
+            return false;
+        }
+        let Some(pools) = self.cached_static_pool_snapshot_for_local_route() else {
+            return false;
+        };
+        let now = Utc::now();
+        pools.iter().any(|pool| {
+            pool.enabled
+                && !pool.is_auto_disabled_at(now)
+                && body_mode_filter.is_none_or(|mode| pool.request_body_mode == mode)
+                && external_pool_eligibility_matches_supported_models(pool, model_candidates)
+        })
+    }
+
+    #[cfg(test)]
     pub async fn has_immediately_available_pool_for_model(
         &self,
         config: &ExternalPoolsConfig,
@@ -4223,23 +4307,30 @@ impl ExternalPoolManager {
         .await
     }
 
-    pub async fn has_immediately_available_pool_for_body_mode_and_model(
+    pub fn has_cached_immediately_available_pool_for_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        model: &str,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_cached_immediately_available_pool_matching(config, None, Some(&model_candidates))
+    }
+
+    pub fn has_cached_immediately_available_pool_for_body_mode_and_model(
         &self,
         config: &ExternalPoolsConfig,
         body_mode: ExternalPoolRequestBodyMode,
         model: Option<&str>,
-        max_wait: Duration,
     ) -> bool {
         let model_candidates = normalize_external_pool_support_candidates(model);
-        self.has_immediately_available_pool_matching(
+        self.has_cached_immediately_available_pool_matching(
             config,
             Some(body_mode),
             Some(&model_candidates),
-            max_wait,
         )
-        .await
     }
 
+    #[cfg(test)]
     async fn has_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
@@ -4259,6 +4350,60 @@ impl ExternalPoolManager {
         })
     }
 
+    fn has_cached_immediately_available_pool_matching(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+        model_candidates: Option<&[String]>,
+    ) -> bool {
+        if !config.external_pools_enabled {
+            return false;
+        }
+        let Some(authoritative_pools) = self.cached_authoritative_pool_snapshot_for_local_route()
+        else {
+            return false;
+        };
+        let pools = authoritative_pools
+            .iter()
+            .filter(|pool| {
+                pool.enabled
+                    && !pool.is_auto_disabled_now()
+                    && external_pool_matches_body_mode_filter(pool, body_mode_filter)
+                    && external_pool_matches_supported_models_normalized(pool, model_candidates)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if pools.is_empty() {
+            return false;
+        }
+
+        let requested_model_cooldowns: &[String] = if config
+            .external_pool_model_unavailable_cooldown_mode
+            == ExternalPoolModelUnavailableCooldownMode::Model
+        {
+            model_candidates.unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let pool_ids = pools.iter().map(|pool| pool.id).collect::<Vec<_>>();
+        let key = SelectionRuntimeSnapshotKey {
+            pool_ids,
+            models: requested_model_cooldowns.to_vec(),
+        };
+        let Some(cached_runtimes) = self.cached_selection_runtime_snapshots(&key) else {
+            self.maybe_spawn_selection_runtime_snapshot_refresh(key);
+            return false;
+        };
+        let selection = self.scan_pool_availability_from_filtered_pools_and_runtimes(
+            pools,
+            materialize_selection_runtime_snapshots(cached_runtimes),
+            config,
+            true,
+        );
+        selection.selected_pool.is_some() || selection.availability.available_pools > 0
+    }
+
+    #[cfg(test)]
     async fn has_immediately_available_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
@@ -5593,7 +5738,6 @@ impl ExternalPoolManager {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut candidates = include_selection.then(Vec::new);
         let mut availability = PoolAvailabilitySnapshot {
             eligible_pools: pools.len(),
             ..PoolAvailabilitySnapshot::default()
@@ -5645,6 +5789,26 @@ impl ExternalPoolManager {
                     degraded_fallback_local_lease: false,
                 };
             }
+        };
+        self.scan_pool_availability_from_filtered_pools_and_runtimes(
+            pools,
+            runtimes,
+            config,
+            include_selection,
+        )
+    }
+
+    fn scan_pool_availability_from_filtered_pools_and_runtimes(
+        &self,
+        pools: Vec<ExternalPool>,
+        runtimes: Vec<anyhow::Result<PoolRuntimeSnapshot>>,
+        config: &ExternalPoolsConfig,
+        include_selection: bool,
+    ) -> PoolSelectionSnapshot {
+        let mut candidates = include_selection.then(Vec::new);
+        let mut availability = PoolAvailabilitySnapshot {
+            eligible_pools: pools.len(),
+            ..PoolAvailabilitySnapshot::default()
         };
         for (pool, runtime) in pools.into_iter().zip(runtimes) {
             let runtime = match runtime {
@@ -6647,6 +6811,50 @@ impl ExternalPoolManager {
             expires_at: Instant::now() + EXTERNAL_POOL_SELECTION_RUNTIME_SNAPSHOT_TTL,
         });
         Ok(materialize_selection_runtime_snapshots(cacheable))
+    }
+
+    fn maybe_spawn_selection_runtime_snapshot_refresh(&self, key: SelectionRuntimeSnapshotKey) {
+        if self.cached_selection_runtime_snapshots(&key).is_some() {
+            return;
+        }
+        let Ok(refresh_guard) = self
+            .selection_runtime_snapshot_refresh_lock
+            .clone()
+            .try_lock_owned()
+        else {
+            return;
+        };
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let _refresh_guard = refresh_guard;
+            if manager.cached_selection_runtime_snapshots(&key).is_some() {
+                return;
+            }
+            let snapshots = match manager
+                .load_pool_runtime_snapshots(&key.pool_ids, &key.models)
+                .await
+            {
+                Ok(snapshots) => snapshots,
+                Err(err) => {
+                    tracing::debug!(
+                        pool_count = key.pool_ids.len(),
+                        model_count = key.models.len(),
+                        error = %err,
+                        "外部池运行态后台刷新失败；本地主路径保持本地调度语义"
+                    );
+                    return;
+                }
+            };
+            let cacheable = snapshots
+                .into_iter()
+                .map(|snapshot| snapshot.map_err(|err| err.to_string()))
+                .collect::<Vec<_>>();
+            *manager.selection_runtime_snapshot.lock() = Some(CachedSelectionRuntimeSnapshot {
+                key,
+                snapshots: cacheable,
+                expires_at: Instant::now() + EXTERNAL_POOL_SELECTION_RUNTIME_SNAPSHOT_TTL,
+            });
+        });
     }
 
     fn cached_selection_runtime_snapshots(

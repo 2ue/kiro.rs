@@ -1,0 +1,221 @@
+  4235	        &self,
+  4236	        id: u64,
+  4237	        request_weight_units: u32,
+  4238	    ) -> anyhow::Result<SchedulerRedisSelectionAdmission> {
+  4239	        let now = Instant::now();
+  4240	        let now_ms = Utc::now().timestamp_millis();
+  4241	        let rpm = {
+  4242	            let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+  4243	            let entries = self.entries.lock();
+  4244	            entries
+  4245	                .iter()
+  4246	                .find(|entry| entry.id == id)
+  4247	                .map(|entry| effective_rpm(entry, global_rpm))
+  4248	                .unwrap_or(global_rpm)
+  4249	        };
+  4250	        if rpm == 0 || self.redis_store.is_none() {
+  4251	            return Ok(SchedulerRedisSelectionAdmission::NotRequired);
+  4252	        }
+  4253	
+  4254	        let Some(redis) = &self.redis_store else {
+  4255	            return Ok(SchedulerRedisSelectionAdmission::NotRequired);
+  4256	        };
+  4257	        let redis = redis.clone();
+  4258	        let response = match self
+  4259	            .await_scheduler_redis_hot_outcome("原子记录 Redis 调度选中次数", || {}, async move {
+  4260	                redis
+  4261	                    .try_record_scheduler_selection(id, rpm, request_weight_units)
+  4262	                    .await
+  4263	            })
+  4264	            .await
+  4265	        {
+  4266	            SchedulerRedisHotOutcome::Completed(response) => response,
+  4267	            SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {
+  4268	                return Err(SchedulerRedisUnavailableError {
+  4269	                    retry_after_secs: 1,
+  4270	                    local_overloaded: true,
+  4271	                }
+  4272	                .into());
+  4273	            }
+  4274	            SchedulerRedisHotOutcome::Skipped | SchedulerRedisHotOutcome::Failed { .. } => {
+  4275	                return Err(SchedulerRedisUnavailableError {
+  4276	                    retry_after_secs: self.scheduler_redis_retry_after_secs(),
+  4277	                    local_overloaded: false,
+  4278	                }
+  4279	                .into());
+  4280	            }
+  4281	        };
+  4282	
+  4283	        match response {
+  4284	            SchedulerSelectionReservation::Recorded {
+  4285	                rate_limit_available_at_ms,
+  4286	                ..
+  4287	            } => {
+  4288	                if let Some(available_at_ms) = rate_limit_available_at_ms
+  4289	                    .and_then(|until_ms| Self::instant_from_epoch_ms(until_ms, now_ms, now))
+  4290	                {
+  4291	                    self.apply_rate_limit_available_at_for_credential(id, available_at_ms);
+  4292	                }
+  4293	                Ok(SchedulerRedisSelectionAdmission::Recorded {
+  4294	                    rate_limit_available_at: rate_limit_available_at_ms
+  4295	                        .and_then(|until_ms| Self::instant_from_epoch_ms(until_ms, now_ms, now)),
+  4296	                })
+  4297	            }
+  4298	            SchedulerSelectionReservation::RateLimited {
+  4299	                retry_after_ms,
+  4300	                rate_limit_available_at_ms,
+  4301	            } => {
+  4302	                let available_at =
+  4303	                    Self::instant_from_epoch_ms(rate_limit_available_at_ms, now_ms, now)
+  4304	                        .unwrap_or(now + StdDuration::from_millis(retry_after_ms.max(1)));
+  4305	                self.apply_rate_limit_available_at_for_credential(id, available_at);
+  4306	                Ok(SchedulerRedisSelectionAdmission::RateLimited(
+  4307	                    SchedulerRedisRateLimitWait {
+  4308	                        retry_after: StdDuration::from_millis(retry_after_ms.max(1)),
+  4309	                        available_at,
+  4310	                    },
+  4311	                ))
+  4312	            }
+  4313	        }
+  4314	    }
+  4315	
+  4316	    fn prepare_in_flight_slot(
+  4317	        &self,
+  4318	        id: u64,
+  4319	        request_weight_units: u32,
+  4320	    ) -> Option<PreparedInFlightSlot> {
+  4321	        let max_concurrent_requests = self.max_concurrent_requests();
+  4322	        let effective_max_concurrent_requests =
+  4323	            self.effective_max_concurrent_requests_for_id(id, max_concurrent_requests);
+  4324	        let global_max_concurrent_requests = self.global_max_concurrent_requests();
+  4325	        let now = Instant::now();
+  4326	        let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
+  4327	
+  4328	        if self.redis_store.is_some() {
+  4329	            let release_dispatcher = self.scheduler_redis_release_dispatcher.as_ref()?.clone();
+  4330	            let release_reservation = release_dispatcher.try_reserve()?;
+  4331	            if !self.acquire_provisional_local_in_flight_slot_with_id(
+  4332	                id,
+  4333	                lease_id,
+  4334	                now,
+  4335	                max_concurrent_requests,
+  4336	                global_max_concurrent_requests,
+  4337	                request_weight_units,
+  4338	            ) {
+  4339	                return None;
+  4340	            }
+  4341	            return Some(PreparedInFlightSlot::Redis {
+  4342	                guard: InFlightLeaseGuard::new(
+  4343	                    self.entries.clone(),
+  4344	                    self.redis_store.clone(),
+  4345	                    Some(release_dispatcher),
+  4346	                    Some(release_reservation),
+  4347	                    Some(self.released_in_flight_lease_tombstones.clone()),
+  4348	                    self.capacity_signal.clone(),
+  4349	                    id,
+  4350	                    lease_id,
+  4351	                    request_weight_units,
+  4352	                ),
+  4353	                effective_max_concurrent_requests,
+  4354	                global_max_concurrent_requests,
+  4355	                request_weight_units,
+  4356	                max_age: self.in_flight_lease_max_age(),
+  4357	            });
+  4358	        }
+  4359	
+  4360	        if self.acquire_local_in_flight_slot_with_id(
+  4361	            id,
+  4362	            lease_id,
+  4363	            now,
+  4364	            max_concurrent_requests,
+  4365	            global_max_concurrent_requests,
+  4366	            request_weight_units,
+  4367	        ) {
+  4368	            return Some(PreparedInFlightSlot::Local(InFlightLeaseGuard::new(
+  4369	                self.entries.clone(),
+  4370	                None,
+  4371	                None,
+  4372	                None,
+  4373	                None,
+  4374	                self.capacity_signal.clone(),
+  4375	                id,
+  4376	                lease_id,
+  4377	                request_weight_units,
+  4378	            )));
+  4379	        }
+  4380	        None
+  4381	    }
+  4382	
+  4383	    async fn confirm_prepared_in_flight_slot(
+  4384	        &self,
+  4385	        prepared: PreparedInFlightSlot,
+  4386	    ) -> anyhow::Result<Option<InFlightLeaseGuard>> {
+  4387	        let (
+  4388	            mut guard,
+  4389	            effective_max_concurrent_requests,
+  4390	            global_max_concurrent_requests,
+  4391	            request_weight_units,
+  4392	            max_age,
+  4393	        ) = match prepared {
+  4394	            PreparedInFlightSlot::Local(guard) => return Ok(Some(guard)),
+  4395	            PreparedInFlightSlot::Redis {
+  4396	                guard,
+  4397	                effective_max_concurrent_requests,
+  4398	                global_max_concurrent_requests,
+  4399	                request_weight_units,
+  4400	                max_age,
+  4401	            } => (
+  4402	                guard,
+  4403	                effective_max_concurrent_requests,
+  4404	                global_max_concurrent_requests,
+  4405	                request_weight_units,
+  4406	                max_age,
+  4407	            ),
+  4408	        };
+  4409	        let redis = self
+  4410	            .redis_store
+  4411	            .as_ref()
+  4412	            .expect("prepared Redis lease requires a Redis store")
+  4413	            .clone();
+  4414	        let credential_id = guard.credential_id();
+  4415	        let lease_id = guard.id();
+  4416	        let redis_acquire = self
+  4417	            .await_scheduler_redis_hot_outcome(
+  4418	                "占用 Redis 凭据并发槽",
+  4419	                || guard.arm_redis_commit_unknown(),
+  4420	                async move {
+  4421	                    redis
+  4422	                        .acquire_dispatch_lease(
+  4423	                            credential_id,
+  4424	                            lease_id,
+  4425	                            effective_max_concurrent_requests,
+  4426	                            global_max_concurrent_requests,
+  4427	                            request_weight_units,
+  4428	                            max_age,
+  4429	                            InFlightKind::Api.as_str(),
+  4430	                        )
+  4431	                        .await
+  4432	                },
+  4433	            )
+  4434	            .await;
+  4435	        match redis_acquire {
+  4436	            SchedulerRedisHotOutcome::Completed(Some(_count)) => {
+  4437	                guard.configure_redis_touch_interval(max_age);
+  4438	                guard.confirm_redis_acquired();
+  4439	                Ok(Some(guard))
+  4440	            }
+  4441	            SchedulerRedisHotOutcome::Completed(None) => {
+  4442	                guard.confirm_redis_not_acquired();
+  4443	                drop(guard);
+  4444	                Ok(None)
+  4445	            }
+  4446	            SchedulerRedisHotOutcome::Failed { commit_unknown } => {
+  4447	                if !commit_unknown {
+  4448	                    guard.confirm_redis_not_acquired();
+  4449	                }
+  4450	                let retry_after_secs = self.scheduler_redis_retry_after_secs();
+  4451	                drop(guard);
+  4452	                Err(SchedulerRedisUnavailableError {
+  4453	                    retry_after_secs,
+  4454	                    local_overloaded: false,
+  4455	                }

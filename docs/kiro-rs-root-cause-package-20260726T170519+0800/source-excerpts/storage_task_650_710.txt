@@ -1,0 +1,61 @@
+   650	fn storage_fallback_runtime() -> &'static Runtime {
+   651	    static FALLBACK_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+   652	    FALLBACK_RUNTIME.get_or_init(|| {
+   653	        tokio::runtime::Builder::new_multi_thread()
+   654	            .worker_threads(2)
+   655	            .thread_name("kiro-storage-task")
+   656	            .enable_all()
+   657	            .build()
+   658	            .expect("创建 best-effort 存储 runtime 失败")
+   659	    })
+   660	}
+   661	
+   662	fn storage_executor_handle() -> Handle {
+   663	    #[cfg(not(test))]
+   664	    if let Ok(handle) = Handle::try_current() {
+   665	        return handle;
+   666	    }
+   667	    storage_fallback_runtime().handle().clone()
+   668	}
+   669	
+   670	fn default_storage_executor() -> BestEffortStorageExecutor {
+   671	    BestEffortStorageExecutor::new_with_critical_lane(
+   672	        &storage_executor_handle(),
+   673	        STORAGE_TASK_QUEUE_CAPACITY,
+   674	        STORAGE_TASK_WORKER_COUNT,
+   675	        STORAGE_CRITICAL_TASK_QUEUE_CAPACITY,
+   676	        STORAGE_CRITICAL_TASK_WORKER_COUNT,
+   677	        STORAGE_TASK_TIMEOUT,
+   678	    )
+   679	}
+   680	
+   681	pub(crate) fn block_on_storage<T: Send>(
+   682	    operation: &'static str,
+   683	    future: impl Future<Output = anyhow::Result<T>> + Send,
+   684	) -> anyhow::Result<T> {
+   685	    let started_at = Instant::now();
+   686	    let result = if let Ok(handle) = Handle::try_current() {
+   687	        match handle.runtime_flavor() {
+   688	            RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| handle.block_on(future)),
+   689	            _ => std::thread::scope(|scope| {
+   690	                scope
+   691	                    .spawn(move || storage_fallback_runtime().block_on(future))
+   692	                    .join()
+   693	                    .map_err(|_| anyhow::anyhow!("同步存储线程异常退出"))?
+   694	            }),
+   695	        }
+   696	    } else {
+   697	        tokio::runtime::Builder::new_current_thread()
+   698	            .enable_all()
+   699	            .build()?
+   700	            .block_on(future)
+   701	    };
+   702	    let elapsed = started_at.elapsed();
+   703	    if elapsed >= StdDuration::from_millis(100) {
+   704	        tracing::warn!(
+   705	            operation,
+   706	            elapsed_ms = elapsed.as_millis() as u64,
+   707	            "同步存储操作耗时较长"
+   708	        );
+   709	    }
+   710	    result.map_err(|err| anyhow::anyhow!("{}失败: {}", operation, err))

@@ -138,7 +138,7 @@ transcript line `94`：
 - line `377`: 用户要求记录成本地文档，脱离当前会话也能无歧义指导实现。
 - line `379`: assistant 明确回应要写自包含本地文档。
 - line `380` - `404`: 写入、编辑、检查文档。
-- line `408`: assistant 最终总结 `docs/prompt-cache-scope-and-kiro-rs-tool-parity.md` 已写入并核对。
+- line `408`: assistant 最终总结 [`../cache-usage-and-production-history/prompt-cache-scope-and-kiro-rs-tool-parity.md`](../cache-usage-and-production-history/prompt-cache-scope-and-kiro-rs-tool-parity.md) 已写入并核对。
 
 该例子的重点：
 
@@ -151,7 +151,7 @@ transcript line `94`：
 
 ```text
 docs/testing/claude-code-cli-full-regression-20260628.md
-docs/kiro-optimization-plans-20260626/IMPLEMENTATION-RECORD-20260627.md
+docs/archive/kiro-proxy-study-and-optimization-20260626/kiro-optimization-plans-20260626/IMPLEMENTATION-RECORD-20260627.md
 ```
 
 其中关于 Claude Code CLI thinking 的历史验证结论：

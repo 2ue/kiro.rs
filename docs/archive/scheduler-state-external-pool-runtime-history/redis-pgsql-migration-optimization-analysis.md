@@ -1,6 +1,6 @@
 # PgSQL + Redis 迁移后的旧实现优化空间分析
 
-本文补充 `docs/redis-pgsql-state-model-full-analysis.md`。
+本文补充 [`redis-pgsql-state-model-full-analysis.md`](redis-pgsql-state-model-full-analysis.md)。
 
 前一份文档重点回答：当前哪些状态在进程内存、PgSQL、Redis、本地文件中分别归属，哪里存在一致性风险。
 

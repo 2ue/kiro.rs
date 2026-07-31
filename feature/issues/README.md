@@ -32,6 +32,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 
 ## 当前权威专题
 
+- [Claude Code 本地账号 WebSearch/tools/image 真实调用分析](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) - 2026-07-29 本地账号 7/8 + `claude-sonnet-4.5` 的当前权威记录；旧 external-pool 调试结论不能替代此本地账号诊断。
 - [协议 transcript 与工具历史泄漏](protocol-transcript-and-tool-history-leak.md)
 - [thinking 与签名内容安全](thinking-and-signed-content-safety.md)
 - [thinking effort、adaptive mode 与 Kiro 上游映射](thinking-effort-adaptive-upstream-mapping.md)
@@ -71,6 +72,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [Runtime completion storage bridge starvation](runtime-completion-storage-bridge-starvation.md)
 - [159/170/142 生产实例运行时卡死：请求完成路径与存储/调度耦合](prod-runtime-completion-storage-coupling-159-170-142-20260727.md)
 - [外部池调度影响本地凭据与 fallback 矩阵缺失](external-pool-scheduler-interference-and-fallback-matrix-20260727.md)
+- [整体调度架构分析：本地凭证、外部池、fallback/rescue 与容量账本](scheduler-architecture-analysis-purpose-and-plan.md)
 - [Dashboard observability redesign](dashboard-observability-redesign.md)
 - [上游错误诊断隐私与响应体边界](upstream-error-diagnostic-privacy-and-bounds.md)
 - [运行时饥饿下的上游 HTTP deadline](upstream-http-deadline-runtime-starvation.md)

@@ -1,0 +1,14 @@
+redis stats
+total_commands_processed:5763481
+instantaneous_ops_per_sec:7
+rejected_connections:0
+expired_keys:2894
+expired_keys_active:78
+evicted_keys:0
+
+redis clients/memory keyspace
+connected_clients:5
+blocked_clients:0
+used_memory_human:328.76M
+used_memory_peak_human:329.45M
+db0:keys=102682,expires=102678,avg_ttl=2848396711,subexpiry=0

@@ -1,0 +1,188 @@
+  3388	            Err(_) => {
+  3389	                let err = anyhow::anyhow!(
+  3390	                    "{}超过共享总期限 {}ms",
+  3391	                    operation,
+  3392	                    operation_timeout.as_millis()
+  3393	                );
+  3394	                admission.failure(operation, &err);
+  3395	                SchedulerRedisExecutionOutcome::Failed {
+  3396	                    commit_unknown: true,
+  3397	                }
+  3398	            }
+  3399	        }
+  3400	    }
+  3401	
+  3402	    fn scheduler_redis_retry_after_secs(&self) -> u64 {
+  3403	        self.scheduler_redis_breaker
+  3404	            .retry_after()
+  3405	            .map(|remaining| remaining.as_secs().saturating_add(1))
+  3406	            .unwrap_or(1)
+  3407	            .max(1)
+  3408	    }
+  3409	
+  3410	    fn scheduler_redis_degraded_retry_after_secs(&self) -> Option<u64> {
+  3411	        self.redis_store.as_ref()?;
+  3412	        self.scheduler_redis_breaker
+  3413	            .retry_after()
+  3414	            .map(|remaining| remaining.as_secs().saturating_add(1).max(1))
+  3415	    }
+  3416	
+  3417	    fn block_on_scheduler_redis_affinity<T: Send>(
+  3418	        &self,
+  3419	        operation: &'static str,
+  3420	        future: impl Future<Output = anyhow::Result<T>> + Send,
+  3421	    ) -> Option<T> {
+  3422	        let breaker = self.scheduler_redis_affinity_breaker.clone();
+  3423	        match block_on_storage(operation, async move {
+  3424	            Ok(Self::execute_scheduler_redis_operation(
+  3425	                breaker,
+  3426	                SCHEDULER_REDIS_AFFINITY_OP_TIMEOUT,
+  3427	                operation,
+  3428	                || {},
+  3429	                future,
+  3430	            )
+  3431	            .await)
+  3432	        }) {
+  3433	            Ok(SchedulerRedisExecutionOutcome::Completed(value)) => Some(value),
+  3434	            Ok(
+  3435	                SchedulerRedisExecutionOutcome::NotStarted(_)
+  3436	                | SchedulerRedisExecutionOutcome::Failed { .. },
+  3437	            )
+  3438	            | Err(_) => None,
+  3439	        }
+  3440	    }
+  3441	
+  3442	    async fn await_scheduler_redis_affinity<T>(
+  3443	        &self,
+  3444	        operation: &'static str,
+  3445	        future: impl Future<Output = anyhow::Result<T>>,
+  3446	    ) -> Option<T> {
+  3447	        match Self::execute_scheduler_redis_operation(
+  3448	            self.scheduler_redis_affinity_breaker.clone(),
+  3449	            SCHEDULER_REDIS_AFFINITY_OP_TIMEOUT,
+  3450	            operation,
+  3451	            || {},
+  3452	            future,
+  3453	        )
+  3454	        .await
+  3455	        {
+  3456	            SchedulerRedisExecutionOutcome::Completed(value) => Some(value),
+  3457	            SchedulerRedisExecutionOutcome::NotStarted(_)
+  3458	            | SchedulerRedisExecutionOutcome::Failed { .. } => None,
+  3459	        }
+  3460	    }
+  3461	
+  3462	    fn block_on_scheduler_redis_hot_outcome<T: Send, F: FnOnce() + Send>(
+  3463	        &self,
+  3464	        operation: &'static str,
+  3465	        on_started: F,
+  3466	        future: impl Future<Output = anyhow::Result<T>> + Send,
+  3467	    ) -> SchedulerRedisHotOutcome<T> {
+  3468	        if self.redis_store.is_none() {
+  3469	            return SchedulerRedisHotOutcome::Skipped;
+  3470	        }
+  3471	        let breaker = self.scheduler_redis_breaker.clone();
+  3472	        let execution = block_on_storage(operation, async move {
+  3473	            Ok(Self::execute_scheduler_redis_operation(
+  3474	                breaker,
+  3475	                SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+  3476	                operation,
+  3477	                on_started,
+  3478	                future,
+  3479	            )
+  3480	            .await)
+  3481	        });
+  3482	        match execution {
+  3483	            Ok(SchedulerRedisExecutionOutcome::Completed(value)) => {
+  3484	                SchedulerRedisHotOutcome::Completed(value)
+  3485	            }
+  3486	            Ok(SchedulerRedisExecutionOutcome::NotStarted(
+  3487	                SchedulerRedisAdmissionError::BreakerOpen,
+  3488	            )) => SchedulerRedisHotOutcome::Skipped,
+  3489	            Ok(SchedulerRedisExecutionOutcome::NotStarted(
+  3490	                SchedulerRedisAdmissionError::LocalSchedulerOverloaded,
+  3491	            )) => SchedulerRedisHotOutcome::LocalSchedulerOverloaded,
+  3492	            Ok(SchedulerRedisExecutionOutcome::Failed { commit_unknown }) => {
+  3493	                SchedulerRedisHotOutcome::Failed { commit_unknown }
+  3494	            }
+  3495	            Err(_) => SchedulerRedisHotOutcome::Failed {
+  3496	                commit_unknown: true,
+  3497	            },
+  3498	        }
+  3499	    }
+  3500	
+  3501	    fn probe_scheduler_redis_capacity_recovery_if_due(&self) {
+  3502	        if !self.scheduler_redis_breaker.recovery_probe_due() {
+  3503	            return;
+  3504	        }
+  3505	        let Some(redis) = &self.redis_store else {
+  3506	            return;
+  3507	        };
+  3508	        let redis = redis.clone();
+  3509	        match self.block_on_scheduler_redis_hot_outcome(
+  3510	            "探测 Redis 调度协调恢复",
+  3511	            || {},
+  3512	            async move { redis.ping().await },
+  3513	        ) {
+  3514	            SchedulerRedisHotOutcome::Completed(()) => {
+  3515	                tracing::debug!("Redis 调度容量 breaker 预检恢复探测成功");
+  3516	            }
+  3517	            SchedulerRedisHotOutcome::Skipped
+  3518	            | SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {}
+  3519	            SchedulerRedisHotOutcome::Failed { .. } => {
+  3520	                tracing::debug!("Redis 调度容量 breaker 预检恢复探测失败，继续 degraded");
+  3521	            }
+  3522	        }
+  3523	    }
+  3524	
+  3525	    async fn await_scheduler_redis_hot_outcome<T, F: FnOnce()>(
+  3526	        &self,
+  3527	        operation: &'static str,
+  3528	        on_started: F,
+  3529	        future: impl Future<Output = anyhow::Result<T>>,
+  3530	    ) -> SchedulerRedisHotOutcome<T> {
+  3531	        if self.redis_store.is_none() {
+  3532	            return SchedulerRedisHotOutcome::Skipped;
+  3533	        }
+  3534	        match Self::execute_scheduler_redis_operation(
+  3535	            self.scheduler_redis_breaker.clone(),
+  3536	            SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+  3537	            operation,
+  3538	            on_started,
+  3539	            future,
+  3540	        )
+  3541	        .await
+  3542	        {
+  3543	            SchedulerRedisExecutionOutcome::Completed(value) => {
+  3544	                SchedulerRedisHotOutcome::Completed(value)
+  3545	            }
+  3546	            SchedulerRedisExecutionOutcome::NotStarted(
+  3547	                SchedulerRedisAdmissionError::BreakerOpen,
+  3548	            ) => SchedulerRedisHotOutcome::Skipped,
+  3549	            SchedulerRedisExecutionOutcome::NotStarted(
+  3550	                SchedulerRedisAdmissionError::LocalSchedulerOverloaded,
+  3551	            ) => SchedulerRedisHotOutcome::LocalSchedulerOverloaded,
+  3552	            SchedulerRedisExecutionOutcome::Failed { commit_unknown } => {
+  3553	                SchedulerRedisHotOutcome::Failed { commit_unknown }
+  3554	            }
+  3555	        }
+  3556	    }
+  3557	
+  3558	    fn block_on_scheduler_redis_state_sync<T: Send>(
+  3559	        &self,
+  3560	        operation: &'static str,
+  3561	        future: impl Future<Output = anyhow::Result<T>> + Send,
+  3562	    ) -> Option<T> {
+  3563	        let breaker = self.scheduler_redis_snapshot_breaker.clone();
+  3564	        let result = block_on_storage(operation, async move {
+  3565	            match Self::execute_scheduler_redis_operation(
+  3566	                breaker,
+  3567	                SCHEDULER_REDIS_SNAPSHOT_OP_TIMEOUT,
+  3568	                operation,
+  3569	                || {},
+  3570	                future,
+  3571	            )
+  3572	            .await
+  3573	            {
+  3574	                SchedulerRedisExecutionOutcome::Completed(value) => Ok(value),
+  3575	                SchedulerRedisExecutionOutcome::NotStarted(reason) => Err(anyhow::anyhow!(

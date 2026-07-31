@@ -1,0 +1,50 @@
+host ss 59137/8990
+LISTEN     0      4096                                     0.0.0.0:59137                     0.0.0.0:*     users:(("docker-proxy",pid=2173151,fd=8))                                  
+FIN-WAIT-2 0      0                                     172.18.0.1:54894                  172.18.0.4:8990  users:(("docker-proxy",pid=2173151,fd=22))                                 
+FIN-WAIT-2 0      0                                     172.18.0.1:39092                  172.18.0.4:8990  users:(("docker-proxy",pid=2173151,fd=16))                                 
+FIN-WAIT-2 0      0                                     172.18.0.1:36508                  172.18.0.4:8990  users:(("docker-proxy",pid=2173151,fd=18))                                 
+FIN-WAIT-2 0      0                                     172.18.0.1:60922                  172.18.0.4:8990  users:(("docker-proxy",pid=2173151,fd=4))                                  
+LISTEN     0      4096                                        [::]:59137                        [::]:*     users:(("docker-proxy",pid=2173157,fd=8))                                  
+
+container netstat state summary
+   2355 CLOSE_WAIT
+   1034 ESTABLISHED
+      2 FIN_WAIT2
+      1 LISTEN
+
+container netstat source/state top
+   2105 152.53.242.178 CLOSE_WAIT
+   1033 152.53.242.178 ESTABLISHED
+    182 127.0.0.1 CLOSE_WAIT
+     40 152.53.194.170 CLOSE_WAIT
+     23 109.107.137.38 CLOSE_WAIT
+      4 172.18.0.1 CLOSE_WAIT
+      2 127.0.0.1 FIN_WAIT2
+      1 172.18.0.5 CLOSE_WAIT
+      1 123.145.117.158 ESTABLISHED
+      1 0.0.0.0 LISTEN
+
+container listen queue
+tcp     3595      0 0.0.0.0:8990            0.0.0.0:*               LISTEN      
+
+fd and limits
+fd_count 151
+socket_fd_count 145
+Max processes             unlimited            unlimited            processes 
+Max open files            1024                 524288               files     
+
+threads stat
+TID 1 S 301 415 0
+TID 4014 S 9576 7035 0
+TID 4030 S 4900 2322 0
+TID 4031 S 11924 10379 0
+TID 4096 S 5989 5234 0
+TID 4509 S 2877 3358 0
+TID 4627 S 1137 1793 0
+TID 4628 S 119 502 0
+TID 4629 S 9 67 0
+TID 4630 S 634 1731 0
+TID 4631 S 297 1058 0
+TID 4634 S 46 147 0
+TID 4637 S 85 420 0
+TID 4638 S 20 99 0
