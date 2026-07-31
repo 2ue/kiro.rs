@@ -1248,6 +1248,14 @@ async fn maybe_raw_external_direct_response(
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
+    if !manager.has_cached_eligible_pool_for_body_mode_and_model(
+        &config,
+        ExternalPoolRequestBodyMode::RawPassthrough,
+        raw_probe.model.as_deref(),
+    ) {
+        return None;
+    }
+
     let reason = manager
         .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
         .await?;

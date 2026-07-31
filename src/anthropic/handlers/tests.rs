@@ -952,6 +952,7 @@ fn websearch_handler_test_router_with_external(
         external_pool_manager,
         Vec::new(),
         true,
+        false,
     )
 }
 
@@ -960,13 +961,14 @@ fn websearch_handler_test_router_with_external_options(
     external_pool_manager: Arc<ExternalPoolManager>,
     credentials: Vec<KiroCredentials>,
     local_pool_preflight_enabled: bool,
+    external_direct_policy_enabled: bool,
 ) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
     config.kiro_upstream_base_url = Some(kiro_base_url.to_string());
     config.kiro_upstream_response_timeout_secs = 1;
     config.credential_retry_max_attempts = 0;
     config.external_pools.external_pools_enabled = true;
-    config.external_pools.external_direct_policy_enabled = false;
+    config.external_pools.external_direct_policy_enabled = external_direct_policy_enabled;
     config.external_pools.local_pool_preflight_enabled = local_pool_preflight_enabled;
     config.external_pools.fallback_on_no_available_credentials = true;
     config.external_pools.fallback_on_local_capacity_exhausted = true;
@@ -1425,6 +1427,86 @@ fn native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds()
     });
 }
 
+async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_pool() {
+    let kiro_upstream = WebSearchHandlerUpstream::start().await;
+    let external_upstream = ExternalMessagesUpstream::start().await;
+    let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
+        &external_upstream.base_url,
+        ExternalPoolRequestBodyMode::Normalized,
+    )
+    .await
+    else {
+        return;
+    };
+    let (router, usage_recorder) = websearch_handler_test_router_with_external_options(
+        &kiro_upstream.base_url,
+        external_pool_manager,
+        Vec::new(),
+        false,
+        true,
+    );
+
+    let response = router
+        .clone()
+        .oneshot(multimodal_handler_request(
+            "/cc/v1/messages",
+            json!({
+                "model": "claude-sonnet-4-5-20250929",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("normalized direct external response");
+    let request_id = response_request_id(&response);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .expect("normalized direct external body");
+    let body = String::from_utf8(body.to_vec()).expect("external response UTF-8");
+    assert!(
+        body.contains("fake-normalized-external-ok"),
+        "normalized direct body={body}"
+    );
+
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.route_kind, Some(UsageRouteKind::ExternalPool));
+    assert_eq!(
+        record.route_subtype,
+        Some(UsageRouteSubtype::ExternalDirectPolicy)
+    );
+    assert_eq!(
+        record.direct_policy_reason.as_deref(),
+        Some("explicit_direct")
+    );
+    let attempts = record
+        .latency_trace
+        .as_ref()
+        .and_then(|trace| trace.inference_attempts)
+        .expect("normalized direct external attempt trace");
+    assert_eq!(attempts.external_attempts, 1);
+    assert_eq!(
+        external_upstream.state.hits(),
+        1,
+        "normalized direct request must reach external pool once"
+    );
+    assert_eq!(
+        kiro_upstream.state.normal_hits(),
+        0,
+        "direct external policy must not call local Kiro upstream"
+    );
+}
+
+#[test]
+fn normalized_external_direct_policy_skips_raw_preparse_without_raw_pool() {
+    run_handler_fixture_on_four_mib_thread("normalized-external-direct-raw-guard", || async {
+        run_normalized_external_direct_policy_skips_raw_preparse_without_raw_pool().await;
+    });
+}
+
 async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp_path_for_five_rounds()
  {
     let mcp_upstream = WebSearchHandlerUpstream::start().await;
@@ -1441,6 +1523,7 @@ async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp
         &mcp_upstream.base_url,
         external_pool_manager,
         Vec::new(),
+        false,
         false,
     );
 
