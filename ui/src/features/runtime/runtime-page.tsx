@@ -75,6 +75,7 @@ import {
 type RuntimeSectionKey =
   | 'loadBalancing'
   | 'capacity'
+  | 'externalPools'
   | 'cooldown'
   | 'scheduler'
   | 'warmup'
@@ -92,6 +93,7 @@ const runtimeSections: Array<{
 }> = [
   { key: 'loadBalancing', title: '负载均衡模式', desc: '请求分配给账号的策略', icon: <Gauge className="h-4 w-4" /> },
   { key: 'capacity', title: '请求容量', desc: '并发、排队、重试、超时', icon: <Gauge className="h-4 w-4" /> },
+  { key: 'externalPools', title: '外部池路由', desc: '控制哪些入口可以进入外部池', icon: <Router className="h-4 w-4" /> },
   { key: 'cooldown', title: '错误恢复 / 冷却', desc: '不同错误类型的暂停策略与退避', icon: <Shield className="h-4 w-4" /> },
   { key: 'scheduler', title: '账号选择权重', desc: '优先使用哪些账号的调度参数', icon: <Gauge className="h-4 w-4" /> },
   { key: 'warmup', title: '新账号预热', desc: '新账号逐步参与请求，稳定后恢复正常', icon: <Sparkles className="h-4 w-4" /> },
@@ -107,6 +109,23 @@ const runtimeSections: Array<{
 function numberValue(value: string, fallback: number): number {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function normalizeExternalPoolRouteMode(value?: string): RuntimeConfig['externalPools']['externalPoolRouteMode'] {
+  if (value === 'allow_list' || value === 'deny_list') return value
+  return 'allow_all'
+}
+
+function normalizeRuleList(value?: string[] | null): string[] {
+  return (value ?? []).map((rule) => rule.trim()).filter(Boolean)
+}
+
+function parseRuleText(value: string): string[] {
+  return value.split(/[\r\n,]+/).map((rule) => rule.trim()).filter(Boolean)
+}
+
+function ruleText(value?: string[] | null): string {
+  return normalizeRuleList(value).join('\n')
 }
 
 function NumField({
@@ -349,6 +368,8 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
       externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
       externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
+      externalPoolRouteMode: normalizeExternalPoolRouteMode(draft.externalPools.externalPoolRouteMode),
+      externalPoolRouteRules: normalizeRuleList(draft.externalPools.externalPoolRouteRules),
       externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
       externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
       externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
@@ -367,6 +388,7 @@ export function RuntimePage() {
   const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
   const [activeSection, setActiveSection] = useState<RuntimeSectionKey>('loadBalancing')
+  const [externalRouteRulesText, setExternalRouteRulesText] = useState('')
 
   useEffect(() => {
     if (config.data) {
@@ -404,6 +426,8 @@ export function RuntimePage() {
         externalPools: {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
+          externalPoolRouteMode: normalizeExternalPoolRouteMode(config.data.externalPools?.externalPoolRouteMode),
+          externalPoolRouteRules: normalizeRuleList(config.data.externalPools?.externalPoolRouteRules),
         },
         payloadShaping: normalizePayloadShaping(config.data.payloadShaping),
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
@@ -412,6 +436,7 @@ export function RuntimePage() {
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
+      setExternalRouteRulesText(ruleText(config.data.externalPools?.externalPoolRouteRules))
     }
   }, [config.data])
 
@@ -764,6 +789,135 @@ export function RuntimePage() {
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />
                 <NumField label="异常并发自动回收" desc="请求长时间没有结束时自动释放占用，避免账号并发数被卡住；0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={set('credentialInFlightLeaseMaxSecs')} />
               </TwoCol>
+            )}
+
+            {activeSection === 'externalPools' && (
+              <div className="space-y-4">
+                <TwoCol>
+                  <TogField
+                    label="启用外部池"
+                    desc="允许请求在本地凭据不可调度或策略命中时进入外部池；下方路由规则会继续限制入口。"
+                    checked={draft.externalPools.externalPoolsEnabled}
+                    onChange={setExternalPools('externalPoolsEnabled')}
+                  />
+                  <TogField
+                    label="外部直连策略"
+                    desc="开启后命中直连模型或路径规则的请求直接走外部池；关闭时外部池只作为本地不可用后的兜底。"
+                    checked={draft.externalPools.externalDirectPolicyEnabled}
+                    onChange={setExternalPools('externalDirectPolicyEnabled')}
+                  />
+                  <TogField
+                    label="本地不可调度时预检外部池"
+                    desc="本地账号容量不足、无可用账号或调度 Redis 退化时，允许请求在解析后优先尝试外部池。"
+                    checked={draft.externalPools.localPoolPreflightEnabled}
+                    onChange={setExternalPools('localPoolPreflightEnabled')}
+                  />
+                  <TogField
+                    label="外部池失败后本地救援"
+                    desc="外部池作为兜底路径失败后，允许最后再尝试一次本地凭据；外部直连策略命中时不会启用该救援。"
+                    checked={draft.externalPools.externalPoolLocalRescueEnabled}
+                    onChange={setExternalPools('externalPoolLocalRescueEnabled')}
+                  />
+                </TwoCol>
+
+                <div className="grid gap-4 md:grid-cols-[minmax(16rem,22rem)_1fr]">
+                  <div className="space-y-1.5">
+                    <div className="text-sm font-semibold">外部池路由模式</div>
+                    <Select
+                      value={draft.externalPools.externalPoolRouteMode}
+                      onValueChange={(v) =>
+                        setExternalPools('externalPoolRouteMode')(
+                          normalizeExternalPoolRouteMode(v),
+                        )
+                      }
+                    >
+                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="allow_all">全部入口允许进入外部池</SelectItem>
+                        <SelectItem value="allow_list">只允许下列入口进入外部池</SelectItem>
+                        <SelectItem value="deny_list">禁止下列入口进入外部池</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      默认允许全部入口，保持升级前行为；切换为允许列表或禁止列表后，右侧规则才会参与判断。
+                    </p>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="text-sm font-semibold">外部池路由规则</div>
+                    <Textarea
+                      className="min-h-40 font-mono text-xs"
+                      value={externalRouteRulesText}
+                      disabled={draft.externalPools.externalPoolRouteMode === 'allow_all'}
+                      placeholder={'/v1\n/cc\n/ha\n/na\n/dfcache/team'}
+                      onChange={(e) => {
+                        setExternalRouteRulesText(e.target.value)
+                        setExternalPools('externalPoolRouteRules')(parseRuleText(e.target.value))
+                      }}
+                    />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages。规则按大小写不敏感的精确或包含匹配；* 表示全部入口。
+                    </p>
+                  </div>
+                </div>
+
+                <TwoCol>
+                  <NumField
+                    label="外部池全局最大并发"
+                    desc="所有外部池合计同时处理的请求上限；0 表示不限制。"
+                    value={draft.externalPools.externalPoolGlobalMaxConcurrentRequests}
+                    min={0}
+                    max={100_000}
+                    suffix="并发"
+                    onChange={setExternalPools('externalPoolGlobalMaxConcurrentRequests')}
+                  />
+                  <NumField
+                    label="外部池最大排队请求数"
+                    desc="外部池并发占满时最多允许排队的请求数；0 表示不排队。"
+                    value={draft.externalPools.externalPoolMaxQueuedRequests}
+                    min={0}
+                    max={100_000}
+                    suffix="请求"
+                    onChange={setExternalPools('externalPoolMaxQueuedRequests')}
+                  />
+                  <NumField
+                    label="外部池最长排队等待"
+                    desc="外部池等待并发名额的最长时间；0 会按后端安全默认值处理。"
+                    value={draft.externalPools.externalPoolDispatchMaxWaitSecs}
+                    min={0}
+                    max={86_400}
+                    suffix="秒"
+                    onChange={setExternalPools('externalPoolDispatchMaxWaitSecs')}
+                  />
+                  <NumField
+                    label="外部池最多故障转移"
+                    desc="同一请求在多个外部池之间最多尝试多少次；0 表示不重试其它外部池。"
+                    value={draft.externalPools.externalPoolRetryMaxAttempts}
+                    min={0}
+                    max={10_000}
+                    suffix="次"
+                    onChange={setExternalPools('externalPoolRetryMaxAttempts')}
+                  />
+                  <NumField
+                    label="外部池失败后本地等待"
+                    desc="触发本地救援时，最多等待本地账号空闲多久。"
+                    value={draft.externalPools.externalPoolLocalRescueMaxWaitSecs}
+                    min={0}
+                    max={300}
+                    suffix="秒"
+                    disabled={!draft.externalPools.externalPoolLocalRescueEnabled}
+                    onChange={setExternalPools('externalPoolLocalRescueMaxWaitSecs')}
+                  />
+                  <NumField
+                    label="外部池输入 token 预检上限"
+                    desc="本地可估算输入 token 且超过该值时，不再发送到外部池；0 表示关闭预检。"
+                    value={draft.externalPools.externalPoolMaxInputTokens}
+                    min={0}
+                    suffix="tokens"
+                    onChange={setExternalPools('externalPoolMaxInputTokens')}
+                  />
+                </TwoCol>
+              </div>
             )}
 
             {activeSection === 'cooldown' && (

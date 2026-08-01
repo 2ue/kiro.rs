@@ -3129,6 +3129,9 @@ fn direct_external_policy_static_reason(
     if !config.external_pools_enabled || !config.external_direct_policy_enabled {
         return None;
     }
+    if !config.external_pool_route_allowed(endpoint) {
+        return None;
+    }
     if config
         .direct_external_model_rules
         .iter()
@@ -4560,6 +4563,32 @@ impl ExternalPoolManager {
                 response_error_type: "service_unavailable".to_string(),
                 route_error_type: "external_pool_unavailable".to_string(),
                 message: "request route is disabled".to_string(),
+                error_id: route.error_id.clone(),
+                retryable: false,
+                attempts: Vec::new(),
+                pool_id: None,
+                pool_name: None,
+            });
+        }
+
+        if !config.external_pool_route_allowed(&route.endpoint) {
+            self.record_external_failure(
+                &route,
+                None,
+                Vec::new(),
+                "external_pool_route_blocked",
+                "request route is blocked by external pool route policy",
+                synthetic_external_error_diagnostics(
+                    &route,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "external_dispatch",
+                ),
+            );
+            return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                response_error_type: "service_unavailable".to_string(),
+                route_error_type: "external_pool_route_blocked".to_string(),
+                message: "request route is blocked by external pool route policy".to_string(),
                 error_id: route.error_id.clone(),
                 retryable: false,
                 attempts: Vec::new(),

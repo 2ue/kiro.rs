@@ -1227,6 +1227,10 @@ fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
         .unwrap_or_else(|| state.image_processing.normalized())
 }
 
+fn external_pool_enabled_for_endpoint(config: &ExternalPoolsConfig, endpoint: &str) -> bool {
+    config.external_pools_enabled && config.external_pool_route_allowed(endpoint)
+}
+
 #[cfg(test)]
 fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response> {
     let request_id = envelope::request_id();
@@ -1248,6 +1252,9 @@ async fn maybe_raw_external_direct_response(
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
+    if !external_pool_enabled_for_endpoint(&config, endpoint) {
+        return None;
+    }
     if !manager.has_cached_eligible_pool_for_body_mode_and_model(
         &config,
         ExternalPoolRequestBodyMode::RawPassthrough,
@@ -1294,7 +1301,9 @@ async fn maybe_raw_external_preflight_response(
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
-    if !config.local_pool_preflight_enabled {
+    if !config.local_pool_preflight_enabled
+        || !external_pool_enabled_for_endpoint(&config, endpoint)
+    {
         return None;
     }
 
@@ -1501,51 +1510,52 @@ fn build_external_fallback_context(
     let provider = state.kiro_provider.clone()?;
     let manager = state.external_pool_manager.clone()?;
     let config = runtime_config.external_pools.clone();
+    if !external_pool_enabled_for_endpoint(&config, endpoint) {
+        return None;
+    }
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
     let policy = &effective_cache_route.policy;
-    config
-        .external_pools_enabled
-        .then_some(ExternalFallbackContext {
-            provider,
-            manager,
-            config,
-            effective_raw_body,
-            effective_raw_probe,
-            raw_body,
-            headers,
-            endpoint: endpoint.to_string(),
-            compat_profile: runtime_config.compat_profile,
-            payload: payload.clone(),
-            request_input_tokens: 0,
-            model_resolution: None,
-            reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
-            prompt_cache: state.prompt_cache.clone(),
-            prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
-            prompt_cache_strategy_type: policy.cache_type,
-            prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
-            prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
-            prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
-            prompt_cache_token_scale: policy.simulation.token_scale,
-            prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
-            prompt_cache_cap_jitter_min_tokens: policy.simulation.cap_jitter_min_tokens,
-            prompt_cache_cap_jitter_max_tokens: policy.simulation.cap_jitter_max_tokens,
-            prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
-            prompt_cache_creation_control: policy.creation_control,
-            prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
-            kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
-            model_capabilities: state.model_capabilities.clone(),
-            pricing_catalog: state.pricing_catalog.clone(),
-            recorder: state.usage_recorder.clone(),
-            error_id: envelope::request_id(),
-            payload_guard_external_enabled: runtime_config.payload_guard_external_enabled,
-            payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
-            payload_guard_retry_config: (runtime_config.payload_guard_external_enabled
-                && runtime_config.too_long_retry_enabled())
-            .then(|| runtime_config.payload_guard_config()),
-            inference_attempt_budget,
-            request_api_key_id,
-            requires_normalized_body,
-        })
+    Some(ExternalFallbackContext {
+        provider,
+        manager,
+        config,
+        effective_raw_body,
+        effective_raw_probe,
+        raw_body,
+        headers,
+        endpoint: endpoint.to_string(),
+        compat_profile: runtime_config.compat_profile,
+        payload: payload.clone(),
+        request_input_tokens: 0,
+        model_resolution: None,
+        reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
+        prompt_cache: state.prompt_cache.clone(),
+        prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
+        prompt_cache_strategy_type: policy.cache_type,
+        prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
+        prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
+        prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
+        prompt_cache_token_scale: policy.simulation.token_scale,
+        prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens: policy.simulation.cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens: policy.simulation.cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
+        prompt_cache_creation_control: policy.creation_control,
+        prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
+        kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        model_capabilities: state.model_capabilities.clone(),
+        pricing_catalog: state.pricing_catalog.clone(),
+        recorder: state.usage_recorder.clone(),
+        error_id: envelope::request_id(),
+        payload_guard_external_enabled: runtime_config.payload_guard_external_enabled,
+        payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
+        payload_guard_retry_config: (runtime_config.payload_guard_external_enabled
+            && runtime_config.too_long_retry_enabled())
+        .then(|| runtime_config.payload_guard_config()),
+        inference_attempt_budget,
+        request_api_key_id,
+        requires_normalized_body,
+    })
 }
 
 impl ExternalFallbackContext {

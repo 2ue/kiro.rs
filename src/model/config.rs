@@ -2676,6 +2676,19 @@ impl Default for ExternalPoolCapacityMode {
     }
 }
 
+/// 外部池入口路由控制模式。
+///
+/// 默认 `allow_all` 保持历史行为。`allow_list` 只允许命中规则的入口进入外部池；
+/// `deny_list` 则禁止命中规则的入口进入外部池，其它入口保持可用。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolRouteMode {
+    #[default]
+    AllowAll,
+    AllowList,
+    DenyList,
+}
+
 /// 外部池返回模型不可用时的冷却范围。
 ///
 /// `model` 是默认值：只短暂避开当前外部池的当前模型，避免一个不支持模型把
@@ -2762,6 +2775,10 @@ pub struct ExternalPoolsConfig {
     pub direct_external_model_rules: Vec<String>,
     #[serde(default)]
     pub direct_external_path_rules: Vec<String>,
+    #[serde(default)]
+    pub external_pool_route_mode: ExternalPoolRouteMode,
+    #[serde(default)]
+    pub external_pool_route_rules: Vec<String>,
     #[serde(default = "default_true")]
     pub fallback_on_local_capacity_exhausted: bool,
     /// Redis scheduler coordination is a local routing failure, so historical
@@ -2858,6 +2875,8 @@ impl Default for ExternalPoolsConfig {
             direct_external_on_local_maintenance: false,
             direct_external_model_rules: Vec::new(),
             direct_external_path_rules: Vec::new(),
+            external_pool_route_mode: ExternalPoolRouteMode::default(),
+            external_pool_route_rules: Vec::new(),
             fallback_on_local_capacity_exhausted: true,
             fallback_on_scheduler_redis_degraded: true,
             fallback_on_no_available_credentials: true,
@@ -2924,6 +2943,34 @@ impl ExternalPoolsConfig {
             self.external_pool_dispatch_max_wait_secs
         }
     }
+
+    pub fn external_pool_route_allowed(&self, endpoint: &str) -> bool {
+        match self.external_pool_route_mode {
+            ExternalPoolRouteMode::AllowAll => true,
+            ExternalPoolRouteMode::AllowList => self
+                .external_pool_route_rules
+                .iter()
+                .any(|rule| external_pool_route_rule_matches(rule, endpoint)),
+            ExternalPoolRouteMode::DenyList => !self
+                .external_pool_route_rules
+                .iter()
+                .any(|rule| external_pool_route_rule_matches(rule, endpoint)),
+        }
+    }
+}
+
+fn external_pool_route_rule_matches(rule: &str, endpoint: &str) -> bool {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return false;
+    }
+    if rule == "*" {
+        return true;
+    }
+    endpoint.eq_ignore_ascii_case(rule)
+        || endpoint
+            .to_ascii_lowercase()
+            .contains(&rule.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5619,6 +5666,77 @@ mod tests {
 
         config.external_pool_dispatch_max_wait_secs = 7;
         assert_eq!(config.effective_dispatch_max_wait_secs(), 7);
+    }
+
+    #[test]
+    fn external_pool_route_policy_defaults_to_allow_all() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "externalPools": {
+                    "externalPoolsEnabled": true
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.external_pools.external_pool_route_mode,
+            ExternalPoolRouteMode::AllowAll
+        );
+        assert!(
+            config
+                .external_pools
+                .external_pool_route_allowed("/cc/v1/messages")
+        );
+        assert!(
+            config
+                .external_pools
+                .external_pool_route_allowed("/dfcache/team-a/v1/messages")
+        );
+    }
+
+    #[test]
+    fn external_pool_route_policy_denies_matching_routes_only() {
+        let mut config = ExternalPoolsConfig {
+            external_pool_route_mode: ExternalPoolRouteMode::DenyList,
+            external_pool_route_rules: vec!["/cc".to_string(), "/dfcache/team-a".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.external_pool_route_allowed("/dfcache/team-a/v1/messages"));
+        assert!(config.external_pool_route_allowed("/v1/messages"));
+
+        config.external_pool_route_rules = vec!["*".to_string()];
+        assert!(!config.external_pool_route_allowed("/v1/messages"));
+        assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
+    }
+
+    #[test]
+    fn external_pool_route_policy_allow_list_requires_a_match() {
+        let config = ExternalPoolsConfig {
+            external_pool_route_mode: ExternalPoolRouteMode::AllowList,
+            external_pool_route_rules: vec!["/ha".to_string(), "/dfcache/team-b".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(config.external_pool_route_allowed("/ha/v1/messages"));
+        assert!(config.external_pool_route_allowed("/dfcache/team-b/v1/messages"));
+        assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.external_pool_route_allowed("/v1/messages"));
+    }
+
+    #[test]
+    fn external_pool_route_policy_matches_case_insensitively() {
+        let config = ExternalPoolsConfig {
+            external_pool_route_mode: ExternalPoolRouteMode::AllowList,
+            external_pool_route_rules: vec!["/CC/V1".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(config.external_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
     }
 
     #[test]

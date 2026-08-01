@@ -7484,6 +7484,38 @@ fn direct_external_policy_enabled_is_global_direct_reason() {
 }
 
 #[test]
+fn direct_external_policy_respects_external_pool_route_policy() {
+    let mut config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_direct_policy_enabled: true,
+        external_pool_route_mode: crate::model::config::ExternalPoolRouteMode::DenyList,
+        external_pool_route_rules: vec!["/cc".to_string()],
+        ..ExternalPoolsConfig::default()
+    };
+
+    assert_eq!(
+        direct_external_policy_static_reason(&config, "/cc/v1/messages", "claude-custom"),
+        None
+    );
+    assert_eq!(
+        direct_external_policy_static_reason(&config, "/v1/messages", "claude-custom").as_deref(),
+        Some("explicit_direct")
+    );
+
+    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::AllowList;
+    config.external_pool_route_rules = vec!["/ha".to_string()];
+    assert_eq!(
+        direct_external_policy_static_reason(&config, "/v1/messages", "claude-custom"),
+        None
+    );
+    assert_eq!(
+        direct_external_policy_static_reason(&config, "/ha/v1/messages", "claude-custom")
+            .as_deref(),
+        Some("explicit_direct")
+    );
+}
+
+#[test]
 fn fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools() {
     let normalized_pool = test_pool("https://normalized.example.com/v1", true);
     let mut raw_pool = test_pool("https://raw.example.com/v1", true);

@@ -10003,6 +10003,38 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
 }
 
 #[test]
+fn external_pool_endpoint_gate_applies_global_enable_and_route_policy() {
+    let mut config = ExternalPoolsConfig::default();
+
+    assert!(!external_pool_enabled_for_endpoint(
+        &config,
+        "/cc/v1/messages"
+    ));
+
+    config.external_pools_enabled = true;
+    assert!(external_pool_enabled_for_endpoint(
+        &config,
+        "/cc/v1/messages"
+    ));
+
+    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::DenyList;
+    config.external_pool_route_rules = vec!["/cc".to_string()];
+    assert!(!external_pool_enabled_for_endpoint(
+        &config,
+        "/cc/v1/messages"
+    ));
+    assert!(external_pool_enabled_for_endpoint(&config, "/v1/messages"));
+
+    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::AllowList;
+    config.external_pool_route_rules = vec!["/dfcache/team-a".to_string()];
+    assert!(!external_pool_enabled_for_endpoint(&config, "/v1/messages"));
+    assert!(external_pool_enabled_for_endpoint(
+        &config,
+        "/dfcache/team-a/v1/messages"
+    ));
+}
+
+#[test]
 fn remote_url_safety_rejects_local_and_private_targets() {
     for url in [
         "http://localhost/image.png",
