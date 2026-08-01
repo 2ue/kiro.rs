@@ -1863,20 +1863,20 @@ fn quota_guard_ignores_stale_missing_non_disabled_and_oauth_account_snapshots() 
         ..Default::default()
     };
     assert!(
-        !MultiTokenManager::account_info_quota_block_reason(
+        MultiTokenManager::account_info_quota_block_reason(
             &manager.entries.lock()[0],
             &stale,
             Utc::now()
         )
-        .is_some()
+        .is_none()
     );
     assert!(
-        !MultiTokenManager::account_info_quota_block_reason(
+        MultiTokenManager::account_info_quota_block_reason(
             &manager.entries.lock()[0],
             &overage_enabled,
             Utc::now()
         )
-        .is_some()
+        .is_none()
     );
     assert!(
         MultiTokenManager::account_info_quota_block_reason(
