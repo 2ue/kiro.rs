@@ -856,7 +856,7 @@ export function RuntimePage() {
                       }}
                     />
                     <p className="text-xs leading-5 text-muted-foreground">
-                      每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages。规则按大小写不敏感的精确或包含匹配；* 表示全部入口。
+                      每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages。规则按大小写不敏感的精确或路径前缀匹配；* 表示全部入口。
                     </p>
                   </div>
                 </div>

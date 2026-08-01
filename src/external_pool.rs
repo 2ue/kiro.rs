@@ -3681,7 +3681,6 @@ impl ExternalPoolManager {
         self.publish_static_pool_snapshot_success(generation, pools)
     }
 
-    #[cfg(test)]
     async fn load_static_pool_snapshot(&self) -> Arc<Vec<ExternalPoolEligibility>> {
         let generation = self.static_pool_snapshot_generation.load(Ordering::Acquire);
         match self.static_pool_snapshot_state(generation) {
@@ -4230,7 +4229,6 @@ impl ExternalPoolManager {
         self.has_eligible_pool_matching(config, None, None).await
     }
 
-    #[cfg(test)]
     pub async fn has_eligible_pool_for_model(
         &self,
         config: &ExternalPoolsConfig,
@@ -4241,7 +4239,6 @@ impl ExternalPoolManager {
             .await
     }
 
-    #[cfg(test)]
     pub async fn has_eligible_pool_for_body_mode_and_model(
         &self,
         config: &ExternalPoolsConfig,
@@ -4293,7 +4290,6 @@ impl ExternalPoolManager {
         })
     }
 
-    #[cfg(test)]
     pub async fn has_immediately_available_pool_for_model(
         &self,
         config: &ExternalPoolsConfig,
@@ -4304,6 +4300,23 @@ impl ExternalPoolManager {
         self.has_immediately_available_pool_matching(
             config,
             None,
+            Some(&model_candidates),
+            max_wait,
+        )
+        .await
+    }
+
+    pub async fn has_immediately_available_pool_for_body_mode_and_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode: ExternalPoolRequestBodyMode,
+        model: Option<&str>,
+        max_wait: Duration,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates(model);
+        self.has_immediately_available_pool_matching(
+            config,
+            Some(body_mode),
             Some(&model_candidates),
             max_wait,
         )
@@ -4333,7 +4346,6 @@ impl ExternalPoolManager {
         )
     }
 
-    #[cfg(test)]
     async fn has_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
@@ -4406,7 +4418,6 @@ impl ExternalPoolManager {
         selection.selected_pool.is_some() || selection.availability.available_pools > 0
     }
 
-    #[cfg(test)]
     async fn has_immediately_available_pool_matching(
         &self,
         config: &ExternalPoolsConfig,

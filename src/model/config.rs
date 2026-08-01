@@ -2967,10 +2967,15 @@ fn external_pool_route_rule_matches(rule: &str, endpoint: &str) -> bool {
     if rule == "*" {
         return true;
     }
-    endpoint.eq_ignore_ascii_case(rule)
-        || endpoint
-            .to_ascii_lowercase()
-            .contains(&rule.to_ascii_lowercase())
+    let endpoint = endpoint.to_ascii_lowercase();
+    let rule = rule.to_ascii_lowercase();
+    if endpoint == rule {
+        return true;
+    }
+    let Some(rest) = endpoint.strip_prefix(&rule) else {
+        return false;
+    };
+    rule.ends_with('/') || rest.starts_with('/')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5736,6 +5741,19 @@ mod tests {
         };
 
         assert!(config.external_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
+    }
+
+    #[test]
+    fn external_pool_route_policy_does_not_match_mid_path_segments() {
+        let config = ExternalPoolsConfig {
+            external_pool_route_mode: ExternalPoolRouteMode::AllowList,
+            external_pool_route_rules: vec!["/v1".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(config.external_pool_route_allowed("/v1/messages"));
+        assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
         assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
     }
 

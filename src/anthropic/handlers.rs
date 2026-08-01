@@ -118,6 +118,7 @@ const SLOW_STREAM_GAP_MS: u64 = 10_000;
 const SLOW_RESPONSE_MS: u64 = 60_000;
 const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
 const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy)]
 struct LocalStreamRetryConfig {
@@ -777,6 +778,11 @@ struct ExternalFallbackContext {
     requires_normalized_body: bool,
 }
 
+struct LocalPoolPreflightExternalOutcome {
+    outcome: ExternalPoolForwardOutcome,
+    local_reason: String,
+}
+
 #[derive(Clone)]
 struct CredentialUsageContext {
     request: RequestUsageContext,
@@ -1255,11 +1261,7 @@ async fn maybe_raw_external_direct_response(
     if !external_pool_enabled_for_endpoint(&config, endpoint) {
         return None;
     }
-    if !manager.has_cached_eligible_pool_for_body_mode_and_model(
-        &config,
-        ExternalPoolRequestBodyMode::RawPassthrough,
-        raw_probe.model.as_deref(),
-    ) {
+    if !raw_external_pool_has_eligible_pool(&manager, &config, raw_probe.model.as_deref()).await {
         return None;
     }
 
@@ -1320,7 +1322,9 @@ async fn maybe_raw_external_preflight_response(
         &config,
         reason,
         raw_probe.model.as_deref(),
-    ) {
+    )
+    .await
+    {
         return None;
     }
 
@@ -1361,7 +1365,25 @@ async fn maybe_raw_external_preflight_response(
     Some(manager.forward_with_failover(config, route).await)
 }
 
-fn raw_external_pool_ready_for_route_reason(
+async fn raw_external_pool_has_eligible_pool(
+    manager: &ExternalPoolManager,
+    config: &ExternalPoolsConfig,
+    model: Option<&str>,
+) -> bool {
+    manager.has_cached_eligible_pool_for_body_mode_and_model(
+        config,
+        ExternalPoolRequestBodyMode::RawPassthrough,
+        model,
+    ) || manager
+        .has_eligible_pool_for_body_mode_and_model(
+            config,
+            ExternalPoolRequestBodyMode::RawPassthrough,
+            model,
+        )
+        .await
+}
+
+async fn raw_external_pool_ready_for_route_reason(
     manager: &ExternalPoolManager,
     config: &ExternalPoolsConfig,
     route_reason: &str,
@@ -1372,13 +1394,26 @@ fn raw_external_pool_ready_for_route_reason(
             config,
             ExternalPoolRequestBodyMode::RawPassthrough,
             model,
-        )
+        ) || manager
+            .has_immediately_available_pool_for_body_mode_and_model(
+                config,
+                ExternalPoolRequestBodyMode::RawPassthrough,
+                model,
+                EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+            )
+            .await
     } else {
         manager.has_cached_eligible_pool_for_body_mode_and_model(
             config,
             ExternalPoolRequestBodyMode::RawPassthrough,
             model,
-        )
+        ) || manager
+            .has_eligible_pool_for_body_mode_and_model(
+                config,
+                ExternalPoolRequestBodyMode::RawPassthrough,
+                model,
+            )
+            .await
     }
 }
 
@@ -1597,7 +1632,7 @@ impl ExternalFallbackContext {
             || self.config.fallback_on_local_transient_exhausted
             || self.config.fallback_on_unsupported_model;
         if !fallback_enabled
-            || !self.has_immediately_available_external_pool_for_model(&self.payload.model)
+            || !self.has_cached_immediately_available_external_pool_for_model(&self.payload.model)
         {
             return (AcquireMode::WaitForCapacity, false);
         }
@@ -1605,7 +1640,7 @@ impl ExternalFallbackContext {
         (acquire_mode, true)
     }
 
-    fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
+    fn has_cached_eligible_external_pool_for_model(&self, model: &str) -> bool {
         match external_fallback_body_mode_filter(self.requires_normalized_body) {
             Some(body_mode) => self
                 .manager
@@ -1620,7 +1655,27 @@ impl ExternalFallbackContext {
         }
     }
 
-    fn has_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
+    async fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
+        self.has_cached_eligible_external_pool_for_model(model)
+            || match external_fallback_body_mode_filter(self.requires_normalized_body) {
+                Some(body_mode) => {
+                    self.manager
+                        .has_eligible_pool_for_body_mode_and_model(
+                            &self.config,
+                            body_mode,
+                            Some(model),
+                        )
+                        .await
+                }
+                None => {
+                    self.manager
+                        .has_eligible_pool_for_model(&self.config, model)
+                        .await
+                }
+            }
+    }
+
+    fn has_cached_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
         match external_fallback_body_mode_filter(self.requires_normalized_body) {
             Some(body_mode) => self
                 .manager
@@ -1635,11 +1690,37 @@ impl ExternalFallbackContext {
         }
     }
 
-    fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
+    async fn has_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
+        self.has_cached_immediately_available_external_pool_for_model(model)
+            || match external_fallback_body_mode_filter(self.requires_normalized_body) {
+                Some(body_mode) => {
+                    self.manager
+                        .has_immediately_available_pool_for_body_mode_and_model(
+                            &self.config,
+                            body_mode,
+                            Some(model),
+                            EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+                        )
+                        .await
+                }
+                None => {
+                    self.manager
+                        .has_immediately_available_pool_for_model(
+                            &self.config,
+                            model,
+                            EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+                        )
+                        .await
+                }
+            }
+    }
+
+    async fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
         if local_route_reason_requires_immediate_external_capacity(route_reason) {
             self.has_immediately_available_external_pool_for_model(model)
+                .await
         } else {
-            self.has_eligible_external_pool_for_model(model)
+            self.has_eligible_external_pool_for_model(model).await
         }
     }
 
@@ -1671,7 +1752,7 @@ impl ExternalFallbackContext {
         &self,
         request_id: &str,
         model: Option<&str>,
-    ) -> Option<ExternalPoolForwardOutcome> {
+    ) -> Option<LocalPoolPreflightExternalOutcome> {
         if !self.config.local_pool_preflight_enabled {
             return None;
         }
@@ -1684,7 +1765,10 @@ impl ExternalFallbackContext {
             return None;
         };
         let route_model = model.unwrap_or(&self.payload.model);
-        if !self.external_pool_ready_for_route_reason(reason, route_model) {
+        if !self
+            .external_pool_ready_for_route_reason(reason, route_model)
+            .await
+        {
             return None;
         }
 
@@ -1713,16 +1797,21 @@ impl ExternalFallbackContext {
         ) {
             Ok(route) => route,
             Err(err) => {
-                return Some(ExternalPoolForwardOutcome::Response(
-                    payload_guard_error_response(err),
-                ));
+                return Some(LocalPoolPreflightExternalOutcome {
+                    outcome: ExternalPoolForwardOutcome::Response(payload_guard_error_response(
+                        err,
+                    )),
+                    local_reason: reason,
+                });
             }
         };
-        Some(
-            self.manager
+        Some(LocalPoolPreflightExternalOutcome {
+            outcome: self
+                .manager
                 .forward_with_failover_result(self.config.clone(), route)
                 .await,
-        )
+            local_reason: reason,
+        })
     }
 
     async fn fallback_after_local_error(
@@ -1816,7 +1905,10 @@ impl ExternalFallbackContext {
             return None;
         };
         let route_reason = route_reason.to_string();
-        if !self.external_pool_ready_for_route_reason(&route_reason, &self.payload.model) {
+        if !self
+            .external_pool_ready_for_route_reason(&route_reason, &self.payload.model)
+            .await
+        {
             tracing::warn!(
                 request_id,
                 classified_reason,
@@ -6228,9 +6320,9 @@ async fn maybe_local_pool_preflight_external_response(
     request_id: &str,
     model: Option<&str>,
 ) -> Option<Response> {
-    let outcome =
+    let preflight =
         maybe_local_pool_preflight_external_outcome(external_fallback, request_id, model).await?;
-    Some(match outcome {
+    Some(match preflight.outcome {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(err) => err.into_response(request_id),
     })
@@ -6240,7 +6332,7 @@ async fn maybe_local_pool_preflight_external_outcome(
     external_fallback: Option<&ExternalFallbackContext>,
     request_id: &str,
     model: Option<&str>,
-) -> Option<ExternalPoolForwardOutcome> {
+) -> Option<LocalPoolPreflightExternalOutcome> {
     external_fallback?
         .local_pool_preflight_outcome(request_id, model)
         .await
@@ -6328,12 +6420,15 @@ async fn maybe_external_fallback_after_websearch_mcp_failure(
 fn local_rescue_reason_after_external_error(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
-    _local_fallback_reason: Option<&str>,
+    local_fallback_reason: Option<&str>,
 ) -> Option<&'static str> {
     if config.external_direct_policy_enabled {
         return None;
     }
     if !config.external_pool_local_rescue_enabled {
+        return None;
+    }
+    if local_fallback_reason_blocks_local_rescue(local_fallback_reason) {
         return None;
     }
     if err.is_rate_limit() {
@@ -6355,6 +6450,26 @@ fn local_rescue_reason_after_external_error(
         return Some("external_bad_request");
     }
     Some("external_error")
+}
+
+fn local_fallback_reason_blocks_local_rescue(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some(
+            "local_no_credentials"
+                | "local_all_disabled"
+                | "local_proxy_blocked"
+                | "local_no_model_compatible"
+                | "local_all_cooling_down"
+                | "local_capacity_full"
+                | "local_capacity_exhausted"
+                | "local_scheduler_redis_degraded"
+                | "local_pool_risk_circuit_open"
+                | "local_transient_exhausted"
+                | "no_available_credentials"
+                | "unsupported_model"
+        )
+    )
 }
 
 fn budgeted_local_rescue_reason_after_external_error(
@@ -6664,14 +6779,15 @@ async fn handle_stream_request(
     )
     .await
     {
-        match outcome {
+        let local_reason = outcome.local_reason;
+        match outcome.outcome {
             ExternalPoolForwardOutcome::Response(response) => return response,
             ExternalPoolForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
                     if let Some(reason) = budgeted_local_rescue_reason_after_external_error(
                         &external.config,
                         &err,
-                        Some("local_preflight"),
+                        Some(local_reason.as_str()),
                         external.inference_attempt_budget.as_ref(),
                     ) {
                         tracing::warn!(
@@ -8848,14 +8964,15 @@ async fn handle_non_stream_request(
     )
     .await
     {
-        match outcome {
+        let local_reason = outcome.local_reason;
+        match outcome.outcome {
             ExternalPoolForwardOutcome::Response(response) => return response,
             ExternalPoolForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
                     if let Some(reason) = budgeted_local_rescue_reason_after_external_error(
                         &external.config,
                         &err,
-                        Some("local_preflight"),
+                        Some(local_reason.as_str()),
                         external.inference_attempt_budget.as_ref(),
                     ) {
                         tracing::warn!(

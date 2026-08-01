@@ -9685,13 +9685,21 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             &rate_limit,
             Some("no_available_credentials")
         ),
-        Some("external_rate_limit")
+        None
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
             &config,
             &rate_limit,
             Some("local_capacity_exhausted")
+        ),
+        None
+    );
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_attempt_reserved_for_fallback")
         ),
         Some("external_rate_limit")
     );
@@ -9789,7 +9797,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             &server_error,
             Some("local_transient_exhausted")
         ),
-        Some("external_error")
+        None
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
@@ -9797,8 +9805,45 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             &server_error,
             Some("local_capacity_exhausted")
         ),
-        Some("external_error")
+        None
     );
+}
+
+#[test]
+fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
+    let config = ExternalPoolsConfig::default();
+    let capacity = ExternalPoolFinalError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        response_error_type: "api_error".to_string(),
+        route_error_type: "external_pool_capacity_full".to_string(),
+        message: "No available external fallback pools".to_string(),
+        error_id: "req_terminal_local_reason".to_string(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: None,
+        pool_name: None,
+    };
+
+    for reason in [
+        "local_no_credentials",
+        "local_all_disabled",
+        "local_proxy_blocked",
+        "local_no_model_compatible",
+        "local_all_cooling_down",
+        "local_capacity_full",
+        "local_capacity_exhausted",
+        "local_scheduler_redis_degraded",
+        "local_pool_risk_circuit_open",
+        "local_transient_exhausted",
+        "no_available_credentials",
+        "unsupported_model",
+    ] {
+        assert_eq!(
+            local_rescue_reason_after_external_error(&config, &capacity, Some(reason)),
+            None,
+            "terminal local reason {reason} must not be rescued back to local"
+        );
+    }
 }
 
 #[test]
