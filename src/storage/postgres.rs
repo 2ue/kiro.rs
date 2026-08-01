@@ -1779,6 +1779,7 @@ impl PostgresStore {
         row.map(credential_from_row).transpose()
     }
 
+    #[cfg(test)]
     pub async fn load_credentials_with_runtime_state(
         &self,
     ) -> anyhow::Result<(
@@ -1800,6 +1801,73 @@ impl PostgresStore {
         tx.commit().await?;
 
         Ok((credentials, runtime_states))
+    }
+
+    /// Load the credential configuration, authoritative runtime state, and the latest
+    /// account-balance snapshot from one repeatable-read transaction.
+    ///
+    /// The account snapshot is intentionally returned separately from runtime state: it is
+    /// display/probe data and must never overwrite an explicit Admin disable or runtime
+    /// generation. Scheduler admission may derive a short-lived quota guard from it.
+    pub async fn load_credentials_with_runtime_state_and_account_info(
+        &self,
+    ) -> anyhow::Result<(
+        Vec<KiroCredentials>,
+        HashMap<u64, CredentialRuntimeStateRow>,
+        HashMap<u64, CredentialAccountInfoRow>,
+    )> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let credential_rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
+            .fetch_all(&mut *tx)
+            .await?;
+        let runtime_state_rows = sqlx::query(CREDENTIAL_RUNTIME_STATE_SELECT_SQL)
+            .fetch_all(&mut *tx)
+            .await?;
+        let account_info_rows = sqlx::query(
+            r#"
+            SELECT credential_id, subscription_title, current_usage, usage_limit,
+                   remaining, usage_percentage, credit_limit, credit_remaining,
+                   credit_base, credit_bonus, overage_status, overage_capability,
+                   overage_cap, overage_rate, current_overages, next_reset_at, checked_at
+            FROM credential_account_info
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let credentials = credentials_from_rows(credential_rows)?;
+        let runtime_states = credential_runtime_states_from_rows(runtime_state_rows)?;
+        let mut account_info = HashMap::with_capacity(account_info_rows.len());
+        for row in account_info_rows {
+            let credential_id: i64 = row.try_get("credential_id")?;
+            let checked_at: DateTime<Utc> = row.try_get("checked_at")?;
+            account_info.insert(
+                credential_id as u64,
+                CredentialAccountInfoRow {
+                    subscription_title: row.try_get("subscription_title")?,
+                    current_usage: row.try_get("current_usage")?,
+                    usage_limit: row.try_get("usage_limit")?,
+                    remaining: row.try_get("remaining")?,
+                    usage_percentage: row.try_get("usage_percentage")?,
+                    credit_limit: row.try_get("credit_limit")?,
+                    credit_remaining: row.try_get("credit_remaining")?,
+                    credit_base: row.try_get("credit_base")?,
+                    credit_bonus: row.try_get("credit_bonus")?,
+                    overage_status: row.try_get("overage_status")?,
+                    overage_capability: row.try_get("overage_capability")?,
+                    overage_cap: row.try_get("overage_cap")?,
+                    overage_rate: row.try_get("overage_rate")?,
+                    current_overages: row.try_get("current_overages")?,
+                    next_reset_at: row.try_get("next_reset_at")?,
+                    checked_at: checked_at.to_rfc3339(),
+                },
+            );
+        }
+        tx.commit().await?;
+
+        Ok((credentials, runtime_states, account_info))
     }
 
     pub async fn load_credential_with_runtime_state(
@@ -14004,6 +14072,24 @@ mod tests {
         );
         assert_eq!(loaded_runtime_state.warmup_remaining, 4);
         assert_eq!(loaded_runtime_state.revision, 1);
+        let (loaded_credentials, loaded_runtime_states, loaded_account_info) = store
+            .load_credentials_with_runtime_state_and_account_info()
+            .await
+            .unwrap();
+        assert!(
+            loaded_credentials
+                .iter()
+                .any(|credential| credential.id == Some(7))
+        );
+        assert_eq!(loaded_runtime_states.get(&7).unwrap().failure_count, 2);
+        assert_eq!(
+            loaded_account_info
+                .get(&7)
+                .unwrap()
+                .overage_status
+                .as_deref(),
+            Some("ENABLED")
+        );
 
         let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
         let mut usage_1 = usage_record("usage-1", 10);

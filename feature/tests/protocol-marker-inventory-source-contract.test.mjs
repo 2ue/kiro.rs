@@ -110,9 +110,11 @@ test('production transcript markers are confined to sanitizer and stream protoco
   assert.doesNotMatch(converter, /"[^"]*Tool results:/)
 })
 
-test('current and history tool-result-only placeholders are inert dots, not transcript prose', () => {
+test('current and history tool-result-only placeholders stay semantic without transcript prose', () => {
   const converter = productionCode('src/anthropic/converter.rs')
-  assert.match(converter, /const EMPTY_USER_CONTENT_PLACEHOLDER: &str = "\.";[\s\S]*const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = EMPTY_USER_CONTENT_PLACEHOLDER;/)
+  assert.match(converter, /const EMPTY_USER_CONTENT_PLACEHOLDER: &str = "\.";/)
+  assert.match(converter, /const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool result received\.";/)
+  assert.doesNotMatch(converter, /const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = EMPTY_USER_CONTENT_PLACEHOLDER;/)
   assert.doesNotMatch(converter, /const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool results provided/)
 
   const history = productionCode('src/anthropic/converter/history.rs')
@@ -178,7 +180,7 @@ test('literal function-call recovery stays scoped to strict envelopes and never 
   assert.match(envelopeParser, /strip_suffix\('>"'\)|strip_suffix\('"'\)/)
 
   const extractor = sourceWindow(stream, 'pub(crate) fn extract_invoke_content_blocks', 2_700)
-  assert.match(extractor, /find_next_function_calls_open/)
+  assert.match(extractor, /find_next_literal_protocol_open/)
   assert.match(extractor, /parse_function_calls_envelope/)
   assert.match(extractor, /all_tools_known/)
   assert.match(extractor, /known_tool_names\.contains\(&call\.name\)/)
@@ -186,8 +188,14 @@ test('literal function-call recovery stays scoped to strict envelopes and never 
   assert.doesNotMatch(extractor, /find_next_named_protocol_open\(text/)
 
   const sniffing = sourceWindow(stream, 'fn drain_invoke_sniff_buffer', 4_200)
-  assert.match(sniffing, /find_next_function_calls_open/)
+  assert.match(sniffing, /find_next_literal_protocol_open/)
   assert.match(sniffing, /FunctionCallsEnvelope::Incomplete/)
-  assert.match(sniffing, /Self::MAX_FUNCTION_CALLS_ENVELOPE_HOLD_BYTES/)
   assert.doesNotMatch(sniffing, /<invoke/)
+
+  const scanner = productionCode('src/anthropic/stream.rs')
+  assert.match(scanner, /const MAX_FUNCTION_CALLS_ENVELOPE_HOLD_BYTES: usize = 262_144;/)
+  assert.match(
+    scanner,
+    /fn find_next_literal_protocol_open[\s\S]*find_next_function_calls_open/,
+  )
 })

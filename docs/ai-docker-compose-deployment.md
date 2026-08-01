@@ -369,6 +369,8 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 | `reportedUsage.pathOverrides` | `/na`、`/cc`、`/ha` | 控制路径前缀覆盖策略。每个前缀独立配置，最长前缀优先。 |
 | `finalCacheReadMaxTokens` | `700000` | 单个路径最终上报的 `cache_read_input_tokens` 上限，在 input 差值转入 cache read 后兜底裁剪。 |
 | `finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` | `0` | 最终读取缓存上限的确定性扣减范围，默认不波动。 |
+| `finalCacheCreationMaxTokens` | `400000` | 单个路径最终上报的 `cache_creation_input_tokens` 上限，在 input 差值转入 cache write 后兜底裁剪。 |
+| `finalCacheCreationJitterMinTokens` / `finalCacheCreationJitterMaxTokens` | `20000` / `45000` | 最终写入缓存上限的确定性扣减范围；有效上限不会高于 `finalCacheCreationMaxTokens`。 |
 | `mode: "preserve"` | 默认用于 cache read/write | 保留本地 high-cache 计算后的字段值。 |
 | `mode: "raw"` | 默认用于 input/output | 使用请求和上游响应的原始字段值，不使用本地 high-cache 放大后的值。 |
 | `mode: "sample-max"` | input 可用 | 把字段采样到 `maxTokens` 以内，数值自然浮动，不固定到上限。 |

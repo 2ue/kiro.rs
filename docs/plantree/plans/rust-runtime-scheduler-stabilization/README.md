@@ -6,7 +6,7 @@ Status: `In Progress`
 
 Current phase: `external-pool hot-path fixed / scheduler architecture and signature blockers open`
 
-Last reviewed: 2026-07-28 Asia/Shanghai
+Last reviewed: 2026-07-31 Asia/Shanghai
 
 Authority:
 
@@ -25,6 +25,7 @@ Authority:
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Indexes:
    - [项目文档处置索引](indexes/document-disposition.md)
+   - [Issue status governance](indexes/issue-status-governance.md)
 5. History:
    - [Evidence index](history/evidence-index.md)
 
@@ -55,4 +56,5 @@ Out of scope:
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |
 | 真实 CLI / load chaos / release gates 未全量闭环 | Open validation | [Validation and release gates](topics/validation-and-release-gates.md) |
 | 项目文档状态漂移、旧分析未归档 | In progress | [Document disposition](indexes/document-disposition.md) |
-
+| 本地账号 WebSearch/tools/image Wave 1 | WebSearch and tool parsing focused verified; image/model/multi-tool-history follow-up open | [Current issue status index](../../../../feature/issues/current-issue-status-index-20260731.md), [analysis priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) |
+| issue 状态、索引和 plan-tree 状态容易漂移 | In progress | [Issue status governance](indexes/issue-status-governance.md), [current issue status index](../../../../feature/issues/current-issue-status-index-20260731.md), [analysis priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) |

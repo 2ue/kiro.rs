@@ -61,6 +61,11 @@ pub(super) struct CredentialEntry {
     pub(super) disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
     pub(super) disabled_reason: Option<DisabledReason>,
+    /// Derived, freshness-bounded account quota guard. This never replaces an explicit
+    /// persisted disable and is recomputed on startup/reload from credential_account_info.
+    pub(super) account_quota_blocked: bool,
+    /// Diagnostic reason for the derived account quota guard.
+    pub(super) account_quota_block_reason: Option<String>,
     /// API 调用成功次数
     pub(super) success_count: u64,
     /// 调度器实际选中该凭据的总次数。

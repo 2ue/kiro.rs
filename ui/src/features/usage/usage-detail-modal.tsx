@@ -97,6 +97,75 @@ function formatUpstreamEventTypeCounts(counts?: Record<string, number>): string 
     .join(' / ')
 }
 
+type ErrorDiagnosticItem = {
+  label: string
+  value: string
+  tone?: 'default' | 'muted' | 'warning' | 'error'
+}
+
+function appendDiagnostic(
+  items: ErrorDiagnosticItem[],
+  seen: Set<string>,
+  label: string,
+  value?: string | null,
+  tone: ErrorDiagnosticItem['tone'] = 'default'
+) {
+  const text = value?.trim()
+  if (!text || seen.has(`${label}\n${text}`)) return
+  seen.add(`${label}\n${text}`)
+  items.push({ label, value: text, tone })
+}
+
+function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
+  const items: ErrorDiagnosticItem[] = []
+  const seen = new Set<string>()
+
+  appendDiagnostic(items, seen, '处理 / 内部错误', record.errorDetail || record.errorMessage, 'error')
+  if (record.errorDetail && record.errorMessage && record.errorDetail !== record.errorMessage) {
+    appendDiagnostic(items, seen, '内部错误摘要', record.errorMessage, 'error')
+  }
+
+  record.credentialAttempts?.forEach((attempt) => {
+    appendDiagnostic(
+      items,
+      seen,
+      `本地上游尝试 #${attempt.attempt} · 账号 #${attempt.credentialId} · ${attempt.statusText || attempt.status || attempt.errorType || attempt.action || '-'}`,
+      attempt.errorMessage || attempt.errorType,
+      'error'
+    )
+  })
+
+  record.externalAttempts?.forEach((attempt) => {
+    appendDiagnostic(
+      items,
+      seen,
+      `外部池上游尝试 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
+      attempt.errorMessage || attempt.errorType,
+      'error'
+    )
+  })
+
+  appendDiagnostic(items, seen, '客户端归一化错误', record.publicErrorMessage, 'muted')
+  return items
+}
+
+function ErrorDiagnosticBlock({ item }: { item: ErrorDiagnosticItem }) {
+  const toneClass = {
+    default: 'border-border bg-muted/30',
+    muted: 'border-border bg-muted/20 text-muted-foreground',
+    warning: 'border-warning/30 bg-warning/10',
+    error: 'border-destructive/30 bg-destructive/5',
+  }[item.tone || 'default']
+  return (
+    <div className={cn('rounded-lg border px-3 py-2', toneClass)}>
+      <div className="text-xs font-medium text-muted-foreground">{item.label}</div>
+      <pre className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-5">
+        {item.value}
+      </pre>
+    </div>
+  )
+}
+
 export function UsageDetailModal({
   record,
   open,
@@ -115,6 +184,7 @@ export function UsageDetailModal({
     record.routeKind === 'external_pool'
     && !!record.upstreamModel
     && record.upstreamModel !== (record.externalOutboundModel || record.upstreamModel)
+  const errorDiagnostics = buildErrorDiagnostics(record)
 
   return (
     <ModalShell open={open} onClose={onClose} title="请求明细" width="max-w-4xl">
@@ -177,6 +247,25 @@ export function UsageDetailModal({
             {record.directPolicyReason && <DetailField label="直连原因" value={record.directPolicyReason} />}
           </div>
         </div>
+
+        {(errorDiagnostics.length > 0 || record.errorMetadata != null) && (
+          <div>
+            <SectionTitle>上游 / 处理错误</SectionTitle>
+            <div className="space-y-2">
+              {errorDiagnostics.map((item, index) => (
+                <ErrorDiagnosticBlock key={`${item.label}-${index}`} item={item} />
+              ))}
+              {record.errorMetadata != null && (
+                <div className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+                  <div className="text-xs font-medium text-muted-foreground">错误元数据</div>
+                  <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-5">
+                    {formatJsonBlock(record.errorMetadata)}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* 用量口径 */}
         <div>
@@ -386,7 +475,7 @@ export function UsageDetailModal({
                       <TableCell>{attemptActionLabel(a.action)}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{formatLatency(a.durationMs)}</TableCell>
                       <TableCell>
-                        <div className="max-w-[260px] truncate text-xs" title={a.errorMessage || a.errorType || ''}>
+                        <div className="max-w-[360px] whitespace-normal break-words text-xs" title={a.errorMessage || a.errorType || ''}>
                           {a.errorMessage || a.errorType || '-'}
                         </div>
                       </TableCell>
@@ -435,7 +524,7 @@ export function UsageDetailModal({
                       <TableCell>{attemptActionLabel(a.action)}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{formatLatency(a.durationMs)}</TableCell>
                       <TableCell>
-                        <div className="max-w-[260px] truncate text-xs" title={a.errorMessage || a.errorType || ''}>
+                        <div className="max-w-[360px] whitespace-normal break-words text-xs" title={a.errorMessage || a.errorType || ''}>
                           {a.errorMessage || a.errorType || '-'}
                         </div>
                       </TableCell>

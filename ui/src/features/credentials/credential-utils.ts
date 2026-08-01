@@ -33,12 +33,14 @@ export function subscriptionBadgeMeta(
   if (!raw) return { label: '未知套餐', tone: 'secondary' }
   const normalized = raw.toLowerCase().replace(/[_\s-]+/g, ' ')
   if (normalized.includes('power')) return { label: 'Power', tone: 'primary', title: raw }
+  if (normalized.includes('pro max')) return { label: 'Pro Max', tone: 'primary', title: raw }
   if (normalized.includes('pro plus') || normalized.includes('pro+')) return { label: 'Pro+', tone: 'primary', title: raw }
   if (normalized.includes('pro')) return { label: 'Pro', tone: 'primary', title: raw }
   if (normalized.includes('free')) return { label: 'Free', tone: 'secondary', title: raw }
   if (normalized.includes('trial') || normalized.includes('试用')) return { label: 'Trial', tone: 'info', title: raw }
   return { label: raw.length > 12 ? raw.slice(0, 12) + '…' : raw, tone: 'neutral', title: raw }
 }
+
 
 export function endpointLabel(endpoint?: string | null): string {
   if (!endpoint) return ''

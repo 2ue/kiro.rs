@@ -7207,25 +7207,15 @@ impl ExternalPoolManager {
             .filter(|_| status == UsageRecordStatus::Success)
             .map(|billing| billing.reported_usage);
         let input_tokens = request_input_tokens;
-        let compat_input_tokens = usage
-            .map(|usage| usage.input_tokens)
-            .unwrap_or(request_input_tokens);
-        let billable_input_tokens = usage
-            .map(|usage| usage.billable_input_tokens)
-            .unwrap_or(request_input_tokens);
-        let output_tokens = usage.map(|usage| usage.output_tokens).unwrap_or(0);
-        let cache_read_input_tokens = usage
-            .map(|usage| usage.cache_read_input_tokens)
-            .unwrap_or(0);
-        let cache_creation_input_tokens = usage
-            .map(|usage| usage.cache_creation_input_tokens)
-            .unwrap_or(0);
-        let cache_creation_5m_input_tokens = usage
-            .map(|usage| usage.cache_creation_5m_input_tokens)
-            .unwrap_or(0);
-        let cache_creation_1h_input_tokens = usage
-            .map(|usage| usage.cache_creation_1h_input_tokens)
-            .unwrap_or(0);
+        let standard_usage =
+            external_standard_usage_for_status(status, request_input_tokens, usage);
+        let compat_input_tokens = standard_usage.input_tokens;
+        let billable_input_tokens = standard_usage.billable_input_tokens;
+        let output_tokens = standard_usage.output_tokens;
+        let cache_read_input_tokens = standard_usage.cache_read_input_tokens;
+        let cache_creation_input_tokens = standard_usage.cache_creation_input_tokens;
+        let cache_creation_5m_input_tokens = standard_usage.cache_creation_5m_input_tokens;
+        let cache_creation_1h_input_tokens = standard_usage.cache_creation_1h_input_tokens;
         let pricing_available = billing
             .as_ref()
             .filter(|_| status == UsageRecordStatus::Success)
@@ -7336,6 +7326,36 @@ impl ExternalPoolManager {
                 .as_ref()
                 .and_then(|report| serde_json::to_value(report).ok()),
         });
+    }
+}
+
+fn external_standard_usage_for_status(
+    status: UsageRecordStatus,
+    request_input_tokens: i32,
+    usage: Option<ExternalPoolUsageSnapshot>,
+) -> ExternalPoolUsageSnapshot {
+    if status == UsageRecordStatus::Success {
+        return usage.unwrap_or(ExternalPoolUsageSnapshot {
+            total_input_tokens: request_input_tokens.max(0),
+            input_tokens: request_input_tokens.max(0),
+            billable_input_tokens: request_input_tokens.max(0),
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        });
+    }
+
+    ExternalPoolUsageSnapshot {
+        total_input_tokens: 0,
+        input_tokens: 0,
+        billable_input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
     }
 }
 
@@ -10381,7 +10401,7 @@ fn project_usage_value(
         .clone()
         .map(|policy| {
             let shaped = policy.apply_final_input_guard(shaped);
-            policy.apply_final_cache_read_guard(shaped)
+            policy.apply_final_standard_cache_guards(shaped)
         })
         .unwrap_or(shaped);
     let projected = shaped
@@ -10393,7 +10413,7 @@ fn project_usage_value(
     let projected = projection
         .reported_policy
         .clone()
-        .map(|policy| policy.apply_final_cache_read_guard(projected))
+        .map(|policy| policy.apply_final_standard_cache_guards(projected))
         .unwrap_or(projected);
     let projected = projection
         .reported_policy

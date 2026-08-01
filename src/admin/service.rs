@@ -6824,11 +6824,20 @@ fn subscription_key(title: Option<&str>) -> String {
     let Some(title) = title else {
         return "unknown".to_string();
     };
-    let lower = title.to_lowercase();
-    if lower.contains("pro+")
+    let lower = title.trim().to_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if compact.contains("power") {
+        "power".to_string()
+    } else if compact.contains("promax") {
+        "pro_max".to_string()
+    } else if lower.contains("pro+")
         || lower.contains("pro plus")
         || lower.contains("pro_plus")
         || lower.contains("pro-plus")
+        || compact.contains("proplus")
     {
         "pro_plus".to_string()
     } else if lower.contains("trial") || lower.contains("试用") {
@@ -6848,6 +6857,8 @@ fn subscription_rank(title: Option<&str>) -> u8 {
         "trial" => 2,
         "pro" => 3,
         "pro_plus" => 4,
+        "pro_max" => 5,
+        "power" => 6,
         _ => 0,
     }
 }

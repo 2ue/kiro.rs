@@ -32,7 +32,12 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 
 ## 当前权威专题
 
-- [Claude Code 本地账号 WebSearch/tools/image 真实调用分析](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) - 2026-07-29 本地账号 7/8 + `claude-sonnet-4.5` 的当前权威记录；旧 external-pool 调试结论不能替代此本地账号诊断。
+- [当前问题状态索引与文档维护规则](current-issue-status-index-20260731.md) - 2026-07-31 当前 open/fix-pending/NO-GO/验证缺口汇总；代码或状态改动必须同步更新 owning issue、该索引和必要的 plan-tree 状态。
+- [当前问题逐项分析优先级队列](issue-analysis-priority-queue-20260731.md) - 2026-07-31 按紧急度和难度排序的问题分析执行顺序；先处理本地账号 Claude Code/WebSearch/tools/image，再推进协议、调度、存储和 UI/release gates。
+- [Claude Code 本地账号 WebSearch/tools/image 真实调用分析](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) - 2026-07-29/31 本地账号 7/8 + `claude-sonnet-4.5` 的当前权威记录；direct native `web_search_YYYYMMDD`、mixed native WebSearch、当前 Claude CLI `WebSearch`、工具命名/schema key 映射和 tool-result-only follow-up focused path 已验证，图片来源矩阵、模型报告和复杂工具历史仍 open；旧 external-pool 调试结论不能替代此本地账号诊断。
+- [下游标准 usage 单字段超过 1m](downstream-usage-standard-field-over-1m-20260731.md) - 2026-07-31 三台生产部署只读证据显示 `input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens` 可单字段超过 1m；标准字段 focused fix 已实现并测试：reported-usage cache creation 使用 `finalCacheCreationMaxTokens=400000` 与 `20000..45000` deterministic jitter，无 full `reportedUsage` 的本地 prompt-cache/`kiro_rs_tool` 路径也会 cap 标准 cache read/write，local credential 与 external pool failure 记录保留诊断估算并将标准字段归零；仍需 frozen/isolated usage-shape smoke、dashboard/API rollup 区分和生产复发观察。
+- [Pro Max 账号卡片套餐显示](subscription-pro-max-card-label-20260801.md) - 根因确认不是截图：UI 套餐 helper 与后端 `subscription_key`/`subscription_rank` 缺少 `Pro Max` 分支，已补齐 `Pro Max` 标签、`pro_max` 筛选键和等级排序，并补充 Power/Pro Max 筛选项；focused Rust/UI/admin-ui 验证通过，最终候选浏览器门禁仍随 release gate 进行。
+- [HTML `<br>` 输出标签污染](html-br-output-tag-contamination-20260731.md) - 2026-07-31 记录 assistant 在正常 prose 中疑似输出 raw `<br>` / HTML-like tag 的复现边界；direct/stream/tool-result/history/CLI 正常场景未复现，web-display 与显式 standalone `<br>` 仅作为合法透传对照；过滤策略仍需真实异常样本或产品规则。
 - [协议 transcript 与工具历史泄漏](protocol-transcript-and-tool-history-leak.md)
 - [thinking 与签名内容安全](thinking-and-signed-content-safety.md)
 - [thinking effort、adaptive mode 与 Kiro 上游映射](thinking-effort-adaptive-upstream-mapping.md)

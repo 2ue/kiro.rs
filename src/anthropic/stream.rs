@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MetadataTokenUsage};
-use crate::model::config::PromptCacheSimulationMode;
+use crate::model::config::{PromptCacheSimulationMode, ReportedUsagePathPolicy};
 
 use super::envelope;
 use super::tool_schema_keys::ToolSchemaKeyMap;
@@ -412,6 +412,18 @@ enum FunctionCallsEnvelope {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteralProtocolKind {
+    FunctionCalls,
+    SearchWeb,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchWebEnvelope {
+    Incomplete,
+    Complete { end: usize, query: Option<String> },
+}
+
 fn parse_named_protocol_open_tag<'a>(
     input: &'a str,
     allowed_names: &[&str],
@@ -572,6 +584,38 @@ fn find_next_function_calls_open(buffer: &str, from: usize) -> Option<usize> {
         .min()
 }
 
+const SEARCH_WEB_OPEN: &str = "<search_web>";
+const SEARCH_WEB_CLOSE: &str = "</search_web>";
+const SEARCH_WEB_QUERY_OPEN: &str = "<query>";
+const SEARCH_WEB_QUERY_CLOSE: &str = "</query>";
+
+fn find_next_search_web_open(buffer: &str, from: usize) -> Option<usize> {
+    let mut search = from;
+    while let Some(relative) = buffer[search..].find(SEARCH_WEB_OPEN) {
+        let start = search + relative;
+        if valid_unquoted_tag(buffer, start, SEARCH_WEB_OPEN) {
+            return Some(start);
+        }
+        search = start + SEARCH_WEB_OPEN.len();
+    }
+    None
+}
+
+fn find_next_literal_protocol_open(
+    buffer: &str,
+    from: usize,
+) -> Option<(usize, LiteralProtocolKind)> {
+    let function_calls = find_next_function_calls_open(buffer, from)
+        .map(|position| (position, LiteralProtocolKind::FunctionCalls));
+    let search_web = find_next_search_web_open(buffer, from)
+        .map(|position| (position, LiteralProtocolKind::SearchWeb));
+    match (function_calls, search_web) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    }
+}
+
 fn parse_function_calls_envelope(buffer: &str, start: usize) -> FunctionCallsEnvelope {
     let Some((open_tag, expected_close)) = FUNCTION_CALLS_TAGS
         .iter()
@@ -596,6 +640,65 @@ fn parse_function_calls_envelope(buffer: &str, start: usize) -> FunctionCallsEnv
         .then(|| parse_strict_invoke_body(&buffer[body_start..close_start]))
         .flatten();
     FunctionCallsEnvelope::Complete { end, calls }
+}
+
+fn parse_search_web_envelope(buffer: &str, start: usize) -> SearchWebEnvelope {
+    if !buffer[start..].starts_with(SEARCH_WEB_OPEN) {
+        return SearchWebEnvelope::Incomplete;
+    }
+    let body_start = start + SEARCH_WEB_OPEN.len();
+    let Some(close_start) = buffer[body_start..]
+        .find(SEARCH_WEB_CLOSE)
+        .map(|offset| body_start + offset)
+    else {
+        return SearchWebEnvelope::Incomplete;
+    };
+    let end = close_start + SEARCH_WEB_CLOSE.len();
+    let body = &buffer[body_start..close_start];
+    let Some(query_start) = body
+        .find(SEARCH_WEB_QUERY_OPEN)
+        .map(|offset| offset + SEARCH_WEB_QUERY_OPEN.len())
+    else {
+        return SearchWebEnvelope::Complete { end, query: None };
+    };
+    let Some(query_end) = body[query_start..]
+        .find(SEARCH_WEB_QUERY_CLOSE)
+        .map(|offset| query_start + offset)
+    else {
+        return SearchWebEnvelope::Complete { end, query: None };
+    };
+    let query = decode_basic_xml_entities(body[query_start..query_end].trim());
+    SearchWebEnvelope::Complete {
+        end,
+        query: (!query.is_empty()).then_some(query),
+    }
+}
+
+fn decode_basic_xml_entities(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn known_websearch_tool_name(known_tool_names: &HashSet<String>) -> Option<String> {
+    known_tool_names
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case("WebSearch") || name.as_str() == "web_search")
+        .cloned()
+        .or_else(|| {
+            known_tool_names
+                .iter()
+                .find(|name| name.eq_ignore_ascii_case("websearch"))
+                .cloned()
+        })
+        .or_else(|| {
+            known_tool_names
+                .contains("web_search")
+                .then(|| "web_search".to_string())
+        })
 }
 
 const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
@@ -734,8 +837,28 @@ fn partial_function_calls_open_start(buf: &str) -> Option<usize> {
     earliest
 }
 
-fn trailing_function_calls_candidate_start(buf: &str) -> Option<usize> {
-    if let Some(open_start) = partial_function_calls_open_start(buf) {
+fn partial_search_web_open_start(buf: &str) -> Option<usize> {
+    for length in 1..SEARCH_WEB_OPEN.len() {
+        if buf.ends_with(&SEARCH_WEB_OPEN[..length]) {
+            return Some(buf.len() - length);
+        }
+    }
+    None
+}
+
+fn partial_literal_protocol_open_start(buf: &str) -> Option<usize> {
+    match (
+        partial_function_calls_open_start(buf),
+        partial_search_web_open_start(buf),
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    }
+}
+
+fn trailing_literal_protocol_candidate_start(buf: &str) -> Option<usize> {
+    if let Some(open_start) = partial_literal_protocol_open_start(buf) {
         return Some(strip_trailing_stray_tokens(&buf[..open_start]).len());
     }
     trailing_stray_token_start(buf).or_else(|| partial_stray_token_start(buf))
@@ -869,15 +992,7 @@ pub(crate) fn extract_invoke_content_blocks(
 
     let mut cursor = 0usize;
     loop {
-        let Some(start) = find_next_function_calls_open(text, cursor) else {
-            let remaining = &text[cursor..];
-            advance_code_fence_state(&mut fence_open, &mut fence_partial, remaining);
-            pending_text.push_str(remaining);
-            break;
-        };
-        let FunctionCallsEnvelope::Complete { end, calls } =
-            parse_function_calls_envelope(text, start)
-        else {
+        let Some((start, protocol_kind)) = find_next_literal_protocol_open(text, cursor) else {
             let remaining = &text[cursor..];
             advance_code_fence_state(&mut fence_open, &mut fence_partial, remaining);
             pending_text.push_str(remaining);
@@ -892,52 +1007,116 @@ pub(crate) fn extract_invoke_content_blocks(
             emitted_visible_text,
             protocol_chain_active,
         );
-        let all_tools_known = calls
-            .as_ref()
-            .map(|calls| {
-                calls
-                    .iter()
-                    .all(|call| known_tool_names.contains(&call.name))
-            })
-            .unwrap_or(false);
 
-        if all_tools_known && visible_before.is_some() {
-            let visible_before = visible_before.expect("checked above");
-            if !visible_before.is_empty() {
-                advance_code_fence_state(&mut fence_open, &mut fence_partial, visible_before);
-                emitted_visible_text |= visible_before
-                    .chars()
-                    .any(|character| !character.is_whitespace());
-                pending_text.push_str(visible_before);
+        match protocol_kind {
+            LiteralProtocolKind::FunctionCalls => {
+                let FunctionCallsEnvelope::Complete { end, calls } =
+                    parse_function_calls_envelope(text, start)
+                else {
+                    let remaining = &text[cursor..];
+                    advance_code_fence_state(&mut fence_open, &mut fence_partial, remaining);
+                    pending_text.push_str(remaining);
+                    break;
+                };
+                let all_tools_known = calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .all(|call| known_tool_names.contains(&call.name))
+                    })
+                    .unwrap_or(false);
+
+                if all_tools_known && visible_before.is_some() {
+                    let visible_before = visible_before.expect("checked above");
+                    if !visible_before.is_empty() {
+                        advance_code_fence_state(
+                            &mut fence_open,
+                            &mut fence_partial,
+                            visible_before,
+                        );
+                        emitted_visible_text |= visible_before
+                            .chars()
+                            .any(|character| !character.is_whitespace());
+                        pending_text.push_str(visible_before);
+                    }
+                    push_text(&mut blocks, &mut pending_text);
+                    for call in calls.expect("known calls exist") {
+                        let upstream_name = call.name;
+                        let name = tool_name_map
+                            .get(&upstream_name)
+                            .cloned()
+                            .unwrap_or_else(|| upstream_name.clone());
+                        let input: serde_json::Value =
+                            serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
+                        let input = tool_schema_key_map.reverse_tool_input(&upstream_name, input);
+                        let input = repair_tool_use_input_for_cli(&name, input);
+                        let tool_use_id =
+                            format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": name,
+                            "input": input,
+                        }));
+                    }
+                    cursor = skip_protocol_whitespace(text, end);
+                    protocol_chain_active = true;
+                } else {
+                    let chunk = &text[cursor..end];
+                    advance_code_fence_state(&mut fence_open, &mut fence_partial, chunk);
+                    emitted_visible_text |=
+                        chunk.chars().any(|character| !character.is_whitespace());
+                    pending_text.push_str(chunk);
+                    cursor = end;
+                    protocol_chain_active = false;
+                }
             }
-            push_text(&mut blocks, &mut pending_text);
-            for call in calls.expect("known calls exist") {
-                let upstream_name = call.name;
-                let name = tool_name_map
-                    .get(&upstream_name)
-                    .cloned()
-                    .unwrap_or_else(|| upstream_name.clone());
-                let input: serde_json::Value =
-                    serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
-                let input = tool_schema_key_map.reverse_tool_input(&upstream_name, input);
-                let input = repair_tool_use_input_for_cli(&name, input);
-                let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
-                blocks.push(json!({
-                    "type": "tool_use",
-                    "id": tool_use_id,
-                    "name": name,
-                    "input": input,
-                }));
+            LiteralProtocolKind::SearchWeb => {
+                let SearchWebEnvelope::Complete { end, query } =
+                    parse_search_web_envelope(text, start)
+                else {
+                    let remaining = &text[cursor..];
+                    advance_code_fence_state(&mut fence_open, &mut fence_partial, remaining);
+                    pending_text.push_str(remaining);
+                    break;
+                };
+                let websearch_tool_name = known_websearch_tool_name(known_tool_names);
+                if let (Some(query), Some(name), Some(visible_before)) =
+                    (query, websearch_tool_name, visible_before)
+                {
+                    if !visible_before.is_empty() {
+                        advance_code_fence_state(
+                            &mut fence_open,
+                            &mut fence_partial,
+                            visible_before,
+                        );
+                        emitted_visible_text |= visible_before
+                            .chars()
+                            .any(|character| !character.is_whitespace());
+                        pending_text.push_str(visible_before);
+                    }
+                    push_text(&mut blocks, &mut pending_text);
+                    let tool_use_id =
+                        format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": name,
+                        "input": {"query": query},
+                    }));
+                    cursor = skip_protocol_whitespace(text, end);
+                    protocol_chain_active = true;
+                } else {
+                    let chunk = &text[cursor..end];
+                    advance_code_fence_state(&mut fence_open, &mut fence_partial, chunk);
+                    emitted_visible_text |=
+                        chunk.chars().any(|character| !character.is_whitespace());
+                    pending_text.push_str(chunk);
+                    cursor = end;
+                    protocol_chain_active = false;
+                }
             }
-            cursor = skip_protocol_whitespace(text, end);
-            protocol_chain_active = true;
-        } else {
-            let chunk = &text[cursor..end];
-            advance_code_fence_state(&mut fence_open, &mut fence_partial, chunk);
-            emitted_visible_text |= chunk.chars().any(|character| !character.is_whitespace());
-            pending_text.push_str(chunk);
-            cursor = end;
-            protocol_chain_active = false;
         }
     }
 
@@ -2060,7 +2239,7 @@ impl StreamContext {
         usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
         let Some(policy) = self.reported_cache_usage_policy.clone() else {
-            return usage;
+            return self.apply_unreported_local_standard_cache_guard(usage);
         };
         let raw = super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens);
         let report_base = if self.local_prompt_cache_projection_enabled {
@@ -2071,7 +2250,23 @@ impl StreamContext {
         let mut reported =
             report_base.with_reported_cache_usage_policy_and_raw(policy.clone(), raw);
         reported = policy.apply_final_input_guard(reported);
-        policy.apply_final_cache_read_guard(reported)
+        policy.apply_final_standard_cache_guards(reported)
+    }
+
+    fn apply_unreported_local_standard_cache_guard(
+        &self,
+        usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        if !self.local_prompt_cache_projection_enabled || !super::cache::usage_has_cache(&usage) {
+            return usage;
+        }
+
+        super::cache::ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy::default(),
+            0,
+        )
+        .map(|guard| guard.apply_final_standard_cache_guards_for_standard_fields(usage))
+        .unwrap_or(usage)
     }
 
     fn initial_usage_for_downstream(&self) -> super::cache::CacheUsage {
@@ -2739,12 +2934,12 @@ impl StreamContext {
         let mut buf = std::mem::take(&mut self.invoke_sniff_buffer);
 
         loop {
-            let Some(start) = find_next_function_calls_open(&buf, 0) else {
+            let Some((start, protocol_kind)) = find_next_literal_protocol_open(&buf, 0) else {
                 if flush {
                     if !buf.is_empty() {
                         events.extend(self.emit_text_delta_raw(&buf));
                     }
-                } else if let Some(hold_start) = trailing_function_calls_candidate_start(&buf) {
+                } else if let Some(hold_start) = trailing_literal_protocol_candidate_start(&buf) {
                     let safe = find_char_boundary(&buf, hold_start);
                     if safe > 0 {
                         events.extend(self.emit_text_delta_raw(&buf[..safe]));
@@ -2766,57 +2961,103 @@ impl StreamContext {
                 !self.pending_leaked_tools.is_empty(),
             );
 
-            match parse_function_calls_envelope(&buf, start) {
-                FunctionCallsEnvelope::Complete { end, calls } => {
-                    let all_tools_known = calls
-                        .as_ref()
-                        .map(|calls| {
-                            calls
-                                .iter()
-                                .all(|call| self.known_tool_names.contains(&call.name))
-                        })
-                        .unwrap_or(false);
-                    if all_tools_known && visible_before.is_some() {
-                        let visible_before = visible_before.expect("checked above");
-                        if !visible_before.is_empty() {
-                            events.extend(self.emit_text_delta_raw(visible_before));
+            match protocol_kind {
+                LiteralProtocolKind::FunctionCalls => {
+                    match parse_function_calls_envelope(&buf, start) {
+                        FunctionCallsEnvelope::Complete { end, calls } => {
+                            let all_tools_known = calls
+                                .as_ref()
+                                .map(|calls| {
+                                    calls
+                                        .iter()
+                                        .all(|call| self.known_tool_names.contains(&call.name))
+                                })
+                                .unwrap_or(false);
+                            if all_tools_known && visible_before.is_some() {
+                                let visible_before = visible_before.expect("checked above");
+                                if !visible_before.is_empty() {
+                                    events.extend(self.emit_text_delta_raw(visible_before));
+                                }
+                                for call in calls.expect("known calls exist") {
+                                    events.extend(
+                                        self.queue_leaked_tool_use(call.name, call.input_json),
+                                    );
+                                }
+                                let remaining_start = skip_protocol_whitespace(&buf, end);
+                                buf = buf[remaining_start..].to_string();
+                            } else {
+                                events.extend(self.emit_text_delta_raw(&buf[..end]));
+                                buf = buf[end..].to_string();
+                            }
                         }
-                        for call in calls.expect("known calls exist") {
-                            events.extend(self.queue_leaked_tool_use(call.name, call.input_json));
-                        }
-                        let remaining_start = skip_protocol_whitespace(&buf, end);
-                        buf = buf[remaining_start..].to_string();
-                    } else {
-                        events.extend(self.emit_text_delta_raw(&buf[..end]));
-                        buf = buf[end..].to_string();
-                    }
-                }
-                FunctionCallsEnvelope::Incomplete => {
-                    if visible_before.is_none() {
-                        let open_len = FUNCTION_CALLS_TAGS
-                            .iter()
-                            .find_map(|(open, _)| {
-                                buf[start..].starts_with(open).then_some(open.len())
-                            })
-                            .expect("scanner only returns complete opening tags");
-                        let release_end = start + open_len;
-                        events.extend(self.emit_text_delta_raw(&buf[..release_end]));
-                        buf = buf[release_end..].to_string();
-                        continue;
-                    }
+                        FunctionCallsEnvelope::Incomplete => {
+                            if visible_before.is_none() {
+                                let open_len = FUNCTION_CALLS_TAGS
+                                    .iter()
+                                    .find_map(|(open, _)| {
+                                        buf[start..].starts_with(open).then_some(open.len())
+                                    })
+                                    .expect("scanner only returns complete opening tags");
+                                let release_end = start + open_len;
+                                events.extend(self.emit_text_delta_raw(&buf[..release_end]));
+                                buf = buf[release_end..].to_string();
+                                continue;
+                            }
 
-                    let hold_start = visible_before.expect("checked above").len();
-                    let held_len = buf.len().saturating_sub(hold_start);
-                    if flush || held_len > Self::MAX_FUNCTION_CALLS_ENVELOPE_HOLD_BYTES {
-                        events.extend(self.emit_text_delta_raw(&buf));
-                    } else {
-                        if hold_start > 0 {
-                            events.extend(self.emit_text_delta_raw(&buf[..hold_start]));
+                            let hold_start = visible_before.expect("checked above").len();
+                            let held_len = buf.len().saturating_sub(hold_start);
+                            if flush || held_len > Self::MAX_FUNCTION_CALLS_ENVELOPE_HOLD_BYTES {
+                                events.extend(self.emit_text_delta_raw(&buf));
+                            } else {
+                                if hold_start > 0 {
+                                    events.extend(self.emit_text_delta_raw(&buf[..hold_start]));
+                                }
+                                self.invoke_sniff_buffer = buf[hold_start..].to_string();
+                            }
+                            break;
                         }
-                        self.invoke_sniff_buffer = buf[hold_start..].to_string();
                     }
-                    break;
                 }
+                LiteralProtocolKind::SearchWeb => match parse_search_web_envelope(&buf, start) {
+                    SearchWebEnvelope::Complete { end, query } => {
+                        let websearch_tool_name = known_websearch_tool_name(&self.known_tool_names);
+                        if let (Some(query), Some(name), Some(visible_before)) =
+                            (query, websearch_tool_name, visible_before)
+                        {
+                            if !visible_before.is_empty() {
+                                events.extend(self.emit_text_delta_raw(visible_before));
+                            }
+                            let input_json = serde_json::to_string(&json!({ "query": query }))
+                                .unwrap_or_else(|_| "{}".to_string());
+                            events.extend(self.queue_leaked_tool_use(name, input_json));
+                            let remaining_start = skip_protocol_whitespace(&buf, end);
+                            buf = buf[remaining_start..].to_string();
+                        } else {
+                            events.extend(self.emit_text_delta_raw(&buf[..end]));
+                            buf = buf[end..].to_string();
+                        }
+                    }
+                    SearchWebEnvelope::Incomplete => {
+                        if visible_before.is_none() {
+                            let release_end = start + SEARCH_WEB_OPEN.len();
+                            events.extend(self.emit_text_delta_raw(&buf[..release_end]));
+                            buf = buf[release_end..].to_string();
+                            continue;
+                        }
+
+                        let hold_start = visible_before.expect("checked above").len();
+                        let held_len = buf.len().saturating_sub(hold_start);
+                        if flush || held_len > Self::MAX_FUNCTION_CALLS_ENVELOPE_HOLD_BYTES {
+                            events.extend(self.emit_text_delta_raw(&buf));
+                        } else {
+                            if hold_start > 0 {
+                                events.extend(self.emit_text_delta_raw(&buf[..hold_start]));
+                            }
+                            self.invoke_sniff_buffer = buf[hold_start..].to_string();
+                        }
+                        break;
+                    }
+                },
             }
         }
 
@@ -5090,6 +5331,105 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_final_usage_caps_cache_creation_after_input_delta() {
+        let mut ctx = StreamContext::new_with_simulation(
+            "test-model",
+            1_000_000,
+            200_000,
+            false,
+            true,
+            HashMap::new(),
+            Some(crate::anthropic::cache::CacheSimulation {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                target_cache_ratio: None,
+                amplification: None,
+                split_cached_input: false,
+                ..Default::default()
+            }),
+            PromptCacheSimulationMode::Disabled,
+        );
+        ctx.set_local_prompt_cache_projection_enabled(false);
+        ctx.set_reported_cache_usage_policy(
+            crate::anthropic::cache::ReportedCacheUsagePolicy::from_path_policy(
+                crate::model::config::ReportedUsagePathPolicy {
+                    final_cache_creation_max_tokens: 400_000,
+                    final_cache_creation_jitter_min_tokens: 0,
+                    final_cache_creation_jitter_max_tokens: 0,
+                    input: crate::model::config::ReportedUsageFieldPolicy::sample_input_max(96),
+                    ..crate::model::config::ReportedUsagePathPolicy::default()
+                },
+                7,
+            ),
+        );
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello"));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        let final_usage = &message_delta.data["usage"];
+        assert!(
+            final_usage["input_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| (1..=96).contains(&tokens))
+        );
+        assert_eq!(final_usage["cache_read_input_tokens"], 0);
+        assert_eq!(final_usage["cache_creation_input_tokens"], 400_000);
+    }
+
+    #[test]
+    fn test_stream_unreported_local_cache_usage_caps_standard_cache_fields() {
+        let mut ctx = StreamContext::new_with_simulation(
+            "test-model",
+            304_883,
+            1_000_000,
+            false,
+            true,
+            HashMap::new(),
+            Some(crate::anthropic::cache::CacheSimulation {
+                cache_creation_input_tokens: 2_645_419,
+                cache_read_input_tokens: 2_646_152,
+                cache_creation_5m_input_tokens: 1_800_000,
+                cache_creation_1h_input_tokens: 845_419,
+                target_cache_ratio: None,
+                amplification: None,
+                split_cached_input: false,
+                ..Default::default()
+            }),
+            PromptCacheSimulationMode::Disabled,
+        );
+        ctx.set_local_prompt_cache_projection_enabled(true);
+
+        let initial_events = ctx.generate_initial_events();
+        let message_start = initial_events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start should exist");
+        let start_usage = &message_start.data["message"]["usage"];
+        assert!(start_usage["cache_read_input_tokens"].as_i64().unwrap() <= 700_000);
+        assert!(start_usage["cache_creation_input_tokens"].as_i64().unwrap() <= 400_000);
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello"));
+        all_events.extend(ctx.generate_final_events());
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        let final_usage = &message_delta.data["usage"];
+        assert_eq!(final_usage["input_tokens"], 304_883);
+        assert!(final_usage["output_tokens"].as_i64().unwrap() > 0);
+        assert!(final_usage["cache_read_input_tokens"].as_i64().unwrap() <= 700_000);
+        assert!(final_usage["cache_creation_input_tokens"].as_i64().unwrap() <= 400_000);
+    }
+
+    #[test]
     fn test_message_metadata_usage_overrides_final_usage() {
         use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
 
@@ -6443,6 +6783,10 @@ mod tests {
         )
     }
 
+    fn websearch_test_tools() -> HashSet<String> {
+        HashSet::from(["WebSearch".to_string()])
+    }
+
     #[test]
     fn literal_tool_protocol_bare_invokes_are_visible_stream_and_non_stream_for_five_rounds() {
         let cases = [
@@ -6517,6 +6861,77 @@ mod tests {
                 2
             );
             assert!(collect_non_stream_text(&blocks).is_empty());
+        }
+    }
+
+    #[test]
+    fn literal_search_web_protocol_recovers_websearch_tool_stream_and_non_stream_for_five_rounds() {
+        let envelope = "<search_web><query>current Shanghai time &amp; date</query></search_web>";
+        for round in 0..5u64 {
+            let chunks = deterministic_ascii_chunks(envelope, 750 + round);
+            let events = run_literal_stream(&chunks, websearch_test_tools());
+            let tools = collect_tool_uses(&events);
+            assert_eq!(tools.len(), 1, "round {round}: {tools:?}");
+            assert_eq!(tools[0].0, "WebSearch");
+            assert_eq!(
+                serde_json::from_str::<Value>(&tools[0].1).unwrap()["query"],
+                "current Shanghai time & date"
+            );
+            assert!(collect_text_content(&events).is_empty(), "round {round}");
+
+            let blocks = extract_invoke_content_blocks(
+                envelope,
+                &websearch_test_tools(),
+                &HashMap::new(),
+                &ToolSchemaKeyMap::default(),
+            );
+            let tool_blocks = blocks
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .collect::<Vec<_>>();
+            assert_eq!(tool_blocks.len(), 1, "round {round}: {blocks:?}");
+            assert_eq!(tool_blocks[0]["name"], "WebSearch");
+            assert_eq!(
+                tool_blocks[0]["input"]["query"],
+                "current Shanghai time & date"
+            );
+            assert!(collect_non_stream_text(&blocks).is_empty(), "round {round}");
+        }
+    }
+
+    #[test]
+    fn literal_search_web_protocol_requires_known_tool_and_protocol_position_for_five_rounds() {
+        let envelope = "<search_web><query>should not run</query></search_web>";
+        let cases = [
+            envelope.to_string(),
+            format!("Here is an example: {envelope}"),
+            format!("```xml\n{envelope}\n```"),
+            "<search_web><not_query>should not run</not_query></search_web>".to_string(),
+        ];
+        for round in 0..5u64 {
+            for case in &cases {
+                let known = if case == envelope {
+                    HashSet::new()
+                } else {
+                    websearch_test_tools()
+                };
+                let chunks = deterministic_ascii_chunks(case, 850 + round);
+                let events = run_literal_stream(&chunks, known.clone());
+                assert!(
+                    collect_tool_uses(&events).is_empty(),
+                    "round {round}: {case}"
+                );
+                assert_eq!(collect_text_content(&events), *case, "round {round}");
+
+                let blocks = extract_invoke_content_blocks(
+                    case,
+                    &known,
+                    &HashMap::new(),
+                    &ToolSchemaKeyMap::default(),
+                );
+                assert!(blocks.iter().all(|block| block["type"] != "tool_use"));
+                assert_eq!(collect_non_stream_text(&blocks), *case, "round {round}");
+            }
         }
     }
 

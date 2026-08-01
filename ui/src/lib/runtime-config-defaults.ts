@@ -18,6 +18,9 @@ import type {
 
 const DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS = 1000
 const DEFAULT_OUTPUT_UPLIFT_PERCENT = 50
+const DEFAULT_FINAL_CACHE_CREATION_MAX_TOKENS = 400000
+const DEFAULT_FINAL_CACHE_CREATION_JITTER_MIN_TOKENS = 20000
+const DEFAULT_FINAL_CACHE_CREATION_JITTER_MAX_TOKENS = 45000
 const DEFAULT_FINAL_OUTPUT_MAX_TOKENS = 200000
 const DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS = 5000
 const DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS = 12000
@@ -89,6 +92,9 @@ export function pathPolicy(
     finalCacheReadMaxTokens: 700000,
     finalCacheReadJitterMinTokens: 0,
     finalCacheReadJitterMaxTokens: 0,
+    finalCacheCreationMaxTokens: DEFAULT_FINAL_CACHE_CREATION_MAX_TOKENS,
+    finalCacheCreationJitterMinTokens: DEFAULT_FINAL_CACHE_CREATION_JITTER_MIN_TOKENS,
+    finalCacheCreationJitterMaxTokens: DEFAULT_FINAL_CACHE_CREATION_JITTER_MAX_TOKENS,
     finalOutputGuardEnabled: true,
     outputUpliftMinTokens: DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS,
     outputUpliftPercent: DEFAULT_OUTPUT_UPLIFT_PERCENT,
@@ -554,6 +560,22 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
     0,
     finalCacheReadJitterMaxTokens
   )
+  const finalCacheCreationMaxTokens = toWhole(
+    policy.finalCacheCreationMaxTokens ?? DEFAULT_FINAL_CACHE_CREATION_MAX_TOKENS
+  )
+  const finalCacheCreationJitterMaxTokens =
+    finalCacheCreationMaxTokens > 0
+      ? toWhole(
+          policy.finalCacheCreationJitterMaxTokens ?? DEFAULT_FINAL_CACHE_CREATION_JITTER_MAX_TOKENS,
+          0,
+          finalCacheCreationMaxTokens
+        )
+      : 0
+  const finalCacheCreationJitterMinTokens = toWhole(
+    policy.finalCacheCreationJitterMinTokens ?? DEFAULT_FINAL_CACHE_CREATION_JITTER_MIN_TOKENS,
+    0,
+    finalCacheCreationJitterMaxTokens
+  )
   const finalOutputMaxTokens = toWhole(policy.finalOutputMaxTokens ?? DEFAULT_FINAL_OUTPUT_MAX_TOKENS)
   const finalOutputJitterMaxTokens =
     finalOutputMaxTokens > 0
@@ -574,6 +596,9 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
     finalCacheReadMaxTokens,
     finalCacheReadJitterMinTokens,
     finalCacheReadJitterMaxTokens,
+    finalCacheCreationMaxTokens,
+    finalCacheCreationJitterMinTokens,
+    finalCacheCreationJitterMaxTokens,
     finalOutputGuardEnabled: policy.finalOutputGuardEnabled ?? true,
     outputUpliftMinTokens: toWhole(policy.outputUpliftMinTokens ?? DEFAULT_OUTPUT_UPLIFT_MIN_TOKENS),
     outputUpliftPercent: toWhole(policy.outputUpliftPercent ?? DEFAULT_OUTPUT_UPLIFT_PERCENT, 0, 200),

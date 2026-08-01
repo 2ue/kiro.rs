@@ -3,7 +3,7 @@
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
 //! 支持多凭据 (MultiTokenManager) 管理
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -40,7 +40,7 @@ use crate::model::config::{
     MIN_TOKEN_REFRESH_MAX_RPM,
 };
 use crate::storage::postgres::{
-    CredentialRefreshExpectedContext, CredentialRefreshFieldsCasOutcome,
+    CredentialAccountInfoRow, CredentialRefreshExpectedContext, CredentialRefreshFieldsCasOutcome,
     CredentialRefreshFieldsPatch, CredentialRuntimeDisabledReasonPatch,
     CredentialRuntimeFailureCounts, CredentialRuntimeStateMutationResult,
     CredentialRuntimeStatePatch, CredentialRuntimeStateRow, CredentialStatsDeltaRow,
@@ -924,6 +924,9 @@ const DISPATCH_QUEUE_LEASE_SAFETY_MARGIN_SECS: u64 = 60;
 const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const PERSISTED_RUNTIME_SUCCESS_RECONCILE_MIN_INTERVAL: StdDuration = StdDuration::from_secs(2);
+/// Account-info snapshots are probe/display data. Only a recent, unambiguous exhausted API-key
+/// snapshot may block dispatch; stale or malformed snapshots must never strand a credential.
+const ACCOUNT_INFO_QUOTA_GUARD_TTL: StdDuration = StdDuration::from_secs(30 * 60);
 /// Capacity/queue operations are correctness-critical, but a single Docker/Redis/runtime jitter
 /// above the old 75ms budget must not turn a healthy local pool into a global 429 wave.
 /// Affinity/sticky operations keep their stricter budget on a separate breaker.
@@ -2093,13 +2096,34 @@ impl MultiTokenManager {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_stores_and_runtime_state(
+        config: Config,
+        credentials: Vec<KiroCredentials>,
+        proxy: Option<ProxyConfig>,
+        postgres_store: Option<Arc<PostgresStore>>,
+        redis_store: Option<Arc<RedisStore>>,
+        initial_runtime_states: Option<HashMap<u64, CredentialRuntimeStateRow>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_stores_and_runtime_state_and_account_info(
+            config,
+            credentials,
+            proxy,
+            postgres_store,
+            redis_store,
+            initial_runtime_states,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_stores_and_runtime_state_and_account_info(
         config: Config,
         mut credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         postgres_store: Option<Arc<PostgresStore>>,
         redis_store: Option<Arc<RedisStore>>,
         initial_runtime_states: Option<HashMap<u64, CredentialRuntimeStateRow>>,
+        initial_account_info: Option<HashMap<u64, CredentialAccountInfoRow>>,
     ) -> anyhow::Result<Self> {
         validate_token_refresh_admission_config(&config)?;
         if credentials.iter().any(|credential| credential.id.is_none()) {
@@ -2161,6 +2185,8 @@ impl MultiTokenManager {
                     } else {
                         None
                     },
+                    account_quota_blocked: false,
+                    account_quota_block_reason: None,
                     success_count: 0,
                     total_selection_count: 0,
                     last_used_at: None,
@@ -2200,6 +2226,12 @@ impl MultiTokenManager {
             }
         }
 
+        if let Some(account_info) = initial_account_info.as_ref() {
+            for entry in &mut entries {
+                Self::apply_account_info_quota_guard(entry, account_info.get(&entry.id));
+            }
+        }
+
         // 检测重复 ID
         let mut seen_ids = std::collections::HashSet::new();
         let mut duplicate_ids = Vec::new();
@@ -2215,7 +2247,7 @@ impl MultiTokenManager {
         // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
         let initial_id = entries
             .iter()
-            .filter(|e| !e.disabled)
+            .filter(|entry| Self::entry_is_scheduler_available(entry))
             .min_by_key(|e| e.credentials.priority)
             .map(|e| e.id)
             .unwrap_or(0);
@@ -2324,6 +2356,9 @@ impl MultiTokenManager {
             manager.apply_loaded_runtime_states(&states);
         } else {
             manager.load_runtime_state();
+        }
+        if let Some(account_info) = initial_account_info {
+            manager.apply_loaded_account_info(&account_info);
         }
         manager.select_highest_priority();
         manager.refresh_scheduler_state_from_redis_force_best_effort();
@@ -5032,6 +5067,17 @@ impl MultiTokenManager {
         self.has_alternate_usable_credential_from_current_state(model, excluded_ids, current_id)
     }
 
+    /// Returns whether the selected credential is currently blocked by a fresh account-balance
+    /// snapshot. This is intentionally separate from `disabled`: the derived guard must not
+    /// overwrite an Admin/runtime disable or its persisted generation.
+    pub fn is_credential_account_quota_blocked(&self, id: u64) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| entry.account_quota_blocked)
+    }
+
     fn has_alternate_usable_credential_from_current_state(
         &self,
         model: Option<&str>,
@@ -6637,7 +6683,7 @@ impl MultiTokenManager {
         // 选择优先级最高的未禁用凭据（不排除当前凭据）
         if let Some(best) = entries
             .iter()
-            .filter(|e| !e.disabled)
+            .filter(|entry| Self::entry_is_scheduler_available(entry))
             .min_by_key(|e| e.credentials.priority)
         {
             if best.id != *current_id {
@@ -7616,6 +7662,72 @@ impl MultiTokenManager {
             || entry.disabled_reason.is_some();
     }
 
+    fn entry_is_scheduler_available(entry: &CredentialEntry) -> bool {
+        !entry.disabled && !entry.account_quota_blocked
+    }
+
+    fn any_scheduler_available(entries: &[CredentialEntry]) -> bool {
+        entries.iter().any(Self::entry_is_scheduler_available)
+    }
+
+    fn account_info_quota_block_reason(
+        entry: &CredentialEntry,
+        account_info: &CredentialAccountInfoRow,
+        now: DateTime<Utc>,
+    ) -> Option<&'static str> {
+        if !entry.credentials.is_api_key_credential() {
+            return None;
+        }
+        let checked_at = DateTime::parse_from_rfc3339(&account_info.checked_at)
+            .ok()
+            .map(|value| value.with_timezone(&Utc))?;
+        let age = now.signed_duration_since(checked_at);
+        let ttl = chrono::Duration::from_std(ACCOUNT_INFO_QUOTA_GUARD_TTL).ok()?;
+        if age < chrono::Duration::zero() || age > ttl {
+            return None;
+        }
+        let overage_disabled = account_info
+            .overage_status
+            .as_deref()
+            .is_some_and(|status| status.trim().eq_ignore_ascii_case("disabled"));
+        if overage_disabled
+            && account_info.remaining.is_finite()
+            && account_info.credit_remaining.is_finite()
+            && account_info.remaining <= 0.0
+            && account_info.credit_remaining <= 0.0
+        {
+            Some("fresh_account_info_remaining_and_credit_exhausted_overage_disabled")
+        } else {
+            None
+        }
+    }
+
+    fn apply_account_info_quota_guard(
+        entry: &mut CredentialEntry,
+        account_info: Option<&CredentialAccountInfoRow>,
+    ) -> bool {
+        let next_reason = account_info
+            .and_then(|info| Self::account_info_quota_block_reason(entry, info, Utc::now()));
+        let next_blocked = next_reason.is_some();
+        let changed = entry.account_quota_blocked != next_blocked
+            || entry.account_quota_block_reason.as_deref() != next_reason;
+        entry.account_quota_blocked = next_blocked;
+        entry.account_quota_block_reason = next_reason.map(str::to_string);
+        changed
+    }
+
+    fn apply_loaded_account_info(
+        &self,
+        account_info: &HashMap<u64, CredentialAccountInfoRow>,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let mut changed = false;
+        for entry in entries.iter_mut() {
+            changed |= Self::apply_account_info_quota_guard(entry, account_info.get(&entry.id));
+        }
+        changed
+    }
+
     /// 非破坏性地将当前凭据快照 upsert 到 PgSQL。
     ///
     /// 该方法只用于旧数据补全、环境变量凭据导入等 bootstrap 场景。底层
@@ -7862,15 +7974,24 @@ impl MultiTokenManager {
             self.invalidate_model_capability_cohorts();
             return Ok(saved);
         };
-        if self.has_pending_runtime_mutations(id)
-            || self
+        if self.runtime_persistence_recovery_pending_for_credential(id) {
+            let saved = self.persist_credential_update(base, requested)?;
+            let current_generation = self
                 .entries
                 .lock()
                 .iter()
                 .find(|entry| entry.id == id)
-                .is_some_and(|entry| entry.runtime_persistence_degraded)
-        {
-            anyhow::bail!("凭据 #{} 运行态持久化正在恢复，请稍后重试", id);
+                .map(|entry| entry.runtime_generation)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            patch.expected_generation = Some(current_generation);
+            let operation_id = uuid::Uuid::new_v4();
+            self.enqueue_admin_runtime_patch_for_recovery(id, operation_id, patch)?;
+            tracing::warn!(
+                credential_id = id,
+                %operation_id,
+                "凭据运行态持久化仍在恢复；Admin 凭据配置已保存，运行态 patch 已进入后台重放队列"
+            );
+            return Ok(saved);
         }
 
         let store = store.clone();
@@ -8039,12 +8160,12 @@ impl MultiTokenManager {
         };
         let proxy_changed = self.reload_proxy_resources_from_postgres()?;
         let store = store.clone();
-        let (credentials, runtime_states) =
+        let (credentials, runtime_states, account_info) =
             block_on_storage("从 PgSQL 一致性重新加载凭据和运行态", async move {
                 credential_pgsql_sync_with_timeout(
                     "从 PgSQL 一致性重新加载凭据和运行态",
                     CREDENTIAL_PGSQL_SYNC_TIMEOUT,
-                    store.load_credentials_with_runtime_state(),
+                    store.load_credentials_with_runtime_state_and_account_info(),
                 )
                 .await
             })?;
@@ -8106,6 +8227,7 @@ impl MultiTokenManager {
                     changed |= entry.disabled != previous_disabled
                         || entry.disabled_reason != previous_reason;
                 }
+                changed |= Self::apply_account_info_quota_guard(entry, account_info.get(&entry.id));
                 entry.credentials = credential;
             }
         }
@@ -8125,6 +8247,8 @@ impl MultiTokenManager {
                 } else {
                     None
                 },
+                account_quota_blocked: false,
+                account_quota_block_reason: None,
                 credentials: credential,
                 failure_count: 0,
                 refresh_failure_count: 0,
@@ -8149,6 +8273,7 @@ impl MultiTokenManager {
             if let Some(state) = runtime_states.get(&id) {
                 Self::apply_runtime_state_if_newer(&mut entry, state);
             }
+            Self::apply_account_info_quota_guard(&mut entry, account_info.get(&id));
             entries.push(entry);
             changed = true;
         }
@@ -8475,6 +8600,82 @@ impl MultiTokenManager {
             .lock()
             .get(&id)
             .is_some_and(|queue| !queue.is_empty())
+    }
+
+    fn runtime_persistence_recovery_pending_for_credential(&self, id: u64) -> bool {
+        self.has_pending_runtime_mutations(id)
+            || self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| entry.runtime_persistence_degraded)
+    }
+
+    fn apply_runtime_patch_to_entry(
+        entry: &mut CredentialEntry,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<()> {
+        if let Some(failure_count) = patch.failure_count {
+            entry.failure_count = failure_count;
+        }
+        if let Some(refresh_failure_count) = patch.refresh_failure_count {
+            entry.refresh_failure_count = refresh_failure_count;
+        }
+        if let Some(warmup_remaining) = patch.warmup_remaining {
+            entry.warmup_remaining = warmup_remaining;
+        }
+        match &patch.disabled_reason {
+            CredentialRuntimeDisabledReasonPatch::Preserve => {}
+            CredentialRuntimeDisabledReasonPatch::Set(reason) => {
+                entry.disabled_reason = DisabledReason::from_str(reason);
+            }
+            CredentialRuntimeDisabledReasonPatch::Clear => {
+                entry.disabled_reason = None;
+            }
+        }
+        if let Some(credential_disabled) = patch.credential_disabled {
+            entry.credentials.disabled = credential_disabled;
+        }
+        if let Some(last_used_at) = patch.last_used_at.as_ref() {
+            let replace = entry
+                .last_used_at
+                .as_ref()
+                .is_none_or(|existing| rfc3339_is_after(last_used_at, existing));
+            if replace {
+                entry.last_used_at = Some(last_used_at.clone());
+            }
+        }
+        if patch.advance_generation {
+            entry.runtime_generation = entry
+                .runtime_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("凭据运行态 generation 已溢出"))?;
+        }
+        Self::recompute_entry_disabled(entry);
+        Ok(())
+    }
+
+    fn enqueue_admin_runtime_patch_for_recovery(
+        &self,
+        id: u64,
+        operation_id: uuid::Uuid,
+        patch: CredentialRuntimeStatePatch,
+    ) -> anyhow::Result<()> {
+        let mutation = PendingCredentialRuntimeMutation::Patch {
+            operation_id,
+            patch: patch.clone(),
+        };
+        if !self.enqueue_pending_runtime_mutation(id, mutation) {
+            anyhow::bail!("凭据不存在: {}", id);
+        }
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+        Self::apply_runtime_patch_to_entry(entry, &patch)?;
+        Ok(())
     }
 
     fn enqueue_pending_runtime_mutation(
@@ -9142,6 +9343,9 @@ impl MultiTokenManager {
         entry: &mut CredentialEntry,
         persisted: &PersistedCredentialRuntimeMutation,
     ) {
+        if persisted.state.generation < entry.runtime_generation {
+            return;
+        }
         Self::apply_authoritative_runtime_state_to_entry(
             entry,
             &persisted.state,
@@ -9188,16 +9392,6 @@ impl MultiTokenManager {
         let Some(store) = &self.postgres_store else {
             return Ok(false);
         };
-        if self.has_pending_runtime_mutations(id)
-            || self
-                .entries
-                .lock()
-                .iter()
-                .find(|entry| entry.id == id)
-                .is_some_and(|entry| entry.runtime_persistence_degraded)
-        {
-            anyhow::bail!("凭据 #{} 运行态持久化正在恢复，请稍后重试", id);
-        }
         let expected_generation = self
             .entries
             .lock()
@@ -9208,6 +9402,16 @@ impl MultiTokenManager {
         patch.expected_generation.get_or_insert(expected_generation);
 
         let operation_id = uuid::Uuid::new_v4();
+        if self.runtime_persistence_recovery_pending_for_credential(id) {
+            self.enqueue_admin_runtime_patch_for_recovery(id, operation_id, patch)?;
+            tracing::warn!(
+                credential_id = id,
+                %operation_id,
+                "凭据运行态持久化仍在恢复；Admin 运行态 patch 已在本地生效并进入后台重放队列"
+            );
+            return Ok(true);
+        }
+
         let store = store.clone();
         let result = block_on_storage("原子更新 PgSQL 凭据运行态字段", async move {
             credential_pgsql_sync_with_timeout(
@@ -9824,18 +10028,18 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
-                return Ok(entries.iter().any(|e| !e.disabled));
+                return Ok(Self::any_scheduler_available(&entries));
             };
 
             if entry.disabled {
-                return Ok(entries.iter().any(|e| !e.disabled));
+                return Ok(Self::any_scheduler_available(&entries));
             }
         }
 
         let (duration, coalesced) = {
             let mut entries = self.entries.lock();
             let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
-                return Ok(entries.iter().any(|entry| !entry.disabled));
+                return Ok(Self::any_scheduler_available(&entries));
             };
             let model = model.map(str::trim).filter(|value| !value.is_empty());
             let model_key = model.map(model_state_key);
@@ -10024,10 +10228,10 @@ impl MultiTokenManager {
         let expected_generation = {
             let entries = self.entries.lock();
             let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             };
             if entry.disabled && !entry.runtime_persistence_degraded {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             }
             entry.runtime_generation
         };
@@ -10078,11 +10282,11 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return Self::any_scheduler_available(&entries),
             };
 
             if entry.disabled && !entry.runtime_persistence_degraded {
-                return entries.iter().any(|e| !e.disabled);
+                return Self::any_scheduler_available(&entries);
             }
 
             if let Some(result) = persisted_state.as_ref() {
@@ -10141,7 +10345,7 @@ impl MultiTokenManager {
         }
         let result = {
             let entries = self.entries.lock();
-            entries.iter().any(|e| !e.disabled)
+            Self::any_scheduler_available(&entries)
         };
         if auto_disabled {
             self.publish_credentials_changed("credential_failure_reported");
@@ -10156,10 +10360,10 @@ impl MultiTokenManager {
         let expected_generation = {
             let entries = self.entries.lock();
             let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             };
             if entry.disabled && !entry.runtime_persistence_degraded {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             }
             entry.runtime_generation
         };
@@ -10170,10 +10374,10 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             let entry = match entries.iter_mut().find(|entry| entry.id == id) {
                 Some(entry) => entry,
-                None => return entries.iter().any(|entry| !entry.disabled),
+                None => return Self::any_scheduler_available(&entries),
             };
             if entry.disabled && !entry.runtime_persistence_degraded {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             }
 
             entry.failure_count = entry.failure_count.saturating_add(1);
@@ -10225,7 +10429,7 @@ impl MultiTokenManager {
         }
         let result = {
             let entries = self.entries.lock();
-            entries.iter().any(|entry| !entry.disabled)
+            Self::any_scheduler_available(&entries)
         };
         if auto_disabled {
             self.publish_credentials_changed("credential_failure_reported");
@@ -10251,11 +10455,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return Self::any_scheduler_available(&entries),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return Self::any_scheduler_available(&entries);
             }
             expected_generation = entry.runtime_generation;
 
@@ -10272,7 +10476,7 @@ impl MultiTokenManager {
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|entry| Self::entry_is_scheduler_available(entry))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -10323,11 +10527,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|entry| entry.id == id) {
                 Some(entry) => entry,
-                None => return entries.iter().any(|entry| !entry.disabled),
+                None => return Self::any_scheduler_available(&entries),
             };
 
             if entry.disabled {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             }
             expected_generation = entry.runtime_generation;
 
@@ -10342,7 +10546,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|entry| !entry.disabled)
+                .filter(|entry| Self::entry_is_scheduler_available(entry))
                 .min_by_key(|entry| entry.credentials.priority)
             {
                 *current_id = next.id;
@@ -10407,7 +10611,7 @@ impl MultiTokenManager {
                 None => {
                     let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
                     return RiskControlReportOutcome {
-                        has_available_credentials: entries.iter().any(|e| !e.disabled),
+                        has_available_credentials: Self::any_scheduler_available(&entries),
                         circuit_open: circuit.open,
                         retry_after_secs: circuit
                             .retry_after
@@ -10419,7 +10623,7 @@ impl MultiTokenManager {
             if entry.disabled {
                 let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
                 return RiskControlReportOutcome {
-                    has_available_credentials: entries.iter().any(|e| !e.disabled),
+                    has_available_credentials: Self::any_scheduler_available(&entries),
                     circuit_open: circuit.open,
                     retry_after_secs: circuit
                         .retry_after
@@ -10446,7 +10650,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|entry| Self::entry_is_scheduler_available(entry))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -10535,7 +10739,7 @@ impl MultiTokenManager {
                 None => {
                     let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
                     return RiskControlReportOutcome {
-                        has_available_credentials: entries.iter().any(|entry| !entry.disabled),
+                        has_available_credentials: Self::any_scheduler_available(&entries),
                         circuit_open: circuit.open,
                         retry_after_secs: circuit
                             .retry_after
@@ -10547,7 +10751,7 @@ impl MultiTokenManager {
             if entry.disabled {
                 let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
                 return RiskControlReportOutcome {
-                    has_available_credentials: entries.iter().any(|entry| !entry.disabled),
+                    has_available_credentials: Self::any_scheduler_available(&entries),
                     circuit_open: circuit.open,
                     retry_after_secs: circuit
                         .retry_after
@@ -10574,7 +10778,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|entry| !entry.disabled)
+                .filter(|entry| Self::entry_is_scheduler_available(entry))
                 .min_by_key(|entry| entry.credentials.priority)
             {
                 *current_id = next.id;
@@ -10650,10 +10854,10 @@ impl MultiTokenManager {
         let expected_generation = {
             let entries = self.entries.lock();
             let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             };
             if entry.disabled && !entry.runtime_persistence_degraded {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             }
             entry.runtime_generation
         };
@@ -10704,10 +10908,10 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             let entry = match entries.iter_mut().find(|entry| entry.id == id) {
                 Some(entry) => entry,
-                None => return entries.iter().any(|entry| !entry.disabled),
+                None => return Self::any_scheduler_available(&entries),
             };
             if entry.disabled && !entry.runtime_persistence_degraded {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             }
 
             if let Some(result) = persisted_state.as_ref() {
@@ -10769,7 +10973,7 @@ impl MultiTokenManager {
         }
         let result = {
             let entries = self.entries.lock();
-            entries.iter().any(|e| !e.disabled)
+            Self::any_scheduler_available(&entries)
         };
         if auto_disabled {
             self.publish_credentials_changed("credential_refresh_failure_reported");
@@ -10793,11 +10997,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|e| e.id == id) {
                 Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
+                None => return Self::any_scheduler_available(&entries),
             };
 
             if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
+                return Self::any_scheduler_available(&entries);
             }
             expected_generation = entry.runtime_generation;
 
@@ -10814,7 +11018,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|e| !e.disabled)
+                .filter(|entry| Self::entry_is_scheduler_available(entry))
                 .min_by_key(|e| e.credentials.priority)
             {
                 *current_id = next.id;
@@ -10865,11 +11069,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|entry| entry.id == id) {
                 Some(entry) => entry,
-                None => return entries.iter().any(|entry| !entry.disabled),
+                None => return Self::any_scheduler_available(&entries),
             };
 
             if entry.disabled {
-                return entries.iter().any(|entry| !entry.disabled);
+                return Self::any_scheduler_available(&entries);
             }
             expected_generation = entry.runtime_generation;
 
@@ -10886,7 +11090,7 @@ impl MultiTokenManager {
 
             if let Some(next) = entries
                 .iter()
-                .filter(|entry| !entry.disabled)
+                .filter(|entry| Self::entry_is_scheduler_available(entry))
                 .min_by_key(|entry| entry.credentials.priority)
             {
                 *current_id = next.id;
@@ -10936,7 +11140,7 @@ impl MultiTokenManager {
         // 选择优先级最高的未禁用凭据（排除当前凭据）
         if let Some(next) = entries
             .iter()
-            .filter(|e| !e.disabled && e.id != *current_id)
+            .filter(|entry| Self::entry_is_scheduler_available(entry) && entry.id != *current_id)
             .min_by_key(|e| e.credentials.priority)
         {
             *current_id = next.id;
@@ -10948,7 +11152,9 @@ impl MultiTokenManager {
             true
         } else {
             // 没有其他可用凭据，检查当前凭据是否可用
-            entries.iter().any(|e| e.id == *current_id && !e.disabled)
+            entries
+                .iter()
+                .any(|entry| entry.id == *current_id && Self::entry_is_scheduler_available(entry))
         }
     }
 
@@ -12076,6 +12282,8 @@ impl MultiTokenManager {
                 runtime_persistence_quarantined: false,
                 disabled: persisted_disabled,
                 disabled_reason: persisted_reason,
+                account_quota_blocked: false,
+                account_quota_block_reason: None,
                 success_count: 0,
                 total_selection_count: 0,
                 last_used_at: None,

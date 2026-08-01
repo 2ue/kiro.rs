@@ -14,7 +14,7 @@ pub(super) fn is_opus_model(model: Option<&str>) -> bool {
 }
 
 pub(super) fn credential_is_usable_for_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
-    if entry.disabled {
+    if entry.disabled || entry.account_quota_blocked {
         return false;
     }
     if !entry.credentials.supports_model(&[model]) {

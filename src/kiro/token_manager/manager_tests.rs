@@ -1,6 +1,7 @@
 use super::*;
 use crate::anthropic::usage::sampled_request_rejection_usage_record;
 use crate::kiro::token_manager::refresh::{is_token_expiring_soon, refresh_token};
+use crate::storage::postgres::CredentialAccountInfoRow;
 use std::sync::Arc;
 
 const SONNET_MODEL: &str = "claude-sonnet-4.5";
@@ -368,6 +369,84 @@ fn runtime_state_apply_rejects_stale_and_equal_revisions() {
     assert_eq!(entry.runtime_revision, 6);
     assert!(entry.disabled);
     assert_eq!(entry.disabled_reason, Some(DisabledReason::TooManyFailures));
+}
+
+#[test]
+fn admin_deferred_runtime_patch_advances_generation_and_ignores_older_replay() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential(
+            "admin-deferred-runtime",
+            "Pro",
+        )],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert!(manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::ApiFailure {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            last_used_at: Utc::now().to_rfc3339(),
+        },
+    ));
+    manager
+        .enqueue_admin_runtime_patch_for_recovery(
+            1,
+            uuid::Uuid::new_v4(),
+            CredentialRuntimeStatePatch {
+                failure_count: Some(0),
+                refresh_failure_count: Some(0),
+                disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+                warmup_remaining: Some(7),
+                credential_disabled: Some(false),
+                expected_generation: Some(0),
+                advance_generation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    {
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.runtime_generation, 1);
+        assert_eq!(entry.failure_count, 0);
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert_eq!(entry.warmup_remaining, 7);
+        assert!(!entry.credentials.disabled);
+        assert!(entry.disabled_reason.is_none());
+        assert!(entry.runtime_persistence_degraded);
+        assert!(entry.runtime_persistence_quarantined);
+    }
+    assert_eq!(manager.runtime_mutation_backlog().0, 2);
+
+    let older_replay = PersistedCredentialRuntimeMutation {
+        state: CredentialRuntimeStateRow {
+            failure_count: MAX_FAILURES_PER_CREDENTIAL,
+            refresh_failure_count: MAX_FAILURES_PER_CREDENTIAL,
+            disabled_reason: Some(DisabledReason::TooManyFailures.as_str().to_string()),
+            warmup_remaining: 0,
+            generation: 0,
+            revision: 100,
+        },
+        credential_disabled: Some(true),
+        applied: true,
+    };
+    {
+        let mut entries = manager.entries.lock();
+        let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+        MultiTokenManager::apply_persisted_runtime_mutation_to_entry(entry, &older_replay);
+        assert_eq!(entry.runtime_generation, 1);
+        assert_eq!(entry.failure_count, 0);
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert_eq!(entry.warmup_remaining, 7);
+        assert!(!entry.credentials.disabled);
+        assert!(entry.disabled_reason.is_none());
+    }
 }
 
 #[test]
@@ -1707,6 +1786,128 @@ fn startup_applies_consistent_runtime_snapshot_before_selecting_current_credenti
     assert_eq!(first.runtime_revision, 1);
 }
 
+#[test]
+fn startup_quota_guard_skips_fresh_exhausted_api_key_and_keeps_runtime_enabled() {
+    let mut exhausted = api_key_credential("startup-quota-exhausted");
+    exhausted.id = Some(1);
+    exhausted.priority = 0;
+    let mut healthy = api_key_credential("startup-quota-healthy");
+    healthy.id = Some(2);
+    healthy.priority = 1;
+    let account_info = HashMap::from([(
+        1,
+        CredentialAccountInfoRow {
+            remaining: 0.0,
+            credit_remaining: 0.0,
+            overage_status: Some("DISABLED".to_string()),
+            checked_at: Utc::now().to_rfc3339(),
+            ..Default::default()
+        },
+    )]);
+
+    let manager = MultiTokenManager::new_with_stores_and_runtime_state_and_account_info(
+        Config::default(),
+        vec![exhausted, healthy],
+        None,
+        None,
+        None,
+        None,
+        Some(account_info),
+    )
+    .unwrap();
+
+    assert_eq!(manager.current_id(), 2);
+    let entries = manager.entries.lock();
+    let exhausted = entries.iter().find(|entry| entry.id == 1).unwrap();
+    let healthy = entries.iter().find(|entry| entry.id == 2).unwrap();
+    assert!(exhausted.account_quota_blocked);
+    assert_eq!(
+        exhausted.account_quota_block_reason.as_deref(),
+        Some("fresh_account_info_remaining_and_credit_exhausted_overage_disabled")
+    );
+    assert!(!exhausted.disabled);
+    assert!(!healthy.account_quota_blocked);
+}
+
+#[test]
+fn quota_guard_ignores_stale_missing_non_disabled_and_oauth_account_snapshots() {
+    let mut api_key = api_key_credential("quota-guard-matrix");
+    api_key.id = Some(1);
+    let oauth = KiroCredentials {
+        id: Some(2),
+        auth_method: Some("social".to_string()),
+        refresh_token: Some("refresh".to_string()),
+        ..Default::default()
+    };
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![api_key, oauth.clone()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    let stale = CredentialAccountInfoRow {
+        remaining: 0.0,
+        credit_remaining: 0.0,
+        overage_status: Some("DISABLED".to_string()),
+        checked_at: (Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        ..Default::default()
+    };
+    let overage_enabled = CredentialAccountInfoRow {
+        remaining: 0.0,
+        credit_remaining: 0.0,
+        overage_status: Some("ENABLED".to_string()),
+        checked_at: Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    assert!(
+        !MultiTokenManager::account_info_quota_block_reason(
+            &manager.entries.lock()[0],
+            &stale,
+            Utc::now()
+        )
+        .is_some()
+    );
+    assert!(
+        !MultiTokenManager::account_info_quota_block_reason(
+            &manager.entries.lock()[0],
+            &overage_enabled,
+            Utc::now()
+        )
+        .is_some()
+    );
+    assert!(
+        MultiTokenManager::account_info_quota_block_reason(
+            &manager.entries.lock()[1],
+            &CredentialAccountInfoRow {
+                remaining: 0.0,
+                credit_remaining: 0.0,
+                overage_status: Some("DISABLED".to_string()),
+                checked_at: Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+            Utc::now()
+        )
+        .is_none(),
+        "OAuth credentials must not use the API-key-only quota guard"
+    );
+    assert!(!manager.entries.lock()[0].account_quota_blocked);
+
+    let exhausted = CredentialAccountInfoRow {
+        remaining: 0.0,
+        credit_remaining: 0.0,
+        overage_status: Some("DISABLED".to_string()),
+        checked_at: Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    manager.apply_loaded_account_info(&HashMap::from([(1, exhausted)]));
+    assert!(manager.entries.lock()[0].account_quota_blocked);
+    manager.apply_loaded_account_info(&HashMap::new());
+    assert!(!manager.entries.lock()[0].account_quota_blocked);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reload_remote_delete_clears_pending_persistence_for_removed_id() {
     let Some(store) = test_postgres_store().await else {
@@ -1757,6 +1958,61 @@ async fn reload_remote_delete_clears_pending_persistence_for_removed_id() {
     assert!(!manager.pending_runtime_mutations.lock().contains_key(&2));
 
     store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_account_info_quota_guard_reselects_healthy_credential() {
+    run_isolated_postgres_fixture(|store| async move {
+        let mut exhausted = api_key_credential("reload-quota-exhausted");
+        exhausted.id = Some(1);
+        exhausted.priority = 0;
+        let mut healthy = api_key_credential("reload-quota-healthy");
+        healthy.id = Some(2);
+        healthy.priority = 1;
+        store
+            .save_credentials(&[exhausted.clone(), healthy.clone()])
+            .await
+            .unwrap();
+
+        let manager = MultiTokenManager::new_with_stores(
+            Config::default(),
+            vec![exhausted, healthy],
+            None,
+            None,
+            false,
+            Some(store.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(manager.current_id(), 1);
+
+        store
+            .save_credential_account_info(
+                1,
+                &CredentialAccountInfoRow {
+                    remaining: 0.0,
+                    credit_remaining: 0.0,
+                    overage_status: Some("DISABLED".to_string()),
+                    checked_at: Utc::now().to_rfc3339(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(manager.reload_credentials_from_postgres().unwrap());
+        assert_eq!(manager.current_id(), 2);
+        assert!(manager.is_credential_account_quota_blocked(1));
+        let entries = manager.entries.lock();
+        let exhausted = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(exhausted.account_quota_blocked);
+        assert!(!exhausted.disabled);
+        assert_eq!(
+            exhausted.account_quota_block_reason.as_deref(),
+            Some("fresh_account_info_remaining_and_credit_exhausted_overage_disabled")
+        );
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4850,6 +5106,161 @@ async fn postgres_reset_generation_fences_pending_failure_and_disable_replay() {
     store.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_admin_capacity_update_defers_runtime_patch_during_recovery() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut config = Config::default();
+    config.credential_warmup_requests = 7;
+    let mut credential = api_key_credential("ksk_admin_capacity_deferred");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager = MultiTokenManager::new_with_stores(
+        config,
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+
+    assert!(manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::ApiFailure {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            last_used_at: Utc::now().to_rfc3339(),
+        },
+    ));
+    assert_eq!(manager.runtime_mutation_backlog().0, 1);
+
+    manager
+        .set_credential_max_concurrent_requests(1, Some(20))
+        .unwrap();
+
+    {
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.credentials.max_concurrent_requests, Some(20));
+        assert_eq!(entry.warmup_remaining, 7);
+        assert_eq!(entry.runtime_generation, 1);
+        assert!(entry.runtime_persistence_degraded);
+        assert!(entry.runtime_persistence_quarantined);
+    }
+    assert_eq!(manager.runtime_mutation_backlog().0, 2);
+    assert!(
+        store
+            .load_credentials()
+            .await
+            .unwrap()
+            .iter()
+            .any(|credential| {
+                credential.id == Some(1) && credential.max_concurrent_requests == Some(20)
+            })
+    );
+
+    manager.save_stats();
+    assert_eq!(manager.runtime_mutation_backlog(), (0, 0));
+    let states = store.load_credential_runtime_state().await.unwrap();
+    let state = states.get(&1).unwrap();
+    assert_eq!(state.generation, 1);
+    assert_eq!(state.warmup_remaining, 7);
+    {
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!entry.runtime_persistence_degraded);
+        assert!(!entry.runtime_persistence_quarantined);
+        assert_eq!(entry.warmup_remaining, 7);
+    }
+
+    store.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_admin_reset_enable_defers_runtime_patch_during_recovery() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credential = api_key_credential("ksk_admin_reset_deferred");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+
+    assert!(manager.enqueue_pending_runtime_mutation(
+        1,
+        PendingCredentialRuntimeMutation::Disable {
+            operation_id: uuid::Uuid::new_v4(),
+            expected_generation: 0,
+            reason: DisabledReason::TooManyFailures.as_str().to_string(),
+            failure_count: Some(MAX_FAILURES_PER_CREDENTIAL),
+            refresh_failure_count: None,
+            last_used_at: Utc::now().to_rfc3339(),
+        },
+    ));
+    assert_eq!(manager.runtime_mutation_backlog().0, 1);
+
+    manager.reset_and_enable(1).unwrap();
+
+    {
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.failure_count, 0);
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert_eq!(entry.runtime_generation, 1);
+        assert!(!entry.credentials.disabled);
+        assert!(entry.disabled_reason.is_none());
+        assert!(entry.runtime_persistence_degraded);
+        assert!(entry.runtime_persistence_quarantined);
+    }
+    assert_eq!(manager.runtime_mutation_backlog().0, 2);
+
+    manager.save_stats();
+    assert_eq!(manager.runtime_mutation_backlog(), (0, 0));
+    {
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.runtime_generation, 1);
+        assert_eq!(entry.failure_count, 0);
+        assert_eq!(entry.refresh_failure_count, 0);
+        assert!(!entry.runtime_persistence_degraded);
+        assert!(!entry.runtime_persistence_quarantined);
+        assert!(!entry.disabled);
+        assert!(entry.disabled_reason.is_none());
+    }
+    let states = store.load_credential_runtime_state().await.unwrap();
+    let state = states.get(&1).unwrap();
+    assert_eq!(state.generation, 1);
+    assert_eq!(state.failure_count, 0);
+    assert_eq!(state.refresh_failure_count, 0);
+    assert!(state.disabled_reason.is_none());
+    assert!(
+        store
+            .load_credentials()
+            .await
+            .unwrap()
+            .iter()
+            .any(|credential| credential.id == Some(1) && !credential.disabled)
+    );
+
+    store.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_add_credential_reject_duplicate_api_key() {
     let config = Config::default();
@@ -6105,6 +6516,8 @@ fn test_health_balanced_score_parameters_are_effective() {
         runtime_persistence_quarantined: false,
         disabled: false,
         disabled_reason: None,
+        account_quota_blocked: false,
+        account_quota_block_reason: None,
         success_count: 0,
         total_selection_count: 100,
         last_used_at: None,
@@ -6135,6 +6548,8 @@ fn test_health_balanced_score_parameters_are_effective() {
         runtime_persistence_quarantined: false,
         disabled: false,
         disabled_reason: None,
+        account_quota_blocked: false,
+        account_quota_block_reason: None,
         success_count: 0,
         total_selection_count: 0,
         last_used_at: None,

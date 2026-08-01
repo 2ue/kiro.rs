@@ -9734,6 +9734,56 @@ impl KiroProvider {
             // 400 Bad Request
             if status.as_u16() == 400 {
                 let bad_request_reason = Self::classify_bad_request_reason(&body);
+                if matches!(
+                    bad_request_reason,
+                    "request_body_invalid_bad_request" | "bad_request"
+                ) && self
+                    .token_manager
+                    .is_credential_account_quota_blocked(ctx.id)
+                {
+                    let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
+                    let can_retry = has_available && attempt + 1 < max_retries;
+                    Self::push_mcp_attempt(
+                        attribution_sink.as_ref(),
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        if can_retry {
+                            "mcp_quota_snapshot_retry_next"
+                        } else {
+                            "mcp_quota_snapshot_fail"
+                        },
+                        Some("mcp_credential_quota_exhausted_400"),
+                        Some("credential_quota_exhausted_400".to_string()),
+                        attempt_started_at,
+                        None,
+                    );
+                    if can_retry {
+                        excluded_ids.insert(ctx.id);
+                        last_error = Some(Self::mcp_failure_error(
+                            McpCallFailureKind::InvalidRequest,
+                            format!(
+                                "MCP 请求失败（{}，账号额度快照已耗尽）: {}",
+                                credential_context, status
+                            ),
+                        ));
+                        self.finish_attempt(&mut ctx);
+                        continue;
+                    }
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::mcp_failure_error_with_attribution(
+                        McpCallFailureKind::InvalidRequest,
+                        format!(
+                            "MCP 请求失败（{}，账号额度快照已耗尽）: {}",
+                            credential_context, status
+                        ),
+                        Some(ctx.id),
+                        Some(credential_label),
+                        attempts,
+                    ));
+                }
                 Self::push_mcp_attempt(
                     attribution_sink.as_ref(),
                     &mut attempts,
@@ -11368,6 +11418,48 @@ impl KiroProvider {
                     Some(content_kind),
                     Some(Self::bad_request_diagnostic_reason(bad_request_reason)),
                 );
+                // A fresh account-info quota guard is the only case where an otherwise opaque
+                // 400 may be attributed to the selected credential. Generic malformed/tool/image
+                // 400s remain fail-fast and never trigger broad fallback.
+                if matches!(
+                    bad_request_reason,
+                    "request_body_invalid_bad_request" | "bad_request"
+                ) && self
+                    .token_manager
+                    .is_credential_account_quota_blocked(ctx.id)
+                {
+                    let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
+                    let can_retry = has_available && attempt + 1 < max_retries;
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        if can_retry {
+                            "quota_snapshot_retry_next"
+                        } else {
+                            "quota_snapshot_fail"
+                        },
+                        Some("credential_quota_exhausted_400"),
+                        Some(message.clone()),
+                        attempt_started_at,
+                        model.as_deref(),
+                    );
+                    if can_retry {
+                        if let Some(session_id) = conversation_id.as_deref() {
+                            self.token_manager
+                                .unbind_session_if_bound_to_deferred(session_id, ctx.id);
+                        }
+                        excluded_ids.insert(ctx.id);
+                        last_error = Some(anyhow::anyhow!(message));
+                        self.finish_attempt(&mut ctx);
+                        continue;
+                    }
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(message, &attempts));
+                }
                 if Self::should_retry_model_unavailable_bad_request(
                     bad_request_reason,
                     model.as_deref(),

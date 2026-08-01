@@ -82,6 +82,13 @@ pub(super) fn create_placeholder_tool(name: &str, options: ConverterOptions) -> 
 pub(super) const TOOL_NAME_MAX_LEN: usize = 63;
 pub(super) const TOOL_HASH_MARKER: &str = "Hash";
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ToolNameMappingSummary {
+    pub total: usize,
+    pub sanitized: usize,
+    pub overlong: usize,
+}
+
 fn capitalize_ascii_first(value: &str) -> String {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -189,6 +196,27 @@ pub(super) fn map_tool_name(
             .or_insert_with(|| name.to_string());
     }
     mapped
+}
+
+pub(super) fn summarize_tool_name_mapping(
+    tool_name_map: &HashMap<String, String>,
+) -> ToolNameMappingSummary {
+    let mut summary = ToolNameMappingSummary {
+        total: tool_name_map.len(),
+        ..ToolNameMappingSummary::default()
+    };
+
+    for original in tool_name_map.values() {
+        let sanitized = sanitize_tool_name(original);
+        if sanitized != *original {
+            summary.sanitized += 1;
+        }
+        if original.len() > TOOL_NAME_MAX_LEN || sanitized.len() > TOOL_NAME_MAX_LEN {
+            summary.overlong += 1;
+        }
+    }
+
+    summary
 }
 
 fn parse_tool_choice(tool_choice: &Option<serde_json::Value>) -> ToolChoiceDirective {

@@ -1,6 +1,6 @@
 # Thinking Effort, Adaptive Mode, And Upstream Mapping
 
-Status: `fixed / final-candidate-validated / monitor future CLI-or-Kiro-schema changes`
+Status: `fixed / final-candidate-validated / current-cli-2.1.220-release-gate-passed / monitor future CLI-or-Kiro-schema changes`
 
 Severity: P0 protocol correctness / P1 capability compatibility
 
@@ -13,6 +13,8 @@ Related cases: A05, A09, C01, D01, D07, F05
 用户可见现象不一定包含固定字符串，可能表现为：同一模型的 `max` 与 `high` 行为、延迟和 usage 完全相同；显式 adaptive 请求退化为普通回答；thinking alias 只注入提示词但没有真实 thinking；主动设置与模型自动触发结果不一致；UI 开关、CLI 参数、请求字段和上游 wire body互相覆盖；响应声称有 thinking token，但请求侧没有启用相应能力。
 
 本专题只负责请求侧能力与强度映射。thinking 正文泄漏、signed/redacted 完整性、stream block 和 `thinking_tokens` 终止安全仍由 [thinking 与签名内容安全](thinking-and-signed-content-safety.md) 负责。
+
+2026-08-01 release-gate refresh: [Final release gate - 2026-08-01](../evidence/final-release-gate-20260801.md) reran the real Claude Code CLI `2.1.220` fake-upstream suite against frozen candidate SHA-256 `bca03a67e3744685e19f95e49b7601fd7d744575e421f140a9d895b1a7c8f3a6`. `thinking-wire` passed `60/60` (`cli`/`ide` x absent/low/medium/high/xhigh/max x 5) with `violations=0`. The validation harness now records the actual CLI version and treats `KIRO_EXPECTED_CLAUDE_VERSION` as optional exact mode; the default policy requires a recognizable version at or above supported minimum `2.1.197`, avoiding stale hard-coded CLI patch pins.
 
 ## 当前事实与待验证假设
 
@@ -125,6 +127,27 @@ runner 同时移除了对既有 9022 listener 的前后 `lsof` 探测，只在�
 2026-07-22 当前工作树补齐完整 service wire 复核：先用 Claude Code CLI 2.1.197 对 absent/`low`/`medium`/`high`/`xhigh`/`max` 六档各 5 轮重新抓原始 CLI body，30/30 均为 `thinking.type=adaptive`；absent 默认 `output_config.effort=high`，显式 `max` 保持 `max`。随后用 frozen `kiro-rs` SHA `31b8c4749201b0f7666b63a9c268c0b75e21f6c1600b18c77bf39a7c6c249c2e`、caller-owned PostgreSQL 两空库、空 Redis DB9 和临时 Node `psql` wrapper 执行 `thinking-effort-kiro-wire.mjs`，CLI/IDE × 6 efforts × 5 rounds 共 60/60 pass；inference=60，model discovery/schema=2，unknown/invalid/protocol violations=0，cleanup 全 true，report SHA-256 `df9a2fe3e07a41fd9df5cd8716ab6270d8902e3a09f1c9f0a749fff7487170a3`。
 
 本轮当前候选事实是：Kiro final wire 没有把 `max` 截成 `high`；当上游 schema path 为 `output_config.effort` 时，wire `thinking` 变体为 `null` 是当前 mapping 合同，代码不发明未被 model discovery 广告的 `thinking` 字段。若未来官方 schema 广告 `reasoning` 或 `thinking` 形式，需由 capability path 切换和新矩阵证明，不能无条件注入。完整当前复核见 [2026-07-22 回归证据](../evidence/final-regression-rerun-20260722.md)。
+
+### 2026-07-31 当前冻结候选复核
+
+使用当前冻结候选 `kiro-rs`（SHA-256
+`00b318aa66fa139e876acd88f7472388c7da4358aa2fef21e925c5f240cb27d7`）和
+Claude Code CLI `2.1.220`，通过 caller-owned 隔离 PostgreSQL/Redis 运行
+`run-claude-cli-release-suite-local.sh` 的 thinking-only 矩阵：
+`cli`/`ide` × absent/`low`/`medium`/`high`/`xhigh`/`max` × 5，共
+`60/60`，无 violations、unknown request 或清理残留。显式 `max` 没有降为
+`high`，两入口均完成 effort schema 与 wire 校验。详见
+[thinking/effort Kiro wire evidence](../evidence/thinking-effort-kiro-wire-20260731.md)。
+
+本轮第一次失败使用了 Volta shim 路径；runner 将符号链接 canonicalize
+为 `volta-shim` 后被 Volta 拒绝直接执行。改用 `volta which claude` 返回的
+真实 Claude CLI 二进制后完整矩阵通过。因此第一次失败归类为验证环境问题，
+不计作协议失败；未来 runner 若继续 canonicalize CLI 路径，应保留“真实
+可执行文件而非 shim”的启动约束。
+
+该结果只关闭当前冻结候选的 thinking/effort 子门禁，不能外推为真实 Kiro
+上游、signed/redacted 响应、native WebSearch/image/agents、混合长历史或最终
+发布通过。
 
 ## 残余风险与回滚
 

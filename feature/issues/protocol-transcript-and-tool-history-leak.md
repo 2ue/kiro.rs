@@ -86,7 +86,10 @@ Git 历史把“旧指纹”和“新指纹”连接为同一根因类，而不�
 - 因此旧会话可泄漏为 `user Tool results provided.`，新会话则更常表现为 `user Continue`；工具名是否带 `Hash<8hex>` 只是后续工具输出的映射指纹。
 - 同一 `ef70aef` 还把 `readHash/editHash/bashHash` 等字面量写进默认 task-quality prompt，进一步向模型提示了项目私有标记；当前迁移会只对字节级匹配旧内置默认值的配置换成无指纹版本，自定义 prompt 不会被覆盖。
 
-选定修复不再继续更换命令型占位词，而是使用最小无语义非空占位 `.`。结构化 `tool_results` 仍是事实载体；占位只满足 Kiro 的非空 content 约束，不能再向模型发出“继续”指令。旧两代占位仍保留在 sanitizer 的 legacy 检测中，以清理已经存在的会话历史。
+选定修复不再继续使用会被模型误解的命令型占位词。真正空的 user 内容仍使用最小无语义占位 `.`；只有结构化
+`tool_results` 的当前/历史 user turn 使用 `Tool result received.`，用于让 Kiro 消费结构化结果，
+但不注入 `Continue` 或旧的 `Tool results provided.` transcript。结构化 `tool_results` 仍是事实载体；
+占位只满足 Kiro 的非空 content 约束。旧两代占位仍保留在 sanitizer 的 legacy 检测中，以清理已经存在的会话历史。
 
 ## 稳定复现
 
@@ -110,7 +113,8 @@ Git 历史把“旧指纹”和“新指纹”连接为同一根因类，而不�
 - sanitizer 只信任当前请求真实工具原名和使用 converter 同一算法得到的确定性映射名；`artifactHashdeadbeef` 之类普通正文不再仅因形状被删除。
 - raw marker-free 请求走单遍预筛后保持原始 bytes；不会为清理逻辑无条件 parse/serialize body。
 - raw prefilter 对 JSON escape 做固定状态扫描；不再因任意正常 `\\uXXXX` 出现就 parse/clone 整棵 DOM，同时保留 marker 任意字符被 escape 时的检测能力。
-- 空 user/tool-result 正文占位已从命令型文本收敛为 `.`。
+- 空 user 正文占位保持为 `.`；tool-result-only current/history turn 使用 `Tool result received.`，
+  解决 Kiro 忽略结构化结果的兼容性问题，同时不恢复 transcript 命令型文本。
 
 当前聚焦代码测试：converter `113/113`、payload guard `55/55`、旧 sanitizer 合同 `20/20`，并新增 2026-07-21 源码合同 `10/10` 与生产 marker inventory 源码合同 `4/4`。这些结果不替代修复后的真实 Claude CLI、长会话和 fault-injection 证据。
 

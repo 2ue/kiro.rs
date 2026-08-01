@@ -21,6 +21,11 @@ use crate::kiro::provider::{McpCallAttribution, McpCallFailureKind};
 
 const MAX_MCP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const WEB_SEARCH_QUERY_PREFIX: &str = "Perform a web search for the query:";
+const KNOWN_NATIVE_WEB_SEARCH_TOOL_TYPES: &[&str] = &[
+    "web_search_20250305",
+    "web_search_20260209",
+    "web_search_20260318",
+];
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -254,20 +259,74 @@ impl WebSearchFailure {
     }
 }
 
+fn is_known_native_web_search_tool_type(tool_type: &str) -> bool {
+    KNOWN_NATIVE_WEB_SEARCH_TOOL_TYPES.contains(&tool_type)
+}
+
+fn is_versioned_web_search_tool_type(tool_type: &str) -> bool {
+    let Some(version) = tool_type.strip_prefix("web_search_") else {
+        return false;
+    };
+    version.len() == 8 && version.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_native_web_search_tool(tool: &crate::anthropic::types::Tool) -> bool {
+    tool.name == "web_search"
+        && tool
+            .tool_type
+            .as_deref()
+            .is_some_and(is_versioned_web_search_tool_type)
+}
+
+pub fn has_unlisted_native_web_search_tool_type(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .filter(|tool| tool.name == "web_search")
+            .filter_map(|tool| tool.tool_type.as_deref())
+            .any(|tool_type| {
+                is_versioned_web_search_tool_type(tool_type)
+                    && !is_known_native_web_search_tool_type(tool_type)
+            })
+    })
+}
+
+pub fn has_misnamed_native_web_search_tool(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            tool.name != "web_search"
+                && tool
+                    .tool_type
+                    .as_deref()
+                    .is_some_and(is_versioned_web_search_tool_type)
+        })
+    })
+}
+
+/// 检查请求是否声明了 Anthropic 原生 WebSearch 工具。
+pub fn has_native_web_search_tool(req: &MessagesRequest) -> bool {
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(is_native_web_search_tool))
+}
+
 /// 检查请求是否为纯 WebSearch 请求
 ///
 /// 条件：tools 有且只有一个，且是 Anthropic 原生 WebSearch 类型。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1
-            && tools.first().is_some_and(|tool| {
-                tool.name == "web_search"
-                    && tool
-                        .tool_type
-                        .as_deref()
-                        .is_some_and(|tool_type| tool_type == "web_search_20250305")
-            })
+        tools.len() == 1 && tools.first().is_some_and(is_native_web_search_tool)
     })
+}
+
+/// 检查请求是否混用了 Anthropic 原生 WebSearch 和普通客户端工具。
+///
+/// 当前原生 WebSearch 由服务端 MCP 路径执行；普通工具由客户端执行。混用时如果继续
+/// 走普通工具转换，会把 `web_search` 当成普通 `tool_use` 返回给没有执行器的客户端。
+pub fn has_mixed_native_web_search_tool(req: &MessagesRequest) -> bool {
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.len() > 1 && tools.iter().any(is_native_web_search_tool))
 }
 
 /// 从消息中提取搜索查询
@@ -985,6 +1044,43 @@ mod tests {
         };
 
         assert!(has_web_search_tool(&req));
+        assert!(has_native_web_search_tool(&req));
+    }
+
+    #[test]
+    fn native_websearch_detection_accepts_current_official_versions() {
+        for tool_type in [
+            "web_search_20250305",
+            "web_search_20260209",
+            "web_search_20260318",
+        ] {
+            let req = request_with(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: json!("query"),
+                }],
+                Some(tool_type),
+                true,
+            );
+            assert!(has_web_search_tool(&req), "{tool_type}");
+            assert!(has_native_web_search_tool(&req), "{tool_type}");
+            assert!(!has_unlisted_native_web_search_tool_type(&req));
+        }
+    }
+
+    #[test]
+    fn native_websearch_detection_accepts_future_version_format_as_basic_websearch() {
+        let req = request_with(
+            vec![Message {
+                role: "user".to_string(),
+                content: json!("query"),
+            }],
+            Some("web_search_20270101"),
+            true,
+        );
+        assert!(has_web_search_tool(&req));
+        assert!(has_native_web_search_tool(&req));
+        assert!(has_unlisted_native_web_search_tool_type(&req));
     }
 
     #[test]
@@ -1008,7 +1104,9 @@ mod tests {
             );
 
             assert!(!has_web_search_tool(&custom));
+            assert!(!has_native_web_search_tool(&custom));
             assert!(has_web_search_tool(&native));
+            assert!(has_native_web_search_tool(&native));
         }
     }
 
@@ -1051,6 +1149,48 @@ mod tests {
 
         // 多个工具时不应该被识别为纯 websearch 请求
         assert!(!has_web_search_tool(&req));
+        assert!(has_native_web_search_tool(&req));
+        assert!(has_mixed_native_web_search_tool(&req));
+    }
+
+    #[test]
+    fn mixed_native_websearch_detection_never_hijacks_same_named_custom_tool() {
+        let custom_with_peer = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(vec![
+                Tool {
+                    tool_type: None,
+                    name: "web_search".to_string(),
+                    description: "Client-side same-name custom tool".to_string(),
+                    input_schema: Default::default(),
+                    max_uses: None,
+                    cache_control: None,
+                },
+                Tool {
+                    tool_type: None,
+                    name: "fixture".to_string(),
+                    description: "Other tool".to_string(),
+                    input_schema: Default::default(),
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert!(!has_web_search_tool(&custom_with_peer));
+        assert!(!has_native_web_search_tool(&custom_with_peer));
+        assert!(!has_mixed_native_web_search_tool(&custom_with_peer));
     }
 
     #[test]

@@ -16,7 +16,7 @@ Last observed: 2026-07-29 Asia/Shanghai
 - 运行时 external pools 已为本轮本地账号测试关闭；关闭前备份为 `/tmp/kiro-runtime-before-local-only-9022.json`。
 - 本地可用账号不是旧文中的“全部 disabled”。当前确认可用的是 credential `7` 和 credential `8`，均为 `social` / `KIRO FREE` / not disabled，且测试端点均可调用 `claude-sonnet-4.5` 返回 `local-ok`。
 - 模型层必须按 usage/log 中的 upstream model 判定。`claude-sonnet-4.5`、`sonnet`、`claude-sonnet-4.6` 当前都能成功，但 `sonnet` 和 `4.6` 实际 upstream 均解析/回退到 `claude-sonnet-4.5`；响应体 echo 的 `model` 不能单独作为真实上游模型依据。
-- WebSearch 不是“完全不可用”：纯 Anthropic native `web_search_20250305` 单工具请求成功，request `req_01yPTQ3uUhHq89z8FGZQycZ9` 返回 `server_tool_use` 和 `web_search_tool_result`。真正问题是 Claude CLI `WebSearch` 在本配置中没有产生真实 tool call，且 native WebSearch 混入普通工具时落成普通 `tool_use name="web_search"`，没有 server-side 执行结果。
+- WebSearch 不是“完全不可用”：纯 Anthropic native `web_search_20250305` 单工具请求成功，request `req_01yPTQ3uUhHq89z8FGZQycZ9` 返回 `server_tool_use` 和 `web_search_tool_result`。这段描述是 2026-07-29 的历史状态；2026-07-31 的本地账号 focused 验证已经证明 `web_search_YYYYMMDD` 泛化、mixed native server-side 执行和当前 Claude CLI `WebSearch` 都能工作，当前权威结论见 [Claude Code local-account WebSearch/tools/image analysis - 2026-07-29](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md)。
 - tools 不是最小路径解析全坏：直接 forced tool request `req_017oazMg5ptjHU64BX1CSYAW` 成功返回 `tool_use echo_value`；真实 Claude CLI `Bash` 与 `Read` 工具也能完成 tool_use/tool_result 闭环。剩余风险集中在工具名规范化/反向映射、tool_choice、长历史 pairing、schema 边界和 prefill 丢弃后的调试可观测性。
 - 图片不是合法图普遍失败：合法 inline base64 PNG 连续三次成功，声明 `image/jpeg` 但实际 PNG 的请求也被修正 media type 后成功；真实 Claude CLI `Read` 图片返回 `Red`。坏图/伪图会在本地 `handler_preflight/local_body_prepare` 阶段 400 拒绝，这是正确行为。间歇性识别问题更可能来自坏/截断字节、remote/file source materialization、大小/并发/deadline、payload guard 裁剪或 tool_result image placeholder 边界。
 
@@ -232,6 +232,55 @@ Claude Code CLI 请求中出现的是客户端工具 `WebSearch`，且通常和 
 - [src/anthropic/body_processing.rs](../../src/anthropic/body_processing.rs): safe/light image processing、remote source materialization、base64 media_type normalization。
 - [src/anthropic/converter/content.rs](../../src/anthropic/converter/content.rs): inline image base64 解码、magic byte 检测、轻量结构校验、tool_result image 提取。
 - [feature/issues/08-image-format-unsupported-400.md](08-image-format-unsupported-400.md): 旧的坏图/伪图专题，仍需真实 CLI image gate 补齐。
+
+## 根因
+
+本文的根因结论是历史结论，只适用于当时 external-pool-heavy 的排查环境：
+
+- 当时本地凭据不可用或被判定不可用，导致很多请求先被环境状态放大。
+- external pool 对完整 Claude Code payload 返回授权类 403，掩盖了本地 tools/WebSearch/image 的真实行为。
+- 带 tools 的 parsed fallback readiness 存在“status endpoint 可调度但热路径认为无 external pool ready”的诊断缺口。
+- WebSearch 分析只覆盖 native 单工具分支，不覆盖 Claude Code CLI `WebSearch` 客户端工具形态。
+- 图片路径在本文中缺少本地账号真实成功/失败闭环，因此本文不能作为当前图片根因权威。
+
+当前本地账号根因以 [Claude Code local-account WebSearch/tools/image analysis - 2026-07-29](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) 为准。
+
+## 复现
+
+本文历史复现分两类：
+
+- External-pool-heavy 历史复现：使用当时的 external pool、完整 Claude CLI stream-json payload、`sonnet -> claude-sonnet-5` 路径，观察 403/503/retry/fallback readiness 行为。
+- 当前不推荐复现：不要再用外部池失败来判断本地账号 7/8 的 tools/WebSearch/image 行为。
+
+如果需要当前复现，应改用本地账号专项文档中的 local-only cases：
+
+- credential `7` / `8`;
+- model `claude-sonnet-4.5`;
+- external pools disabled;
+- direct pure native WebSearch、mixed WebSearch、direct tool、CLI Bash/Read、valid/invalid image controls.
+
+## 方案
+
+本文不再提供当前修复方案。历史方案只保留为误判来源和 fallback/external-pool 诊断参考。
+
+当前方案入口：
+
+- local-account WebSearch/tools/image 修复方向见 [local-account analysis](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md)。
+- native WebSearch fallback 见 [websearch-normalized-external-fallback-preflight.md](websearch-normalized-external-fallback-preflight.md)。
+- WebSearch/MCP correctness/privacy 见 [websearch-mcp-protocol-usage-and-privacy.md](websearch-mcp-protocol-usage-and-privacy.md)。
+- 图片坏图/伪图见 [08-image-format-unsupported-400.md](08-image-format-unsupported-400.md)。
+
+## 残余风险与回滚
+
+Residual risk:
+
+- 本文仍包含大量 external-pool-heavy 历史事实，后续读者可能误把它当成当前 local-only 结论。
+- 如果不保留顶部 supersession note，容易再次把“外部池授权失败”误判成“本地账号 tools/image/WebSearch 不可用”。
+
+Rollback boundary:
+
+- 不得删除历史记录中的 request id 和环境事实；它们解释了早期误判来源。
+- 不得把本文状态改回当前权威，除非重新跑同一范围的本地账号验证并更新所有关联文档。
 
 ## 当前不能下的结论
 

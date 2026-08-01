@@ -371,8 +371,8 @@ async fn main() {
         "usage/dashboard PgSQL 已使用独立连接池，避免占用主业务 PgSQL pool"
     );
 
-    let (credentials_list, initial_runtime_states) = postgres_store
-        .load_credentials_with_runtime_state()
+    let (credentials_list, initial_runtime_states, initial_account_info) = postgres_store
+        .load_credentials_with_runtime_state_and_account_info()
         .await
         .unwrap_or_else(|e| {
             tracing::error!("从 PgSQL 一致性加载凭据和运行态失败: {}", e);
@@ -514,13 +514,14 @@ async fn main() {
     }
 
     // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new_with_stores_and_runtime_state(
+    let token_manager = MultiTokenManager::new_with_stores_and_runtime_state_and_account_info(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
         Some(postgres_store.clone()),
         Some(redis_store.clone()),
         Some(initial_runtime_states),
+        Some(initial_account_info),
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);

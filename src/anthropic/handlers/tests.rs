@@ -1250,17 +1250,27 @@ async fn run_websearch_canonical_detection_and_current_long_history_query_are_ex
             .await
             .expect("mixed tools response");
         assert_eq!(mixed.status(), StatusCode::OK, "round {round}");
-        axum::body::to_bytes(mixed.into_body(), 256 * 1024)
+        let mixed_body = axum::body::to_bytes(mixed.into_body(), 256 * 1024)
             .await
             .expect("mixed tools body");
+        let mixed_body = String::from_utf8_lossy(&mixed_body);
+        assert!(
+            mixed_body.contains(r#""type":"web_search_tool_result""#),
+            "round {round}: {mixed_body}"
+        );
     }
 
-    assert_eq!(upstream.state.mcp_hits(), 5);
-    assert_eq!(upstream.state.normal_hits(), 10);
+    assert_eq!(upstream.state.mcp_hits(), 10);
+    assert_eq!(upstream.state.normal_hits(), 5);
     assert_eq!(
         upstream.state.queries(),
         (1..=5)
-            .map(|round| format!("canonical-current-{round}"))
+            .flat_map(|round| {
+                [
+                    format!("canonical-current-{round}"),
+                    format!("mixed-{round}"),
+                ]
+            })
             .collect::<Vec<_>>()
     );
 
@@ -1319,6 +1329,60 @@ fn websearch_canonical_detection_and_current_long_history_query_are_exact_for_fi
         run_websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds(
         )
         .await;
+    });
+}
+
+async fn run_native_websearch_current_official_and_future_version_formats_route_to_mcp() {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, _usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+
+    for tool_type in [
+        "web_search_20250305",
+        "web_search_20260209",
+        "web_search_20260318",
+        "web_search_20270101",
+    ] {
+        let query = format!("official-version-{tool_type}");
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                websearch_messages_body(
+                    vec![json!({"role": "user", "content": query})],
+                    false,
+                    Some(tool_type),
+                    false,
+                ),
+            ))
+            .await
+            .expect("official WebSearch version response");
+        assert_eq!(response.status(), StatusCode::OK, "{tool_type}");
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("official WebSearch body");
+        assert!(
+            String::from_utf8_lossy(&body).contains(r#""type":"web_search_tool_result""#),
+            "{tool_type}"
+        );
+    }
+
+    assert_eq!(upstream.state.mcp_hits(), 4);
+    assert_eq!(upstream.state.normal_hits(), 0);
+    assert_eq!(
+        upstream.state.queries(),
+        vec![
+            "official-version-web_search_20250305".to_string(),
+            "official-version-web_search_20260209".to_string(),
+            "official-version-web_search_20260318".to_string(),
+            "official-version-web_search_20270101".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn native_websearch_current_official_and_future_version_formats_route_to_mcp() {
+    run_handler_fixture_on_four_mib_thread("websearch-official-versions", || async {
+        run_native_websearch_current_official_and_future_version_formats_route_to_mcp().await;
     });
 }
 
@@ -4814,7 +4878,7 @@ fn all_parsed_external_fallback_entrypoints_share_model_and_body_mode_eligibilit
 fn native_websearch_runs_local_pool_preflight_before_mcp_intercept() {
     let source = include_str!("../handlers.rs");
     let websearch_block = source
-        .split("if websearch::has_web_search_tool(&payload)")
+        .split("if websearch::has_native_web_search_tool(&payload)")
         .nth(1)
         .expect("native WebSearch block exists");
     let preflight = websearch_block
@@ -6322,6 +6386,92 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
 }
 
 #[test]
+fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache() {
+    let usage_context = RequestUsageContext {
+        recorder: Arc::new(UsageRecorder::new(10)),
+        tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        prompt_cache: Arc::new(PromptCacheTracker::default()),
+        prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        request_id: "req_dfcache_tool_standard_guard".to_string(),
+        error_id: "req_01dfcache_tool_standard_guard".to_string(),
+        endpoint: "/dfcache/team/v1/messages".to_string(),
+        stream: false,
+        model: "claude-sonnet-4-6".to_string(),
+        upstream_model: None,
+        model_resolution_source: None,
+        model_resolution_note: None,
+        requested_max_tokens: 0,
+        downstream_stop_reason: Arc::new(Mutex::new(None)),
+        conversation_id: Some("session-dfcache-tool".to_string()),
+        request_api_key_id: None,
+        prompt_cache_scope_conversation_id: Some("session-dfcache-tool".to_string()),
+        input_tokens: 304_883,
+        context_window_tokens: 1_000_000,
+        prompt_cache_profile: None,
+        kiro_rs_tool_prompt_cache_plan: None,
+        prompt_cache_route_namespace: Some("/dfcache/team".to_string()),
+        prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
+        simulation_mode: PromptCacheSimulationMode::Disabled,
+        prompt_cache_target_read_ratio: 0.0,
+        prompt_cache_token_scale: 1.0,
+        prompt_cache_max_simulated_input_tokens: 0,
+        prompt_cache_cap_jitter_min_tokens: 0,
+        prompt_cache_cap_jitter_max_tokens: 0,
+        prompt_cache_scale_min_input_tokens: 0,
+        prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+        prompt_cache_bounds: PromptCacheBounds::default(),
+        reported_cache_usage_policy: None,
+        simulated_usage: None,
+        simulated_source: Some(UsageSource::LocalPromptCache),
+        payload_breakdown: None,
+        payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
+        route_subtype_override: None,
+        fallback_reason: None,
+        local_preflight: None,
+        external_attempts: Vec::new(),
+        started_at: Instant::now(),
+        first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        latency: RequestLatencyTraceState::new(),
+    };
+    let usage = CacheUsage {
+        total_input_tokens: 5_292_349,
+        input_tokens: 349,
+        output_tokens: 17,
+        cache_creation_input_tokens: 2_645_419,
+        cache_read_input_tokens: 2_646_152,
+        cache_creation_5m_input_tokens: 1_800_000,
+        cache_creation_1h_input_tokens: 845_419,
+    };
+
+    let local = usage_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
+    assert_eq!(local.input_tokens, usage.input_tokens);
+    assert_eq!(local.output_tokens, usage.output_tokens);
+    assert!(local.cache_read_input_tokens <= 700_000);
+    assert!(local.cache_creation_input_tokens <= 400_000);
+    assert_eq!(
+        local.total_input_tokens,
+        local
+            .input_tokens
+            .saturating_add(local.cache_creation_input_tokens)
+            .saturating_add(local.cache_read_input_tokens)
+    );
+    assert!(
+        local.cache_creation_5m_input_tokens + local.cache_creation_1h_input_tokens
+            <= local.cache_creation_input_tokens
+    );
+
+    let upstream =
+        usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
+    assert_eq!(upstream.input_tokens, usage_context.input_tokens);
+    assert_eq!(upstream.output_tokens, usage.output_tokens);
+    assert_eq!(upstream.cache_creation_input_tokens, 0);
+    assert_eq!(upstream.cache_read_input_tokens, 0);
+}
+
+#[test]
 fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
     let usage_context = RequestUsageContext {
         recorder: Arc::new(UsageRecorder::new(10)),
@@ -7433,6 +7583,94 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
             .and_then(|value| value.as_str()),
         Some("rpm_limited")
     );
+}
+
+#[test]
+fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
+    let usage_recorder = Arc::new(UsageRecorder::new(10));
+    let request_input_tokens = 2_648_439;
+    let usage_context = RequestUsageContext {
+        recorder: usage_recorder.clone(),
+        tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        prompt_cache: Arc::new(PromptCacheTracker::default()),
+        prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        request_id: "req_large_failure_estimate".to_string(),
+        error_id: "req_01large_failure_estimate".to_string(),
+        endpoint: "/dfcache/team/v1/messages".to_string(),
+        stream: false,
+        model: "claude-sonnet-4-6".to_string(),
+        upstream_model: None,
+        model_resolution_source: None,
+        model_resolution_note: None,
+        requested_max_tokens: 0,
+        downstream_stop_reason: Arc::new(Mutex::new(None)),
+        conversation_id: Some("session-large-failure".to_string()),
+        request_api_key_id: None,
+        prompt_cache_scope_conversation_id: Some("session-large-failure".to_string()),
+        input_tokens: request_input_tokens,
+        context_window_tokens: 1_000_000,
+        prompt_cache_profile: None,
+        kiro_rs_tool_prompt_cache_plan: None,
+        prompt_cache_route_namespace: Some("/dfcache/team".to_string()),
+        prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
+        simulation_mode: PromptCacheSimulationMode::Disabled,
+        prompt_cache_target_read_ratio: 0.0,
+        prompt_cache_token_scale: 1.0,
+        prompt_cache_max_simulated_input_tokens: 0,
+        prompt_cache_cap_jitter_min_tokens: 0,
+        prompt_cache_cap_jitter_max_tokens: 0,
+        prompt_cache_scale_min_input_tokens: 0,
+        prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+        prompt_cache_bounds: PromptCacheBounds::default(),
+        reported_cache_usage_policy: None,
+        simulated_usage: None,
+        simulated_source: None,
+        payload_breakdown: None,
+        payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
+        route_subtype_override: None,
+        fallback_reason: None,
+        local_preflight: None,
+        external_attempts: Vec::new(),
+        started_at: Instant::now(),
+        first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        latency: RequestLatencyTraceState::new(),
+    };
+
+    usage_context
+        .attach_credential(
+            Some(1141),
+            Some("ksk".to_string()),
+            false,
+            false,
+            Vec::new(),
+        )
+        .record_failure(
+            UsageRecordStatus::Error,
+            "rate_limit_error",
+            "upstream rate limit",
+        );
+
+    let records = usage_recorder.query(Default::default()).records;
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.total_input_tokens, request_input_tokens);
+    assert_eq!(
+        record
+            .raw_usage
+            .as_ref()
+            .map(|usage| usage.total_input_tokens),
+        Some(request_input_tokens)
+    );
+    assert_eq!(record.compat_input_tokens, 0);
+    assert_eq!(record.billable_input_tokens, 0);
+    assert_eq!(record.output_tokens, 0);
+    assert_eq!(record.cache_read_input_tokens, 0);
+    assert_eq!(record.cache_creation_input_tokens, 0);
+    assert_eq!(record.estimated_cost_usd, 0.0);
 }
 
 #[test]

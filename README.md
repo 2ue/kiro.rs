@@ -306,6 +306,9 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `reportedUsage.*.finalCacheReadMaxTokens` | number | `700000` | 每个路径策略最终上报的 `cache_read_input_tokens` 上限；在 input 差值转入 cache read 后执行，0 表示关闭 |
 | `reportedUsage.*.finalCacheReadJitterMinTokens` | number | `0` | 最终读取缓存上限的确定性扣减下限 |
 | `reportedUsage.*.finalCacheReadJitterMaxTokens` | number | `0` | 最终读取缓存上限的确定性扣减上限 |
+| `reportedUsage.*.finalCacheCreationMaxTokens` | number | `400000` | 每个路径策略最终上报的 `cache_creation_input_tokens` 上限；在 input 差值转入 cache write 后执行，0 表示关闭 |
+| `reportedUsage.*.finalCacheCreationJitterMinTokens` | number | `20000` | 最终写入缓存上限的确定性扣减下限 |
+| `reportedUsage.*.finalCacheCreationJitterMaxTokens` | number | `45000` | 最终写入缓存上限的确定性扣减上限，生效后的 cap 不会高于 `finalCacheCreationMaxTokens` |
 | `reportedUsage.*.finalOutputGuardEnabled` | boolean | `true` | 是否启用最终输出限制。关闭后不执行 output 百分比放大和最终上限裁剪，只保留 `output` 字段自身的改写结果 |
 | `reportedUsage.*.outputUpliftMinTokens` | number | `1000` | `output_tokens` 完成字段改写后，大于该阈值才进入百分比放大；等于阈值不放大 |
 | `reportedUsage.*.outputUpliftPercent` | number | `50` | `output_tokens` 超过阈值后的放大百分比；0 表示关闭放大，最大 200 |
@@ -379,7 +382,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 - `cacheRead`：控制 `cache_read_input_tokens`。默认建议 `preserve`。
 - `cacheCreation`：控制 `cache_creation_input_tokens`。`/cc` 默认使用 `sample-target`，`targetTokens` 为 `3000`，`normalMaxMultiplier` 为 `1.2`。
 
-每个路径策略还会在所有字段改写完成后应用 `finalCacheReadMaxTokens`，默认把最终 `cache_read_input_tokens` 限制在 `700000` 以内。`finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` 可让触顶值在上限以下确定性波动；守护只会向下裁剪，不会抬高原本较小的读取缓存值。
+每个路径策略还会在所有字段改写完成后应用 `finalCacheReadMaxTokens` 和 `finalCacheCreationMaxTokens`。默认把最终 `cache_read_input_tokens` 限制在 `700000` 以内，并把最终 `cache_creation_input_tokens` 限制在 `400000 - deterministic_jitter(20000..45000)` 以内。`finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` 与 `finalCacheCreationJitterMinTokens` / `finalCacheCreationJitterMaxTokens` 可让触顶值在上限以下确定性波动；守护只会向下裁剪，不会抬高原本较小的读取或写入缓存值。
 
 ### credentials.json
 

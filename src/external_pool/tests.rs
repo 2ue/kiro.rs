@@ -6357,6 +6357,53 @@ fn external_error_diagnostics_records_status_and_non_duplicate_metadata() {
 }
 
 #[test]
+fn external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuses() {
+    let huge_usage = ExternalPoolUsageSnapshot {
+        total_input_tokens: 2_648_439,
+        input_tokens: 1_100_000,
+        billable_input_tokens: 1_100_000,
+        output_tokens: 77,
+        cache_creation_input_tokens: 1_300_180,
+        cache_read_input_tokens: 1_200_000,
+        cache_creation_5m_input_tokens: 700_000,
+        cache_creation_1h_input_tokens: 600_180,
+    };
+
+    for status in [
+        UsageRecordStatus::Error,
+        UsageRecordStatus::StreamError,
+        UsageRecordStatus::UpstreamTimeout,
+        UsageRecordStatus::ClientDropped,
+    ] {
+        let standard_usage =
+            external_standard_usage_for_status(status, 2_648_439, Some(huge_usage));
+        assert_eq!(standard_usage.total_input_tokens, 0, "status={status:?}");
+        assert_eq!(standard_usage.input_tokens, 0, "status={status:?}");
+        assert_eq!(standard_usage.billable_input_tokens, 0, "status={status:?}");
+        assert_eq!(standard_usage.output_tokens, 0, "status={status:?}");
+        assert_eq!(
+            standard_usage.cache_creation_input_tokens, 0,
+            "status={status:?}"
+        );
+        assert_eq!(
+            standard_usage.cache_read_input_tokens, 0,
+            "status={status:?}"
+        );
+    }
+
+    let success_missing_usage =
+        external_standard_usage_for_status(UsageRecordStatus::Success, 2_648_439, None);
+    assert_eq!(success_missing_usage.total_input_tokens, 2_648_439);
+    assert_eq!(success_missing_usage.input_tokens, 2_648_439);
+    assert_eq!(success_missing_usage.billable_input_tokens, 2_648_439);
+    assert_eq!(success_missing_usage.output_tokens, 0);
+
+    let success_reported_usage =
+        external_standard_usage_for_status(UsageRecordStatus::Success, 2_648_439, Some(huge_usage));
+    assert_eq!(success_reported_usage, huge_usage);
+}
+
+#[test]
 fn external_error_classification_attempt_usage_and_final_error_never_retain_raw_bodies() {
     for round in 0..5 {
         for (status, body) in [
@@ -9559,6 +9606,51 @@ fn usage_projection_final_cache_read_guard_runs_after_external_pool_uplift() {
     let reported = projected.usage_capture.reported.expect("reported usage");
 
     assert_eq!(reported.cache_read_input_tokens, 100);
+    assert_eq!(
+        reported.total_input_tokens,
+        reported
+            .input_tokens
+            .saturating_add(reported.cache_read_input_tokens)
+            .saturating_add(reported.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_final_cache_creation_guard_runs_after_external_pool_uplift() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.request_input_tokens = 200_000;
+    route.reported_usage.path_overrides.insert(
+        "/cc".to_string(),
+        ReportedUsagePathPolicy {
+            final_cache_creation_max_tokens: 100,
+            final_cache_creation_jitter_min_tokens: 0,
+            final_cache_creation_jitter_max_tokens: 0,
+            input: ReportedUsageFieldPolicy::sample_input_max(1),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+    let projection = projection_context(&route, &pool, 200).expect("projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+    let reported = projected.usage_capture.reported.expect("reported usage");
+
+    assert_eq!(reported.input_tokens, 1);
+    assert_eq!(reported.cache_read_input_tokens, 0);
+    assert_eq!(reported.cache_creation_input_tokens, 100);
+    assert_eq!(
+        usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        100
+    );
     assert_eq!(
         reported.total_input_tokens,
         reported

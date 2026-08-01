@@ -2906,7 +2906,7 @@ impl RequestUsageContext {
             usage
         };
         let Some(policy) = self.reported_cache_usage_policy.clone() else {
-            return usage;
+            return self.apply_unreported_local_standard_cache_guard(usage, usage_source);
         };
         let report_base = if self.uses_local_prompt_cache_strategy()
             && (usage_source == UsageSource::LocalPromptCache
@@ -2919,16 +2919,16 @@ impl RequestUsageContext {
         let mut reported =
             report_base.with_reported_cache_usage_policy_and_raw(policy.clone(), raw);
         reported = policy.apply_final_input_guard(reported);
-        policy.apply_final_cache_read_guard(reported)
+        policy.apply_final_standard_cache_guards(reported)
     }
 
     fn ensure_reported_usage_for_record(
         &self,
         usage: super::cache::CacheUsage,
-        _usage_source: UsageSource,
+        usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
         let Some(policy) = self.reported_cache_usage_policy.clone() else {
-            return usage;
+            return self.apply_unreported_local_standard_cache_guard(usage, usage_source);
         };
 
         let raw = super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens);
@@ -2947,11 +2947,11 @@ impl RequestUsageContext {
     fn ensure_reported_usage_for_record_with_raw(
         &self,
         usage: super::cache::CacheUsage,
-        _usage_source: UsageSource,
+        usage_source: UsageSource,
         raw: super::cache::RawUsage,
     ) -> super::cache::CacheUsage {
         let Some(policy) = self.reported_cache_usage_policy.clone() else {
-            return usage;
+            return self.apply_unreported_local_standard_cache_guard(usage, usage_source);
         };
 
         if self.uses_local_prompt_cache_strategy() && super::cache::usage_has_cache(&usage) {
@@ -2972,6 +2972,26 @@ impl RequestUsageContext {
             PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
         ) && (self.simulation_mode == PromptCacheSimulationMode::HighCache
             || self.kiro_rs_tool_prompt_cache_plan.is_some())
+    }
+
+    fn apply_unreported_local_standard_cache_guard(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
+        if usage_source != UsageSource::LocalPromptCache || !super::cache::usage_has_cache(&usage) {
+            return usage;
+        }
+        if !matches!(
+            self.prompt_cache_strategy_type,
+            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
+        ) {
+            return usage;
+        }
+
+        default_standard_cache_field_guard()
+            .map(|guard| guard.apply_final_standard_cache_guards_for_standard_fields(usage))
+            .unwrap_or(usage)
     }
 }
 
@@ -3082,6 +3102,10 @@ fn reported_cache_usage_policy_for_request(
     }
 
     super::cache::ReportedCacheUsagePolicy::from_path_policy(reported_usage.clone(), seed)
+}
+
+fn default_standard_cache_field_guard() -> Option<super::cache::ReportedCacheUsagePolicy> {
+    super::cache::ReportedCacheUsagePolicy::from_path_policy(ReportedUsagePathPolicy::default(), 0)
 }
 
 #[cfg(test)]
@@ -3855,12 +3879,13 @@ impl CredentialUsageContext {
         public_error: Option<UsagePublicError>,
         kiro_metering_usage: Option<f64>,
     ) {
+        let standard_usage = standard_usage_for_status(status, usage);
         let pricing = self.request.pricing_catalog.estimate(
             self.request
                 .upstream_model
                 .as_deref()
                 .unwrap_or(&self.request.model),
-            usage,
+            standard_usage,
         );
         let original_pricing = raw_usage.map(|usage| {
             self.request.pricing_catalog.estimate(
@@ -3940,13 +3965,13 @@ impl CredentialUsageContext {
             usage_source,
             raw_usage: raw_usage_snapshot,
             total_input_tokens: diagnostic_total_input_tokens,
-            compat_input_tokens: usage.input_tokens,
-            billable_input_tokens: usage.billable_input_tokens(),
-            output_tokens: usage.output_tokens,
-            cache_read_input_tokens: usage.cache_read_input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+            compat_input_tokens: standard_usage.input_tokens,
+            billable_input_tokens: standard_usage.billable_input_tokens(),
+            output_tokens: standard_usage.output_tokens,
+            cache_read_input_tokens: standard_usage.cache_read_input_tokens,
+            cache_creation_input_tokens: standard_usage.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: standard_usage.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: standard_usage.cache_creation_1h_input_tokens,
             estimated_cost_usd: pricing.cost_usd,
             original_cost_usd: original_pricing
                 .filter(|estimate| estimate.available)
@@ -3995,6 +4020,25 @@ impl CredentialUsageContext {
             payload_breakdown,
             payload_guard_report,
         });
+    }
+}
+
+fn standard_usage_for_status(
+    status: UsageRecordStatus,
+    usage: super::cache::CacheUsage,
+) -> super::cache::CacheUsage {
+    if status == UsageRecordStatus::Success {
+        return usage;
+    }
+
+    super::cache::CacheUsage {
+        total_input_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
     }
 }
 
@@ -5715,8 +5759,22 @@ async fn post_messages_inner(
         external.model_resolution = Some(model_resolution.clone());
     }
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    if websearch::has_misnamed_native_web_search_tool(&payload) {
+        let response = envelope::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "The native web_search tool must be named web_search.",
+        );
+        record_pre_usage_rejection(
+            attribution.as_ref(),
+            RequestRejectionReason::WebSearchUnsupported,
+            &endpoint,
+            &response,
+        );
+        return response;
+    }
+    // 检查是否声明了 Anthropic 原生 WebSearch 工具。
+    if websearch::has_native_web_search_tool(&payload) {
         if !websearch_supported_for_profile(runtime_config.compat_profile) {
             let response = envelope::error_response(
                 StatusCode::BAD_REQUEST,
@@ -5731,7 +5789,14 @@ async fn post_messages_inner(
             );
             return response;
         }
-        tracing::info!("detected native WebSearch tool request");
+        tracing::info!(
+            native_websearch_tool_count = payload.tools.as_ref().map_or(0, Vec::len),
+            native_websearch_pure_tool = websearch::has_web_search_tool(&payload),
+            native_websearch_mixed_tools = websearch::has_mixed_native_web_search_tool(&payload),
+            native_websearch_unlisted_version =
+                websearch::has_unlisted_native_web_search_tool_type(&payload),
+            "detected native WebSearch tool request"
+        );
 
         if let Some(external) = external_fallback.as_ref() {
             let request_id = envelope::request_id();

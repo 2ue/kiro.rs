@@ -1,6 +1,6 @@
 # WebSearch/MCP 协议、错误、usage、attempt 与隐私边界
 
-Status: `implemented / focused-verified / native-cli-and-auxiliary-gates-open`
+Status: `implemented / focused-verified / direct-cli-focused-verified / auxiliary-prod-gates-open`
 
 Severity: P1
 
@@ -23,9 +23,10 @@ Date: 2026-07-16
 
 ## 当前结论
 
-focused 修复与重复测试已经关闭上述 correctness/privacy/client-cancel 主缺陷：
+focused 修复与重复测试已经关闭上述 correctness/privacy/client-cancel 主缺陷；2026-07-31 又补齐了 native WebSearch 版本格式、mixed native 退化和 Claude CLI focused path：
 
-- 只有唯一且 type/name 都匹配的 Anthropic server WebSearch 才走特殊路径；普通同名 client tool 与 mixed tools 走正常工具路径。
+- `type: "web_search_YYYYMMDD"` 且 `name: "web_search"` 的 Anthropic server WebSearch 走特殊路径；当前官方列出的版本只用于观测，未来-looking 8 位数字版本也按 basic WebSearch 执行。
+- 普通同名 client tool 不被劫持；mixed native WebSearch 不再走正常工具路径并返回无人执行的普通 `tool_use name="web_search"`，而是进入 server-side MCP/WebSearch 分支。
 - query 只从最后一个 user turn 内提取，不再跨 turn 回退；当前 turn 只有 tool result 或空白时稳定 400、0 MCP hit。
 - MCP HTTP、timeout、disconnect、body limit、JSON-RPC、`isError`、non-text、ID mismatch 均 fail closed；合法零结果仍保持真实成功。
 - stream 与 non-stream 分别返回 SSE 与 Anthropic JSON message。
@@ -34,9 +35,11 @@ focused 修复与重复测试已经关闭上述 correctness/privacy/client-cance
 - raw query/result/private body 不进入公开错误、usage 或 DEBUG tracing。
 - success renderer 只生成一次 summary；stream 以有界字符块增量构造事件，不再 clone 结果并重复生成 summary 或分配整段 `Vec<char>`。
 
-仍不能标记为最终发布完成：Claude Code CLI 2.1.197 的 native WebSearch 5-session gate 尚未执行；Profile discovery、token refresh、model catalog 的生产 request-scoped auxiliary attribution 尚未完成；当前证据来自共享 dirty tree，而不是冻结 release candidate。
+仍不能标记为最终发布完成：Claude Code CLI `2.1.220` 的当前 focused run 已通过，但还不是 5-session native/CLI gate；Profile discovery、token refresh、model catalog 的生产 request-scoped auxiliary attribution 尚未完成；生产 recurrence 和 release-candidate 绑定仍需单独记录。
 
 ## 2026-07-29 本地账号复验
+
+This subsection is retained as pre-fix local-account evidence. The WebSearch behavior below was superseded by the 2026-07-31 focused fix and live validation.
 
 本轮使用本地账号 credential `7` / `8`，外部池关闭，只验证 `claude-sonnet-4.5` 相关路径。新的结论需要区分三种 WebSearch 形态：
 
@@ -47,7 +50,7 @@ focused 修复与重复测试已经关闭上述 correctness/privacy/client-cance
   - credential `8`
   - upstream `claude-sonnet-4.5`
   - response 包含 `server_tool_use` 与 `web_search_tool_result`
-- Claude Code CLI `WebSearch` 当前没有形成真实工具调用：
+- Claude Code CLI `WebSearch` did not form a real tool call in this earlier run:
   - CLI case `websearch_tool`
   - model `claude-sonnet-4.5`
   - exit `0`
@@ -55,14 +58,35 @@ focused 修复与重复测试已经关闭上述 correctness/privacy/client-cance
   - `toolResultCount=0`
   - final usage `server_tool_use.web_search_requests=0`
   - assistant text 出现 `<search_web><query>...</query></search_web>` 伪 XML，但没有真实执行搜索
-- mixed native WebSearch + 普通 tool 不是已支持路径：
+- mixed native WebSearch + 普通 tool was not a supported path before the 2026-07-31 fix:
   - request `req_01H7Q6sMoZEAN7kyan5zLYjL`
   - body 同时包含 native `web_search_20250305` 与 `echo_value`
   - route `local_credential/local_success`，credential `8`，upstream `claude-sonnet-4.5`
   - response `stop_reason="tool_use"`，内容是普通 `tool_use name="web_search" input={}`
   - 没有 `server_tool_use`，没有 `web_search_tool_result`
 
-源码原因仍是 `src/anthropic/websearch.rs:260` 的 `has_web_search_tool` 只识别 `tools.len() == 1` 的 native WebSearch；`src/anthropic/handlers.rs:5707` 只有在该 predicate 为 true 时才进入 native WebSearch MCP branch。这个选择可以防止普通同名工具被劫持，但也意味着 mixed native WebSearch 需要明确产品决策：要么支持 server-side 执行并继续 turn，要么 fail closed 返回清晰错误，不能把 `web_search` 下发成无人执行的普通 tool。
+修复前源码原因是 `src/anthropic/websearch.rs` 的 `has_web_search_tool` 只识别 `tools.len() == 1` 且 exact `web_search_20250305` 的 native WebSearch；`src/anthropic/handlers.rs` 只有在该 predicate 为 true 时才进入 native WebSearch MCP branch。这个选择可以防止普通同名工具被劫持，但也让 mixed native WebSearch 退化为无人执行的普通 tool。
+
+## 2026-07-31 focused update
+
+The current candidate changes the native WebSearch contract:
+
+- Detection accepts `web_search_YYYYMMDD` generically with `name: "web_search"`.
+- Known official versions currently tracked for observability: `web_search_20250305`, `web_search_20260209`, `web_search_20260318`.
+- Future-looking versions such as `web_search_20270101` execute through the same basic server-side WebSearch path and are logged as unlisted, not rejected.
+- Mixed native WebSearch plus ordinary client tools executes server-side MCP/WebSearch before normal tool conversion.
+- Misnamed native WebSearch remains a normalized local `400 invalid_request_error`.
+- Claude Code-style pseudo XML `<search_web><query>...</query></search_web>` is recovered into a WebSearch tool_use only when a known WebSearch tool is declared and the text is at a protocol-visible position.
+
+Live local-account evidence on `127.0.0.1:9022`:
+
+- direct `web_search_20250305`: request `req_01GDJcJ8QCyBm5q4j6MZzzhW`, HTTP 200, `server_tool_use=1`, `web_search_tool_result=1`, local success on upstream `claude-sonnet-4.5`;
+- direct `web_search_20260318`: request `req_01FuBYdXdnQBk8f3rmGgMnE1`, HTTP 200, `server_tool_use=1`, `web_search_tool_result=1`, local success on upstream `claude-sonnet-4.5`;
+- future-looking `web_search_20270101`: request `req_01Z1k1iXfg8qLFX38PerhnXd`, HTTP 200, `server_tool_use=1`, `web_search_tool_result=1`, log `native_websearch_unlisted_version=true`, local success on upstream `claude-sonnet-4.5`;
+- mixed native `web_search_20260318` plus `echo_value`: request `req_01DoTcTMR8zc37cqd584eopP`, stream HTTP 200, `server_tool_use=1`, `web_search_tool_result=1`, no ordinary `tool_use`, local success on upstream `claude-sonnet-4.5`;
+- real Claude Code CLI `2.1.220`: session `10c87c84-4b3f-4b74-81e1-de663161621f`, `toolUseNames=["WebSearch"]`, `toolResultCount=1`, final answer included search-derived sources, no internal leak.
+
+Boundary: this is focused proof for direct native WebSearch and current Claude CLI client-side WebSearch. It does not yet implement a complete Anthropic mixed native/client tool state machine that can alternate server and ordinary client tools in one model turn.
 
 ## 根因与代码链
 
@@ -122,7 +146,7 @@ Profile discovery、token refresh 与 model catalog 的 production request-scope
 
 | 维度 | 场景 | 轮次 | 验收 |
 | --- | --- | ---: | --- |
-| 识别 | canonical type/name、普通同名 tool、混合 tools | 每格 5 | 只有 canonical pure server WebSearch 进入特殊路径 |
+| 识别 | versioned native type/name、普通同名 tool、混合 tools、future-looking version、misnamed native | 每格 5 | versioned native and mixed native WebSearch enter the special path; ordinary custom same-name tools do not; misnamed native fails locally |
 | query | single turn、20/100 turns、array/string、旧首条/新末条、空/非 text | 每格 5 | 只发送当前最后 user query；非法输入 0 MCP |
 | stream | stream true/false、正常/零结果 | 每格 5 | content type/body形态正确；blocks、stop、usage 等价 |
 | 错误 | 400/429/500/timeout/disconnect/malformed/JSON-RPC/isError | 每格 5 | 无假成功；规范公开错误 + error ID；内部证据保留 |
@@ -130,7 +154,7 @@ Profile discovery、token refresh 与 model catalog 的 production request-scope
 | 资源 | Content-Length/chunked over-limit、slow body、client drop | 每格 5 | 有限字节/时间；future/socket/permit释放；随后 5/5 恢复 |
 | usage | local success/error/drop、不同 request key | 每格 5 | UsageRecord 有 channel ID、attempts、route/error；无原始 key/query |
 | 隐私 | info/debug marker capture | 每格 5 | query/request/response marker 0 命中；保留 bounded metadata |
-| CLI | native WebSearch 可用时真实 Claude CLI | 5 session | 实际能力，不以 MCP fixture 冒充；usage/terminal/错误正确 |
+| CLI | native/direct and Claude CLI client-side WebSearch | focused + future 5 session | 实际能力，不以 MCP fixture 冒充；usage/terminal/错误正确；当前 focused CLI path 已通过，5-session gate remains |
 
 ## 当前验证与证据
 
@@ -141,6 +165,8 @@ Profile discovery、token refresh 与 model catalog 的 production request-scope
 - canonical/custom/mixed `15/15`；20/100 tool cycle `10/10`；non-text/blank current turn `10/10` 且 0 MCP；stream/non-stream zero result `10/10`。
 - full/never-polled/partial stream ownership `15/15`；等待 MCP headers 与读取 body 时取消各 5 轮、合计 `10/10`；每轮均保留稳定 request-key digest、credential 与明确 attempt，且只有 1 个 MCP hit。
 - provider MCP `7/7`，覆盖 1/20/60 credentials 各 5 轮、shared hard budget、lease/drop、body limit 和 acquire failure。
+- 2026-07-31 direct native version-family/mixed live validation passed on current local `9022` candidate; request ids `req_01GDJcJ8QCyBm5q4j6MZzzhW`, `req_01FuBYdXdnQBk8f3rmGgMnE1`, `req_01Z1k1iXfg8qLFX38PerhnXd`, `req_01DoTcTMR8zc37cqd584eopP`.
+- 2026-07-31 real Claude Code CLI `2.1.220` focused WebSearch run passed with `toolUseNames=["WebSearch"]` and `toolResultCount=1`.
 - inference attempt budget `13/13`；attribution sink 内部 `5/5`；两套 UI contract 与 production build 通过；独立 target `cargo check --all-targets` 0 warning。
 - raw query/result/private marker 在公开 body、usage 与 current-thread DEBUG capture 中均 0 命中。
 

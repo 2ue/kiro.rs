@@ -1515,6 +1515,34 @@ function PathPolicyEditor({
           <FieldPolicyEditor title="展示缓存写入" policy={policy.cacheCreation} onChange={set('cacheCreation')} />
           <TwoCol>
             <NumField
+              label="写入缓存最终上限"
+              desc="缓存写入最终最多显示多少 Token；0 表示不限制。只会压低过大的值，不会把小值抬高。"
+              value={policy.finalCacheCreationMaxTokens}
+              min={0}
+              suffix="Token"
+              onChange={set('finalCacheCreationMaxTokens')}
+            />
+            <NumField
+              label="写入上限扣减下限"
+              desc="触顶时至少从写入上限里扣掉多少 Token，避免每次都显示同一个最大值。"
+              value={policy.finalCacheCreationJitterMinTokens}
+              min={0}
+              suffix="Token"
+              onChange={set('finalCacheCreationJitterMinTokens')}
+            />
+          </TwoCol>
+          <TwoCol>
+            <NumField
+              label="写入上限扣减上限"
+              desc="触顶时最多从写入上限里扣掉多少 Token；必须大于等于扣减下限。"
+              value={policy.finalCacheCreationJitterMaxTokens}
+              min={0}
+              suffix="Token"
+              onChange={set('finalCacheCreationJitterMaxTokens')}
+            />
+          </TwoCol>
+          <TwoCol>
+            <NumField
               label="读取缓存最终上限"
               desc="缓存读取最终最多显示多少 Token；0 表示不限制。只会压低过大的值，不会把小值抬高。"
               value={policy.finalCacheReadMaxTokens}

@@ -226,6 +226,20 @@ fn credit_snapshot_uses_overage_bonus_for_all_paid_tiers() {
 }
 
 #[test]
+fn subscription_key_and_rank_distinguish_pro_max_from_pro() {
+    for title in ["Kiro Pro Max", "KIRO PRO_MAX", "pro-max", "promax"] {
+        assert_eq!(subscription_key(Some(title)), "pro_max", "title={title}");
+        assert_eq!(subscription_rank(Some(title)), 5, "title={title}");
+    }
+    assert_eq!(subscription_key(Some("Kiro Pro")), "pro");
+    assert_eq!(subscription_rank(Some("Kiro Pro")), 3);
+    assert_eq!(subscription_key(Some("Kiro Pro+")), "pro_plus");
+    assert_eq!(subscription_rank(Some("Kiro Pro+")), 4);
+    assert_eq!(subscription_key(Some("Kiro Power")), "power");
+    assert_eq!(subscription_rank(Some("Kiro Power")), 6);
+}
+
+#[test]
 fn live_credit_snapshot_does_not_infer_bonus_from_usage_limit() {
     let pro_without_active_bonus =
         credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 11_000.0, 0.0);

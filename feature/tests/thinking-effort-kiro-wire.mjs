@@ -54,10 +54,8 @@ const FAKE_EFFORT_SCHEMA = Object.freeze({
   values: ['low', 'medium', 'high', 'xhigh', 'max'],
   default: 'high',
 })
-const EXPECTED_CLAUDE_VERSION = process.env.KIRO_EXPECTED_CLAUDE_VERSION || '2.1.197'
-if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(EXPECTED_CLAUDE_VERSION)) {
-  throw new Error('KIRO_EXPECTED_CLAUDE_VERSION must be a version identifier')
-}
+const EXPECTED_CLAUDE_VERSION = optionalVersionEnvironment('KIRO_EXPECTED_CLAUDE_VERSION')
+const MINIMUM_CLAUDE_VERSION = versionEnvironment('KIRO_MIN_CLAUDE_VERSION', '2.1.197')
 const RUN_ID = `thinking-effort-wire-${Date.now()}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const REQUEST_KEY = `sk-request-${RUN_ID}`
 const ADMIN_KEY = `sk-admin-${RUN_ID}`
@@ -168,6 +166,60 @@ function requiredEnvironment(name) {
   const value = String(process.env[name] || '').trim()
   if (!value) throw new Error(`${name} is required`)
   return value
+}
+
+function versionEnvironment(name, fallback) {
+  const value = String(process.env[name] || fallback).trim()
+  if (!isVersionIdentifier(value)) throw new Error(`${name} must be a version identifier`)
+  return value
+}
+
+function optionalVersionEnvironment(name) {
+  const value = String(process.env[name] || '').trim()
+  if (!value) return null
+  if (!isVersionIdentifier(value)) throw new Error(`${name} must be a version identifier`)
+  return value
+}
+
+function isVersionIdentifier(value) {
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(value)
+}
+
+function parseClaudeCliVersion(output) {
+  const match = String(output || '').match(/(^|\s)(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)(?=\s|$|\()/)
+  return match?.[2] || null
+}
+
+function compareSemverNumbers(left, right) {
+  const leftParts = left.split(/[+-]/, 1)[0].split('.').map(Number)
+  const rightParts = right.split(/[+-]/, 1)[0].split('.').map(Number)
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) return leftParts[index] - rightParts[index]
+  }
+  return 0
+}
+
+function validateClaudeCliVersionOutput(output, options = {}) {
+  const expectedVersion = options.expectedVersion ?? EXPECTED_CLAUDE_VERSION
+  const minimumVersion = options.minimumVersion ?? MINIMUM_CLAUDE_VERSION
+  const actualVersion = parseClaudeCliVersion(output)
+  if (!actualVersion) {
+    throw new Error('Claude CLI version must be identifiable from --version output')
+  }
+  if (expectedVersion) {
+    if (actualVersion !== expectedVersion) {
+      throw new Error(
+        `Claude CLI version must be exactly ${expectedVersion}; actual ${actualVersion}`,
+      )
+    }
+    return { policy: 'exact', actualVersion, expectedVersion, minimumVersion: null }
+  }
+  if (compareSemverNumbers(actualVersion, minimumVersion) < 0) {
+    throw new Error(
+      `Claude CLI version ${actualVersion} is below supported minimum ${minimumVersion}`,
+    )
+  }
+  return { policy: 'minimum', actualVersion, expectedVersion: null, minimumVersion }
 }
 
 function parseOptionalIntegerEnvironment(name, fallback, minimum, maximum) {
@@ -2469,10 +2521,7 @@ async function main() {
         DISABLE_TELEMETRY: '1',
       }),
     })
-    const escapedVersion = EXPECTED_CLAUDE_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    if (!new RegExp(`(^|\\s)${escapedVersion}(?=\\s|$|\\()`).test(claudeCliVersionOutput)) {
-      throw new Error(`Claude CLI version must be exactly identifiable as ${EXPECTED_CLAUDE_VERSION}`)
-    }
+    const claudeVersionCheck = validateClaudeCliVersionOutput(claudeCliVersionOutput)
 
     for (const endpoint of ENDPOINTS) {
       throwIfShutdownRequested()
@@ -2563,9 +2612,11 @@ async function main() {
       binaryIdentity: binaryIdentityBefore,
       claudeBinaryIdentity: claudeIdentityBefore,
       psqlBinaryIdentity: psqlIdentity,
-      claudeCliVersion: EXPECTED_CLAUDE_VERSION,
+      claudeCliVersion: claudeVersionCheck.actualVersion,
       claudeCliVersionOutputSha256: sha256(claudeCliVersionOutput),
-      expectedClaudeVersion: EXPECTED_CLAUDE_VERSION,
+      claudeCliVersionPolicy: claudeVersionCheck.policy,
+      expectedClaudeVersion: claudeVersionCheck.expectedVersion,
+      minimumClaudeVersion: claudeVersionCheck.minimumVersion,
       rounds: ROUNDS,
       endpoints: ENDPOINTS,
       efforts: EFFORTS,
@@ -2963,6 +3014,24 @@ function runContractFixture() {
     url: new URL('http://127.0.0.1/wrong'),
     body: {},
   })
+  const versionPolicy = {
+    defaultMinimumAcceptsCurrent: validateClaudeCliVersionOutput('2.1.220 (Claude Code)'),
+    exactAcceptsMatching: validateClaudeCliVersionOutput('2.1.220 (Claude Code)', {
+      expectedVersion: '2.1.220',
+    }),
+    belowMinimumRejected: false,
+    exactMismatchRejected: false,
+  }
+  try {
+    validateClaudeCliVersionOutput('2.1.196 (Claude Code)')
+  } catch (error) {
+    versionPolicy.belowMinimumRejected = /below supported minimum 2\.1\.197/.test(error.message)
+  }
+  try {
+    validateClaudeCliVersionOutput('2.1.220 (Claude Code)', { expectedVersion: '2.1.197' })
+  } catch (error) {
+    versionPolicy.exactMismatchRejected = /exactly 2\.1\.197; actual 2\.1\.220/.test(error.message)
+  }
   const serviceEnvironment = isolatedServiceEnvironment('cli', 19022)
   const claudeEnvironment = isolatedClaudeEnvironment('/tmp/contract-home', '/tmp/contract-config', 19023)
   const forbiddenInheritedNames = [
@@ -2994,6 +3063,7 @@ function runContractFixture() {
     models: FAKE_MODEL_IDS,
     protocolResults,
     mutatedProtocol,
+    versionPolicy,
     environment: {
       serviceInheritedForbidden: forbiddenInheritedNames.filter((name) => (
         process.env[name] !== undefined && serviceEnvironment[name] === process.env[name]

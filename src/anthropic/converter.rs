@@ -63,7 +63,9 @@ use tool_pairing::{
 use tools::{
     SYSTEM_CHUNKED_POLICY, TOOL_HASH_MARKER, TOOL_NAME_MAX_LEN, map_tool_name, shorten_tool_name,
 };
-use tools::{collect_history_tool_names, convert_tools, create_placeholder_tool};
+use tools::{
+    collect_history_tool_names, convert_tools, create_placeholder_tool, summarize_tool_name_mapping,
+};
 
 pub(crate) fn deterministic_mapped_tool_name(name: &str) -> String {
     tools::deterministic_mapped_tool_name(name)
@@ -74,10 +76,12 @@ pub(crate) fn legacy_overlong_mapped_tool_name(name: &str) -> Option<String> {
 }
 
 /// Kiro requires a non-empty user message even when structured tool results
-/// carry the entire turn. Keep the placeholder semantically inert so it cannot
-/// prime the model to reproduce an internal `user Continue` transcript.
+/// carry the entire turn. A bare "." makes the model ignore current tool
+/// results in real CLI follow-up turns, while this short marker preserves the
+/// tool-result boundary without recreating an internal `user Continue`
+/// transcript.
 const EMPTY_USER_CONTENT_PLACEHOLDER: &str = ".";
-const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = EMPTY_USER_CONTENT_PLACEHOLDER;
+const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool result received.";
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 
 /// 转换结果
@@ -89,7 +93,7 @@ pub struct ConversionResult {
     pub tool_cache_point_insert_after: Vec<usize>,
     /// 是否把 cachePoint 插入计划记录到 payload diagnostics。
     pub cache_point_plan_recording_enabled: bool,
-    /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
+    /// 工具名称映射（Kiro-safe 名称 → 原始名称），当名称规范化或超长缩短时非空。
     pub tool_name_map: HashMap<String, String>,
     /// 工具 input_schema property key 映射（上游工具名 → 清洗 key 到原始 key），仅在本次请求内使用。
     pub tool_schema_key_map: ToolSchemaKeyMap,
@@ -568,7 +572,13 @@ fn convert_request_with_model_id(
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
+        let summary = summarize_tool_name_mapping(&tool_name_map);
+        tracing::info!(
+            mapped_tool_name_count = summary.total,
+            sanitized_tool_name_count = summary.sanitized,
+            overlong_tool_name_count = summary.overlong,
+            "工具名称已规范化/映射"
+        );
     }
     let mapped_schema_key_count = converted_tools.tool_schema_key_map.len();
     if mapped_schema_key_count > 0 {
@@ -1377,6 +1387,23 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_name_mapping_summary_distinguishes_sanitized_and_overlong_names() {
+        let mut map = HashMap::new();
+        for name in [
+            "Bash",
+            "echo_value",
+            "veryLongToolNameThatKeepsGrowingBeyondTheKiroSixtyThreeCharacterLimit",
+        ] {
+            map_tool_name(name, &mut map, ConverterOptions::default());
+        }
+
+        let summary = summarize_tool_name_mapping(&map);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.sanitized, 2);
+        assert_eq!(summary.overlong, 1);
+    }
+
+    #[test]
     fn convert_tools_rejects_raw_name_that_collides_with_another_mapped_name_atomically() {
         let invalid_name = "foo-bar";
         let mapped_name = deterministic_mapped_tool_name(invalid_name);
@@ -2125,6 +2152,10 @@ mod tests {
         let current = &result.conversation_state.current_message.user_input_message;
 
         assert_eq!(current.content, TOOL_RESULTS_PROVIDED_PLACEHOLDER);
+        assert_ne!(
+            current.content, EMPTY_USER_CONTENT_PLACEHOLDER,
+            "tool-result-only turns need a semantic marker so Kiro consumes the structured result"
+        );
         assert_eq!(current.user_input_message_context.tool_results.len(), 1);
         assert_eq!(result.warnings.tool_result_content_placeholders, 1);
     }

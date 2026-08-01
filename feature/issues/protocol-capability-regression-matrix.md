@@ -143,6 +143,7 @@ upstream 或故障恢复通过。
 - transcript、thinking、tool history、图片 decoded-byte、payload history 性能、400 classifier 和 request-key admission 已有各自聚焦结果，见对应专题及 [证据索引](../evidence/README.md)。
 - API-key token-bucket 突发边界在生产一分钟窗口下重新执行，测试体内 5 轮均为前 32 个准入、第 33 个规范拒绝。
 - 修复前 CLI normal/tool/MCP/long-history 结果仍只是回归基线，不计作当前候选通过。
+- 2026-07-31 当前冻结候选的真实 Claude Code CLI thinking/effort wire 子门禁已通过：`cli`/`ide` × 6 effort × 5 轮，共 `60/60`；显式 `max` 未降级，未发现 violations/unknown request，详见 [2026-07-31 thinking wire evidence](../evidence/thinking-effort-kiro-wire-20260731.md)。该结果只关闭 thinking/effort 子门禁，不关闭本专题的 native WebSearch/image/agents、真实上游、签名响应、混合长历史、浏览器和 L1-L5 门禁。
 
 ## 未执行项与残余风险
 

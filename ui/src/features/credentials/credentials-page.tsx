@@ -941,6 +941,8 @@ export function CredentialsPage() {
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__all__">全部订阅</SelectItem>
+                  <SelectItem value="power">Power</SelectItem>
+                  <SelectItem value="pro_max">Pro Max</SelectItem>
                   <SelectItem value="pro_plus">Pro+</SelectItem>
                   <SelectItem value="pro">Pro</SelectItem>
                   <SelectItem value="trial">试用</SelectItem>

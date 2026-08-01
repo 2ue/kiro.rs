@@ -66,6 +66,22 @@ test('contract fixture behavior is stable for five independent rounds', () => {
     assert.ok(facts.mutatedProtocol.includes('path'))
     assert.ok(facts.mutatedProtocol.includes('host'))
     assert.ok(facts.mutatedProtocol.includes('content_type'))
+    assert.deepEqual(facts.versionPolicy, {
+      defaultMinimumAcceptsCurrent: {
+        policy: 'minimum',
+        actualVersion: '2.1.220',
+        expectedVersion: null,
+        minimumVersion: '2.1.197',
+      },
+      exactAcceptsMatching: {
+        policy: 'exact',
+        actualVersion: '2.1.220',
+        expectedVersion: '2.1.220',
+        minimumVersion: null,
+      },
+      belowMinimumRejected: true,
+      exactMismatchRejected: true,
+    })
     assert.deepEqual(facts.environment.serviceInheritedForbidden, [])
     assert.deepEqual(facts.environment.claudeInheritedForbidden, [])
     assert.equal(facts.environment.postgresPinned, true)

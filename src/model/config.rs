@@ -1053,6 +1053,21 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default)]
     pub final_cache_read_jitter_max_tokens: i32,
 
+    /// 最终下游上报的 cache_creation_input_tokens 上限。
+    ///
+    /// 该限制在 input 差值转入 cache creation 之后执行，只向下裁剪，不会抬高小值。
+    /// 0 表示关闭最终守护。
+    #[serde(default = "default_final_cache_creation_max_tokens")]
+    pub final_cache_creation_max_tokens: i32,
+
+    /// 写入缓存最终上限的确定性扣减下限。
+    #[serde(default = "default_reported_usage_final_cache_creation_jitter_min_tokens")]
+    pub final_cache_creation_jitter_min_tokens: i32,
+
+    /// 写入缓存最终上限的确定性扣减上限。
+    #[serde(default = "default_reported_usage_final_cache_creation_jitter_max_tokens")]
+    pub final_cache_creation_jitter_max_tokens: i32,
+
     /// 是否启用 output 字段最终限制逻辑。
     ///
     /// 关闭后，只执行 output 字段自身的 raw/preserve/sample-* 改写，不再执行放大或最终上限裁剪。
@@ -1106,6 +1121,11 @@ impl Default for ReportedUsagePathPolicy {
             final_cache_read_max_tokens: default_final_cache_read_max_tokens(),
             final_cache_read_jitter_min_tokens: 0,
             final_cache_read_jitter_max_tokens: 0,
+            final_cache_creation_max_tokens: default_final_cache_creation_max_tokens(),
+            final_cache_creation_jitter_min_tokens:
+                default_reported_usage_final_cache_creation_jitter_min_tokens(),
+            final_cache_creation_jitter_max_tokens:
+                default_reported_usage_final_cache_creation_jitter_max_tokens(),
             final_output_guard_enabled: true,
             output_uplift_min_tokens: default_reported_usage_output_uplift_min_tokens(),
             output_uplift_percent: default_reported_usage_output_uplift_percent(),
@@ -1141,6 +1161,18 @@ impl ReportedUsagePathPolicy {
         if final_cache_read_jitter_min_tokens > final_cache_read_jitter_max_tokens {
             final_cache_read_jitter_min_tokens = final_cache_read_jitter_max_tokens;
         }
+        let final_cache_creation_max_tokens = self.final_cache_creation_max_tokens.max(0);
+        let mut final_cache_creation_jitter_min_tokens = self
+            .final_cache_creation_jitter_min_tokens
+            .max(0)
+            .min(final_cache_creation_max_tokens);
+        let final_cache_creation_jitter_max_tokens = self
+            .final_cache_creation_jitter_max_tokens
+            .max(0)
+            .min(final_cache_creation_max_tokens);
+        if final_cache_creation_jitter_min_tokens > final_cache_creation_jitter_max_tokens {
+            final_cache_creation_jitter_min_tokens = final_cache_creation_jitter_max_tokens;
+        }
         let final_output_max_tokens = self.final_output_max_tokens.max(0);
         let mut final_output_jitter_min_tokens = self
             .final_output_jitter_min_tokens
@@ -1160,6 +1192,9 @@ impl ReportedUsagePathPolicy {
             final_cache_read_max_tokens,
             final_cache_read_jitter_min_tokens,
             final_cache_read_jitter_max_tokens,
+            final_cache_creation_max_tokens,
+            final_cache_creation_jitter_min_tokens,
+            final_cache_creation_jitter_max_tokens,
             final_output_guard_enabled: self.final_output_guard_enabled,
             output_uplift_min_tokens: self.output_uplift_min_tokens.max(0),
             output_uplift_percent: self.output_uplift_percent.min(200),
@@ -1201,6 +1236,32 @@ impl ReportedUsagePathPolicy {
         {
             return Err(format!(
                 "{} finalCacheReadJitterMaxTokens 不能大于 finalCacheReadMaxTokens",
+                label
+            ));
+        }
+        if self.final_cache_creation_max_tokens < 0 {
+            return Err(format!("{} finalCacheCreationMaxTokens 不能小于 0", label));
+        }
+        if self.final_cache_creation_jitter_min_tokens < 0
+            || self.final_cache_creation_jitter_max_tokens < 0
+        {
+            return Err(format!(
+                "{} finalCacheCreationJitterMinTokens 和 finalCacheCreationJitterMaxTokens 不能小于 0",
+                label
+            ));
+        }
+        if self.final_cache_creation_jitter_min_tokens > self.final_cache_creation_jitter_max_tokens
+        {
+            return Err(format!(
+                "{} finalCacheCreationJitterMinTokens 不能大于 finalCacheCreationJitterMaxTokens",
+                label
+            ));
+        }
+        if self.final_cache_creation_max_tokens > 0
+            && self.final_cache_creation_jitter_max_tokens > self.final_cache_creation_max_tokens
+        {
+            return Err(format!(
+                "{} finalCacheCreationJitterMaxTokens 不能大于 finalCacheCreationMaxTokens",
                 label
             ));
         }
@@ -4295,6 +4356,18 @@ fn default_final_cache_read_max_tokens() -> i32 {
     700_000
 }
 
+fn default_final_cache_creation_max_tokens() -> i32 {
+    400_000
+}
+
+fn default_reported_usage_final_cache_creation_jitter_min_tokens() -> i32 {
+    20_000
+}
+
+fn default_reported_usage_final_cache_creation_jitter_max_tokens() -> i32 {
+    45_000
+}
+
 fn default_reported_usage_output_uplift_min_tokens() -> i32 {
     1_000
 }
@@ -5574,6 +5647,7 @@ mod tests {
                 "reportedUsage": {
                     "default": {
                         "finalCacheReadMaxTokens": 800000,
+                        "finalCacheCreationMaxTokens": 500000,
                         "input": { "mode": "raw" }
                     },
 	                    "pathOverrides": {
@@ -5581,6 +5655,9 @@ mod tests {
 	                            "finalCacheReadMaxTokens": 300000,
 	                            "finalCacheReadJitterMinTokens": 8000,
 	                            "finalCacheReadJitterMaxTokens": 24000,
+	                            "finalCacheCreationMaxTokens": 180000,
+	                            "finalCacheCreationJitterMinTokens": 9000,
+	                            "finalCacheCreationJitterMaxTokens": 21000,
 	                            "finalOutputGuardEnabled": false,
 	                            "outputUpliftMinTokens": 1000,
 	                            "outputUpliftPercent": 50,
@@ -5618,10 +5695,20 @@ mod tests {
                 .final_cache_read_max_tokens,
             800_000
         );
+        assert_eq!(
+            config
+                .reported_usage
+                .policy_for_path("/v1/messages")
+                .final_cache_creation_max_tokens,
+            500_000
+        );
         let policy = config.reported_usage.policy_for_path("/cc/v1/messages");
         assert_eq!(policy.final_cache_read_max_tokens, 300_000);
         assert_eq!(policy.final_cache_read_jitter_min_tokens, 8_000);
         assert_eq!(policy.final_cache_read_jitter_max_tokens, 24_000);
+        assert_eq!(policy.final_cache_creation_max_tokens, 180_000);
+        assert_eq!(policy.final_cache_creation_jitter_min_tokens, 9_000);
+        assert_eq!(policy.final_cache_creation_jitter_max_tokens, 21_000);
         assert!(!policy.final_output_guard_enabled);
         assert_eq!(policy.output_uplift_min_tokens, 1_000);
         assert_eq!(policy.output_uplift_percent, 50);
@@ -7073,6 +7160,15 @@ mod tests {
         assert_eq!(default_policy.final_cache_read_max_tokens, 700_000);
         assert_eq!(default_policy.final_cache_read_jitter_min_tokens, 0);
         assert_eq!(default_policy.final_cache_read_jitter_max_tokens, 0);
+        assert_eq!(default_policy.final_cache_creation_max_tokens, 400_000);
+        assert_eq!(
+            default_policy.final_cache_creation_jitter_min_tokens,
+            20_000
+        );
+        assert_eq!(
+            default_policy.final_cache_creation_jitter_max_tokens,
+            45_000
+        );
         assert!(default_policy.final_output_guard_enabled);
         assert_eq!(default_policy.output_uplift_min_tokens, 1_000);
         assert_eq!(default_policy.output_uplift_percent, 50);
@@ -7090,6 +7186,9 @@ mod tests {
 
         let cc_policy = config.reported_usage.policy_for_path("/cc/v1/messages");
         assert_eq!(cc_policy.final_cache_read_max_tokens, 700_000);
+        assert_eq!(cc_policy.final_cache_creation_max_tokens, 400_000);
+        assert_eq!(cc_policy.final_cache_creation_jitter_min_tokens, 20_000);
+        assert_eq!(cc_policy.final_cache_creation_jitter_max_tokens, 45_000);
         assert!(cc_policy.final_output_guard_enabled);
         assert_eq!(cc_policy.output_uplift_min_tokens, 1_000);
         assert_eq!(cc_policy.output_uplift_percent, 50);
