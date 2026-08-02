@@ -2755,10 +2755,10 @@ pub struct ExternalPoolsConfig {
     pub external_pool_global_max_concurrent_requests: u32,
     #[serde(default = "default_external_pool_max_queued_requests")]
     pub external_pool_max_queued_requests: u32,
-    /// 外部池请求输入 token 预检上限。
+    /// 外部池估算输入 token 兼容字段。
     ///
-    /// `0` 表示不做预检；默认 1,000,000，匹配当前外部池常见硬上限，避免
-    /// 本地已能估算出超限时仍把请求发到外部池再失败。
+    /// 历史版本曾用它在发送前拒绝外部池请求。当前外部池按本地凭证同款语义：
+    /// 先按请求体处理配置发送，是否上下文超限以真实上游响应为准。
     #[serde(default = "default_external_pool_max_input_tokens")]
     pub external_pool_max_input_tokens: i32,
     #[serde(default)]

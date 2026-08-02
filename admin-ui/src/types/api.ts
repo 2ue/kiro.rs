@@ -1377,6 +1377,8 @@ export interface ExternalPoolsConfig {
   directExternalOnLocalMaintenance: boolean
   directExternalModelRules: string[]
   directExternalPathRules: string[]
+  externalPoolRouteMode: 'allow_all' | 'allow_list' | 'deny_list'
+  externalPoolRouteRules: string[]
   fallbackOnLocalCapacityExhausted: boolean
   fallbackOnSchedulerRedisDegraded: boolean
   fallbackOnNoAvailableCredentials: boolean

@@ -1,10 +1,11 @@
 # 外部池 prompt 超长（上游硬限制 + 本地高负载两段式）
 
-Status: `classification-and-preflight-focused-pass / real-route-revalidation-pending`
+Status: `classification-recorded / preflight-design-superseded / config-alignment-focused-pass / integration-dispatch-focused-pass / release-gate-pending`
 
 Severity: P1
 
-- 状态：已定性；2026-07-13 已做错误分类、用量估算与外部池 max-input 预检
+- 状态：已定性；2026-07-13 的外部池 max-input 预检方案已被 2026-08-02
+  “按本地凭证同款请求大小保护语义”取代
 - 严重级别：低 —— 生产近 12 小时 7 条（占非成功请求 2.5%）
 - 分类来源：`tmp/analysis-usage-llm-errors` root-cause `04-external_pool_prompt_too_long`
 
@@ -38,7 +39,10 @@ Severity: P1
 
 - ❌ 无法让超过 1M 的 prompt 被接受（上游硬限制）。
 - ✅ **已改进**：parsed external route 不再把 `request_input_tokens` 恒置为 0；`prompt is too long` 已纳入 payload/context too-long 分类；外部池对外 public message 改为清晰的上下文过长语义，但仍不透出外部池原文。
-- ✅ **已增加预检**：运行时配置新增 `externalPoolMaxInputTokens`，默认 `1,000,000`，`0` 表示关闭。若本次请求已有 input token 估算且超过该上限，代理直接返回稳定 `invalid_request_error`，记录 external failure usage，不占用外部池并发、不发外部池请求。
+- 🔁 **设计已修正**：运行时配置中的 `externalPoolMaxInputTokens` 保留为历史兼容字段，
+  但不再作为外部池发送前拒绝条件。外部池应按本地凭证同款语义处理：先根据
+  “请求体处理 / Body 模式”和“请求大小保护 / 过大请求处理方式”发送；真实
+  上下文超限以上游 400 为准。
 - ⚠️ **后续可选增强**：如果不同外部池或不同模型有不同上限，可继续扩展为 per-pool / per-model 上限；当前先用全局默认解决现网样本里的 1M 硬限制。
 - ⚠️ 本地连续 3 次 500 高负载属**调度/容量**问题，与本请求内容无关；可关注账号池健康度，但不属于本请求可修复项。
 
@@ -52,12 +56,22 @@ Severity: P1
 - [x] `prompt is too long` 被识别为 payload/context too-long。
 - [x] 外部池 public error 使用上下文过长语义，但不泄露外部池 raw message。
 - [x] parsed external route 携带非 0 `request_input_tokens`。
-- [x] `externalPoolMaxInputTokens` 预检：超过上限时本地返回 `invalid_request_error`，不发外部池。
-- [ ] 真实服务低量回归：正常外部池请求不受影响；超限请求本地快速失败。
+- [x] `externalPoolMaxInputTokens` 兼容字段：即使估算输入超过该值，也不在外部池发送前
+  直接返回 400。
+- [x] PG/Redis focused dispatch：`external_pool_max_input_tokens_does_not_short_circuit_dispatch`
+  确认估算输入 `1,500,000` 且兼容字段为 `1` 时仍进入 fake external 上游一次。
+- [ ] 真实服务低量回归：正常外部池请求不受影响；超限请求由上游真实响应触发
+  “失败后再处理并重试”或最终上下文超限错误；不在现网做高量/超大请求压测。
 
 ## 残余风险与回滚
 
-全局 `externalPoolMaxInputTokens` 不能表达不同 pool/model 的真实上限，token estimate 也可能与外部提供方 tokenizer 有偏差；因此预检必须保守且错误可解释。回滚可以关闭该预检（配置 0）以恢复上游判定，但不得恢复外部 raw 错误泄漏、无限等待或把确定性 too-long 当可换池重试。最终仍需正常/near-limit/over-limit 每类 5 轮和错误后恢复。
+全局 `externalPoolMaxInputTokens` 不能表达不同外部账号/模型的真实上限，token estimate
+也可能与外部提供方 tokenizer 有偏差；因此它不应再驱动本地发送前拒绝。回滚不能恢复
+“估算输入超限即本地 400”的行为；如需未来做上下文窗口策略，应建模为 per-pool /
+per-model 能力和明确的“请求大小保护”处理方式，而不是全局预检硬拦截。
+
+本记录已被 [2026-08-01 生产外部池两类错误根因补充](20260801-production-external-errors-root-cause.md)
+中的 P001 修复方向取代。
 
 ## 关联
 

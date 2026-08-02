@@ -7263,37 +7263,50 @@ fn supported_model_filter_uses_original_payload_and_raw_model_candidates() {
     ));
 }
 
-#[test]
-fn external_pool_max_input_preflight_only_rejects_known_oversized_routes() {
-    let mut config = ExternalPoolsConfig {
-        external_pool_max_input_tokens: 100,
+#[tokio::test]
+async fn external_pool_max_input_tokens_does_not_short_circuit_dispatch() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let fake = AuxiliaryFallbackFakeServer::start().await;
+    let mut pool_request = create_pool_request("external-no-input-preflight", 1, true);
+    pool_request.base_url = fake.base_url.clone();
+    postgres.create_external_pool(pool_request).await.unwrap();
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_max_input_tokens: 1,
+        external_pool_retry_max_attempts: 0,
         ..ExternalPoolsConfig::default()
     };
-    let mut route = test_route("claude-sonnet-4.5");
-
-    route.request_input_tokens = 100;
-    assert_eq!(
-        external_pool_max_input_tokens_for_route(&config, &route),
-        None
-    );
-
-    route.request_input_tokens = 101;
-    assert_eq!(
-        external_pool_max_input_tokens_for_route(&config, &route),
-        Some(100)
-    );
-
-    route.request_input_tokens = 0;
-    assert_eq!(
-        external_pool_max_input_tokens_for_route(&config, &route),
-        None
-    );
-
-    config.external_pool_max_input_tokens = 0;
+    let mut route = test_route("claude-sonnet-4-6");
     route.request_input_tokens = 1_500_000;
-    assert_eq!(
-        external_pool_max_input_tokens_for_route(&config, &route),
-        None
+    let hits_before = fake.snapshot().3;
+
+    let response = match manager.forward_with_failover_result(config, route).await {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!(
+                "external max-input compatibility field must not reject before dispatch: {}",
+                error.message
+            )
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fake.snapshot().3, hits_before + 1);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[test]
+fn external_pool_max_input_tokens_has_no_dispatch_preflight_stage() {
+    let source = include_str!("../external_pool.rs");
+
+    assert!(
+        !source.contains("external_prompt_too_long_preflight"),
+        "external pool must not synthesize a prompt-too-long preflight stage"
+    );
+    assert!(
+        !source.contains("external_pool_max_input_tokens_for_route"),
+        "externalPoolMaxInputTokens is a compatibility field, not a dispatch preflight gate"
     );
 }
 

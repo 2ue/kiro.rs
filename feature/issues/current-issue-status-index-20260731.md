@@ -4,7 +4,7 @@ Status: `active-index / derived-from-feature-issues / update-required-with-issue
 
 Severity: P0/P1 documentation control. This file prevents open blockers, partially fixed issues, and final validation gaps from being lost across sessions.
 
-Last reviewed: 2026-08-01 Asia/Shanghai
+Last reviewed: 2026-08-02 Asia/Shanghai
 
 ## 范围与结论
 
@@ -24,10 +24,10 @@ Current inventory from the 2026-08-01 scan:
 
 | Metric | Count | Meaning |
 | --- | ---: | --- |
-| Issue documents scanned | 68 | Markdown files under `feature/issues/` including this workspace's active and retained issue records |
+| Issue documents scanned | 70 | Markdown files under `feature/issues/` including this workspace's active and retained issue records |
 | `NO-GO` / `release-blocked` / `release-blocking` statuses | 6 | Broad gates normally block a full closure release unless explicitly superseded or scoped out by the current release decision |
-| Implementation/fix still pending | 3 | Analysis exists, but implementation or productization is not complete |
-| Any `pending` / `open` / `partial` / `gates-open` / `not released` status | 51 | Most issue records still require a validation, rollout, or status-refresh action |
+| Implementation/fix still pending | 4 | Analysis exists, but implementation or productization is not complete |
+| Any `pending` / `open` / `partial` / `gates-open` / `not released` status | 53 | Most issue records still require a validation, rollout, or status-refresh action |
 | Fixed/implemented but final validation still pending | about 41 | Code or focused tests exist, but final candidate, real CLI, real upstream, browser, load, or production recurrence evidence is missing |
 
 The practical conclusion is:
@@ -57,6 +57,7 @@ These are the highest-signal files that still represent implementation or releas
 | Area | Issue | Current status | Remaining work recorded |
 | --- | --- | --- | --- |
 | Claude Code local accounts / WebSearch / tools / image | [claude-code-local-accounts-websearch-tools-image-analysis-20260729.md](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) | `analysis-recorded / local-account-real-call-evidence-collected / wave1-websearch-direct-and-cli-focused-verified / fixes-pending` | Native `web_search_YYYYMMDD` direct requests, future-looking WebSearch versions, mixed native WebSearch server-side execution, Claude CLI `WebSearch`, tool-name/schema-key mapping, collision rejection, and current tool-result-only follow-up have focused passes; remaining work is image-source matrix, model-reporting clarity, longer multi-tool history regressions, and any future full mixed native/client tool state-machine design |
+| External pool prompt length / model processing | [20260801-production-external-errors-root-cause.md](20260801-production-external-errors-root-cause.md) | `root-cause-confirmed / implementation-focused-pass / frontend-contract-gate-pass / integration-dispatch-focused-pass / release-gate-pending` | P001: 外部池“输入上限预检”发送前 400 绕过“请求大小保护”，已改为取消内容长度发送前拒绝，保留调度/安全预检，并让“标准处理”按“发送前先处理”或“失败后再处理并重试”执行；Raw 透传直接交给外部上游。P002: 显式直连外部账号与本地失败 fallback route 现在携带“模型（本地解析）”并补齐本地 Kiro 发送链路的兼容模型处理，使“映射后内部处理”和“内部处理后映射”能按配置生效；`admin-ui` 外部池路径策略类型合同与兼容字段文案已同步；focused Rust/UI/doc 与 PG/Redis 外部池 dispatch hit 通过，剩余发布门禁与发版 |
 | Local credential quota/overage dispatch | [local-credential-exhausted-overage-disabled-400-20260731.md](local-credential-exhausted-overage-disabled-400-20260731.md) | `analysis-recorded / production-evidence-collected / usage-detail-diagnostics-improved / scheduler-quota-guard-implemented / focused-tests-passed / scoped-release-gate-passed / production-recurrence-pending` | Scheduler startup/reload now jointly loads `credential_account_info`, derives a freshness-bounded API-key quota guard for `remaining<=0 + credit_remaining<=0 + overage_status=DISABLED`, excludes guarded credentials from dispatch/fallback selection, and only treats opaque 400 as credential quota when that guard is already present; focused PgSQL manager reload regression passed in an isolated test schema; 2026-08-01 scoped release gate passed; remaining gates are production recurrence and broader isolated/load validation |
 | Usage accounting / downstream standard fields | [downstream-usage-standard-field-over-1m-20260731.md](downstream-usage-standard-field-over-1m-20260731.md) | `analysis-recorded / production-evidence-collected / standard-field-guard-implemented / focused-tests-passed / scoped-release-gate-passed / production-recurrence-pending` | Known code residuals are now focused-tested: no-reportedUsage local prompt-cache standard cache fields are capped, including `kiro_rs_tool`; local credential and external pool failure records keep request estimates in diagnostics and zero downstream-standard fields. 2026-08-01 scoped release gate passed; remaining gates are dashboard/API rollup distinction, production recurrence, and broader load validation |
 | Account card subscription tier | [subscription-pro-max-card-label-20260801.md](subscription-pro-max-card-label-20260801.md) | `root-cause-confirmed / ui-and-backend-fix-implemented / focused-tests-passed / scoped-release-gate-passed / browser-pending` | `Pro Max` was classified by the generic `Pro` fallback; UI label, backend `pro_max` key/rank, and Power/Pro Max filter options are fixed. 2026-08-01 scoped release gate passed; browser screenshot verification remains useful but did not block this deterministic classifier fix |
@@ -95,7 +96,7 @@ These remain useful for provenance, but should not drive current local-account o
 | --- | --- |
 | [claude-code-real-cli-tools-websearch-image-debug-20260729.md](claude-code-real-cli-tools-websearch-image-debug-20260729.md) | Historical external-pool-heavy pass; superseded for local-account diagnosis by [local-account analysis](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) |
 | [03-client-dropped-downstream.md](03-client-dropped-downstream.md) | Historical classification plus cleanup/resource gate |
-| [04-external-pool-prompt-too-long.md](04-external-pool-prompt-too-long.md) | Classification/preflight focused pass; needs real-route revalidation |
+| [04-external-pool-prompt-too-long.md](04-external-pool-prompt-too-long.md) | Historical classification; its old max-input preflight design is superseded by [2026-08-01 external-pool root cause](20260801-production-external-errors-root-cause.md) |
 | [09-intent-preamble-end-turn-no-tool-use.md](09-intent-preamble-end-turn-no-tool-use.md) | Usage observability pass; needs long-session statistical gate |
 
 ## 复现/刷新方式

@@ -1515,7 +1515,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         .oneshot(multimodal_handler_request(
             "/cc/v1/messages",
             json!({
-                "model": "claude-sonnet-4-5-20250929",
+                "model": "claude-opus-4-6-thinking",
                 "max_tokens": 32,
                 "stream": false,
                 "messages": [{"role": "user", "content": "hi"}]
@@ -1546,6 +1546,13 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         record.direct_policy_reason.as_deref(),
         Some("explicit_direct")
     );
+    assert_eq!(record.model, "claude-opus-4-6-thinking");
+    assert_eq!(record.upstream_model.as_deref(), Some("claude-opus-4.6"));
+    assert_eq!(
+        record.external_outbound_model.as_deref(),
+        Some("claude-opus-4.6")
+    );
+    assert!(record.model_resolution_source.is_some());
     let attempts = record
         .latency_trace
         .as_ref()
@@ -1557,6 +1564,9 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         1,
         "normalized direct request must reach external pool once"
     );
+    let bodies = external_upstream.state.bodies();
+    let outbound: Value = serde_json::from_str(&bodies[0]).expect("external body json");
+    assert_eq!(outbound["model"], "claude-opus-4.6");
     assert_eq!(
         kiro_upstream.state.normal_hits(),
         0,
@@ -4871,6 +4881,44 @@ fn all_parsed_external_fallback_entrypoints_share_model_and_body_mode_eligibilit
     );
     assert!(
         source.contains("match external_fallback_body_mode_filter(self.requires_normalized_body)")
+    );
+}
+
+#[test]
+fn direct_external_policy_resolves_model_before_route_request() {
+    let source = include_str!("../handlers.rs");
+
+    assert!(
+        source.contains(
+            "let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping("
+        ),
+        "direct external policy must compute 模型（本地解析） before bypassing local credentials"
+    );
+    assert!(
+        source.contains(".direct_policy_response(&request_id, direct_model_resolution)"),
+        "direct external policy must pass 模型（本地解析） into the external route"
+    );
+    assert!(
+        source.contains("external.model_resolution = model_resolution;"),
+        "external direct route must retain 模型（本地解析） for external 模型处理"
+    );
+    assert!(
+        source.contains("external_route_model_resolution(direct_model_resolution)"),
+        "direct external policy must use the same processed 模型（上游） that local Kiro dispatch would use"
+    );
+}
+
+#[test]
+fn external_route_model_resolution_prefers_local_processed_model_for_cc_aliases() {
+    let resolved = external_route_model_resolution(ModelResolution::exact(
+        "claude-opus-4-6-thinking".to_string(),
+    ));
+
+    assert_eq!(resolved.source, ModelResolutionSource::Alias);
+    assert_eq!(resolved.upstream_model.as_deref(), Some("claude-opus-4.6"));
+    assert_eq!(
+        resolved.note.as_deref(),
+        Some("claude-opus-4-6-thinking -> claude-opus-4.6")
     );
 }
 

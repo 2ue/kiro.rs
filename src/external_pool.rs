@@ -1350,22 +1350,6 @@ fn effective_external_pool_stream_response_mode(
         .unwrap_or(config.external_pool_stream_response_mode)
 }
 
-fn external_pool_max_input_tokens_for_route(
-    config: &ExternalPoolsConfig,
-    route: &ExternalRouteRequest,
-) -> Option<i32> {
-    let max_input_tokens = config.external_pool_max_input_tokens.max(0);
-    if max_input_tokens == 0 {
-        return None;
-    }
-    let request_input_tokens = route.request_input_tokens.max(0);
-    if request_input_tokens > max_input_tokens {
-        Some(max_input_tokens)
-    } else {
-        None
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalPoolSelectionFailureKind {
     AdmissionSaturated,
@@ -4600,44 +4584,6 @@ impl ExternalPoolManager {
                 response_error_type: "service_unavailable".to_string(),
                 route_error_type: "external_pool_route_blocked".to_string(),
                 message: "request route is blocked by external pool route policy".to_string(),
-                error_id: route.error_id.clone(),
-                retryable: false,
-                attempts: Vec::new(),
-                pool_id: None,
-                pool_name: None,
-            });
-        }
-
-        if let Some(max_input_tokens) = external_pool_max_input_tokens_for_route(&config, &route) {
-            let message = format!(
-                "prompt is too long: estimated input tokens {} exceed configured external pool maximum {}",
-                route.request_input_tokens.max(0),
-                max_input_tokens
-            );
-            tracing::warn!(
-                request_id = %route.request_id,
-                error_id = %route.error_id,
-                request_input_tokens = route.request_input_tokens,
-                external_pool_max_input_tokens = max_input_tokens,
-                "external pool request rejected before dispatch because prompt is too long"
-            );
-            self.record_external_failure(
-                &route,
-                None,
-                Vec::new(),
-                "bad_request",
-                &message,
-                synthetic_external_error_diagnostics(
-                    &route,
-                    StatusCode::BAD_REQUEST,
-                    "external_prompt_too_long_preflight",
-                ),
-            );
-            return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
-                status: StatusCode::BAD_REQUEST,
-                response_error_type: "invalid_request_error".to_string(),
-                route_error_type: "bad_request".to_string(),
-                message,
                 error_id: route.error_id.clone(),
                 retryable: false,
                 attempts: Vec::new(),

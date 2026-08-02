@@ -371,7 +371,7 @@ export function ExternalPoolsPage() {
                   </SelectBox>
                   <NumberBox disabled={!externalEnabled} label="全局并发上限" description="限制同时进行的外部账号请求数；不是 RPM。0 表示不限。" suffix="并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolGlobalMaxConcurrentRequests: v }))} />
                   <NumberBox disabled={!waitModeActive} label="外部池排队上限" description="externalPoolMaxQueuedRequests；只限制外部池 wait 队列，不是本地账号 dispatch 队列。" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxQueuedRequests: v }))} />
-                  <NumberBox disabled={!externalEnabled} label="输入上限预检" suffix="Token" value={configDraft.externalPoolMaxInputTokens} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxInputTokens: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="估算输入上限（兼容）" description="保留历史配置；不再作为本地发送前拒绝条件，真实上下文超限以上游响应和请求大小保护为准。" suffix="Token" value={configDraft.externalPoolMaxInputTokens} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxInputTokens: v }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待" description="必须大于 0；旧配置中的 0 按安全默认值 30 秒处理。" suffix="秒" min={1} value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolDispatchMaxWaitSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="最大重试" suffix="次" value={configDraft.externalPoolRetryMaxAttempts} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryMaxAttempts: v }))} />
                 </div>

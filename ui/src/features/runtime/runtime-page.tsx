@@ -909,8 +909,8 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolLocalRescueMaxWaitSecs')}
                   />
                   <NumField
-                    label="外部池输入 token 预检上限"
-                    desc="本地可估算输入 token 且超过该值时，不再发送到外部池；0 表示关闭预检。"
+                    label="外部池估算输入上限（兼容）"
+                    desc="保留历史配置；当前不再用它做本地发送前拒绝，真实上下文超限以上游响应和请求大小保护为准。"
                     value={draft.externalPools.externalPoolMaxInputTokens}
                     min={0}
                     suffix="tokens"

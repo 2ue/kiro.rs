@@ -45,7 +45,7 @@ use super::body_capabilities::ParsedAnthropicBodyPlan;
 use super::body_processing;
 use super::converter::{
     ConversionError, ConverterOptions, ProxyWarnings, convert_request_with_resolved_model,
-    extract_stable_conversation_id,
+    extract_stable_conversation_id, map_model,
 };
 use super::envelope;
 use super::inference_attempt_budget::{
@@ -1724,12 +1724,18 @@ impl ExternalFallbackContext {
         }
     }
 
-    async fn direct_policy_response(&self, request_id: &str) -> Option<Response> {
+    async fn direct_policy_response(
+        &self,
+        request_id: &str,
+        model_resolution: Option<ModelResolution>,
+    ) -> Option<Response> {
         let reason = self
             .manager
             .direct_policy_reason(&self.config, &self.endpoint, &self.payload.model)
             .await?;
-        let route = match self.route_request(
+        let mut external = self.clone();
+        external.model_resolution = model_resolution;
+        let route = match external.route_request(
             request_id.to_string(),
             UsageRouteSubtype::ExternalDirectPolicy,
             None,
@@ -5341,6 +5347,33 @@ fn resolve_request_model(
     Ok(resolution)
 }
 
+fn external_route_model_resolution(mut resolution: ModelResolution) -> ModelResolution {
+    if !matches!(
+        resolution.source,
+        ModelResolutionSource::ExactUpstream | ModelResolutionSource::PassThrough
+    ) {
+        return resolution;
+    }
+
+    let Some(mapped_model) = map_model(&resolution.requested_model)
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+    else {
+        return resolution;
+    };
+    if resolution.upstream_model.as_deref() == Some(mapped_model.as_str()) {
+        return resolution;
+    }
+
+    resolution.upstream_model = Some(mapped_model.clone());
+    resolution.source = ModelResolutionSource::Alias;
+    resolution.note = Some(format!(
+        "{} -> {}",
+        resolution.requested_model, mapped_model
+    ));
+    resolution
+}
+
 fn should_expose_proxy_warnings(runtime_config: &RequestRuntimeConfig) -> bool {
     runtime_config.expose_proxy_warnings && !runtime_config.compat_profile.is_strict()
 }
@@ -5829,7 +5862,18 @@ async fn post_messages_inner(
 
     if let Some(external) = external_fallback.as_ref() {
         let request_id = envelope::request_id();
-        if let Some(response) = external.direct_policy_response(&request_id).await {
+        let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping(
+            &payload.model,
+            runtime_config.model_resolution_mode,
+            &runtime_config.model_mapping,
+        );
+        let direct_model_resolution = (direct_model_resolution.source
+            != ModelResolutionSource::Unsupported)
+            .then(|| external_route_model_resolution(direct_model_resolution));
+        if let Some(response) = external
+            .direct_policy_response(&request_id, direct_model_resolution)
+            .await
+        {
             return response;
         }
     }
@@ -5858,7 +5902,7 @@ async fn post_messages_inner(
         }
     };
     if let Some(external) = external_fallback.as_mut() {
-        external.model_resolution = Some(model_resolution.clone());
+        external.model_resolution = Some(external_route_model_resolution(model_resolution.clone()));
     }
 
     if websearch::has_misnamed_native_web_search_tool(&payload) {
