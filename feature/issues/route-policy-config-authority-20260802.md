@@ -1,12 +1,12 @@
 # 内置路由策略必须完全由配置决定
 
-Status: `analysis-recorded / backend-and-ui-implemented / focused-verified / full-rust-and-ui-gates-passed / cli-fake-upstream-verified / release-pending / live-reload-pending`
+Status: `analysis-recorded / backend-and-ui-implemented / focused-verified / full-rust-and-ui-gates-passed / cli-fake-upstream-verified / released-v0.0.131 / live-reload-pending`
 
 Severity: P0 correctness / configuration authority
 
 Last reviewed: 2026-08-02 Asia/Shanghai
 
-本轮实现和验证已完成：后端运行时策略解析、新版 `ui`、旧版 `admin-ui` 均已同步；冻结候选二进制已通过真实 Claude Code CLI 假上游套件。没有重启现网服务，也没有把浏览器交互或生产复发观察误记为已通过。
+本轮实现和验证已完成并发布为 `v0.0.131`：后端运行时策略解析、新版 `ui`、旧版 `admin-ui` 均已同步；冻结候选二进制已通过真实 Claude Code CLI 假上游套件。没有重启现网服务，也没有把浏览器交互或生产复发观察误记为已通过。
 
 ## 范围与结论
 
@@ -186,6 +186,7 @@ Last reviewed: 2026-08-02 Asia/Shanghai
 - `git diff --check`：通过。
 - 冻结候选二进制 SHA-256：`fba89eb1e57947b481f38051341481662ca1c7f927a25c4ec167351cef0fcf77`。
 - Claude Code CLI `2.1.220` 假上游套件通过：`bare-invoke`、`long-session`（`5 sessions / 110 turns / 100 tool pairs / leakMatches=[]`）和 `thinking-wire`（`60/60`）；thinking 子套件使用 Claude Code 包内真实二进制复跑，排除了 Volta shim 环境噪声。
+- 发布：工作提交 `4981285`，后续任务登记提交 `89cb4fc`，版本提交 `59b4c26`，标签 `v0.0.131` 已推送到 `origin`。
 
 ### 关键行为覆盖
 

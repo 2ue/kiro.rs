@@ -12,7 +12,7 @@ Current phase:
 - Downstream usage standard-field guard residual code fixes are implemented and focused-tested; final candidate, isolated usage-shape smoke, UI/API rollup distinction, and production recurrence remain pending.
 - Account-card subscription classification now distinguishes `Pro Max` from generic `Pro`; focused Rust/UI/admin-ui validation passed, while final candidate/browser validation remains open.
 - Current scoped patch release gate passed on 2026-08-01 and was published as `v0.0.130`. Broader production recurrence, image-source matrix, browser, load/chaos, and architecture gates remain post-release work rather than closed issues.
-- 2026-08-02 route-policy config-authority focused pass is implemented: built-in routes remain fixed entrypoints, but cache, usage, prompt-steering, external-pool route rules, and cache namespace are selected by configuration, not by hardcoded `/cc`/`/v1`/`/ha`/`/na` path checks. The handler configuration matrix and frozen-candidate Claude Code CLI fake-upstream suite passed; live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open until after release.
+- 2026-08-02 route-policy config-authority focused pass is implemented and released as `v0.0.131`: built-in routes remain fixed entrypoints, but cache, usage, prompt-steering, external-pool route rules, and cache namespace are selected by configuration, not by hardcoded `/cc`/`/v1`/`/ha`/`/na` path checks. The handler configuration matrix and frozen-candidate Claude Code CLI fake-upstream suite passed; live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open as post-release observation.
 - 2026-08-02 user reprioritization recorded: after the route-policy release, process the new read-only production usage-error audit for `152.53.243.159` and `152.53.194.170`, then the language-constraint first-language-lock issue, then the usage-cleanup UI/semantics consistency issue. These are registered as analysis-planned and are not treated as fixed.
 
 Last landed evidence:
@@ -77,6 +77,7 @@ Last landed evidence:
   - `builtin_routes_follow_runtime_cache_and_prompt_config_matrix` passed through the scoped Cargo wrapper; it verifies `/cc -> no_cache`, `/na -> current_high_cache` shared namespace, `/ha -> current_high_cache` independent namespace, prompt steering only on `/ha`, and local `count_tokens` behavior across all built-ins.
   - Validation passed: full Rust all-targets `1864 passed / 0 failed / 6 ignored`, `kiro_loadtest 31/31`, `cargo fmt --check`, `cargo check --all-targets --locked`, `pnpm --dir ui check/build`, `pnpm --dir admin-ui build`, docs contract, prompt independence/default parity, and `git diff --check`.
   - Frozen candidate SHA-256 `fba89eb1e57947b481f38051341481662ca1c7f927a25c4ec167351cef0fcf77` passed Claude Code CLI `2.1.220` fake-upstream `bare-invoke`, `long-session` (`5 sessions / 110 turns / 100 tool pairs / leakMatches=[]`), and `thinking-wire` (`60/60`) using the real package binary rather than the Volta shim.
+  - Released as `v0.0.131`: work commit `4981285`, follow-up task registration commit `89cb4fc`, release commit `59b4c26`, tag `v0.0.131`.
 
 Active TODO:
 
