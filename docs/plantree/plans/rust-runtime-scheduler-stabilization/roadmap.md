@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-07-28 Asia/Shanghai
+Last reviewed: 2026-08-02 Asia/Shanghai
 
 ## Done
 
@@ -11,6 +11,7 @@ Last reviewed: 2026-07-28 Asia/Shanghai
   - cold cache + locked PgSQL + 128 concurrent local gates return fast;
   - warmed cache respects available/full/released external runtime capacity.
 - Current active TODOs migrated from `feature/todo` into this plan's topics.
+- Route-policy config authority focused pass: built-in `/v1`、`/cc`、`/ha`、`/na` routes remain fixed entrypoints, but cache, usage, prompt steering, external-pool route rules, and cache namespace now resolve from runtime configuration. Full Rust all-targets, UI/admin-ui build, docs contract, prompt parity/independence, and diff checks passed; live reload/browser/production gates remain post-focused follow-up.
 
 ## In Progress
 
@@ -37,4 +38,3 @@ Last reviewed: 2026-07-28 Asia/Shanghai
 - Full project-wide Markdown migration.
 - Deletion of any legacy document.
 - Real upstream high-concurrency pressure.
-

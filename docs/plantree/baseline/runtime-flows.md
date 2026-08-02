@@ -9,15 +9,17 @@ Related: [Business context](business-context.md), [System context](system-contex
 
 ## Route Resolution
 
-`src/anthropic/router.rs:257-348` creates route-specific `AppState` clones and mounts authenticated APIs.
+`src/anthropic/router.rs` mounts built-in route entrypoints. Runtime cache, usage,
+prompt-steering and external-pool behavior is selected by configuration using the
+actual endpoint path; built-in route addresses are not immutable strategy names.
 
-| Path | Messages handler | Default cache meaning | Special contract |
+| Path | Messages handler | Historical default policy | Special contract |
 | --- | --- | --- | --- |
-| `/v1/messages` | `post_messages` | high-cache | General Anthropic compatibility |
-| `/na/v1/messages` | `post_messages_real_cache_usage` | no-cache | Does not enter local prompt-cache simulation |
-| `/ha/v1/messages` | `post_messages_ha` | high-cache | Independent path-level reported-usage override |
-| `/dfcache/{route}/v1/messages` | `post_messages_dfcache` | configured high-cache | Route name must be explicitly configured |
-| `/cc/v1/messages` | `post_messages_cc` | high-cache | Claude Code event/usage compatibility |
+| `/v1/messages` | `post_messages` | current-high-cache | General Anthropic compatibility |
+| `/na/v1/messages` | `post_messages_na` | no-cache | Built-in entrypoint; cache/usage can be changed by path policy |
+| `/ha/v1/messages` | `post_messages_ha` | current-high-cache | Built-in entrypoint; cache/usage can be changed by path policy |
+| `/dfcache/{route}/v1/messages` | `post_messages_dfcache` | current-high-cache with path namespace | Route name must be explicitly configured |
+| `/cc/v1/messages` | `post_messages_cc` | current-high-cache plus Claude Code prompt default | Claude Code event/usage compatibility |
 
 Models, Files, and count-tokens routes are mounted for the same route families. The global HTTP request-body limit is 50 MiB.
 

@@ -207,7 +207,9 @@ const normalizeBodyConversion = (
 
 const defaultPromptSteering = (): RuntimeConfig['promptSteering'] => ({
   enabled: true,
-  scope: 'cc_only',
+  scope: 'route_rules',
+  routeMode: 'allow_list',
+  routeRules: ['/cc'],
   applyToExternalPool: true,
   applyToCountTokens: true,
   languageConstraint: { enabled: true, prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT },
@@ -218,13 +220,23 @@ const defaultPromptSteering = (): RuntimeConfig['promptSteering'] => ({
   custom: { enabled: false, prompt: '' },
 })
 
+const normalizePromptSteeringRouteRules = (value?: string[] | null): string[] =>
+  Array.from(new Set((value ?? []).map((rule) => rule.trim()).filter(Boolean)))
+
 const normalizePromptSteering = (
   input?: Partial<RuntimeConfig['promptSteering']> | null,
 ): RuntimeConfig['promptSteering'] => {
   const defaults = defaultPromptSteering()
+  const routeMode = input?.routeMode === 'allow_all' || input?.routeMode === 'deny_list'
+    ? input.routeMode
+    : defaults.routeMode
+  const routeRules = normalizePromptSteeringRouteRules(input?.routeRules ?? defaults.routeRules)
   const next = {
     ...defaults,
     ...(input ?? {}),
+    scope: input?.scope === 'cc_only' ? 'route_rules' : (input?.scope ?? defaults.scope),
+    routeMode,
+    routeRules: routeMode === 'allow_list' && routeRules.length === 0 ? defaults.routeRules : routeRules,
     languageConstraint: { ...defaults.languageConstraint, ...(input?.languageConstraint ?? {}) },
     taskQuality: { ...defaults.taskQuality, ...(input?.taskQuality ?? {}) },
     toolChoice: { ...defaults.toolChoice, ...(input?.toolChoice ?? {}) },
@@ -1839,7 +1851,7 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool
 }
 
 function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -1916,6 +1928,7 @@ function defaultPathCachePatch(
   }
   return {
     cacheType: 'current_high_cache',
+    routeNamespace: Boolean(normalizeDefinedCacheRoute(prefix)),
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
     reportedUsage: defaultUsagePatch(prefix),
@@ -1934,6 +1947,10 @@ function cacheTypeDesc(cacheType: CacheRoutePolicyPatch['cacheType']): string {
 
 function isBuiltInCachePrefix(prefix: string): boolean {
   return (BUILT_IN_CACHE_PREFIXES as readonly string[]).includes(prefix)
+}
+
+function builtinDefaultCacheType(prefix: string): CacheStrategyType {
+  return prefix === '/na' ? 'no_cache' : 'current_high_cache'
 }
 
 function canonicalCachePolicyPath(prefix: string): string {
@@ -2216,6 +2233,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
 function currentHighCachePathDefaults(prefix: string, reportedUsage?: ReportedUsagePathPolicy): CacheRoutePolicyPatch {
   return {
     cacheType: 'current_high_cache',
+    routeNamespace: Boolean(normalizeDefinedCacheRoute(prefix)),
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
     reportedUsage: reportedUsage ?? defaultUsagePatch(prefix),
@@ -2244,6 +2262,7 @@ function pathPolicyWithStrategyDefaults(
     cacheType,
     ...(cacheType === 'current_high_cache'
       ? {
+          routeNamespace: policy.routeNamespace ?? template.routeNamespace ?? Boolean(normalizeDefinedCacheRoute(prefix)),
           simulation: policy.simulation ?? template.simulation ?? defaultSimulationPatch(),
           creationControl: policy.creationControl ?? template.creationControl ?? defaultPromptCacheCreationControl(),
           reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
@@ -2402,6 +2421,12 @@ function PathCachePolicyCard({
       ) : effectiveCacheType === 'current_high_cache' ? (
         <div className="space-y-4">
           <h4 className="text-sm font-semibold">本路径策略参数</h4>
+          <ToggleField
+            title="独立路径缓存空间"
+            description="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一凭据、会话、模型的默认缓存空间共享。"
+            checked={Boolean(effectivePolicy.routeNamespace)}
+            onCheckedChange={(routeNamespace) => patch({ routeNamespace })}
+          />
           <SimulationOverrideForm
             value={effectivePolicy.simulation ?? defaultSimulationPatch()}
             onChange={(simulation) => patch({ simulation })}
@@ -2467,9 +2492,6 @@ function CachePolicyEditor({
     const normalizedPrefix = canonicalCachePolicyPath(prefix)
     const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
     const legacyReportedUsage = reportedUsageForPrefix(value.reportedUsage.pathOverrides, normalizedPrefix)
-    if (normalizedPrefix === '/na') {
-      return { cacheType: 'no_cache' }
-    }
     if (existing) {
       if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool') {
         return existing
@@ -2480,7 +2502,7 @@ function CachePolicyEditor({
       return currentHighCachePathDefaults(normalizedPrefix, legacyReportedUsage)
     }
     if (isBuiltInCachePrefix(normalizedPrefix)) {
-      return currentHighCachePathDefaults(normalizedPrefix)
+      return defaultPathCachePatch(normalizedPrefix, builtinDefaultCacheType(normalizedPrefix))
     }
     const normalizedRoute = normalizeDefinedCacheRoute(normalizedPrefix)
     if (normalizedRoute && value.definedCacheRoutes.includes(normalizedRoute)) {
@@ -2763,6 +2785,7 @@ export function RuntimeConfigPanel() {
   const updateConfig = useUpdateRuntimeConfig()
   const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyConfig)
+  const [promptSteeringRouteRulesText, setPromptSteeringRouteRulesText] = useState('')
 
   useEffect(() => {
     if (config.data) {
@@ -2814,6 +2837,7 @@ export function RuntimeConfigPanel() {
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
+      setPromptSteeringRouteRulesText(promptSteering.routeRules.join('\n'))
     }
   }, [config.data])
 
@@ -3567,20 +3591,62 @@ export function RuntimeConfigPanel() {
                 value={draft.promptSteering.scope}
                 onChange={(event) => updatePromptSteering('scope', event.target.value as RuntimeConfig['promptSteering']['scope'])}
               >
-                <option value="cc_only">仅 /cc 路径</option>
+                <option value="route_rules">按路径规则</option>
                 <option value="claude_code_profile">Claude Code / Debug profile</option>
                 <option value="all_routes">全部 messages 路由</option>
               </select>
             </label>
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">提示词路径模式</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">只在“按路径规则”范围下参与判断。</div>
+              </div>
+              <select
+                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={draft.promptSteering.routeMode}
+                disabled={draft.promptSteering.scope !== 'route_rules'}
+                onChange={(event) =>
+                  updatePromptSteering(
+                    'routeMode',
+                    event.target.value as RuntimeConfig['promptSteering']['routeMode'],
+                  )
+                }
+              >
+                <option value="allow_list">只对规则命中的入口生效</option>
+                <option value="deny_list">对规则外的入口生效</option>
+                <option value="allow_all">全部入口生效</option>
+              </select>
+            </label>
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">提示词路径规则</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  每行一条，可填入口前缀或完整 messages / count_tokens 路径；规则按大小写不敏感的精确或路径前缀匹配。
+                </div>
+              </div>
+              <textarea
+                className="min-h-28 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={promptSteeringRouteRulesText}
+                disabled={draft.promptSteering.scope !== 'route_rules' || draft.promptSteering.routeMode === 'allow_all'}
+                placeholder={'/cc\n/v1\n/ha\n/na\n/dfcache/team'}
+                onChange={(event) => {
+                  const routeRules = normalizePromptSteeringRouteRules(
+                    event.target.value.split(/[\r\n,]+/),
+                  )
+                  setPromptSteeringRouteRulesText(event.target.value)
+                  updatePromptSteering('routeRules', routeRules)
+                }}
+              />
+            </label>
             <ToggleField
               title="应用到外部池"
-              description="开启后 /cc 请求进入外部池 raw passthrough 时也使用增强后的 system。"
+              description="开启后，请求进入外部池 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
               checked={draft.promptSteering.applyToExternalPool}
               onCheckedChange={(applyToExternalPool) => updatePromptSteering('applyToExternalPool', applyToExternalPool)}
             />
             <ToggleField
               title="count_tokens 同步计入"
-              description="/cc count_tokens 使用同一提示词引导，避免估算低于真实请求。"
+              description="count_tokens 使用同一提示词路径规则，避免估算低于真实请求。"
               checked={draft.promptSteering.applyToCountTokens}
               onCheckedChange={(applyToCountTokens) => updatePromptSteering('applyToCountTokens', applyToCountTokens)}
             />

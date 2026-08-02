@@ -9,7 +9,9 @@ use crate::anthropic::router::{
     AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider,
 };
 use crate::anthropic::types::{Message, Metadata, SystemMessage};
-use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder, UsageRouteKind, UsageRouteSubtype};
+use crate::anthropic::usage::{
+    UsageRecord, UsageRecordQuery, UsageRecorder, UsageRouteKind, UsageRouteSubtype,
+};
 use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -25,11 +27,16 @@ use crate::kiro::model::events::MetadataTokenUsage;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::{
     CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch, CacheSimulationPolicyPatch,
-    PromptCacheCreationControlConfig, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
-    RequestAdmissionConfig,
+    PromptCacheCreationControlConfig, PromptSteeringRouteMode, PromptSteeringScope,
+    ReportedUsageFieldPolicy, ReportedUsagePathPolicy, RequestAdmissionConfig,
 };
 use crate::storage::{postgres::PostgresStore, redis_cache::RedisStore};
-use axum::{Router, body::Body, http::Request, routing::post};
+use axum::{
+    Router,
+    body::{Body, Bytes},
+    http::Request,
+    routing::post,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -69,6 +76,7 @@ fn eventstream_test_frame(event_type: &str, payload: serde_json::Value) -> Vec<u
 #[derive(Clone, Default)]
 struct MultimodalHandlerUpstreamState {
     hits: Arc<AtomicUsize>,
+    bodies: Arc<StdMutex<Vec<String>>>,
 }
 
 struct MultimodalHandlerUpstream {
@@ -106,6 +114,14 @@ impl MultimodalHandlerUpstream {
 
     fn hits(&self) -> usize {
         self.state.hits.load(Ordering::Acquire)
+    }
+
+    fn bodies_snapshot(&self) -> Vec<String> {
+        self.state
+            .bodies
+            .lock()
+            .expect("upstream bodies lock")
+            .clone()
     }
 }
 
@@ -571,8 +587,14 @@ async fn external_messages_upstream(
 
 async fn multimodal_handler_upstream(
     State(state): State<MultimodalHandlerUpstreamState>,
+    body: Bytes,
 ) -> Response {
     state.hits.fetch_add(1, Ordering::AcqRel);
+    state
+        .bodies
+        .lock()
+        .expect("upstream bodies lock")
+        .push(String::from_utf8_lossy(&body).to_string());
     let mut body = eventstream_test_frame(
         "assistantResponseEvent",
         json!({"content":"inline-ok","messageStatus":"COMPLETED"}),
@@ -2420,6 +2442,31 @@ fn inline_multimodal_body(include_max_tokens: bool) -> String {
     body.to_string()
 }
 
+const ROUTE_POLICY_MATRIX_PROMPT_MARKER: &str = "ROUTE_POLICY_MATRIX_PROMPT_20260803";
+
+fn route_policy_matrix_messages_body(label: &str) -> String {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 32,
+        "stream": false,
+        "system": "stable route policy cache system prompt ".repeat(700),
+        "metadata": {
+            "user_id": r#"{"session_id":"11111111-2222-4333-8444-555555555555"}"#
+        },
+        "messages": [{"role": "user", "content": format!("route policy matrix {label}")}]
+    })
+    .to_string()
+}
+
+fn route_policy_matrix_count_tokens_body() -> String {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "system": "stable route policy count tokens system prompt ".repeat(20),
+        "messages": [{"role": "user", "content": "same count_tokens payload"}]
+    })
+    .to_string()
+}
+
 fn multimodal_handler_request(path: &str, body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -2428,6 +2475,120 @@ fn multimodal_handler_request(path: &str, body: String) -> Request<Body> {
         .header("x-api-key", "b07-handler-key")
         .body(Body::from(body))
         .expect("build multimodal handler request")
+}
+
+fn route_policy_matrix_config(base_url: &str) -> Config {
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(base_url.to_string());
+    config.kiro_upstream_response_timeout_secs = 2;
+    config.credential_retry_max_attempts = 1;
+
+    config.cache_policy.path_overrides.insert(
+        "/cc".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::NoCache),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    config.cache_policy.path_overrides.insert(
+        "/na".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(false),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    config.cache_policy.path_overrides.insert(
+        "/ha".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(true),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+
+    config.prompt_steering.scope = PromptSteeringScope::RouteRules;
+    config.prompt_steering.route_mode = PromptSteeringRouteMode::AllowList;
+    config.prompt_steering.route_rules = vec!["/ha".to_string()];
+    config.prompt_steering.language_constraint.enabled = false;
+    config.prompt_steering.task_quality.enabled = false;
+    config.prompt_steering.tool_choice.enabled = false;
+    config.prompt_steering.chunked_write.enabled = false;
+    config.prompt_steering.thinking.enabled = false;
+    config.prompt_steering.custom.enabled = true;
+    config.prompt_steering.custom.prompt = format!(
+        "{ROUTE_POLICY_MATRIX_PROMPT_MARKER} {}",
+        "extra route policy prompt tokens ".repeat(50)
+    );
+
+    config
+}
+
+fn usage_field(value: &Value, field: &str) -> i64 {
+    value["usage"][field]
+        .as_i64()
+        .unwrap_or_else(|| panic!("missing usage.{field}: {value}"))
+}
+
+async fn route_policy_matrix_message_request(
+    app: &Router,
+    usage_recorder: &UsageRecorder,
+    upstream: &MultimodalHandlerUpstream,
+    path: &str,
+    label: &str,
+) -> (Value, UsageRecord, String) {
+    let body_index = upstream.hits();
+    let response = app
+        .clone()
+        .oneshot(multimodal_handler_request(
+            path,
+            route_policy_matrix_messages_body(label),
+        ))
+        .await
+        .expect("route policy matrix message response");
+    assert_eq!(response.status(), StatusCode::OK, "{path} message status");
+    let request_id = response_request_id(&response);
+    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .expect("read route policy matrix message response");
+    let value: Value = serde_json::from_slice(&body).expect("route policy matrix message JSON");
+    assert_eq!(value["content"][0]["text"], "inline-ok", "{path}");
+    let record = usage_record_for_request(usage_recorder, &request_id);
+    assert_eq!(record.endpoint, path, "{path} usage endpoint");
+    assert_eq!(
+        record.route_kind,
+        Some(UsageRouteKind::LocalCredential),
+        "{path} route kind"
+    );
+    let bodies = upstream.bodies_snapshot();
+    let upstream_body = bodies
+        .get(body_index)
+        .unwrap_or_else(|| panic!("{path}: upstream body at index {body_index} missing"))
+        .clone();
+    (value, record, upstream_body)
+}
+
+async fn route_policy_matrix_count_tokens(app: &Router, path: &str) -> i64 {
+    let response = app
+        .clone()
+        .oneshot(multimodal_handler_request(
+            path,
+            route_policy_matrix_count_tokens_body(),
+        ))
+        .await
+        .expect("route policy matrix count_tokens response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{path} count_tokens status"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read route policy matrix count_tokens response");
+    let value: Value = serde_json::from_slice(&body).expect("route policy count_tokens JSON");
+    value["input_tokens"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{path}: missing input_tokens: {value}"))
 }
 
 async fn assert_remote_multimodal_limit_response(response: Response, path: &str, round: usize) {
@@ -2592,6 +2753,147 @@ fn all_multimodal_handlers_reject_21_remote_sources_before_upstream_for_five_rou
             upstream.hits(),
             25,
             "five rounds across five inline message routes should each reach inference exactly once"
+        );
+    });
+}
+
+#[test]
+fn builtin_routes_follow_runtime_cache_and_prompt_config_matrix() {
+    run_handler_fixture_on_four_mib_thread("route-policy-config-matrix", || async {
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let config = route_policy_matrix_config(&upstream.base_url);
+        let (app, usage_recorder) = multimodal_handler_test_router_from_config(config.clone());
+
+        let cc_policy = config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(
+            cc_policy.policy.cache_type,
+            PromptCacheStrategyType::NoCache
+        );
+        assert_eq!(cc_policy.namespace, None);
+        let na_policy = config.cache_policy_for_path("/na/v1/messages");
+        assert_eq!(
+            na_policy.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(na_policy.namespace, None);
+        let ha_policy = config.cache_policy_for_path("/ha/v1/messages");
+        assert_eq!(
+            ha_policy.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(ha_policy.namespace.as_deref(), Some("/ha"));
+
+        let (v1_body, v1_record, v1_upstream_body) = route_policy_matrix_message_request(
+            &app,
+            &usage_recorder,
+            &upstream,
+            "/v1/messages",
+            "shared",
+        )
+        .await;
+        assert!(
+            !v1_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/v1 should not receive /ha prompt steering"
+        );
+        assert!(usage_field(&v1_body, "cache_creation_input_tokens") > 0);
+        assert_eq!(usage_field(&v1_body, "cache_read_input_tokens"), 0);
+        assert!(v1_record.cache_creation_input_tokens > 0);
+        assert_eq!(v1_record.cache_read_input_tokens, 0);
+
+        let (cc_body, cc_record, cc_upstream_body) = route_policy_matrix_message_request(
+            &app,
+            &usage_recorder,
+            &upstream,
+            "/cc/v1/messages",
+            "shared",
+        )
+        .await;
+        assert!(
+            !cc_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/cc should not receive /ha prompt steering"
+        );
+        assert_eq!(usage_field(&cc_body, "cache_creation_input_tokens"), 0);
+        assert_eq!(usage_field(&cc_body, "cache_read_input_tokens"), 0);
+        assert_eq!(cc_record.cache_creation_input_tokens, 0);
+        assert_eq!(cc_record.cache_read_input_tokens, 0);
+
+        let (na_body, na_record, na_upstream_body) = route_policy_matrix_message_request(
+            &app,
+            &usage_recorder,
+            &upstream,
+            "/na/v1/messages",
+            "shared",
+        )
+        .await;
+        assert!(
+            !na_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/na should not receive /ha prompt steering"
+        );
+        assert!(
+            usage_field(&na_body, "cache_read_input_tokens") > 0,
+            "/na is configured high-cache with shared namespace, so it should read the /v1 cache entry"
+        );
+        assert!(na_record.cache_read_input_tokens > 0);
+
+        let (ha_first_body, ha_first_record, ha_first_upstream_body) =
+            route_policy_matrix_message_request(
+                &app,
+                &usage_recorder,
+                &upstream,
+                "/ha/v1/messages",
+                "shared",
+            )
+            .await;
+        assert!(
+            ha_first_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER),
+            "/ha should receive configured prompt steering"
+        );
+        assert_eq!(
+            usage_field(&ha_first_body, "cache_read_input_tokens"),
+            0,
+            "/ha is configured with independent namespace, so it must not read /v1 or /na cache entries"
+        );
+        assert!(usage_field(&ha_first_body, "cache_creation_input_tokens") > 0);
+        assert_eq!(ha_first_record.cache_read_input_tokens, 0);
+        assert!(ha_first_record.cache_creation_input_tokens > 0);
+
+        let (ha_second_body, ha_second_record, ha_second_upstream_body) =
+            route_policy_matrix_message_request(
+                &app,
+                &usage_recorder,
+                &upstream,
+                "/ha/v1/messages",
+                "shared",
+            )
+            .await;
+        assert!(ha_second_upstream_body.contains(ROUTE_POLICY_MATRIX_PROMPT_MARKER));
+        assert!(
+            usage_field(&ha_second_body, "cache_read_input_tokens") > 0,
+            "second /ha request should read from its own independent namespace"
+        );
+        assert!(ha_second_record.cache_read_input_tokens > 0);
+
+        let hits_before_count_tokens = upstream.hits();
+        let v1_count = route_policy_matrix_count_tokens(&app, "/v1/messages/count_tokens").await;
+        let cc_count = route_policy_matrix_count_tokens(&app, "/cc/v1/messages/count_tokens").await;
+        let na_count = route_policy_matrix_count_tokens(&app, "/na/v1/messages/count_tokens").await;
+        let ha_count = route_policy_matrix_count_tokens(&app, "/ha/v1/messages/count_tokens").await;
+        assert_eq!(
+            upstream.hits(),
+            hits_before_count_tokens,
+            "count_tokens must stay local for all built-in routes"
+        );
+        assert_eq!(
+            cc_count, v1_count,
+            "/cc should not receive /ha prompt steering"
+        );
+        assert_eq!(
+            na_count, v1_count,
+            "/na should not receive /ha prompt steering"
+        );
+        assert!(
+            ha_count > v1_count,
+            "/ha count_tokens should include configured prompt steering: ha={ha_count}, v1={v1_count}"
         );
     });
 }

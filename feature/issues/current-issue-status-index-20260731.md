@@ -20,15 +20,15 @@ are broader production,
 load/chaos, browser, image-source, and architecture gates that remain open as
 post-release work; they are not reclassified as closed by this scoped release.
 
-Current inventory from the 2026-08-01 scan:
+Current inventory from the 2026-08-02 route-policy update:
 
 | Metric | Count | Meaning |
 | --- | ---: | --- |
-| Issue documents scanned | 70 | Markdown files under `feature/issues/` including this workspace's active and retained issue records |
+| Issue documents scanned | 71 | Markdown files under `feature/issues/` including this workspace's active and retained issue records |
 | `NO-GO` / `release-blocked` / `release-blocking` statuses | 6 | Broad gates normally block a full closure release unless explicitly superseded or scoped out by the current release decision |
-| Implementation/fix still pending | 4 | Analysis exists, but implementation or productization is not complete |
+| Implementation/fix still pending | 3 | Analysis exists, but implementation or productization is not complete |
 | Any `pending` / `open` / `partial` / `gates-open` / `not released` status | 53 | Most issue records still require a validation, rollout, or status-refresh action |
-| Fixed/implemented but final validation still pending | about 41 | Code or focused tests exist, but final candidate, real CLI, real upstream, browser, load, or production recurrence evidence is missing |
+| Fixed/implemented but final validation still pending | about 42 | Code or focused tests exist, but final candidate, real CLI, real upstream, browser, load, or production recurrence evidence is missing |
 
 The practical conclusion is:
 
@@ -85,6 +85,7 @@ The documents below record substantial implementation or focused validation, but
 | Scheduler / external pool | [external-pool-redis-coordination-and-release.md](external-pool-redis-coordination-and-release.md), [external-pool-authoritative-selection-and-dispatch-fence.md](external-pool-authoritative-selection-and-dispatch-fence.md), [external-pool-profiles-and-sse-safety.md](external-pool-profiles-and-sse-safety.md), [external-pool-success-zero-billing.md](external-pool-success-zero-billing.md), [external-pool-scheduler-interference-and-fallback-matrix-20260727.md](external-pool-scheduler-interference-and-fallback-matrix-20260727.md), [redis-scheduler-degraded-and-fallback.md](redis-scheduler-degraded-and-fallback.md), [high-concurrency-low-rpm-runtime-quarantine.md](high-concurrency-low-rpm-runtime-quarantine.md), [dispatch-queue-lease-renewal-rpm-amplification.md](dispatch-queue-lease-renewal-rpm-amplification.md) | Frozen load, two-instance, external takeover dynamic, native/CLI/UI/upgrade follow-up, production recurrence |
 | Storage / usage / dashboard | [usage-cleanup-safety-and-redis-isolation.md](usage-cleanup-safety-and-redis-isolation.md), [usage-dashboard-p95-and-window-semantics.md](usage-dashboard-p95-and-window-semantics.md), [external-pool-success-zero-billing.md](external-pool-success-zero-billing.md), [upstream-error-diagnostic-privacy-and-bounds.md](upstream-error-diagnostic-privacy-and-bounds.md) | Dynamic multi-instance recheck, runtime re-verification, persistent storage scans, frozen load |
 | Usage projection sanity | [downstream-usage-standard-field-over-1m-20260731.md](downstream-usage-standard-field-over-1m-20260731.md) | Production evidence shows final standard usage fields can exceed 1m; reported-usage cache creation, unreported local prompt-cache cache read/write, and failure diagnostic input separation are now implemented and focused-tested. 2026-08-01 scoped release gate passed; dashboard/API rollup distinction, production recurrence, and broader load validation remain open |
+| Route policy config authority | [route-policy-config-authority-20260802.md](route-policy-config-authority-20260802.md) | Backend and both UI surfaces are implemented and focused-verified; the handler matrix and frozen-candidate Claude Code CLI fake-upstream suite also passed. Built-in routes remain fixed entrypoints, while cache, usage, prompt steering, external pool route rules, and cache namespace resolve from runtime configuration. Release is pending; live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open |
 | UI / admin / operations | [two-ui-cost-precision-and-config-authority.md](two-ui-cost-precision-and-config-authority.md), [aws-kiro-api-key-region-lifecycle.md](aws-kiro-api-key-region-lifecycle.md), [business-observability-redis-fault-domain.md](business-observability-redis-fault-domain.md), [mcp-completion-runtime-card-error-source.md](mcp-completion-runtime-card-error-source.md), [local-credential-exhausted-overage-disabled-400-20260731.md](local-credential-exhausted-overage-disabled-400-20260731.md) | Usage detail modal now foregrounds upstream/processing diagnostics in both UIs; local API-key quota guard has focused Rust/provider/storage passes; browser gate, frozen runtime gate, and production recurrence remain pending |
 | Release / upgrade / artifacts | [upgrade-v101-v102-v103-smoke.md](upgrade-v101-v102-v103-smoke.md), [postgres-startup-migration-atomicity.md](postgres-startup-migration-atomicity.md), [validation-build-artifact-lifecycle-and-disk-safety.md](validation-build-artifact-lifecycle-and-disk-safety.md), [runtime-stack-overflow-and-handler-future-size.md](runtime-stack-overflow-and-handler-future-size.md) | Final release binary rebind, final inventory, frozen release HTTP/load |
 

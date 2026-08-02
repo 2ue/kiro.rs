@@ -696,13 +696,13 @@ async fn main() {
     );
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages (high-cache)");
+    tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
     tracing::info!("  GET  /na/v1/models");
-    tracing::info!("  POST /na/v1/messages (no-cache)");
+    tracing::info!("  POST /na/v1/messages");
     tracing::info!("  POST /na/v1/messages/count_tokens");
     tracing::info!("  GET  /ha/v1/models");
-    tracing::info!("  POST /ha/v1/messages (high-cache input-compatible)");
+    tracing::info!("  POST /ha/v1/messages");
     tracing::info!("  POST /ha/v1/messages/count_tokens");
     tracing::info!("  GET  /cc/v1/models");
     tracing::info!("  POST /cc/v1/messages");

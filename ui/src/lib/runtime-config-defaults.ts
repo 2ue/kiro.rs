@@ -188,7 +188,9 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
 export function defaultPromptSteering(): PromptSteeringConfig {
   return {
     enabled: true,
-    scope: 'cc_only',
+    scope: 'route_rules',
+    routeMode: 'allow_list',
+    routeRules: ['/cc'],
     applyToExternalPool: true,
     applyToCountTokens: true,
     languageConstraint: { enabled: true, prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT },
@@ -202,9 +204,16 @@ export function defaultPromptSteering(): PromptSteeringConfig {
 
 export function normalizePromptSteering(input?: Partial<PromptSteeringConfig> | null): PromptSteeringConfig {
   const defaults = defaultPromptSteering()
+  const routeMode = input?.routeMode === 'allow_all' || input?.routeMode === 'deny_list'
+    ? input.routeMode
+    : defaults.routeMode
+  const routeRules = normalizeRuleList(input?.routeRules ?? defaults.routeRules)
   const next = {
     ...defaults,
     ...(input ?? {}),
+    scope: input?.scope === 'cc_only' ? 'route_rules' : (input?.scope ?? defaults.scope),
+    routeMode,
+    routeRules: routeMode === 'allow_list' && routeRules.length === 0 ? defaults.routeRules : routeRules,
     languageConstraint: { ...defaults.languageConstraint, ...(input?.languageConstraint ?? {}) },
     taskQuality: { ...defaults.taskQuality, ...(input?.taskQuality ?? {}) },
     toolChoice: { ...defaults.toolChoice, ...(input?.toolChoice ?? {}) },
@@ -216,6 +225,10 @@ export function normalizePromptSteering(input?: Partial<PromptSteeringConfig> | 
   if (!next.taskQuality.prompt.trim()) next.taskQuality.prompt = DEFAULT_TASK_QUALITY_PROMPT
   next.custom.prompt = next.custom.prompt.trim()
   return next
+}
+
+function normalizeRuleList(value?: string[] | null): string[] {
+  return Array.from(new Set((value ?? []).map((rule) => rule.trim()).filter(Boolean)))
 }
 
 export function defaultMissingMaxTokens(): MissingMaxTokensConfig {
@@ -649,7 +662,7 @@ function canonicalCachePolicyPath(prefix: string): string {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool
 }
 
 export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {

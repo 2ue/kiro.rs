@@ -389,6 +389,7 @@ export function RuntimePage() {
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
   const [activeSection, setActiveSection] = useState<RuntimeSectionKey>('loadBalancing')
   const [externalRouteRulesText, setExternalRouteRulesText] = useState('')
+  const [promptSteeringRouteRulesText, setPromptSteeringRouteRulesText] = useState('')
 
   useEffect(() => {
     if (config.data) {
@@ -437,6 +438,7 @@ export function RuntimePage() {
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
       setExternalRouteRulesText(ruleText(config.data.externalPools?.externalPoolRouteRules))
+      setPromptSteeringRouteRulesText(ruleText(promptSteering.routeRules))
     }
   }, [config.data])
 
@@ -1066,22 +1068,54 @@ export function RuntimePage() {
                       <Select value={draft.promptSteering.scope} onValueChange={(v) => setPromptSteering('scope')(v as RuntimeConfig['promptSteering']['scope'])}>
                         <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="cc_only">仅 /cc 路径</SelectItem>
+                          <SelectItem value="route_rules">按路径规则</SelectItem>
                           <SelectItem value="claude_code_profile">Claude Code / Debug profile</SelectItem>
                           <SelectItem value="all_routes">全部 messages 路由</SelectItem>
                         </SelectContent>
                       </Select>
                       <div className="text-xs leading-5 text-muted-foreground">anthropic-strict profile 始终不注入 synthetic prompt。</div>
                     </div>
+                    <div className="space-y-1.5">
+                      <div className="text-sm font-semibold">提示词路径模式</div>
+                      <Select
+                        value={draft.promptSteering.routeMode}
+                        disabled={draft.promptSteering.scope !== 'route_rules'}
+                        onValueChange={(v) => setPromptSteering('routeMode')(v as RuntimeConfig['promptSteering']['routeMode'])}
+                      >
+                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="allow_list">只对规则命中的入口生效</SelectItem>
+                          <SelectItem value="deny_list">对规则外的入口生效</SelectItem>
+                          <SelectItem value="allow_all">全部入口生效</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <div className="text-xs leading-5 text-muted-foreground">仅在“按路径规则”范围下参与判断。</div>
+                    </div>
+                    <div className="space-y-1.5 md:col-span-2">
+                      <div className="text-sm font-semibold">提示词路径规则</div>
+                      <Textarea
+                        className="min-h-28 font-mono text-xs"
+                        value={promptSteeringRouteRulesText}
+                        disabled={draft.promptSteering.scope !== 'route_rules' || draft.promptSteering.routeMode === 'allow_all'}
+                        placeholder={'/cc\n/v1\n/ha\n/na\n/dfcache/team'}
+                        onChange={(e) => {
+                          setPromptSteeringRouteRulesText(e.target.value)
+                          setPromptSteering('routeRules')(parseRuleText(e.target.value))
+                        }}
+                      />
+                      <div className="text-xs leading-5 text-muted-foreground">
+                        每行一条，可填入口前缀或完整 messages / count_tokens 路径；默认规则是 /cc，但可以改成任意内置或自定义路由。
+                      </div>
+                    </div>
                     <TogField
                       label="应用到外部池"
-                      desc="开启后 /cc 请求进入外部池 raw passthrough 时也使用增强后的 system。"
+                      desc="开启后，请求进入外部池 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
                       checked={draft.promptSteering.applyToExternalPool}
                       onChange={setPromptSteering('applyToExternalPool')}
                     />
                     <TogField
                       label="count_tokens 同步计入"
-                      desc="/cc count_tokens 使用同一提示词引导，避免估算低于真实请求。"
+                      desc="count_tokens 使用同一提示词路径规则，避免估算低于真实请求。"
                       checked={draft.promptSteering.applyToCountTokens}
                       onChange={setPromptSteering('applyToCountTokens')}
                     />

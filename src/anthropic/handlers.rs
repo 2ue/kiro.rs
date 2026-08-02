@@ -5663,8 +5663,8 @@ pub async fn post_messages(
 
 /// POST /na/v1/messages
 ///
-/// 创建消息（对话），默认不进入本地 prompt-cache 模拟，直接使用原始 usage。
-pub async fn post_messages_real_cache_usage(
+/// 创建消息（对话）。缓存、usage 和外部池策略由运行配置按入口路径解析。
+pub async fn post_messages_na(
     State(state): State<AppState>,
     headers: HeaderMap,
     attribution: Option<Extension<RequestRejectionAttribution>>,
@@ -5683,7 +5683,7 @@ pub async fn post_messages_real_cache_usage(
 
 /// POST /ha/v1/messages
 ///
-/// 创建消息（对话），使用 high-cache 计算；下游 usage 上报由 `/ha` 路径覆盖项独立控制。
+/// 创建消息（对话）。缓存、usage 和外部池策略由运行配置按入口路径解析。
 pub async fn post_messages_ha(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -10439,10 +10439,25 @@ pub async fn count_tokens(
     count_tokens_for_endpoint(state, payload, "/v1/messages/count_tokens").await
 }
 
+/// POST /na/v1/messages/count_tokens
+pub async fn count_tokens_na(
+    State(state): State<AppState>,
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+) -> Response {
+    count_tokens_for_endpoint(state, payload, "/na/v1/messages/count_tokens").await
+}
+
+/// POST /ha/v1/messages/count_tokens
+pub async fn count_tokens_ha(
+    State(state): State<AppState>,
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+) -> Response {
+    count_tokens_for_endpoint(state, payload, "/ha/v1/messages/count_tokens").await
+}
+
 /// POST /cc/v1/messages/count_tokens
 ///
-/// Claude Code count_tokens must apply the same request-level prompt steering as `/cc/v1/messages`,
-/// otherwise the estimate under-counts the injected system guidance.
+/// Uses the same route-policy resolution as `/cc/v1/messages`.
 pub async fn count_tokens_cc(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
@@ -10532,9 +10547,7 @@ pub async fn count_tokens_dfcache(
 
 /// POST /cc/v1/messages
 ///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应实时转发 Kiro eventstream，避免 Claude Code CLI 长时间没有过程输出
-/// - 最终 usage 仍会在 message_delta 和 usage records 中修正
+/// Claude Code 常用入口。兼容 profile、缓存、usage 和外部池策略由运行配置解析。
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     headers: HeaderMap,

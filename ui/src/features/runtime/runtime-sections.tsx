@@ -116,6 +116,14 @@ function defaultUsagePatch(prefix: string): ReportedUsagePathPolicy {
     : pathPolicy()
 }
 
+function defaultRouteNamespace(prefix: string): boolean {
+  return Boolean(normalizeDefinedCacheRoute(prefix))
+}
+
+function builtinDefaultCacheType(prefix: string): CacheStrategyType {
+  return prefix === '/na' ? 'no_cache' : 'current_high_cache'
+}
+
 function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') {
     return { cacheType: 'no_cache' }
@@ -129,6 +137,7 @@ function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): Ca
   }
   return {
     cacheType: 'current_high_cache',
+    routeNamespace: defaultRouteNamespace(prefix),
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
     reportedUsage: defaultUsagePatch(prefix),
@@ -511,6 +520,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
 function currentHighCachePathDefaults(prefix: string, reportedUsage?: ReportedUsagePathPolicy): CacheRoutePolicyPatch {
   return {
     cacheType: 'current_high_cache',
+    routeNamespace: defaultRouteNamespace(prefix),
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
     reportedUsage: reportedUsage ?? defaultUsagePatch(prefix),
@@ -596,6 +606,7 @@ function pathPolicyWithStrategyDefaults(
     cacheType,
     ...(cacheType === 'current_high_cache'
       ? {
+          routeNamespace: policy.routeNamespace ?? template.routeNamespace ?? defaultRouteNamespace(prefix),
           simulation: policy.simulation ?? template.simulation ?? defaultSimulationPatch(),
           creationControl: policy.creationControl ?? template.creationControl ?? defaultPromptCacheCreationControl(),
           reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
@@ -750,6 +761,12 @@ function PathStrategyBindingCard({
       ) : effectiveCacheType === 'current_high_cache' ? (
         <div className="space-y-4">
           <div className="text-sm font-semibold">本路径策略参数</div>
+          <TogField
+            label="独立路径缓存空间"
+            desc="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一凭据、会话、模型的默认缓存空间共享。"
+            checked={Boolean(effectivePolicy.routeNamespace)}
+            onChange={(routeNamespace) => patch({ routeNamespace })}
+          />
           <SimulationOverrideForm
             value={effectivePolicy.simulation ?? defaultSimulationPatch()}
             onChange={(simulation) => patch({ simulation })}
@@ -820,9 +837,6 @@ export function CachePolicySettingsSection({
     const normalizedPrefix = canonicalCachePolicyPath(prefix)
     const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
     const legacyReportedUsage = reportedUsageForPrefix(config.reportedUsage.pathOverrides, normalizedPrefix)
-    if (normalizedPrefix === '/na') {
-      return { cacheType: 'no_cache' }
-    }
     if (existing) {
       if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool') {
         return existing
@@ -833,7 +847,7 @@ export function CachePolicySettingsSection({
       return currentHighCachePathDefaults(normalizedPrefix, legacyReportedUsage)
     }
     if (isBuiltInCachePrefix(normalizedPrefix)) {
-      return currentHighCachePathDefaults(normalizedPrefix)
+      return defaultPathCachePatch(normalizedPrefix, builtinDefaultCacheType(normalizedPrefix))
     }
     const normalizedRoute = normalizeDefinedCacheRoute(normalizedPrefix)
     if (normalizedRoute && config.definedCacheRoutes.includes(normalizedRoute)) {

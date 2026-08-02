@@ -1240,6 +1240,7 @@ export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_
 
 export interface CacheRoutePolicyPatch {
   cacheType?: PromptCacheStrategyType
+  routeNamespace?: boolean
   simulation?: CacheSimulationPolicyPatch
   creationControl?: PromptCacheCreationControlConfig
   reportedUsage?: ReportedUsagePathPolicy
@@ -1290,7 +1291,8 @@ export interface BodyConversionConfig {
   historyPlaceholderTools: boolean
 }
 
-export type PromptSteeringScope = 'cc_only' | 'claude_code_profile' | 'all_routes'
+export type PromptSteeringScope = 'route_rules' | 'cc_only' | 'claude_code_profile' | 'all_routes'
+export type PromptSteeringRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
 
 export interface PromptSteeringTextBlock {
   enabled: boolean
@@ -1310,6 +1312,8 @@ export interface ChunkedWritePromptSteeringConfig {
 export interface PromptSteeringConfig {
   enabled: boolean
   scope: PromptSteeringScope
+  routeMode: PromptSteeringRouteMode
+  routeRules: string[]
   applyToExternalPool: boolean
   applyToCountTokens: boolean
   languageConstraint: PromptSteeringTextBlock

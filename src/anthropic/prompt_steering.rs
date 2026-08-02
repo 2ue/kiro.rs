@@ -7,7 +7,7 @@
 use crate::anthropic::types::{CountTokensRequest, MessagesRequest, SystemMessage};
 use crate::model::config::{
     CompatProfile, PROMPT_STEERING_END_MARKER, PROMPT_STEERING_MARKER, PromptSteeringConfig,
-    PromptSteeringScope,
+    PromptSteeringRouteMode, PromptSteeringScope, route_rule_matches,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +79,9 @@ fn should_apply(
     }
 
     match config.scope {
-        PromptSteeringScope::CcOnly => is_cc_endpoint(endpoint),
+        PromptSteeringScope::RouteRules | PromptSteeringScope::CcOnly => {
+            prompt_steering_route_allowed(endpoint, &config)
+        }
         PromptSteeringScope::ClaudeCodeProfile => {
             matches!(
                 compat_profile,
@@ -90,10 +92,18 @@ fn should_apply(
     }
 }
 
-fn is_cc_endpoint(endpoint: &str) -> bool {
-    endpoint.starts_with("/cc/")
-        || endpoint == "/cc/v1/messages"
-        || endpoint == "/cc/v1/messages/count_tokens"
+fn prompt_steering_route_allowed(endpoint: &str, config: &PromptSteeringConfig) -> bool {
+    match config.route_mode {
+        PromptSteeringRouteMode::AllowAll => true,
+        PromptSteeringRouteMode::AllowList => config
+            .route_rules
+            .iter()
+            .any(|rule| route_rule_matches(rule, endpoint)),
+        PromptSteeringRouteMode::DenyList => !config
+            .route_rules
+            .iter()
+            .any(|rule| route_rule_matches(rule, endpoint)),
+    }
 }
 
 fn apply_to_system(system: &mut Option<Vec<SystemMessage>>, config: &PromptSteeringConfig) -> bool {
@@ -201,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_messages_do_not_get_default_cc_only_prompt() {
+    fn v1_messages_do_not_get_default_route_rule_prompt() {
         let mut req = request();
 
         assert!(!apply_to_messages_request(
@@ -212,6 +222,58 @@ mod tests {
         ));
 
         assert!(req.system.is_none());
+    }
+
+    #[test]
+    fn prompt_steering_route_rules_are_config_driven_for_all_paths() {
+        let mut config = PromptSteeringConfig {
+            route_rules: vec!["/ha".to_string()],
+            ..PromptSteeringConfig::default()
+        }
+        .normalized();
+        config.custom.enabled = true;
+        config.custom.prompt = "route-rule-test".to_string();
+
+        let mut cc = request();
+        assert!(!apply_to_messages_request(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+            &mut cc,
+        ));
+        assert!(cc.system.is_none());
+
+        let mut ha = request();
+        assert!(apply_to_messages_request(
+            "/ha/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+            &mut ha,
+        ));
+        assert!(
+            ha.system
+                .as_ref()
+                .is_some_and(|system| system[0].text.contains("route-rule-test"))
+        );
+
+        let mut count_tokens = CountTokensRequest {
+            model: ha.model.clone(),
+            messages: ha.messages.clone(),
+            system: None,
+            tools: ha.tools.clone(),
+        };
+        assert!(apply_to_count_tokens_request(
+            "/ha/v1/messages/count_tokens",
+            CompatProfile::ClaudeCode,
+            &config,
+            &mut count_tokens,
+        ));
+        assert!(
+            count_tokens
+                .system
+                .as_ref()
+                .is_some_and(|system| system[0].text.contains("route-rule-test"))
+        );
     }
 
     #[test]
@@ -250,7 +312,7 @@ mod tests {
     #[test]
     fn messages_and_count_tokens_share_operator_prompt_policy_for_five_rounds() {
         let scopes = [
-            PromptSteeringScope::CcOnly,
+            PromptSteeringScope::RouteRules,
             PromptSteeringScope::ClaudeCodeProfile,
             PromptSteeringScope::AllRoutes,
         ];

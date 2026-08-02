@@ -27,9 +27,8 @@ impl Default for TlsBackend {
 
 /// 路径级 prompt-cache usage 模式。
 ///
-/// 该枚举仍作为内部请求链路标记使用；外部配置不再选择缓存模式：
-/// `/v1`、`/cc/v1`、`/ha/v1` 消息路径默认使用 high-cache；
-/// `/na` 是 no-cache 路径，不进入本地 prompt-cache 计算。
+/// 该枚举仍作为内部请求链路标记使用。入口路径只负责定位配置；
+/// 缓存模式由 `cachePolicy` 的默认值和路径覆盖项决定。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
@@ -292,13 +291,27 @@ pub const PROMPT_STEERING_END_MARKER: &str = "</prompt_steering>";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptSteeringScope {
-    /// 只对 `/cc/v1/messages` 和 `/cc/v1/messages/count_tokens` 生效。
+    /// 按 `routeMode` / `routeRules` 配置选择入口。旧配置中的 `cc_only`
+    /// 也按路径规则处理，默认规则仍是 `/cc`。
     #[default]
+    #[serde(alias = "cc_only")]
+    RouteRules,
+    /// 旧配置兼容值；运行时等价于 `route_rules`。
+    #[serde(rename = "legacy_cc_only", skip_serializing)]
     CcOnly,
     /// 对 Claude Code / Debug 兼容 profile 生效。
     ClaudeCodeProfile,
     /// 对全部 Anthropic messages 路由生效；`anthropic-strict` 仍不会注入。
     AllRoutes,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSteeringRouteMode {
+    AllowAll,
+    #[default]
+    AllowList,
+    DenyList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -390,6 +403,10 @@ pub struct PromptSteeringConfig {
     pub enabled: bool,
     #[serde(default)]
     pub scope: PromptSteeringScope,
+    #[serde(default)]
+    pub route_mode: PromptSteeringRouteMode,
+    #[serde(default = "default_prompt_steering_route_rules")]
+    pub route_rules: Vec<String>,
     #[serde(default = "default_true")]
     pub apply_to_external_pool: bool,
     #[serde(default = "default_true")]
@@ -412,7 +429,9 @@ impl Default for PromptSteeringConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            scope: PromptSteeringScope::CcOnly,
+            scope: PromptSteeringScope::RouteRules,
+            route_mode: PromptSteeringRouteMode::AllowList,
+            route_rules: default_prompt_steering_route_rules(),
             apply_to_external_pool: true,
             apply_to_count_tokens: true,
             language_constraint: default_language_constraint_block(),
@@ -427,6 +446,13 @@ impl Default for PromptSteeringConfig {
 
 impl PromptSteeringConfig {
     pub fn normalized(mut self) -> Self {
+        if self.scope == PromptSteeringScope::CcOnly {
+            self.scope = PromptSteeringScope::RouteRules;
+        }
+        self.route_rules = normalize_route_rules(&self.route_rules);
+        if self.route_mode == PromptSteeringRouteMode::AllowList && self.route_rules.is_empty() {
+            self.route_rules = default_prompt_steering_route_rules();
+        }
         if self.language_constraint.prompt.trim().is_empty() {
             self.language_constraint.prompt = DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.to_string();
         } else {
@@ -440,6 +466,10 @@ impl PromptSteeringConfig {
         self.custom.prompt = self.custom.prompt.trim().to_string();
         self
     }
+}
+
+fn default_prompt_steering_route_rules() -> Vec<String> {
+    vec!["/cc".to_string()]
 }
 
 pub const DEFAULT_MISSING_MAX_TOKENS_VALUE: i32 = 20_480;
@@ -2014,6 +2044,8 @@ pub struct CacheRoutePolicyPatch {
     #[serde(default)]
     pub cache_type: Option<PromptCacheStrategyType>,
     #[serde(default)]
+    pub route_namespace: Option<bool>,
+    #[serde(default)]
     pub simulation: Option<CacheSimulationPolicyPatch>,
     #[serde(default)]
     pub creation_control: Option<PromptCacheCreationControlConfig>,
@@ -2118,6 +2150,7 @@ impl CacheRoutePolicyPatch {
     fn affects_cache_state(&self) -> bool {
         self.cache_type
             .is_some_and(|cache_type| cache_type != PromptCacheStrategyType::NoCache)
+            || self.route_namespace.is_some()
             || self.simulation.is_some()
             || self.creation_control.is_some()
             || self.cache_point.is_some()
@@ -2127,6 +2160,7 @@ impl CacheRoutePolicyPatch {
 
     pub fn is_empty(&self) -> bool {
         self.cache_type.is_none()
+            && self.route_namespace.is_none()
             && self
                 .simulation
                 .as_ref()
@@ -2177,10 +2211,17 @@ impl CachePolicyConfig {
                 .entry(prefix.to_string())
                 .or_insert_with(|| CacheRoutePolicyPatch {
                     cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                    route_namespace: Some(false),
                     ..CacheRoutePolicyPatch::default()
                 });
         }
-        self.ensure_builtin_no_cache_route("/na");
+        self.path_overrides
+            .entry("/na".to_string())
+            .or_insert_with(|| CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::NoCache),
+                route_namespace: Some(false),
+                ..CacheRoutePolicyPatch::default()
+            });
         self
     }
 
@@ -2190,6 +2231,7 @@ impl CachePolicyConfig {
                 .entry(prefix)
                 .or_insert_with(|| CacheRoutePolicyPatch {
                     cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                    route_namespace: Some(true),
                     ..CacheRoutePolicyPatch::default()
                 });
         }
@@ -2197,21 +2239,7 @@ impl CachePolicyConfig {
     }
 
     pub fn migrate_builtin_no_cache_routes(&mut self) -> bool {
-        self.ensure_builtin_no_cache_route("/na")
-    }
-
-    fn ensure_builtin_no_cache_route(&mut self, prefix: &str) -> bool {
-        let expected = CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::NoCache),
-            ..CacheRoutePolicyPatch::default()
-        };
-        match self.path_overrides.get(prefix) {
-            Some(policy) if policy == &expected => false,
-            _ => {
-                self.path_overrides.insert(prefix.to_string(), expected);
-                true
-            }
-        }
+        false
     }
 
     pub fn normalized(&self) -> Self {
@@ -2398,15 +2426,10 @@ pub fn resolve_cache_policy_for_path(
     let namespace = match cache_type {
         PromptCacheStrategyType::NoCache => None,
         PromptCacheStrategyType::KiroRsTool => Some(prefix.clone()),
-        PromptCacheStrategyType::CurrentHighCache => {
-            if matches!(prefix.as_str(), "/v1" | "/cc" | "/ha" | "/na") {
-                None
-            } else {
-                override_policy
-                    .affects_cache_state()
-                    .then(|| prefix.clone())
-            }
-        }
+        PromptCacheStrategyType::CurrentHighCache => override_policy
+            .route_namespace
+            .unwrap_or_else(|| override_policy.affects_cache_state())
+            .then(|| prefix.clone()),
     };
 
     ResolvedCacheRoutePolicy {
@@ -2950,32 +2973,13 @@ impl ExternalPoolsConfig {
             ExternalPoolRouteMode::AllowList => self
                 .external_pool_route_rules
                 .iter()
-                .any(|rule| external_pool_route_rule_matches(rule, endpoint)),
+                .any(|rule| route_rule_matches(rule, endpoint)),
             ExternalPoolRouteMode::DenyList => !self
                 .external_pool_route_rules
                 .iter()
-                .any(|rule| external_pool_route_rule_matches(rule, endpoint)),
+                .any(|rule| route_rule_matches(rule, endpoint)),
         }
     }
-}
-
-fn external_pool_route_rule_matches(rule: &str, endpoint: &str) -> bool {
-    let rule = rule.trim();
-    if rule.is_empty() {
-        return false;
-    }
-    if rule == "*" {
-        return true;
-    }
-    let endpoint = endpoint.to_ascii_lowercase();
-    let rule = rule.to_ascii_lowercase();
-    if endpoint == rule {
-        return true;
-    }
-    let Some(rest) = endpoint.strip_prefix(&rule) else {
-        return false;
-    };
-    rule.ends_with('/') || rest.starts_with('/')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3533,7 +3537,7 @@ pub struct Config {
     #[serde(default)]
     pub body_conversion: BodyConversionConfig,
 
-    /// 提示词引导配置。默认只对 Claude Code `/cc` 路径注入语言约束和任务质量引导。
+    /// 提示词引导配置。默认路径规则仍只命中 `/cc`，但实际生效范围由配置决定。
     /// `enabled` 是所有代理新增提示内容的总开关；子开关只在总开关开启时进一步细分。
     #[serde(default)]
     pub prompt_steering: PromptSteeringConfig,
@@ -4509,6 +4513,53 @@ pub fn normalize_defined_cache_routes(routes: &[String]) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn normalize_route_rule(rule: &str) -> Option<String> {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "*" {
+        return Some("*".to_string());
+    }
+    let with_slash = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    let normalized = with_slash.trim_end_matches('/').to_ascii_lowercase();
+    Some(if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        normalized
+    })
+}
+
+pub(crate) fn normalize_route_rules(rules: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    rules
+        .iter()
+        .filter_map(|rule| normalize_route_rule(rule))
+        .filter(|rule| seen.insert(rule.clone()))
+        .collect()
+}
+
+pub(crate) fn route_rule_matches(rule: &str, endpoint: &str) -> bool {
+    let Some(rule) = normalize_route_rule(rule) else {
+        return false;
+    };
+    if rule == "*" {
+        return true;
+    }
+    let endpoint = endpoint.trim().to_ascii_lowercase();
+    if endpoint == rule {
+        return true;
+    }
+    let Some(rest) = endpoint.strip_prefix(&rule) else {
+        return false;
+    };
+    rule.ends_with('/') || rest.starts_with('/')
+}
+
 fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
     let mut normalized = Vec::new();
     for key in keys {
@@ -4802,7 +4853,6 @@ impl Config {
     /// with current built-in route semantics.
     pub fn apply_runtime_config_migrations(&mut self) -> bool {
         let mut changed = self.cache_policy.migrate_builtin_no_cache_routes();
-        changed |= self.reported_usage.path_overrides.remove("/na").is_some();
         if self.runtime_config_migration_version < 1 {
             if self.payload_guard_mode == PayloadGuardMode::Preemptive {
                 self.payload_guard_mode = PayloadGuardMode::OnTooLong;
@@ -6157,6 +6207,7 @@ mod tests {
             "/matrix".to_string(),
             CacheRoutePolicyPatch {
                 cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                route_namespace: None,
                 simulation: Some(CacheSimulationPolicyPatch {
                     enabled: Some(true),
                     target_read_ratio: Some(0.77),
@@ -6211,6 +6262,7 @@ mod tests {
             "/plain".to_string(),
             CacheRoutePolicyPatch {
                 cache_type: Some(PromptCacheStrategyType::NoCache),
+                route_namespace: None,
                 simulation: Some(CacheSimulationPolicyPatch {
                     enabled: Some(true),
                     target_read_ratio: Some(0.88),
@@ -6244,6 +6296,7 @@ mod tests {
             "/tool-matrix".to_string(),
             CacheRoutePolicyPatch {
                 cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                route_namespace: None,
                 simulation: Some(CacheSimulationPolicyPatch {
                     enabled: Some(true),
                     token_scale: Some(2.5),
@@ -6796,6 +6849,65 @@ mod tests {
     }
 
     #[test]
+    fn builtin_route_cache_strategy_is_config_driven() {
+        let mut config = Config::default();
+        config.cache_policy.path_overrides.insert(
+            "/cc".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::NoCache),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        config.cache_policy.path_overrides.insert(
+            "/na".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                route_namespace: Some(false),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    target_read_ratio: Some(0.72),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(77),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        config.cache_policy.path_overrides.insert(
+            "/ha".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                route_namespace: Some(true),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let cc = config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(cc.policy.cache_type, PromptCacheStrategyType::NoCache);
+        assert_eq!(cc.namespace, None);
+        assert!(!cc.policy.reported_usage.enabled);
+
+        let na = config.cache_policy_for_path("/na/v1/messages");
+        assert_eq!(
+            na.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(na.namespace, None);
+        assert!(na.policy.simulation.enabled);
+        assert_eq!(na.policy.simulation.target_read_ratio, 0.72);
+        assert_eq!(na.policy.reported_usage.input.max_tokens, 77);
+
+        let ha = config.cache_policy_for_path("/ha/v1/messages");
+        assert_eq!(
+            ha.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(ha.namespace.as_deref(), Some("/ha"));
+    }
+
+    #[test]
     fn cache_policy_builtin_defaults_do_not_overwrite_existing_path() {
         let mut cache_policy = CachePolicyConfig::default();
         cache_policy.path_overrides.insert(
@@ -6834,20 +6946,21 @@ mod tests {
                 .path_overrides
                 .get("/na")
                 .and_then(|policy| policy.cache_type),
-            Some(PromptCacheStrategyType::NoCache)
+            Some(PromptCacheStrategyType::CurrentHighCache)
         );
         assert!(
             with_builtins
                 .path_overrides
                 .get("/na")
                 .and_then(|policy| policy.simulation)
-                .is_none()
+                .is_some()
         );
     }
 
     #[test]
-    fn runtime_config_migration_rewrites_legacy_na_to_no_cache() {
+    fn runtime_config_migration_preserves_explicit_na_policy() {
         let mut config = Config::default();
+        config.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
         config.cache_policy.path_overrides.insert(
             "/na".to_string(),
             CacheRoutePolicyPatch {
@@ -6861,17 +6974,18 @@ mod tests {
             },
         );
 
-        assert!(config.apply_runtime_config_migrations());
+        assert!(!config.apply_runtime_config_migrations());
         let na = config
             .cache_policy
             .path_overrides
             .get("/na")
             .expect("/na should be retained as an explicit route");
-        assert_eq!(na.cache_type, Some(PromptCacheStrategyType::NoCache));
-        assert!(na.reported_usage.is_none());
-        assert!(na.cache_point.is_none());
-
-        assert!(!config.apply_runtime_config_migrations());
+        assert_eq!(
+            na.cache_type,
+            Some(PromptCacheStrategyType::CurrentHighCache)
+        );
+        assert!(na.reported_usage.is_some());
+        assert!(na.cache_point.is_some());
     }
 
     #[test]

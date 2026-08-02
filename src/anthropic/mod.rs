@@ -6,23 +6,23 @@
 //!
 //! ## 标准端点 (/v1)
 //! - `GET /v1/models` - 获取可用模型列表
-//! - `POST /v1/messages` - 创建消息（对话，默认 high-cache 本地 usage 模拟）
+//! - `POST /v1/messages` - 创建消息（对话）
 //! - `POST /v1/messages/count_tokens` - 计算 token 数量
 //!
-//! ## No-cache 端点 (/na/v1)
+//! ## 内置端点 (/na/v1)
 //! - `GET /na/v1/models` - 获取可用模型列表
-//! - `POST /na/v1/messages` - 创建消息（默认不进入本地 prompt-cache 模拟，直接使用原始 usage）
+//! - `POST /na/v1/messages` - 创建消息（策略由运行配置决定）
 //! - `POST /na/v1/messages/count_tokens` - 计算 token 数量
 //!
-//! ## 高缓存 input 兼容端点 (/ha/v1)
+//! ## 内置端点 (/ha/v1)
 //! - `GET /ha/v1/models` - 获取可用模型列表
-//! - `POST /ha/v1/messages` - 创建消息（high-cache；usage 上报由 `/ha` 覆盖项独立控制）
-//! - `POST /ha/v1/messages/count_tokens` - 计算 token 数量（与 /v1 相同）
+//! - `POST /ha/v1/messages` - 创建消息（策略由运行配置决定）
+//! - `POST /ha/v1/messages/count_tokens` - 计算 token 数量
 //!
 //! ## Claude Code 兼容端点 (/cc/v1)
 //! - `GET /cc/v1/models` - 获取可用模型列表
 //! - `POST /cc/v1/messages` - 创建消息（实时流式返回，最终 message_delta.usage 修正用量）
-//! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量（与 /v1 相同）
+//! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量
 //!
 //! # 使用示例
 //! ```rust,ignore

@@ -94,11 +94,11 @@ Single-user operation does not eliminate security boundaries:
 
 | Route family | Intended policy meaning |
 | --- | --- |
-| `/v1/*` | Default Anthropic-compatible route; currently uses the default/high-cache policy family |
-| `/na/v1/*` | No-cache-oriented route and corresponding reported-usage policy |
-| `/ha/v1/*` | Explicit high-cache route with independent path overrides |
-| `/dfcache/{name}/v1/*` | Operator-defined high-cache route with longest-prefix policy resolution |
-| `/cc/v1/*` | Claude Code compatibility route with stricter protocol behavior |
+| `/v1/*` | Built-in Anthropic-compatible route; default cache/usage policy is seeded by runtime config and can be overridden |
+| `/na/v1/*` | Built-in route whose historical default is no-cache; runtime cache/usage policy is configurable |
+| `/ha/v1/*` | Built-in route whose historical default is high-cache; runtime cache/usage policy is configurable |
+| `/dfcache/{name}/v1/*` | Operator-defined route with longest-prefix policy resolution; route name must be explicitly configured |
+| `/cc/v1/*` | Built-in Claude Code compatibility route; protocol/profile behavior is configurable separately from cache/usage policy |
 | `/api/admin/*` | Privileged management API for the same operator-owned service |
 | `/healthz`, `/readyz` | Process liveness and dependency/runtime readiness |
 

@@ -26,9 +26,9 @@ use super::{
         get_file_content_dfcache, get_file_dfcache, list_files, upload_file,
     },
     handlers::{
-        count_tokens, count_tokens_cc, count_tokens_dfcache, get_models, get_models_dfcache,
-        post_messages, post_messages_cc, post_messages_dfcache, post_messages_ha,
-        post_messages_real_cache_usage,
+        count_tokens, count_tokens_cc, count_tokens_dfcache, count_tokens_ha, count_tokens_na,
+        get_models, get_models_dfcache, post_messages, post_messages_cc, post_messages_dfcache,
+        post_messages_ha, post_messages_na,
     },
     middleware::{AppState, auth_middleware, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
@@ -144,11 +144,11 @@ impl AnthropicRouterConfig {
 /// - `GET /v1/models` - 获取可用模型列表
 /// - `POST /v1/messages` - 创建消息（对话）
 /// - `POST /v1/messages/count_tokens` - 计算 token 数量
-/// - `GET /na/v1/models` - 获取可用模型列表（no-cache）
-/// - `POST /na/v1/messages` - 创建消息（no-cache）
+/// - `GET /na/v1/models` - 获取可用模型列表
+/// - `POST /na/v1/messages` - 创建消息
 /// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
-/// - `GET /ha/v1/models` - 获取可用模型列表（high-cache，usage 上报由 `/ha` 覆盖项控制）
-/// - `POST /ha/v1/messages` - 创建消息（high-cache，usage 上报由 `/ha` 覆盖项控制）
+/// - `GET /ha/v1/models` - 获取可用模型列表
+/// - `POST /ha/v1/messages` - 创建消息
 /// - `POST /ha/v1/messages/count_tokens` - 计算 token 数量
 ///
 /// # 认证
@@ -268,7 +268,7 @@ pub fn create_router_with_provider(
     let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) = route_prompt_cache_states(base_state);
     let define_cache_state = v1_state.clone();
 
-    // 需要认证的 /v1 路由（默认 high-cache）
+    // 需要认证的内置 /v1 路由。运行策略由运行配置按入口路径解析。
     let v1_routes = Router::new()
         .route("/models", get(get_models))
         .route(
@@ -293,7 +293,7 @@ pub fn create_router_with_provider(
         ))
         .with_state(v1_state);
 
-    // 需要认证的 /na/v1 路由（默认 no-cache）
+    // 需要认证的内置 /na/v1 路由。运行策略由运行配置按入口路径解析。
     let na_v1_routes = Router::new()
         .route("/models", get(get_models))
         .route(
@@ -306,20 +306,19 @@ pub fn create_router_with_provider(
         .route("/files/{file_id}/content", get(get_file_content))
         .route(
             "/messages",
-            post(post_messages_real_cache_usage).layer(middleware::from_fn_with_state(
+            post(post_messages_na).layer(middleware::from_fn_with_state(
                 request_admission_state.clone(),
                 request_admission_middleware,
             )),
         )
-        .route("/messages/count_tokens", post(count_tokens))
+        .route("/messages/count_tokens", post(count_tokens_na))
         .layer(middleware::from_fn_with_state(
             na_v1_state.clone(),
             auth_middleware,
         ))
         .with_state(na_v1_state);
 
-    // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
-    // 与 /v1 的区别：实时流式返回，最终 message_delta.usage 修正用量。
+    // 需要认证的内置 /cc/v1 路由。运行策略由运行配置按入口路径解析。
     let cc_v1_routes = Router::new()
         .route("/models", get(get_models))
         .route(
@@ -344,7 +343,7 @@ pub fn create_router_with_provider(
         ))
         .with_state(cc_v1_state);
 
-    // 需要认证的 /ha/v1 路由（high-cache；usage 上报由 /ha 路径覆盖项独立控制）
+    // 需要认证的内置 /ha/v1 路由。运行策略由运行配置按入口路径解析。
     let ha_v1_routes = Router::new()
         .route("/models", get(get_models))
         .route(
@@ -362,7 +361,7 @@ pub fn create_router_with_provider(
                 request_admission_middleware,
             )),
         )
-        .route("/messages/count_tokens", post(count_tokens))
+        .route("/messages/count_tokens", post(count_tokens_ha))
         .layer(middleware::from_fn_with_state(
             ha_v1_state.clone(),
             auth_middleware,
@@ -416,16 +415,10 @@ pub fn create_router_with_provider(
 
 fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppState, AppState) {
     (
-        base_state
-            .clone()
-            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
-        base_state
-            .clone()
-            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::Disabled),
-        base_state
-            .clone()
-            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
-        base_state.with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
+        base_state.clone(),
+        base_state.clone(),
+        base_state.clone(),
+        base_state,
     )
 }
 
@@ -456,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn route_prompt_cache_states_keep_na_no_cache_and_other_builtin_cache_paths_high_cache() {
+    fn route_prompt_cache_states_keep_strategy_out_of_route_registration() {
         for base_mode in [
             PromptCacheSimulationMode::Disabled,
             PromptCacheSimulationMode::HighCache,
@@ -464,22 +457,10 @@ mod tests {
             let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) =
                 route_prompt_cache_states(base_state(base_mode));
 
-            assert_eq!(
-                v1_state.prompt_cache_simulation_mode,
-                PromptCacheSimulationMode::HighCache
-            );
-            assert_eq!(
-                na_v1_state.prompt_cache_simulation_mode,
-                PromptCacheSimulationMode::Disabled
-            );
-            assert_eq!(
-                cc_v1_state.prompt_cache_simulation_mode,
-                PromptCacheSimulationMode::HighCache
-            );
-            assert_eq!(
-                ha_v1_state.prompt_cache_simulation_mode,
-                PromptCacheSimulationMode::HighCache
-            );
+            assert_eq!(v1_state.prompt_cache_simulation_mode, base_mode);
+            assert_eq!(na_v1_state.prompt_cache_simulation_mode, base_mode);
+            assert_eq!(cc_v1_state.prompt_cache_simulation_mode, base_mode);
+            assert_eq!(ha_v1_state.prompt_cache_simulation_mode, base_mode);
             assert!(Arc::ptr_eq(
                 &v1_state.prompt_cache,
                 &na_v1_state.prompt_cache

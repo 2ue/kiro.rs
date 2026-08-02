@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last reviewed: 2026-08-01 Asia/Shanghai
+Last reviewed: 2026-08-02 Asia/Shanghai
 
 Current phase:
 
@@ -11,7 +11,8 @@ Current phase:
 - Issue-status governance added: `feature/issues` now has a current blocker/status rollup, and this plan records when issue docs, the rollup index, and plan-tree state must be updated together.
 - Downstream usage standard-field guard residual code fixes are implemented and focused-tested; final candidate, isolated usage-shape smoke, UI/API rollup distinction, and production recurrence remain pending.
 - Account-card subscription classification now distinguishes `Pro Max` from generic `Pro`; focused Rust/UI/admin-ui validation passed, while final candidate/browser validation remains open.
-- Current scoped patch release gate passed on 2026-08-01 and is authorized for `v0.0.126` release after the dedicated Cargo version bump/tag validation. Broader production recurrence, image-source matrix, browser, load/chaos, and architecture gates remain post-release work rather than closed issues.
+- Current scoped patch release gate passed on 2026-08-01 and was published as `v0.0.130`. Broader production recurrence, image-source matrix, browser, load/chaos, and architecture gates remain post-release work rather than closed issues.
+- 2026-08-02 route-policy config-authority focused pass is implemented: built-in routes remain fixed entrypoints, but cache, usage, prompt-steering, external-pool route rules, and cache namespace are selected by configuration, not by hardcoded `/cc`/`/v1`/`/ha`/`/na` path checks. The handler configuration matrix and frozen-candidate Claude Code CLI fake-upstream suite passed; live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open until after release.
 
 Last landed evidence:
 
@@ -69,14 +70,20 @@ Last landed evidence:
   - UI `npm run check`, UI `npm run build`, admin-ui `npm run build`, Node contracts `283 tests / 261 pass / 22 skipped / 0 fail`, feature docs, `git diff --check`, Cargo fmt, and build-artifact inventory all passed.
   - Real Claude Code CLI `2.1.220` fake-upstream suite passed: bare-invoke, long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=[]`, and thinking-wire `60/60`.
   - The thinking-wire validation harness now treats `KIRO_EXPECTED_CLAUDE_VERSION` as optional exact mode and otherwise accepts recognizable CLI versions at or above supported minimum `2.1.197`, recording the actual version in the report.
+- 2026-08-02 route-policy config-authority focused pass:
+  - [Route policy config authority](../../../../feature/issues/route-policy-config-authority-20260802.md) moved from implementation-in-progress to backend/UI implemented and focused verified.
+  - Runtime strategy selection no longer treats `/cc`、`/v1`、`/ha`、`/na` as immutable strategy switches; prompt steering uses `routeMode` / `routeRules`, cache namespace uses `routeNamespace`, and built-in cache defaults no longer override explicit route configuration.
+  - `builtin_routes_follow_runtime_cache_and_prompt_config_matrix` passed through the scoped Cargo wrapper; it verifies `/cc -> no_cache`, `/na -> current_high_cache` shared namespace, `/ha -> current_high_cache` independent namespace, prompt steering only on `/ha`, and local `count_tokens` behavior across all built-ins.
+  - Validation passed: full Rust all-targets `1864 passed / 0 failed / 6 ignored`, `kiro_loadtest 31/31`, `cargo fmt --check`, `cargo check --all-targets --locked`, `pnpm --dir ui check/build`, `pnpm --dir admin-ui build`, docs contract, prompt independence/default parity, and `git diff --check`.
+  - Frozen candidate SHA-256 `fba89eb1e57947b481f38051341481662ca1c7f927a25c4ec167351cef0fcf77` passed Claude Code CLI `2.1.220` fake-upstream `bare-invoke`, `long-session` (`5 sessions / 110 turns / 100 tool pairs / leakMatches=[]`), and `thinking-wire` (`60/60`) using the real package binary rather than the Volta shim.
 
 Active TODO:
 
 1. Complete first archive batch for old slow-first-token/stream-fluidity analysis.
 2. Decide and implement explicit local capacity overflow policy.
 3. Design cooldown policy controls and manual recovery.
-4. Run scheduler/external-pool load + chaos validation.
-5. Continue Wave 1 in [priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) order: frozen/full-service isolated validation for the local exhausted-account quota guard, isolated/frozen usage-shape validation plus production recurrence for downstream standard usage fields, image-source matrix, model-reporting clarity, broader multi-tool/history regressions, image-bearing tool_result cases, HTML-like output tag filtering decision, and any future complete mixed native/client WebSearch state-machine design.
+4. Continue Wave 1 in [priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) order: image-source matrix, model-reporting clarity, broader multi-tool/history regressions, image-bearing tool_result cases, HTML-like output tag filtering decision, and any future complete mixed native/client WebSearch state-machine design.
+5. For route-policy config authority, run later C1/C2 gates only when needed: isolated service reload, browser save/reload interaction, real Claude CLI dynamic behavior, and production recurrence observation.
 
 Blocked by:
 
@@ -84,7 +91,7 @@ Blocked by:
 - Full load/chaos requires scoped fake/local test plan and frozen binary.
 - Broader production recurrence, image-source matrix, browser validation,
   multi-instance/load/chaos, and architecture gates remain open post-release.
-  They are not closed by the current `v0.0.126` scoped patch release evidence.
+  They are not closed by the current `v0.0.130` scoped patch release evidence.
 
 Next target:
 

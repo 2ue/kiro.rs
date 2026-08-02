@@ -268,11 +268,6 @@ impl AppState {
         self
     }
 
-    pub fn with_prompt_cache_simulation_mode(mut self, mode: PromptCacheSimulationMode) -> Self {
-        self.prompt_cache_simulation_mode = mode;
-        self
-    }
-
     pub fn with_payload_guard(
         mut self,
         enabled: bool,
