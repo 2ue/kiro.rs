@@ -2,13 +2,24 @@
 
 Role: Usage 明细清理、Redis 单线程隔离、持久任务恢复与 F03 验收权威
 
-Status: `cleanup-suite-and-writer-lock-order-focused-pass / dynamic-multi-instance-recheck-pending`
+Status: `cleanup-suite-and-writer-lock-order-focused-pass / product-semantics-recheck-pending / dynamic-multi-instance-recheck-pending`
 
 Severity: P1
 
 Last updated: 2026-07-16
 
 ## 结论
+
+### 2026-08-02 新增用户问题登记
+
+用户补充了与现有后端安全合同不同的一组体验问题，暂不视为已复现：
+
+- 新旧 UI 的清理入口、限制提示和结果展示不一致；
+- 单次最多 500 条导致大数据量清理过慢；
+- 页面提示的清理限制与实际执行语义不一致；
+- 清理后汇总数据有时消失、有时保留、过一段时间又回来。
+
+这些现象可能分别来自 UI 合同漂移、批量预算/任务状态误解、Redis 派生汇总失效竞态，不能通过简单提高上限或强制删除汇总来处理。后续必须先用同一套脱敏数据验证 soft cleanup、hard cleanup、取消/resume、多实例 writer 和新旧 UI 的真实状态，再决定是否调整批量上限、合并清理方式或修复汇总读写一致性。
 
 旧实现存在两条独立危险路径，不能只通过把 `DEL` 改成 `UNLINK` 修复：
 

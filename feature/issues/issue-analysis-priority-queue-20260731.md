@@ -51,6 +51,16 @@ Then check whether any item below has moved category. If yes, update this queue,
 
 ## Priority queue
 
+### 2026-08-02 用户重新指定的当前顺序
+
+在已有 Wave 1/2/3 门禁继续保留的前提下，当前用户要求优先登记并逐项处理：
+
+| Order | Issue | First action | Do not do |
+| ---: | --- | --- | --- |
+| U1 | [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md) | 只读采集 usage 错误、代码版本、脱敏磁盘证据，并在隔离服务复现 | 不直接改生产配置、不为降低错误率盲目重试 |
+| U2 | [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) | 做首语言、切换语言、压缩、并发会话矩阵 | 不先假设是“第一次用户语言”或全局缓存 |
+| U3 | [Usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md) | 对齐新旧 UI、后端清理合同、汇总读写和批量预算 | 不先把 500 提高或强制删除汇总 |
+
 ### Wave 1: urgent and comparatively small
 
 | Order | Issue | Why first | First analysis action | Exit criteria |

@@ -13,6 +13,7 @@ Current phase:
 - Account-card subscription classification now distinguishes `Pro Max` from generic `Pro`; focused Rust/UI/admin-ui validation passed, while final candidate/browser validation remains open.
 - Current scoped patch release gate passed on 2026-08-01 and was published as `v0.0.130`. Broader production recurrence, image-source matrix, browser, load/chaos, and architecture gates remain post-release work rather than closed issues.
 - 2026-08-02 route-policy config-authority focused pass is implemented: built-in routes remain fixed entrypoints, but cache, usage, prompt-steering, external-pool route rules, and cache namespace are selected by configuration, not by hardcoded `/cc`/`/v1`/`/ha`/`/na` path checks. The handler configuration matrix and frozen-candidate Claude Code CLI fake-upstream suite passed; live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open until after release.
+- 2026-08-02 user reprioritization recorded: after the route-policy release, process the new read-only production usage-error audit for `152.53.243.159` and `152.53.194.170`, then the language-constraint first-language-lock issue, then the usage-cleanup UI/semantics consistency issue. These are registered as analysis-planned and are not treated as fixed.
 
 Last landed evidence:
 

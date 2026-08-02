@@ -39,6 +39,8 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [Pro Max 账号卡片套餐显示](subscription-pro-max-card-label-20260801.md) - 根因确认不是截图：UI 套餐 helper 与后端 `subscription_key`/`subscription_rank` 缺少 `Pro Max` 分支，已补齐 `Pro Max` 标签、`pro_max` 筛选键和等级排序，并补充 Power/Pro Max 筛选项；focused Rust/UI/admin-ui 验证通过，最终候选浏览器门禁仍随 release gate 进行。
 - [2026-08-01 生产外部池两类错误根因补充](20260801-production-external-errors-root-cause.md) - 外部池“输入上限预检”发送前硬拒绝绕过“请求大小保护”，以及外部池 route 缺少本地 Kiro 发送链路的兼容模型处理导致部分“模型处理”模式无法按配置生效；当前修复是取消内容长度发送前拒绝、保留调度/安全预检，并让直接外部池和本地失败 fallback 路径携带“模型（本地解析）”。
 - [内置路由策略必须完全由配置决定](route-policy-config-authority-20260802.md) - 2026-08-02 P0 配置权威问题已完成后端与两套 UI focused 修复：`/cc`、`/v1`、`/ha`、`/na` 仍是内置入口，但缓存、usage、提示词、外部池等运行策略均由运行配置解析；`/cc` 可配置成无缓存，`/na` 可配置成高缓存，提示词引导按路径规则命中任意内置或自定义入口；全量 Rust、UI/admin-ui build、文档合同和提示词配置独立性测试通过，真实服务热加载/浏览器交互/生产复发观察仍作为后续门禁。
+- [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md) - 2026-08-02 新登记；先只读收集两台机器的 usage 错误、代码版本和脱敏证据，再逐类判断有限重试、请求处理、fallback 或不改，禁止为了降低错误率吞掉确定性请求错误。
+- [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) - 2026-08-02 新登记；现象尚未确认是用户首语言、会话状态、全局缓存还是提示词合并顺序，先做多语言、压缩和并发会话矩阵。
 - [HTML `<br>` 输出标签污染](html-br-output-tag-contamination-20260731.md) - 2026-07-31 记录 assistant 在正常 prose 中疑似输出 raw `<br>` / HTML-like tag 的复现边界；direct/stream/tool-result/history/CLI 正常场景未复现，web-display 与显式 standalone `<br>` 仅作为合法透传对照；过滤策略仍需真实异常样本或产品规则。
 - [协议 transcript 与工具历史泄漏](protocol-transcript-and-tool-history-leak.md)
 - [thinking 与签名内容安全](thinking-and-signed-content-safety.md)
