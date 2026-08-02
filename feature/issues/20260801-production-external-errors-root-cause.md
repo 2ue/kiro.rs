@@ -1,6 +1,6 @@
 # 2026-08-01 生产外部池两类错误根因补充
 
-Status: `root-cause-confirmed / implementation-focused-pass / frontend-contract-gate-pass / integration-dispatch-focused-pass / release-gate-pending`
+Status: `root-cause-confirmed / implementation-focused-pass / frontend-contract-gate-pass / integration-dispatch-focused-pass / released-v0.0.130`
 
 Severity: P0
 

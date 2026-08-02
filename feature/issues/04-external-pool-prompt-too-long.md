@@ -1,6 +1,6 @@
 # 外部池 prompt 超长（上游硬限制 + 本地高负载两段式）
 
-Status: `classification-recorded / preflight-design-superseded / config-alignment-focused-pass / integration-dispatch-focused-pass / release-gate-pending`
+Status: `classification-recorded / preflight-design-superseded / config-alignment-focused-pass / integration-dispatch-focused-pass / released-v0.0.130`
 
 Severity: P1
 
