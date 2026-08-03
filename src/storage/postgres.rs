@@ -118,6 +118,10 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
         column_name: "rollup_active",
     },
     RequiredPostgresColumn {
+        table_name: "usage_cleanup_jobs",
+        column_name: "batch_size",
+    },
+    RequiredPostgresColumn {
         table_name: "usage_records",
         column_name: "original_cost_usd",
     },
@@ -852,7 +856,13 @@ impl PostgresStore {
             })
             .collect();
 
-        let missing = required_postgres_schema_missing_columns(&present);
+        let mut missing = required_postgres_schema_missing_columns(&present);
+        if !self
+            .usage_cleanup_batch_size_constraint_is_current()
+            .await?
+        {
+            missing.push("usage_cleanup_jobs.batch_size_check<=5000".to_string());
+        }
         if missing.is_empty() {
             return Ok(());
         }
@@ -871,6 +881,23 @@ impl PostgresStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    async fn usage_cleanup_batch_size_constraint_is_current(&self) -> anyhow::Result<bool> {
+        sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(bool_or(pg_get_constraintdef(c.oid) LIKE '%<= 5000%'), false)
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = current_schema()
+              AND t.relname = 'usage_cleanup_jobs'
+              AND c.conname = 'usage_cleanup_jobs_batch_size_check'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn ping(&self) -> anyhow::Result<()> {
@@ -962,6 +989,12 @@ impl PostgresStore {
                     &mut tx,
                     "credential-stats-delta-batches-v1",
                     CREDENTIAL_STATS_DELTA_BATCH_SQL,
+                )
+                .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "usage-cleanup-batch-size-limit-v1",
+                    USAGE_CLEANUP_BATCH_SIZE_LIMIT_SQL,
                 )
                 .await?;
 
@@ -10330,7 +10363,7 @@ CREATE TABLE IF NOT EXISTS usage_cleanup_jobs (
     job_id TEXT PRIMARY KEY,
     mode TEXT NOT NULL CHECK (mode IN ('soft_delete', 'hard_delete')),
     cutoff_at TIMESTAMPTZ NOT NULL,
-    batch_size INTEGER NOT NULL CHECK (batch_size > 0 AND batch_size <= 500),
+    batch_size INTEGER NOT NULL CHECK (batch_size > 0 AND batch_size <= 5000),
     max_batches INTEGER NOT NULL CHECK (max_batches > 0 AND max_batches <= 10000),
     pause_ms_between_batches BIGINT NOT NULL CHECK (
         pause_ms_between_batches >= 0 AND pause_ms_between_batches <= 10000
@@ -10793,6 +10826,15 @@ CREATE INDEX IF NOT EXISTS idx_credential_stats_delta_batches_created_at
     ON credential_stats_delta_batches (created_at ASC);
 "#;
 
+const USAGE_CLEANUP_BATCH_SIZE_LIMIT_SQL: &str = r#"
+ALTER TABLE usage_cleanup_jobs
+    DROP CONSTRAINT IF EXISTS usage_cleanup_jobs_batch_size_check;
+
+ALTER TABLE usage_cleanup_jobs
+    ADD CONSTRAINT usage_cleanup_jobs_batch_size_check
+    CHECK (batch_size > 0 AND batch_size <= 5000);
+"#;
+
 const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL: &str = r#"
 CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
 SELECT
@@ -10943,6 +10985,7 @@ mod tests {
         for pair in [
             ("external_upstream_pools", "revision"),
             ("usage_records", "rollup_active"),
+            ("usage_cleanup_jobs", "batch_size"),
             ("usage_records", "original_cost_usd"),
             ("usage_records", "kiro_metering_usage"),
             ("model_capabilities_sync_status", "reasoning_fields"),
@@ -11123,6 +11166,88 @@ mod tests {
                 .iter()
                 .any(|window| window.summary.total_requests >= 1),
             "dashboard should load after usage dashboard upgrade-column repair"
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_startup_migration_expands_usage_cleanup_batch_size_constraint() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+
+        sqlx::query(
+            "DELETE FROM schema_migrations WHERE version = 'usage-cleanup-batch-size-limit-v1'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            ALTER TABLE usage_cleanup_jobs
+                DROP CONSTRAINT IF EXISTS usage_cleanup_jobs_batch_size_check
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            ALTER TABLE usage_cleanup_jobs
+                ADD CONSTRAINT usage_cleanup_jobs_batch_size_check
+                CHECK (batch_size > 0 AND batch_size <= 500)
+            "#,
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let old_constraint_error = sqlx::query(
+            r#"
+            INSERT INTO usage_cleanup_jobs (
+                job_id, mode, cutoff_at, batch_size, max_batches,
+                pause_ms_between_batches, status
+            )
+            VALUES ($1, 'soft_delete', now(), 501, 100, 0, 'queued')
+            "#,
+        )
+        .bind("cleanup-old-limit-rejected")
+        .execute(store.pool())
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(old_constraint_error.contains("usage_cleanup_jobs_batch_size_check"));
+
+        let compatibility_error = store
+            .verify_required_schema_compatibility(false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(compatibility_error.contains("usage_cleanup_jobs.batch_size_check<=5000"));
+
+        store.migrate_with_options(false).await.unwrap();
+        store
+            .verify_required_schema_compatibility(true)
+            .await
+            .unwrap();
+        let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
+        assert!(
+            usage_store
+                .create_cleanup_job(NewUsageCleanupJob {
+                    job_id: "cleanup-new-limit-accepted",
+                    mode: "soft_delete",
+                    cutoff_at: Utc::now(),
+                    batch_size: 5_000,
+                    max_batches: 100,
+                    pause_ms_between_batches: 0,
+                })
+                .await
+                .unwrap(),
+            "expanded cleanup batch-size constraint must accept 5000"
         );
 
         store.drop_test_schema().await.unwrap();

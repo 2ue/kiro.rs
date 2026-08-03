@@ -9,7 +9,7 @@ import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger,
 
 const CLEANUP_MAX_OLDER_THAN_DAYS = 3650
 const CLEANUP_DEFAULT_BATCH_SIZE = 250
-const CLEANUP_MAX_BATCH_SIZE = 500
+const CLEANUP_MAX_BATCH_SIZE = 5000
 const CLEANUP_MAX_PAUSE_MS = 10000
 
 function boundedInteger(value: string, fallback: number, min: number, max: number): number {
@@ -23,7 +23,7 @@ function cleanupRangeLabel(days: number): string {
 }
 
 export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [olderThanDays, setOlderThanDays] = useState('30')
+  const [olderThanDays, setOlderThanDays] = useState('7')
   const [mode, setMode] = useState<'soft_delete' | 'hard_delete'>('soft_delete')
   const [batchSize, setBatchSize] = useState(String(CLEANUP_DEFAULT_BATCH_SIZE))
   const [pauseMs, setPauseMs] = useState('100')
@@ -61,11 +61,13 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
   }
 
   const handleStart = async () => {
-    if (!previewResult) return
     const request = buildRequest()
+    const previewText = previewResult
+      ? `预计命中 ${formatNumber(previewResult.matchedRows)} 条，`
+      : ''
     const ok = await confirm({
       title: '确认清理',
-      message: `将清理 ${previewResult.matchedRows} 条 ${cleanupRangeLabel(request.olderThanDays ?? 30)}的记录（${mode === 'hard_delete' ? '物理删除，不可恢复' : '软删除'}）。确认执行？`,
+      message: `将${previewText}清理 ${cleanupRangeLabel(request.olderThanDays ?? 7)}的记录（${mode === 'hard_delete' ? '物理删除，不可恢复' : '软删除'}）。确认执行？`,
       confirmText: '执行清理',
       tone: 'danger',
     })
@@ -190,7 +192,10 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
         <div className="space-y-3">
           <div className="flex items-center gap-3">
             <label className="text-xs text-muted-foreground w-20 shrink-0">删除模式</label>
-            <Select value={mode} onValueChange={(v) => setMode(v as 'soft_delete' | 'hard_delete')}>
+            <Select value={mode} onValueChange={(v) => {
+              setMode(v as 'soft_delete' | 'hard_delete')
+              setPreviewResult(null)
+            }}>
               <SelectTrigger size="sm" className="flex-1"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="soft_delete">软删除（标记删除）</SelectItem>
@@ -206,7 +211,10 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               max={CLEANUP_MAX_OLDER_THAN_DAYS}
               className="flex-1 h-8 text-xs"
               value={olderThanDays}
-              onChange={(e) => setOlderThanDays(e.target.value)}
+              onChange={(e) => {
+                setOlderThanDays(e.target.value)
+                setPreviewResult(null)
+              }}
             />
             <span className="text-xs text-muted-foreground">天前的记录</span>
           </div>
@@ -220,12 +228,15 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
                 max={CLEANUP_MAX_BATCH_SIZE}
                 className="flex-1 h-8 text-xs"
                 value={batchSize}
-                onChange={(e) => setBatchSize(e.target.value)}
+                onChange={(e) => {
+                  setBatchSize(e.target.value)
+                  setPreviewResult(null)
+                }}
                 placeholder={String(CLEANUP_DEFAULT_BATCH_SIZE)}
               />
               <span className="text-xs text-muted-foreground/60">条</span>
             </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批短事务，后端安全上限 {CLEANUP_MAX_BATCH_SIZE}，默认 {CLEANUP_DEFAULT_BATCH_SIZE}</p>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批短事务，默认 {CLEANUP_DEFAULT_BATCH_SIZE}，后端安全上限 {formatNumber(CLEANUP_MAX_BATCH_SIZE)}；单批过大时任务可能因锁争用暂停，可降低后恢复。</p>
           </div>
           <div className="space-y-1">
             <div className="flex items-center gap-3">
@@ -236,7 +247,10 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
                 max={CLEANUP_MAX_PAUSE_MS}
                 className="flex-1 h-8 text-xs"
                 value={pauseMs}
-                onChange={(e) => setPauseMs(e.target.value)}
+                onChange={(e) => {
+                  setPauseMs(e.target.value)
+                  setPreviewResult(null)
+                }}
                 placeholder="100"
               />
               <span className="text-xs text-muted-foreground/60">ms</span>
@@ -266,7 +280,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
           <Button variant="outline" size="sm" onClick={handlePreview} disabled={previewing || isRunning}>
             {previewing ? '预览中...' : '预览'}
           </Button>
-          <Button size="sm" onClick={handleStart} disabled={!previewResult || startCleanup.isPending || isRunning}>
+          <Button size="sm" onClick={handleStart} disabled={startCleanup.isPending || isRunning}>
             {startCleanup.isPending ? '启动中...' : '执行清理'}
           </Button>
         </div>

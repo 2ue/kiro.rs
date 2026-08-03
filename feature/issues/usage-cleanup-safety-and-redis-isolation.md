@@ -2,20 +2,76 @@
 
 Role: Usage 明细清理、Redis 单线程隔离、持久任务恢复与 F03 验收权威
 
-Status: `cleanup-suite-and-writer-lock-order-focused-pass / product-semantics-recheck-pending / dynamic-multi-instance-recheck-pending`
+Status: `cleanup-suite-and-writer-lock-order-focused-pass / ui-parity-and-cache-race-fix-focused-verified / browser-focused-verified / batch-limit-5000-focused-verified / production-scale-performance-pending / dynamic-multi-instance-recheck-pending`
 
 Severity: P1
 
-Last updated: 2026-07-16
+Last updated: 2026-08-03
+
+## 2026-08-03 每批数量后端上限调整
+
+用户指出“后端安全上限 500”过小。复核源码后确认该 500 同时存在于三层，不能只改 UI：
+
+- 后端请求归一化 `USAGE_CLEANUP_MAX_BATCH_SIZE`；
+- PostgreSQL `usage_cleanup_jobs.batch_size` CHECK 约束；
+- 新旧两套 UI 的 `每批数量` 输入最大值和提示文案。
+
+当前已将 `每批数量` 的后端硬上限提高到 `5,000`，默认仍保持 `250`，单次 worker 默认仍最多 `10,000` 批。旧数据库通过启动迁移 `usage-cleanup-batch-size-limit-v1` 将 `usage_cleanup_jobs_batch_size_check` 从 `<=500` 升级到 `<=5000`；新数据库建表约束也同步为 `<=5000`。如果关闭启动迁移并连接旧库，schema compatibility 会提前报告 `usage_cleanup_jobs.batch_size_check<=5000`，避免 UI/后端放行 5,000 但数据库插入 job 时才失败。两套 UI 均同步显示“默认 250，后端安全上限 5,000”，并提示单批过大时任务可能因锁争用暂停，可降低后恢复。
+
+这个调整不移除安全边界：每批仍是独立 PostgreSQL 短事务，使用 `FOR UPDATE SKIP LOCKED`、`lock_timeout=250ms`、`statement_timeout=10s`、批次后持久化进度和 `yield`，并保留取消、暂停和显式恢复。若生产库上 `5,000` 单批过大，预期行为是批次返回 0/has_remaining，经有限重试后任务进入“已暂停”，操作员降低 `每批数量` 后恢复；不能把上限提高理解成无界清理或完整性能门禁通过。
+
+验证见 [Usage cleanup batch limit and v0.0.131 publish failure - 2026-08-03](../evidence/usage-cleanup-batch-limit-and-release-131-20260803.md)：
+
+- `usage_cleanup_request`：`4/4` 通过，覆盖默认 250、501 被接受、5000 被接受、5001 被拒绝。
+- `postgres_startup_migration_expands_usage_cleanup_batch_size_constraint`：`1/1` 通过，旧 `<=500` 约束会被 schema compatibility 拦截，迁移后接受 `5000`。
+- `required_postgres_schema_columns_cover_known_upgrade_breakers`：`1/1` 通过，`usage_cleanup_jobs.batch_size` 纳入升级必需 schema guard。
+- `cargo test cleanup -- --nocapture --test-threads=1`：`42/42` 通过。
+- `pnpm --dir ui check/build`、`pnpm --dir admin-ui build`、`cargo fmt --all -- --check`、`cargo check --all-targets --locked` 和 Clippy baseline 均通过。
+
+仍未关闭：生产规模清理吞吐、多实例 Admin cache/cleanup 竞态、Redis 慢断混沌和最终 release gate。
+
+## 2026-08-02 浏览器交互补充
+
+两套 UI 已在隔离浏览器上下文中真实打开并登录本地 API，未接受任何清理确认、未提交 `/cleanup/start`、未修改本地 usage 数据：
+
+- 新 UI `127.0.0.1:9023/ui/runtime`：默认保留 7 天、每批 250、批次间隔 100ms；预览可选；预览后修改保留天数会清除预计命中；切换物理删除后显示不可恢复合同；取消确认后没有发出启动请求。
+- 旧 UI `127.0.0.1:9025/admin/`：默认创建/删除时间 7 天、每批 250、批次间隔 100ms；预估可选；参数修改清除旧预估；硬删除合同可见；不预估也允许开始。
+- 对两套 UI 注入 `queued` 状态后，页面都显示“排队中”，不再把排队任务显示为“空闲”。
+
+详细输出和运行边界见 [Language And Usage Focused Validation](../evidence/language-and-usage-cleanup-focused-validation-20260802.md)。
+
+这只关闭浏览器交互缺口，不关闭真实多实例缓存写入/清理竞态、生产规模批量性能或 Redis 慢断混沌门禁。
 
 ## 结论
+
+### 2026-08-02 用户体验复核与最小修复
+
+本轮确认“新旧 UI 表现不一致”不是单一视觉问题，而是实际请求语义和状态文案漂移：
+
+- 新 UI 默认“保留天数”为 30，旧 UI 和后端安全默认值为 7；已统一新 UI 为 7。
+- 旧 UI 将 `queued`（排队中）显示成“空闲”；已补为“排队中”。
+- 新 UI 强制先完成“预览”才允许执行，旧 UI 和后端 `/cleanup/start` 都允许直接提交；已统一为预览可选，确认框在有预览时显示预计命中条数，没有预览时仍显示真实清理范围和安全合同。
+- 两套 UI 在修改删除模式、保留天数、每批数量或批次间隔后，都会清除旧预览结果，避免用旧匹配数确认新参数。
+- “5,000 条”是**每个 PostgreSQL 短事务批次的硬上限**，不是整次清理最多 5,000 条；默认每批 250 条，单次 worker 默认最多 10,000 批，达到预算后进入“已暂停”并可恢复。默认批次间隔为 100ms；提高每批数量只能减少批次数，不能绕过单批锁/语句超时保护。
+
+另确认一条会导致“汇总先消失、随后又回来”的代码级竞态：`get_usage_summary` / `get_usage_dashboard` 原先把旧或新聚合通过 `tokio::spawn` 异步写入 Admin Redis；清理 worker 随后删除 `admin_cache:usage:*` 时，先前排队的旧写入可能在删除之后完成，把清理前的汇总重新写回。当前已将 usage summary/dashboard 的 Admin 缓存写入改为在调用返回前完成；清理删除因此不会被同一实例的过期异步写入反向复活。外部池 Admin 缓存仍保持异步写入，因为它不属于 usage cleanup 数据面。
+
+本轮验证：
+
+- `pnpm --dir ui check` 通过。
+- `pnpm --dir admin-ui build` 通过。
+- `cargo fmt --check` 通过（通过 `feature/tests/run-cargo-scoped.sh`）。
+- `admin::service::tests::usage_cleanup*`：7/7 通过；无隔离数据库时仅跳过存储集成正文，不计为通过。
+- 在一次性隔离 PostgreSQL `127.0.0.1:47432`、Redis `127.0.0.1:47379` 上，`cargo test cleanup -- --nocapture --test-threads=1` 连续 3 次外层执行，每次 41/41，合计 123/123、0 failed、0 ignored；三轮均覆盖 soft/hard rollup、watermark、in-flight writer、Redis guarded summary、取消/恢复和高基数零计数清理。测试后已删除隔离容器。
+
+浏览器交互、真实多实例 Admin cache 写入竞态和生产规模批量性能仍未关闭，不能把本轮 focused 结果描述成完整 F03 发布门禁通过。
 
 ### 2026-08-02 新增用户问题登记
 
 用户补充了与现有后端安全合同不同的一组体验问题，暂不视为已复现：
 
 - 新旧 UI 的清理入口、限制提示和结果展示不一致；
-- 单次最多 500 条导致大数据量清理过慢；
+- 单批最多 500 条导致大数据量清理过慢；当前后端和 UI 上限已提高到 5,000，但生产规模吞吐仍待验证；
 - 页面提示的清理限制与实际执行语义不一致；
 - 清理后汇总数据有时消失、有时保留、过一段时间又回来。
 
@@ -101,8 +157,8 @@ POST /api/admin/usage-records/cleanup/start
 - partial unique index 保证全局只有一个 queued/running job。
 - worker 原子 claim；30 秒 lease，每 10 秒 heartbeat。续租失败或 lease 丢失后当前 worker停止，不再写 final。
 - cancel 写 PostgreSQL 权威字段；heartbeat 和每批 progress 都读取该字段，同实例 AtomicBool 只用于更快停止。
-- 默认 batch 250，硬上限 500。
-- 每批独立事务，`lock_timeout=250ms`、`statement_timeout=2s`、`FOR UPDATE SKIP LOCKED`。
+- 默认 batch 250，硬上限 5,000；旧 PostgreSQL CHECK 约束通过启动迁移 `usage-cleanup-batch-size-limit-v1` 同步升级。
+- 每批独立事务，`lock_timeout=250ms`、`statement_timeout=10s`、`FOR UPDATE SKIP LOCKED`。
 - `usage_cleanup_watermarks` 保存单调 soft cutoff；`created_at < watermark` 的晚到记录和 replay 被拒绝，避免清理后旧数据重新进入 rollup。
 - usage writer transaction 在读 watermark、写 detail/rollup 到 commit 期间持有 `pg_advisory_xact_lock_shared`；cleanup 推进 watermark 前取得同一 key 的 exclusive transaction advisory lock。这样 cleanup 会等待所有已开始的 writer commit，再推进 cutoff 并处理其旧记录；推进后的 writer 则读取新 watermark。
 - 明细 soft-delete、`rollup_active=false` 和 rollup 负增量位于同一事务。负增量后只按本批受影响的维度键删除 `requests <= 0` 行，不做全表修复扫描。
@@ -191,12 +247,14 @@ KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:<isolated-port>/' \
 | 验证 | 结果 | 说明 |
 | --- | --- | --- |
 | `cargo check --tests` | PASS | 2026-07-16；仅有并行 attempt-budget provider 旧 wrapper dead-code warning |
-| cleanup 请求默认/边界 | PASS | 4 tests；默认 250、最大 500、cutoff/0-day/非法上限 |
+| cleanup 请求默认/边界 | PASS | 4 tests；默认 250、501 合法、最大 5,000、5,001 非法、cutoff/0-day/非法上限 |
+| cleanup batch-size CHECK 迁移 | PASS | `postgres_startup_migration_expands_usage_cleanup_batch_size_constraint` 1/1；旧 `<=500` 约束会被 compatibility guard 拦截，迁移后接受 5,000 |
+| schema compatibility guard | PASS | `required_postgres_schema_columns_cover_known_upgrade_breakers` 1/1；`usage_cleanup_jobs.batch_size` 被记录为升级必需字段 |
 | resume 单次 batch budget | PASS | 1 test；累计 batches 不令 resumed worker 立即再次 paused |
 | UNLINK fallback classifier | PASS | 1 test；只接受明确 unknown UNLINK command |
 | PostgreSQL persistent/lease/cancel/requeue | PASS after fix | 隔离 PostgreSQL 外层 3 轮；首次运行发现 `INT4` 按 `i64/INT8` 解码失败，修正 job row 类型映射后 3/3 通过 |
 | PostgreSQL batch/idempotent/SKIP LOCKED | PASS | 与上项同一外层命令，修复后 3/3 通过；每轮 soft/hard 最终为 0，锁行被跳过 |
-| cleanup 一致性总组 | PASS (3 outer runs) | 隔离 PostgreSQL/Redis，`cargo test cleanup -- --nocapture --test-threads=1` 每次 36/36，三次合计 108/108、0 ignored；覆盖 watermark、in-flight commit、并发旧写、soft/hard rollup、duration max、legacy cost、零计数定点删除、lease/cancel/recovery 和 Redis guarded commit |
+| cleanup 一致性总组 | PASS (latest focused run) | 2026-08-03 使用本地配置 PostgreSQL/Redis 测试 schema：`cargo test cleanup -- --nocapture --test-threads=1` 为 42/42、0 failed、0 ignored；历史隔离外层三轮为 36/36 x3 与 41/41 x3 |
 | historical cost + same-ID update | PASS | 本地 estimated fallback 与 external raw-cost fallback 各内部 3 轮；同 ID 降费用/降 duration 后只保留新值 |
 | 高基数 rollup pruning | PASS | 每轮 48 个唯一 conversation/credential/cache/duration，以 batch 7 多批清理，内部 3 轮；六类表无零计数残留，新记录恰好一次 |
 | PostgreSQL fallback 性能 | PASS (isolated cleanup runs) | 三次外层 cleanup 运行中的 summary p95 `4.952-9.945 ms`，dashboard p95 `16.645-49.070 ms`；只证明隔离 fixture，不代表 writer advisory-lock 或生产规模 |

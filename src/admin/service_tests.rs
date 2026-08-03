@@ -540,6 +540,12 @@ fn usage_cleanup_request_cutoff_before_overrides_days() {
     assert_eq!(plan.batch_size, USAGE_CLEANUP_MAX_BATCH_SIZE);
     assert_eq!(plan.max_batches, 10_000);
     assert_eq!(plan.pause_ms_between_batches, 0);
+
+    let mut above_legacy_limit = cleanup_request();
+    above_legacy_limit.batch_size = Some(501);
+    let plan =
+        normalize_usage_cleanup_request(above_legacy_limit).expect("501 is within current limit");
+    assert_eq!(plan.batch_size, 501);
 }
 
 #[test]

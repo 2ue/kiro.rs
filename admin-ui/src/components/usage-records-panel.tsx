@@ -1577,11 +1577,13 @@ export function UsageRecordsPanel() {
 }
 
 function cleanupModeLabel(mode?: UsageCleanupMode): string {
-  return mode === 'hard_delete' ? '硬删除已软删记录' : '软删除可见明细'
+  return mode === 'hard_delete' ? '物理删除已软删除记录' : '软删除可见明细'
 }
 
 function cleanupStatusLabel(status?: string): string {
   switch (status) {
+    case 'queued':
+      return '排队中'
     case 'running':
       return '运行中'
     case 'paused':
@@ -1600,7 +1602,7 @@ function cleanupStatusLabel(status?: string): string {
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES = 10000
 const USAGE_CLEANUP_MAX_OLDER_THAN_DAYS = 3650
 const USAGE_CLEANUP_DEFAULT_BATCH_SIZE = 250
-const USAGE_CLEANUP_MAX_BATCH_SIZE = 500
+const USAGE_CLEANUP_MAX_BATCH_SIZE = 5000
 const USAGE_CLEANUP_MAX_PAUSE_MS = 10000
 
 function parseCleanupInteger(value: string, fallback: number, min: number, max: number): number {
@@ -1643,6 +1645,10 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
     ? Math.ceil(preview.matchedRows / Math.max(parsedBatchSize, 1))
     : null
 
+  useEffect(() => {
+    previewCleanup.reset()
+  }, [mode, parsedOlderThanDays, parsedBatchSize, parsedPauseMs])
+
   const previewRows = () => {
     previewCleanup.mutate(payload(), {
       onError: (error) => toast.error(`预估失败: ${extractErrorMessage(error)}`),
@@ -1651,8 +1657,11 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
 
   const start = () => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
+    const previewText = preview
+      ? `预计命中 ${formatNumber(preview.matchedRows)} 条，`
+      : ''
     const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或本次执行达到安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批；达到上限后可显式恢复下一轮。\n\n软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删的记录。`
+      `确定开始${cleanupModeLabel(mode)}？\n\n${previewText}范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或本次执行达到安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批；达到上限后可显式恢复下一轮。\n\n软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删除的记录。`
     )
     if (!confirmed) return
 
@@ -1737,7 +1746,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">每批数量</span>
               <Input value={batchSize} onChange={(event) => setBatchSize(event.target.value)} inputMode="numeric" min={1} max={USAGE_CLEANUP_MAX_BATCH_SIZE} type="number" />
-              <span className="block text-[0.68rem] text-muted-foreground">后端安全上限 {formatNumber(USAGE_CLEANUP_MAX_BATCH_SIZE)}。</span>
+              <span className="block text-[0.68rem] text-muted-foreground">默认 {formatNumber(USAGE_CLEANUP_DEFAULT_BATCH_SIZE)}；后端安全上限 {formatNumber(USAGE_CLEANUP_MAX_BATCH_SIZE)}。单批过大时任务可能因锁争用暂停，可降低后恢复。</span>
             </label>
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">批次间隔毫秒</span>

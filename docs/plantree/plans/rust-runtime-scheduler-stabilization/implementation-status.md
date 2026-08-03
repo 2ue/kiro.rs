@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last reviewed: 2026-08-02 Asia/Shanghai
+Last reviewed: 2026-08-03 Asia/Shanghai
 
 Current phase:
 
@@ -12,8 +12,12 @@ Current phase:
 - Downstream usage standard-field guard residual code fixes are implemented and focused-tested; final candidate, isolated usage-shape smoke, UI/API rollup distinction, and production recurrence remain pending.
 - Account-card subscription classification now distinguishes `Pro Max` from generic `Pro`; focused Rust/UI/admin-ui validation passed, while final candidate/browser validation remains open.
 - Current scoped patch release gate passed on 2026-08-01 and was published as `v0.0.130`. Broader production recurrence, image-source matrix, browser, load/chaos, and architecture gates remain post-release work rather than closed issues.
-- 2026-08-02 route-policy config-authority focused pass is implemented and released as `v0.0.131`: built-in routes remain fixed entrypoints, but cache, usage, prompt-steering, external-pool route rules, and cache namespace are selected by configuration, not by hardcoded `/cc`/`/v1`/`/ha`/`/na` path checks. The handler configuration matrix and frozen-candidate Claude Code CLI fake-upstream suite passed; live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open as post-release observation.
-- 2026-08-02 user reprioritization recorded: after the route-policy release, process the new read-only production usage-error audit for `152.53.243.159` and `152.53.194.170`, then the language-constraint first-language-lock issue, then the usage-cleanup UI/semantics consistency issue. These are registered as analysis-planned and are not treated as fixed.
+- 2026-08-02 route-policy config-authority focused pass is implemented and tagged as `v0.0.131`: built-in routes remain fixed entrypoints, but cache, usage, prompt-steering, external-pool route rules, and cache namespace are selected by configuration, not by hardcoded `/cc`/`/v1`/`/ha`/`/na` path checks. The handler configuration matrix and frozen-candidate Claude Code CLI fake-upstream suite passed. Remote Docker publish run `30757990049` failed in Clippy baseline before image build; current tree fixes that bucket regression, but `v0.0.131` must not be treated as a completed image release. Live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open as post-release observation.
+- 2026-08-02 user ordering clarification recorded: the language-constraint first-language-lock issue and the usage-cleanup UI/semantics consistency issue were raised before the later `152.53.243.159` / `152.53.194.170` production audit, so they must be completed first. The production audit remains registered as the third task. All three remain open and are not treated as fixed by `v0.0.131`.
+- 2026-08-02 language-constraint validation expanded: source inspection found no server-side first-language state; direct HTTP, real Claude Code CLI short/reverse/long-history sessions, simulated compacted-summary switches and opposite-language concurrent sessions followed the latest user language. Actual Claude Code automatic compact threshold and user-failure-transcript evidence remain open; no forced language override was implemented.
+- 2026-08-02 usage cleanup UX/cache validation expanded: both UIs now share the 7-day default, queued status label, optional preview semantics and stale-preview invalidation; usage summary/dashboard Admin cache writes are synchronous to prevent cleanup-time stale-cache resurrection. UI checks/builds, focused cleanup tests, isolated PostgreSQL/Redis cleanup `41/41 x 3`, and real browser interaction passed; dynamic multi-instance cache race and production-scale performance remain open.
+- 2026-08-03 usage cleanup batch limit follow-up implemented and focused-verified: `每批数量` default remains 250, backend/UI max is now 5,000, old PostgreSQL CHECK constraints migrate via `usage-cleanup-batch-size-limit-v1`, migration-disabled old schemas fail compatibility early, and both UIs disclose the same bound. Validation passed: `usage_cleanup_request 4/4`, migration test `1/1`, schema guard test `1/1`, cleanup group `42/42`, UI check/build, admin-ui build, cargo fmt/check, and Clippy baseline. Production-scale throughput and dynamic multi-instance/Redis chaos remain open.
+- 2026-08-03 `159/170` usage-error audit completed as read-only evidence pass: both hosts run `v0.0.123`; P001 external prompt-too-long preflight and P002 usage-standard large fields map to known later fixes, P003 external retryable 5xx already exhausts both enabled pools before client 502, and P004 external 400 is a diagnostic gap rather than a retry candidate. Evidence is under `tmp/prod-evidence/20260803-025431-usage-audit-159-170/`; production recurrence after upgrade and Admin-only upstream diagnostic enhancement remain open.
 
 Last landed evidence:
 
@@ -77,7 +81,11 @@ Last landed evidence:
   - `builtin_routes_follow_runtime_cache_and_prompt_config_matrix` passed through the scoped Cargo wrapper; it verifies `/cc -> no_cache`, `/na -> current_high_cache` shared namespace, `/ha -> current_high_cache` independent namespace, prompt steering only on `/ha`, and local `count_tokens` behavior across all built-ins.
   - Validation passed: full Rust all-targets `1864 passed / 0 failed / 6 ignored`, `kiro_loadtest 31/31`, `cargo fmt --check`, `cargo check --all-targets --locked`, `pnpm --dir ui check/build`, `pnpm --dir admin-ui build`, docs contract, prompt independence/default parity, and `git diff --check`.
   - Frozen candidate SHA-256 `fba89eb1e57947b481f38051341481662ca1c7f927a25c4ec167351cef0fcf77` passed Claude Code CLI `2.1.220` fake-upstream `bare-invoke`, `long-session` (`5 sessions / 110 turns / 100 tool pairs / leakMatches=[]`), and `thinking-wire` (`60/60`) using the real package binary rather than the Volta shim.
-  - Released as `v0.0.131`: work commit `4981285`, follow-up task registration commit `89cb4fc`, release commit `59b4c26`, tag `v0.0.131`.
+  - Tagged as `v0.0.131`: work commit `4981285`, follow-up task registration commit `89cb4fc`, release commit `59b4c26`, tag `v0.0.131`; remote Docker publish failed before image build because Clippy baseline detected one new `src/model/config.rs` bucket warning.
+- 2026-08-03 usage cleanup batch-limit and `v0.0.131` failure evidence:
+  - Evidence: [Usage cleanup batch limit and v0.0.131 publish failure](../../../../feature/evidence/usage-cleanup-batch-limit-and-release-131-20260803.md).
+  - `每批数量` default 250 / max 5,000 implemented across backend, PostgreSQL constraint migration, migration-disabled compatibility guard, `ui`, and `admin-ui`.
+  - Validation passed: `cargo fmt --all -- --check`, `cargo check --locked --all-targets`, Clippy baseline `811 <= 849`, `usage_cleanup_request 4/4`, migration test `1/1`, schema guard test `1/1`, cleanup group `42/42`, `pnpm --dir ui check/build`, and `pnpm --dir admin-ui build`.
 
 Active TODO:
 
@@ -97,4 +105,4 @@ Blocked by:
 
 Next target:
 
-- Continue Wave 1 after the WebSearch/tool parsing focused fixes: image-source matrix first, then model-reporting clarity and broader multi-tool/history regressions.
+- Continue from the clarified order with the remaining open gates: real automatic Claude Code compact/user-failure evidence for language only if a sample appears; dynamic multi-instance/production-scale usage cleanup validation; production recurrence checks after upgrading `159/170` beyond `v0.0.123`; and, if still missing in the current candidate, an Admin-only external 400 upstream diagnostic enhancement.

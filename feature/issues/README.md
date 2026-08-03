@@ -28,7 +28,7 @@ Status: `execute-ready / issue-by-issue implementation and verification in progr
 
 以下范围均已有独立专题入口，但 `partial`/`pending` 项仍需在统一候选上完成动态证据，不因文档存在而视为关闭：Claude Code transcript/tool history；thinking 与 signed/redacted 内容；external raw/normalized/SSE/strict；payload/body/image/document/web fetch；prompt/tool_choice/thinking/chunk/count_tokens；stream/HTTP 200 exception；重试预算/API-key admission/RPM；Redis degraded/external fallback/local-first/多实例；usage cleanup；两 UI；旧版本升级；AWS API key/region；生产证据脱敏。
 
-Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细及其累计统计、费用、credential summary、Dashboard、cache-read 和 duration rollup 贡献，hard cleanup 只物理删除 tombstone、不重复扣减；soft tombstone 存在期间同 ID 不复活，cutoff 后的新 ID 可写。hard cleanup 后不承诺永久 ID 防重。当前源码测试与两 UI 文案已按该合同更新，并增加 in-flight writer/watermark transaction guard；cleanup 过滤组 36/36 x3 外层通过，但完整套件、writer 性能、Redis chaos 和 UI browser 未关闭。
+Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细及其累计统计、费用、credential summary、Dashboard、cache-read 和 duration rollup 贡献，hard cleanup 只物理删除 tombstone、不重复扣减；soft tombstone 存在期间同 ID 不复活，cutoff 后的新 ID 可写。hard cleanup 后不承诺永久 ID 防重。当前源码测试、两 UI 文案和真实浏览器交互已按该合同更新，并增加 in-flight writer/watermark transaction guard；`每批数量` 默认 250、后端/UI 上限已从 500 提高到 5,000，并补充旧 PostgreSQL CHECK 约束迁移和迁移关闭时的 schema compatibility guard；cleanup 过滤组最新 42/42 通过，但完整套件、writer 性能、Redis chaos、生产规模吞吐和动态多实例门禁未关闭。
 
 ## 当前权威专题
 
@@ -39,8 +39,9 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [Pro Max 账号卡片套餐显示](subscription-pro-max-card-label-20260801.md) - 根因确认不是截图：UI 套餐 helper 与后端 `subscription_key`/`subscription_rank` 缺少 `Pro Max` 分支，已补齐 `Pro Max` 标签、`pro_max` 筛选键和等级排序，并补充 Power/Pro Max 筛选项；focused Rust/UI/admin-ui 验证通过，最终候选浏览器门禁仍随 release gate 进行。
 - [2026-08-01 生产外部池两类错误根因补充](20260801-production-external-errors-root-cause.md) - 外部池“输入上限预检”发送前硬拒绝绕过“请求大小保护”，以及外部池 route 缺少本地 Kiro 发送链路的兼容模型处理导致部分“模型处理”模式无法按配置生效；当前修复是取消内容长度发送前拒绝、保留调度/安全预检，并让直接外部池和本地失败 fallback 路径携带“模型（本地解析）”。
 - [内置路由策略必须完全由配置决定](route-policy-config-authority-20260802.md) - 2026-08-02 P0 配置权威问题已完成后端与两套 UI focused 修复：`/cc`、`/v1`、`/ha`、`/na` 仍是内置入口，但缓存、usage、提示词、外部池等运行策略均由运行配置解析；`/cc` 可配置成无缓存，`/na` 可配置成高缓存，提示词引导按路径规则命中任意内置或自定义入口；全量 Rust、UI/admin-ui build、文档合同和提示词配置独立性测试通过，真实服务热加载/浏览器交互/生产复发观察仍作为后续门禁。
-- [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md) - 2026-08-02 新登记；先只读收集两台机器的 usage 错误、代码版本和脱敏证据，再逐类判断有限重试、请求处理、fallback 或不改，禁止为了降低错误率吞掉确定性请求错误。
-- [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) - 2026-08-02 新登记；现象尚未确认是用户首语言、会话状态、全局缓存还是提示词合并顺序，先做多语言、压缩和并发会话矩阵。
+- [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) - 2026-08-02 新登记；短/长历史、真实 Claude Code CLI 基础会话、模拟压缩摘要和相反首语言并发矩阵均未复现首语言锁定，真实自动 compact 阈值和异常样本仍待证据。
+- [usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md) - 2026-08-02/03 用户体验问题；后端安全合同、新旧 UI 语义、真实浏览器交互、Admin cache 写入竞态修复、`每批数量` 上限 5,000、PostgreSQL 约束迁移和迁移关闭时 schema compatibility guard 已有 focused pass，但动态多实例一致性、生产规模性能和 Redis chaos 仍未关闭，不能把已有 focused 证据当成完整修复。
+- [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md) - 2026-08-02 新登记；按用户澄清排在语言约束和 usage 清理之后。2026-08-03 已完成只读 evidence pass，两台均为 `v0.0.123`，形成 P001-P004 问题簇；超长预检和 usage 标准字段属于旧版本已记录类，外部 5xx 已跨池重试，外部 400 不自动重试而保留为 Admin 诊断增强候选。
 - [HTML `<br>` 输出标签污染](html-br-output-tag-contamination-20260731.md) - 2026-07-31 记录 assistant 在正常 prose 中疑似输出 raw `<br>` / HTML-like tag 的复现边界；direct/stream/tool-result/history/CLI 正常场景未复现，web-display 与显式 standalone `<br>` 仅作为合法透传对照；过滤策略仍需真实异常样本或产品规则。
 - [协议 transcript 与工具历史泄漏](protocol-transcript-and-tool-history-leak.md)
 - [thinking 与签名内容安全](thinking-and-signed-content-safety.md)

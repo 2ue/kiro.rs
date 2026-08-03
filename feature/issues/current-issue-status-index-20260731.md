@@ -4,7 +4,7 @@ Status: `active-index / derived-from-feature-issues / update-required-with-issue
 
 Severity: P0/P1 documentation control. This file prevents open blockers, partially fixed issues, and final validation gaps from being lost across sessions.
 
-Last reviewed: 2026-08-02 Asia/Shanghai
+Last reviewed: 2026-08-03 Asia/Shanghai
 
 ## 范围与结论
 
@@ -19,6 +19,13 @@ the final release gates and was published as `v0.0.130` from commits
 are broader production,
 load/chaos, browser, image-source, and architecture gates that remain open as
 post-release work; they are not reclassified as closed by this scoped release.
+
+Current release note for `v0.0.131`: the tag and release commit exist, but the
+remote Docker publish did not complete. GitHub Actions run `30757990049`
+failed in “Check Clippy warning baseline” before Docker build/manifest. The
+current working tree fixes that Clippy bucket regression without loosening the
+baseline; a future publish should use the next version rather than treating
+failed `v0.0.131` as a completed image release.
 
 Current inventory from the 2026-08-02 route-policy update:
 
@@ -54,13 +61,13 @@ Plan-tree already exists and should remain the single durable planning entrypoin
 
 These are the highest-signal files that still represent implementation or release blockers according to their own `Status` lines.
 
-### 2026-08-02 用户重新指定的逐项顺序
+### 2026-08-02 用户澄清的逐项顺序
 
-当前新增任务不代表已修复，按以下顺序登记并推进：
+以下问题都没有被 `v0.0.131` 路由策略发布标记为已修复。用户明确要求先处理此前已经提出的语言约束和 usage 清理问题，再处理后来追加的 159/170 现网审计；此前把 159/170 排在最前是顺序理解错误。
 
-1. [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md)：只读生产证据、代码版本和脱敏 JSONL 聚类；先判断是否值得修复或有限重试。
-2. [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md)：先确认语言状态作用域和复现边界。
-3. [Usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md)：补齐新旧 UI、500 条限制、汇总消失/回来的产品语义与动态一致性证据。
+1. [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md)：先确认语言状态作用域和复现边界。
+2. [Usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md)：补齐新旧 UI、`每批数量` 上限、汇总消失/回来的产品语义与动态一致性证据。
+3. [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md)：在前两项完成后只读采集两台机器的 usage 错误、代码版本和脱敏 JSONL，再逐类判断有限重试、请求处理、fallback 或不改。
 
 | Area | Issue | Current status | Remaining work recorded |
 | --- | --- | --- | --- |
@@ -77,8 +84,8 @@ These are the highest-signal files that still represent implementation or releas
 | Retry budget / admission / RPM amplification | [retry-budget-admission-and-rpm-amplification.md](retry-budget-admission-and-rpm-amplification.md) | `... gates-pending / NO-GO` | Persistent usage attribution, live Redis/PG, cross-instance aggregate admission, real handler/CLI, client retry, 429/500/partial and L3-L5 recovery |
 | Token refresh failure wave / cluster RPM | [token-refresh-failure-wave-and-cluster-rpm.md](token-refresh-failure-wave-and-cluster-rpm.md) | `... provider-and-frozen-candidate-unverified / NO-GO` | Redis 60/8 two replicas, Redis slow/error/restart, cancellation phases, provider/PG/frozen evidence |
 | Redis usage writer / scheduler isolation | [redis-usage-writer-atomicity-cardinality-and-scheduler-isolation.md](redis-usage-writer-atomicity-cardinality-and-scheduler-isolation.md) | `... multi-instance-and-production-cardinality-pending / NO-GO` | Multi-instance, production-cardinality, scheduler isolation pressure, production p95/p99 |
-| 159/170 production usage error audit | [production-usage-error-audit-159-170-20260802.md](production-usage-error-audit-159-170-20260802.md) | `analysis-planned / read-only-evidence-pending / implementation-not-authorized` | Must inspect current usage error fields, code version, redacted disk evidence, and isolated external-pool reproduction before selecting any retry or request-processing change |
-| Language constraint first-language lock | [language-constraint-first-language-lock-20260802.md](language-constraint-first-language-lock-20260802.md) | `analysis-planned / reproduction-pending / implementation-not-authorized` | Must determine whether the first language is per request, session, process, or prompt merge state before changing language steering |
+| 159/170 production usage error audit | [production-usage-error-audit-159-170-20260802.md](production-usage-error-audit-159-170-20260802.md) | `read-only-evidence-collected / problem-clusters-recorded / no-new-runtime-fix-selected-yet` | Both hosts run `v0.0.123`; P001 prompt-too-long preflight and P002 usage-standard old behavior overlap later fixes, P003 external 5xx already retries across both enabled pools before returning 502, and P004 external 400 is a diagnostic gap rather than a retry candidate. Redacted problem folders live under `tmp/prod-evidence/20260803-025431-usage-audit-159-170/problems/`; production recurrence after upgrade and Admin-only upstream diagnostic enhancement remain open |
+| Language constraint first-language lock | [language-constraint-first-language-lock-20260802.md](language-constraint-first-language-lock-20260802.md) | `analysis-confirmed / compressed-summary-and-concurrent-matrix-not-reproduced / implementation-not-authorized` | Direct HTTP, real Claude Code CLI short/reverse/long-history, simulated compacted-summary and opposite-language concurrent sessions follow the latest message; actual Claude Code automatic compact threshold and user-provided failure transcript remain open, so no forced language override is selected |
 
 ## Fixed or implemented but not finally closed
 
@@ -93,9 +100,9 @@ The documents below record substantial implementation or focused validation, but
 | Stream and terminal states | [02-stream-upstream-idle-timeout.md](02-stream-upstream-idle-timeout.md), [06-stream-upstream-status-error.md](06-stream-upstream-status-error.md), [07-stream-internal-read-error.md](07-stream-internal-read-error.md), [10-stream-end-turn-vs-silent-truncation.md](10-stream-end-turn-vs-silent-truncation.md), [stream-terminal-errors-and-precommit-retry.md](stream-terminal-errors-and-precommit-retry.md), [11-stream-observability-and-trivial-text-optimization.md](11-stream-observability-and-trivial-text-optimization.md) | Unified precommit/transport/fault gates, final CLI/HTTP/load gates |
 | Output contamination | [html-br-output-tag-contamination-20260731.md](html-br-output-tag-contamination-20260731.md) | Keep diagnostic-only unless an unsolicited normal-prose sample is captured; any future normalization must preserve explicit HTML/code/web-display answers |
 | Scheduler / external pool | [external-pool-redis-coordination-and-release.md](external-pool-redis-coordination-and-release.md), [external-pool-authoritative-selection-and-dispatch-fence.md](external-pool-authoritative-selection-and-dispatch-fence.md), [external-pool-profiles-and-sse-safety.md](external-pool-profiles-and-sse-safety.md), [external-pool-success-zero-billing.md](external-pool-success-zero-billing.md), [external-pool-scheduler-interference-and-fallback-matrix-20260727.md](external-pool-scheduler-interference-and-fallback-matrix-20260727.md), [redis-scheduler-degraded-and-fallback.md](redis-scheduler-degraded-and-fallback.md), [high-concurrency-low-rpm-runtime-quarantine.md](high-concurrency-low-rpm-runtime-quarantine.md), [dispatch-queue-lease-renewal-rpm-amplification.md](dispatch-queue-lease-renewal-rpm-amplification.md) | Frozen load, two-instance, external takeover dynamic, native/CLI/UI/upgrade follow-up, production recurrence |
-| Storage / usage / dashboard | [usage-cleanup-safety-and-redis-isolation.md](usage-cleanup-safety-and-redis-isolation.md), [usage-dashboard-p95-and-window-semantics.md](usage-dashboard-p95-and-window-semantics.md), [external-pool-success-zero-billing.md](external-pool-success-zero-billing.md), [upstream-error-diagnostic-privacy-and-bounds.md](upstream-error-diagnostic-privacy-and-bounds.md) | New UI/old UI cleanup semantics, 500-row limit, summary disappearance/reappearance, dynamic multi-instance recheck, runtime re-verification, persistent storage scans, frozen load |
+| Storage / usage / dashboard | [usage-cleanup-safety-and-redis-isolation.md](usage-cleanup-safety-and-redis-isolation.md), [usage-dashboard-p95-and-window-semantics.md](usage-dashboard-p95-and-window-semantics.md), [external-pool-success-zero-billing.md](external-pool-success-zero-billing.md), [upstream-error-diagnostic-privacy-and-bounds.md](upstream-error-diagnostic-privacy-and-bounds.md) | New/old UI cleanup semantics, stale preview drift, queued label and browser interaction are verified; `每批数量` default remains 250 and backend/UI max is now 5,000 with PostgreSQL CHECK migration plus migration-disabled compatibility guard; usage Admin summary/dashboard cache-write race fixed and focused-tested. Dynamic multi-instance recheck and production-scale batch performance remain open |
 | Usage projection sanity | [downstream-usage-standard-field-over-1m-20260731.md](downstream-usage-standard-field-over-1m-20260731.md) | Production evidence shows final standard usage fields can exceed 1m; reported-usage cache creation, unreported local prompt-cache cache read/write, and failure diagnostic input separation are now implemented and focused-tested. 2026-08-01 scoped release gate passed; dashboard/API rollup distinction, production recurrence, and broader load validation remain open |
-| Route policy config authority | [route-policy-config-authority-20260802.md](route-policy-config-authority-20260802.md) | Backend and both UI surfaces are implemented, focused-verified, and released as `v0.0.131`; the handler matrix and frozen-candidate Claude Code CLI fake-upstream suite also passed. Built-in routes remain fixed entrypoints, while cache, usage, prompt steering, external pool route rules, and cache namespace resolve from runtime configuration. Live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open |
+| Route policy config authority | [route-policy-config-authority-20260802.md](route-policy-config-authority-20260802.md) | Backend and both UI surfaces are implemented and focused-verified; the handler matrix and frozen-candidate Claude Code CLI fake-upstream suite also passed. `v0.0.131` tag was pushed, but remote Docker publish failed in Clippy baseline before image build. Built-in routes remain fixed entrypoints, while cache, usage, prompt steering, external pool route rules, and cache namespace resolve from runtime configuration. Live service reload, browser interaction, real CLI dynamic configuration, and production recurrence remain open |
 | UI / admin / operations | [two-ui-cost-precision-and-config-authority.md](two-ui-cost-precision-and-config-authority.md), [aws-kiro-api-key-region-lifecycle.md](aws-kiro-api-key-region-lifecycle.md), [business-observability-redis-fault-domain.md](business-observability-redis-fault-domain.md), [mcp-completion-runtime-card-error-source.md](mcp-completion-runtime-card-error-source.md), [local-credential-exhausted-overage-disabled-400-20260731.md](local-credential-exhausted-overage-disabled-400-20260731.md) | Usage detail modal now foregrounds upstream/processing diagnostics in both UIs; local API-key quota guard has focused Rust/provider/storage passes; browser gate, frozen runtime gate, and production recurrence remain pending |
 | Release / upgrade / artifacts | [upgrade-v101-v102-v103-smoke.md](upgrade-v101-v102-v103-smoke.md), [postgres-startup-migration-atomicity.md](postgres-startup-migration-atomicity.md), [validation-build-artifact-lifecycle-and-disk-safety.md](validation-build-artifact-lifecycle-and-disk-safety.md), [runtime-stack-overflow-and-handler-future-size.md](runtime-stack-overflow-and-handler-future-size.md) | Final release binary rebind, final inventory, frozen release HTTP/load |
 

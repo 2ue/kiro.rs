@@ -51,15 +51,15 @@ Then check whether any item below has moved category. If yes, update this queue,
 
 ## Priority queue
 
-### 2026-08-02 用户重新指定的当前顺序
+### 2026-08-02 用户澄清的当前顺序
 
-在已有 Wave 1/2/3 门禁继续保留的前提下，当前用户要求优先登记并逐项处理：
+在已有 Wave 1/2/3 门禁继续保留的前提下，用户明确要求先完成此前已经提出但尚未关闭的语言约束和 usage 清理问题，再处理后来追加的 159/170 现网审计。此前把 159/170 排在最前是顺序理解错误，已在本次状态更新中纠正：
 
 | Order | Issue | First action | Do not do |
 | ---: | --- | --- | --- |
-| U1 | [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md) | 只读采集 usage 错误、代码版本、脱敏磁盘证据，并在隔离服务复现 | 不直接改生产配置、不为降低错误率盲目重试 |
-| U2 | [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) | 做首语言、切换语言、压缩、并发会话矩阵 | 不先假设是“第一次用户语言”或全局缓存 |
-| U3 | [Usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md) | 对齐新旧 UI、后端清理合同、汇总读写和批量预算 | 不先把 500 提高或强制删除汇总 |
+| U1 | [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) | 已完成源码、直接 HTTP、反向切换、长历史、真实 Claude Code CLI 基础会话、模拟压缩摘要和相反首语言并发矩阵；继续等待真实自动 compact 边界或异常样本 | 不先假设是“第一次用户语言”或全局缓存，也不在未复现时强制每轮覆盖语言 |
+| U2 | [Usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md) | 已完成新旧 UI 参数/状态/预览语义对齐、usage Admin 汇总竞态修复、真实浏览器交互验证、`每批数量` 后端/UI 上限 5,000、PostgreSQL 约束迁移和迁移关闭时 compatibility guard；继续做动态多实例和生产规模批量验证 | 不把 5,000 继续无证据提高成无界清理，不强制删除汇总，不把 focused 存储测试或浏览器通过当成完整发布门禁 |
+| U3 | [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md) | 已完成只读采集并形成 P001-P004 问题簇：两台均为 `v0.0.123`；超长预检和 usage 标准字段是旧版本已记录类；外部 5xx 已跨池重试；外部 400 不自动重试，保留为诊断增强候选 | 不直接改生产配置、不为降低错误率盲目重试；不把 focused 证据当作生产升级后 recurrence 已关闭 |
 
 ### Wave 1: urgent and comparatively small
 
@@ -74,7 +74,8 @@ Then check whether any item below has moved category. If yes, update this queue,
 
 Wave 1 progress on 2026-07-31:
 
-- Order 0 route-policy config authority focused fix landed on 2026-08-02 and was released as `v0.0.131`: `/cc`、`/v1`、`/ha`、`/na` 保持内置入口，但缓存、usage、提示词、外部池路径规则和缓存命名空间均按运行配置解析；后端、`ui`、`admin-ui` 已同步。Validation passed: route handler matrix `1/1`, full Rust all-targets `1864/0/6` plus `kiro_loadtest 31/31`, `cargo fmt --check`, `cargo check --all-targets --locked`, `pnpm --dir ui check/build`, `pnpm --dir admin-ui build`, docs contract, prompt independence/default parity, `git diff --check`, and frozen-candidate Claude Code CLI `2.1.220` fake-upstream `bare-invoke`, `long-session`, and `thinking-wire 60/60`. Live reload, browser, and production observation remain open.
+- Order 0 route-policy config authority focused fix landed on 2026-08-02 and was tagged as `v0.0.131`: `/cc`、`/v1`、`/ha`、`/na` 保持内置入口，但缓存、usage、提示词、外部池路径规则和缓存命名空间均按运行配置解析；后端、`ui`、`admin-ui` 已同步。Validation passed: route handler matrix `1/1`, full Rust all-targets `1864/0/6` plus `kiro_loadtest 31/31`, `cargo fmt --check`, `cargo check --all-targets --locked`, `pnpm --dir ui check/build`, `pnpm --dir admin-ui build`, docs contract, prompt independence/default parity, `git diff --check`, and frozen-candidate Claude Code CLI `2.1.220` fake-upstream `bare-invoke`, `long-session`, and `thinking-wire 60/60`. Remote Docker publish for `v0.0.131` failed in Clippy baseline before image build; current tree fixes that bucket regression, but 131 must not be treated as a completed image release. Live reload, browser, and production observation remain open.
+- Usage cleanup U2 batch-limit follow-up landed on 2026-08-03 source tree: `每批数量` default remains 250, max is 5,000, old PostgreSQL CHECK constraints migrate via `usage-cleanup-batch-size-limit-v1`, migration-disabled old schemas fail compatibility early, and both UIs display the same bound. Focused validation passed: `usage_cleanup_request 4/4`, migration test `1/1`, schema guard test `1/1`, cleanup group `42/42`, UI check/build, admin-ui build, cargo fmt/check, and Clippy baseline.
 - Order 1 WebSearch focused capability fix landed and was live-verified through local accounts: direct native `web_search_YYYYMMDD` accepts official `20250305` / `20260318`, accepts future-looking `20270101`, and mixed native + ordinary tool returns server-side `web_search_tool_result`; real Claude Code CLI `2.1.220` with `--tools=WebSearch --allowedTools=WebSearch` produced `toolUseNames=["WebSearch"]` and one `tool_result`.
 - Order 2 focused fix landed: tool-name mapping logs now report total mapped, sanitized, and overlong counts instead of implying every mapping is an overlong shortening. Focused regression: `test_tool_name_mapping_summary_distinguishes_sanitized_and_overlong_names`.
 - Order 2/1 tool parsing focused fix landed: direct live matrix now covers `Bash`, hyphenated names, names with spaces, overlong names, invalid schema property keys, ambiguous normalized `tool_choice`, and raw-vs-mapped collisions. A real bug was found and fixed where current tool-result-only turns used `"."` as Kiro content and could make CLI follow-up ignore valid `tool_result`; new marker is `Tool result received.`, with post-fix direct `direct-fixed-ok` and real CLI `cli-fixed-ok`.

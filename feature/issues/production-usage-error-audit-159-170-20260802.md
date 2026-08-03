@@ -1,10 +1,10 @@
 # 159/170 现网 usage 错误审计与体验改进
 
-Status: `analysis-planned / read-only-evidence-pending / implementation-not-authorized`
+Status: `read-only-evidence-collected / problem-clusters-recorded / no-new-runtime-fix-selected-yet`
 
 Severity: `P1 pending evidence; promote to P0 only if request interruption or retry storm is confirmed`
 
-Last reviewed: 2026-08-02 Asia/Shanghai
+Last reviewed: 2026-08-03 Asia/Shanghai
 
 ## 范围与目标
 
@@ -24,7 +24,7 @@ Last reviewed: 2026-08-02 Asia/Shanghai
 
 ## 用户可见现象与影响
 
-用户尚未给出本轮两台机器的具体错误行，因此当前不能把任何单一错误归因到代码根因。需要从 usage 的“错误类型”“错误阶段”“客户端错误类型”“客户端状态码”“内部状态码”“模型（请求）”“模型（上游）”“路由”“Fallback 原因”和真实上游诊断中建立错误聚类。
+本轮已对两台机器完成只读 evidence pass。两台机器都运行 `ghcr.io/2ue/kiro-rs:0.0.123`，主要错误来自外部池 5xx/400，另有旧版本外部池超长预检和 usage 标准字段旧行为。
 
 关注的体验指标：
 
@@ -34,6 +34,47 @@ Last reviewed: 2026-08-02 Asia/Shanghai
 - 是否把上下文超限、工具 schema、图片格式等确定性请求错误错误地重试；
 - 是否出现 usage 记录成功但客户端失败，或客户端成功但 usage 归一化成错误；
 - 错误弹层是否保留真实上游/处理诊断，而不只显示归一化文案。
+
+## 2026-08-03 只读证据结果
+
+证据根目录：
+
+- `tmp/prod-evidence/20260803-025431-usage-audit-159-170/`
+
+本轮没有重启、Compose 写操作、数据库写入、Redis 写入、配置修改或远程文件删除。
+
+部署与版本：
+
+| Host | Image | App status | Port |
+| --- | --- | --- | --- |
+| `152.53.243.159` | `ghcr.io/2ue/kiro-rs:0.0.123` | healthy | `59137 -> 8990` |
+| `152.53.194.170` | `ghcr.io/2ue/kiro-rs:0.0.123` | healthy | `59137 -> 8990` |
+
+6h usage fingerprint:
+
+| Host | Top classes |
+| --- | --- |
+| `152.53.243.159` | external `server_error` 196; external `bad_request` 82; `network_error` 11; prompt-too-long preflight classes 8 total; `security_lock` 5; `auth_error` 5 |
+| `152.53.194.170` | external `server_error` 199; external `bad_request` 121; `auth_error` 5; `client_dropped` 4; `network_error` 3; `rate_limit` 2; prompt-too-long preflight 1 |
+
+已形成四个问题簇：
+
+| Problem | Current interpretation | Treatment |
+| --- | --- | --- |
+| [P001 external prompt-too-long preflight](../../tmp/prod-evidence/20260803-025431-usage-audit-159-170/problems/P001-external-prompt-too-long-preflight/problem.md) | `v0.0.123` 在发送外部池前按估算输入硬 400；`externalAttempts=0` | 与 [20260801 外部池根因](20260801-production-external-errors-root-cause.md)一致，后续版本已取消此硬预检；等待生产升级后复查 |
+| [P002 usage standard fields on v0.0.123](../../tmp/prod-evidence/20260803-025431-usage-audit-159-170/problems/P002-usage-standard-fields-v123/problem.md) | 错误行把 request estimate 放进 downstream-standard 输入字段；成功行 cache projection 接近 1m | 与 [Downstream standard usage field over 1m](downstream-usage-standard-field-over-1m-20260731.md)一致，后续版本已有 focused fix；等待生产升级后复查 |
+| [P003 external retryable 5xx exhausted](../../tmp/prod-evidence/20260803-025431-usage-audit-159-170/problems/P003-external-retryable-5xx-exhausted/problem.md) | 已跨两个启用外部池重试，两个池均 502 后返回客户端 502；另有一个正样本证明跨池重试能成功 | 不选盲目增加重试；优先观察外部池健康/容量/cooldown |
+| [P004 external 400 diagnostic gap](../../tmp/prod-evidence/20260803-025431-usage-audit-159-170/problems/P004-external-400-bad-request-diagnostics/problem.md) | 400 被正确标为 `retryable=false`，但 usage 只保存归一化错误和低粒度 metadata，缺少 Admin 可用的脱敏上游分类 | 不自动重试；后续若当前版本仍不足，做“真实上游/处理诊断”的脱敏结构化持久化，不泄漏 raw body |
+
+关键样本：
+
+- `152.53.243.159` `req_01QiZxVrczduKL5YzCvGTE2z`：`/cc/v1/messages`，`claude-opus-5`，`错误来源=external_prompt_too_long_preflight`，`externalAttempts=0`，standard `input_tokens=2,793,383`。
+- `152.53.194.170` `req_0166sFWMjMccwFCfQza85zzV`：`/ha/v1/messages`，`claude-sonnet-5`，`错误来源=external_prompt_too_long_preflight`，`externalAttempts=0`，standard `input_tokens=1,394,935`。
+- `152.53.243.159` `req_01aqAYbzZH6a9r3Ps2Y9GDDA`：external 502，`jinnyapi` 与 `kkkkyue` 两次都 `retry_next`，最终客户端 502。
+- `152.53.194.170` `req_01rHLgUX8SLaLB8aHYq3zJN1`：external 502，`kkkkyue` 与 `jinnyapi` 两次都 `retry_next`，最终客户端 502。
+- `152.53.243.159` `req_01xHarsYWjan2BxUWPViZvKw` 与 `152.53.194.170` `req_01q8AWWQo5fD1Ja7Ak86bmAg`：external 400，单池尝试，`retryable=false`，没有 `payloadBreakdown` / `payloadGuardReport` / tool-format JSONL 样本。
+
+tool-format debug 配置在两台机器上都是启用且目录为 `logs/tool-format-debug`，但容器内未发现该目录，也没有这些 request id 的磁盘 JSONL 样本。当前源码只在更具体的 request-body/tool-use format 错误路径写该诊断；这些生产行是 generic external 400/502，因此 usage JSONB 是本轮权威证据。
 
 ## 当前已知关联材料
 
@@ -81,7 +122,13 @@ Last reviewed: 2026-08-02 Asia/Shanghai
 
 ## 方案状态
 
-当前不选定修复方案。先完成证据聚类，再对每个错误类别单独决定“修复请求处理”“有限重试”“路由/fallback”“诊断保留”或“不改”。
+当前不新增运行时代码改动：
+
+- P001/P002 与已记录并后续发布的旧版本缺陷重合，先等待生产从 `v0.0.123` 升级后复查。
+- P003 已经执行跨外部池重试；不选择盲目增加即时重试。
+- P004 不选择 400 自动重试。真正可提升体验的是 Admin/usage 诊断增强：保存脱敏、低基数、受限的上游错误分类和处理信息，同时继续禁止 raw body 进入客户端错误、普通日志和默认 usage 明细。
+
+如果当前本地/发布版本仍只给出归一化 400 而没有足够 Admin 诊断，后续可把 P004 拆成独立实现项并补 focused test。
 
 ## 验收矩阵
 
@@ -93,7 +140,13 @@ Last reviewed: 2026-08-02 Asia/Shanghai
 
 ## 修复后结果
 
-待分析和验证后填写；当前为空，不代表问题已修复。
+本轮是只读审计，不改现网、不发版。已完成问题聚类和处理选择：
+
+- 不把所有报错都强行“解决”；
+- 不对确定性 400 盲目重试；
+- 不把已跨两个外部池失败的 5xx 再做无证据多次重试；
+- 把旧版本已修复类问题留给生产升级后 recurrence check；
+- 把 usage 弹层“真实上游/处理诊断”收敛为后端脱敏诊断持久化问题，而不是前端单独展示问题。
 
 ## 残余风险与回滚
 

@@ -106,7 +106,7 @@ const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_DEFAULT_BATCH_SIZE: usize = 250;
-const USAGE_CLEANUP_MAX_BATCH_SIZE: usize = 500;
+const USAGE_CLEANUP_MAX_BATCH_SIZE: usize = 5_000;
 const USAGE_CLEANUP_LEASE_SECS: u64 = 30;
 const USAGE_CLEANUP_HEARTBEAT_ATTEMPT_TIMEOUT_MS: u64 = 2_000;
 const USAGE_CLEANUP_HEARTBEAT_MAX_ATTEMPTS: usize = 3;
@@ -740,6 +740,32 @@ impl AdminService {
                 tracing::warn!("写入 observability Redis Admin 缓存失败: {}", err);
             }
         });
+    }
+
+    /// Usage summary/dashboard cache writes must complete before the caller returns.
+    ///
+    /// Cleanup invalidates the same Redis keys in a later phase. Fire-and-forget writes can
+    /// otherwise finish after that invalidation and resurrect a pre-cleanup aggregate.
+    fn write_usage_admin_cache<T>(&self, key: String, value: T, ttl_secs: usize)
+    where
+        T: Serialize,
+    {
+        let value = match serde_json::to_value(&value) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("序列化 Usage Admin 缓存失败: {}", err);
+                return;
+            }
+        };
+        self.write_admin_cache_shadow(key.clone(), value.clone(), ttl_secs);
+        let Some(redis) = self.observability_redis_store.clone() else {
+            return;
+        };
+        if let Err(err) =
+            block_on_admin_store(async move { redis.set_json(key, &value, ttl_secs).await })
+        {
+            tracing::warn!("写入 observability Redis Usage Admin 缓存失败: {}", err);
+        }
     }
 
     fn write_admin_cache_shadow(&self, key: String, value: Value, ttl_secs: usize) {
@@ -3712,7 +3738,7 @@ impl AdminService {
         }
 
         let summary = self.usage_recorder.summary(high_cache_threshold);
-        self.write_admin_cache(cache_key, summary.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        self.write_usage_admin_cache(cache_key, summary.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
         summary
     }
 
@@ -3733,7 +3759,7 @@ impl AdminService {
             .usage_recorder
             .dashboard(timezone.as_deref(), high_cache_threshold)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-        self.write_admin_cache(cache_key, dashboard.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        self.write_usage_admin_cache(cache_key, dashboard.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
         Ok(dashboard)
     }
 
@@ -6997,7 +7023,7 @@ fn normalize_usage_cleanup_request(
         .unwrap_or(USAGE_CLEANUP_DEFAULT_BATCH_SIZE);
     if batch_size == 0 || batch_size > USAGE_CLEANUP_MAX_BATCH_SIZE {
         return Err(AdminServiceError::InvalidCredential(format!(
-            "batchSize 必须在 1..={} 之间",
+            "每批数量 batchSize 必须在 1..={} 之间",
             USAGE_CLEANUP_MAX_BATCH_SIZE
         )));
     }

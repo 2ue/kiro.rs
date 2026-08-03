@@ -6959,8 +6959,10 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_preserves_explicit_na_policy() {
-        let mut config = Config::default();
-        config.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
+        let mut config = Config {
+            runtime_config_migration_version: CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
+            ..Config::default()
+        };
         config.cache_policy.path_overrides.insert(
             "/na".to_string(),
             CacheRoutePolicyPatch {
