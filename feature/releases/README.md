@@ -2,7 +2,7 @@
 
 Role: 保存最终发布门禁、版本决策、提交、tag、推送、回滚点和发布后观察结果
 
-Status: `v0.0.114` 已发布；post-release documentation update in progress
+Status: `v0.0.131` 已发布；post-release observation remains open
 
 在所有适用门禁通过前，本目录不会记录“可发布”。发布时必须先同步远端分支与 tag，使用项目版本权威计算新版本，工作修复提交与版本提交分开，先推分支再推 tag，不修改依赖要求版本，不 force push。
 
@@ -49,3 +49,29 @@ beb9b3420b20776db489461d65392b5b1d6e5d92
 ```
 
 Post-release note: 本段是在 tag 推送成功后补写的文档记录；不会移动已发布 tag，也不会修改 `v0.0.114` 指向的 release commit。
+
+## 2026-08-03 v0.0.131 失败恢复后重新发布
+
+本次使用 `tag-only` release model。`Cargo.toml` 根 crate 版本已经是
+`0.0.131`，因此没有新增版本 bump commit；修复提交单独提交并先推送
+`main`，再重建并推送同名失败 tag。
+
+- 修复提交：`511cebb60e26d970b77b33a3638ec8d9806505de`
+  (`fix: raise usage cleanup safety limit`)。
+- 旧失败 tag：删除远端和本地 `v0.0.131`，因为用户明确要求重新发布 131。
+- 新 annotated tag：`v0.0.131`，peeled commit 为 `511cebb60e26d970b77b33a3638ec8d9806505de`。
+- 远端 Docker workflow：`Publish Docker Images #162`
+  (`30800052601`)。
+- 结果：`Success`，总时长 `25m 36s`；quality、amd64/arm64 build 和
+  multi-architecture manifest 全部成功。
+
+远端校验：
+
+```text
+git ls-remote origin 'refs/tags/v0.0.131^{}'
+511cebb60e26d970b77b33a3638ec8d9806505de refs/tags/v0.0.131^{}
+```
+
+本次发布修复了首次 `30757990049` 因 `src/model/config.rs` Clippy
+bucket 回归导致的失败。生产服务未被本地操作；部署是否已拉取新镜像仍需
+按现网发布流程单独观察。

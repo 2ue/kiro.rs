@@ -1,6 +1,6 @@
-# Usage cleanup batch limit and v0.0.131 publish failure - 2026-08-03
+# Usage cleanup batch limit and v0.0.131 release recovery - 2026-08-03
 
-Status: `focused-pass / release-131-remote-failure-root-cause-recorded / no-production-service-change`
+Status: `focused-pass / release-131-published / no-production-service-change`
 
 ## Scope
 
@@ -23,7 +23,7 @@ No production host was modified. The local `127.0.0.1:9022` service was not rest
 
 The safety contract is unchanged: cleanup still runs as short PostgreSQL batches with `FOR UPDATE SKIP LOCKED`, `lock_timeout=250ms`, `statement_timeout=10s`, persisted progress, explicit resume, cancellation, and per-run `maxBatches=10,000`.
 
-## Remote v0.0.131 Failure
+## Remote v0.0.131 Failure And Recovery
 
 Remote Actions evidence:
 
@@ -48,6 +48,20 @@ Fix:
 
 - The test now uses a struct initializer with `..Config::default()` instead of field reassignment.
 - The baseline file was not loosened.
+
+Recovery and successful republish:
+
+- The fixed source was committed as `511cebb60e26d970b77b33a3638ec8d9806505de`
+  (`fix: raise usage cleanup safety limit`) and pushed to `main`.
+- The failed remote `v0.0.131` tag was explicitly deleted and recreated because
+  the user requested reusing version 131 rather than advancing to 132.
+- The recreated annotated tag `v0.0.131` peels to `511cebb60e26d970b77b33a3638ec8d9806505de`.
+- GitHub Actions workflow `Publish Docker Images`, run `30800052601` (`#162`),
+  was triggered by the recreated tag:
+  `https://github.com/2ue/kiro.rs/actions/runs/30800052601`.
+- Run `#162` completed successfully in `25m 36s`. The quality gate, both
+  architecture Docker builds, and the multi-architecture manifest job all
+  completed successfully.
 
 ## Validation
 
@@ -96,7 +110,7 @@ The first attempt at the migration test used a guessed PostgreSQL password and f
 
 ## Release Meaning
 
-This closes the focused implementation and local validation for raising the cleanup `每批数量` backend limit from 500 to 5,000 and fixes the known `v0.0.131` Clippy publish blocker in the current working tree.
+This closes the focused implementation and local validation for raising the cleanup `每批数量` backend limit from 500 to 5,000, fixes the known `v0.0.131` Clippy publish blocker, and records the successful Docker republish of `v0.0.131` from the repaired commit.
 
 It does not close:
 
@@ -104,4 +118,4 @@ It does not close:
 - dynamic multi-instance Admin cache and cleanup races;
 - Redis slow/reset chaos;
 - a final release build or tag;
-- the already failed `v0.0.131` Docker publish. A new release should use the next version rather than treating the failed 131 workflow as successfully published.
+- production deployment rollout and post-release observation of the successfully republished `v0.0.131`.
