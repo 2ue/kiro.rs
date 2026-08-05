@@ -54,8 +54,9 @@ pub(super) fn should_retry_same_pool(
     if !err.retryable {
         return false;
     }
-    // 认证、配额、渠道禁用和端点配置错误应先冷却并切换池，
-    // 不应在同一个明显有问题的外部账号上重复发送。
+    // These errors should leave the current candidate for this request instead
+    // of repeatedly sending to the same pool. They are still treated as
+    // recoverable health signals by the pool scheduler.
     if err.auto_disable_reason.is_some()
         || err
             .cooldown
@@ -67,9 +68,7 @@ pub(super) fn should_retry_same_pool(
     let Some(status) = err.status else {
         return false;
     };
-    config
-        .same_pool_retry_status_codes()
-        .contains(&status.as_u16())
+    retry_status_matches(status, &config.same_pool_retry_status_codes())
 }
 
 pub(super) fn should_retry_cross_pool(
@@ -88,12 +87,17 @@ pub(super) fn should_retry_cross_pool(
     let Some(status) = err.status else {
         return config.external_pool_retry_on_network_error;
     };
-    config.retry_status_codes().contains(&status.as_u16())
+    retry_status_matches(status, &config.retry_status_codes())
 }
 
 pub(super) fn same_pool_retry_delay(config: &ExternalPoolsConfig) -> Option<Duration> {
     let delay_ms = config.external_pool_same_pool_retry_delay_ms;
     (delay_ms > 0).then(|| Duration::from_millis(delay_ms))
+}
+
+fn retry_status_matches(status: StatusCode, configured: &std::collections::BTreeSet<u16>) -> bool {
+    let code = status.as_u16();
+    configured.contains(&code) || (status.is_server_error() && configured.contains(&500))
 }
 
 fn payload_too_long_message(message: &str) -> bool {

@@ -1865,12 +1865,23 @@ impl RedisStore {
         reason: &str,
         pool_id: Option<u64>,
     ) -> anyhow::Result<u64> {
+        self.publish_external_pool_data_changed_with_origin(reason, pool_id, None)
+            .await
+    }
+
+    pub async fn publish_external_pool_data_changed_with_origin(
+        &self,
+        reason: &str,
+        pool_id: Option<u64>,
+        origin: Option<&str>,
+    ) -> anyhow::Result<u64> {
         const SCRIPT: &str = r#"
             local generation = redis.call('INCR', KEYS[1])
             local payload = cjson.encode({
                 generation = generation,
                 reason = ARGV[1],
-                poolId = ARGV[2]
+                poolId = ARGV[2],
+                origin = ARGV[3]
             })
             redis.call('PUBLISH', KEYS[2], payload)
             return generation
@@ -1883,6 +1894,7 @@ impl RedisStore {
             .arg(self.external_pool_data_changed_channel())
             .arg(reason)
             .arg(pool_id.map(|id| id.to_string()).unwrap_or_default())
+            .arg(origin.unwrap_or_default())
             .query_async(&mut manager)
             .await?;
         Ok(generation)

@@ -4,7 +4,7 @@ Status: `active-analysis-queue / ordered-easy-to-hard-with-urgency-first`
 
 Severity: P0/P1 execution control. This queue defines the order for analyzing current open issues one by one, balancing easiest safe progress against urgent release/user-impact blockers.
 
-Last reviewed: 2026-07-31 Asia/Shanghai
+Last reviewed: 2026-08-05 Asia/Shanghai
 
 ## 范围与结论
 
@@ -50,6 +50,14 @@ done | sort
 Then check whether any item below has moved category. If yes, update this queue, [current issue status index](current-issue-status-index-20260731.md), and the owning issue file.
 
 ## Priority queue
+
+### 2026-08-05 当前 P0：外部池高可用调度
+
+用户已明确把外部池调度高可用作为当前核心目标。这个问题优先于其他后续 polish 和生产观察项，直到实现和持续验证达到发版标准。
+
+| Order | Issue | First action | Do not do |
+| ---: | --- | --- | --- |
+| P0 | [外部池高可用调度与冷却回归](external-pool-ha-scheduler-cooldown-regression-20260805.md) | 按 [外部池高可用调度执行计划](../../docs/plantree/plans/rust-runtime-scheduler-stabilization/topics/external-pool-ha-scheduler-execution-plan-20260805.md) 修复 132 过度池级冷却和优先级故障转移问题；验证持续失败、随机失败、高并发、客户端重试放大、恢复回流、路线边界和 usage 独立性 | 不把 `401/402/403/429/5xx/网络/协议` 默认当永久问题；不把失败 1/2 次当验收标准；不靠手动清除冷却证明高可用 |
 
 ### 2026-08-02 用户澄清的当前顺序
 

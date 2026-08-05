@@ -153,9 +153,7 @@ const EXTERNAL_POOL_SUCCESS_RESET_COALESCE_WINDOW: Duration = Duration::from_sec
 const EXTERNAL_POOL_SUCCESS_RESET_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
 const EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS: usize = 64;
 const EXTERNAL_POOL_SUCCESS_RESET_MAX_TRACKED_POOLS: usize = 4_096;
-const EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS: usize = 300;
-const EXTERNAL_POOL_TRANSIENT_COOLDOWN_MAX_SECS: u64 = 300;
-const EXTERNAL_POOL_TRANSIENT_COOLDOWN_JITTER_PERCENT: u8 = 20;
+const EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS: usize = 30;
 const EXTERNAL_POOL_STATIC_SNAPSHOT_JITTER_PERCENT: u8 = 10;
 const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
 const EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
@@ -1880,6 +1878,7 @@ impl Drop for ExternalPoolCoordinatorPermit {
 pub struct ExternalPoolManager {
     postgres: Arc<PostgresStore>,
     redis: Arc<RedisStore>,
+    instance_id: String,
     client: reqwest::Client,
     capacity_signal: Arc<CapacitySignal>,
     #[cfg(test)]
@@ -3176,6 +3175,7 @@ impl ExternalPoolManager {
         Self {
             postgres,
             redis,
+            instance_id: uuid::Uuid::new_v4().to_string(),
             client: reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
@@ -3504,9 +3504,19 @@ impl ExternalPoolManager {
     }
 
     pub fn observe_external_pool_data_event(&self, payload: &str) -> bool {
-        let generation = serde_json::from_str::<serde_json::Value>(payload)
-            .ok()
-            .and_then(|value| value.get("generation").and_then(serde_json::Value::as_u64));
+        let value = match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let generation = value.get("generation").and_then(serde_json::Value::as_u64);
+        let origin = value.get("origin").and_then(serde_json::Value::as_str);
+        if origin.is_some_and(|origin| origin == self.instance_id) {
+            if let Some(generation) = generation {
+                self.observed_pool_data_generation
+                    .fetch_max(generation, Ordering::AcqRel);
+            }
+            return false;
+        }
         generation.is_some_and(|generation| self.observe_pool_data_generation(generation))
     }
 
@@ -3528,9 +3538,14 @@ impl ExternalPoolManager {
     fn publish_external_pool_data_changed_async(&self, reason: &'static str, pool_id: Option<u64>) {
         let redis = self.redis.clone();
         let observed_generation = self.observed_pool_data_generation.clone();
+        let origin = self.instance_id.clone();
         tokio::spawn(async move {
             match redis
-                .publish_external_pool_data_changed(reason, pool_id)
+                .publish_external_pool_data_changed_with_origin(
+                    reason,
+                    pool_id,
+                    Some(origin.as_str()),
+                )
                 .await
             {
                 Ok(generation) => {
@@ -4948,6 +4963,13 @@ impl ExternalPoolManager {
                         last_error = None;
                         continue;
                     }
+                    let cooldown_hint = err.cooldown.clone();
+                    if let Some((_, reason)) = &cooldown_hint {
+                        if should_record_external_pool_soft_failure(reason) {
+                            self.record_external_pool_soft_failure(pool_id, reason)
+                                .await;
+                        }
+                    }
                     let same_pool_retry_count = same_pool_retry_counts.entry(pool_id).or_insert(0);
                     if should_retry_external_same_pool(&config, &err)
                         && *same_pool_retry_count < config.external_pool_same_pool_retry_count
@@ -4981,16 +5003,7 @@ impl ExternalPoolManager {
                         preselected_pool = Some(pool);
                         continue;
                     }
-                    if let Some((duration, reason)) = &err.cooldown {
-                        let duration = if reason == "model_unavailable"
-                            && config.external_pool_model_unavailable_cooldown_mode
-                                != ExternalPoolModelUnavailableCooldownMode::Pool
-                        {
-                            *duration
-                        } else {
-                            self.escalated_external_pool_cooldown(pool_id, *duration, reason)
-                                .await
-                        };
+                    if let Some((duration, reason)) = &cooldown_hint {
                         if reason == "model_mapping_miss" {
                             // Request-scoped mismatch: skip this pool for the current request, but
                             // do not cool down the pool globally for other models.
@@ -5010,19 +5023,19 @@ impl ExternalPoolManager {
                                     }
                                     self.mark_pool_model_cooldowns(
                                         pool_id,
-                                        duration,
+                                        *duration,
                                         reason.clone(),
                                         &models,
                                     )
                                     .await;
                                 }
                                 ExternalPoolModelUnavailableCooldownMode::Pool => {
-                                    self.mark_pool_cooldown(pool_id, duration, reason.clone())
+                                    self.mark_pool_cooldown(pool_id, *duration, reason.clone())
                                         .await;
                                 }
                             }
-                        } else {
-                            self.mark_pool_cooldown(pool_id, duration, reason.clone())
+                        } else if should_mark_external_pool_hard_cooldown(reason) {
+                            self.mark_pool_cooldown(pool_id, *duration, reason.clone())
                                 .await;
                         }
                     }
@@ -5911,17 +5924,10 @@ impl ExternalPoolManager {
                     cooldown_scope = Some(PoolCooldownScope::Model);
                 }
             }
-            // A transiently failed pool is penalized while its pool-level
-            // cooldown is active. Once that cooldown has elapsed, keep the
-            // pool eligible as a half-open recovery probe; retaining the
-            // historical penalty after cooldown would make the pool unable
-            // to win selection again, because success (which clears the
-            // streak) can only be observed after a request reaches it.
-            let transient_failure_streak = if cooldown_remaining_secs == 0 {
-                0
-            } else {
-                runtime.transient_failure_streak
-            };
+            // Soft failures are a short-lived health signal, not a hard filter.
+            // They must affect ranking even when no pool cooldown exists so a
+            // healthy lower-priority pool can take over during upstream jitter.
+            let transient_failure_streak = runtime.transient_failure_streak;
             match Self::skip_reason(
                 &pool,
                 in_flight,
@@ -6726,72 +6732,43 @@ impl ExternalPoolManager {
         }
     }
 
-    async fn escalated_external_pool_cooldown(
-        &self,
-        pool_id: u64,
-        base_duration: Duration,
-        reason: &str,
-    ) -> Duration {
-        if !matches!(
-            reason,
-            "rate_limit"
-                | "database_busy"
-                | "server_error"
-                | "network_error"
-                | "protocol_contamination"
-                | "misconfigured_endpoint"
-        ) {
-            return base_duration;
-        }
-
+    async fn record_external_pool_soft_failure(&self, pool_id: u64, reason: &str) {
         let key = external_pool_transient_failure_key(pool_id);
-        let streak = match timeout(
+        match timeout(
             EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT,
             self.redis
                 .incr_with_ttl(&key, EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS),
         )
         .await
         {
-            Ok(Ok(streak)) => streak.max(1),
+            Ok(Ok(streak)) => {
+                tracing::debug!(
+                    pool_id,
+                    reason,
+                    streak = streak.max(1),
+                    window_secs = EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS,
+                    "recorded external pool soft failure for health-aware selection"
+                );
+            }
             Ok(Err(err)) => {
                 tracing::warn!(
                     pool_id,
                     reason,
                     error = %err,
-                    "外部池瞬态失败计数写入失败，使用基础冷却"
+                    "外部池软失败计数写入失败"
                 );
-                return base_duration;
             }
             Err(_) => {
                 tracing::warn!(
                     pool_id,
                     reason,
                     timeout_ms = EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT.as_millis(),
-                    "外部池瞬态失败计数写入超时，使用基础冷却"
+                    "外部池软失败计数写入超时"
                 );
-                return base_duration;
             }
-        };
-
-        let shift = streak.saturating_sub(1).min(8) as u32;
-        let multiplier = 1u32.checked_shl(shift).unwrap_or(256);
-        let escalated = base_duration
-            .saturating_mul(multiplier)
-            .min(Duration::from_secs(
-                EXTERNAL_POOL_TRANSIENT_COOLDOWN_MAX_SECS,
-            ));
-        let jittered = deterministic_duration_jitter(
-            escalated,
-            EXTERNAL_POOL_TRANSIENT_COOLDOWN_JITTER_PERCENT,
-            pool_id ^ streak.rotate_left(17) ^ stable_hash64(reason.as_bytes()),
-        );
-        let cap = if base_duration > Duration::from_secs(EXTERNAL_POOL_TRANSIENT_COOLDOWN_MAX_SECS)
-        {
-            base_duration
-        } else {
-            Duration::from_secs(EXTERNAL_POOL_TRANSIENT_COOLDOWN_MAX_SECS)
-        };
-        base_duration.max(jittered.min(cap))
+        }
+        self.invalidate_external_pool_runtime_capacity_state();
+        self.capacity_signal.notify_state_changed();
     }
 
     async fn mark_pool_cooldown(&self, pool_id: u64, duration: Duration, reason: String) {
@@ -7220,9 +7197,6 @@ impl ExternalPoolManager {
         let keys = EXTERNAL_POOL_AUTO_DISABLE_REASONS
             .iter()
             .map(|reason| format!("external_pool:{}:auto_disable_failures:{}", pool_id, reason))
-            .chain(std::iter::once(external_pool_transient_failure_key(
-                pool_id,
-            )))
             .collect::<Vec<_>>();
         #[cfg(test)]
         let tasks_in_flight = self.success_reset_tasks_in_flight.clone();
@@ -8191,11 +8165,6 @@ fn deterministic_duration_jitter(base: Duration, percent: u8, seed: u64) -> Dura
     Duration::from_millis(jittered.min(u64::MAX as u128) as u64)
 }
 
-fn stable_hash64(value: &[u8]) -> u64 {
-    let digest = Sha256::digest(value);
-    u64::from_be_bytes(digest[..8].try_into().unwrap_or_default())
-}
-
 fn external_release_retry_delay(failures: u32, intent: &ExternalPoolReleaseIntent) -> Duration {
     let multiplier = 1u32
         .checked_shl(failures.saturating_sub(1).min(16))
@@ -8701,12 +8670,21 @@ fn external_error_diagnostics(
         metadata_insert(&mut metadata, "autoDisableReason", reason);
     }
     if let Some((duration, reason)) = err.cooldown.as_ref() {
-        metadata_insert(&mut metadata, "cooldownReason", reason.as_str());
-        if !duration.is_zero() {
+        if reason == "model_unavailable" || should_mark_external_pool_hard_cooldown(reason) {
+            metadata_insert(&mut metadata, "cooldownReason", reason.as_str());
+            if !duration.is_zero() {
+                metadata_insert(
+                    &mut metadata,
+                    "cooldownMs",
+                    serde_json::Value::from(duration.as_millis() as u64),
+                );
+            }
+        } else if should_record_external_pool_soft_failure(reason) {
+            metadata_insert(&mut metadata, "softFailureReason", reason.as_str());
             metadata_insert(
                 &mut metadata,
-                "cooldownMs",
-                serde_json::Value::from(duration.as_millis() as u64),
+                "softFailureWindowSecs",
+                EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS as u64,
             );
         }
     }
@@ -8874,6 +8852,14 @@ fn external_pool_cooldown_duration(
     default_cooldown_secs: u64,
 ) -> Duration {
     retry_after.unwrap_or_else(|| Duration::from_secs(default_cooldown_secs.max(1)))
+}
+
+fn should_record_external_pool_soft_failure(reason: &str) -> bool {
+    !matches!(reason, "model_mapping_miss" | "model_unavailable")
+}
+
+fn should_mark_external_pool_hard_cooldown(reason: &str) -> bool {
+    matches!(reason, "misconfigured_endpoint")
 }
 
 fn classify_external_error(

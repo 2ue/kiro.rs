@@ -10494,6 +10494,73 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
 }
 
 #[test]
+fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_flag() {
+    use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_direct_policy_enabled: false,
+        external_pool_local_rescue_enabled: true,
+        ..Default::default()
+    };
+    let server_error = ExternalPoolFinalError {
+        status: StatusCode::BAD_GATEWAY,
+        response_error_type: "api_error".to_string(),
+        route_error_type: "server_error".to_string(),
+        message: "external upstream failed".to_string(),
+        error_id: "req_direct_route_subtype".to_string(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: Some(1),
+        pool_name: Some("direct".to_string()),
+    };
+
+    for round in 1..=10 {
+        assert_eq!(
+            local_rescue_reason_after_external_route_error(
+                UsageRouteSubtype::ExternalDirectPolicy,
+                &config,
+                &server_error,
+                Some("local_capacity_full"),
+                Some(4),
+            ),
+            None,
+            "round {round}: route subtype external_direct_policy is an absolute local-rescue boundary"
+        );
+
+        let budget = InferenceAttemptBudget::new(8);
+        budget
+            .reserve(InferenceAttemptKind::ExternalPool, 0)
+            .unwrap();
+        assert_eq!(
+            budgeted_local_rescue_reason_after_external_route_error(
+                UsageRouteSubtype::ExternalDirectPolicy,
+                &config,
+                &server_error,
+                Some("local_capacity_full"),
+                Some(4),
+                &budget,
+            ),
+            None,
+            "round {round}: direct route subtype must ignore remaining local rescue budget"
+        );
+
+        assert_eq!(
+            budgeted_local_rescue_reason_after_external_route_error(
+                UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+                &config,
+                &server_error,
+                Some("local_capacity_full"),
+                Some(4),
+                &budget,
+            ),
+            Some("external_error"),
+            "round {round}: local-first fallback route still allows bounded rescue when the fresh local pool is dispatchable"
+        );
+    }
+}
+
+#[test]
 fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 

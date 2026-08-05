@@ -6455,12 +6455,16 @@ async fn maybe_external_fallback_after_websearch_mcp_failure(
     })
 }
 
-fn local_rescue_reason_after_external_error(
+fn local_rescue_reason_after_external_route_error(
+    route_subtype: UsageRouteSubtype,
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
+    if !external_route_subtype_allows_local_rescue(route_subtype) {
+        return None;
+    }
     if config.external_direct_policy_enabled {
         return None;
     }
@@ -6492,6 +6496,40 @@ fn local_rescue_reason_after_external_error(
     Some("external_error")
 }
 
+#[cfg(test)]
+fn local_rescue_reason_after_external_error(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolFinalError,
+    local_fallback_reason: Option<&str>,
+    current_local_dispatchable: Option<usize>,
+) -> Option<&'static str> {
+    local_rescue_reason_after_external_route_error(
+        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+        config,
+        err,
+        local_fallback_reason,
+        current_local_dispatchable,
+    )
+}
+
+fn external_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) -> bool {
+    matches!(
+        route_subtype,
+        UsageRouteSubtype::ExternalFallbackPreflight
+            | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
+    )
+}
+
+fn external_fallback_route_subtype_for_attempts(
+    attempts: &[KiroCredentialAttempt],
+) -> UsageRouteSubtype {
+    if attempts.is_empty() {
+        UsageRouteSubtype::ExternalFallbackPreflight
+    } else {
+        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
+    }
+}
+
 fn local_fallback_reason_blocks_local_rescue(
     reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
@@ -6521,7 +6559,8 @@ fn local_fallback_reason_blocks_local_rescue(
     }
 }
 
-fn budgeted_local_rescue_reason_after_external_error(
+fn budgeted_local_rescue_reason_after_external_route_error(
+    route_subtype: UsageRouteSubtype,
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
@@ -6531,11 +6570,30 @@ fn budgeted_local_rescue_reason_after_external_error(
     if inference_attempt_budget.available_attempts(0) == 0 {
         return None;
     }
-    local_rescue_reason_after_external_error(
+    local_rescue_reason_after_external_route_error(
+        route_subtype,
         config,
         err,
         local_fallback_reason,
         current_local_dispatchable,
+    )
+}
+
+#[cfg(test)]
+fn budgeted_local_rescue_reason_after_external_error(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolFinalError,
+    local_fallback_reason: Option<&str>,
+    current_local_dispatchable: Option<usize>,
+    inference_attempt_budget: &InferenceAttemptBudget,
+) -> Option<&'static str> {
+    budgeted_local_rescue_reason_after_external_route_error(
+        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+        config,
+        err,
+        local_fallback_reason,
+        current_local_dispatchable,
+        inference_attempt_budget,
     )
 }
 
@@ -6845,7 +6903,8 @@ async fn handle_stream_request(
             ExternalPoolForwardOutcome::Response(response) => return response,
             ExternalPoolForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
-                    if let Some(reason) = budgeted_local_rescue_reason_after_external_error(
+                    if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
+                        UsageRouteSubtype::ExternalFallbackPreflight,
                         &external.config,
                         &err,
                         Some(local_reason.as_str()),
@@ -7148,7 +7207,10 @@ async fn handle_stream_request(
                                                 ),
                                             );
                                             if let Some(reason) =
-                                                budgeted_local_rescue_reason_after_external_error(
+                                                budgeted_local_rescue_reason_after_external_route_error(
+                                                    external_fallback_route_subtype_for_attempts(
+                                                        &all_attempts,
+                                                    ),
                                                     &external.config,
                                                     &err,
                                                     local_fallback_reason.as_deref(),
@@ -7284,7 +7346,8 @@ async fn handle_stream_request(
                                             KiroProvider::call_failure_kind_from_error(&e),
                                         );
                                     if let Some(reason) =
-                                        budgeted_local_rescue_reason_after_external_error(
+                                        budgeted_local_rescue_reason_after_external_route_error(
+                                            external_fallback_route_subtype_for_attempts(&attempts),
                                             &external.config,
                                             &err,
                                             local_fallback_reason.as_deref(),
@@ -9034,7 +9097,8 @@ async fn handle_non_stream_request(
             ExternalPoolForwardOutcome::Response(response) => return response,
             ExternalPoolForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
-                    if let Some(reason) = budgeted_local_rescue_reason_after_external_error(
+                    if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
+                        UsageRouteSubtype::ExternalFallbackPreflight,
                         &external.config,
                         &err,
                         Some(local_reason.as_str()),
@@ -9331,7 +9395,10 @@ async fn handle_non_stream_request(
                                                 ),
                                             );
                                             if let Some(reason) =
-                                                budgeted_local_rescue_reason_after_external_error(
+                                                budgeted_local_rescue_reason_after_external_route_error(
+                                                    external_fallback_route_subtype_for_attempts(
+                                                        &all_attempts,
+                                                    ),
                                                     &external.config,
                                                     &err,
                                                     local_fallback_reason.as_deref(),
@@ -9458,7 +9525,8 @@ async fn handle_non_stream_request(
                                             KiroProvider::call_failure_kind_from_error(&e),
                                         );
                                     if let Some(reason) =
-                                        budgeted_local_rescue_reason_after_external_error(
+                                        budgeted_local_rescue_reason_after_external_route_error(
+                                            external_fallback_route_subtype_for_attempts(&attempts),
                                             &external.config,
                                             &err,
                                             local_fallback_reason.as_deref(),

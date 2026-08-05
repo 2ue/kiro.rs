@@ -2792,9 +2792,10 @@ pub struct ExternalPoolsConfig {
     pub external_pool_retry_max_attempts: u32,
     /// 外部池之间故障转移时允许重试的 HTTP 状态码。
     ///
-    /// 认证、配额、渠道禁用等已被分类为账号级临时不可调度的错误，
-    /// 即使不在此列表中也仍会按分类结果切换到其他外部池；该列表控制
-    /// 普通 HTTP 错误是否继续消耗跨池重试预算。
+    /// 认证、配额、渠道禁用等错误默认也按临时抖动信号处理；该列表控制
+    /// 普通 HTTP 错误是否继续消耗跨池重试预算。默认列表中的 500 作为
+    /// 5xx 族兜底，覆盖 523/524/599 等未逐个枚举的上游临时错误；如果
+    /// 运营侧显式只配置 502 等具体状态码，则按配置收窄。
     #[serde(default = "default_external_pool_retry_status_codes")]
     pub external_pool_retry_status_codes: Vec<u16>,
     /// 连接、DNS、超时等没有 HTTP 状态码的网络错误是否允许跨池重试。
@@ -2879,12 +2880,19 @@ pub struct ExternalPoolsConfig {
     pub external_pool_auto_disable_window_secs: u64,
     #[serde(default)]
     pub external_pool_auto_disable_duration_secs: u64,
+    /// 外部池限流类错误的历史兼容冷却秒数。
+    ///
+    /// 当前普通上游错误默认只写短期健康降权，不写池级冷却；该值只在
+    /// 严格临时不可调度或兼容诊断路径中作为时间提示。
     #[serde(default = "default_external_pool_rate_limit_cooldown_secs")]
     pub external_pool_rate_limit_cooldown_secs: u64,
+    /// 外部池服务器错误的历史兼容冷却秒数。
     #[serde(default = "default_external_pool_server_error_cooldown_secs")]
     pub external_pool_server_error_cooldown_secs: u64,
+    /// 外部池网络错误的历史兼容冷却秒数。
     #[serde(default = "default_external_pool_network_error_cooldown_secs")]
     pub external_pool_network_error_cooldown_secs: u64,
+    /// 外部池协议错误的历史兼容冷却秒数。
     #[serde(default = "default_external_pool_protocol_error_cooldown_secs")]
     pub external_pool_protocol_error_cooldown_secs: u64,
     #[serde(default)]
@@ -4401,6 +4409,7 @@ fn default_external_pool_retry_max_attempts() -> u32 {
 }
 
 fn default_external_pool_retry_status_codes() -> Vec<u16> {
+    // 500 is treated as the default 5xx family retry guard by retry_pipeline.
     vec![408, 425, 429, 500, 502, 503, 504, 529]
 }
 
@@ -4409,6 +4418,7 @@ fn default_external_pool_same_pool_retry_count() -> u32 {
 }
 
 fn default_external_pool_same_pool_retry_status_codes() -> Vec<u16> {
+    // 500 is treated as the default 5xx family retry guard by retry_pipeline.
     vec![408, 425, 429, 500, 502, 503, 504, 529]
 }
 

@@ -16,7 +16,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
@@ -35,6 +35,39 @@ const REPORT_ROOT = path.join(ARTIFACT_ROOT, 'reports', 'external-pool-priority-
 const REPORT_PATH = path.join(REPORT_ROOT, `${RUN_ID}.json`)
 const CHILDREN = new Set()
 const SERVERS = new Set()
+const CLIENT_AGENT = new http.Agent({
+  keepAlive: true,
+  maxSockets: boundedInteger(process.env.KIRO_EXTERNAL_FAILOVER_CLIENT_SOCKETS, 64, 8, 256),
+  maxFreeSockets: 32,
+})
+const BUSINESS_MARKER_RE = /\b(?:priority-failover-burst[12]|priority-recovery|rate-limit-failover|external-direct-no-local-rescue)-?\d*\b/
+const STRESS_ENABLED = process.env.KIRO_EXTERNAL_FAILOVER_STRESS === '1'
+const STRESS_BURST_CONCURRENCY = boundedInteger(
+  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_BURST,
+  256,
+  64,
+  2048,
+)
+const STRESS_RPM = boundedInteger(process.env.KIRO_EXTERNAL_FAILOVER_STRESS_RPM, 1200, 120, 6000)
+const STRESS_DURATION_SECONDS = boundedInteger(
+  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_SECONDS,
+  900,
+  60,
+  3600,
+)
+const STRESS_MAX_IN_FLIGHT = boundedInteger(
+  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_IN_FLIGHT,
+  1024,
+  64,
+  4096,
+)
+const STRESS_SAME_POOL_RETRY_COUNT = boundedInteger(
+  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_SAME_POOL_RETRY,
+  1,
+  0,
+  3,
+)
+const KEEP_TEMP = process.env.KIRO_EXTERNAL_FAILOVER_KEEP_TEMP === '1'
 
 function required(name) {
   const value = String(process.env[name] || '').trim()
@@ -42,8 +75,44 @@ function required(name) {
   return value
 }
 
+function boundedInteger(value, fallback, min, max) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, Math.floor(parsed)))
+}
+
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex')
+}
+
+function processMetrics(child) {
+  if (!child?.pid) return null
+  const ps = spawnSync('ps', ['-o', 'rss=,vsz=,%cpu=,etime=', '-p', String(child.pid)], {
+    encoding: 'utf8',
+    timeout: 2_000,
+  })
+  if (ps.status !== 0) return null
+  const fields = ps.stdout.trim().split(/\s+/)
+  if (fields.length < 4) return null
+  const [rssKib, vszKib, cpuPercent, elapsed] = fields
+  const lsof = spawnSync('sh', ['-c', `lsof -nP -p ${Number(child.pid)} 2>/dev/null | wc -l`], {
+    encoding: 'utf8',
+    timeout: 3_000,
+  })
+  const established = spawnSync(
+    'sh',
+    ['-c', `lsof -nP -a -p ${Number(child.pid)} -iTCP -sTCP:ESTABLISHED 2>/dev/null | wc -l`],
+    { encoding: 'utf8', timeout: 3_000 },
+  )
+  return {
+    at: new Date().toISOString(),
+    rssKib: Number(rssKib) || null,
+    vszKib: Number(vszKib) || null,
+    cpuPercent: Number(cpuPercent) || null,
+    elapsed,
+    fdCount: Number(lsof.stdout.trim()) || null,
+    establishedTcpCount: Number(established.stdout.trim()) || null,
+  }
 }
 
 function redact(value) {
@@ -111,6 +180,7 @@ function createUpstream(name, initialStatus) {
   const state = {
     name,
     status: initialStatus,
+    delayMs: 0,
     hits: 0,
     requests: [],
   }
@@ -125,6 +195,9 @@ function createUpstream(name, initialStatus) {
       anthropicVersion: request.headers['anthropic-version'] || null,
       status: state.status,
     })
+    if (state.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, state.delayMs))
+    }
     if (state.status !== 200) {
       json(response, state.status, {
         type: 'error',
@@ -160,10 +233,17 @@ function createUpstream(name, initialStatus) {
 }
 
 function createLocalUpstream() {
-  const state = { hits: 0 }
+  const state = { hits: 0, inferenceHits: 0, requests: [] }
   const server = http.createServer(async (request, response) => {
-    await readBody(request)
+    const body = await readBody(request)
+    const marker = body.match(BUSINESS_MARKER_RE)?.[0] || null
     state.hits += 1
+    if (marker) state.inferenceHits += 1
+    state.requests.push({
+      path: request.url,
+      marker,
+      method: request.method,
+    })
     json(response, 200, { message: 'local-should-not-be-used' })
   })
   SERVERS.add(server)
@@ -228,9 +308,48 @@ async function waitForHealth(baseUrl, child) {
 }
 
 async function requestJson(url, options = {}) {
-  const response = await fetch(url, options)
-  const text = await response.text()
-  return { status: response.status, text, headers: response.headers }
+  const parsed = new URL(url)
+  if (parsed.protocol !== 'http:') {
+    try {
+      const response = await fetch(url, options)
+      const text = await response.text()
+      return { status: response.status, text, headers: response.headers }
+    } catch (error) {
+      const cause = error?.cause
+      const detail = cause
+        ? `${cause.code || cause.message || cause.name}:${cause.message || ''}`
+        : String(error?.message || error)
+      return { status: 'network_error', text: detail, headers: new Headers() }
+    }
+  }
+
+  return new Promise((resolve) => {
+    const request = http.request(parsed, {
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      agent: CLIENT_AGENT,
+    }, (response) => {
+      const chunks = []
+      response.on('data', (chunk) => chunks.push(chunk))
+      response.once('end', () => resolve({
+        status: response.statusCode || 0,
+        text: Buffer.concat(chunks).toString('utf8'),
+        headers: response.headers,
+      }))
+      response.once('error', (error) => resolve({
+        status: 'network_error',
+        text: String(error?.message || error),
+        headers: {},
+      }))
+    })
+    request.once('error', (error) => resolve({
+      status: 'network_error',
+      text: String(error?.code ? `${error.code}:${error.message}` : error?.message || error),
+      headers: {},
+    }))
+    if (options.body !== undefined && options.body !== null) request.write(options.body)
+    request.end()
+  })
 }
 
 async function postMessage(baseUrl, marker) {
@@ -244,6 +363,80 @@ async function postMessage(baseUrl, marker) {
       messages: [{ role: 'user', content: marker }],
     }),
   })
+}
+
+async function postMessages(baseUrl, phase, count) {
+  return Promise.all(Array.from({ length: count }, (_, index) => postMessage(baseUrl, `${phase}-${index}`)
+    .then((response) => ({ phase, index, response }))))
+}
+
+async function runFixedRatePhase(baseUrl, phase, durationSeconds, rpm, maxInFlight, child) {
+  const startedAt = Date.now()
+  const deadline = startedAt + durationSeconds * 1000
+  const intervalMs = 60_000 / rpm
+  const pending = new Set()
+  const statusCounts = new Map()
+  const failures = []
+  const resourceSamples = []
+  let nextAt = startedAt
+  let sent = 0
+  let completed = 0
+  let nextResourceSampleAt = startedAt
+
+  const launch = () => {
+    if (Date.now() >= deadline || pending.size >= maxInFlight) return false
+    const index = sent
+    sent += 1
+    const task = (async () => {
+      try {
+        const response = await postMessage(baseUrl, `${phase}-${index}`)
+        completed += 1
+        statusCounts.set(response.status, (statusCounts.get(response.status) || 0) + 1)
+        if (response.status !== 200 && failures.length < 20) {
+          failures.push({ index, status: response.status, text: response.text.slice(0, 200) })
+        }
+      } catch (error) {
+        completed += 1
+        statusCounts.set('network_error', (statusCounts.get('network_error') || 0) + 1)
+        if (failures.length < 20) {
+          failures.push({ index, status: 'network_error', text: String(error?.message || error) })
+        }
+      } finally {
+        pending.delete(task)
+      }
+    })()
+    pending.add(task)
+    return true
+  }
+
+  while (Date.now() < deadline) {
+    const now = Date.now()
+    if (now >= nextResourceSampleAt) {
+      const metrics = processMetrics(child)
+      if (metrics) resourceSamples.push(metrics)
+      nextResourceSampleAt = now + 10_000
+    }
+    while (nextAt <= now && nextAt < deadline && pending.size < maxInFlight) {
+      launch()
+      nextAt += intervalMs
+    }
+    const waitMs = Math.max(1, Math.min(25, nextAt - Date.now()))
+    await new Promise((resolve) => setTimeout(resolve, waitMs))
+  }
+  await Promise.all([...pending])
+  const finalMetrics = processMetrics(child)
+  if (finalMetrics) resourceSamples.push(finalMetrics)
+  return {
+    phase,
+    durationSeconds,
+    targetRpm: rpm,
+    sent,
+    completed,
+    statusCounts: Object.fromEntries(statusCounts),
+    failures,
+    resourceSamples,
+    elapsedMs: Date.now() - startedAt,
+  }
 }
 
 async function admin(baseUrl, pathName, options = {}) {
@@ -286,6 +479,7 @@ async function main() {
     port: servicePort,
     apiKey: REQUEST_KEY,
     adminApiKey: ADMIN_KEY,
+    requestAdmission: { rpm: 0, maxConcurrentRequests: 0, maxQueuedRequests: 0, queueTimeoutMs: 0 },
     defaultEndpoint: 'ide',
     kiroUpstreamBaseUrl: `http://127.0.0.1:${localPort}/kiro`,
     kiroUpstreamResponseTimeoutSecs: 5,
@@ -293,12 +487,13 @@ async function main() {
     inferenceUpstreamMaxAttempts: 8,
     credentialWarmupRequests: 0,
     credentialMaxConcurrentRequests: 4,
-    externalPools: {
-      externalPoolsEnabled: true,
-      externalDirectPolicyEnabled: true,
+      externalPools: {
+        externalPoolsEnabled: true,
+        externalDirectPolicyEnabled: true,
+        externalPoolGlobalMaxConcurrentRequests: STRESS_ENABLED ? 4096 : 512,
       externalPoolRetryMaxAttempts: 3,
       externalPoolRetryStatusCodes: [429, 500, 502, 503, 504],
-      externalPoolSamePoolRetryCount: 1,
+      externalPoolSamePoolRetryCount: STRESS_ENABLED ? STRESS_SAME_POOL_RETRY_COUNT : 1,
       externalPoolSamePoolRetryStatusCodes: [429, 500, 502, 503, 504],
       externalPoolSamePoolRetryDelayMs: 10,
       externalPoolServerErrorCooldownSecs: 2,
@@ -339,7 +534,7 @@ async function main() {
           authType: 'bearer',
           enabled: true,
           priority,
-          maxConcurrentRequests: 20,
+          maxConcurrentRequests: STRESS_ENABLED ? 1024 : 128,
           usageProjectionMode: 'pass_through',
           requestBodyMode: 'normalized',
           rawModelMode: 'none',
@@ -354,43 +549,69 @@ async function main() {
     process.stderr.write(`pool status: ${statusSnapshot.status} ${statusSnapshot.text}\n`)
     await new Promise((resolve) => setTimeout(resolve, 1_500))
 
-    // A high-priority pool failing must not monopolize traffic. The first
-    // request may spend the configured same-pool retry, but later requests
-    // should be served by healthy lower-priority pools during cooldown.
-    for (let index = 0; index < 24; index += 1) {
-      const response = await postMessage(baseUrl, `priority-failover-${index}`)
+    // A high-priority pool failing under burst traffic must not monopolize
+    // later traffic. The first burst may already have selected the bad pool
+    // before its health signal is visible, but the next burst must move to
+    // healthy lower-priority external pools.
+    const firstBurst = await postMessages(baseUrl, 'priority-failover-burst1', 24)
+    const firstBurstStatus = await admin(baseUrl, '/api/admin/external-pools/status')
+    process.stderr.write(
+      `after first burst pool status: ${firstBurstStatus.status} ${firstBurstStatus.text}\n`,
+    )
+    for (const { phase, index, response } of firstBurst) {
       process.stderr.write(`a-failing ${index}: ${response.status} ${response.text.slice(0, 120)}\n`)
-      assert.equal(response.status, 200, JSON.stringify({ index, status: response.status, text: response.text }))
-      results.push({ phase: 'a-failing', index, status: response.status })
+      assert.equal(response.status, 200, JSON.stringify({ phase, index, status: response.status, text: response.text }))
+      results.push({ phase, index, status: response.status })
     }
-    assert.ok(upstreams.yuenan.state.hits <= 3, `yuenan repeated during cooldown: ${upstreams.yuenan.state.hits}`)
-    assert.ok(upstreams.kkkkyue.state.hits > 0, 'kkkkyue never took over from failed yuenan')
+    assert.equal(local.state.inferenceHits, 0, 'external-direct business traffic hit local credential during first burst')
+    assert.ok(
+      upstreams.kkkkyue.state.hits > 0,
+      `kkkkyue never took over from failed yuenan; pool status after burst: ${firstBurstStatus.text}`,
+    )
     assert.ok(
       upstreams.kkkkyue.state.hits + upstreams.jinnyapi.state.hits > 0,
       'no healthy lower-priority pool took over from failed yuenan',
     )
+    const yuenanAfterFirstBurst = upstreams.yuenan.state.hits
+    const healthyAfterFirstBurst = upstreams.kkkkyue.state.hits + upstreams.jinnyapi.state.hits
+
+    const secondBurst = await postMessages(baseUrl, 'priority-failover-burst2', 24)
+    for (const { phase, index, response } of secondBurst) {
+      assert.equal(response.status, 200, JSON.stringify({ phase, index, status: response.status, text: response.text }))
+      results.push({ phase, index, status: response.status })
+    }
+    assert.equal(local.state.inferenceHits, 0, 'external-direct business traffic hit local credential during second burst')
+    assert.ok(
+      upstreams.yuenan.state.hits - yuenanAfterFirstBurst <= 4,
+      `turbulent priority-1 pool reclaimed too much second-burst traffic: ${upstreams.yuenan.state.hits - yuenanAfterFirstBurst}`,
+    )
+    assert.ok(
+      upstreams.kkkkyue.state.hits + upstreams.jinnyapi.state.hits > healthyAfterFirstBurst,
+      'healthy lower-priority pools did not carry the second burst',
+    )
     process.stderr.write(`phase-a hits: ${JSON.stringify(Object.fromEntries(Object.entries(upstreams).map(([name, value]) => [name, value.state.hits])))}\n`)
 
-    // Recovery: after the cooldown expires, a healthy high-priority pool must
-    // receive traffic again instead of being permanently quarantined.
+    // Recovery: after the short soft-failure window expires, a healthy
+    // high-priority pool must receive traffic again instead of being
+    // permanently quarantined.
     upstreams.yuenan.state.status = 200
-    // Two failed sends produce an escalated cooldown (base * 2^streak,
-    // plus bounded jitter). Wait beyond the configured max for this phase so
-    // the recovery probe is not mistaken for a missing recovery path.
-    await new Promise((resolve) => setTimeout(resolve, 10_000))
+    await new Promise((resolve) => setTimeout(resolve, 35_000))
     const yuenanBeforeRecovery = upstreams.yuenan.state.hits
     for (let index = 0; index < 12; index += 1) {
       const response = await postMessage(baseUrl, `priority-recovery-${index}`)
       assert.equal(response.status, 200, JSON.stringify({ index, status: response.status, text: response.text }))
       results.push({ phase: 'a-recovered', index, status: response.status })
     }
+    assert.equal(local.state.inferenceHits, 0, 'external-direct business traffic hit local credential during recovery')
     assert.ok(
       upstreams.yuenan.state.hits > yuenanBeforeRecovery,
       'recovered yuenan did not receive traffic again',
     )
 
-    // A 429 on one pool is also a failover signal; it must not pin traffic to
-    // that pool while other external pools remain healthy.
+    // A 429 on one pool is also a failover signal; when priority-1 is
+    // temporarily failing and priority-10 is rate-limited, priority-20 must
+    // take over instead of falling back to local.
+    upstreams.yuenan.state.status = 503
     upstreams.kkkkyue.state.status = 429
     const before429 = {
       yuenan: upstreams.yuenan.state.hits,
@@ -402,21 +623,121 @@ async function main() {
       assert.equal(response.status, 200, JSON.stringify({ index, status: response.status, text: response.text }))
       results.push({ phase: 'b-429', index, status: response.status })
     }
+    assert.equal(local.state.inferenceHits, 0, 'external-direct business traffic hit local credential during 503+429 turbulence')
+    assert.ok(upstreams.yuenan.state.hits - before429.yuenan <= 3, '503 priority-1 pool was retried excessively')
     assert.ok(upstreams.kkkkyue.state.hits - before429.kkkkyue <= 3, '429 pool was retried excessively')
     assert.ok(
-      (upstreams.yuenan.state.hits - before429.yuenan) + (upstreams.jinnyapi.state.hits - before429.jinnyapi) > 0,
-      'healthy external pools did not take over from 429 pool',
+      upstreams.jinnyapi.state.hits - before429.jinnyapi > 0,
+      'healthy priority-20 pool did not take over from 503+429 turbulence',
     )
+
+    let stressReport = null
+    if (STRESS_ENABLED) {
+      // Sustained stress deliberately uses a much higher load than the
+      // baseline burst. The primary pool remains unhealthy while the two
+      // backups are slowed, so accumulated queue/lease/retry defects have
+      // time to surface instead of being hidden by a short burst.
+      upstreams.yuenan.state.status = 503
+      upstreams.yuenan.state.delayMs = 250
+      upstreams.kkkkyue.state.status = 200
+      upstreams.kkkkyue.state.delayMs = 250
+      upstreams.jinnyapi.state.status = 200
+      upstreams.jinnyapi.state.delayMs = 250
+      const stressBurst = await postMessages(
+        baseUrl,
+        'stress-burst',
+        STRESS_BURST_CONCURRENCY,
+      )
+      const stressBurstStatusCounts = new Map()
+      const stressBurstFailures = []
+      for (const { response } of stressBurst) {
+        stressBurstStatusCounts.set(
+          String(response.status),
+          (stressBurstStatusCounts.get(String(response.status)) || 0) + 1,
+        )
+        if (response.status !== 200 && stressBurstFailures.length < 40) {
+          stressBurstFailures.push({
+            status: response.status,
+            text: response.text.slice(0, 300),
+          })
+        }
+      }
+      const stressBurstStatus = await admin(baseUrl, '/api/admin/external-pools/status')
+      const stressBurstAlive = await requestJson(`${baseUrl}/healthz`)
+      process.stderr.write(
+        `stress burst statusCounts=${JSON.stringify(Object.fromEntries(stressBurstStatusCounts))} `
+        + `failures=${JSON.stringify(stressBurstFailures)} `
+        + `health=${stressBurstAlive.status} pools=${stressBurstStatus.status} ${stressBurstStatus.text.slice(0, 2000)}\n`,
+      )
+      assert.equal(
+        stressBurstFailures.length,
+        0,
+        `stress burst contained failed requests: ${JSON.stringify(stressBurstFailures)}`,
+      )
+      const stressBefore = Object.fromEntries(
+        Object.entries(upstreams).map(([name, value]) => [name, value.state.hits]),
+      )
+      stressReport = await runFixedRatePhase(
+        baseUrl,
+        'stress-fixed-rate',
+        STRESS_DURATION_SECONDS,
+        STRESS_RPM,
+        STRESS_MAX_IN_FLIGHT,
+        child,
+      )
+      assert.equal(
+        stressReport.completed,
+        stressReport.sent,
+        `stress phase left incomplete requests: ${JSON.stringify(stressReport)}`,
+      )
+      assert.ok(
+        stressReport.statusCounts['200'] > 0,
+        `stress phase had no successful responses: ${JSON.stringify(stressReport)}`,
+      )
+      assert.equal(
+        local.state.inferenceHits,
+        0,
+        'external-direct sustained stress traffic hit local credential',
+      )
+      assert.ok(
+        upstreams.kkkkyue.state.hits > stressBefore.kkkkyue
+          || upstreams.jinnyapi.state.hits > stressBefore.jinnyapi,
+        'healthy backup pools did not carry sustained stress traffic',
+      )
+      process.stderr.write(`stress report: ${JSON.stringify(stressReport)}\n`)
+
+      // Stop the fault and remove the artificial delay. Recovery must happen
+      // after the long window, not only after a single retry.
+      upstreams.yuenan.state.status = 200
+      upstreams.yuenan.state.delayMs = 0
+      upstreams.kkkkyue.state.delayMs = 0
+      upstreams.jinnyapi.state.delayMs = 0
+      await new Promise((resolve) => setTimeout(resolve, 35_000))
+      const stressRecoveryBefore = upstreams.yuenan.state.hits
+      const stressRecovery = await postMessages(baseUrl, 'stress-recovery', 64)
+      for (const { response } of stressRecovery) {
+        assert.equal(response.status, 200, `stress recovery returned ${response.status}: ${response.text.slice(0, 200)}`)
+      }
+      assert.ok(
+        upstreams.yuenan.state.hits > stressRecoveryBefore,
+        'primary pool did not receive traffic after sustained stress recovery',
+      )
+    }
 
     // Explicit external-direct must never rescue to the local credential,
     // even when every external pool returns a server error.
     upstreams.yuenan.state.status = 503
     upstreams.kkkkyue.state.status = 503
     upstreams.jinnyapi.state.status = 503
-    const localBefore = local.state.hits
+    const localBeforeInference = local.state.inferenceHits
     const directFailure = await postMessage(baseUrl, 'external-direct-no-local-rescue')
     assert.notEqual(directFailure.status, 200, `all external pools unexpectedly succeeded: ${directFailure.text}`)
-    assert.equal(local.state.hits, localBefore, 'external-direct failure silently fell back to local credential')
+    assert.equal(
+      local.state.inferenceHits,
+      localBeforeInference,
+      'external-direct failure silently fell back to local credential',
+    )
+    assert.equal(local.state.inferenceHits, 0, 'external-direct business traffic hit local credential')
     results.push({ phase: 'c-direct-no-local-rescue', status: directFailure.status })
 
     const report = {
@@ -432,7 +753,14 @@ async function main() {
         requestCount: value.state.requests.length,
         anthropicVersionPresent: value.state.requests.every((request) => Boolean(request.anthropicVersion)),
       }])),
-      localHits: local.state.hits,
+      local: {
+        hits: local.state.hits,
+        inferenceHits: local.state.inferenceHits,
+        requestCount: local.state.requests.length,
+        requests: local.state.requests.slice(-20),
+      },
+      stress: stressReport,
+      tempRoot: KEEP_TEMP ? TEMP_ROOT : null,
       results,
     }
     fs.writeFileSync(REPORT_PATH, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 })
@@ -448,7 +776,14 @@ async function main() {
         status: value.state.status,
         hits: value.state.hits,
       }])),
-      localHits: local.state.hits,
+      local: {
+        hits: local.state.hits,
+        inferenceHits: local.state.inferenceHits,
+        requestCount: local.state.requests.length,
+        requests: local.state.requests.slice(-20),
+      },
+      stress: null,
+      tempRoot: KEEP_TEMP ? TEMP_ROOT : null,
     }
     fs.mkdirSync(REPORT_ROOT, { recursive: true, mode: 0o700 })
     fs.writeFileSync(REPORT_PATH, `${JSON.stringify(failure, null, 2)}\n`, { mode: 0o600 })
@@ -456,7 +791,11 @@ async function main() {
   } finally {
     await stopChild(child)
     await Promise.all([...SERVERS].map((server) => new Promise((resolve) => server.close(resolve))))
-    fs.rmSync(TEMP_ROOT, { recursive: true, force: true })
+    if (!KEEP_TEMP) {
+      fs.rmSync(TEMP_ROOT, { recursive: true, force: true })
+    } else {
+      process.stderr.write(`kept validation temp root: ${TEMP_ROOT}\n`)
+    }
   }
   process.stdout.write(`${REPORT_PATH}\n`)
 }

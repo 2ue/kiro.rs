@@ -105,6 +105,41 @@ async fn test_external_pool_manager() -> Option<(ExternalPoolManager, Arc<Postgr
     Some((ExternalPoolManager::new(postgres.clone(), redis), postgres))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_local_mutations_keep_all_pools_when_own_event_is_observed() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+
+    for (index, name) in ["local-one", "local-two", "local-three"].iter().enumerate() {
+        let mut request = create_pool_request(name, (index + 1) as i32, true);
+        request.supported_models = vec!["claude-sonnet-4".to_string()];
+        let pool = postgres.create_external_pool(request).await.unwrap();
+        manager.notify_external_pool_data_changed_with_local_pool("test_local_create", &pool);
+
+        let generation = index as u64 + 1;
+        let own_event = serde_json::json!({
+            "generation": generation,
+            "reason": "test_local_create",
+            "poolId": pool.id,
+            "origin": manager.instance_id,
+        })
+        .to_string();
+        assert!(
+            !manager.observe_external_pool_data_event(&own_event),
+            "an event emitted by this process must not invalidate the just-merged local snapshot"
+        );
+        let snapshot = manager.load_authoritative_pool_snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.len(),
+            index + 1,
+            "local mutation {name} must retain all previously created pools"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 enum TestRawHttpBody {
     DeclaredOnly(usize),
     Chunked(Vec<u8>),
@@ -348,6 +383,187 @@ impl Drop for ExternalMessagesFakeServer {
     }
 }
 
+#[derive(Clone)]
+struct FlakyExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    remaining_failures: Arc<AtomicU64>,
+    failure_status: StatusCode,
+    failure_body: serde_json::Value,
+    success_body: serde_json::Value,
+}
+
+struct FlakyExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FlakyExternalMessagesFakeServer {
+    async fn start_failures_then_success(
+        failure_count: u64,
+        failure_status: StatusCode,
+        failure_body: serde_json::Value,
+        success_body: serde_json::Value,
+    ) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<FlakyExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            state.hits.fetch_add(1, Ordering::Relaxed);
+            let previous = state.remaining_failures.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| (current > 0).then(|| current - 1),
+            );
+            if previous.is_ok() {
+                (state.failure_status, axum::Json(state.failure_body.clone()))
+            } else {
+                (StatusCode::OK, axum::Json(state.success_body.clone()))
+            }
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let state = FlakyExternalMessagesFakeState {
+            hits: hits.clone(),
+            remaining_failures: Arc::new(AtomicU64::new(failure_count)),
+            failure_status,
+            failure_body,
+            success_body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind flaky external messages fake server");
+        let address = listener
+            .local_addr()
+            .expect("flaky external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve flaky external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> u64 {
+        self.hits.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for FlakyExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+struct TurbulentExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    fail_until_hit: u64,
+    fail_percent: u8,
+    seed: u64,
+    statuses: Arc<Vec<(StatusCode, String)>>,
+    success_body: serde_json::Value,
+}
+
+struct TurbulentExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TurbulentExternalMessagesFakeServer {
+    async fn start(
+        fail_until_hit: u64,
+        fail_percent: u8,
+        seed: u64,
+        statuses: Vec<(StatusCode, &str)>,
+        success_body: serde_json::Value,
+    ) -> Self {
+        assert!(!statuses.is_empty(), "turbulent statuses must not be empty");
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<TurbulentExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            let hit = state.hits.fetch_add(1, Ordering::Relaxed) + 1;
+            let should_fail = hit <= state.fail_until_hit
+                && deterministic_failure_percent(hit, state.seed) < state.fail_percent as u64;
+            if should_fail {
+                state.failures.fetch_add(1, Ordering::Relaxed);
+                let index = deterministic_failure_percent(hit, state.seed ^ 0x51d7_34a3) as usize
+                    % state.statuses.len();
+                let (status, message) = &state.statuses[index];
+                return (*status, axum::Json(fake_external_error_body(message)));
+            }
+            (StatusCode::OK, axum::Json(state.success_body.clone()))
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let state = TurbulentExternalMessagesFakeState {
+            hits: hits.clone(),
+            failures: failures.clone(),
+            fail_until_hit,
+            fail_percent: fail_percent.min(100),
+            seed,
+            statuses: Arc::new(
+                statuses
+                    .into_iter()
+                    .map(|(status, message)| (status, message.to_string()))
+                    .collect(),
+            ),
+            success_body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind turbulent external messages fake server");
+        let address = listener
+            .local_addr()
+            .expect("turbulent external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve turbulent external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            failures,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Acquire),
+            self.failures.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl Drop for TurbulentExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn deterministic_failure_percent(index: u64, seed: u64) -> u64 {
+    let mut mixed = index.wrapping_add(seed).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    mixed ^= mixed >> 33;
+    mixed % 100
+}
+
 fn fake_external_success_body(text: &str) -> serde_json::Value {
     serde_json::json!({
         "id": "msg_external_retry",
@@ -392,6 +608,15 @@ async fn create_messages_pool_with_concurrency(
     request.max_concurrent_requests = max_concurrent_requests;
     request.supported_models = vec!["claude-sonnet-4-6".to_string()];
     postgres.create_external_pool(request).await.unwrap()
+}
+
+async fn unused_loopback_base_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused loopback port");
+    let address = listener.local_addr().expect("unused loopback address");
+    drop(listener);
+    format!("http://{address}")
 }
 
 fn auxiliary_fallback_local_provider(base_url: &str, expired_for_refresh: bool) -> KiroProvider {
@@ -3681,7 +3906,7 @@ async fn external_pool_auto_disable_two_managers_claim_one_revision_transition_p
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_success_reset_coalesces_five_keys_and_obeys_task_cap() {
+async fn external_pool_success_reset_coalesces_auto_disable_keys_and_obeys_task_cap() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -3738,9 +3963,10 @@ async fn external_pool_success_reset_coalesces_five_keys_and_obeys_task_cap() {
         .get_json::<u64>(external_pool_transient_failure_key(pool_id))
         .await
         .unwrap();
-    assert!(
-        transient.is_none(),
-        "transient failure streak must be cleared"
+    assert_eq!(
+        transient,
+        Some(1),
+        "single successes must not erase soft failure health evidence during intermittent turbulence"
     );
 
     let held_permits = futures::future::join_all(
@@ -3765,29 +3991,25 @@ async fn external_pool_success_reset_coalesces_five_keys_and_obeys_task_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_transient_failure_cooldown_escalates_and_resets_after_success() {
+async fn external_pool_soft_failure_streak_accumulates_and_requires_manual_clear_or_ttl() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
     let pool_id = 43;
-    let base = Duration::from_secs(10);
 
-    let first = manager
-        .escalated_external_pool_cooldown(pool_id, base, "server_error")
+    manager
+        .record_external_pool_soft_failure(pool_id, "server_error")
         .await;
-    let second = manager
-        .escalated_external_pool_cooldown(pool_id, base, "server_error")
+    manager
+        .record_external_pool_soft_failure(pool_id, "server_error")
         .await;
-
-    assert!(first >= base);
-    assert!(
-        second > first,
-        "consecutive transient failures should extend the pool cooldown"
-    );
-    assert!(
-        second >= Duration::from_secs(16),
-        "second 5xx failure should be near a 2x cooldown even with jitter"
-    );
+    let streak = manager
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_key(pool_id))
+        .await
+        .unwrap()
+        .expect("soft failure streak should exist");
+    assert_eq!(streak, 2);
 
     manager.reset_pool_auto_disable_failure_counts(pool_id);
     timeout(Duration::from_secs(2), async {
@@ -3800,14 +4022,32 @@ async fn external_pool_transient_failure_cooldown_escalates_and_resets_after_suc
         }
     })
     .await
-    .expect("success reset should clear transient failure streak");
+    .expect("success reset should finish without clearing soft failure streak");
 
     let after_reset = manager
-        .escalated_external_pool_cooldown(pool_id, base, "server_error")
-        .await;
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_key(pool_id))
+        .await
+        .unwrap();
     assert_eq!(
-        after_reset, first,
-        "a later success should reset transient cooldown escalation"
+        after_reset,
+        Some(2),
+        "one later success should not reset accumulated soft failure streak"
+    );
+
+    let cleared = manager.clear_pool_cooldowns(pool_id).await.unwrap();
+    assert!(
+        cleared >= 1,
+        "manual clear should remove soft failure streak"
+    );
+    let after_clear = manager
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_key(pool_id))
+        .await
+        .unwrap();
+    assert!(
+        after_clear.is_none(),
+        "manual clear should reset the soft failure streak"
     );
 
     postgres.drop_test_schema().await.unwrap();
@@ -5294,7 +5534,7 @@ async fn external_pool_terminal_account_error_skips_same_pool_retry_and_fails_ov
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_retry_after_header_sets_real_pool_cooldown() {
+async fn external_pool_retry_after_header_records_soft_failure_without_pool_cooldown() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -5327,7 +5567,7 @@ async fn external_pool_retry_after_header_sets_real_pool_cooldown() {
         manager.forward_with_failover_result(config, route),
     )
     .await
-    .expect("Retry-After fake upstream request should finish");
+    .expect("rate-limit fake upstream request should finish");
     assert!(
         matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
         "single rate-limited pool should return a final error"
@@ -5337,13 +5577,16 @@ async fn external_pool_retry_after_header_sets_real_pool_cooldown() {
     let runtime = manager
         .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
         .await
-        .expect("read pool cooldown snapshot");
-    assert!(
-        (3..=4).contains(&runtime.pool_cooldown_remaining_secs),
-        "Retry-After should drive the real pool cooldown, got {:?}",
-        runtime.pool_cooldown_remaining_secs
+        .expect("read pool runtime snapshot");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "ordinary 429 must not hard-cool the whole external pool"
     );
-    assert_eq!(runtime.pool_cooldown_reason.as_deref(), Some("rate_limit"));
+    assert_eq!(runtime.pool_cooldown_reason.as_deref(), None);
+    assert_eq!(
+        runtime.transient_failure_streak, 1,
+        "ordinary 429 should only leave a short-lived health penalty"
+    );
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -5532,6 +5775,775 @@ async fn external_pool_transient_failure_penalty_moves_sustained_traffic_to_heal
     assert_eq!(selected_after_clear.id, primary.id);
 
     postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_one_wave_all_pools_transient_502_does_not_blackout_recovery() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let pool_a_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        1,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-a-recovered"),
+    )
+    .await;
+    let pool_b_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        1,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-b-recovered"),
+    )
+    .await;
+    let pool_c_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        1,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-c-recovered"),
+    )
+    .await;
+    let pool_a = create_messages_pool_with_concurrency(
+        &postgres,
+        "one-wave-primary",
+        1,
+        &pool_a_server.base_url,
+        64,
+    )
+    .await;
+    let pool_b = create_messages_pool_with_concurrency(
+        &postgres,
+        "one-wave-secondary",
+        10,
+        &pool_b_server.base_url,
+        64,
+    )
+    .await;
+    let pool_c = create_messages_pool_with_concurrency(
+        &postgres,
+        "one-wave-tertiary",
+        20,
+        &pool_c_server.base_url,
+        64,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 128,
+        external_pool_retry_max_attempts: 3,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        external_pool_server_error_cooldown_secs: 30,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let mut first_route = test_route("claude-sonnet-4-6");
+    first_route.request_id = "req_one_wave_first".to_string();
+    first_route.error_id = "err_one_wave_first".to_string();
+    first_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let first = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config.clone(), first_route),
+    )
+    .await
+    .expect("first wave should finish");
+    assert!(
+        matches!(first, ExternalPoolForwardOutcome::FinalError(_)),
+        "when every configured pool fails once, the first request can fail"
+    );
+    assert_eq!(pool_a_server.snapshot(), 1);
+    assert_eq!(pool_b_server.snapshot(), 1);
+    assert_eq!(pool_c_server.snapshot(), 1);
+
+    for pool in [&pool_a, &pool_b, &pool_c] {
+        let runtime = manager
+            .load_pool_runtime_snapshot(pool.id, &[])
+            .await
+            .expect("read runtime after one transient wave");
+        assert_eq!(
+            runtime.pool_cooldown_remaining_secs, 0,
+            "ordinary one-wave 502 must not hard-cool pool {}",
+            pool.name
+        );
+        assert_eq!(
+            runtime.transient_failure_streak, 1,
+            "ordinary one-wave 502 should only soft-penalize pool {}",
+            pool.name
+        );
+    }
+
+    let mut recovered_route = test_route("claude-sonnet-4-6");
+    recovered_route.request_id = "req_one_wave_recovered".to_string();
+    recovered_route.error_id = "err_one_wave_recovered".to_string();
+    recovered_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let recovered = timeout(
+        Duration::from_millis(750),
+        manager.forward_with_failover_result(config, recovered_route),
+    )
+    .await
+    .expect("recovered pools must be callable immediately after the transient wave");
+    match recovered {
+        ExternalPoolForwardOutcome::Response(response) => {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("recovered transient pools should not remain blacked out: {error:?}")
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn external_pool_high_concurrency_sustained_primary_502_transfers_to_backup_without_cooldown()
+{
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing_primary = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let healthy_secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-ok"),
+    )
+    .await;
+    let healthy_tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-ok"),
+    )
+    .await;
+    let primary = create_messages_pool_with_concurrency(
+        &postgres,
+        "concurrent-sustained-primary",
+        1,
+        &failing_primary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "concurrent-sustained-secondary",
+        10,
+        &healthy_secondary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "concurrent-sustained-tertiary",
+        20,
+        &healthy_tertiary.base_url,
+        128,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 384,
+        external_pool_retry_max_attempts: 3,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let run_batch = |batch: &'static str| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..64).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_{batch}_{index}");
+                    route.error_id = format!("err_{batch}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("concurrent request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_batch("concurrent_sustained_wave1").await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy backup should absorb concurrent primary failures: {error:?}")
+            }
+        }
+    }
+    let primary_after_first_wave = failing_primary.snapshot();
+    assert!(
+        primary_after_first_wave > 0,
+        "first wave must actually hit the failing priority-1 pool"
+    );
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary.id, &[])
+        .await
+        .expect("read primary runtime after high-concurrency wave");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "high-concurrency 502 wave must not hard-cool the primary pool"
+    );
+    assert!(
+        runtime.transient_failure_streak > 0,
+        "high-concurrency 502 wave should leave a soft health penalty"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_batch("concurrent_sustained_wave2").await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy backup should keep absorbing traffic after soft penalty: {error:?}")
+            }
+        }
+    }
+    let primary_second_wave_hits = failing_primary
+        .snapshot()
+        .saturating_sub(primary_after_first_wave);
+    assert!(
+        primary_second_wave_hits <= 2,
+        "soft penalty should prevent the failing priority-1 pool from monopolizing the next high-concurrency wave; got {primary_second_wave_hits} extra hits"
+    );
+    assert_eq!(
+        healthy_secondary
+            .snapshot()
+            .saturating_add(healthy_tertiary.snapshot()),
+        128,
+        "healthy backup pools should receive every successful request"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn external_pool_high_concurrency_random_mixed_status_turbulence_transfers_to_healthy_pools()
+{
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let primary = TurbulentExternalMessagesFakeServer::start(
+        10_000,
+        85,
+        0x5eed_2026,
+        vec![
+            (StatusCode::UNAUTHORIZED, "invalid token"),
+            (StatusCode::PAYMENT_REQUIRED, "no credit available"),
+            (StatusCode::FORBIDDEN, "security precaution"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate limit"),
+            (StatusCode::BAD_GATEWAY, "temporary upstream failure"),
+            (
+                StatusCode::from_u16(523).expect("523 is a valid HTTP status"),
+                "origin unreachable",
+            ),
+        ],
+        fake_external_success_body("primary-rare-ok"),
+    )
+    .await;
+    let secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-ok"),
+    )
+    .await;
+    let tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-ok"),
+    )
+    .await;
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "random-mixed-primary",
+        1,
+        &primary.base_url,
+        256,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "random-mixed-secondary",
+        10,
+        &secondary.base_url,
+        256,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "random-mixed-tertiary",
+        20,
+        &tertiary.base_url,
+        256,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 512,
+        external_pool_retry_max_attempts: 4,
+        external_pool_same_pool_retry_count: 0,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let run_batch = |batch: &'static str, size: usize| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..size).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_{batch}_{index}");
+                    route.error_id = format!("err_{batch}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(5));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("random mixed turbulence request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_batch("random_mixed_wave1", 128).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy external pools should absorb mixed temporary failures: {error:?}")
+            }
+        }
+    }
+    let (primary_wave1_hits, primary_wave1_failures) = primary.snapshot();
+    assert!(
+        primary_wave1_failures > 20,
+        "the first wave must exercise sustained mixed failures, got {primary_wave1_failures}"
+    );
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read primary runtime after random mixed wave");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "mixed 401/402/403/429/5xx turbulence must not hard-cool the primary pool"
+    );
+    assert!(
+        runtime.transient_failure_streak >= primary_wave1_failures as u32,
+        "mixed turbulence should accumulate soft evidence instead of being erased by rare successes"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_batch("random_mixed_wave2", 128).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!(
+                    "next traffic wave should stay on healthy pools while the primary is turbulent: {error:?}"
+                )
+            }
+        }
+    }
+    let (primary_total_hits, _) = primary.snapshot();
+    let primary_wave2_hits = primary_total_hits.saturating_sub(primary_wave1_hits);
+    assert!(
+        primary_wave2_hits <= 4,
+        "soft health penalty should prevent a turbulent priority-1 pool from reclaiming sustained traffic; got {primary_wave2_hits} extra hits"
+    );
+    assert!(
+        secondary.snapshot().saturating_add(tertiary.snapshot()) >= 220,
+        "healthy backup pools should carry most successful traffic under sustained mixed turbulence"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn external_pool_high_concurrency_network_turbulence_transfers_to_healthy_pools() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let primary_base_url = unused_loopback_base_url().await;
+    let secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-network-ok"),
+    )
+    .await;
+    let tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-network-ok"),
+    )
+    .await;
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "network-turbulence-primary",
+        1,
+        &primary_base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "network-turbulence-secondary",
+        10,
+        &secondary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "network-turbulence-tertiary",
+        20,
+        &tertiary.base_url,
+        128,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 384,
+        external_pool_retry_max_attempts: 3,
+        external_pool_retry_on_network_error: true,
+        external_pool_same_pool_retry_count: 0,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let run_batch = |batch: &'static str| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..64).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_{batch}_{index}");
+                    route.error_id = format!("err_{batch}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("network turbulence request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_batch("network_turbulence_wave1").await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb network failures: {error:?}")
+            }
+        }
+    }
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read primary runtime after network wave");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "connection-level turbulence must not hard-cool the primary pool"
+    );
+    assert!(
+        runtime.transient_failure_streak > 0,
+        "network failures should leave soft health evidence"
+    );
+    let first_streak = runtime.transient_failure_streak;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_batch("network_turbulence_wave2").await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("subsequent traffic should stay on healthy pools: {error:?}")
+            }
+        }
+    }
+    let after_second = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read primary runtime after second network wave");
+    assert!(
+        after_second.transient_failure_streak <= first_streak.saturating_add(2),
+        "soft penalty should stop repeated high-concurrency traffic from pounding the bad network pool"
+    );
+    assert!(
+        secondary.snapshot().saturating_add(tertiary.snapshot()) >= 120,
+        "healthy backup pools should carry sustained network turbulence traffic"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_all_pools_sustained_502_recovers_without_long_blackout() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let pool_a_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        20,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-a-recovered"),
+    )
+    .await;
+    let pool_b_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        20,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-b-recovered"),
+    )
+    .await;
+    let pool_c_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+        20,
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+        fake_external_success_body("pool-c-recovered"),
+    )
+    .await;
+    let pool_a = create_messages_pool_with_concurrency(
+        &postgres,
+        "sustained-all-primary",
+        1,
+        &pool_a_server.base_url,
+        64,
+    )
+    .await;
+    let pool_b = create_messages_pool_with_concurrency(
+        &postgres,
+        "sustained-all-secondary",
+        10,
+        &pool_b_server.base_url,
+        64,
+    )
+    .await;
+    let pool_c = create_messages_pool_with_concurrency(
+        &postgres,
+        "sustained-all-tertiary",
+        20,
+        &pool_c_server.base_url,
+        64,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 192,
+        external_pool_retry_max_attempts: 3,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    for index in 0..20 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_sustained_all_fail_{index}");
+        route.error_id = format!("err_sustained_all_fail_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("sustained all-pool failure request should finish");
+        assert!(
+            matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+            "all pools still failing should produce bounded final errors"
+        );
+    }
+    assert_eq!(pool_a_server.snapshot(), 20);
+    assert_eq!(pool_b_server.snapshot(), 20);
+    assert_eq!(pool_c_server.snapshot(), 20);
+
+    for pool in [&pool_a, &pool_b, &pool_c] {
+        let runtime = manager
+            .load_pool_runtime_snapshot(pool.id, &[])
+            .await
+            .expect("read runtime after sustained all-pool failure");
+        assert_eq!(
+            runtime.pool_cooldown_remaining_secs, 0,
+            "sustained ordinary failures must not create long pool cooldown for {}",
+            pool.name
+        );
+        assert!(
+            runtime.transient_failure_streak >= 20,
+            "sustained ordinary failures should accumulate soft evidence for {}",
+            pool.name
+        );
+    }
+
+    let mut recovered_route = test_route("claude-sonnet-4-6");
+    recovered_route.request_id = "req_sustained_all_recovered".to_string();
+    recovered_route.error_id = "err_sustained_all_recovered".to_string();
+    recovered_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let recovered = timeout(
+        Duration::from_millis(750),
+        manager.forward_with_failover_result(config, recovered_route),
+    )
+    .await
+    .expect("recovered pools should be callable without waiting for long cooldown");
+    match recovered {
+        ExternalPoolForwardOutcome::Response(response) => {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("recovered sustained-failure pools should not remain blacked out: {error:?}")
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_one_wave_account_capacity_and_quota_errors_soft_recover() {
+    for (case, status, message) in [
+        ("auth_401", StatusCode::UNAUTHORIZED, "invalid token"),
+        (
+            "security_403",
+            StatusCode::FORBIDDEN,
+            "account locked temporarily",
+        ),
+        (
+            "quota_402",
+            StatusCode::PAYMENT_REQUIRED,
+            "no credit available",
+        ),
+        ("rate_429", StatusCode::TOO_MANY_REQUESTS, "rate limit"),
+    ] {
+        let Some((manager, postgres)) = test_external_pool_manager().await else {
+            return;
+        };
+        let first_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+            1,
+            status,
+            fake_external_error_body(message),
+            fake_external_success_body(&format!("{case}-first-recovered")),
+        )
+        .await;
+        let second_server = FlakyExternalMessagesFakeServer::start_failures_then_success(
+            1,
+            status,
+            fake_external_error_body(message),
+            fake_external_success_body(&format!("{case}-second-recovered")),
+        )
+        .await;
+        let first_pool = create_messages_pool_with_concurrency(
+            &postgres,
+            &format!("{case}-primary"),
+            1,
+            &first_server.base_url,
+            32,
+        )
+        .await;
+        let second_pool = create_messages_pool_with_concurrency(
+            &postgres,
+            &format!("{case}-secondary"),
+            10,
+            &second_server.base_url,
+            32,
+        )
+        .await;
+
+        let config = ExternalPoolsConfig {
+            external_pools_enabled: true,
+            external_pool_global_max_concurrent_requests: 64,
+            external_pool_retry_max_attempts: 2,
+            external_pool_retry_status_codes: vec![status.as_u16()],
+            external_pool_same_pool_retry_count: 0,
+            external_pool_rate_limit_cooldown_secs: 30,
+            external_pool_protocol_error_cooldown_secs: 30,
+            external_pool_transient_failure_priority_penalty: 20,
+            ..ExternalPoolsConfig::default()
+        };
+
+        let mut first_route = test_route("claude-sonnet-4-6");
+        first_route.request_id = format!("req_one_wave_{case}_first");
+        first_route.error_id = format!("err_one_wave_{case}_first");
+        first_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let first = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), first_route),
+        )
+        .await
+        .expect("first account/capacity/quota wave should finish");
+        assert!(
+            matches!(first, ExternalPoolForwardOutcome::FinalError(_)),
+            "{case}: first request can fail when all pools fail once"
+        );
+
+        for pool in [&first_pool, &second_pool] {
+            let runtime = manager
+                .load_pool_runtime_snapshot(pool.id, &[])
+                .await
+                .expect("read runtime after one account/capacity/quota wave");
+            assert_eq!(
+                runtime.pool_cooldown_remaining_secs, 0,
+                "{case}: one temporary status must not hard-cool pool {}",
+                pool.name
+            );
+            assert_eq!(
+                runtime.transient_failure_streak, 1,
+                "{case}: one temporary status should only soft-penalize pool {}",
+                pool.name
+            );
+        }
+
+        let mut recovered_route = test_route("claude-sonnet-4-6");
+        recovered_route.request_id = format!("req_one_wave_{case}_recovered");
+        recovered_route.error_id = format!("err_one_wave_{case}_recovered");
+        recovered_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let recovered = timeout(
+            Duration::from_millis(750),
+            manager.forward_with_failover_result(config, recovered_route),
+        )
+        .await
+        .expect("recovered account/capacity/quota pools must be callable immediately");
+        match recovered {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK, "{case}");
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("{case}: recovered temporary pools should not remain blacked out: {error:?}")
+            }
+        }
+
+        postgres.drop_test_schema().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7199,7 +8211,7 @@ async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
 }
 
 #[test]
-fn external_pool_retry_after_header_overrides_retryable_cooldown_and_is_recorded() {
+fn external_pool_retry_after_header_classifies_rate_limit_as_soft_failure_hint() {
     let mut headers = HeaderMap::new();
     headers.insert(header::RETRY_AFTER, HeaderValue::from_static("4"));
     let err = classify_external_error(
@@ -7224,9 +8236,14 @@ fn external_pool_retry_after_header_overrides_retryable_cooldown_and_is_recorded
         anthropic_error_type_for_external_error(&err),
         false,
     );
-    let metadata = diagnostics.metadata.expect("retry-after metadata");
-    assert_eq!(metadata["cooldownReason"], "rate_limit");
-    assert_eq!(metadata["cooldownMs"], 4_000);
+    let metadata = diagnostics.metadata.expect("rate-limit metadata");
+    assert_eq!(metadata["softFailureReason"], "rate_limit");
+    assert_eq!(
+        metadata["softFailureWindowSecs"],
+        EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS as u64
+    );
+    assert!(metadata.get("cooldownReason").is_none());
+    assert!(metadata.get("cooldownMs").is_none());
 }
 
 #[test]
@@ -7288,7 +8305,8 @@ fn external_error_diagnostics_records_status_and_non_duplicate_metadata() {
     let metadata = diagnostics.metadata.unwrap();
     assert_eq!(metadata["responseErrorType"], "rate_limit_error");
     assert_eq!(metadata["retryable"], true);
-    assert_eq!(metadata["cooldownReason"], "rate_limit");
+    assert_eq!(metadata["softFailureReason"], "rate_limit");
+    assert!(metadata.get("cooldownReason").is_none());
     for duplicate_key in [
         "message",
         "rawMessage",
