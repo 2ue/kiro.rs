@@ -51,6 +51,8 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [远程图片/文档辅助请求、资源上限与 SSRF 连接绑定](remote-multimodal-resource-and-ssrf-bounds.md)
 - [external profile 与 SSE 安全](external-pool-profiles-and-sse-safety.md)
 - [外部池成功请求 0 计费与非流式 usage 捕获分裂](external-pool-success-zero-billing.md)
+- [外部池费用口径与 Dashboard 聚合差异](external-pool-billing-cost-statistics-20260803.md) - 2026-08-04 focused 复核通过：外部池原始成本优先按上游真实 usage，缺失时才使用本地估算 fallback；本地整形 usage 保持独立，PgSQL rollup、Redis Dashboard materialization、Admin UI build 和文档合同通过；生产升级后观察仍开放。
+- [外部池直连、模型映射与跨池重试异常](external-pool-direct-model-retry-20260804.md) - 2026-08-04 跨 159/170/142 证据矩阵已补齐；`usage` 明细只保存请求决策轨迹，不保存完整运行时配置快照；当前证据未证明外部直连隐式回本地。P0 已修复并 focused 验证：“请求正文模式”不再作为选池前置筛选、Raw 入口可重选标准处理池、外部池默认补 `anthropic-version`；“外部池最多尝试”与“同池重试次数”已分离，“跨池重试状态码”“网络错误跨池重试”“协议错误跨池重试”“同池重试状态码/间隔”“Retry-After 驱动的池级冷却”“连续瞬态失败冷却上浮”和“清除冷却”已通过本地隔离 PostgreSQL/Redis + fake upstream 验证；生产复发、候选筛选原因和模型字段可观测性仍开放。
 - [external pool Redis 协调、restart fencing 与 release backlog](external-pool-redis-coordination-and-release.md)
 - [external pool 权威选池 PostgreSQL 扇出与发送 revision fence](external-pool-authoritative-selection-and-dispatch-fence.md)
 - [重试预算、准入与 RPM 放大](retry-budget-admission-and-rpm-amplification.md)

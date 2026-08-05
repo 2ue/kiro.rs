@@ -6,10 +6,15 @@ Related:
 
 - [整体调度架构分析：本地凭证、外部池、fallback/rescue 与容量账本](../../../../../feature/issues/scheduler-architecture-analysis-purpose-and-plan.md)
 - [外部池调度影响本地凭据与 fallback 矩阵缺失](../../../../../feature/issues/external-pool-scheduler-interference-and-fallback-matrix-20260727.md)
+- [统一调度目标契约、状态机与验证方案](scheduler-target-state-machine-and-test-contract.md)
 
 ## 当前状态
 
-已有分析目的、范围、参考项目和源码参考位置，但还没有完成完整设计，也没有实现统一调度器。
+2026-08-04 已完成源码级调度分析和目标设计记录，但尚未实现统一调度器。权威分析文档已经覆盖本地账号、外部池、请求准入、容量/排队、冷却、同池/跨池重试、fallback/rescue、WebSearch/MCP、`sub2api` 对照、配置重组和验证矩阵：
+
+- [整体调度架构分析：本地凭证、外部池、fallback/rescue 与容量账本](../../../../../feature/issues/scheduler-architecture-analysis-purpose-and-plan.md)
+
+当前状态：`analysis-complete / target-design-proposed / implementation-not-authorized`。
 
 当前源码仍是多套局部机制叠加：
 
@@ -99,7 +104,8 @@ HTTP request
 验收：
 
 - dashboard/usage 能分别展示请求数、attempts、actual upstream sends。
-- 每条 usage 记录能说明这次请求产生了几个本地 send、几个外部 send、几个 MCP send。
+- usage 明细的调度诊断区域能说明这次请求产生了几个本地 send、几个外部 send、几个 MCP send；
+  这些计数不参与最终 usage token、usage 整形或费用计算。
 - request admission 可选择按 downstream requests 或 actual upstream sends 限制。
 
 ## P0-4：调度故障域隔离

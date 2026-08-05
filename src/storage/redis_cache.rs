@@ -326,12 +326,15 @@ pub struct ExternalPoolCoordinatorSnapshot {
     pub capacity: ExternalPoolCapacityState,
     pub cooldown_values: Vec<Option<String>>,
     pub cooldown_ttls: Vec<Option<StdDuration>>,
+    pub transient_failure_streak: u32,
+    pub transient_failure_ttl: Option<StdDuration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalPoolCoordinatorSnapshotRequest {
     pub pool_id: u64,
     pub cooldown_keys: Vec<String>,
+    pub transient_failure_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2012,7 +2015,6 @@ impl RedisStore {
         Ok(stats)
     }
 
-    #[cfg(test)]
     pub async fn incr_with_ttl(
         &self,
         key: impl AsRef<str>,
@@ -4780,6 +4782,7 @@ impl RedisStore {
                 &[ExternalPoolCoordinatorSnapshotRequest {
                     pool_id,
                     cooldown_keys: cooldown_keys.to_vec(),
+                    transient_failure_key: format!("external_pool:{pool_id}:transient_failures"),
                 }],
                 max_age,
                 coordination_epoch,
@@ -4854,13 +4857,21 @@ impl RedisStore {
                     table.insert(result, redis.call('PTTL', KEYS[key_index]))
                     key_index = key_index + 1
                 end
+                local transient_value = redis.pcall('GET', KEYS[key_index])
+                if type(transient_value) == 'table' and transient_value.err then
+                    table.insert(result, '__kiro_rs_invalid_redis_type__')
+                else
+                    table.insert(result, transient_value or '')
+                end
+                table.insert(result, redis.call('PTTL', KEYS[key_index]))
+                key_index = key_index + 1
             end
             return result
         "#;
         let global_keys = external_pool_global_in_flight_keys();
         let mut manager = self.scheduler_capacity_manager();
         let redis_key_count = requests.iter().fold(4usize, |count, request| {
-            count.saturating_add(2usize.saturating_add(request.cooldown_keys.len()))
+            count.saturating_add(3usize.saturating_add(request.cooldown_keys.len()))
         });
         let mut command = redis::cmd("EVAL");
         command
@@ -4878,6 +4889,7 @@ impl RedisStore {
             for key in &request.cooldown_keys {
                 command.arg(self.key(key));
             }
+            command.arg(self.key(&request.transient_failure_key));
         }
         command.arg(max_age_ms).arg(requests.len());
         for request in requests {
@@ -4899,7 +4911,7 @@ impl RedisStore {
         }
         let expected_values = requests.iter().fold(3usize, |count, request| {
             count.saturating_add(
-                2usize.saturating_add(request.cooldown_keys.len().saturating_mul(2)),
+                4usize.saturating_add(request.cooldown_keys.len().saturating_mul(2)),
             )
         });
         if result.len() != expected_values {
@@ -4926,6 +4938,18 @@ impl RedisStore {
                 cooldown_ttls
                     .push((ttl_ms >= 0).then(|| StdDuration::from_millis(ttl_ms.max(1) as u64)));
             }
+            let transient_value = redis::from_redis_value::<String>(&result[cursor])?;
+            cursor += 1;
+            let transient_ttl_ms = redis::from_redis_value::<i64>(&result[cursor])?;
+            cursor += 1;
+            let transient_failure_streak = transient_value
+                .parse::<u64>()
+                .ok()
+                .filter(|_| transient_ttl_ms >= 0)
+                .unwrap_or_default()
+                .min(u64::from(u32::MAX)) as u32;
+            let transient_failure_ttl = (transient_ttl_ms >= 0)
+                .then(|| StdDuration::from_millis(transient_ttl_ms.max(1) as u64));
             snapshots.push(ExternalPoolCoordinatorSnapshot {
                 capacity: ExternalPoolCapacityState {
                     pool_in_flight_requests,
@@ -4933,6 +4957,8 @@ impl RedisStore {
                 },
                 cooldown_values,
                 cooldown_ttls,
+                transient_failure_streak,
+                transient_failure_ttl,
             });
         }
         Ok(snapshots)
@@ -10171,6 +10197,7 @@ mod tests {
             .map(|pool_id| ExternalPoolCoordinatorSnapshotRequest {
                 pool_id: *pool_id,
                 cooldown_keys: vec![format!("external_pool:{pool_id}:cooldown")],
+                transient_failure_key: format!("external_pool:{pool_id}:transient_failures"),
             })
             .collect::<Vec<_>>();
         let snapshots = stores[0]

@@ -4,6 +4,24 @@ export const splitRules = (value: string) => value.split('\n').map((item) => ite
 export const joinRules = (value: string[] = []) => value.join('\n')
 export const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 
+export const parseStatusCodeList = (value: string): number[] => {
+  const seen = new Set<number>()
+  const codes: number[] = []
+  for (const raw of value.split(/[\s,，;；]+/)) {
+    const text = raw.trim()
+    if (!text) continue
+    const code = Number(text)
+    if (!Number.isInteger(code) || code < 100 || code > 599 || seen.has(code)) continue
+    seen.add(code)
+    codes.push(code)
+  }
+  return codes
+}
+
+export const joinStatusCodeList = (value: number[] = []) => value
+  .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
+  .join(', ')
+
 export const parseSupportedModelsText = (value: string): string[] => {
   const seen = new Set<string>()
   const models: string[] = []

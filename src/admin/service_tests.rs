@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::config::RequestAdmissionConfig;
+use crate::model::config::{ExternalPoolsConfig, RequestAdmissionConfig};
 use std::collections::HashSet;
 
 fn cleanup_request() -> UsageCleanupRequest {
@@ -136,6 +136,22 @@ fn runtime_cooldown_validation_rejects_zero_values() {
         validate_runtime_cooldown_settings(1, 2, &[1, 0]),
         Err(AdminServiceError::InvalidCredential(_))
     ));
+}
+
+#[test]
+fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_transient_failure_priority_penalty: 10_000,
+        ..ExternalPoolsConfig::default()
+    };
+    validate_external_pools_config(&config).expect("upper bound should be accepted");
+
+    config.external_pool_transient_failure_priority_penalty = 10_001;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(
+        err.contains("externalPoolTransientFailurePriorityPenalty"),
+        "unexpected validation error: {err}"
+    );
 }
 
 #[test]

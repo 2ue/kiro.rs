@@ -1357,6 +1357,13 @@ export interface ExternalPoolsConfig {
   externalPoolCapacityMode: 'fail_fast' | 'wait'
   externalPoolDispatchMaxWaitSecs: number
   externalPoolRetryMaxAttempts: number
+  externalPoolRetryStatusCodes: number[]
+  externalPoolRetryOnNetworkError: boolean
+  externalPoolRetryOnProtocolError: boolean
+  externalPoolSamePoolRetryCount: number
+  externalPoolSamePoolRetryStatusCodes: number[]
+  externalPoolSamePoolRetryDelayMs: number
+  externalPoolTransientFailurePriorityPenalty: number
   externalDirectPolicyEnabled: boolean
   directExternalOnLocalMaintenance: boolean
   directExternalModelRules: string[]
@@ -1443,6 +1450,8 @@ export interface ExternalPoolStatus {
   inFlight: number
   cooldownRemainingSecs: number
   cooldownReason?: string
+  transientFailureStreak: number
+  transientFailureTtlSecs: number
   dispatchable: boolean
   skippedReason?: string
 }

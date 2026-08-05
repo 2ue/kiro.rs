@@ -41,19 +41,26 @@ pub(super) fn prepare_request(
         } => (payload_guard, model, thinking_normalization),
     };
 
-    let Some(payload) = route.payload.as_ref() else {
-        return Err(ExternalPoolError {
-            status: None,
+    let raw_projection_payload = if route.payload.is_none() {
+        Some(external_route_raw_projection_payload(route).ok_or_else(|| ExternalPoolError {
+            status: Some(StatusCode::BAD_REQUEST),
             message: format!(
-                "external pool #{} requires normalized request body but raw route has no parsed payload",
+                "external pool #{} requires normalized request body but raw route could not be parsed",
                 pool.id
             ),
             retryable: false,
             auto_disable_reason: None,
-            cooldown: Some((Duration::ZERO, "body_mode_mismatch".to_string())),
+            cooldown: None,
             protocol_error: None,
-        });
+        })?)
+    } else {
+        None
     };
+    let payload = route
+        .payload
+        .as_ref()
+        .or(raw_projection_payload.as_deref())
+        .expect("raw projection payload is parsed when typed payload is missing");
 
     let normalized_base = route.preparation_cache.normalized_base.get_or_init(|| {
         route.preparation_cache.record_normalized_base_build();

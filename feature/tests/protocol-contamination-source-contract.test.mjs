@@ -166,7 +166,7 @@ test('history converter builds sanitizer scope from all current and historical t
 
 test('request entry blocks strict contamination and prevents raw external bypass after sanitization', () => {
   const source = sourceFile('src/anthropic/handlers/request_entry.rs')
-  const entry = sourceWindow(source, 'pub(super) async fn handle_messages_endpoint', 4_200)
+  const entry = sourceWindow(source, 'pub(super) async fn handle_messages_endpoint', 5_500)
 
   assert.match(entry, /let effective_raw_body = raw_body\.clone\(\)/)
   assert.match(entry, /sanitize_raw_request_assistant_history_with_probe\(\s*&raw_body,\s*&raw_probe/s)

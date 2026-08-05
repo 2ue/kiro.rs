@@ -17,6 +17,25 @@ pub(super) async fn handle_messages_endpoint(
         runtime_config.inference_upstream_max_attempts,
         runtime_config.auxiliary_upstream_max_attempts,
     ));
+    let local_dispatch_max_wait_secs = state
+        .kiro_provider
+        .as_ref()
+        .map(|provider| provider.runtime_config().credential_dispatch_max_wait_secs)
+        .unwrap_or(5);
+    let shared_dispatch_max_wait_secs = local_dispatch_max_wait_secs
+        .max(
+            runtime_config
+                .external_pools
+                .effective_dispatch_max_wait_secs(),
+        )
+        .max(
+            runtime_config
+                .external_pools
+                .external_pool_local_rescue_max_wait_secs,
+        );
+    inference_attempt_budget.set_dispatch_deadline_after(std::time::Duration::from_secs(
+        shared_dispatch_max_wait_secs.max(1),
+    ));
     let mut defaulted_max_tokens = None;
     let mut raw_probe = probe_raw_messages_body(&raw_body);
     if let Err(error) = apply_missing_max_tokens_policy_with_probe(

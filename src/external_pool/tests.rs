@@ -280,6 +280,120 @@ impl Drop for AuxiliaryFallbackFakeServer {
     }
 }
 
+#[derive(Clone)]
+struct ExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: serde_json::Value,
+}
+
+struct ExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExternalMessagesFakeServer {
+    async fn start(status: StatusCode, body: serde_json::Value) -> Self {
+        Self::start_with_headers(status, HeaderMap::new(), body).await
+    }
+
+    async fn start_with_headers(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: serde_json::Value,
+    ) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<ExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            state.hits.fetch_add(1, Ordering::Relaxed);
+            (state.status, state.headers.clone(), axum::Json(state.body))
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let state = ExternalMessagesFakeState {
+            hits: hits.clone(),
+            status,
+            headers,
+            body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind external messages fake server");
+        let address = listener.local_addr().expect("external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> u64 {
+        self.hits.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn fake_external_success_body(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "msg_external_retry",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 7, "output_tokens": 1}
+    })
+}
+
+fn fake_external_error_body(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {"type": "api_error", "message": message},
+        "type": "error"
+    })
+}
+
+async fn create_messages_pool(
+    postgres: &PostgresStore,
+    name: &str,
+    priority: i32,
+    base_url: &str,
+) -> ExternalPool {
+    let mut request = create_pool_request(name, priority, true);
+    request.base_url = base_url.to_string();
+    request.max_concurrent_requests = 4;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    postgres.create_external_pool(request).await.unwrap()
+}
+
+async fn create_messages_pool_with_concurrency(
+    postgres: &PostgresStore,
+    name: &str,
+    priority: i32,
+    base_url: &str,
+    max_concurrent_requests: u32,
+) -> ExternalPool {
+    let mut request = create_pool_request(name, priority, true);
+    request.base_url = base_url.to_string();
+    request.max_concurrent_requests = max_concurrent_requests;
+    request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    postgres.create_external_pool(request).await.unwrap()
+}
+
 fn auxiliary_fallback_local_provider(base_url: &str, expired_for_refresh: bool) -> KiroProvider {
     let mut config = Config::default();
     config.kiro_upstream_base_url = Some(base_url.to_string());
@@ -1448,6 +1562,7 @@ fn external_pool_skip_reason_respects_enabled_switches_and_capacity() {
 
 #[test]
 fn external_pool_candidate_selection_handles_multiple_backup_pools() {
+    let config = ExternalPoolsConfig::default();
     let mut primary = test_pool("https://primary.example.test", true);
     primary.id = 11;
     primary.priority = 1;
@@ -1461,27 +1576,56 @@ fn external_pool_candidate_selection_handles_multiple_backup_pools() {
     tertiary.priority = 3;
     tertiary.max_concurrent_requests = 1;
 
-    let selected = select_external_pool_candidate(vec![
-        (secondary.clone(), 0),
-        (tertiary.clone(), 0),
-        (primary.clone(), 0),
-    ])
+    let selected = select_external_pool_candidate(
+        vec![
+            (secondary.clone(), 0, 0),
+            (tertiary.clone(), 0, 0),
+            (primary.clone(), 0, 0),
+        ],
+        &config,
+    )
     .expect("candidate should be selected");
     assert_eq!(selected.id, primary.id);
 
-    let selected =
-        select_external_pool_candidate(vec![(secondary.clone(), 0), (tertiary.clone(), 0)])
-            .expect("fallback candidate should be selected when primary is excluded/full");
+    let selected = select_external_pool_candidate(
+        vec![(secondary.clone(), 0, 0), (tertiary.clone(), 0, 0)],
+        &config,
+    )
+    .expect("fallback candidate should be selected when primary is excluded/full");
     assert_eq!(selected.id, secondary.id);
 
     primary.priority = 1;
     secondary.priority = 1;
     primary.max_concurrent_requests = 2;
     secondary.max_concurrent_requests = 4;
-    let selected =
-        select_external_pool_candidate(vec![(primary.clone(), 1), (secondary.clone(), 1)])
-            .expect("lower same-priority load should be selected");
+    let selected = select_external_pool_candidate(
+        vec![(primary.clone(), 1, 0), (secondary.clone(), 1, 0)],
+        &config,
+    )
+    .expect("lower same-priority load should be selected");
     assert_eq!(selected.id, secondary.id);
+}
+
+#[test]
+fn external_pool_candidate_selection_penalizes_transient_failures() {
+    let config = ExternalPoolsConfig::default();
+    let mut failing_primary = test_pool("https://failing-primary.example.test", true);
+    failing_primary.id = 41;
+    failing_primary.priority = 1;
+    failing_primary.max_concurrent_requests = 4;
+    let mut healthy_backup = test_pool("https://healthy-backup.example.test", true);
+    healthy_backup.id = 42;
+    healthy_backup.priority = 10;
+    healthy_backup.max_concurrent_requests = 4;
+    let selected = select_external_pool_candidate(
+        vec![
+            (failing_primary.clone(), 0, 1),
+            (healthy_backup.clone(), 0, 0),
+        ],
+        &config,
+    )
+    .expect("healthy backup should be selected once the primary accumulated a transient failure");
+    assert_eq!(selected.id, healthy_backup.id);
 }
 
 #[tokio::test]
@@ -1994,7 +2138,7 @@ async fn external_pool_static_eligibility_snapshot_singleflights_models_and_body
                                 .await
                         }
                         3 => {
-                            !manager
+                            manager
                                 .has_eligible_pool_for_body_mode_and_model(
                                     &config,
                                     ExternalPoolRequestBodyMode::Normalized,
@@ -2065,7 +2209,7 @@ async fn external_pool_static_eligibility_snapshot_singleflights_models_and_body
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_fallback_body_mode_eligibility_is_raw_normalized_symmetric() {
+async fn external_pool_fallback_eligibility_uses_model_not_body_mode() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -2092,17 +2236,17 @@ async fn external_pool_fallback_body_mode_eligibility_is_raw_normalized_symmetri
                     Some("model-raw-only"),
                 )
                 .await,
-            "round {round}: raw-only model must match the raw pool"
+            "round {round}: raw-only model must match by supported model"
         );
         assert!(
-            !manager
+            manager
                 .has_eligible_pool_for_body_mode_and_model(
                     &config,
                     ExternalPoolRequestBodyMode::Normalized,
                     Some("model-raw-only"),
                 )
                 .await,
-            "round {round}: raw-only pool must not reserve normalized fallback"
+            "round {round}: body mode must not hide a model-supported raw pool"
         );
         assert!(
             manager
@@ -2112,17 +2256,17 @@ async fn external_pool_fallback_body_mode_eligibility_is_raw_normalized_symmetri
                     Some("model-normalized-only"),
                 )
                 .await,
-            "round {round}: normalized-only model must match the normalized pool"
+            "round {round}: normalized-only model must match by supported model"
         );
         assert!(
-            !manager
+            manager
                 .has_eligible_pool_for_body_mode_and_model(
                     &config,
                     ExternalPoolRequestBodyMode::RawPassthrough,
                     Some("model-normalized-only"),
                 )
                 .await,
-            "round {round}: normalized-only pool must not reserve raw fallback"
+            "round {round}: body mode must not hide a model-supported normalized pool"
         );
         assert!(
             manager
@@ -2414,7 +2558,7 @@ async fn external_pool_static_eligibility_invalidation_observes_every_pool_mutat
             .await
     );
     assert!(
-        !manager
+        manager
             .has_eligible_pool_for_body_mode_and_model(
                 &config,
                 ExternalPoolRequestBodyMode::Normalized,
@@ -3552,6 +3696,11 @@ async fn external_pool_success_reset_coalesces_five_keys_and_obeys_task_cap() {
             .await
             .unwrap();
     }
+    manager
+        .redis
+        .incr_with_ttl(external_pool_transient_failure_key(pool_id), 60)
+        .await
+        .unwrap();
     let started_before = manager.success_reset_tasks_started.load(Ordering::Acquire);
     for _ in 0..10_000 {
         manager.reset_pool_auto_disable_failure_counts(pool_id);
@@ -3584,6 +3733,15 @@ async fn external_pool_success_reset_coalesces_five_keys_and_obeys_task_cap() {
             .unwrap();
         assert!(value.is_none(), "reason {reason} must be cleared");
     }
+    let transient = manager
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_key(pool_id))
+        .await
+        .unwrap();
+    assert!(
+        transient.is_none(),
+        "transient failure streak must be cleared"
+    );
 
     let held_permits = futures::future::join_all(
         (0..EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS)
@@ -3603,6 +3761,55 @@ async fn external_pool_success_reset_coalesces_five_keys_and_obeys_task_cap() {
         "no task may be spawned after the hard task cap is exhausted"
     );
     drop(held_permits);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_transient_failure_cooldown_escalates_and_resets_after_success() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let pool_id = 43;
+    let base = Duration::from_secs(10);
+
+    let first = manager
+        .escalated_external_pool_cooldown(pool_id, base, "server_error")
+        .await;
+    let second = manager
+        .escalated_external_pool_cooldown(pool_id, base, "server_error")
+        .await;
+
+    assert!(first >= base);
+    assert!(
+        second > first,
+        "consecutive transient failures should extend the pool cooldown"
+    );
+    assert!(
+        second >= Duration::from_secs(16),
+        "second 5xx failure should be near a 2x cooldown even with jitter"
+    );
+
+    manager.reset_pool_auto_disable_failure_counts(pool_id);
+    timeout(Duration::from_secs(2), async {
+        while manager
+            .success_reset_tasks_in_flight
+            .load(Ordering::Acquire)
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("success reset should clear transient failure streak");
+
+    let after_reset = manager
+        .escalated_external_pool_cooldown(pool_id, base, "server_error")
+        .await;
+    assert_eq!(
+        after_reset, first,
+        "a later success should reset transient cooldown escalation"
+    );
+
     postgres.drop_test_schema().await.unwrap();
 }
 
@@ -3996,6 +4203,118 @@ async fn external_pool_cancelled_waiter_releases_redis_queue_lease() {
     postgres.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_dispatch_deadline_is_shared_with_capacity_wait() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_capacity_mode: ExternalPoolCapacityMode::Wait,
+        external_pool_max_queued_requests: 1,
+        external_pool_dispatch_max_wait_secs: 60,
+        external_pool_request_timeout_secs: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request("external-shared-deadline", 1, true))
+        .await
+        .unwrap();
+    let held_lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "external pool lease should be held before waiting: {}",
+                unavailable.detail
+            )
+        }
+    };
+
+    let mut route = test_route("claude-sonnet-4-5");
+    route.started_at = Instant::now() - Duration::from_secs(2);
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("expired dispatch deadline should terminate promptly");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "capacity wait must use the request's remaining deadline"
+    );
+    match outcome {
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            assert_eq!(error.route_error_type, "external_pool_deadline_exceeded");
+        }
+        ExternalPoolForwardOutcome::Response(_) => {
+            panic!("a held pool must not produce a response after the deadline")
+        }
+    }
+
+    drop(held_lease);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_dispatch_uses_shared_request_deadline_before_pool_timeout() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_capacity_mode: ExternalPoolCapacityMode::Wait,
+        external_pool_max_queued_requests: 1,
+        external_pool_dispatch_max_wait_secs: 60,
+        external_pool_request_timeout_secs: 60,
+        ..ExternalPoolsConfig::default()
+    };
+    let pool = postgres
+        .create_external_pool(create_pool_request(
+            "external-shared-request-deadline",
+            1,
+            true,
+        ))
+        .await
+        .unwrap();
+    let held_lease = match manager.acquire_pool(&pool, &config).await {
+        PoolAcquireResult::Acquired(lease) => lease,
+        PoolAcquireResult::Unavailable(unavailable) => {
+            panic!(
+                "external pool lease should be held before waiting: {}",
+                unavailable.detail
+            )
+        }
+    };
+
+    let route = test_route("claude-sonnet-4-5");
+    route
+        .inference_attempt_budget
+        .set_dispatch_deadline_after(Duration::from_millis(50));
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("shared request deadline should terminate capacity wait");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "shared deadline should win over the configured 60 second pool timeout"
+    );
+    match outcome {
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            assert_eq!(error.route_error_type, "external_pool_deadline_exceeded");
+        }
+        ExternalPoolForwardOutcome::Response(_) => {
+            panic!("a held pool must not produce a response after the shared deadline")
+        }
+    }
+
+    drop(held_lease);
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test]
 async fn external_pool_coordinator_failure_fails_closed_without_queue_admission() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
@@ -4032,6 +4351,7 @@ async fn external_pool_coordinator_failure_fails_closed_without_queue_admission(
             &mut queue_guard,
             &mut wait_started_at,
             &mut capacity_waiter,
+            None,
         )
         .await;
 
@@ -4092,6 +4412,7 @@ async fn legacy_zero_external_wait_reaches_a_bounded_final_error() {
             &mut queue_guard,
             &mut wait_started_at,
             &mut capacity_waiter,
+            None,
         )
         .await;
 
@@ -4162,6 +4483,7 @@ async fn external_pool_model_unavailable_cooldown_is_model_scoped_and_does_not_q
             &mut queue_guard,
             &mut wait_started_at,
             &mut capacity_waiter,
+            None,
         )
         .await;
     let ExternalCapacityDecision::FinalError(error) = decision else {
@@ -4563,7 +4885,23 @@ async fn external_pool_atomic_acquire_honors_pool_cooldown_and_fails_closed_on_b
         assert_eq!(blocked.reason, PoolCapacityWaitReason::Cooldown);
         assert_eq!(blocked.detail, "cooldown_during_atomic_acquire");
         assert!(blocked.wait_for.is_some());
-        manager.redis.del(&cooldown_key).await.unwrap();
+        let cleared = manager.clear_pool_cooldowns(pool.id).await.unwrap();
+        assert!(
+            cleared >= 1,
+            "round {round}: clearing pool cooldown should delete at least one Redis key"
+        );
+        let cleared_snapshot = manager
+            .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
+            .await
+            .unwrap();
+        assert_eq!(
+            cleared_snapshot.pool_cooldown_remaining_secs, 0,
+            "round {round}: cleared pool cooldown must be absent from the runtime snapshot"
+        );
+        assert!(
+            cleared_snapshot.model_cooldown.is_none(),
+            "round {round}: clearing pool cooldown should also clear model cooldown state"
+        );
 
         let before_model_race = manager
             .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
@@ -4597,13 +4935,20 @@ async fn external_pool_atomic_acquire_honors_pool_cooldown_and_fails_closed_on_b
             0,
             "round {round}: rejected model cooldown race must not occupy a lease"
         );
-        for model in &model_cooldown_candidates {
-            manager
-                .redis
-                .del(external_pool_model_cooldown_key(pool.id, model))
-                .await
-                .unwrap();
-        }
+        let cleared = manager.clear_pool_cooldowns(pool.id).await.unwrap();
+        assert!(
+            cleared >= 1,
+            "round {round}: clearing model cooldown should delete at least one Redis key"
+        );
+        let cleared_snapshot = manager
+            .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
+            .await
+            .unwrap();
+        assert_eq!(cleared_snapshot.pool_cooldown_remaining_secs, 0);
+        assert!(
+            cleared_snapshot.model_cooldown.is_none(),
+            "round {round}: cleared model cooldown must be absent from the runtime snapshot"
+        );
 
         manager
             .redis
@@ -4634,6 +4979,557 @@ async fn external_pool_atomic_acquire_honors_pool_cooldown_and_fails_closed_on_b
         let drained = manager.drain_release_intents(Duration::from_secs(5)).await;
         assert!(drained.drained, "round {round}: release task should drain");
     }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_same_pool_retry_runs_even_when_pool_attempt_budget_is_one_for_five_rounds() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    create_messages_pool(&postgres, "same-pool-budget-primary", 1, &failing.base_url).await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 4,
+        external_pool_retry_max_attempts: 1,
+        external_pool_same_pool_retry_count: 1,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_retry_budget".to_string();
+    route.error_id = "err_same_pool_retry_budget".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("same-pool retry should finish");
+    assert!(
+        matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+        "single permanently failing pool should still end with a final error"
+    );
+    assert_eq!(
+        failing.snapshot(),
+        2,
+        "same-pool retry must not be blocked by the one-pool cross-pool attempt budget"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configured_status() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("retry-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-before-failover-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-before-failover-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 1,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_before_failover".to_string();
+    route.error_id = "err_same_pool_before_failover".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("same-pool retry failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("configured retryable status should reach secondary pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read retry success body");
+    assert!(
+        body.windows(b"retry-ok".len())
+            .any(|window| window == b"retry-ok")
+    );
+    assert_eq!(
+        failing.snapshot(),
+        2,
+        "configured status should retry the selected pool before switching"
+    );
+    assert_eq!(
+        succeeding.snapshot(),
+        1,
+        "secondary pool should be tried after same-pool retry is exhausted"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("no-same-pool-retry-ok"),
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-status-filter-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-status-filter-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::TOO_MANY_REQUESTS.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_status_filter".to_string();
+    route.error_id = "err_same_pool_status_filter".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("status-filtered failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("unconfigured status should switch pools without same-pool retry: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        1,
+        "status not listed in 同池重试状态码 must not retry the same pool"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_cross_pool_retry_status_codes_can_stop_failover() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("unused"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "cross-pool-status-filter-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "cross-pool-status-filter-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_retry_status_codes: vec![StatusCode::TOO_MANY_REQUESTS.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_cross_pool_status_filter".to_string();
+    route.error_id = "err_cross_pool_status_filter".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("cross-pool status filtering should finish");
+    assert!(
+        matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+        "a status excluded from cross-pool retry must fail without switching pools"
+    );
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_terminal_account_error_skips_same_pool_retry_and_fails_over() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::UNAUTHORIZED,
+        fake_external_error_body("invalid token"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("auth-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "terminal-account-error-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "terminal-account-error-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::UNAUTHORIZED.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_terminal_account_error".to_string();
+    route.error_id = "err_terminal_account_error".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("terminal account failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("terminal account error should fail over to the next pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        1,
+        "auth errors should cool down and fail over instead of retrying the same account"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_retry_after_header_sets_real_pool_cooldown() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RETRY_AFTER, HeaderValue::from_static("4"));
+    let failing = ExternalMessagesFakeServer::start_with_headers(
+        StatusCode::TOO_MANY_REQUESTS,
+        headers,
+        fake_external_error_body("rate limited"),
+    )
+    .await;
+    let pool =
+        create_messages_pool(&postgres, "retry-after-real-cooldown", 1, &failing.base_url).await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 4,
+        external_pool_retry_max_attempts: 1,
+        external_pool_same_pool_retry_count: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_retry_after_real_cooldown".to_string();
+    route.error_id = "err_retry_after_real_cooldown".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+    let model_cooldown_candidates = route.model_cooldown_candidates();
+
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("Retry-After fake upstream request should finish");
+    assert!(
+        matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+        "single rate-limited pool should return a final error"
+    );
+    assert_eq!(failing.snapshot(), 1);
+
+    let runtime = manager
+        .load_pool_runtime_snapshot(pool.id, &model_cooldown_candidates)
+        .await
+        .expect("read pool cooldown snapshot");
+    assert!(
+        (3..=4).contains(&runtime.pool_cooldown_remaining_secs),
+        "Retry-After should drive the real pool cooldown, got {:?}",
+        runtime.pool_cooldown_remaining_secs
+    );
+    assert_eq!(runtime.pool_cooldown_reason.as_deref(), Some("rate_limit"));
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_transient_failure_penalty_moves_sustained_traffic_to_healthy_backup() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing_primary = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let healthy_secondary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-secondary-ok"),
+    )
+    .await;
+    let healthy_tertiary = ExternalMessagesFakeServer::start(
+        StatusCode::OK,
+        fake_external_success_body("healthy-tertiary-ok"),
+    )
+    .await;
+    let primary = create_messages_pool_with_concurrency(
+        &postgres,
+        "transient-priority-primary",
+        1,
+        &failing_primary.base_url,
+        64,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "transient-priority-secondary",
+        10,
+        &healthy_secondary.base_url,
+        64,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "transient-priority-tertiary",
+        20,
+        &healthy_tertiary.base_url,
+        64,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 128,
+        external_pool_retry_max_attempts: 3,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        external_pool_server_error_cooldown_secs: 1,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let mut first_route = test_route("claude-sonnet-4-6");
+    first_route.request_id = "req_transient_priority_first".to_string();
+    first_route.error_id = "err_transient_priority_first".to_string();
+    first_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config.clone(), first_route),
+    )
+    .await
+    .expect("first failover request should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("primary 502 should fail over to a healthy backup: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(failing_primary.snapshot(), 1);
+    assert_eq!(healthy_secondary.snapshot(), 1);
+    assert_eq!(healthy_tertiary.snapshot(), 0);
+
+    let runtime_after_failure = manager
+        .load_pool_runtime_snapshot(primary.id, &[])
+        .await
+        .expect("read primary runtime after failure");
+    assert_eq!(runtime_after_failure.transient_failure_streak, 1);
+    assert!(
+        runtime_after_failure.transient_failure_ttl.is_some(),
+        "primary transient failure window should remain after the failed send"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+
+    let statuses = manager
+        .status(&config)
+        .await
+        .expect("read external pool status");
+    let primary_status = statuses
+        .iter()
+        .find(|status| status.pool.id == primary.id)
+        .expect("primary status");
+    assert_eq!(primary_status.transient_failure_streak, 1);
+    assert!(
+        primary_status.transient_failure_ttl_secs > 0,
+        "status should expose the remaining transient failure window"
+    );
+
+    for index in 0..5 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_transient_priority_seq_{index}");
+        route.error_id = format!("err_transient_priority_seq_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let response = match timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("sequential backup request should finish")
+        {
+            ExternalPoolForwardOutcome::Response(response) => response,
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("sequential traffic should stay on a healthy backup: {error:?}")
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        failing_primary.snapshot(),
+        1,
+        "primary must not be retried immediately after its short cooldown expires"
+    );
+    assert_eq!(healthy_secondary.snapshot(), 6);
+
+    let concurrent = futures::future::join_all((0..24).map(|index| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            let mut route = test_route("claude-sonnet-4-6");
+            route.request_id = format!("req_transient_priority_concurrent_{index}");
+            route.error_id = format!("err_transient_priority_concurrent_{index}");
+            route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+            timeout(
+                Duration::from_secs(3),
+                manager.forward_with_failover_result(config, route),
+            )
+            .await
+            .expect("concurrent backup request should finish")
+        }
+    }))
+    .await;
+    for outcome in concurrent {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("concurrent traffic should stay on healthy backup pools: {error:?}")
+            }
+        }
+    }
+    assert_eq!(
+        failing_primary.snapshot(),
+        1,
+        "concurrent traffic must not be trapped by the failed priority-1 pool"
+    );
+    assert_eq!(
+        healthy_secondary.snapshot(),
+        30,
+        "healthy priority-10 backup should carry the redirected traffic"
+    );
+    assert_eq!(healthy_tertiary.snapshot(), 0);
+
+    let cleared = manager
+        .clear_pool_cooldowns(primary.id)
+        .await
+        .expect("clear primary cooldowns and transient failure window");
+    assert!(
+        cleared >= 1,
+        "clear cooldown should also remove the transient failure window"
+    );
+    let selected_after_clear = manager
+        .select_pool_for_route(&HashSet::new(), &config, &test_route("claude-sonnet-4-6"))
+        .await
+        .selected_pool
+        .expect("primary should be eligible again after manual clear");
+    assert_eq!(selected_after_clear.id, primary.id);
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -6303,6 +7199,60 @@ async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
 }
 
 #[test]
+fn external_pool_retry_after_header_overrides_retryable_cooldown_and_is_recorded() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RETRY_AFTER, HeaderValue::from_static("4"));
+    let err = classify_external_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        Bytes::from_static(
+            br#"{"error":{"type":"rate_limit_error","message":"slow down"},"type":"error"}"#,
+        ),
+        headers,
+        &ExternalPoolsConfig::default(),
+    );
+
+    assert_eq!(
+        err.cooldown,
+        Some((Duration::from_secs(4), "rate_limit".to_string()))
+    );
+
+    let mut route = test_route("claude-sonnet-4-6");
+    route.error_id = "req_01retryafter".to_string();
+    let diagnostics = external_error_diagnostics(
+        &route,
+        &err,
+        anthropic_error_type_for_external_error(&err),
+        false,
+    );
+    let metadata = diagnostics.metadata.expect("retry-after metadata");
+    assert_eq!(metadata["cooldownReason"], "rate_limit");
+    assert_eq!(metadata["cooldownMs"], 4_000);
+}
+
+#[test]
+fn external_pool_retry_after_http_date_is_bounded() {
+    let retry_at = (Utc::now() + chrono::Duration::days(30)).to_rfc2822();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&retry_at).expect("retry-after date header"),
+    );
+    let err = classify_external_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from_static(br#"{"error":{"message":"temporarily unavailable"}}"#),
+        headers,
+        &ExternalPoolsConfig::default(),
+    );
+
+    let (cooldown, reason) = err.cooldown.expect("server cooldown");
+    assert_eq!(reason, "server_error");
+    assert_eq!(
+        cooldown,
+        Duration::from_secs(EXTERNAL_POOL_RETRY_AFTER_MAX_SECS)
+    );
+}
+
+#[test]
 fn external_pool_error_classifies_nested_rate_limit_body() {
     let err = classify_external_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -7341,6 +8291,65 @@ fn supported_model_filter_requires_a_candidate_when_list_is_restricted() {
     ));
 }
 
+#[test]
+fn forward_headers_adds_default_anthropic_version_for_external_auth_modes() {
+    let headers = HeaderMap::new();
+    let mut bearer_pool = test_pool("https://example.com/v1", true);
+    bearer_pool.auth_type = ExternalPoolAuthType::Bearer;
+    bearer_pool.api_key = Some("sk-bearer".to_string());
+
+    let bearer = forward_headers(&headers, &bearer_pool).expect("bearer headers");
+    assert_eq!(
+        bearer
+            .get(HeaderName::from_static("anthropic-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    assert_eq!(
+        bearer
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer sk-bearer")
+    );
+    assert!(bearer.get(HeaderName::from_static("x-api-key")).is_none());
+
+    let mut x_api_key_pool = bearer_pool;
+    x_api_key_pool.auth_type = ExternalPoolAuthType::XApiKey;
+    x_api_key_pool.api_key = Some("sk-x-api-key".to_string());
+    let x_api_key = forward_headers(&headers, &x_api_key_pool).expect("x-api-key headers");
+    assert_eq!(
+        x_api_key
+            .get(HeaderName::from_static("anthropic-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    assert_eq!(
+        x_api_key
+            .get(HeaderName::from_static("x-api-key"))
+            .and_then(|value| value.to_str().ok()),
+        Some("sk-x-api-key")
+    );
+    assert!(x_api_key.get(header::AUTHORIZATION).is_none());
+}
+
+#[test]
+fn forward_headers_preserves_client_anthropic_version() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static("2024-02-29"),
+    );
+    let pool = test_pool("https://example.com/v1", true);
+
+    let forwarded = forward_headers(&headers, &pool).expect("headers");
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("anthropic-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("2024-02-29")
+    );
+}
+
 fn test_external_pool_outbound_body(route: &ExternalRouteRequest, pool: &ExternalPool) -> Bytes {
     external_pool_outbound_body(route, pool).expect("build external outbound body")
 }
@@ -7726,6 +8735,90 @@ fn external_pool_raw_passthrough_keeps_body_byte_for_byte() {
 
     assert_eq!(prepared.body, Bytes::from_static(raw));
     assert!(prepared.outbound_model.is_none());
+}
+
+#[test]
+fn raw_route_can_build_normalized_body_for_selected_normalized_pool() {
+    let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}],"max_tokens":8}"#;
+    let route = raw_test_route(raw);
+    assert!(route.payload.is_none());
+    assert_eq!(
+        route.body_mode_filter,
+        Some(ExternalPoolRequestBodyMode::RawPassthrough)
+    );
+
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+    pool.supported_models = vec!["client-model".to_string()];
+
+    let prepared = external_pool_prepare_request(&route, &pool)
+        .expect("raw route should lazily parse for normalized pool");
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("normalized body remains JSON");
+
+    assert_eq!(value["model"], "client-model");
+    assert_eq!(value["messages"][0]["content"], "hello");
+    assert_eq!(value["max_tokens"], 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_route_failover_reselects_normalized_pool_by_model_after_raw_pool_502() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let (bad_gateway_url, bad_gateway_task) = spawn_test_raw_http_response(
+        StatusCode::BAD_GATEWAY,
+        TestRawHttpBody::Fixed(
+            br#"{"error":{"message":"upstream temporarily unavailable"}}"#.to_vec(),
+        ),
+    )
+    .await;
+    let normalized_fake = AuxiliaryFallbackFakeServer::start().await;
+
+    let mut raw_pool = create_pool_request("raw-first-502", 1, true);
+    raw_pool.base_url = bad_gateway_url;
+    raw_pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+    raw_pool.raw_model_mode = ExternalPoolRawModelMode::None;
+    raw_pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+    raw_pool.supported_models = vec!["client-model".to_string()];
+    postgres.create_external_pool(raw_pool).await.unwrap();
+
+    let mut normalized_pool = create_pool_request("normalized-second-ok", 10, true);
+    normalized_pool.base_url = normalized_fake.base_url.clone();
+    normalized_pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+    normalized_pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+    normalized_pool.supported_models = vec!["client-model".to_string()];
+    postgres
+        .create_external_pool(normalized_pool)
+        .await
+        .unwrap();
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 2,
+        ..ExternalPoolsConfig::default()
+    };
+    let route = raw_test_route(
+        br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}],"max_tokens":8}"#,
+    );
+    let hits_before = normalized_fake.snapshot().3;
+
+    let response = match manager.forward_with_failover_result(config, route).await {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("raw 502 should retry a model-supported normalized pool: {error:?}");
+        }
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(normalized_fake.snapshot().3, hits_before + 1);
+    timeout(Duration::from_secs(2), bad_gateway_task)
+        .await
+        .expect("raw failing pool should have been tried")
+        .expect("raw failing pool task should finish");
+
+    postgres.drop_test_schema().await.unwrap();
 }
 
 #[test]
@@ -8827,6 +9920,69 @@ fn openai_usage_is_normalized_for_non_stream_external_pool_body() {
     assert_eq!(billing.raw_usage.input_tokens, 11);
     assert_eq!(billing.reported_usage.output_tokens, 3);
     assert_eq!(billing.usage_candidate_path.as_deref(), Some("$.usage"));
+    assert!(!billing.usage_estimated);
+}
+
+#[test]
+fn openai_usage_is_captured_for_stream_external_pool_billing() {
+    let route = test_route("claude-opus-4-6");
+    let pool = test_pool("http://pool.example.com", false);
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+
+    capture_sse_event_usage(
+        br#"event: message_delta
+data: {"type":"message_delta","usage":{"prompt_tokens":1234,"completion_tokens":56,"total_tokens":1290}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+
+    let billing = external_pool_billing_from_capture_ref(&route, &pool, &capture)
+        .expect("stream usage should produce billing");
+    assert_eq!(billing.raw_usage.input_tokens, 1234);
+    assert_eq!(billing.raw_usage.output_tokens, 56);
+    assert_eq!(billing.reported_usage.input_tokens, 1234);
+    assert_eq!(billing.reported_usage.output_tokens, 56);
+    assert!(!billing.usage_estimated);
+    assert_eq!(
+        billing.usage_candidate_path, None,
+        "stream captures do not assign a non-stream candidate path"
+    );
+}
+
+#[test]
+fn openai_stream_usage_keeps_local_shaping_separate_from_raw_billing() {
+    let route = test_route("claude-opus-4-6");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+        stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
+        ..ExternalUsageCapture::default()
+    }));
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"prompt_tokens":1234,"completion_tokens":56,"total_tokens":1290}}
+
+"#;
+
+    let rewritten = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let value = event_data_value(&rewritten);
+    assert_eq!(value["usage"]["output_tokens"], 56);
+
+    let billing = external_pool_billing_from_capture_ref(&route, &pool, &capture)
+        .expect("stream usage should produce billing");
+    assert_eq!(billing.raw_usage.input_tokens, 1234);
+    assert_eq!(billing.raw_usage.output_tokens, 56);
+    assert_eq!(billing.shaped_usage.output_tokens, 56);
+    assert_eq!(
+        value["usage"]["input_tokens"].as_i64(),
+        Some(billing.reported_usage.input_tokens as i64)
+    );
+    assert!(billing.usage_projection_applied);
     assert!(!billing.usage_estimated);
 }
 

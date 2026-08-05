@@ -6,7 +6,7 @@ Status: `In Progress`
 
 Current phase: `external-pool hot-path fixed / scheduler architecture and signature blockers open`
 
-Last reviewed: 2026-07-31 Asia/Shanghai
+Last reviewed: 2026-08-04 Asia/Shanghai
 
 Authority:
 
@@ -21,12 +21,17 @@ Authority:
 3. Topics:
    - [外部池与本地凭证调度](topics/external-pool-local-first-scheduler.md)
    - [整体调度架构优化](topics/route-planner-capacity-ledger.md)
+   - [统一调度目标契约、状态机与验证方案](topics/scheduler-target-state-machine-and-test-contract.md)
+   - [当前目标符合度矩阵](topics/scheduler-target-compliance-matrix.md)
+   - [持续调度验证方案](topics/sustained-scheduling-validation.md)
    - [Thinking signature 协议安全](topics/thinking-signature-protocol-safety.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
-4. Indexes:
+4. Decisions:
+   - [Decision 001：本地账号与外部池统一调度目标契约](decisions/001-local-external-scheduler-target-contract.md)
+5. Indexes:
    - [项目文档处置索引](indexes/document-disposition.md)
    - [Issue status governance](indexes/issue-status-governance.md)
-5. History:
+6. History:
    - [Evidence index](history/evidence-index.md)
 
 ## Scope

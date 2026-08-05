@@ -9902,16 +9902,32 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                 start.wait().await;
 
                 let scheduler_started = Instant::now();
-                let scheduler_lease = manager
-                    .acquire_in_flight_slot(1, 1)
-                    .await
+                let scheduler_result = manager.acquire_in_flight_slot(1, 1).await;
+                let scheduler_elapsed = scheduler_started.elapsed();
+                let scheduler_lease = scheduler_result
                     .unwrap_or_else(|error| {
+                        let breaker = manager.scheduler_redis_breaker.stats_snapshot();
                         panic!(
-                            "{scenario}: scheduler must remain available below the 250ms capacity deadline: {error}"
+                            "{scenario}: scheduler must remain available below the 250ms capacity deadline: \
+                             error={error}; elapsed={scheduler_elapsed:?}; \
+                             breaker_degraded={}; breaker_admitted={}; breaker_failures={}; \
+                             breaker_fail_fast={}; usage_round_trips={}; route_state={:?}",
+                            manager.scheduler_redis_breaker.is_degraded(),
+                            breaker.admitted,
+                            breaker.failures,
+                            breaker.fail_fast,
+                            redis_store.usage_summary_write_round_trips(),
+                            manager.local_pool_route_state(None).kind,
                         )
                     })
-                    .unwrap_or_else(|| panic!("{scenario}: scheduler unexpectedly had no capacity"));
-                let scheduler_elapsed = scheduler_started.elapsed();
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{scenario}: scheduler unexpectedly had no capacity; \
+                             elapsed={scheduler_elapsed:?}; usage_round_trips={}; route_state={:?}",
+                            redis_store.usage_summary_write_round_trips(),
+                            manager.local_pool_route_state(None).kind,
+                        )
+                    });
                 drop(scheduler_lease);
                 let usage = tokio::time::timeout(StdDuration::from_secs(8), usage)
                     .await
@@ -10499,8 +10515,13 @@ async fn redis_lease_release_is_non_blocking_under_latency_and_burst() {
         eprintln!("跳过 Redis lease release latency 测试：未设置 KIRO_RS_TEST_REDIS_URL");
         return;
     };
+    let mut test_config = Config::default();
+    // This test intentionally creates 300 simultaneous leases to verify that
+    // dropping the guards never waits on Redis. Keep the fixture capacity
+    // unlimited; the production default remains bounded.
+    test_config.credential_max_concurrent_requests = 0;
     let manager = MultiTokenManager::new_with_stores(
-        Config::default(),
+        test_config,
         vec![api_key_credential("release-latency-burst")],
         None,
         None,

@@ -2790,6 +2790,32 @@ pub struct ExternalPoolsConfig {
     pub external_pool_dispatch_max_wait_secs: u64,
     #[serde(default = "default_external_pool_retry_max_attempts")]
     pub external_pool_retry_max_attempts: u32,
+    /// 外部池之间故障转移时允许重试的 HTTP 状态码。
+    ///
+    /// 认证、配额、渠道禁用等已被分类为账号级临时不可调度的错误，
+    /// 即使不在此列表中也仍会按分类结果切换到其他外部池；该列表控制
+    /// 普通 HTTP 错误是否继续消耗跨池重试预算。
+    #[serde(default = "default_external_pool_retry_status_codes")]
+    pub external_pool_retry_status_codes: Vec<u16>,
+    /// 连接、DNS、超时等没有 HTTP 状态码的网络错误是否允许跨池重试。
+    #[serde(default = "default_true")]
+    pub external_pool_retry_on_network_error: bool,
+    /// 成功状态码下返回错误信封、SSE 协议污染等协议错误是否允许跨池重试。
+    #[serde(default = "default_true")]
+    pub external_pool_retry_on_protocol_error: bool,
+    #[serde(default = "default_external_pool_same_pool_retry_count")]
+    pub external_pool_same_pool_retry_count: u32,
+    #[serde(default = "default_external_pool_same_pool_retry_status_codes")]
+    pub external_pool_same_pool_retry_status_codes: Vec<u16>,
+    #[serde(default = "default_external_pool_same_pool_retry_delay_ms")]
+    pub external_pool_same_pool_retry_delay_ms: u64,
+    /// 外部池瞬态失败调度罚分。
+    ///
+    /// 每一个仍在 Redis 瞬态失败窗口内的失败 streak，都会临时增加池的
+    /// 有效优先级。默认 20 可让优先级 1 的故障池在一次可重试失败后让位给
+    /// 优先级 10/20 的健康池；填 0 会退回只按配置优先级和负载排序。
+    #[serde(default = "default_external_pool_transient_failure_priority_penalty")]
+    pub external_pool_transient_failure_priority_penalty: u32,
     #[serde(default)]
     pub external_direct_policy_enabled: bool,
     #[serde(default)]
@@ -2894,6 +2920,16 @@ impl Default for ExternalPoolsConfig {
             external_pool_capacity_mode: ExternalPoolCapacityMode::default(),
             external_pool_dispatch_max_wait_secs: default_external_pool_dispatch_max_wait_secs(),
             external_pool_retry_max_attempts: default_external_pool_retry_max_attempts(),
+            external_pool_retry_status_codes: default_external_pool_retry_status_codes(),
+            external_pool_retry_on_network_error: true,
+            external_pool_retry_on_protocol_error: true,
+            external_pool_same_pool_retry_count: default_external_pool_same_pool_retry_count(),
+            external_pool_same_pool_retry_status_codes:
+                default_external_pool_same_pool_retry_status_codes(),
+            external_pool_same_pool_retry_delay_ms: default_external_pool_same_pool_retry_delay_ms(
+            ),
+            external_pool_transient_failure_priority_penalty:
+                default_external_pool_transient_failure_priority_penalty(),
             external_direct_policy_enabled: false,
             direct_external_on_local_maintenance: false,
             direct_external_model_rules: Vec::new(),
@@ -2979,6 +3015,22 @@ impl ExternalPoolsConfig {
                 .iter()
                 .any(|rule| route_rule_matches(rule, endpoint)),
         }
+    }
+
+    pub fn same_pool_retry_status_codes(&self) -> BTreeSet<u16> {
+        self.external_pool_same_pool_retry_status_codes
+            .iter()
+            .copied()
+            .filter(|code| (100..=599).contains(code))
+            .collect()
+    }
+
+    pub fn retry_status_codes(&self) -> BTreeSet<u16> {
+        self.external_pool_retry_status_codes
+            .iter()
+            .copied()
+            .filter(|code| (100..=599).contains(code))
+            .collect()
     }
 }
 
@@ -4345,7 +4397,27 @@ fn default_external_pool_dispatch_max_wait_secs() -> u64 {
 }
 
 fn default_external_pool_retry_max_attempts() -> u32 {
+    3
+}
+
+fn default_external_pool_retry_status_codes() -> Vec<u16> {
+    vec![408, 425, 429, 500, 502, 503, 504, 529]
+}
+
+fn default_external_pool_same_pool_retry_count() -> u32 {
     1
+}
+
+fn default_external_pool_same_pool_retry_status_codes() -> Vec<u16> {
+    vec![408, 425, 429, 500, 502, 503, 504, 529]
+}
+
+fn default_external_pool_same_pool_retry_delay_ms() -> u64 {
+    500
+}
+
+fn default_external_pool_transient_failure_priority_penalty() -> u32 {
+    20
 }
 
 fn default_external_pool_max_input_tokens() -> i32 {
@@ -5267,7 +5339,30 @@ mod tests {
             512
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 10);
-        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 1);
+        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 3);
+        assert_eq!(
+            config.external_pools.external_pool_retry_status_codes,
+            vec![408, 425, 429, 500, 502, 503, 504, 529]
+        );
+        assert!(config.external_pools.external_pool_retry_on_network_error);
+        assert!(config.external_pools.external_pool_retry_on_protocol_error);
+        assert_eq!(config.external_pools.external_pool_same_pool_retry_count, 1);
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_same_pool_retry_status_codes,
+            vec![408, 425, 429, 500, 502, 503, 504, 529]
+        );
+        assert_eq!(
+            config.external_pools.external_pool_same_pool_retry_delay_ms,
+            500
+        );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_transient_failure_priority_penalty,
+            20
+        );
         assert_eq!(
             config.external_pools.external_pool_max_input_tokens,
             1_000_000
@@ -5327,7 +5422,14 @@ mod tests {
             512
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 10);
-        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 1);
+        assert_eq!(config.external_pools.external_pool_retry_max_attempts, 3);
+        assert_eq!(config.external_pools.external_pool_same_pool_retry_count, 1);
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_transient_failure_priority_penalty,
+            20
+        );
         assert_eq!(
             config.external_pools.external_pool_dispatch_max_wait_secs,
             5

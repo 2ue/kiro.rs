@@ -553,6 +553,11 @@ export async function clearExternalPoolAutoDisabled(id: number): Promise<Externa
   return data
 }
 
+export async function clearExternalPoolCooldown(id: number): Promise<ExternalPool> {
+  const { data } = await api.post<ExternalPool>(`/external-pools/${id}/cooldown/clear`)
+  return data
+}
+
 export async function setExternalPoolSupportedModels(
   id: number,
   req: SetSupportedModelsRequest

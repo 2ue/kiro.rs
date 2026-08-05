@@ -1049,6 +1049,16 @@ pub async fn clear_external_pool_auto_disabled(
     }
 }
 
+pub async fn clear_external_pool_cooldown(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.clear_external_pool_cooldown(id) {
+        Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
 pub async fn get_external_pool_status(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.get_external_pool_status() {
         Ok(status) => Json(status).into_response(),

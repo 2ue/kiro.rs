@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last reviewed: 2026-08-03 Asia/Shanghai
+Last reviewed: 2026-08-05 Asia/Shanghai
 
 Current phase:
 
@@ -19,6 +19,55 @@ Current phase:
 - 2026-08-03 usage cleanup batch limit follow-up implemented and focused-verified: `每批数量` default remains 250, backend/UI max is now 5,000, old PostgreSQL CHECK constraints migrate via `usage-cleanup-batch-size-limit-v1`, migration-disabled old schemas fail compatibility early, and both UIs disclose the same bound. Validation passed: `usage_cleanup_request 4/4`, migration test `1/1`, schema guard test `1/1`, cleanup group `42/42`, UI check/build, admin-ui build, cargo fmt/check, and Clippy baseline. Production-scale throughput and dynamic multi-instance/Redis chaos remain open.
 - 2026-08-03 `v0.0.131` release recovery completed: repaired commit `511cebb` was pushed to `main`, the failed `v0.0.131` tag was deleted/recreated on that commit, and `Publish Docker Images #162` completed successfully in `25m 36s` with quality, amd64/arm64 image builds, and manifest creation all green.
 - 2026-08-03 `159/170` usage-error audit completed as read-only evidence pass: both hosts run `v0.0.123`; P001 external prompt-too-long preflight and P002 usage-standard large fields map to known later fixes, P003 external retryable 5xx already exhausts both enabled pools before client 502, and P004 external 400 is a diagnostic gap rather than a retry candidate. Evidence is under `tmp/prod-evidence/20260803-025431-usage-audit-159-170/`; production recurrence after upgrade and Admin-only upstream diagnostic enhancement remain open.
+- 2026-08-04 external-pool priority/direct/model/retry audit updated across 159/170/142 evidence: existing records do not prove external direct silently rescues to local credentials; the local-error samples are only-local entries such as `/dfcache/onlylocal`. `usage` 明细只保存请求决策轨迹，不保存完整运行时配置快照。P0 has now been implemented and focused-verified: selection is based on route/config/capacity/cooldown/model support, `请求正文模式` is only selected-pool body processing, Raw routes can retry into a normalized pool when the raw body parses as `MessagesRequest`, and runtime external-pool requests default `anthropic-version: 2023-06-01` when the client omits it. The retry/cooldown stability phase is also implemented: “外部池最多尝试” and “同池重试次数” are separate budgets; “跨池重试状态码”, “网络错误跨池重试”, “协议错误跨池重试”, “同池重试状态码/间隔” are configurable; terminal account/model errors skip same-pool retry; `Retry-After` drives pool cooldown; consecutive transient failures escalate cooldown up to the default 300s cap with jitter; Admin/两套 UI expose “清除冷却” with immediate runtime snapshot invalidation. Remaining open follow-ups are production recurrence, candidate rejection observability, clearer display of `模型（请求）` / `模型（本地解析）` / actual external outbound model, and multi-instance cooldown-race coverage. Generic `5xx` hard auto-disable remains intentionally deferred until a threshold/window/manual-clear policy is accepted. Evidence: [External pool body-mode/model routing fix 2026-08-04](../../../../feature/evidence/external-pool-body-mode-model-routing-fix-20260804.md) and [External pool retry/cooldown focused validation 2026-08-04](../../../../feature/evidence/external-pool-retry-cooldown-fix-20260804.md).
+- 2026-08-04 external-pool usage billing/raw-cost verification passed: stream OpenAI-compatible usage capture, raw-vs-shaped usage separation, PgSQL usage/pricing persistence, PgSQL external billing rollup, Redis Dashboard materialization, Admin UI build, docs contract, diff check and fmt all passed locally. Evidence: [External pool billing verification 2026-08-04](../../../../feature/evidence/external-pool-billing-verification-20260804.md). Production observation after rollout remains open.
+- 2026-08-04 local-rescue boundary refinement is implemented and focused-verified: after a
+  local-first request falls back to an external pool, external failure may return to local
+  only when the fresh local route state is `Ready` with dispatchable capacity remaining.
+  External direct, no-local-credential, all-disabled, unsupported-model, Redis-degraded and
+  risk-circuit states remain external-only. Capacity-recovery and exhausted-capacity matrices
+  passed through scoped Cargo; production recurrence remains a separate observation gate.
+- 2026-08-04 scheduler architecture analysis is now source-verified and design-complete for
+  the current planning phase. The issue document records the real request-admission,
+  local-account, external-pool, retry, cooldown, queue, fallback/rescue and WebSearch/MCP
+  paths; a target RoutePlan/finite-state-machine, shared deadline/attempt semantics,
+  health-aware priority overflow, configuration regrouping, `sub2api` comparison and
+  validation matrix are included. No runtime code was changed in this pass; implementation
+  remains unauthorized until the target semantics and open questions are accepted.
+- 2026-08-04 target scheduler contract and compliance records added:
+  - [Decision 001](decisions/001-local-external-scheduler-target-contract.md) is
+    `Proposed / awaiting user confirmation`; external direct boundaries, local-first fallback,
+    bounded local rescue, retry/cooldown, configuration authority, shared deadline and
+    observability requirements are separated from still-open default parameters.
+  - [Unified target state machine and test contract](topics/scheduler-target-state-machine-and-test-contract.md)
+    records the full route-mode matrix, error-action matrix, health-aware priority requirement,
+    page-field semantics, staged implementation plan and real sustained HTTP validation gates.
+  - [Scheduler target compliance matrix](topics/scheduler-target-compliance-matrix.md)
+    records current status as focused/local partial/non-conformant/not-yet-tested. It
+    explicitly identifies hard priority ordering, non-unified wait budgets and missing
+    candidate/attempt observability as remaining structural gaps.
+  - [Sustained scheduling validation](topics/sustained-scheduling-validation.md) defines the
+    required isolated L0-L5 fake-upstream, multi-account/multi-pool, fault-wave, two-instance,
+    Redis/PgSQL and 15–30 minute soak gates. No complete run has been claimed yet.
+- Focused confirmation evidence is recorded in
+  [scheduler target contract focused validation 2026-08-04](../../../../feature/evidence/scheduler-target-contract-focused-validation-20260804.md):
+  external pool `10/10`, handler fallback/rescue `9/9`, Node contracts `104 total / 92 passed /
+  12 skipped`, docs/diff pass. The evidence explicitly keeps health-aware priority overflow,
+  shared end-to-end deadline, candidate/attempt observability, multi-instance races and L1–L5
+  sustained scheduling open.
+- 2026-08-05 Redis scheduler/usage joint-fault boundary was rechecked. The previously observed
+  `latency-75-round-1` failure was not deterministic: after adding elapsed/breaker/route-state
+  diagnostics to the assertion, a complete one-round matrix passed, then a three-round matrix
+  passed `24/24` exact invocations. Measured 75ms scenarios stayed at `77–101ms`, while 500ms
+  scenarios failed closed and recovered as designed. No production deadline or breaker threshold
+  was relaxed. Evidence: [scheduler shared deadline and Redis chaos 2026-08-05](../../../../feature/evidence/scheduler-shared-deadline-and-load-chaos-20260805.md).
+- 2026-08-05 final frozen candidate dynamic load gate completed with fresh caller-owned
+  PostgreSQL databases and isolated Redis DBs. L3 passed `9/9`, L4 passed `12/12`, external
+  priority failover passed with high-priority failure takeover/recovery and no direct-to-local
+  rescue, and L5 passed `3/3` (`180s` long-stream, `1380/1380` success, `60s` idle recovery,
+  RSS/FD settled). The L5 runner now warms the service with 12 successful requests before
+  taking the resource baseline so allocator/connection-pool warm-up is not reported as a leak.
+  Evidence is appended to [scheduler shared deadline and Redis chaos 2026-08-05](../../../../feature/evidence/scheduler-shared-deadline-and-load-chaos-20260805.md).
 
 Last landed evidence:
 
@@ -91,10 +140,11 @@ Last landed evidence:
 Active TODO:
 
 1. Complete first archive batch for old slow-first-token/stream-fluidity analysis.
-2. Decide and implement explicit local capacity overflow policy.
-3. Design cooldown policy controls and manual recovery.
-4. Continue Wave 1 in [priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) order: image-source matrix, model-reporting clarity, broader multi-tool/history regressions, image-bearing tool_result cases, HTML-like output tag filtering decision, and any future complete mixed native/client WebSearch state-machine design.
-5. For route-policy config authority, run later C1/C2 gates only when needed: isolated service reload, browser save/reload interaction, real Claude CLI dynamic behavior, and production recurrence observation.
+2. Accept or revise the source-verified scheduler target semantics and open questions in
+   [整体调度架构分析](../../../../feature/issues/scheduler-architecture-analysis-purpose-and-plan.md).
+3. Finish candidate rejection observability and model-field display improvements.
+4. Keep production observation for external-pool body-mode/model routing and retry/cooldown after rollout separate from local focused verification.
+5. Keep production observation for usage billing/raw-cost after rollout separate from local focused verification.
 
 Blocked by:
 

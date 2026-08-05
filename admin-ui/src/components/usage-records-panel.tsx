@@ -372,10 +372,95 @@ function formatJsonBlock(value: unknown): string {
   }
 }
 
+type SelectionFailureSample = {
+  accountId?: number
+  poolId?: number
+  statusCode?: number
+  reason?: string
+  primaryReason?: string
+  message?: string
+}
+
+type SelectionFailureMetadata = {
+  primaryReason?: unknown
+  reason?: unknown
+  eligiblePools?: unknown
+  availablePools?: unknown
+  temporaryUnavailablePools?: unknown
+  sampledAccounts?: unknown
+  [key: string]: unknown
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function extractSelectionFailure(metadata: unknown): SelectionFailureMetadata | null {
+  if (!isRecord(metadata)) return null
+  const selectionFailure = metadata.selectionFailure
+  if (!isRecord(selectionFailure)) return null
+  return selectionFailure as SelectionFailureMetadata
+}
+
+function selectionFailureLabel(selectionFailure: SelectionFailureMetadata): string {
+  const parts: string[] = []
+  const primaryReason =
+    (typeof selectionFailure.primaryReason === 'string' && selectionFailure.primaryReason.trim()) ||
+    (typeof selectionFailure.reason === 'string' && selectionFailure.reason.trim()) ||
+    ''
+  if (primaryReason) {
+    parts.push(`主因 ${primaryReason}`)
+  }
+  const counts: string[] = []
+  if (typeof selectionFailure.eligiblePools === 'number' && Number.isFinite(selectionFailure.eligiblePools)) {
+    counts.push(`候选池 ${selectionFailure.eligiblePools}`)
+  }
+  if (typeof selectionFailure.availablePools === 'number' && Number.isFinite(selectionFailure.availablePools)) {
+    counts.push(`可用池 ${selectionFailure.availablePools}`)
+  }
+  if (
+    typeof selectionFailure.temporaryUnavailablePools === 'number'
+    && Number.isFinite(selectionFailure.temporaryUnavailablePools)
+  ) {
+    counts.push(`临时不可用 ${selectionFailure.temporaryUnavailablePools}`)
+  }
+  if (counts.length > 0) {
+    parts.push(counts.join(' · '))
+  }
+  const sampledAccounts = Array.isArray(selectionFailure.sampledAccounts)
+    ? selectionFailure.sampledAccounts
+        .map((sample) => {
+          if (!isRecord(sample)) return null
+          const typed = sample as SelectionFailureSample
+          const identity = typeof typed.accountId === 'number'
+            ? `#${typed.accountId}`
+            : typeof typed.poolId === 'number'
+              ? `池 #${typed.poolId}`
+              : null
+          const state = typeof typed.statusCode === 'number'
+            ? String(typed.statusCode)
+            : typeof typed.reason === 'string' && typed.reason.trim()
+              ? typed.reason.trim()
+              : typeof typed.primaryReason === 'string' && typed.primaryReason.trim()
+                ? typed.primaryReason.trim()
+                : typeof typed.message === 'string' && typed.message.trim()
+                  ? typed.message.trim()
+                  : null
+          if (!identity && !state) return null
+          return [identity, state].filter(Boolean).join(' · ')
+        })
+        .filter((entry): entry is string => Boolean(entry))
+    : []
+  if (sampledAccounts.length > 0) {
+    parts.push(`样本 ${sampledAccounts.join(' / ')}`)
+  }
+  return parts.join('\n')
+}
+
 type ErrorDiagnosticItem = {
   label: string
   value: string
-  tone?: 'default' | 'muted' | 'error'
+  tone?: 'default' | 'muted' | 'warning' | 'error'
 }
 
 function appendErrorDiagnostic(
@@ -394,6 +479,7 @@ function appendErrorDiagnostic(
 function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
   const items: ErrorDiagnosticItem[] = []
   const seen = new Set<string>()
+  const selectionFailure = extractSelectionFailure(record.errorMetadata)
 
   appendErrorDiagnostic(items, seen, '处理 / 内部错误', record.errorDetail || record.errorMessage, 'error')
   if (record.errorDetail && record.errorMessage && record.errorDetail !== record.errorMessage) {
@@ -420,6 +506,16 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     )
   })
 
+  if (selectionFailure) {
+    appendErrorDiagnostic(
+      items,
+      seen,
+      '候选拒绝 / selectionFailure',
+      selectionFailureLabel(selectionFailure),
+      'warning'
+    )
+  }
+
   appendErrorDiagnostic(items, seen, '客户端归一化错误', record.publicErrorMessage, 'muted')
   return items
 }
@@ -428,6 +524,8 @@ function ErrorDiagnosticBlock({ item }: { item: ErrorDiagnosticItem }) {
   const toneClass =
     item.tone === 'error'
       ? 'border-destructive/30 bg-destructive/5'
+      : item.tone === 'warning'
+        ? 'border-warning/30 bg-warning/10'
       : item.tone === 'muted'
         ? 'border-border bg-muted/20 text-muted-foreground'
         : 'border-border bg-muted/30'
@@ -1417,7 +1515,11 @@ export function UsageRecordsPanel() {
                           <div className="text-xs text-muted-foreground">上游原始 usage 成本</div>
                           <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
                           <div className="mt-1 font-medium">{formatUsdDetailed(billing.rawCostUsd || 0)}</div>
-                          <div className="text-xs text-muted-foreground">按外部上游返回 usage 估算</div>
+                          <div className="text-xs text-muted-foreground">
+                            {billing.usageEstimated
+                              ? `上游未返回 usage，使用本地估算 fallback${billing.usageEstimateReason ? ` · ${billing.usageEstimateReason}` : ''}`
+                              : '按外部上游返回的真实 usage 计算'}
+                          </div>
                         </div>
                         <div>
                           <div className="text-xs text-muted-foreground">整形后计费</div>

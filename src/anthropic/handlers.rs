@@ -1269,7 +1269,19 @@ async fn maybe_raw_external_direct_response(
         .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
         .await?;
     let request_id = envelope::request_id();
-    let route = raw_external_route_request_with_hints(
+    let direct_model_resolution = raw_probe
+        .model
+        .as_deref()
+        .map(|model| {
+            state.model_capabilities.resolve_model_with_mapping(
+                model,
+                runtime_config.model_resolution_mode,
+                &runtime_config.model_mapping,
+            )
+        })
+        .filter(|resolution| resolution.source != ModelResolutionSource::Unsupported)
+        .map(external_route_model_resolution);
+    let mut route = raw_external_route_request_with_hints(
         state,
         &runtime_config,
         &cache_route,
@@ -1285,6 +1297,11 @@ async fn maybe_raw_external_direct_response(
         request_api_key_id,
         raw_probe,
     );
+    if let Some(resolution) = direct_model_resolution {
+        route.upstream_model = resolution.upstream_model;
+        route.model_resolution_source = Some(resolution.source.as_str().to_string());
+        route.model_resolution_note = resolution.note;
+    }
 
     Some(manager.forward_with_failover(config, route).await)
 }
@@ -1370,17 +1387,11 @@ async fn raw_external_pool_has_eligible_pool(
     config: &ExternalPoolsConfig,
     model: Option<&str>,
 ) -> bool {
-    manager.has_cached_eligible_pool_for_body_mode_and_model(
-        config,
-        ExternalPoolRequestBodyMode::RawPassthrough,
-        model,
-    ) || manager
-        .has_eligible_pool_for_body_mode_and_model(
-            config,
-            ExternalPoolRequestBodyMode::RawPassthrough,
-            model,
-        )
-        .await
+    let Some(model) = model else {
+        return false;
+    };
+    manager.has_cached_eligible_pool_for_model(config, model)
+        || manager.has_eligible_pool_for_model(config, model).await
 }
 
 async fn raw_external_pool_ready_for_route_reason(
@@ -1390,30 +1401,19 @@ async fn raw_external_pool_ready_for_route_reason(
     model: Option<&str>,
 ) -> bool {
     if local_route_reason_requires_immediate_external_capacity(route_reason) {
-        manager.has_cached_immediately_available_pool_for_body_mode_and_model(
-            config,
-            ExternalPoolRequestBodyMode::RawPassthrough,
-            model,
-        ) || manager
-            .has_immediately_available_pool_for_body_mode_and_model(
-                config,
-                ExternalPoolRequestBodyMode::RawPassthrough,
-                model,
-                EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
-            )
-            .await
+        let Some(model) = model else {
+            return false;
+        };
+        manager.has_cached_immediately_available_pool_for_model(config, model)
+            || manager
+                .has_immediately_available_pool_for_model(
+                    config,
+                    model,
+                    EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+                )
+                .await
     } else {
-        manager.has_cached_eligible_pool_for_body_mode_and_model(
-            config,
-            ExternalPoolRequestBodyMode::RawPassthrough,
-            model,
-        ) || manager
-            .has_eligible_pool_for_body_mode_and_model(
-                config,
-                ExternalPoolRequestBodyMode::RawPassthrough,
-                model,
-            )
-            .await
+        raw_external_pool_has_eligible_pool(manager, config, model).await
     }
 }
 
@@ -1515,7 +1515,7 @@ fn raw_external_route_request_with_hints(
         request_id: request_id.clone(),
         error_id: envelope::request_id(),
         recorder: state.usage_recorder.clone(),
-        started_at: Instant::now(),
+        started_at: inference_attempt_budget.started_at().into(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
         payload_breakdown: None,
@@ -1594,6 +1594,16 @@ fn build_external_fallback_context(
 }
 
 impl ExternalFallbackContext {
+    fn current_local_dispatchable(&self, model: Option<&str>) -> Option<usize> {
+        let model = model.or(Some(self.payload.model.as_str()));
+        let state = self.provider.local_pool_route_state_fresh(model);
+        Some(if matches!(state.kind, LocalPoolRouteStateKind::Ready) {
+            state.dispatchable
+        } else {
+            0
+        })
+    }
+
     fn refresh_payload(&mut self, payload: &MessagesRequest) {
         let original_input_tokens = token::count_all_tokens(
             &payload.model,
@@ -1637,82 +1647,43 @@ impl ExternalFallbackContext {
             return (AcquireMode::WaitForCapacity, false);
         }
         let acquire_mode = local_pool_acquire_mode(&self.config);
-        (acquire_mode, true)
+        (
+            clamp_acquire_mode_to_dispatch_deadline(
+                acquire_mode,
+                self.inference_attempt_budget.as_ref(),
+            ),
+            true,
+        )
     }
 
     fn has_cached_eligible_external_pool_for_model(&self, model: &str) -> bool {
-        match external_fallback_body_mode_filter(self.requires_normalized_body) {
-            Some(body_mode) => self
-                .manager
-                .has_cached_eligible_pool_for_body_mode_and_model(
-                    &self.config,
-                    body_mode,
-                    Some(model),
-                ),
-            None => self
-                .manager
-                .has_cached_eligible_pool_for_model(&self.config, model),
-        }
+        self.manager
+            .has_cached_eligible_pool_for_model(&self.config, model)
     }
 
     async fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
         self.has_cached_eligible_external_pool_for_model(model)
-            || match external_fallback_body_mode_filter(self.requires_normalized_body) {
-                Some(body_mode) => {
-                    self.manager
-                        .has_eligible_pool_for_body_mode_and_model(
-                            &self.config,
-                            body_mode,
-                            Some(model),
-                        )
-                        .await
-                }
-                None => {
-                    self.manager
-                        .has_eligible_pool_for_model(&self.config, model)
-                        .await
-                }
-            }
+            || self
+                .manager
+                .has_eligible_pool_for_model(&self.config, model)
+                .await
     }
 
     fn has_cached_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
-        match external_fallback_body_mode_filter(self.requires_normalized_body) {
-            Some(body_mode) => self
-                .manager
-                .has_cached_immediately_available_pool_for_body_mode_and_model(
-                    &self.config,
-                    body_mode,
-                    Some(model),
-                ),
-            None => self
-                .manager
-                .has_cached_immediately_available_pool_for_model(&self.config, model),
-        }
+        self.manager
+            .has_cached_immediately_available_pool_for_model(&self.config, model)
     }
 
     async fn has_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
         self.has_cached_immediately_available_external_pool_for_model(model)
-            || match external_fallback_body_mode_filter(self.requires_normalized_body) {
-                Some(body_mode) => {
-                    self.manager
-                        .has_immediately_available_pool_for_body_mode_and_model(
-                            &self.config,
-                            body_mode,
-                            Some(model),
-                            EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
-                        )
-                        .await
-                }
-                None => {
-                    self.manager
-                        .has_immediately_available_pool_for_model(
-                            &self.config,
-                            model,
-                            EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
-                        )
-                        .await
-                }
-            }
+            || self
+                .manager
+                .has_immediately_available_pool_for_model(
+                    &self.config,
+                    model,
+                    EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+                )
+                .await
     }
 
     async fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
@@ -2054,7 +2025,7 @@ impl ExternalFallbackContext {
             request_id,
             error_id: self.error_id.clone(),
             recorder: self.recorder.clone(),
-            started_at: Instant::now(),
+            started_at: self.inference_attempt_budget.started_at().into(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
             latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
             payload_breakdown: None,
@@ -2085,6 +2056,25 @@ fn local_pool_acquire_mode(config: &ExternalPoolsConfig) -> AcquireMode {
         ))
     } else {
         AcquireMode::WaitForCapacity
+    }
+}
+
+fn clamp_acquire_mode_to_dispatch_deadline(
+    mode: AcquireMode,
+    budget: &InferenceAttemptBudget,
+) -> AcquireMode {
+    let Some(remaining) = budget.dispatch_remaining() else {
+        return mode;
+    };
+    match mode {
+        AcquireMode::WaitForCapacity => AcquireMode::WaitForCapacityMax(remaining),
+        AcquireMode::WaitForCapacityMax(max_wait) => {
+            AcquireMode::WaitForCapacityMax(max_wait.min(remaining))
+        }
+        AcquireMode::FailFastOnCapacityWaitForRedis(max_wait) => {
+            AcquireMode::FailFastOnCapacityWaitForRedis(max_wait.min(remaining))
+        }
+        AcquireMode::FailFastOnCapacity => AcquireMode::FailFastOnCapacity,
     }
 }
 
@@ -6231,6 +6221,8 @@ async fn call_api_stream_maybe_fail_fast(
     } else {
         (AcquireMode::WaitForCapacity, false)
     };
+    let acquire_mode =
+        clamp_acquire_mode_to_dispatch_deadline(acquire_mode, inference_attempt_budget.as_ref());
     if let Some(kiro_request) =
         kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
     {
@@ -6276,6 +6268,8 @@ async fn call_api_maybe_fail_fast(
     } else {
         (AcquireMode::WaitForCapacity, false)
     };
+    let acquire_mode =
+        clamp_acquire_mode_to_dispatch_deadline(acquire_mode, inference_attempt_budget.as_ref());
     if let Some(kiro_request) =
         kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
     {
@@ -6465,6 +6459,7 @@ fn local_rescue_reason_after_external_error(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
+    current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
     if config.external_direct_policy_enabled {
         return None;
@@ -6472,7 +6467,8 @@ fn local_rescue_reason_after_external_error(
     if !config.external_pool_local_rescue_enabled {
         return None;
     }
-    if local_fallback_reason_blocks_local_rescue(local_fallback_reason) {
+    if local_fallback_reason_blocks_local_rescue(local_fallback_reason, current_local_dispatchable)
+    {
         return None;
     }
     if err.is_rate_limit() {
@@ -6496,7 +6492,10 @@ fn local_rescue_reason_after_external_error(
     Some("external_error")
 }
 
-fn local_fallback_reason_blocks_local_rescue(reason: Option<&str>) -> bool {
+fn local_fallback_reason_blocks_local_rescue(
+    reason: Option<&str>,
+    current_local_dispatchable: Option<usize>,
+) -> bool {
     matches!(
         reason,
         Some(
@@ -6505,27 +6504,39 @@ fn local_fallback_reason_blocks_local_rescue(reason: Option<&str>) -> bool {
                 | "local_proxy_blocked"
                 | "local_no_model_compatible"
                 | "local_all_cooling_down"
-                | "local_capacity_full"
-                | "local_capacity_exhausted"
                 | "local_scheduler_redis_degraded"
                 | "local_pool_risk_circuit_open"
                 | "local_transient_exhausted"
                 | "no_available_credentials"
                 | "unsupported_model"
         )
-    )
+    ) || match reason {
+        Some(
+            "local_capacity_full"
+            | "local_capacity_exhausted"
+            | "local_attempt_reserved_for_fallback",
+        ) => current_local_dispatchable.unwrap_or(0) == 0,
+        None => true,
+        _ => false,
+    }
 }
 
 fn budgeted_local_rescue_reason_after_external_error(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
+    current_local_dispatchable: Option<usize>,
     inference_attempt_budget: &InferenceAttemptBudget,
 ) -> Option<&'static str> {
     if inference_attempt_budget.available_attempts(0) == 0 {
         return None;
     }
-    local_rescue_reason_after_external_error(config, err, local_fallback_reason)
+    local_rescue_reason_after_external_error(
+        config,
+        err,
+        local_fallback_reason,
+        current_local_dispatchable,
+    )
 }
 
 /// Last-chance local retry after an external-pool final error.
@@ -6542,9 +6553,12 @@ async fn call_stream_local_rescue_after_external_error(
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
-    let acquire_mode = AcquireMode::WaitForCapacityMax(Duration::from_secs(
-        external.config.external_pool_local_rescue_max_wait_secs,
-    ));
+    let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
+        AcquireMode::WaitForCapacityMax(Duration::from_secs(
+            external.config.external_pool_local_rescue_max_wait_secs,
+        )),
+        external.inference_attempt_budget.as_ref(),
+    );
     if let Some(kiro_request) =
         kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
     {
@@ -6590,9 +6604,12 @@ async fn call_non_stream_local_rescue_after_external_error(
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
-    let acquire_mode = AcquireMode::WaitForCapacityMax(Duration::from_secs(
-        external.config.external_pool_local_rescue_max_wait_secs,
-    ));
+    let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
+        AcquireMode::WaitForCapacityMax(Duration::from_secs(
+            external.config.external_pool_local_rescue_max_wait_secs,
+        )),
+        external.inference_attempt_budget.as_ref(),
+    );
     if let Some(kiro_request) =
         kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
     {
@@ -6832,6 +6849,7 @@ async fn handle_stream_request(
                         &external.config,
                         &err,
                         Some(local_reason.as_str()),
+                        external.current_local_dispatchable(Some(model)),
                         external.inference_attempt_budget.as_ref(),
                     ) {
                         tracing::warn!(
@@ -7134,6 +7152,8 @@ async fn handle_stream_request(
                                                     &external.config,
                                                     &err,
                                                     local_fallback_reason.as_deref(),
+                                                    external
+                                                        .current_local_dispatchable(Some(model)),
                                                     external.inference_attempt_budget.as_ref(),
                                                 )
                                             {
@@ -7268,6 +7288,7 @@ async fn handle_stream_request(
                                             &external.config,
                                             &err,
                                             local_fallback_reason.as_deref(),
+                                            external.current_local_dispatchable(Some(model)),
                                             external.inference_attempt_budget.as_ref(),
                                         )
                                     {
@@ -9017,6 +9038,7 @@ async fn handle_non_stream_request(
                         &external.config,
                         &err,
                         Some(local_reason.as_str()),
+                        external.current_local_dispatchable(Some(model)),
                         external.inference_attempt_budget.as_ref(),
                     ) {
                         tracing::warn!(
@@ -9313,6 +9335,8 @@ async fn handle_non_stream_request(
                                                     &external.config,
                                                     &err,
                                                     local_fallback_reason.as_deref(),
+                                                    external
+                                                        .current_local_dispatchable(Some(model)),
                                                     external.inference_attempt_budget.as_ref(),
                                                 )
                                             {
@@ -9438,6 +9462,7 @@ async fn handle_non_stream_request(
                                             &external.config,
                                             &err,
                                             local_fallback_reason.as_deref(),
+                                            external.current_local_dispatchable(Some(model)),
                                             external.inference_attempt_budget.as_ref(),
                                         )
                                     {

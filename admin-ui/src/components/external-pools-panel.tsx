@@ -4,6 +4,7 @@ import { CheckCircle2, FlaskConical, Loader2, Pencil, Play, Plus, Power, Refresh
 import { toast } from 'sonner'
 import {
   clearExternalPoolAutoDisabled,
+  clearExternalPoolCooldown,
   createExternalPool,
   deleteExternalPool,
   discoverExternalPoolSupportedModels,
@@ -39,6 +40,20 @@ const splitRules = (value: string) => value.split('\n').map((item) => item.trim(
 const joinRules = (value: string[] = []) => value.join('\n')
 const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
+const parseStatusCodeList = (value: string) => {
+  const seen = new Set<number>()
+  const codes: number[] = []
+  for (const raw of value.split(/[\s,，;；]+/)) {
+    const code = Number(raw.trim())
+    if (!Number.isInteger(code) || code < 100 || code > 599 || seen.has(code)) continue
+    seen.add(code)
+    codes.push(code)
+  }
+  return codes
+}
+const joinStatusCodeList = (value: number[] = []) => value
+  .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
+  .join(', ')
 
 const parseSupportedModelsText = (value: string): string[] => {
   const seen = new Set<string>()
@@ -240,6 +255,8 @@ export function ExternalPoolsPanel() {
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
   const [modelRulesText, setModelRulesText] = useState('')
   const [pathRulesText, setPathRulesText] = useState('')
+  const [retryStatusCodesText, setRetryStatusCodesText] = useState('')
+  const [samePoolRetryStatusCodesText, setSamePoolRetryStatusCodesText] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [editingPool, setEditingPool] = useState<ExternalPool | null>(null)
   const [testingPool, setTestingPool] = useState<ExternalPool | null>(null)
@@ -255,6 +272,8 @@ export function ExternalPoolsPanel() {
     setConfigDraft(externalPools)
     setModelRulesText(joinRules(externalPools.directExternalModelRules))
     setPathRulesText(joinRules(externalPools.directExternalPathRules))
+    setRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolRetryStatusCodes))
+    setSamePoolRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolSamePoolRetryStatusCodes))
   }, [runtimeConfig.data?.externalPools])
 
   const statusMap = useMemo(() => {
@@ -287,6 +306,11 @@ export function ExternalPoolsPanel() {
           externalPoolMaxInputTokens: whole(configDraft.externalPoolMaxInputTokens),
           externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs, 1),
           externalPoolRetryMaxAttempts: whole(configDraft.externalPoolRetryMaxAttempts),
+          externalPoolRetryStatusCodes: parseStatusCodeList(retryStatusCodesText),
+          externalPoolSamePoolRetryCount: whole(configDraft.externalPoolSamePoolRetryCount),
+          externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(samePoolRetryStatusCodesText),
+          externalPoolSamePoolRetryDelayMs: whole(configDraft.externalPoolSamePoolRetryDelayMs),
+          externalPoolTransientFailurePriorityPenalty: whole(configDraft.externalPoolTransientFailurePriorityPenalty),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
@@ -524,7 +548,14 @@ export function ExternalPoolsPanel() {
                   <NumberBox disabled={!waitModeActive} label="外部池排队上限" description="externalPoolMaxQueuedRequests；只限制外部池 wait 队列，不是本地账号 dispatch 队列。" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
                   <NumberBox disabled={!externalEnabled} label="估算输入上限（兼容）" description="保留历史配置；不再作为本地发送前拒绝条件，真实上下文超限以上游响应和请求大小保护为准。" value={configDraft.externalPoolMaxInputTokens} onChange={(externalPoolMaxInputTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxInputTokens }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待秒数" description="必须大于 0；旧配置中的 0 按安全默认值 30 秒处理。" min={1} value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
-                  <NumberBox disabled={!externalEnabled} label="最大重试次数" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
+                  <NumberBox disabled={!externalEnabled} label="外部池最多尝试" description="控制同一请求最多尝试多少个外部池；0 表示按候选池自动尝试一轮。" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
+                  <Toggle disabled={!externalEnabled} label="网络错误跨池重试" description="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他外部池。" checked={configDraft.externalPoolRetryOnNetworkError} onChange={(externalPoolRetryOnNetworkError) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryOnNetworkError }))} />
+                  <Toggle disabled={!externalEnabled} label="协议错误跨池重试" description="成功状态码但返回错误信封或协议污染时，是否允许切换其他外部池。" checked={configDraft.externalPoolRetryOnProtocolError} onChange={(externalPoolRetryOnProtocolError) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryOnProtocolError }))} />
+                  <TextArea disabled={!externalEnabled} label="跨池重试状态码" value={retryStatusCodesText} onChange={setRetryStatusCodesText} />
+                  <NumberBox disabled={!externalEnabled} label="同池重试次数" description="命中下面状态码时，先在同一个外部池上重试；重试耗尽后才冷却并尝试其他外部池。" value={configDraft.externalPoolSamePoolRetryCount} onChange={(externalPoolSamePoolRetryCount) => setConfigDraft((prev) => ({ ...prev, externalPoolSamePoolRetryCount }))} />
+                  <NumberBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试间隔毫秒" value={configDraft.externalPoolSamePoolRetryDelayMs} onChange={(externalPoolSamePoolRetryDelayMs) => setConfigDraft((prev) => ({ ...prev, externalPoolSamePoolRetryDelayMs }))} />
+                  <NumberBox disabled={!externalEnabled} label="失败池临时降权" description="每个瞬态失败窗口内的失败次数都会临时增加有效优先级；默认 20，可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。" value={configDraft.externalPoolTransientFailurePriorityPenalty} onChange={(externalPoolTransientFailurePriorityPenalty) => setConfigDraft((prev) => ({ ...prev, externalPoolTransientFailurePriorityPenalty }))} />
+                  <TextArea disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试状态码" value={samePoolRetryStatusCodesText} onChange={setSamePoolRetryStatusCodesText} />
                   <SelectBox disabled={!externalEnabled} label="流式 SSE 默认转发" value={configDraft.externalPoolStreamResponseMode} onChange={(externalPoolStreamResponseMode) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamResponseMode: externalPoolStreamResponseMode as ExternalPoolsConfig['externalPoolStreamResponseMode'] }))}>
                     <option value="event_passthrough">事件级透传</option>
                   </SelectBox>
@@ -640,7 +671,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -655,6 +686,9 @@ export function ExternalPoolsPanel() {
                   </Button>
                   <Button variant="outline" size="sm" onClick={() => mutatePool(() => clearExternalPoolAutoDisabled(pool.id), '自动禁用状态已清除')}>
                     <RotateCcw className="mr-2 h-4 w-4" />清除禁用
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => mutatePool(() => clearExternalPoolCooldown(pool.id), '冷却状态已清除')}>
+                    <RotateCcw className="mr-2 h-4 w-4" />清除冷却
                   </Button>
                   <Button variant="outline" size="sm" onClick={() => status.refetch()}>
                     <RefreshCw className="mr-2 h-4 w-4" />刷新
@@ -1224,10 +1258,13 @@ function HintBox({ children }: { children: ReactNode }) {
   )
 }
 
-function Toggle({ label, checked, onChange, disabled = false }: { label: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean }) {
+function Toggle({ label, description, checked, onChange, disabled = false }: { label: string; description?: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean }) {
   return (
     <label className={`flex items-center justify-between gap-3 rounded-md border p-3 text-sm ${disabled ? 'cursor-not-allowed bg-muted/40 opacity-60' : ''}`}>
-      <span>{label}</span>
+      <span className="min-w-0">
+        <span className="block">{label}</span>
+        {description ? <span className="mt-0.5 block text-xs leading-4 text-muted-foreground">{description}</span> : null}
+      </span>
       <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} />
     </label>
   )

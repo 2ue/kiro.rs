@@ -189,6 +189,8 @@ struct LoadtestReport {
     request_profile: RequestProfile,
     started_at: String,
     duration_ms: u128,
+    launched_requests: usize,
+    join_errors: usize,
     requests: usize,
     success: usize,
     errors: usize,
@@ -404,10 +406,23 @@ async fn run_loadtest(config: RunConfig) -> anyhow::Result<LoadtestReport> {
     let mut launched = 0usize;
 
     while launched < total_requests {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
-        }
-        let permit = semaphore.clone().acquire_owned().await?;
+        let permit = if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(
+                deadline.saturating_duration_since(now),
+                semaphore.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(permit) => permit?,
+                Err(_) => break,
+            }
+        } else {
+            semaphore.clone().acquire_owned().await?
+        };
         let client = client.clone();
         let config = config.clone();
         let index = launched;
@@ -419,6 +434,7 @@ async fn run_loadtest(config: RunConfig) -> anyhow::Result<LoadtestReport> {
     }
 
     let mut results = Vec::with_capacity(launched);
+    let mut join_errors = 0usize;
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok(request)) => results.push(request),
@@ -438,6 +454,17 @@ async fn run_loadtest(config: RunConfig) -> anyhow::Result<LoadtestReport> {
             }
             Err(err) => {
                 tracing::warn!("loadtest task failed: {err}");
+                join_errors += 1;
+                results.push(RequestResult {
+                    status: None,
+                    success: false,
+                    ttfb_ms: None,
+                    first_thinking_ms: None,
+                    first_text_ms: None,
+                    total_latency_ms: run_started.elapsed().as_millis(),
+                    request_id: None,
+                    error_id: None,
+                });
             }
         }
     }
@@ -451,6 +478,8 @@ async fn run_loadtest(config: RunConfig) -> anyhow::Result<LoadtestReport> {
         request_profile(&config),
         started_at,
         run_started.elapsed().as_millis(),
+        launched,
+        join_errors,
         results,
         resource_start,
         resource_peak,
@@ -1216,6 +1245,8 @@ fn build_report(
     request_profile: RequestProfile,
     started_at: String,
     duration_ms: u128,
+    launched_requests: usize,
+    join_errors: usize,
     results: Vec<RequestResult>,
     resource_start: ResourceSample,
     resource_peak: ResourceSample,
@@ -1262,6 +1293,8 @@ fn build_report(
         request_profile,
         started_at,
         duration_ms,
+        launched_requests,
+        join_errors,
         requests: results.len(),
         success,
         errors: results.len().saturating_sub(success),

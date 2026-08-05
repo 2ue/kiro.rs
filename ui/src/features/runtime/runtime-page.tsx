@@ -124,6 +124,24 @@ function parseRuleText(value: string): string[] {
   return value.split(/[\r\n,]+/).map((rule) => rule.trim()).filter(Boolean)
 }
 
+function parseStatusCodeList(value: string): number[] {
+  const seen = new Set<number>()
+  const codes: number[] = []
+  for (const raw of value.split(/[\s,，;；]+/)) {
+    const code = Number(raw.trim())
+    if (!Number.isInteger(code) || code < 100 || code > 599 || seen.has(code)) continue
+    seen.add(code)
+    codes.push(code)
+  }
+  return codes
+}
+
+function joinStatusCodeList(value: number[] = []): string {
+  return value
+    .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
+    .join(', ')
+}
+
 function ruleText(value?: string[] | null): string {
   return normalizeRuleList(value).join('\n')
 }
@@ -351,6 +369,13 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolMaxInputTokens: toWhole(draft.externalPools.externalPoolMaxInputTokens),
       externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs, 1),
       externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
+      externalPoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.externalPools.externalPoolRetryStatusCodes)),
+      externalPoolRetryOnNetworkError: Boolean(draft.externalPools.externalPoolRetryOnNetworkError),
+      externalPoolRetryOnProtocolError: Boolean(draft.externalPools.externalPoolRetryOnProtocolError),
+      externalPoolSamePoolRetryCount: toWhole(draft.externalPools.externalPoolSamePoolRetryCount),
+      externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.externalPools.externalPoolSamePoolRetryStatusCodes)),
+      externalPoolSamePoolRetryDelayMs: toWhole(draft.externalPools.externalPoolSamePoolRetryDelayMs),
+      externalPoolTransientFailurePriorityPenalty: toWhole(draft.externalPools.externalPoolTransientFailurePriorityPenalty),
       externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
       localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
       localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
@@ -900,6 +925,65 @@ export function RuntimePage() {
                     suffix="次"
                     onChange={setExternalPools('externalPoolRetryMaxAttempts')}
                   />
+                  <TogField
+                    label="网络错误跨池重试"
+                    desc="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他外部池。"
+                    checked={draft.externalPools.externalPoolRetryOnNetworkError}
+                    onChange={setExternalPools('externalPoolRetryOnNetworkError')}
+                  />
+                  <TogField
+                    label="协议错误跨池重试"
+                    desc="上游返回成功状态码但内容是错误信封或协议污染时，是否允许切换其他外部池。"
+                    checked={draft.externalPools.externalPoolRetryOnProtocolError}
+                    onChange={setExternalPools('externalPoolRetryOnProtocolError')}
+                  />
+                  <label className="space-y-1.5 text-sm md:col-span-2">
+                    <span className="text-muted-foreground">跨池重试状态码</span>
+                    <Input
+                      className="font-mono text-xs"
+                      value={joinStatusCodeList(draft.externalPools.externalPoolRetryStatusCodes)}
+                      onChange={(event) => setExternalPools('externalPoolRetryStatusCodes')(parseStatusCodeList(event.target.value))}
+                    />
+                    <span className="block text-xs leading-4 text-muted-foreground">
+                      控制普通 HTTP 错误是否继续尝试其他外部池；认证、配额、渠道禁用等已分类错误仍按错误分类切换。
+                    </span>
+                  </label>
+                  <NumField
+                    label="同池重试次数"
+                    desc="命中下面状态码时，先在同一个外部池上重试；重试耗尽后才冷却并尝试其他外部池。"
+                    value={draft.externalPools.externalPoolSamePoolRetryCount}
+                    min={0}
+                    max={10}
+                    suffix="次"
+                    onChange={setExternalPools('externalPoolSamePoolRetryCount')}
+                  />
+                  <NumField
+                    label="同池重试间隔"
+                    desc="同一个外部池重试之间的等待时间。"
+                    value={draft.externalPools.externalPoolSamePoolRetryDelayMs}
+                    min={0}
+                    max={60_000}
+                    suffix="毫秒"
+                    onChange={setExternalPools('externalPoolSamePoolRetryDelayMs')}
+                  />
+                  <NumField
+                    label="失败池临时降权"
+                    desc="外部池出现可重试瞬态失败后，在失败窗口内临时增加有效优先级；默认 20 可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。"
+                    value={draft.externalPools.externalPoolTransientFailurePriorityPenalty}
+                    min={0}
+                    max={10_000}
+                    suffix="优先级"
+                    onChange={setExternalPools('externalPoolTransientFailurePriorityPenalty')}
+                  />
+                  <label className="space-y-1.5 text-sm md:col-span-2">
+                    <span className="text-muted-foreground">同池重试状态码</span>
+                    <Input
+                      className="font-mono text-xs"
+                      value={joinStatusCodeList(draft.externalPools.externalPoolSamePoolRetryStatusCodes)}
+                      onChange={(event) => setExternalPools('externalPoolSamePoolRetryStatusCodes')(parseStatusCodeList(event.target.value))}
+                    />
+                    <span className="block text-xs leading-4 text-muted-foreground">支持用逗号、空格或换行分隔；默认值用于 401、403、429、500、502、503、504。</span>
+                  </label>
                   <NumField
                     label="外部池失败后本地等待"
                     desc="触发本地救援时，最多等待本地账号空闲多久。"

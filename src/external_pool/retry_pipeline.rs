@@ -47,6 +47,55 @@ pub(super) fn payload_guard_retry_route(
     Some(next)
 }
 
+pub(super) fn should_retry_same_pool(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolError,
+) -> bool {
+    if !err.retryable {
+        return false;
+    }
+    // 认证、配额、渠道禁用和端点配置错误应先冷却并切换池，
+    // 不应在同一个明显有问题的外部账号上重复发送。
+    if err.auto_disable_reason.is_some()
+        || err
+            .cooldown
+            .as_ref()
+            .is_some_and(|(_, reason)| reason == "model_unavailable")
+    {
+        return false;
+    }
+    let Some(status) = err.status else {
+        return false;
+    };
+    config
+        .same_pool_retry_status_codes()
+        .contains(&status.as_u16())
+}
+
+pub(super) fn should_retry_cross_pool(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolError,
+) -> bool {
+    if !err.retryable {
+        return false;
+    }
+    if err.auto_disable_reason.is_some() {
+        return true;
+    }
+    if err.protocol_error.is_some() {
+        return config.external_pool_retry_on_protocol_error;
+    }
+    let Some(status) = err.status else {
+        return config.external_pool_retry_on_network_error;
+    };
+    config.retry_status_codes().contains(&status.as_u16())
+}
+
+pub(super) fn same_pool_retry_delay(config: &ExternalPoolsConfig) -> Option<Duration> {
+    let delay_ms = config.external_pool_same_pool_retry_delay_ms;
+    (delay_ms > 0).then(|| Duration::from_millis(delay_ms))
+}
+
 fn payload_too_long_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("context window is full")

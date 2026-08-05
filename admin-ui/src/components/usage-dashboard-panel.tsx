@@ -570,7 +570,7 @@ function ExternalPoolBillingPanel({
   return (
     <Panel
       title="备用池计费拆分"
-      subtitle="上游原始成本来自外部池原始 usage；最终上报使用整形并放大后的 usage；盈利按放大后计费减上游原始成本计算"
+      subtitle="原始成本优先使用外部池上游返回的 usage；只有上游未返回 usage 时才使用本地估算 fallback。最终上报使用本地整形后的 usage。"
       actions={
         <Badge variant={hasLoss ? 'destructive' : hasProfit ? 'warning' : 'success'}>
           {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
@@ -586,7 +586,7 @@ function ExternalPoolBillingPanel({
         <div className="rounded-md border bg-muted/30 p-3">
           <div className="text-xs text-muted-foreground">上游原始成本</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
-          <div className="mt-1 text-xs text-muted-foreground">按备用池 raw usage 估算</div>
+          <div className="mt-1 text-xs text-muted-foreground">优先按上游真实 usage；缺失时使用本地估算 fallback</div>
         </div>
         <div className="rounded-md border bg-muted/30 p-3">
           <div className="text-xs text-muted-foreground">整形后计费</div>

@@ -13,6 +13,7 @@ import {
 import { toast } from 'sonner'
 import {
   clearExternalPoolAutoDisabled,
+  clearExternalPoolCooldown,
   createExternalPool,
   deleteExternalPool,
   discoverExternalPoolSupportedModels,
@@ -46,7 +47,9 @@ import {
   authLabel,
   defaultPoolForm,
   joinRules,
+  joinStatusCodeList,
   parseModelMappingRules,
+  parseStatusCodeList,
   parseSupportedModelsText,
   poolFormFromPool,
   poolBodyModeSummary,
@@ -105,6 +108,8 @@ export function ExternalPoolsPage() {
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
   const [modelRulesText, setModelRulesText] = useState('')
   const [pathRulesText, setPathRulesText] = useState('')
+  const [retryStatusCodesText, setRetryStatusCodesText] = useState('')
+  const [samePoolRetryStatusCodesText, setSamePoolRetryStatusCodesText] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [editingPool, setEditingPool] = useState<ExternalPool | null>(null)
   const [testingPool, setTestingPool] = useState<ExternalPool | null>(null)
@@ -117,6 +122,8 @@ export function ExternalPoolsPage() {
     setConfigDraft(externalPools)
     setModelRulesText(joinRules(externalPools.directExternalModelRules))
     setPathRulesText(joinRules(externalPools.directExternalPathRules))
+    setRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolRetryStatusCodes))
+    setSamePoolRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolSamePoolRetryStatusCodes))
   }, [runtimeConfig.data?.externalPools])
 
   const statusMap = useMemo(() => {
@@ -147,6 +154,11 @@ export function ExternalPoolsPage() {
           externalPoolMaxInputTokens: whole(configDraft.externalPoolMaxInputTokens),
           externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs, 1),
           externalPoolRetryMaxAttempts: whole(configDraft.externalPoolRetryMaxAttempts),
+          externalPoolRetryStatusCodes: parseStatusCodeList(retryStatusCodesText),
+          externalPoolSamePoolRetryCount: whole(configDraft.externalPoolSamePoolRetryCount),
+          externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(samePoolRetryStatusCodesText),
+          externalPoolSamePoolRetryDelayMs: whole(configDraft.externalPoolSamePoolRetryDelayMs),
+          externalPoolTransientFailurePriorityPenalty: whole(configDraft.externalPoolTransientFailurePriorityPenalty),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
@@ -373,7 +385,14 @@ export function ExternalPoolsPage() {
                   <NumberBox disabled={!waitModeActive} label="外部池排队上限" description="externalPoolMaxQueuedRequests；只限制外部池 wait 队列，不是本地账号 dispatch 队列。" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxQueuedRequests: v }))} />
                   <NumberBox disabled={!externalEnabled} label="估算输入上限（兼容）" description="保留历史配置；不再作为本地发送前拒绝条件，真实上下文超限以上游响应和请求大小保护为准。" suffix="Token" value={configDraft.externalPoolMaxInputTokens} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxInputTokens: v }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待" description="必须大于 0；旧配置中的 0 按安全默认值 30 秒处理。" suffix="秒" min={1} value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolDispatchMaxWaitSecs: v }))} />
-                  <NumberBox disabled={!externalEnabled} label="最大重试" suffix="次" value={configDraft.externalPoolRetryMaxAttempts} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryMaxAttempts: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="外部池最多尝试" description="控制同一请求最多尝试多少个外部账号；0 表示按候选账号自动尝试一轮。" suffix="池" value={configDraft.externalPoolRetryMaxAttempts} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryMaxAttempts: v }))} />
+                  <ToggleRow label="网络错误跨池重试" description="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他外部池。" checked={configDraft.externalPoolRetryOnNetworkError} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryOnNetworkError: v }))} />
+                  <ToggleRow label="协议错误跨池重试" description="成功状态码但返回错误信封或协议污染时，是否允许切换其他外部池。" checked={configDraft.externalPoolRetryOnProtocolError} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryOnProtocolError: v }))} />
+                  <TextAreaBox disabled={!externalEnabled} label="跨池重试状态码" value={retryStatusCodesText} onChange={setRetryStatusCodesText} />
+                  <NumberBox disabled={!externalEnabled} label="同池重试次数" description="命中下面状态码时，先在同一个外部账号上重试；重试耗尽后才冷却并尝试其他外部账号。" suffix="次" value={configDraft.externalPoolSamePoolRetryCount} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryCount: v }))} />
+                  <NumberBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试间隔" suffix="毫秒" value={configDraft.externalPoolSamePoolRetryDelayMs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryDelayMs: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="失败池临时降权" description="每个瞬态失败窗口内的失败次数都会临时增加有效优先级；默认 20，可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。" suffix="优先级" min={0} value={configDraft.externalPoolTransientFailurePriorityPenalty} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailurePriorityPenalty: v }))} />
+                  <TextAreaBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试状态码" value={samePoolRetryStatusCodesText} onChange={setSamePoolRetryStatusCodesText} />
                 </div>
               </FormSection>
               <FormSection title="冷却与超时">
@@ -507,7 +526,7 @@ export function ExternalPoolsPage() {
                           <Badge tone={runtime?.dispatchable ? 'info' : 'neutral'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                         </div>
                         <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {inFlight}/{capacity} · 优先级 {pool.priority}</div>
-                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} · {poolSupportedModelsSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} · {poolSupportedModelsSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
                         {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                       </div>
                     </div>
@@ -519,6 +538,9 @@ export function ExternalPoolsPage() {
                       </Button>
                       <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearExternalPoolAutoDisabled(pool.id), '自动禁用状态已清除')}>
                         <RotateCcw className="h-3.5 w-3.5" />清除禁用
+                      </Button>
+                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearExternalPoolCooldown(pool.id), '冷却状态已清除')}>
+                        <RotateCcw className="h-3.5 w-3.5" />清除冷却
                       </Button>
                       <Button variant="ghost" size="xs" onClick={() => status.refetch()}><RefreshCw className="h-3.5 w-3.5" />刷新</Button>
                       <Button

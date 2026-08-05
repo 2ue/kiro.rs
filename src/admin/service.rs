@@ -1239,6 +1239,26 @@ impl AdminService {
         Ok(pool.masked_for_admin_response())
     }
 
+    pub fn clear_external_pool_cooldown(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+        let manager = self.external_pool_manager.clone();
+        let deleted = block_on_admin_store(async move { manager.clear_pool_cooldowns(id).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.audit(
+            "clear_external_pool_cooldown",
+            "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "deletedKeys": deleted }),
+        );
+        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        Ok(pool.masked_for_admin_response())
+    }
+
     pub fn get_external_pool_status(
         &self,
     ) -> Result<ExternalPoolsStatusResponse, AdminServiceError> {
@@ -5605,6 +5625,37 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     }
     if config.external_pool_retry_max_attempts > 10_000 {
         return Err("externalPoolRetryMaxAttempts 不能大于 10000".to_string());
+    }
+    if config
+        .external_pool_retry_status_codes
+        .iter()
+        .any(|code| !(100..=599).contains(code))
+    {
+        return Err("externalPoolRetryStatusCodes 只能包含 100 到 599 的 HTTP 状态码".to_string());
+    }
+    if config.external_pool_retry_status_codes.len() > 100 {
+        return Err("externalPoolRetryStatusCodes 不能超过 100 个".to_string());
+    }
+    if config.external_pool_same_pool_retry_count > 10 {
+        return Err("externalPoolSamePoolRetryCount 不能大于 10".to_string());
+    }
+    if config.external_pool_same_pool_retry_delay_ms > 60_000 {
+        return Err("externalPoolSamePoolRetryDelayMs 不能大于 60000".to_string());
+    }
+    if config
+        .external_pool_same_pool_retry_status_codes
+        .iter()
+        .any(|code| !(100..=599).contains(code))
+    {
+        return Err(
+            "externalPoolSamePoolRetryStatusCodes 只能包含 100 到 599 的 HTTP 状态码".to_string(),
+        );
+    }
+    if config.external_pool_same_pool_retry_status_codes.len() > 100 {
+        return Err("externalPoolSamePoolRetryStatusCodes 不能超过 100 个".to_string());
+    }
+    if config.external_pool_transient_failure_priority_penalty > 10_000 {
+        return Err("externalPoolTransientFailurePriorityPenalty 不能大于 10000".to_string());
     }
     if config.external_pool_local_rescue_max_wait_secs > 300 {
         return Err("externalPoolLocalRescueMaxWaitSecs 不能大于 300".to_string());

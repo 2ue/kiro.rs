@@ -44,8 +44,9 @@ export function HintBox({ children }: { children: ReactNode }) {
 // ToggleRow
 // ============================================================================
 
-export function ToggleRow({ label, checked, disabled = false, onChange }: {
+export function ToggleRow({ label, description, checked, disabled = false, onChange }: {
   label: string
+  description?: string
   checked: boolean
   disabled?: boolean
   onChange: (v: boolean) => void
@@ -55,7 +56,10 @@ export function ToggleRow({ label, checked, disabled = false, onChange }: {
       'flex min-h-12 items-center justify-between gap-3 rounded-lg bg-card px-3 py-2 text-sm shadow-sm',
       disabled && 'cursor-not-allowed opacity-60',
     )}>
-      <span className="min-w-0 font-medium text-muted-foreground">{label}</span>
+      <span className="min-w-0">
+        <span className="block font-medium text-muted-foreground">{label}</span>
+        {description && <span className="mt-0.5 block text-xs leading-4 text-muted-foreground">{description}</span>}
+      </span>
       <Switch className="shrink-0" checked={checked} disabled={disabled} onCheckedChange={onChange} />
     </label>
   )

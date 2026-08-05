@@ -8,8 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, batch_import_credentials, batch_update_credentials, cancel_usage_cleanup,
-        clear_credential_in_flight, clear_external_pool_auto_disabled, clear_usage_records,
-        create_external_pool, create_proxy_resource, create_request_api_key, delete_credential,
+        clear_credential_in_flight, clear_external_pool_auto_disabled,
+        clear_external_pool_cooldown, clear_usage_records, create_external_pool,
+        create_proxy_resource, create_request_api_key, delete_credential,
         delete_disabled_credentials, delete_external_pool, delete_manual_model,
         delete_proxy_resource, delete_request_api_key, discover_credential_supported_models,
         discover_external_pool_supported_models,
@@ -176,6 +177,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/external-pools/{id}/auto-disabled/clear",
             post(clear_external_pool_auto_disabled),
+        )
+        .route(
+            "/external-pools/{id}/cooldown/clear",
+            post(clear_external_pool_cooldown),
         )
         .route("/external-pools/{id}/test", post(test_external_pool))
         .route("/usage-records", get(get_usage_records))

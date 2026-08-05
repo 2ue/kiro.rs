@@ -759,12 +759,16 @@ function sampleProcess(pid) {
   const rss = execFileSyncText("ps", ["-o", "rss=", "-p", String(pid)])
     .trim()
     .split(/\s+/)[0];
+  const vsz = execFileSyncText("ps", ["-o", "vsz=", "-p", String(pid)])
+    .trim()
+    .split(/\s+/)[0];
   const cpu = execFileSyncText("ps", ["-o", "%cpu=", "-p", String(pid)])
     .trim()
     .split(/\s+/)[0];
   const lsof = execFileSyncText("lsof", ["-p", String(pid)]);
   return {
     rssBytes: Number(rss || 0) * 1024,
+    vszBytes: Number(vsz || 0) * 1024,
     cpuPercent: Number(cpu || 0),
     fdCount: Math.max(0, lsof.split(/\r?\n/).length - 1),
   };
@@ -996,6 +1000,16 @@ async function runL5(ctx, durationSecs, idleCooldownSecs) {
     "long-stream",
     { delayMs: 250, streamChunks: 24, streamChunkDelayMs: 100 },
     async ({ fake, proxy }) => {
+      // Establish a post-startup allocator baseline before the sustained run.
+      // Measuring RSS immediately after process startup makes normal connection
+      // pools and serialization buffers look like a leak after the first load.
+      await runLoad(ctx, proxy, {
+        id: "l5_warmup_baseline_c3_r12",
+        requests: 12,
+        concurrency: 3,
+        expect: "success",
+        timeoutSecs: 30,
+      });
       const startSample = sampleProcess(proxy.child.pid);
       await runLoad(ctx, proxy, {
         id: `l5_long_stream_soak_${durationSecs}s_c20`,
@@ -1007,13 +1021,44 @@ async function runL5(ctx, durationSecs, idleCooldownSecs) {
         timeoutSecs: Math.max(120, durationSecs + 60),
         processTimeoutSecs: durationSecs + 120,
       });
-      await sleep(idleCooldownSecs * 1000);
-      const idleSample = sampleProcess(proxy.child.pid);
+      const idleSamples = [];
+      const idleSampleCount = Math.max(4, Math.min(12, Math.ceil(idleCooldownSecs / 10)));
+      const idleSampleIntervalMs = Math.max(
+        1_000,
+        Math.floor((idleCooldownSecs * 1_000) / idleSampleCount),
+      );
+      for (let index = 0; index < idleSampleCount; index += 1) {
+        await sleep(idleSampleIntervalMs);
+        idleSamples.push(sampleProcess(proxy.child.pid));
+      }
+      const idleSample = idleSamples.at(-1) || sampleProcess(proxy.child.pid);
+      const idleFirstSample = idleSamples[0] || idleSample;
+      const idleRssDeltaBytes = idleSample.rssBytes - idleFirstSample.rssBytes;
+      const idleVszDeltaBytes = idleSample.vszBytes - idleFirstSample.vszBytes;
+      const idleTail = idleSamples.slice(-3);
+      const idleTailRssValues = idleTail.map((sample) => sample.rssBytes);
+      const idleTailRssMax = Math.max(...idleTailRssValues);
+      const idleTailRssMin = Math.min(...idleTailRssValues);
+      const idleTailLargeIncreases = idleTail
+        .slice(1)
+        .filter((sample, index) => (
+          sample.rssBytes > idleTail[index].rssBytes + 8 * 1024 * 1024
+        )).length;
       ctx.extra.soak = {
         durationSecs,
         idleCooldownSecs,
         startSample,
         idleSample,
+        idleSamples,
+        idleRssDeltaBytes,
+        idleVszDeltaBytes,
+        idleRssSettled:
+          idleTail.length >= 3 &&
+          idleTailLargeIncreases === 0 &&
+          idleTailRssMax <= idleFirstSample.rssBytes + 16 * 1024 * 1024 &&
+          idleSample.rssBytes <= idleFirstSample.rssBytes + 8 * 1024 * 1024,
+        idleTailLargeIncreases,
+        idleTailRssRangeBytes: idleTailRssMax - idleTailRssMin,
         rssReturnedWithin32MiB:
           idleSample.rssBytes <= Math.max(startSample.rssBytes + 32 * 1024 * 1024, Math.ceil(startSample.rssBytes * 1.2)),
         fdReturnedWithin5: idleSample.fdCount <= startSample.fdCount + 5,
@@ -1126,6 +1171,7 @@ async function main() {
       passed =
         passed &&
         ctx.extra.soak.rssReturnedWithin32MiB === true &&
+        ctx.extra.soak.idleRssSettled === true &&
         ctx.extra.soak.fdReturnedWithin5 === true;
     }
   } finally {

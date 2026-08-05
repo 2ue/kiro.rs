@@ -9385,7 +9385,7 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     let request_body_mode: String = row
         .try_get("request_body_mode")
         .map_err(|_| anyhow::anyhow!("request_body_mode 字段类型无效"))?;
-    let request_body_mode = ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
+    let _request_body_mode = ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
         .ok_or_else(|| anyhow::anyhow!("request_body_mode 值无效"))?;
     let raw_model_mode: String = row.try_get("raw_model_mode")?;
     ExternalPoolRawModelMode::parse_known(&raw_model_mode)
@@ -9418,7 +9418,6 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     Ok(ExternalPoolEligibility {
         id: row.try_get::<i64, _>("id")?.max(0) as u64,
         enabled: row.try_get("enabled")?,
-        request_body_mode,
         auto_disabled: row.try_get("auto_disabled")?,
         auto_disabled_until: row.try_get("auto_disabled_until")?,
         supported_models: Arc::new(

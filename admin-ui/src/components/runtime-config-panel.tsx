@@ -49,6 +49,24 @@ const DEFAULT_FINAL_OUTPUT_MAX_TOKENS = 200000
 const DEFAULT_FINAL_OUTPUT_JITTER_MIN_TOKENS = 5000
 const DEFAULT_FINAL_OUTPUT_JITTER_MAX_TOKENS = 12000
 
+function parseStatusCodeList(value: string): number[] {
+  const seen = new Set<number>()
+  const codes: number[] = []
+  for (const raw of value.split(/[\s,，;；]+/)) {
+    const code = Number(raw.trim())
+    if (!Number.isInteger(code) || code < 100 || code > 599 || seen.has(code)) continue
+    seen.add(code)
+    codes.push(code)
+  }
+  return codes
+}
+
+function joinStatusCodeList(value: number[] = []): string {
+  return value
+    .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
+    .join(', ')
+}
+
 const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT = `<language_constraint>
 面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
 
@@ -335,6 +353,13 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolStreamResponseMode: 'event_passthrough' as const,
   externalPoolDispatchMaxWaitSecs: 30,
   externalPoolRetryMaxAttempts: 0,
+  externalPoolRetryStatusCodes: [408, 425, 429, 500, 502, 503, 504, 529],
+  externalPoolRetryOnNetworkError: true,
+  externalPoolRetryOnProtocolError: true,
+  externalPoolSamePoolRetryCount: 3,
+  externalPoolSamePoolRetryStatusCodes: [401, 403, 429, 500, 502, 503, 504],
+  externalPoolSamePoolRetryDelayMs: 500,
+  externalPoolTransientFailurePriorityPenalty: 20,
   externalDirectPolicyEnabled: false,
   directExternalOnLocalMaintenance: false,
   directExternalModelRules: [],
@@ -2934,6 +2959,13 @@ export function RuntimeConfigPanel() {
         externalPoolMaxInputTokens: toWhole(draft.externalPools.externalPoolMaxInputTokens),
         externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs, 1),
         externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
+        externalPoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.externalPools.externalPoolRetryStatusCodes)),
+        externalPoolRetryOnNetworkError: Boolean(draft.externalPools.externalPoolRetryOnNetworkError),
+        externalPoolRetryOnProtocolError: Boolean(draft.externalPools.externalPoolRetryOnProtocolError),
+        externalPoolSamePoolRetryCount: toWhole(draft.externalPools.externalPoolSamePoolRetryCount),
+        externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.externalPools.externalPoolSamePoolRetryStatusCodes)),
+        externalPoolSamePoolRetryDelayMs: toWhole(draft.externalPools.externalPoolSamePoolRetryDelayMs),
+        externalPoolTransientFailurePriorityPenalty: toWhole(draft.externalPools.externalPoolTransientFailurePriorityPenalty),
         externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
         localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
         localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),

@@ -1,5 +1,6 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -180,6 +181,8 @@ pub(crate) struct InferenceAttemptBudget {
     mcp_attempts: AtomicU32,
     exhausted: AtomicBool,
     auxiliary: Arc<AuxiliaryAttemptBudget>,
+    started_at: Instant,
+    dispatch_deadline: OnceLock<Instant>,
 }
 
 const DOWNSTREAM_COMMITTED_BIT: u32 = 1 << 31;
@@ -206,7 +209,34 @@ impl InferenceAttemptBudget {
             mcp_attempts: AtomicU32::new(0),
             exhausted: AtomicBool::new(false),
             auxiliary: Arc::new(AuxiliaryAttemptBudget::new(auxiliary_max_attempts)),
+            started_at: Instant::now(),
+            dispatch_deadline: OnceLock::new(),
         }
+    }
+
+    /// The request start is shared by local and external routing phases.  A
+    /// fallback route must not receive a fresh queue budget merely because it
+    /// was entered later in the request lifecycle.
+    pub(crate) fn started_at(&self) -> Instant {
+        self.started_at
+    }
+
+    /// Installs the request-wide dispatch deadline once at admission time.
+    /// Tests that construct a budget directly intentionally leave it unset and
+    /// retain the legacy per-stage wait behavior.
+    pub(crate) fn set_dispatch_deadline_after(&self, duration: Duration) {
+        let _ = self
+            .dispatch_deadline
+            .set(self.started_at + duration.max(Duration::from_millis(1)));
+    }
+
+    pub(crate) fn dispatch_deadline(&self) -> Option<Instant> {
+        self.dispatch_deadline.get().copied()
+    }
+
+    pub(crate) fn dispatch_remaining(&self) -> Option<Duration> {
+        self.dispatch_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
     pub(crate) fn auxiliary_budget(&self) -> Arc<AuxiliaryAttemptBudget> {
@@ -525,6 +555,22 @@ mod tests {
             assert_eq!(snapshot.consumed, 3);
             assert!(!snapshot.exhausted);
         }
+    }
+
+    #[test]
+    fn dispatch_deadline_is_shared_and_only_installed_once() {
+        let budget = InferenceAttemptBudget::new(4);
+        budget.set_dispatch_deadline_after(Duration::from_secs(5));
+        let first = budget
+            .dispatch_deadline()
+            .expect("request deadline should be installed");
+        budget.set_dispatch_deadline_after(Duration::from_secs(60));
+        let second = budget
+            .dispatch_deadline()
+            .expect("request deadline should remain available");
+        assert_eq!(first, second);
+        assert!(budget.dispatch_remaining().is_some());
+        assert!(budget.started_at() <= first);
     }
 
     #[test]

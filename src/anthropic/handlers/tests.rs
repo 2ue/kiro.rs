@@ -5156,7 +5156,7 @@ fn contaminated_fallback_requires_normalized_pool_for_five_rounds() {
 }
 
 #[test]
-fn all_parsed_external_fallback_entrypoints_share_model_and_body_mode_eligibility() {
+fn all_parsed_external_fallback_entrypoints_share_model_only_eligibility() {
     let source = include_str!("../handlers.rs");
     assert_eq!(
         source
@@ -5182,7 +5182,18 @@ fn all_parsed_external_fallback_entrypoints_share_model_and_body_mode_eligibilit
         "local attempt policy must only switch to fail-fast when cached external capacity is immediately available"
     );
     assert!(
-        source.contains("match external_fallback_body_mode_filter(self.requires_normalized_body)")
+        source.contains(
+            "body_mode_filter: external_fallback_body_mode_filter(self.requires_normalized_body)"
+        ),
+        "body mode remains a route body-processing hint, not an external-pool candidate filter"
+    );
+    assert!(
+        !source.contains("has_eligible_pool_for_body_mode_and_model"),
+        "parsed external fallback eligibility must be model-based, not body-mode-based"
+    );
+    assert!(
+        !source.contains("has_immediately_available_pool_for_body_mode_and_model"),
+        "parsed immediate external fallback readiness must be model-based, not body-mode-based"
     );
 }
 
@@ -6426,6 +6437,23 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
             "round {round}: the operator preflight switch remains authoritative"
         );
         config.local_pool_preflight_enabled = true;
+    }
+}
+
+#[test]
+fn local_acquire_mode_is_clamped_to_shared_request_deadline() {
+    let budget = InferenceAttemptBudget::new(4);
+    budget.set_dispatch_deadline_after(Duration::from_millis(25));
+    let mode = clamp_acquire_mode_to_dispatch_deadline(
+        AcquireMode::WaitForCapacityMax(Duration::from_secs(7)),
+        &budget,
+    );
+    match mode {
+        AcquireMode::WaitForCapacityMax(wait) => {
+            assert!(wait <= Duration::from_millis(25));
+            assert!(wait < Duration::from_secs(7));
+        }
+        other => panic!("unexpected acquire mode: {other:?}"),
     }
 }
 
@@ -10026,14 +10054,20 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             pool_name: Some("backup".to_string()),
         };
     assert_eq!(
-        local_rescue_reason_after_external_error(&config, &rate_limit, None),
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
         Some("external_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
             &config,
             &rate_limit,
-            Some("no_available_credentials")
+            Some("no_available_credentials"),
+            Some(1),
         ),
         None
     );
@@ -10041,7 +10075,8 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_external_error(
             &config,
             &rate_limit,
-            Some("local_capacity_exhausted")
+            Some("local_capacity_exhausted"),
+            Some(0),
         ),
         None
     );
@@ -10049,7 +10084,8 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_external_error(
             &config,
             &rate_limit,
-            Some("local_attempt_reserved_for_fallback")
+            Some("local_attempt_reserved_for_fallback"),
+            Some(1),
         ),
         Some("external_rate_limit")
     );
@@ -10066,7 +10102,12 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         pool_name: Some("backup".to_string()),
     };
     assert_eq!(
-        local_rescue_reason_after_external_error(&config, &timeout, None),
+        local_rescue_reason_after_external_error(
+            &config,
+            &timeout,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
         Some("external_timeout")
     );
 
@@ -10082,7 +10123,12 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         pool_name: None,
     };
     assert_eq!(
-        local_rescue_reason_after_external_error(&config, &capacity, None),
+        local_rescue_reason_after_external_error(
+            &config,
+            &capacity,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
         Some("external_capacity")
     );
 
@@ -10098,35 +10144,55 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         pool_name: Some("backup".to_string()),
     };
     assert_eq!(
-        local_rescue_reason_after_external_error(&config, &bad_request, None),
+        local_rescue_reason_after_external_error(
+            &config,
+            &bad_request,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
         Some("external_bad_request")
     );
 
     let mut disabled = config.clone();
     disabled.external_pool_local_rescue_enabled = false;
     assert_eq!(
-        local_rescue_reason_after_external_error(&disabled, &rate_limit, None),
+        local_rescue_reason_after_external_error(&disabled, &rate_limit, None, Some(1)),
         None
     );
 
     let mut direct = config.clone();
     direct.external_direct_policy_enabled = true;
     assert_eq!(
-        local_rescue_reason_after_external_error(&direct, &rate_limit, None),
+        local_rescue_reason_after_external_error(
+            &direct,
+            &rate_limit,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
         None
     );
 
     let mut no_rate_limit = config;
     no_rate_limit.external_pool_local_rescue_on_rate_limit = false;
     assert_eq!(
-        local_rescue_reason_after_external_error(&no_rate_limit, &rate_limit, None),
+        local_rescue_reason_after_external_error(
+            &no_rate_limit,
+            &rate_limit,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
         None
     );
 
     let mut no_capacity = no_rate_limit;
     no_capacity.external_pool_local_rescue_on_capacity = false;
     assert_eq!(
-        local_rescue_reason_after_external_error(&no_capacity, &capacity, None),
+        local_rescue_reason_after_external_error(
+            &no_capacity,
+            &capacity,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
         None
     );
 
@@ -10145,7 +10211,8 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_external_error(
             &no_capacity,
             &server_error,
-            Some("local_transient_exhausted")
+            Some("local_transient_exhausted"),
+            Some(1),
         ),
         None
     );
@@ -10153,7 +10220,8 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_external_error(
             &no_capacity,
             &server_error,
-            Some("local_capacity_exhausted")
+            Some("local_capacity_exhausted"),
+            Some(0),
         ),
         None
     );
@@ -10180,8 +10248,6 @@ fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
         "local_proxy_blocked",
         "local_no_model_compatible",
         "local_all_cooling_down",
-        "local_capacity_full",
-        "local_capacity_exhausted",
         "local_scheduler_redis_degraded",
         "local_pool_risk_circuit_open",
         "local_transient_exhausted",
@@ -10189,11 +10255,82 @@ fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
         "unsupported_model",
     ] {
         assert_eq!(
-            local_rescue_reason_after_external_error(&config, &capacity, Some(reason)),
+            local_rescue_reason_after_external_error(&config, &capacity, Some(reason), Some(1),),
             None,
             "terminal local reason {reason} must not be rescued back to local"
         );
     }
+}
+
+#[test]
+fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fallbacks() {
+    let config = ExternalPoolsConfig::default();
+    let rate_limit = ExternalPoolFinalError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        response_error_type: "rate_limit_error".to_string(),
+        route_error_type: "rate_limit".to_string(),
+        message: "external rate limit".to_string(),
+        error_id: "req_capacity_guard_rate".to_string(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: Some(1),
+        pool_name: Some("backup".to_string()),
+    };
+
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_capacity_full"),
+            Some(1),
+        ),
+        Some("external_rate_limit")
+    );
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_capacity_exhausted"),
+            Some(1),
+        ),
+        Some("external_rate_limit")
+    );
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_attempt_reserved_for_fallback"),
+            Some(1),
+        ),
+        Some("external_rate_limit")
+    );
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_capacity_full"),
+            Some(0),
+        ),
+        None
+    );
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_capacity_exhausted"),
+            Some(0),
+        ),
+        None
+    );
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &rate_limit,
+            Some("local_attempt_reserved_for_fallback"),
+            Some(0),
+        ),
+        None
+    );
 }
 
 #[test]
@@ -10225,7 +10362,8 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
             budgeted_local_rescue_reason_after_external_error(
                 &config,
                 &rate_limit,
-                None,
+                Some("local_capacity_full"),
+                Some(1),
                 &remaining,
             ),
             Some("external_rate_limit"),
@@ -10245,7 +10383,8 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
             budgeted_local_rescue_reason_after_external_error(
                 &config,
                 &rate_limit,
-                None,
+                Some("local_capacity_full"),
+                Some(1),
                 &exhausted,
             ),
             None,
@@ -10325,7 +10464,12 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
     for round in 1..=5 {
         for err in &errors {
             assert_eq!(
-                local_rescue_reason_after_external_error(&config, err, Some("local_preflight")),
+                local_rescue_reason_after_external_error(
+                    &config,
+                    err,
+                    Some("local_capacity_full"),
+                    Some(1),
+                ),
                 None,
                 "round {round}: direct external policy must not route external failures back to local"
             );
@@ -10338,7 +10482,8 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
                 budgeted_local_rescue_reason_after_external_error(
                     &config,
                     err,
-                    Some("local_preflight"),
+                    Some("local_capacity_full"),
+                    Some(1),
                     &budget,
                 ),
                 None,
@@ -10374,7 +10519,8 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
             budgeted_local_rescue_reason_after_external_error(
                 &config,
                 &capacity,
-                Some("local_preflight"),
+                Some("local_capacity_full"),
+                Some(1),
                 &budget,
             ),
             Some("external_capacity"),
@@ -10388,7 +10534,8 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
             budgeted_local_rescue_reason_after_external_error(
                 &config,
                 &capacity,
-                Some("local_preflight"),
+                Some("local_capacity_full"),
+                Some(1),
                 &budget,
             ),
             None,
