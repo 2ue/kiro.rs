@@ -29,7 +29,8 @@ deep-audit 的脚本、汇总和部分 report 存在，但真实 Claude CLI/dire
 - [2026-08-05 external-pool HA scheduler validation](external-pool-ha-scheduler-validation-20260805.md)：确认并修复本进程自发 Redis
   外部池变更事件清空本地权威快照的根因；最终候选完成 3 轮真实 HTTP 多池故障接管/恢复、
   256 并发、1800 RPM/60 秒持续到达率、外部直连边界、隔离 PgSQL/Redis 回归、全量 Rust
-  `1896/0/6 ignored + 31/31` 和资源回落验证。当前只剩生产 rollout/观察，不表示本地候选仍阻塞。
+  `1896/0/6 ignored + 31/31` 和资源回落验证，并已通过 `Publish Docker Images #164`
+  发布为 `v0.0.133`。当前只剩生产 rollout/观察，不表示本地实现仍阻塞。
 - [2026-08-05 scheduler shared deadline and Redis chaos](scheduler-shared-deadline-and-load-chaos-20260805.md)：记录 Redis usage writer 与调度联合故障矩阵的初次 75ms 边界失败、诊断增强和后续 3 outer × 8 exact `24/24` 通过结果；结论是不修改生产 250ms 期限、不把一次本机边界抖动误判为固定代码缺陷，同时记录外部池优先级故障切换与半开放恢复动态验证。
 - 同一证据文件的最终候选动态补充记录 fresh-database L3 `9/9`、L4 `12/12`、外部池优先级故障恢复和 L5 `180s + 60s idle` `3/3`；L5 先 warm-up 再取 RSS 基线，避免把正常 allocator/连接池冷启动分配误报为泄漏。
 

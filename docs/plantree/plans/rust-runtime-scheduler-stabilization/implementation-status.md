@@ -84,7 +84,9 @@ Current phase:
   Three rounds of real HTTP multi-pool failover/recovery, 256-concurrency plus 1800 RPM/60s
   sustained traffic, external-direct route boundary, isolated PgSQL/Redis regression,
   full Rust (`1896/0/6 ignored` plus `kiro_loadtest 31/31`), format/diff and artifact gates
-  passed. Evidence: [external-pool HA scheduler validation 2026-08-05](../../../../feature/evidence/external-pool-ha-scheduler-validation-20260805.md).
+  passed. The candidate was released as `v0.0.133`; GitHub Actions `Publish Docker Images #164`
+  completed successfully for quality, amd64/arm64 builds and manifest. Evidence:
+  [external-pool HA scheduler validation 2026-08-05](../../../../feature/evidence/external-pool-ha-scheduler-validation-20260805.md).
 
 Last landed evidence:
 

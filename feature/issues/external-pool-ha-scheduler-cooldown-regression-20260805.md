@@ -1,6 +1,6 @@
 # 外部池高可用调度与冷却回归
 
-Status: `P0 / target-confirmed / root-cause-fixed / real-http-verified / release-candidate-passed / production-rollout-pending`
+Status: `P0 / target-confirmed / root-cause-fixed / real-http-verified / released-v0.0.133 / production-rollout-pending`
 
 Severity: `P0`
 
@@ -285,6 +285,7 @@ Redis 事件竞态：当前进程发布自己的变更事件后又消费该事�
 `kiro_loadtest 31/31`，格式、差异和构建产物库存门禁均通过。详细命令、候选二进制
 哈希和资源采样见[专项证据](../evidence/external-pool-ha-scheduler-validation-20260805.md)。
 
-`production-rollout-pending` 仅表示尚未将该候选部署到三台现网机器并观察，不表示
+`v0.0.133` 已通过 GitHub Actions `Publish Docker Images #164` 的质量门禁、amd64/arm64
+构建和 manifest 发布流程。`production-rollout-pending` 仅表示尚未将该版本部署到三台现网机器并观察，不表示
 本地实现或本地发布候选仍有验证阻塞。更大范围的统一 RoutePlan、候选拒绝可观测性
 和生产回归仍按 plan-tree 中的独立开放项管理。

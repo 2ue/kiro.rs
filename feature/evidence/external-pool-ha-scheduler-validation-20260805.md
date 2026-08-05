@@ -1,6 +1,6 @@
 # 外部池高可用调度修复与真实 HTTP 验证（2026-08-05）
 
-Status: `verified-local / release-candidate-passed / production-rollout-pending`
+Status: `verified-local / released-v0.0.133 / production-rollout-pending`
 
 Scope: 修复外部池管理变更后的本进程权威池快照被自身 Redis 事件清空，导致
 高优先级池和备用池从候选集合消失、最后创建的池独占流量的问题；同时复核
@@ -93,6 +93,15 @@ ESTABLISHED TCP：45 -> 52 -> 44
 ```
 
 停止流量后 FD/TCP 回落，临时服务、端口、数据库和 Redis 前缀均清理。
+
+## 发布结果
+
+- 版本：`v0.0.133`
+- 修复提交：`9dfaad9`
+- 版本提交：`8216481`
+- GitHub Actions：`Publish Docker Images #164`
+- 结果：质量门禁、amd64/arm64 镜像构建和 manifest 均成功
+- 现网三台机器尚未滚动升级；升级前继续保持只读观察和回滚准备
 
 ## 代码/回归门禁
 

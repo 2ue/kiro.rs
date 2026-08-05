@@ -29,7 +29,8 @@ Last reviewed: 2026-08-05 Asia/Shanghai
 - External-pool HA scheduler P0 root cause fix: self-originated Redis mutation events no longer
   clear the current process's freshly merged authoritative snapshot. Three real HTTP baseline
   rounds, 256-concurrency/1800-RPM sustained traffic, external-direct boundary, isolated storage
-  regression and full Rust gates passed. See [专项证据](../../../../feature/evidence/external-pool-ha-scheduler-validation-20260805.md).
+  regression and full Rust gates passed; released as `v0.0.133` through GitHub Actions
+  `Publish Docker Images #164`. See [专项证据](../../../../feature/evidence/external-pool-ha-scheduler-validation-20260805.md).
 - Source-verified scheduler architecture analysis: the current local-account/external-pool
   request chain, normal and exceptional transitions, queue/capacity/cooldown/retry semantics,
   fallback/rescue boundaries, `sub2api` comparison, configuration regrouping and target
