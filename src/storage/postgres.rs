@@ -32,8 +32,7 @@ use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
     ExternalPoolEligibility, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
     ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
-    UpdateExternalPoolRequest, mask_external_pool_key,
-    normalize_external_pool_model_mapping_rules,
+    UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_model_mapping_rules,
 };
 use crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -17635,7 +17634,10 @@ mod tests {
             ExternalPoolStreamRetryMode::Enabled
         );
         assert_eq!(loaded.route_mode, ExternalPoolRouteMode::AllowList);
-        assert_eq!(loaded.route_rules, vec!["/cc".to_string(), "/ha".to_string()]);
+        assert_eq!(
+            loaded.route_rules,
+            vec!["/cc".to_string(), "/ha".to_string()]
+        );
 
         let updated = store
             .update_external_pool(

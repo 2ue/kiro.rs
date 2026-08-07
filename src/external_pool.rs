@@ -67,11 +67,10 @@ use crate::{
     http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout},
     kiro::token_manager::storage_task::spawn_critical_storage_task,
     model::config::{
-        ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode,
-        ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ExternalPoolsConfig,
-        KiroRsToolCachePolicy, ModelMappingRule, PromptCacheCreationControlConfig,
-        PromptCacheSimulationMode, PromptCacheStrategyType, ReportedUsageConfig,
-        normalize_route_rules, route_rule_matches,
+        ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode, ExternalPoolRouteMode,
+        ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
+        ModelMappingRule, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+        PromptCacheStrategyType, ReportedUsageConfig, normalize_route_rules, route_rule_matches,
     },
     model::model_processing::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
@@ -4321,7 +4320,8 @@ impl ExternalPoolManager {
 
     #[cfg(test)]
     pub async fn has_eligible_pool(&self, config: &ExternalPoolsConfig) -> bool {
-        self.has_eligible_pool_matching(config, None, None, None).await
+        self.has_eligible_pool_matching(config, None, None, None)
+            .await
     }
 
     #[cfg(test)]
@@ -4342,13 +4342,8 @@ impl ExternalPoolManager {
         model: &str,
     ) -> bool {
         let model_candidates = normalize_external_pool_support_candidates([model]);
-        self.has_eligible_pool_matching(
-            config,
-            None,
-            Some(&model_candidates),
-            Some(endpoint),
-        )
-        .await
+        self.has_eligible_pool_matching(config, None, Some(&model_candidates), Some(endpoint))
+            .await
     }
 
     #[cfg(test)]
