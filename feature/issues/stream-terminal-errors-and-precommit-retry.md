@@ -1,10 +1,10 @@
 # Stream Terminal Errors And Precommit Retry
 
-Status: `focused-router-and-release-2mib-unit-passed / final-cli-http-load-gates-pending`
+Status: `focused-router-and-release-2mib-unit-passed / external-pool-pre-output-stream-retry-implemented / focused-fake-http-and-routing-validated / normal-routing-rerun-passed-20260807 / frozen-cli-load-passed-20260807 / production-rollout-observation-pending / release-candidate-v0.0.134`
 
 Severity: P0 release gate
 
-Last updated: 2026-07-16
+Last updated: 2026-08-07
 
 ## 问题、现象与影响
 
@@ -23,6 +23,59 @@ Last updated: 2026-07-16
 真正进入 handler precommit retry 的当前矩阵是六类 EventStream 故障：body read error、idle timeout、bad CRC、truncated frame、显式 incomplete status、protocol contamination。另测 `application/vnd.amazon.eventstream` Content-Type 配 JSON bytes；生产可达分类是 decoder `protocol_error`，不是 handler `status_error`。
 
 因此不再把 handler `status_error` 写成当前 Router 可达的生产路径。provider typed retry 和 handler stream retry 必须分别计账，但共享同一个 inference attempt budget。
+
+## 2026-08-06 外部池流式首语义输出前错误子问题
+
+本文件原先主要覆盖本地 Kiro/AWS EventStream handler 的 precommit retry 和 postcommit fail-closed。2026-08-06 新增的现网问题来自外部池 `event_passthrough` / SSE 路径：
+
+- 页面样本：`req_01KaWrDY5oZkY13XQqdJB9PH`，入口 `/cc/v1/messages`，路由 `外部直连 · external_pool · external_direct_policy`，外部账号 `#18 yuenan-1`，状态 `流错误`，错误阶段 `external_account_stream`，内部错误信息 `external upstream emitted an error event`，客户端状态码 `200`。
+- 真实采样：`yuenan` stream `12` 次中 `5` 次为空回/协议前置流错误，`7` 次正常；`yuenan-1` stream `12` 次中 `2` 次为空回/协议前置流错误，`10` 次正常。两个池 non-stream 各 `5/5` 成功。
+- 可恢复指纹：`HTTP 200 -> message_start -> error`，且没有 `content_block_start`、`content_block_delta`、thinking、tool_use 或 `input_json_delta`。
+
+修复前代码不会切池的原因是外部池流式 `HTTP 2xx` 路径在拿到 response header 后立刻构造并返回 `Response`；后续 SSE body 里的 error/read/idle 由 body stream wrapper 记录为 `stream_error`，此时外部池 failover 主循环已经结束，不能再重新选择池。
+
+正确修复不是“所有流错误都重试”，而是新增外部池流式预读缓冲：
+
+1. 在向下游发送任何旧尝试事件前，预读上游 SSE。
+2. 只缓冲 `message_start`、`ping`、usage preview 等 protocol-only 事件。
+3. 若首个有效语义输出前遇到 error event、idle timeout、read error 或 EOF without terminal，则丢弃缓冲、释放租约、排除当前池，并按外部池同池/跨池预算换池。
+4. 一旦读到有效语义输出，就把缓冲和当前语义事件作为 response body 前缀提交；之后任何错误都不得重放完整请求。
+5. 外部直连仍只在外部池内部恢复，不能 fallback 到本地账号。
+6. 被丢弃的失败尝试只能进入调度 attempt 诊断，不能混入最终成功 usage；最终成功 usage 仍按最终上游真实 usage 或既有估算 fallback 计算。
+
+本轮实现结果：
+
+- `src/model/config.rs` 增加全局 `external_pool_stream_pre_output_retry_enabled`，默认 `true`。
+- `src/external_pool.rs` 增加 `ExternalPoolStreamRetryMode` 和单池 `pre_output_stream_retry_mode`，并在 stream 2xx 分支先预读 SSE：pre-output error event、body read error、idle timeout、EOF without terminal 会转为 retryable external-pool failure，回到既有同请求外部池预算；读到 commit 边界后才把 buffered prefix 发给下游。
+- `src/storage/postgres.rs` 增加 `external_upstream_pools.pre_output_stream_retry_mode TEXT NOT NULL DEFAULT 'inherit'`，并接入 create/update/list/get/strict dispatch 解析。
+- 主 UI 和 admin-ui 增加全局 `流式首输出前错误换池` toggle、单池 `首输出前流式恢复` select 和列表摘要。
+- 真实 loopback Axum SSE fake-upstream 测试覆盖 `message_start -> error`、`message_start -> ping -> error`、EOF、read error、idle timeout、单池禁用、post-commit 不重放，并断言失败尝试不泄漏到下游或最终成功 usage。
+
+focused validation 已通过，但 final release gate 仍未关闭：
+
+- `feature/tests/run-cargo-scoped.sh external-stream-preoutput-unit-final -- cargo test external_pool_pre_output_stream --locked`：`2 passed`
+- `feature/tests/run-cargo-scoped.sh external-stream-preoutput-http-matrix -- cargo test external_pool_stream_ --locked`：`6 passed`
+- `feature/tests/run-cargo-scoped.sh external-stream-storage -- cargo test postgres_external_pool_list_and_get_preserve_body_modes --locked`：`1 passed`
+- `feature/tests/run-cargo-scoped.sh external-stream-preoutput-check -- cargo check --all-targets --locked`：pass
+- `feature/tests/run-cargo-scoped.sh external-stream-preoutput-fmt-check -- cargo fmt --all -- --check`：pass
+- `git diff --check`、`pnpm --dir ui check/build`、`pnpm --dir admin-ui build`：pass；UI build 只有既有 chunk-size warning
+
+用户追加要求验证“是否影响其他正常逻辑调度，特别是正常流式/非流式输出，以及本地账号和外部池 direct 在各种配置下的调度”。本轮已按本地 plan/issue 文档抽取 focused 回归矩阵并通过，并在 2026-08-07 使用 `cargo +1.92.0` 重新复跑核心调度和输出矩阵：
+
+- 正常外部 stream：`external_pool_stream_` 在显式注入本地 Docker PgSQL/Redis 后 `6 passed`，覆盖 pre-output 恢复、禁用开关和 post-commit 不重放。
+- 正常外部 non-stream / stream usage：OpenAI-compatible non-stream usage、stream billing、raw-vs-shaped usage separation、clean non-stream byte identity、missing usage estimate 共 6 个 targeted 测试通过。
+- 正常本地 stream/non-stream：`stream_success_records_requested_max_tokens_and_downstream_stop_reason` 与 `local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds` 通过。
+- 外部 direct 正常 stream/non-stream：`normalized_external_direct_policy_skips_raw_preparse_without_raw_pool` 已扩展为同时覆盖 `stream=false` / `stream=true`，断言 route subtype 为 `external_direct_policy`、模型发出值为 `claude-opus-4.6`、外部尝试为 1、本地 Kiro upstream hit 为 0。
+- 本地优先/外部 fallback/rescue 配置：`external_fallback`、`direct_external`、`local_pool_preflight_reason`、`local_external_fallback_capacity_gate`、`fresh_local_pool_state`、`classified_scheduler_degraded`、`external_local_rescue`、`local_rescue_requires` 等 focused 组合通过。
+- Router 级正常路径：normalized external preflight stream/non-stream、scheduler failure 后 external fallback、WebSearch stream/non-stream success、stream completion/client drop usage ownership、route config authority 矩阵均通过。
+- 最终 `cargo check --all-targets --locked`、`cargo fmt --all -- --check`、`git diff --check` 和 build artifact inventory 均通过。
+- 2026-08-07 scoped rerun：
+  - `normal-routing-scheduler-matrix-20260807`：16 个 focused Cargo filter 命令通过，覆盖 external stream/pre-output/storage、fallback/direct、本地 preflight/fresh Ready/Redis degraded、local rescue、external direct stream/non-stream、本地 stream/non-stream 和 route config authority。
+  - `normal-output-external-usage-matrix-20260807`：8 个 external normal output/usage 精确测试通过，覆盖 normal non-stream body identity、OpenAI-compatible usage、stream billing、raw/shaped 分离、missing usage estimate、pricing model match。
+  - `normal-routing-static-final-20260807`：`cargo +1.92.0 fmt --all -- --check` 与 `cargo +1.92.0 check --all-targets --locked` 通过。
+  - `git diff --check`、feature docs、artifact inventory、`pnpm --dir ui check/build`、`pnpm --dir admin-ui build` 通过；本机 pnpm 为 `10.33.4`，因此该前端结果是本地复验，不替代 baseline pnpm `11.11.0` CI gate。
+
+2026-08-07 最终冻结候选动态 gate 也已通过：`kiro-rs` SHA-256 `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688`，`kiro_loadtest` SHA-256 `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d`；真实 Claude Code CLI `2.1.221` fake-upstream gate 为 bare `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire rerun `60/60`；load/chaos 为 L3 `9/9`、L4 `12/12`、L5 `900s` soak `6820/6820` success，`300s` idle 后 RSS/FD 回落并通过 post-soak recovery。生产 rollout 观察和必要的 `yuenan` / `yuenan-1` 复核仍留给发布后执行；本状态不冒领生产观察。详细实现/验证状态见 [外部池流式首语义输出前错误恢复](../../docs/plantree/plans/rust-runtime-scheduler-stabilization/topics/external-pool-stream-pre-output-retry-20260806.md)。采样摘要见 [Yuenan stream-error sampling 2026-08-06](../evidence/external-pool-stream-error-yuenan-sampling-20260806.md)，focused/final candidate evidence 见 [External-pool stream pre-output retry focused validation 2026-08-06](../evidence/external-pool-stream-pre-output-retry-validation-20260806.md)。
 
 ## 根因与修复
 
@@ -64,15 +117,15 @@ handler retry 不能独立创造第二套无界预算。每轮实际上游 hits 
 
 ## 当前证据与验收
 
-聚焦结果见 [Handler EventStream 与 runtime stack 矩阵证据](../evidence/handler-eventstream-runtime-matrix-20260716.md)。冻结候选仍须完成：
+聚焦结果见 [Handler EventStream 与 runtime stack 矩阵证据](../evidence/handler-eventstream-runtime-matrix-20260716.md)。外部池 stream pre-output focused/final-candidate 结果见 [External-pool stream pre-output retry focused validation 2026-08-06](../evidence/external-pool-stream-pre-output-retry-validation-20260806.md)。冻结候选本地 gate 状态：
 
 1. `cargo fmt --check`、`git diff --check`、`cargo check --all-targets` 和相关全量测试。
 2. 当前 checkpoint 的 release-only 2 MiB worker 已通过；最终 tag binary 需绑定同一结果，并完成隔离 HTTP fault matrix。
-3. Claude Code CLI 2.1.197 的 C1-C4：normal、thinking、tool、MCP、长会话、resume 和错误路径。
-4. 至少 1,000 次 release HTTP 请求、三轮 burst、异常后 normal `5/5` 恢复及资源回落。
+3. Claude Code CLI `2.1.221` frozen fake-upstream gate 已通过：bare、long-session、thinking-wire。
+4. L3/L4/L5 fake-upstream load/chaos 已通过，其中 L5 为 `900s` soak + `300s` idle。
 
 任一 success 缺可信 terminal/final usage，任一 failure 伪造 `message_stop`，任一已提交请求发生上游重放，任一 usage/hit 超共享预算，或任一私有 marker 出现在公开面，都阻止发布。
 
 ## 残余边界
 
-local non-stream contamination 当前没有 response-level 跨账号重试；external SSE 在 Response 已建立后也不能跨 pool 重试。这些路径必须 fail closed 并有明确观测，不能通过伪造 success 补齐。当前结果不能承诺未来未知 upstream event 一定兼容，只能保证已列未知/缺终止模型会明确失败或在首输出前有界恢复。
+local non-stream contamination 当前没有 response-level 跨账号重试；external SSE 在语义输出已经提交后也不能跨 pool 重放。这些路径必须 fail closed 并有明确观测，不能通过伪造 success 补齐。当前结果不能承诺未来未知 upstream event 一定兼容，只能保证已列未知/缺终止模型会明确失败或在首输出前有界恢复。

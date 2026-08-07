@@ -6,7 +6,7 @@ Status: `In Progress`
 
 Current phase: `external-pool hot-path fixed / scheduler architecture and signature blockers open`
 
-Last reviewed: 2026-08-04 Asia/Shanghai
+Last reviewed: 2026-08-07 Asia/Shanghai
 
 Authority:
 
@@ -24,6 +24,7 @@ Authority:
    - [统一调度目标契约、状态机与验证方案](topics/scheduler-target-state-machine-and-test-contract.md)
    - [当前目标符合度矩阵](topics/scheduler-target-compliance-matrix.md)
    - [持续调度验证方案](topics/sustained-scheduling-validation.md)
+   - [外部池流式首语义输出前错误恢复](topics/external-pool-stream-pre-output-retry-20260806.md)
    - [Thinking signature 协议安全](topics/thinking-signature-protocol-safety.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Decisions:
@@ -57,6 +58,7 @@ Out of scope:
 | Problem | Status | Owning topic |
 | --- | --- | --- |
 | 外部池开启影响本地凭证热路径 | Hot-path fixed; strategy/chaos follow-up open | [External pool local-first scheduler](topics/external-pool-local-first-scheduler.md) |
+| 外部池流式首语义输出前 error/空回不会换池 | Focused implementation, normal routing/output rerun, frozen Claude CLI and L3-L5 load/chaos gates passed; production rollout observation pending | [External pool stream pre-output retry](topics/external-pool-stream-pre-output-retry-20260806.md), [Stream terminal errors and precommit retry](../../../../feature/issues/stream-terminal-errors-and-precommit-retry.md) |
 | 调度模式分散、无法统一解释 route/fallback/rescue | Open design | [Route planner and capacity ledger](topics/route-planner-capacity-ledger.md) |
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |
 | 真实 CLI / load chaos / release gates 未全量闭环 | Open validation | [Validation and release gates](topics/validation-and-release-gates.md) |

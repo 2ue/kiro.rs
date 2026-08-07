@@ -1159,6 +1159,7 @@ export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolStreamResponseMode = 'event_passthrough'
+export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled'
 export type ExternalPoolModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
@@ -1423,6 +1424,7 @@ export interface ExternalPoolsConfig {
   externalPoolRequestTimeoutSecs: number
   externalPoolStreamRequestTimeoutSecs: number
   externalPoolStreamIdleTimeoutSecs: number
+  externalPoolStreamPreOutputRetryEnabled: boolean
   externalPoolAutoDisableOnChannelDisabled: boolean
   externalPoolUsageProjectionUpliftPercent: number
   externalPoolUsageProjectionOutputUpliftMinTokens: number
@@ -1444,6 +1446,7 @@ export interface ExternalPool {
   requestBodyMode: ExternalPoolRequestBodyMode
   rawModelMode: ExternalPoolRawModelMode
   autoDisablePolicy: ExternalPoolAutoDisablePolicy
+  preOutputStreamRetryMode: ExternalPoolStreamRetryMode
   autoDisabled: boolean
   autoDisabledReason?: string
   autoDisabledAt?: string
@@ -1492,6 +1495,7 @@ export interface CreateExternalPoolRequest {
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
+  preOutputStreamRetryMode?: ExternalPoolStreamRetryMode
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
   modelMappingMode?: ExternalPoolModelMappingMode
@@ -1514,6 +1518,7 @@ export interface UpdateExternalPoolRequest {
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
+  preOutputStreamRetryMode?: ExternalPoolStreamRetryMode
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
   modelMappingMode?: ExternalPoolModelMappingMode

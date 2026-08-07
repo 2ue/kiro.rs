@@ -18,6 +18,7 @@ import {
   appendModelMappingRules,
   parseModelMappingRules,
   requestBodyModeDescription,
+  streamRetryDescription,
   streamResponseDescription,
   usageProjectionDescription,
 } from './external-pool-utils'
@@ -188,6 +189,22 @@ export function ExternalPoolFormModal({
                 <SelectItem value="event_passthrough">SSE 事件级透传</SelectItem>
               </SelectBox>
               <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
+            </div>
+          </FormSection>
+
+          <FormSection title="首输出前流式恢复" description="只覆盖当前外部账号在未提交内容前的 stream body 错误恢复。">
+            <div className="space-y-3">
+              <SelectBox
+                label="首输出前流式恢复"
+                value={draft.preOutputStreamRetryMode}
+                disabled={saving}
+                onChange={(v) => set('preOutputStreamRetryMode', v as ExternalPoolFormDraft['preOutputStreamRetryMode'])}
+              >
+                <SelectItem value="inherit">继承全局</SelectItem>
+                <SelectItem value="enabled">启用</SelectItem>
+                <SelectItem value="disabled">禁用</SelectItem>
+              </SelectBox>
+              <HintBox>{streamRetryDescription(draft.preOutputStreamRetryMode)}</HintBox>
             </div>
           </FormSection>
         </div>

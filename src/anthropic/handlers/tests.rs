@@ -16,7 +16,7 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
     ExternalPoolManager, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
-    ExternalPoolRequestBodyMode, ExternalPoolUsageProjectionMode,
+    ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
 };
 use crate::kiro::call_trace::{
     AccountRejectReason, KiroCallError, SelectionFailureStage, SelectionFailureSummary,
@@ -951,6 +951,7 @@ async fn test_external_pool_manager_for_handlers(
             request_body_mode: body_mode,
             raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+            pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
             preserve_path: true,
             normalize_model_version_dots: false,
             model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
@@ -1532,67 +1533,83 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         true,
     );
 
-    let response = router
-        .clone()
-        .oneshot(multimodal_handler_request(
-            "/cc/v1/messages",
-            json!({
-                "model": "claude-opus-4-6-thinking",
-                "max_tokens": 32,
-                "stream": false,
-                "messages": [{"role": "user", "content": "hi"}]
-            })
-            .to_string(),
-        ))
-        .await
-        .expect("normalized direct external response");
-    let request_id = response_request_id(&response);
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
-        .await
-        .expect("normalized direct external body");
-    let body = String::from_utf8(body.to_vec()).expect("external response UTF-8");
-    assert!(
-        body.contains("fake-normalized-external-ok"),
-        "normalized direct body={body}"
-    );
+    for stream in [false, true] {
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                json!({
+                    "model": "claude-opus-4-6-thinking",
+                    "max_tokens": 32,
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": format!("hi stream={stream}")}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("normalized direct external response");
+        let request_id = response_request_id(&response);
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("normalized direct external body");
+        let body = String::from_utf8(body.to_vec()).expect("external response UTF-8");
+        assert!(
+            body.contains("fake-normalized-external-ok"),
+            "stream={stream} normalized direct body={body}"
+        );
 
-    let record = usage_record_for_request(&usage_recorder, &request_id);
-    assert_eq!(record.status, UsageRecordStatus::Success);
-    assert_eq!(record.route_kind, Some(UsageRouteKind::ExternalPool));
-    assert_eq!(
-        record.route_subtype,
-        Some(UsageRouteSubtype::ExternalDirectPolicy)
-    );
-    assert_eq!(
-        record.direct_policy_reason.as_deref(),
-        Some("explicit_direct")
-    );
-    assert_eq!(record.model, "claude-opus-4-6-thinking");
-    assert_eq!(record.upstream_model.as_deref(), Some("claude-opus-4.6"));
-    assert_eq!(
-        record.external_outbound_model.as_deref(),
-        Some("claude-opus-4.6")
-    );
-    assert!(record.model_resolution_source.is_some());
-    let attempts = record
-        .latency_trace
-        .as_ref()
-        .and_then(|trace| trace.inference_attempts)
-        .expect("normalized direct external attempt trace");
-    assert_eq!(attempts.external_attempts, 1);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success, "stream={stream}");
+        assert_eq!(
+            record.route_kind,
+            Some(UsageRouteKind::ExternalPool),
+            "stream={stream}"
+        );
+        assert_eq!(
+            record.route_subtype,
+            Some(UsageRouteSubtype::ExternalDirectPolicy),
+            "stream={stream}"
+        );
+        assert_eq!(
+            record.direct_policy_reason.as_deref(),
+            Some("explicit_direct"),
+            "stream={stream}"
+        );
+        assert_eq!(record.model, "claude-opus-4-6-thinking", "stream={stream}");
+        assert_eq!(
+            record.upstream_model.as_deref(),
+            Some("claude-opus-4.6"),
+            "stream={stream}"
+        );
+        assert_eq!(
+            record.external_outbound_model.as_deref(),
+            Some("claude-opus-4.6"),
+            "stream={stream}"
+        );
+        assert!(record.model_resolution_source.is_some(), "stream={stream}");
+        let attempts = record
+            .latency_trace
+            .as_ref()
+            .and_then(|trace| trace.inference_attempts)
+            .expect("normalized direct external attempt trace");
+        assert_eq!(attempts.external_attempts, 1, "stream={stream}");
+    }
     assert_eq!(
         external_upstream.state.hits(),
-        1,
-        "normalized direct request must reach external pool once"
+        2,
+        "normalized direct stream and non-stream requests must reach external pool"
     );
     let bodies = external_upstream.state.bodies();
-    let outbound: Value = serde_json::from_str(&bodies[0]).expect("external body json");
-    assert_eq!(outbound["model"], "claude-opus-4.6");
+    assert_eq!(bodies.len(), 2);
+    for body in bodies {
+        let outbound: Value = serde_json::from_str(&body).expect("external body json");
+        assert_eq!(outbound["model"], "claude-opus-4.6");
+    }
     assert_eq!(
         kiro_upstream.state.normal_hits(),
         0,
-        "direct external policy must not call local Kiro upstream"
+        "direct external policy must not call local Kiro upstream for stream or non-stream"
     );
 }
 

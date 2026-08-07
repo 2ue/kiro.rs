@@ -368,6 +368,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolRequestTimeoutSecs: 180,
     externalPoolStreamRequestTimeoutSecs: 0,
     externalPoolStreamIdleTimeoutSecs: 180,
+    externalPoolStreamPreOutputRetryEnabled: true,
     externalPoolAutoDisableOnChannelDisabled: true,
     externalPoolUsageProjectionUpliftPercent: 25,
     externalPoolUsageProjectionOutputUpliftMinTokens: 0,

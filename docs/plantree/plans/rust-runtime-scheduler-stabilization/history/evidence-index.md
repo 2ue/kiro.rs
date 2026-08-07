@@ -1,6 +1,6 @@
 # Evidence Index
 
-Last reviewed: 2026-08-05 Asia/Shanghai
+Last reviewed: 2026-08-07 Asia/Shanghai
 
 ## Current evidence
 
@@ -20,6 +20,8 @@ Last reviewed: 2026-08-05 Asia/Shanghai
 | 2026-08-04 | `scheduler-target-contract-focused-validation-20260804.md` | Proposed local/external scheduler target contract and current compliance confirmation | Rust external focused `10/10`; handler focused `9/9`; Node contracts `104 total / 92 passed / 12 skipped`; docs/diff pass; complete L1–L5 sustained matrix not run |
 | 2026-08-05 | `scheduler-shared-deadline-and-load-chaos-20260805.md` | Redis scheduler/usage joint fault boundary, external-pool priority failover and half-open recovery | Redis chaos `24/24` exact across 3 outer rounds; 75ms boundary reproduced once then passed in 3 complete rounds; external priority failover pass; no production deadline relaxation |
 | 2026-08-05 | `scheduler-shared-deadline-and-load-chaos-20260805.md` (final candidate dynamic supplement) | Fresh-database L3/L4/L5 and external priority failover | L3 `9/9`, L4 `12/12`, external priority failover pass, L5 `3/3` with `1380/1380` long-stream success and settled RSS/FD after warm baseline |
+| 2026-08-06 | `external-pool-stream-error-yuenan-sampling-20260806.md` | External-pool stream `message_start -> error` sampling on `yuenan` / `yuenan-1` | Sampling summary only: `yuenan` stream `7/12` normal and `5/12` empty/protocol-only stream error; `yuenan-1` stream `10/12` normal and `2/12` empty/protocol-only stream error; both non-stream `5/5` success. Raw transcript not archived; later focused fake-upstream validation is recorded separately |
+| 2026-08-06/07 | `external-pool-stream-pre-output-retry-validation-20260806.md` | External-pool stream pre-output retry implementation, storage/UI wiring, normal stream/non-stream output, routing regression, frozen CLI/load candidate gates | Focused fake-upstream `external_pool_stream_ 6/6` with local PgSQL/Redis; storage `1/1`; normal external stream/non-stream usage/body targeted tests; local stream/non-stream success; external direct stream/non-stream no-local-hit; external fallback/direct/local-rescue/route-config classifier batches. 2026-08-07 rerun used `cargo +1.92.0` for scheduler/output and external usage matrices, plus Rust check/fmt, UI/admin-ui builds, docs, diff and artifact inventory. Final frozen candidate SHA `eec71c67...` passed Claude CLI bare `20/20`, long-session `110 turns`, thinking-wire rerun `60/60`, L3 `9/9`, L4 `12/12`, and L5 `900s` soak `6820/6820` with RSS/FD recovery. Production observation pending |
 
 ## Related evidence packages
 

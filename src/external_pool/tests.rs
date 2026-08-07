@@ -48,6 +48,19 @@ fn persisted_external_pool_enum_parsers_reject_unknown_values_for_five_rounds() 
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
         assert!(ExternalPoolStreamResponseMode::parse_known("corrupt").is_none());
+        assert_eq!(
+            ExternalPoolStreamRetryMode::parse_known("inherit"),
+            Some(ExternalPoolStreamRetryMode::Inherit)
+        );
+        assert_eq!(
+            ExternalPoolStreamRetryMode::parse_known("enabled"),
+            Some(ExternalPoolStreamRetryMode::Enabled)
+        );
+        assert_eq!(
+            ExternalPoolStreamRetryMode::parse_known("disabled"),
+            Some(ExternalPoolStreamRetryMode::Disabled)
+        );
+        assert!(ExternalPoolStreamRetryMode::parse_known("corrupt").is_none());
     }
 }
 
@@ -384,6 +397,115 @@ impl Drop for ExternalMessagesFakeServer {
 }
 
 #[derive(Clone)]
+enum ExternalStreamFakeStep {
+    Chunk(Vec<u8>),
+    Delay(Duration),
+    Error(String),
+}
+
+impl ExternalStreamFakeStep {
+    fn chunk(data: impl Into<Vec<u8>>) -> Self {
+        Self::Chunk(data.into())
+    }
+
+    fn delay(duration: Duration) -> Self {
+        Self::Delay(duration)
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self::Error(message.into())
+    }
+}
+
+#[derive(Clone)]
+struct ExternalStreamFakeState {
+    hits: Arc<AtomicU64>,
+    status: StatusCode,
+    steps: Arc<Vec<ExternalStreamFakeStep>>,
+}
+
+struct ExternalStreamFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExternalStreamFakeServer {
+    async fn start(steps: Vec<ExternalStreamFakeStep>) -> Self {
+        Self::start_with_status(StatusCode::OK, steps).await
+    }
+
+    async fn start_with_status(status: StatusCode, steps: Vec<ExternalStreamFakeStep>) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<ExternalStreamFakeState>,
+        ) -> Response {
+            state.hits.fetch_add(1, Ordering::Relaxed);
+            let steps = state.steps.clone();
+            let stream =
+                futures::stream::unfold((steps, 0usize), |(steps, mut index)| async move {
+                    loop {
+                        let step = steps.get(index).cloned()?;
+                        index = index.saturating_add(1);
+                        match step {
+                            ExternalStreamFakeStep::Chunk(bytes) => {
+                                return Some((
+                                    Ok::<Bytes, std::io::Error>(Bytes::from(bytes)),
+                                    (steps, index),
+                                ));
+                            }
+                            ExternalStreamFakeStep::Delay(duration) => {
+                                tokio::time::sleep(duration).await;
+                            }
+                            ExternalStreamFakeStep::Error(message) => {
+                                return Some((Err(std::io::Error::other(message)), (steps, index)));
+                            }
+                        }
+                    }
+                });
+            Response::builder()
+                .status(state.status)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .expect("build external stream fake response")
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let state = ExternalStreamFakeState {
+            hits: hits.clone(),
+            status,
+            steps: Arc::new(steps),
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind external stream fake server");
+        let address = listener.local_addr().expect("external stream address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve external stream fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            task,
+        }
+    }
+
+    fn snapshot(&self) -> u64 {
+        self.hits.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ExternalStreamFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
 struct FlakyExternalMessagesFakeState {
     hits: Arc<AtomicU64>,
     remaining_failures: Arc<AtomicU64>,
@@ -583,6 +705,163 @@ fn fake_external_error_body(message: &str) -> serde_json::Value {
     })
 }
 
+fn external_sse_event(name: &str, value: serde_json::Value) -> String {
+    format!("event: {name}\ndata: {value}\n\n")
+}
+
+fn external_sse_message_start(id: &str, input_tokens: i32) -> String {
+    external_sse_event(
+        "message_start",
+        serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": null,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+            }
+        }),
+    )
+}
+
+fn external_sse_ping() -> String {
+    external_sse_event("ping", serde_json::json!({"type": "ping"}))
+}
+
+fn external_sse_error(message: &str) -> String {
+    external_sse_event(
+        "error",
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message}
+        }),
+    )
+}
+
+fn external_sse_text_start() -> String {
+    external_sse_event(
+        "content_block_start",
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    )
+}
+
+fn external_sse_text_delta(text: &str) -> String {
+    external_sse_event(
+        "content_block_delta",
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    )
+}
+
+fn external_sse_text_stop() -> String {
+    external_sse_event(
+        "content_block_stop",
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+    )
+}
+
+fn external_sse_message_delta(input_tokens: i32, output_tokens: i32) -> String {
+    external_sse_event(
+        "message_delta",
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        }),
+    )
+}
+
+fn external_sse_message_stop() -> String {
+    external_sse_event("message_stop", serde_json::json!({"type": "message_stop"}))
+}
+
+fn external_stream_success_steps(
+    message_id: &str,
+    text: &str,
+    input_tokens: i32,
+    output_tokens: i32,
+) -> Vec<ExternalStreamFakeStep> {
+    vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start(message_id, input_tokens)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta(text)),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(input_tokens, output_tokens)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ]
+}
+
+fn external_stream_config_for_test() -> ExternalPoolsConfig {
+    ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 0,
+        external_pool_stream_idle_timeout_secs: 1,
+        external_pool_protocol_error_cooldown_secs: 1,
+        external_pool_network_error_cooldown_secs: 1,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    }
+}
+
+fn external_stream_route(
+    request_id: impl Into<String>,
+    error_id: impl Into<String>,
+) -> (
+    ExternalRouteRequest,
+    Arc<crate::anthropic::usage::UsageRecorder>,
+) {
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(16));
+    let mut route = test_route("claude-sonnet-4-6");
+    payload_mut(&mut route).stream = true;
+    refresh_test_route_derived_state(&mut route);
+    route.request_id = request_id.into();
+    route.error_id = error_id.into();
+    route.recorder = recorder.clone();
+    route.direct_policy_reason = Some(EXPLICIT_DIRECT_POLICY_REASON.to_string());
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+    (route, recorder)
+}
+
+async fn read_response_body_text_allow_error(response: Response) -> (String, Option<String>) {
+    let mut stream = response.into_body().into_data_stream();
+    let mut body = Vec::new();
+    let mut error = None;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => body.extend_from_slice(&chunk),
+            Err(err) => {
+                error = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    (String::from_utf8_lossy(&body).into_owned(), error)
+}
+
+fn usage_record_for_request(
+    recorder: &crate::anthropic::usage::UsageRecorder,
+    request_id: &str,
+) -> UsageRecord {
+    let result = recorder.query(UsageRecordQuery {
+        request_id: Some(request_id.to_string()),
+        ..UsageRecordQuery::default()
+    });
+    assert_eq!(result.records.len(), 1, "usage record for {request_id}");
+    result.records[0].clone()
+}
+
 async fn create_messages_pool(
     postgres: &PostgresStore,
     name: &str,
@@ -608,6 +887,429 @@ async fn create_messages_pool_with_concurrency(
     request.max_concurrent_requests = max_concurrent_requests;
     request.supported_models = vec!["claude-sonnet-4-6".to_string()];
     postgres.create_external_pool(request).await.unwrap()
+}
+
+#[test]
+fn external_pool_pre_output_stream_retry_effective_mode_respects_overrides() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_stream_pre_output_retry_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut pool = test_pool("https://example.test/v1", true);
+
+    pool.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::Inherit;
+    assert!(effective_external_pool_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+
+    config.external_pool_stream_pre_output_retry_enabled = false;
+    assert!(!effective_external_pool_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+
+    pool.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::Enabled;
+    assert!(effective_external_pool_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+
+    config.external_pool_stream_pre_output_retry_enabled = true;
+    pool.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::Disabled;
+    assert!(!effective_external_pool_pre_output_stream_retry_enabled(
+        &pool, &config
+    ));
+}
+
+#[test]
+fn external_pool_pre_output_stream_commit_classifier_is_conservative() {
+    let message_start = external_sse_message_start("msg_classifier_start", 10);
+    assert!(
+        !external_sse_event_commits_pre_output_stream(message_start.as_bytes()),
+        "message_start is protocol-only and can be buffered before retry"
+    );
+
+    let ping = external_sse_ping();
+    assert!(
+        !external_sse_event_commits_pre_output_stream(ping.as_bytes()),
+        "ping is protocol-only and can be discarded with a failed attempt"
+    );
+
+    let text_start = external_sse_text_start();
+    assert!(
+        external_sse_event_commits_pre_output_stream(text_start.as_bytes()),
+        "content_block_start commits downstream protocol state even when text is empty"
+    );
+
+    let stop = external_sse_message_stop();
+    assert!(
+        external_sse_event_commits_pre_output_stream(stop.as_bytes()),
+        "legal terminal message_stop is not retried by this pre-output failure feature"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_pre_output_error_event_fails_over_and_keeps_success_usage_clean() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw upstream failure secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_b",
+        "ok-from-b",
+        222,
+        5,
+    ))
+    .await;
+    let pool_a =
+        create_messages_pool(&postgres, "stream-pre-output-error-a", 1, &failing.base_url).await;
+    let pool_b = create_messages_pool(
+        &postgres,
+        "stream-pre-output-error-b",
+        10,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let request_id = "req_stream_pre_output_error_failover";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_pre_output_error");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("pre-output error event failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("pre-output error should fail over to healthy pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("ok-from-b"));
+    assert!(body.contains("msg_b"));
+    assert!(!body.contains("msg_a"));
+    assert!(!body.contains("raw upstream failure secret"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_pool_id, Some(pool_b.id));
+    assert_eq!(record.local_attempted, Some(false));
+    assert!(record.credential_attempts.is_empty());
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].pool_id, pool_a.id);
+    assert_eq!(record.external_attempts[0].action, "retry_next");
+    assert_eq!(
+        record.external_attempts[0].error_type.as_deref(),
+        Some("protocol_error")
+    );
+    assert_eq!(record.external_attempts[1].pool_id, pool_b.id);
+    assert_eq!(record.external_attempts[1].action, "success");
+    let billing = record
+        .external_pool_billing
+        .as_ref()
+        .expect("successful stream billing");
+    assert_eq!(billing.raw_usage.input_tokens, 222);
+    assert_eq!(billing.raw_usage.output_tokens, 5);
+    assert_eq!(billing.reported_usage.input_tokens, 222);
+    assert_eq!(billing.reported_usage.output_tokens, 5);
+    assert_ne!(billing.raw_usage.input_tokens, 111);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_protocol_only_then_error_event_fails_over_without_leaking_prefix() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_protocol_only_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw protocol-only failure")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_protocol_only_b",
+        "ok-after-ping",
+        222,
+        6,
+    ))
+    .await;
+    create_messages_pool(
+        &postgres,
+        "stream-protocol-only-error-a",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "stream-protocol-only-error-b",
+        10,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let request_id = "req_stream_protocol_only_error_failover";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_protocol_only_error");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("protocol-only pre-output error failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("protocol-only pre-output error should fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("ok-after-ping"));
+    assert!(body.contains("msg_protocol_only_b"));
+    assert!(!body.contains("msg_protocol_only_a"));
+    assert!(!body.contains("raw protocol-only failure"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].action, "retry_next");
+    assert_eq!(record.external_attempts[1].action, "success");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_pre_output_eof_read_error_and_idle_fail_over_to_next_pool() {
+    for (case, steps) in [
+        (
+            "eof",
+            vec![ExternalStreamFakeStep::chunk(external_sse_message_start(
+                "msg_eof_a",
+                111,
+            ))],
+        ),
+        (
+            "read_error",
+            vec![
+                ExternalStreamFakeStep::chunk(external_sse_message_start("msg_read_a", 111)),
+                ExternalStreamFakeStep::error("controlled fake upstream body error"),
+            ],
+        ),
+        (
+            "idle",
+            vec![
+                ExternalStreamFakeStep::chunk(external_sse_message_start("msg_idle_a", 111)),
+                ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+                ExternalStreamFakeStep::chunk(external_sse_error("late idle failure")),
+            ],
+        ),
+    ] {
+        let Some((manager, postgres)) = test_external_pool_manager().await else {
+            return;
+        };
+        let failing = ExternalStreamFakeServer::start(steps).await;
+        let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+            &format!("msg_{case}_b"),
+            &format!("ok-{case}-from-b"),
+            222,
+            7,
+        ))
+        .await;
+        create_messages_pool(
+            &postgres,
+            &format!("stream-pre-output-{case}-a"),
+            1,
+            &failing.base_url,
+        )
+        .await;
+        create_messages_pool(
+            &postgres,
+            &format!("stream-pre-output-{case}-b"),
+            10,
+            &succeeding.base_url,
+        )
+        .await;
+
+        let request_id = format!("req_stream_pre_output_{case}_failover");
+        let (route, recorder) =
+            external_stream_route(request_id.clone(), format!("err_stream_pre_output_{case}"));
+        let response = match timeout(
+            Duration::from_secs(6),
+            manager.forward_with_failover_result(external_stream_config_for_test(), route),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: failover should finish"))
+        {
+            ExternalPoolForwardOutcome::Response(response) => response,
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("{case}: pre-output stream failure should fail over: {error:?}")
+            }
+        };
+        let (body, stream_error) = read_response_body_text_allow_error(response).await;
+        assert_eq!(stream_error, None, "{case}");
+        assert!(body.contains(&format!("ok-{case}-from-b")), "{case}");
+        assert!(!body.contains("msg_eof_a"), "{case}");
+        assert!(!body.contains("msg_read_a"), "{case}");
+        assert!(!body.contains("msg_idle_a"), "{case}");
+        assert!(
+            !body.contains("controlled fake upstream body error"),
+            "{case}"
+        );
+        assert_eq!(failing.snapshot(), 1, "{case}");
+        assert_eq!(succeeding.snapshot(), 1, "{case}");
+
+        let record = usage_record_for_request(&recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success, "{case}");
+        assert_eq!(record.external_attempts.len(), 2, "{case}");
+        assert_eq!(record.external_attempts[0].action, "retry_next", "{case}");
+        assert_eq!(record.external_attempts[1].action, "success", "{case}");
+        assert_eq!(record.output_tokens, 7, "{case}");
+
+        postgres.drop_test_schema().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_pre_output_retry_disabled_returns_original_stream_error_without_failover()
+ {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_disabled_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw disabled retry secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_disabled_b",
+        "should-not-run",
+        222,
+        8,
+    ))
+    .await;
+    let mut disabled_pool_request = create_pool_request("stream-pre-output-disabled-a", 1, true);
+    disabled_pool_request.base_url = failing.base_url.clone();
+    disabled_pool_request.max_concurrent_requests = 4;
+    disabled_pool_request.supported_models = vec!["claude-sonnet-4-6".to_string()];
+    disabled_pool_request.pre_output_stream_retry_mode = ExternalPoolStreamRetryMode::Disabled;
+    postgres
+        .create_external_pool(disabled_pool_request)
+        .await
+        .unwrap();
+    create_messages_pool(
+        &postgres,
+        "stream-pre-output-disabled-b",
+        10,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let request_id = "req_stream_pre_output_retry_disabled";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_pre_output_disabled");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("disabled retry stream should return response")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!(
+                "disabled retry keeps current stream behavior, not final dispatch error: {error:?}"
+            )
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("msg_disabled_a"));
+    assert!(body.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+    assert!(!body.contains("raw disabled retry secret"));
+    assert!(!body.contains("should-not-run"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::StreamError);
+    assert_eq!(record.error_type.as_deref(), Some("stream_error"));
+    assert_eq!(
+        record.error_message.as_deref(),
+        Some("external upstream emitted an error event")
+    );
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_error_after_content_start_does_not_replay_request() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_post_commit_a", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_error("raw post-commit secret")),
+    ])
+    .await;
+    let succeeding = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_post_commit_b",
+        "should-not-replay",
+        222,
+        9,
+    ))
+    .await;
+    create_messages_pool(&postgres, "stream-post-commit-a", 1, &failing.base_url).await;
+    create_messages_pool(&postgres, "stream-post-commit-b", 10, &succeeding.base_url).await;
+
+    let request_id = "req_stream_post_commit_error_no_replay";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_post_commit_error");
+    let response = match timeout(
+        Duration::from_secs(5),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("post-commit stream should return original response")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("post-commit stream error must not become pre-response failover: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("msg_post_commit_a"));
+    assert!(body.contains("content_block_start"));
+    assert!(body.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+    assert!(!body.contains("raw post-commit secret"));
+    assert!(!body.contains("should-not-replay"));
+    assert!(!body.contains("msg_post_commit_b"));
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 0);
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::StreamError);
+    assert_eq!(record.error_type.as_deref(), Some("stream_error"));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+    assert_eq!(
+        record.external_attempts[0].pool_name,
+        "stream-post-commit-a"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
 }
 
 async fn unused_loopback_base_url() -> String {
@@ -774,6 +1476,7 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExtern
         request_body_mode: ExternalPoolRequestBodyMode::Normalized,
         raw_model_mode: ExternalPoolRawModelMode::None,
         auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+        pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
         preserve_path: true,
         normalize_model_version_dots: false,
         model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
@@ -9141,6 +9844,7 @@ fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
         request_body_mode: ExternalPoolRequestBodyMode::Normalized,
         raw_model_mode: ExternalPoolRawModelMode::None,
         auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+        pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
         auto_disabled: false,
         auto_disabled_reason: None,
         auto_disabled_at: None,

@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last reviewed: 2026-08-05 Asia/Shanghai
+Last reviewed: 2026-08-07 Asia/Shanghai
 
 Current phase:
 
@@ -87,9 +87,55 @@ Current phase:
   passed. The candidate was released as `v0.0.133`; GitHub Actions `Publish Docker Images #164`
   completed successfully for quality, amd64/arm64 builds and manifest. Evidence:
   [external-pool HA scheduler validation 2026-08-05](../../../../feature/evidence/external-pool-ha-scheduler-validation-20260805.md).
+- 2026-08-06 external-pool stream pre-output retry focused implementation validated:
+  production/user sample
+  `req_01KaWrDY5oZkY13XQqdJB9PH` shows `外部直连` stream `HTTP 200` followed by
+  `external upstream emitted an error event` from `#18 yuenan-1`. Sampling against `yuenan`
+  and `yuenan-1` found a recoverable-looking `message_start -> error` pattern before any
+  content/thinking/tool output, while non-stream calls in the same sample succeeded. The root
+  cause was code shape: external stream `HTTP 2xx` returned `Response` before reading the SSE
+  body, so body-phase errors could not re-enter the cross-pool retry loop. The working tree now
+  implements protocol-only SSE buffering before downstream commit, retryable external-pool
+  failover on pre-output error/read/idle/EOF, global default plus per-pool override, storage/admin/UI
+  wiring, and focused fake-upstream validation. User-requested normal-output and scheduling
+  regression also passed for external stream/non-stream, local stream/non-stream, external direct
+  stream/non-stream, local-first fallback/rescue classifier boundaries and route config authority.
+  Real Claude Code CLI, load/chaos, production rollout observation and `yuenan` / `yuenan-1`
+  recurrence checks remain open. Handoff:
+  [external-pool stream pre-output retry](topics/external-pool-stream-pre-output-retry-20260806.md).
+- 2026-08-07 user-requested normal scheduling/output rerun passed for the same stream
+  pre-output retry working tree. `cargo +1.92.0` scoped batches covered external stream
+  recovery/storage, external normal non-stream/stream usage, external direct stream/non-stream
+  with zero local hits, local stream/non-stream success, local-first fallback/rescue classifier
+  boundaries, fresh local Ready, Redis degraded and route config authority. Rust fmt/check,
+  diff hygiene, feature-doc links, artifact inventory and UI/admin-ui builds also passed. This is
+  still focused local evidence; real Claude Code CLI, load/chaos and production observation remained open at that checkpoint.
+- 2026-08-07 final frozen candidate gate for the stream pre-output retry working tree passed:
+  `kiro-rs` SHA-256 `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688` and
+  `kiro_loadtest` SHA-256 `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d`.
+  The scoped C0 batch passed Rust fmt, full `cargo +1.92.0 test --locked`, all-target check,
+  and release build for `kiro-rs` / `kiro_loadtest`. Real Claude Code CLI `2.1.221`
+  fake-upstream gates passed as bare `20/20`, long-session `5 sessions / 110 turns /
+  100 tool pairs / leakMatches=0`, and thinking-wire rerun `60/60`. Frozen load/chaos passed
+  L3 `9/9`, L4 `12/12`, and L5 `900s` soak with `6820/6820` long-stream successes plus
+  `300s` idle RSS/FD recovery and post-soak normal recovery. Production rollout observation and
+  renewed `yuenan` / `yuenan-1` recurrence checks remain post-release work.
 
 Last landed evidence:
 
+- 2026-08-06/07 external-pool stream pre-output retry focused validation:
+  [External-pool stream pre-output retry validation](../../../../feature/evidence/external-pool-stream-pre-output-retry-validation-20260806.md).
+  `external_pool_stream_` real local PgSQL/Redis `6/6`; storage persistence `1/1`;
+  pre-output effective mode/classifier `2/2`; normal external stream/non-stream usage/body
+  targeted tests `8` commands passed; routing/config classifier batch passed across external
+  fallback, direct external, local preflight, fresh local Ready, Redis degraded, local rescue,
+  normalized external stream/non-stream fallback and route config authority; `cargo check
+  --all-targets --locked`, `cargo fmt --all -- --check`, `git diff --check`, UI/admin-ui
+  gates and build artifact inventory passed. 2026-08-07 rerun used `cargo +1.92.0` and added
+  exact external normal-output/usage checks plus UI/admin-ui build reruns. Final frozen candidate
+  CLI/load gates also passed: Claude CLI bare `20/20`, long-session `110 turns`, thinking-wire
+  rerun `60/60`, load L3 `9/9`, L4 `12/12`, L5 `900s` soak `6820/6820` with RSS/FD recovery.
+  Production rollout observation remains pending.
 - `external_pool_cached_immediate_availability` real local PgSQL/Redis: `2 passed / 0 failed`.
 - `external_pool_immediate_availability_requires_current_capacity_and_recovers`: `1 passed / 0 failed`.
 - `external_fallback`: `9 passed / 0 failed`.
@@ -158,25 +204,22 @@ Last landed evidence:
 
 Active TODO:
 
-1. Complete the final release diff/version/tag/push workflow for the verified HA candidate.
+1. Publish the verified `v0.0.134` candidate.
 2. Observe the three production deployments after rollout without changing the local `9022`
    service or usage calculation chain.
 3. Finish first archive batch for old slow-first-token/stream-fluidity analysis.
 4. Continue candidate rejection observability and model-field display improvements as separate
    follow-up work.
-5. Keep production observation for external-pool body-mode/model routing and usage billing/raw-cost
-   separate from the local HA release gate.
 
 Blocked by:
 
-- No local blocker remains for the external-pool HA P0 release candidate. Production rollout
-  and post-rollout observation are intentionally separate from local validation.
+- External-pool HA P0 `v0.0.133` release candidate itself has no local blocker. The current
+  working tree contains a separate stream pre-output retry release candidate whose local CLI/load
+  gates have passed. Production observation is post-release and must not be claimed before rollout.
 - Thinking signature Branch A vs B, image-source matrix, browser follow-up, and broader
   architecture gates remain independent open items and are not part of this P0 release.
 
 Next target:
 
-- Finish the publish-new-version workflow for the verified candidate, then monitor the release
-  workflow. After successful publication, perform read-only production observation and update
-  the evidence/index state; do not mix that observation with the independent language, usage
-  cleanup, image, or architecture follow-ups.
+- Publish `v0.0.134`. Keep production observation for the new stream follow-up separate from
+  already-published `v0.0.133`.

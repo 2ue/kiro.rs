@@ -192,6 +192,7 @@ type ExternalPoolFormDraft = {
   priority: number
   maxConcurrentRequests: number
   streamResponseMode: 'inherit' | NonNullable<CreateExternalPoolRequest['streamResponseMode']>
+  preOutputStreamRetryMode: NonNullable<CreateExternalPoolRequest['preOutputStreamRetryMode']>
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
@@ -213,6 +214,7 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   priority: 100,
   maxConcurrentRequests: 10,
   streamResponseMode: 'inherit',
+  preOutputStreamRetryMode: 'inherit',
   requestBodyMode: 'normalized',
   rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
@@ -234,6 +236,7 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
   streamResponseMode: pool.streamResponseMode || 'inherit',
+  preOutputStreamRetryMode: pool.preOutputStreamRetryMode || 'inherit',
   requestBodyMode: pool.requestBodyMode || 'normalized',
   rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
@@ -328,6 +331,7 @@ export function ExternalPoolsPanel() {
           externalPoolRequestTimeoutSecs: whole(configDraft.externalPoolRequestTimeoutSecs),
           externalPoolStreamRequestTimeoutSecs: whole(configDraft.externalPoolStreamRequestTimeoutSecs),
           externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
+          externalPoolStreamPreOutputRetryEnabled: Boolean(configDraft.externalPoolStreamPreOutputRetryEnabled),
           externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
           externalPoolUsageProjectionOutputUpliftMinTokens: whole(configDraft.externalPoolUsageProjectionOutputUpliftMinTokens),
           externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
@@ -577,6 +581,7 @@ export function ExternalPoolsPanel() {
                   <NumberBox disabled={!externalEnabled} label="非流式总超时" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(externalPoolRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRequestTimeoutSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="流式总超时" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(externalPoolStreamRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamRequestTimeoutSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="流式空闲超时" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(externalPoolStreamIdleTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamIdleTimeoutSecs }))} />
+                  <Toggle disabled={!externalEnabled} label="流式首输出前错误换池" description="stream 已返回 200 但还没提交 content、thinking 或 tool_use 前遇到 error、断流、EOF 或空闲超时时，允许在外部池内换池。" checked={configDraft.externalPoolStreamPreOutputRetryEnabled} onChange={(externalPoolStreamPreOutputRetryEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamPreOutputRetryEnabled }))} />
                 </div>
               </FormSection>
 
@@ -671,7 +676,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolStreamRetrySummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -889,6 +894,17 @@ function ExternalPoolFormDialog({
                   <option value="event_passthrough">SSE 事件级透传</option>
                 </SelectBox>
                 <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
+              </div>
+            </FormSection>
+
+            <FormSection title="首输出前流式恢复" description="只覆盖当前外部池在未提交内容前的 stream body 错误恢复。">
+              <div className="space-y-3">
+                <SelectBox label="首输出前流式恢复" value={draft.preOutputStreamRetryMode} disabled={saving} onChange={(preOutputStreamRetryMode) => onDraftChange((prev) => ({ ...prev, preOutputStreamRetryMode: preOutputStreamRetryMode as ExternalPoolFormDraft['preOutputStreamRetryMode'] }))}>
+                  <option value="inherit">继承全局</option>
+                  <option value="enabled">启用</option>
+                  <option value="disabled">禁用</option>
+                </SelectBox>
+                <HintBox>{streamRetryDescription(draft.preOutputStreamRetryMode)}</HintBox>
               </div>
             </FormSection>
           </div>
@@ -1440,6 +1456,16 @@ function streamResponseDescription(mode: ExternalPoolFormDraft['streamResponseMo
   return '当前外部池不单独覆盖流式 SSE 转发方式，使用外部池全局默认值；usage 口径仍由上面的 Usage 上报模式决定。'
 }
 
+function streamRetryDescription(mode: ExternalPoolFormDraft['preOutputStreamRetryMode']) {
+  if (mode === 'enabled') {
+    return '当前外部池强制启用：stream 在 message_start、ping 等协议前缀后遇到 error、断流、EOF 或空闲超时时，可在未提交内容前换其他外部池。'
+  }
+  if (mode === 'disabled') {
+    return '当前外部池强制关闭：stream body 内错误保持现有流错误行为，不把本次请求重放到其他外部池。'
+  }
+  return '当前外部池继承全局“流式首输出前错误换池”开关。'
+}
+
 function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
   if (pool.usageProjectionMode !== 'current_path_policy') {
     return 'Usage: 严格透传'
@@ -1458,6 +1484,15 @@ function poolStreamSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
   const mode = pool.streamResponseMode || config.externalPoolStreamResponseMode
   const summary = mode === 'event_passthrough' ? '流式: 事件透传' : '流式: 默认'
   return pool.streamResponseMode ? `${summary} · 单池覆盖` : summary
+}
+
+function poolStreamRetrySummary(pool: ExternalPool, config: ExternalPoolsConfig) {
+  const mode = pool.preOutputStreamRetryMode || 'inherit'
+  if (mode === 'enabled') return '首输出恢复: 启用'
+  if (mode === 'disabled') return '首输出恢复: 禁用'
+  return config.externalPoolStreamPreOutputRetryEnabled
+    ? '首输出恢复: 继承启用'
+    : '首输出恢复: 继承禁用'
 }
 
 function authLabel(authType: ExternalPool['authType']) {

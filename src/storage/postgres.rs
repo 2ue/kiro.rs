@@ -31,8 +31,8 @@ use crate::anthropic::usage::{
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
     ExternalPoolEligibility, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
-    ExternalPoolRequestBodyMode, ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest,
-    mask_external_pool_key, normalize_external_pool_model_mapping_rules,
+    ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
+    UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_model_mapping_rules,
 };
 use crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -55,7 +55,7 @@ FROM credential_runtime_state
 const EXTERNAL_POOL_SELECT_SQL: &str = r#"
 SELECT id, name, base_url, api_key, auth_type, enabled, priority,
        max_concurrent_requests, usage_projection_mode, stream_response_mode,
-       request_body_mode, raw_model_mode, auto_disable_policy,
+       request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
        auto_disabled, auto_disabled_reason, auto_disabled_at,
        auto_disabled_until, auto_disabled_last_error, preserve_path,
        normalize_model_version_dots, model_mapping_mode,
@@ -108,6 +108,10 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "external_upstream_pools",
         column_name: "revision",
+    },
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "pre_output_stream_retry_mode",
     },
     RequiredPostgresColumn {
         table_name: "usage_records",
@@ -1236,7 +1240,7 @@ impl PostgresStore {
                    (btrim(api_key) <> '') AS api_key_present,
                    auth_type, max_concurrent_requests, usage_projection_mode,
                    stream_response_mode, request_body_mode, raw_model_mode,
-                   auto_disable_policy, model_mapping_mode,
+                   auto_disable_policy, pre_output_stream_retry_mode, model_mapping_mode,
                    model_mapping_require_match, model_mapping_rules,
                    auto_disabled, auto_disabled_until, supported_models
             FROM external_upstream_pools
@@ -1285,7 +1289,7 @@ impl PostgresStore {
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
                    max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                   request_body_mode, raw_model_mode, auto_disable_policy,
+                   request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
                    normalize_model_version_dots, model_mapping_mode,
@@ -1373,14 +1377,14 @@ impl PostgresStore {
             INSERT INTO external_upstream_pools (
                 name, base_url, api_key, auth_type, enabled, priority,
                 max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                request_body_mode, raw_model_mode, auto_disable_policy,
+                request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                 preserve_path, normalize_model_version_dots, model_mapping_mode,
                 model_mapping_require_match, model_mapping_rules, supported_models, notes, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy,
+                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -1400,6 +1404,7 @@ impl PostgresStore {
         .bind(request.request_body_mode.as_str())
         .bind(request.raw_model_mode.as_str())
         .bind(request.auto_disable_policy.as_str())
+        .bind(request.pre_output_stream_retry_mode.as_str())
         .bind(request.preserve_path)
         .bind(request.normalize_model_version_dots)
         .bind(request.model_mapping_mode.as_str())
@@ -1471,6 +1476,9 @@ impl PostgresStore {
         let auto_disable_policy = request
             .auto_disable_policy
             .unwrap_or(current.auto_disable_policy);
+        let pre_output_stream_retry_mode = request
+            .pre_output_stream_retry_mode
+            .unwrap_or(current.pre_output_stream_retry_mode);
         let preserve_path = request.preserve_path.unwrap_or(current.preserve_path);
         let normalize_model_version_dots = request
             .normalize_model_version_dots
@@ -1508,19 +1516,20 @@ impl PostgresStore {
                 request_body_mode = $11,
                 raw_model_mode = $12,
                 auto_disable_policy = $13,
-                preserve_path = $14,
-                normalize_model_version_dots = $15,
-                model_mapping_mode = $16,
-                model_mapping_require_match = $17,
-                model_mapping_rules = $18,
-                supported_models = $19,
-                notes = $20,
+                pre_output_stream_retry_mode = $14,
+                preserve_path = $15,
+                normalize_model_version_dots = $16,
+                model_mapping_mode = $17,
+                model_mapping_require_match = $18,
+                model_mapping_rules = $19,
+                supported_models = $20,
+                notes = $21,
                 revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy,
+                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -1541,6 +1550,7 @@ impl PostgresStore {
         .bind(request_body_mode.as_str())
         .bind(raw_model_mode.as_str())
         .bind(auto_disable_policy.as_str())
+        .bind(pre_output_stream_retry_mode.as_str())
         .bind(preserve_path)
         .bind(normalize_model_version_dots)
         .bind(model_mapping_mode.as_str())
@@ -1587,7 +1597,7 @@ impl PostgresStore {
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy,
+                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -1639,7 +1649,7 @@ impl PostgresStore {
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy,
+                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -1700,7 +1710,7 @@ impl PostgresStore {
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
-                      request_body_mode, raw_model_mode, auto_disable_policy,
+                      request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -9393,6 +9403,9 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
     ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
         .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?;
+    let pre_output_stream_retry_mode: String = row.try_get("pre_output_stream_retry_mode")?;
+    ExternalPoolStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
+        .ok_or_else(|| anyhow::anyhow!("pre_output_stream_retry_mode 值无效"))?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
     ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
         .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?;
@@ -9460,6 +9473,12 @@ fn external_pool_from_row_with_policy(
             .unwrap_or_else(|_| "none".to_string())
     };
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
+    let pre_output_stream_retry_mode: String = if strict_dispatch {
+        row.try_get("pre_output_stream_retry_mode")?
+    } else {
+        row.try_get("pre_output_stream_retry_mode")
+            .unwrap_or_else(|_| "inherit".to_string())
+    };
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
     let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
@@ -9532,6 +9551,12 @@ fn external_pool_from_row_with_policy(
     } else {
         ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy)
     };
+    let pre_output_stream_retry_mode = if strict_dispatch {
+        ExternalPoolStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
+            .ok_or_else(|| anyhow::anyhow!("pre_output_stream_retry_mode 值无效"))?
+    } else {
+        ExternalPoolStreamRetryMode::parse(&pre_output_stream_retry_mode)
+    };
     let model_mapping_mode = if strict_dispatch {
         ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
             .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?
@@ -9582,6 +9607,7 @@ fn external_pool_from_row_with_policy(
         request_body_mode,
         raw_model_mode,
         auto_disable_policy,
+        pre_output_stream_retry_mode,
         auto_disabled: row.try_get("auto_disabled")?,
         auto_disabled_reason: row.try_get("auto_disabled_reason")?,
         auto_disabled_at: row.try_get("auto_disabled_at")?,
@@ -10085,6 +10111,7 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     request_body_mode TEXT NOT NULL DEFAULT 'normalized',
     raw_model_mode TEXT NOT NULL DEFAULT 'none',
     auto_disable_policy TEXT NOT NULL DEFAULT 'inherit',
+    pre_output_stream_retry_mode TEXT NOT NULL DEFAULT 'inherit',
     auto_disabled BOOLEAN NOT NULL DEFAULT false,
     auto_disabled_reason TEXT,
     auto_disabled_at TIMESTAMPTZ,
@@ -10134,6 +10161,9 @@ ALTER TABLE external_upstream_pools
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS auto_disable_policy TEXT NOT NULL DEFAULT 'inherit';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS pre_output_stream_retry_mode TEXT NOT NULL DEFAULT 'inherit';
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS auto_disabled BOOLEAN NOT NULL DEFAULT false;
@@ -10983,6 +11013,7 @@ mod tests {
             .collect();
         for pair in [
             ("external_upstream_pools", "revision"),
+            ("external_upstream_pools", "pre_output_stream_retry_mode"),
             ("usage_records", "rollup_active"),
             ("usage_cleanup_jobs", "batch_size"),
             ("usage_records", "original_cost_usd"),
@@ -17417,6 +17448,7 @@ mod tests {
                 request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
                 raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
                 auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+                pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Enabled,
                 preserve_path: true,
                 normalize_model_version_dots: false,
                 model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
@@ -17446,6 +17478,10 @@ mod tests {
             created.stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
+        assert_eq!(
+            created.pre_output_stream_retry_mode,
+            ExternalPoolStreamRetryMode::Enabled
+        );
 
         let listed = store.list_external_pools(false).await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -17460,6 +17496,10 @@ mod tests {
         assert_eq!(
             listed[0].stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
+        );
+        assert_eq!(
+            listed[0].pre_output_stream_retry_mode,
+            ExternalPoolStreamRetryMode::Enabled
         );
 
         let loaded = store
@@ -17479,6 +17519,10 @@ mod tests {
             loaded.stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
+        assert_eq!(
+            loaded.pre_output_stream_retry_mode,
+            ExternalPoolStreamRetryMode::Enabled
+        );
 
         let updated = store
             .update_external_pool(
@@ -17489,6 +17533,7 @@ mod tests {
                     )),
                     request_body_mode: Some(ExternalPoolRequestBodyMode::RawPassthrough),
                     raw_model_mode: Some(ExternalPoolRawModelMode::None),
+                    pre_output_stream_retry_mode: Some(ExternalPoolStreamRetryMode::Disabled),
                     ..UpdateExternalPoolRequest::default()
                 },
             )
@@ -17504,6 +17549,10 @@ mod tests {
             updated.stream_response_mode,
             Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
+        assert_eq!(
+            updated.pre_output_stream_retry_mode,
+            ExternalPoolStreamRetryMode::Disabled
+        );
 
         let inherited = store
             .update_external_pool(
@@ -17517,6 +17566,10 @@ mod tests {
             .unwrap()
             .expect("pool should clear stream override");
         assert_eq!(inherited.stream_response_mode, None);
+        assert_eq!(
+            inherited.pre_output_stream_retry_mode,
+            ExternalPoolStreamRetryMode::Disabled
+        );
 
         store.drop_test_schema().await.unwrap();
     }

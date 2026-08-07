@@ -2905,6 +2905,12 @@ pub struct ExternalPoolsConfig {
     pub external_pool_stream_request_timeout_secs: u64,
     #[serde(default = "default_external_pool_stream_idle_timeout_secs")]
     pub external_pool_stream_idle_timeout_secs: u64,
+    /// 外部池流式响应在有效语义输出前出现 error/断流/idle 时是否允许换池恢复。
+    ///
+    /// 该开关只覆盖“尚未向下游提交有效内容”的安全窗口。单个外部池可以通过
+    /// `preOutputStreamRetryMode` 覆盖为启用或禁用；默认继承全局值。
+    #[serde(default = "default_external_pool_stream_pre_output_retry_enabled")]
+    pub external_pool_stream_pre_output_retry_enabled: bool,
     #[serde(default = "default_true")]
     pub external_pool_auto_disable_on_channel_disabled: bool,
     #[serde(default = "default_external_pool_usage_projection_uplift_percent")]
@@ -2989,6 +2995,8 @@ impl Default for ExternalPoolsConfig {
             external_pool_stream_request_timeout_secs: 0,
             external_pool_stream_idle_timeout_secs: default_external_pool_stream_idle_timeout_secs(
             ),
+            external_pool_stream_pre_output_retry_enabled:
+                default_external_pool_stream_pre_output_retry_enabled(),
             external_pool_auto_disable_on_channel_disabled: true,
             external_pool_usage_projection_uplift_percent:
                 default_external_pool_usage_projection_uplift_percent(),
@@ -4464,6 +4472,10 @@ fn default_external_pool_request_timeout_secs() -> u64 {
 
 fn default_external_pool_stream_idle_timeout_secs() -> u64 {
     180
+}
+
+fn default_external_pool_stream_pre_output_retry_enabled() -> bool {
+    true
 }
 
 fn default_external_pool_usage_projection_uplift_percent() -> u32 {

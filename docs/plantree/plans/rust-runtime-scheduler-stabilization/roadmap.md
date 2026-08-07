@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-08-05 Asia/Shanghai
+Last reviewed: 2026-08-07 Asia/Shanghai
 
 ## Done
 
@@ -31,6 +31,17 @@ Last reviewed: 2026-08-05 Asia/Shanghai
   rounds, 256-concurrency/1800-RPM sustained traffic, external-direct boundary, isolated storage
   regression and full Rust gates passed; released as `v0.0.133` through GitHub Actions
   `Publish Docker Images #164`. See [专项证据](../../../../feature/evidence/external-pool-ha-scheduler-validation-20260805.md).
+- External-pool stream pre-output retry focused implementation: external stream 2xx now buffers
+  protocol-only SSE before downstream commit and can retry another external pool on pre-output
+  error event, read error, idle timeout or EOF. Global/per-pool config, PostgreSQL/admin/UI wiring,
+  fake-upstream HTTP recovery, normal stream/non-stream output, external direct stream/non-stream,
+  local-first fallback/rescue classifier and route config authority regressions passed; the
+  user-requested 2026-08-07 rerun repeated the core scheduler/output matrix with
+  `cargo +1.92.0` and reran Rust/UI/docs/artifact gates. Final frozen candidate gates also passed:
+  Claude CLI `2.1.221` bare `20/20`, long-session `110 turns`, thinking-wire rerun `60/60`, L3
+  `9/9`, L4 `12/12`, and L5 `900s` soak `6820/6820` with `300s` idle RSS/FD recovery. Production
+  observation remains open. See
+  [focused validation](../../../../feature/evidence/external-pool-stream-pre-output-retry-validation-20260806.md).
 - Source-verified scheduler architecture analysis: the current local-account/external-pool
   request chain, normal and exceptional transitions, queue/capacity/cooldown/retry semantics,
   fallback/rescue boundaries, `sub2api` comparison, configuration regrouping and target
@@ -71,19 +82,27 @@ Last reviewed: 2026-08-05 Asia/Shanghai
     through the [sustained scheduling validation](topics/sustained-scheduling-validation.md)
     before changing runtime behavior.
 - External-pool HA follow-up after the verified P0:
-  - owning issue: [外部池高可用调度与冷却回归](../../../feature/issues/external-pool-ha-scheduler-cooldown-regression-20260805.md);
+  - owning issue: [外部池高可用调度与冷却回归](../../../../feature/issues/external-pool-ha-scheduler-cooldown-regression-20260805.md);
   - local root-cause fix and release-candidate validation are complete;
   - remaining work is production rollout/observation plus the larger RoutePlan, candidate
     rejection observability and long-window policy follow-ups. These are not blockers for the
     verified local P0 candidate.
+- External-pool stream pre-output retry follow-up:
+  - owning issue: [Stream terminal errors and precommit retry](../../../../feature/issues/stream-terminal-errors-and-precommit-retry.md);
+  - handoff: [外部池流式首语义输出前错误恢复](topics/external-pool-stream-pre-output-retry-20260806.md);
+  - current evidence: `yuenan` / `yuenan-1` stream sampling shows `message_start -> error`
+    before content/thinking/tool output, while non-stream succeeds;
+  - current code state: focused implementation, 2026-08-07 normal-routing/output rerun, frozen
+    Claude CLI and L3-L5 load/chaos gates have passed; final pre-release static/UI/docs/artifact
+    gates also passed; remaining work is publication, production rollout observation and renewed `yuenan` / `yuenan-1`
+    recurrence checks.
 
 ## Next
 
-1. Finish the final release diff/version/tag/push workflow for the verified candidate.
-2. Monitor the release workflow and record the published artifact result.
-3. After publication, perform read-only production observation and update the issue/evidence
+1. Publish `v0.0.134`.
+2. After publication of the verified candidate, perform read-only production observation and update the issue/evidence
    indexes without changing usage semantics.
-4. Continue the independent documentation archive and scheduler observability follow-ups.
+3. Continue the independent documentation archive and scheduler observability follow-ups.
 
 ## Deferred
 

@@ -1,4 +1,4 @@
-import type { ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, CreateExternalPoolRequest, ExternalPoolStreamResponseMode } from '@/types/api'
+import type { ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, CreateExternalPoolRequest, ExternalPoolStreamResponseMode, ExternalPoolStreamRetryMode } from '@/types/api'
 
 export const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 export const joinRules = (value: string[] = []) => value.join('\n')
@@ -38,6 +38,7 @@ export const parseSupportedModelsText = (value: string): string[] => {
 
 export const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
 export type ExternalPoolStreamResponseDraft = ExternalPoolStreamResponseMode | 'inherit'
+export type ExternalPoolStreamRetryDraft = ExternalPoolStreamRetryMode
 
 export const parseModelMappingRules = (value: string): ExternalPoolModelMappingRule[] => value
   .split('\n')
@@ -115,6 +116,7 @@ export type ExternalPoolFormDraft = {
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
   streamResponseMode: ExternalPoolStreamResponseDraft
+  preOutputStreamRetryMode: ExternalPoolStreamRetryDraft
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   preservePath: boolean
   normalizeModelVersionDots: boolean
@@ -137,6 +139,7 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
   streamResponseMode: 'inherit',
+  preOutputStreamRetryMode: 'inherit',
   autoDisablePolicy: 'inherit',
   preservePath: true,
   normalizeModelVersionDots: false,
@@ -159,6 +162,7 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
   streamResponseMode: pool.streamResponseMode || 'inherit',
+  preOutputStreamRetryMode: pool.preOutputStreamRetryMode || 'inherit',
   autoDisablePolicy: pool.autoDisablePolicy,
   preservePath: pool.preservePath !== false,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
@@ -256,6 +260,25 @@ export function streamResponseDescription(mode: ExternalPoolStreamResponseDraft)
     return '仅控制 stream=true 的 SSE 事件转发方式。文本、thinking、tool 等普通事件按上游事件级转发；usage 是否透传上游或按路径整理，由上面的下游 usage 口径决定。'
   }
   return '当前外部账号不单独指定流式 SSE 转发方式，使用外部池全局默认值；usage 口径仍由上面的下游 usage 口径决定。'
+}
+
+export function streamRetryDescription(mode: ExternalPoolStreamRetryDraft): string {
+  if (mode === 'enabled') {
+    return '当前外部账号强制启用：stream 在 message_start、ping 等协议前缀后遇到 error、断流、EOF 或空闲超时时，可在未提交内容前换其他外部账号。'
+  }
+  if (mode === 'disabled') {
+    return '当前外部账号强制关闭：stream body 内错误保持现有流错误行为，不把本次请求重放到其他外部账号。'
+  }
+  return '当前外部账号继承全局“流式首输出前错误换池”开关。'
+}
+
+export function streamRetrySummary(pool: ExternalPool, config: ExternalPoolsConfig): string {
+  const mode = pool.preOutputStreamRetryMode || 'inherit'
+  if (mode === 'enabled') return '首输出恢复：启用'
+  if (mode === 'disabled') return '首输出恢复：禁用'
+  return config.externalPoolStreamPreOutputRetryEnabled
+    ? '首输出恢复：继承启用'
+    : '首输出恢复：继承禁用'
 }
 
 export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig): string {

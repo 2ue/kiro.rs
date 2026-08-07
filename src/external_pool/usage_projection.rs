@@ -6,7 +6,7 @@ struct ExternalUsageProjectionState {
     observed_cache_read_evidence: bool,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(super) struct ExternalUsageProjectionContext {
     pub(super) mode: ExternalPoolUsageProjectionMode,
     pub(super) raw_input_tokens: i32,

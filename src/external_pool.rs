@@ -15,7 +15,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use parking_lot::Mutex as SyncMutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -160,6 +160,7 @@ const EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
 const EXTERNAL_POOL_ERROR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 const EXTERNAL_POOL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const EXTERNAL_POOL_DEFAULT_RESPONSE_BODY_TIMEOUT_SECS: u64 = 180;
+const SAFE_EXTERNAL_STREAM_ERROR_EVENT: &str = "external upstream emitted an error event";
 const EXTERNAL_POOL_AUTO_DISABLE_REASONS: &[&str] = &[
     "auth_error",
     "security_lock",
@@ -346,6 +347,43 @@ impl ExternalPoolAutoDisablePolicy {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ExternalPoolStreamRetryMode {
+    Inherit,
+    Enabled,
+    Disabled,
+}
+
+impl Default for ExternalPoolStreamRetryMode {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+impl ExternalPoolStreamRetryMode {
+    pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "inherit" => Some(Self::Inherit),
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ExternalPoolModelMappingMode {
     Passthrough,
     PassthroughMapping,
@@ -420,6 +458,8 @@ pub struct ExternalPool {
     #[serde(default)]
     pub raw_model_mode: ExternalPoolRawModelMode,
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
+    #[serde(default)]
+    pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
     pub auto_disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_disabled_reason: Option<String>,
@@ -529,6 +569,8 @@ pub struct CreateExternalPoolRequest {
     pub raw_model_mode: ExternalPoolRawModelMode,
     #[serde(default)]
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
+    #[serde(default)]
+    pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
     #[serde(default = "default_true")]
     pub preserve_path: bool,
     #[serde(default)]
@@ -575,6 +617,8 @@ pub struct UpdateExternalPoolRequest {
     pub raw_model_mode: Option<ExternalPoolRawModelMode>,
     #[serde(default)]
     pub auto_disable_policy: Option<ExternalPoolAutoDisablePolicy>,
+    #[serde(default)]
+    pub pre_output_stream_retry_mode: Option<ExternalPoolStreamRetryMode>,
     #[serde(default)]
     pub preserve_path: Option<bool>,
     #[serde(default)]
@@ -5344,7 +5388,7 @@ impl ExternalPoolManager {
                 ));
             }
             route.latency_trace.mark_upstream_header(route.started_at);
-            let body_stream = response.bytes_stream();
+            let mut body_stream = response.bytes_stream();
             let stream_plan = ExternalStreamProcessingPlan::for_pool(pool, config);
             let projection_context = build_external_usage_projection_context(
                 route,
@@ -5376,15 +5420,52 @@ impl ExternalPoolManager {
                     Some(route.error_id.clone()),
                 ),
             ));
+            let mut prefix = Vec::<u8>::new();
+            let mut buffer = Vec::<u8>::new();
+            let mut last_chunk_at = Instant::now();
+            if effective_external_pool_pre_output_stream_retry_enabled(pool, config) {
+                last_chunk_at = match pre_read_external_stream_before_commit(
+                    &mut body_stream,
+                    &mut buffer,
+                    &mut prefix,
+                    &lease,
+                    route,
+                    pool,
+                    config,
+                    projection_context.as_ref(),
+                    &usage_capture,
+                    stream_plan,
+                    stream_error_mask.as_ref(),
+                    &transcript_state,
+                    stream_idle_timeout,
+                    &outbound_model,
+                )
+                .await
+                {
+                    Ok(last_chunk_at) => last_chunk_at,
+                    Err(err) => {
+                        drop(lease);
+                        return Err(err);
+                    }
+                };
+            }
             let stream = futures::stream::unfold(
                 (
                     body_stream,
-                    Vec::<u8>::new(),
+                    (!prefix.is_empty()).then_some(prefix),
+                    buffer,
                     Some(lease),
-                    Instant::now(),
+                    last_chunk_at,
                     false,
                 ),
-                move |(mut body_stream, mut buffer, lease, mut last_chunk_at, finished)| {
+                move |(
+                    mut body_stream,
+                    mut prefix,
+                    mut buffer,
+                    lease,
+                    mut last_chunk_at,
+                    finished,
+                )| {
                     let projection_context = projection_context.clone();
                     let usage_capture = usage_capture.clone();
                     let latency_trace = latency_trace.clone();
@@ -5394,7 +5475,28 @@ impl ExternalPoolManager {
                         if finished {
                             return None;
                         }
+                        if let Some(prefix_chunk) = prefix.take().filter(|chunk| !chunk.is_empty())
+                        {
+                            return Some((
+                                Ok(Bytes::from(prefix_chunk)),
+                                (body_stream, None, buffer, lease, last_chunk_at, false),
+                            ));
+                        }
                         loop {
+                            let projected = drain_sse_events_with_transcript(
+                                &mut buffer,
+                                projection_context.as_ref(),
+                                Some(&usage_capture),
+                                Some(stream_error_mask.as_ref()),
+                                stream_plan,
+                                Some(&mut transcript_state.lock()),
+                            );
+                            if !projected.is_empty() {
+                                return Some((
+                                    Ok(Bytes::from(projected)),
+                                    (body_stream, None, buffer, lease, last_chunk_at, false),
+                                ));
+                            }
                             tokio::select! {
                                 chunk = body_stream.next() => {
                                     match chunk {
@@ -5416,6 +5518,7 @@ impl ExternalPoolManager {
                                                     Ok(Bytes::from(projected)),
                                                     (
                                                         body_stream,
+                                                        None,
                                                         buffer,
                                                         lease,
                                                         last_chunk_at,
@@ -5440,6 +5543,7 @@ impl ExternalPoolManager {
                                                     )),
                                                     (
                                                         body_stream,
+                                                        None,
                                                         Vec::new(),
                                                         None,
                                                         last_chunk_at,
@@ -5464,6 +5568,7 @@ impl ExternalPoolManager {
                                                 )),
                                                 (
                                                     body_stream,
+                                                    None,
                                                     Vec::new(),
                                                     None,
                                                     last_chunk_at,
@@ -5499,6 +5604,7 @@ impl ExternalPoolManager {
                                                 Ok(Bytes::from(tail)),
                                                 (
                                                     body_stream,
+                                                    None,
                                                     Vec::new(),
                                                     None,
                                                     last_chunk_at,
@@ -5516,6 +5622,7 @@ impl ExternalPoolManager {
                                         )),
                                         (
                                             body_stream,
+                                            None,
                                             Vec::new(),
                                             None,
                                             last_chunk_at,
@@ -5535,6 +5642,7 @@ impl ExternalPoolManager {
                                         ))),
                                         (
                                             body_stream,
+                                            None,
                                             Vec::new(),
                                             None,
                                             last_chunk_at,
@@ -7985,6 +8093,322 @@ async fn external_pool_stream_idle_deadline(
     }
 }
 
+fn effective_external_pool_pre_output_stream_retry_enabled(
+    pool: &ExternalPool,
+    config: &ExternalPoolsConfig,
+) -> bool {
+    match pool.pre_output_stream_retry_mode {
+        ExternalPoolStreamRetryMode::Enabled => true,
+        ExternalPoolStreamRetryMode::Disabled => false,
+        ExternalPoolStreamRetryMode::Inherit => {
+            config.external_pool_stream_pre_output_retry_enabled
+        }
+    }
+}
+
+fn external_pre_output_stream_protocol_error(
+    message: impl Into<String>,
+    protocol_error: &'static str,
+    config: &ExternalPoolsConfig,
+    outbound_model: Option<String>,
+) -> ExternalForwardError {
+    ExternalForwardError::new(
+        ExternalPoolError {
+            status: Some(StatusCode::OK),
+            message: message.into(),
+            retryable: true,
+            auto_disable_reason: None,
+            cooldown: Some((
+                Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
+                "protocol_error".to_string(),
+            )),
+            protocol_error: Some(protocol_error),
+        },
+        outbound_model,
+    )
+}
+
+fn external_pre_output_stream_network_error(
+    message: impl Into<String>,
+    config: &ExternalPoolsConfig,
+    outbound_model: Option<String>,
+) -> ExternalForwardError {
+    ExternalForwardError::new(
+        ExternalPoolError {
+            status: None,
+            message: message.into(),
+            retryable: true,
+            auto_disable_reason: None,
+            cooldown: Some((
+                Duration::from_secs(config.external_pool_network_error_cooldown_secs.max(1)),
+                "network_error".to_string(),
+            )),
+            protocol_error: None,
+        },
+        outbound_model,
+    )
+}
+
+fn external_sse_event_name(event: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(event).ok()?;
+    text.lines().find_map(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("event:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+    })
+}
+
+fn external_sse_event_is_error_event(event: &[u8]) -> bool {
+    let text = match std::str::from_utf8(event) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    let explicit_error_event = text.lines().any(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("event:")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("error"))
+    });
+    if explicit_error_event {
+        return true;
+    }
+    for line in text.split_inclusive('\n') {
+        let trimmed_line_end = line.trim_end_matches(['\r', '\n']);
+        let Some(data) = trimmed_line_end.strip_prefix("data:") else {
+            continue;
+        };
+        let data_json = data.trim();
+        if data_json.is_empty() || data_json == "[DONE]" {
+            continue;
+        }
+        if serde_json::from_str::<serde_json::Value>(data_json)
+            .ok()
+            .is_some_and(|value| external_stream_payload_is_error(false, &value))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn external_sse_event_commits_pre_output_stream(event: &[u8]) -> bool {
+    match external_sse_event_name(event).as_deref() {
+        Some("content_block_start" | "message_stop") => return true,
+        _ => {}
+    }
+    let text = match std::str::from_utf8(event) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    for line in text.split_inclusive('\n') {
+        let trimmed_line_end = line.trim_end_matches(['\r', '\n']);
+        let Some(data) = trimmed_line_end.strip_prefix("data:") else {
+            continue;
+        };
+        let data_json = data.trim();
+        if data_json.is_empty() {
+            continue;
+        }
+        if data_json == "[DONE]" {
+            return true;
+        }
+        if serde_json::from_str::<serde_json::Value>(data_json)
+            .ok()
+            .is_some_and(|value| external_sse_data_commits_pre_output_stream(&value))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn external_sse_data_commits_pre_output_stream(value: &serde_json::Value) -> bool {
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("content_block_start" | "message_stop") => return true,
+        Some("content_block_delta") if external_sse_data_has_first_output(value) => return true,
+        _ => {}
+    }
+    external_sse_data_has_first_output(value) || openai_stream_data_commits_pre_output(value)
+}
+
+fn openai_stream_data_commits_pre_output(value: &serde_json::Value) -> bool {
+    let Some(choices) = value.get("choices").and_then(|value| value.as_array()) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        choice
+            .get("finish_reason")
+            .is_some_and(|value| !value.is_null())
+            || ["/message/content", "/delta/content", "/text"]
+                .iter()
+                .filter_map(|pointer| choice.pointer(pointer))
+                .any(|candidate| {
+                    estimate_json_output_fragment_tokens(candidate).is_some_and(|tokens| tokens > 0)
+                })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pre_read_external_stream_before_commit<S>(
+    body_stream: &mut S,
+    buffer: &mut Vec<u8>,
+    prefix: &mut Vec<u8>,
+    lease: &ExternalPoolLease,
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    config: &ExternalPoolsConfig,
+    projection_context: Option<&ExternalUsageProjectionContext>,
+    usage_capture: &Arc<SyncMutex<ExternalUsageCapture>>,
+    stream_plan: ExternalStreamProcessingPlan,
+    stream_error_mask: &ExternalStreamErrorMask,
+    transcript_state: &Arc<SyncMutex<ExternalAnthropicTranscriptState>>,
+    stream_idle_timeout: Option<Duration>,
+    outbound_model: &Option<String>,
+) -> Result<Instant, ExternalForwardError>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let mut last_chunk_at = Instant::now();
+    loop {
+        while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
+            let end = idx + delimiter_len;
+            let event = buffer.drain(..end).collect::<Vec<u8>>();
+            if external_sse_event_is_error_event(&event) {
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    error_id = %route.error_id,
+                    pool_id = pool.id,
+                    pool_name = %pool.name,
+                    "external pool stream emitted error event before downstream semantic output; retrying within external pool budget"
+                );
+                return Err(external_pre_output_stream_protocol_error(
+                    SAFE_EXTERNAL_STREAM_ERROR_EVENT,
+                    "stream_pre_output_error_event",
+                    config,
+                    outbound_model.clone(),
+                ));
+            }
+
+            let commits_downstream = external_sse_event_commits_pre_output_stream(&event);
+            prefix.extend(process_sse_event_with_plan_and_transcript(
+                &event,
+                projection_context,
+                Some(usage_capture),
+                Some(stream_error_mask),
+                stream_plan,
+                Some(&mut transcript_state.lock()),
+            ));
+            if prefix.len() > EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES {
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    error_id = %route.error_id,
+                    pool_id = pool.id,
+                    pool_name = %pool.name,
+                    buffered_bytes = prefix.len(),
+                    max_buffered_bytes = EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES,
+                    "external pool pre-output stream prefix exceeded limit before commit"
+                );
+                return Err(external_pre_output_stream_protocol_error(
+                    "external pre-output stream buffer exceeded limit",
+                    "stream_pre_output_buffer_limit",
+                    config,
+                    outbound_model.clone(),
+                ));
+            }
+            if commits_downstream {
+                return Ok(last_chunk_at);
+            }
+        }
+
+        if buffer.len() > EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES {
+            tracing::warn!(
+                request_id = %route.request_id,
+                error_id = %route.error_id,
+                pool_id = pool.id,
+                pool_name = %pool.name,
+                buffered_bytes = buffer.len(),
+                max_buffered_bytes = EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES,
+                "external pool pre-output stream event buffer exceeded limit"
+            );
+            return Err(external_pre_output_stream_protocol_error(
+                "external pre-output stream event exceeded buffer limit",
+                "stream_pre_output_buffer_limit",
+                config,
+                outbound_model.clone(),
+            ));
+        }
+
+        tokio::select! {
+            chunk = body_stream.next() => {
+                match chunk {
+                    Some(Ok(chunk)) => {
+                        route.latency_trace.mark_first_upstream_chunk(route.started_at);
+                        last_chunk_at = Instant::now();
+                        buffer.extend_from_slice(&chunk);
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(
+                            request_id = %route.request_id,
+                            error_id = %route.error_id,
+                            pool_id = pool.id,
+                            pool_name = %pool.name,
+                            error_class = %sanitized_external_network_error("stream pre-output read failed", &err),
+                            "external pool stream read failed before downstream semantic output"
+                        );
+                        return Err(external_pre_output_stream_network_error(
+                            sanitized_external_network_error("stream pre-output read failed", &err),
+                            config,
+                            outbound_model.clone(),
+                        ));
+                    }
+                    None => {
+                        tracing::warn!(
+                            request_id = %route.request_id,
+                            error_id = %route.error_id,
+                            pool_id = pool.id,
+                            pool_name = %pool.name,
+                            buffered_bytes = buffer.len(),
+                            prefix_bytes = prefix.len(),
+                            "external pool stream ended before downstream semantic output or terminal event"
+                        );
+                        return Err(external_pre_output_stream_protocol_error(
+                            "external upstream ended stream before semantic output",
+                            "stream_pre_output_eof",
+                            config,
+                            outbound_model.clone(),
+                        ));
+                    }
+                }
+            }
+            _ = lease.wait_until_lost() => {
+                return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
+            }
+            _ = external_pool_stream_idle_deadline(last_chunk_at, stream_idle_timeout) => {
+                let seconds = stream_idle_timeout
+                    .map(|timeout| timeout.as_secs())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    error_id = %route.error_id,
+                    pool_id = pool.id,
+                    pool_name = %pool.name,
+                    idle_timeout_secs = seconds,
+                    "external pool stream idled before downstream semantic output"
+                );
+                return Err(external_pre_output_stream_network_error(
+                    format!(
+                        "model endpoint stream idle timeout before semantic output after {} seconds",
+                        seconds
+                    ),
+                    config,
+                    outbound_model.clone(),
+                ));
+            }
+        }
+    }
+}
+
 pub(crate) fn external_pool_models_url(base_url: &str) -> Result<Url, url::ParseError> {
     let mut base = base_url.trim().trim_end_matches('/').to_string();
     if base_url_ends_with_v1(&base) {
@@ -9096,6 +9520,7 @@ fn error_type_for_external_error(err: &ExternalPoolError) -> String {
             || reason == "model_unavailable"
             || reason == "model_mapping_miss"
             || reason == "server_error"
+            || reason == "protocol_error"
             || reason.starts_with("network_error")
             || reason == "inference_attempt_limit"
             || reason == "inference_attempt_reserved_for_fallback"
@@ -10494,11 +10919,10 @@ fn maybe_mask_external_stream_error_event(
         return None;
     }
 
-    const SAFE_STREAM_ERROR: &str = "external upstream emitted an error event";
     if let Some(capture) = capture {
         let mut capture = capture.lock();
         if capture.stream_error_message.is_none() {
-            capture.stream_error_message = Some(SAFE_STREAM_ERROR.to_string());
+            capture.stream_error_message = Some(SAFE_EXTERNAL_STREAM_ERROR_EVENT.to_string());
         }
     }
     tracing::warn!(
