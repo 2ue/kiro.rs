@@ -199,6 +199,8 @@ type ExternalPoolFormDraft = {
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   normalizeModelVersionDots: boolean
   supportedModelsText: string
+  routeMode: NonNullable<CreateExternalPoolRequest['routeMode']>
+  routeRulesText: string
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
   modelMappingRequireMatch: boolean
   modelMappingRulesText: string
@@ -221,6 +223,8 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   autoDisablePolicy: 'inherit',
   normalizeModelVersionDots: false,
   supportedModelsText: '',
+  routeMode: 'allow_all',
+  routeRulesText: '',
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: false,
   modelMappingRulesText: '',
@@ -243,6 +247,8 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   autoDisablePolicy: pool.autoDisablePolicy,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
   supportedModelsText: joinRules(pool.supportedModels || []),
+  routeMode: pool.routeMode || 'allow_all',
+  routeRulesText: joinRules(pool.routeRules || []),
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),
   modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
@@ -355,7 +361,7 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, ...form } = createForm
+      const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = createForm
       await createExternalPool({
         ...form,
         name: createForm.name.trim(),
@@ -366,6 +372,7 @@ export function ExternalPoolsPanel() {
         streamResponseMode: createForm.streamResponseMode === 'inherit' ? null : createForm.streamResponseMode,
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
+        routeRules: splitRules(routeRulesText),
       })
       toast.success('外部池已添加')
       setCreateOpen(false)
@@ -391,7 +398,7 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, ...form } = editForm
+      const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = editForm
       const payload: UpdateExternalPoolRequest = {
         ...form,
         name: editForm.name.trim(),
@@ -402,6 +409,7 @@ export function ExternalPoolsPanel() {
         streamResponseMode: editForm.streamResponseMode === 'inherit' ? null : editForm.streamResponseMode,
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
+        routeRules: splitRules(routeRulesText),
       }
       await updateExternalPool(editingPool.id, payload)
       toast.success('外部池已更新')
@@ -676,7 +684,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolStreamRetrySummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolStreamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -926,6 +934,28 @@ function ExternalPoolFormDialog({
                   空列表表示不限制；非空时，请求模型必须精确命中这里的列表才会调度到该外部池。
                 </div>
               </div>
+            </div>
+          </FormSection>
+
+          <FormSection title="入口路由" description="只限制当前外部池能承接哪些入口；仍会同时受全局外部池路由规则限制。">
+            <div className="grid gap-3 md:grid-cols-[240px_1fr]">
+              <SelectBox
+                label="单池路由模式"
+                value={draft.routeMode}
+                disabled={saving}
+                onChange={(routeMode) => onDraftChange((prev) => ({ ...prev, routeMode: routeMode as ExternalPoolFormDraft['routeMode'] }))}
+              >
+                <option value="allow_all">全部入口允许</option>
+                <option value="allow_list">只允许下列入口</option>
+                <option value="deny_list">禁止下列入口</option>
+              </SelectBox>
+              <TextArea
+                label="单池路由规则"
+                description="每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages；* 表示全部入口。"
+                value={draft.routeRulesText}
+                disabled={saving || draft.routeMode === 'allow_all'}
+                onChange={(routeRulesText) => onDraftChange((prev) => ({ ...prev, routeRulesText }))}
+              />
             </div>
           </FormSection>
 
@@ -1493,6 +1523,21 @@ function poolStreamRetrySummary(pool: ExternalPool, config: ExternalPoolsConfig)
   return config.externalPoolStreamPreOutputRetryEnabled
     ? '首输出恢复: 继承启用'
     : '首输出恢复: 继承禁用'
+}
+
+function poolRouteSummary(pool: ExternalPool) {
+  const rules = pool.routeRules || []
+  if (!pool.routeMode || pool.routeMode === 'allow_all') return '入口: 不限制'
+  if (pool.routeMode === 'allow_list') {
+    if (rules.length === 0) return '入口: 不允许'
+    return rules.length <= 2
+      ? `入口: 仅 ${rules.join(', ')}`
+      : `入口: 仅 ${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
+  }
+  if (rules.length === 0) return '入口: 不限制'
+  return rules.length <= 2
+    ? `入口: 排除 ${rules.join(', ')}`
+    : `入口: 排除 ${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
 }
 
 function authLabel(authType: ExternalPool['authType']) {

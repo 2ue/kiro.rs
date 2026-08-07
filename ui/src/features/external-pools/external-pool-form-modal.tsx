@@ -228,6 +228,28 @@ export function ExternalPoolFormModal({
           </div>
         </FormSection>
 
+        <FormSection title="入口路由" description="只限制当前外部账号能承接哪些入口；仍会同时受全局外部池路由规则限制。">
+          <div className="grid gap-3 md:grid-cols-[240px_1fr]">
+            <SelectBox
+              label="单池路由模式"
+              value={draft.routeMode}
+              disabled={saving}
+              onChange={(v) => set('routeMode', v as ExternalPoolFormDraft['routeMode'])}
+            >
+              <SelectItem value="allow_all">全部入口允许</SelectItem>
+              <SelectItem value="allow_list">只允许下列入口</SelectItem>
+              <SelectItem value="deny_list">禁止下列入口</SelectItem>
+            </SelectBox>
+            <TextAreaBox
+              label="单池路由规则"
+              description="每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages；* 表示全部入口。"
+              value={draft.routeRulesText}
+              disabled={saving || draft.routeMode === 'allow_all'}
+              onChange={(v) => set('routeRulesText', v)}
+            />
+          </div>
+        </FormSection>
+
         <FormSection title="请求体处理" description="控制发往该外部账号前是否进入本系统 body 处理链路。">
           <div className="grid gap-3">
             <div className="space-y-3">

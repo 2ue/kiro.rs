@@ -1261,7 +1261,9 @@ async fn maybe_raw_external_direct_response(
     if !external_pool_enabled_for_endpoint(&config, endpoint) {
         return None;
     }
-    if !raw_external_pool_has_eligible_pool(&manager, &config, raw_probe.model.as_deref()).await {
+    if !raw_external_pool_has_eligible_pool(&manager, &config, endpoint, raw_probe.model.as_deref())
+        .await
+    {
         return None;
     }
 
@@ -1338,6 +1340,7 @@ async fn maybe_raw_external_preflight_response(
         &manager,
         &config,
         reason,
+        endpoint,
         raw_probe.model.as_deref(),
     )
     .await
@@ -1385,35 +1388,40 @@ async fn maybe_raw_external_preflight_response(
 async fn raw_external_pool_has_eligible_pool(
     manager: &ExternalPoolManager,
     config: &ExternalPoolsConfig,
+    endpoint: &str,
     model: Option<&str>,
 ) -> bool {
     let Some(model) = model else {
         return false;
     };
-    manager.has_cached_eligible_pool_for_model(config, model)
-        || manager.has_eligible_pool_for_model(config, model).await
+    manager.has_cached_eligible_pool_for_route_and_model(config, endpoint, model)
+        || manager
+            .has_eligible_pool_for_route_and_model(config, endpoint, model)
+            .await
 }
 
 async fn raw_external_pool_ready_for_route_reason(
     manager: &ExternalPoolManager,
     config: &ExternalPoolsConfig,
     route_reason: &str,
+    endpoint: &str,
     model: Option<&str>,
 ) -> bool {
     if local_route_reason_requires_immediate_external_capacity(route_reason) {
         let Some(model) = model else {
             return false;
         };
-        manager.has_cached_immediately_available_pool_for_model(config, model)
+        manager.has_cached_immediately_available_pool_for_route_and_model(config, endpoint, model)
             || manager
-                .has_immediately_available_pool_for_model(
+                .has_immediately_available_pool_for_route_and_model(
                     config,
+                    endpoint,
                     model,
                     EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
                 )
                 .await
     } else {
-        raw_external_pool_has_eligible_pool(manager, config, model).await
+        raw_external_pool_has_eligible_pool(manager, config, endpoint, model).await
     }
 }
 
@@ -1657,29 +1665,37 @@ impl ExternalFallbackContext {
     }
 
     fn has_cached_eligible_external_pool_for_model(&self, model: &str) -> bool {
-        self.manager
-            .has_cached_eligible_pool_for_model(&self.config, model)
+        self.manager.has_cached_eligible_pool_for_route_and_model(
+            &self.config,
+            &self.endpoint,
+            model,
+        )
     }
 
     async fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
         self.has_cached_eligible_external_pool_for_model(model)
             || self
                 .manager
-                .has_eligible_pool_for_model(&self.config, model)
+                .has_eligible_pool_for_route_and_model(&self.config, &self.endpoint, model)
                 .await
     }
 
     fn has_cached_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
         self.manager
-            .has_cached_immediately_available_pool_for_model(&self.config, model)
+            .has_cached_immediately_available_pool_for_route_and_model(
+                &self.config,
+                &self.endpoint,
+                model,
+            )
     }
 
     async fn has_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
         self.has_cached_immediately_available_external_pool_for_model(model)
             || self
                 .manager
-                .has_immediately_available_pool_for_model(
+                .has_immediately_available_pool_for_route_and_model(
                     &self.config,
+                    &self.endpoint,
                     model,
                     EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
                 )

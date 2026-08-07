@@ -958,6 +958,8 @@ async fn test_external_pool_manager_for_handlers(
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
             supported_models: Vec::new(),
+            route_mode: crate::model::config::ExternalPoolRouteMode::AllowAll,
+            route_rules: Vec::new(),
             notes: None,
         })
         .await
@@ -5173,7 +5175,7 @@ fn contaminated_fallback_requires_normalized_pool_for_five_rounds() {
 }
 
 #[test]
-fn all_parsed_external_fallback_entrypoints_share_model_only_eligibility() {
+fn all_parsed_external_fallback_entrypoints_share_route_and_model_eligibility() {
     let source = include_str!("../handlers.rs");
     assert_eq!(
         source
@@ -5195,8 +5197,8 @@ fn all_parsed_external_fallback_entrypoints_share_model_only_eligibility() {
         "parsed preflight and local-error fallback must share the route-reason availability gate"
     );
     assert!(
-        source.contains(".has_cached_immediately_available_pool_for_model("),
-        "local attempt policy must only switch to fail-fast when cached external capacity is immediately available"
+        source.contains(".has_cached_immediately_available_pool_for_route_and_model("),
+        "local attempt policy must only switch to fail-fast when cached external capacity is immediately available for this route"
     );
     assert!(
         source.contains(
@@ -5206,11 +5208,11 @@ fn all_parsed_external_fallback_entrypoints_share_model_only_eligibility() {
     );
     assert!(
         !source.contains("has_eligible_pool_for_body_mode_and_model"),
-        "parsed external fallback eligibility must be model-based, not body-mode-based"
+        "parsed external fallback eligibility must be route-and-model-based, not body-mode-based"
     );
     assert!(
         !source.contains("has_immediately_available_pool_for_body_mode_and_model"),
-        "parsed immediate external fallback readiness must be model-based, not body-mode-based"
+        "parsed immediate external fallback readiness must be route-and-model-based, not body-mode-based"
     );
 }
 

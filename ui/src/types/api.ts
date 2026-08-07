@@ -1146,6 +1146,7 @@ export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
 export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
+export type ExternalPoolRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
 
 export interface ExternalPoolModelMappingRule {
   enabled?: boolean
@@ -1369,7 +1370,7 @@ export interface ExternalPoolsConfig {
   directExternalOnLocalMaintenance: boolean
   directExternalModelRules: string[]
   directExternalPathRules: string[]
-  externalPoolRouteMode: 'allow_all' | 'allow_list' | 'deny_list'
+  externalPoolRouteMode: ExternalPoolRouteMode
   externalPoolRouteRules: string[]
   fallbackOnLocalCapacityExhausted: boolean
   fallbackOnSchedulerRedisDegraded: boolean
@@ -1439,6 +1440,8 @@ export interface ExternalPool {
   modelMappingRequireMatch: boolean
   modelMappingRules: ExternalPoolModelMappingRule[]
   supportedModels: string[]
+  routeMode: ExternalPoolRouteMode
+  routeRules: string[]
   notes?: string
   createdAt: string
   updatedAt: string
@@ -1483,6 +1486,8 @@ export interface CreateExternalPoolRequest {
   modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
   supportedModels?: string[]
+  routeMode?: ExternalPoolRouteMode
+  routeRules?: string[]
   notes?: string
 }
 
@@ -1506,6 +1511,8 @@ export interface UpdateExternalPoolRequest {
   modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
   supportedModels?: string[]
+  routeMode?: ExternalPoolRouteMode
+  routeRules?: string[]
   notes?: string
 }
 

@@ -121,6 +121,8 @@ export type ExternalPoolFormDraft = {
   preservePath: boolean
   normalizeModelVersionDots: boolean
   supportedModelsText: string
+  routeMode: NonNullable<CreateExternalPoolRequest['routeMode']>
+  routeRulesText: string
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
   modelMappingRequireMatch: boolean
   modelMappingRulesText: string
@@ -144,6 +146,8 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   preservePath: true,
   normalizeModelVersionDots: false,
   supportedModelsText: '',
+  routeMode: 'allow_all',
+  routeRulesText: '',
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: false,
   modelMappingRulesText: '',
@@ -167,6 +171,8 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   preservePath: pool.preservePath !== false,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
   supportedModelsText: joinRules(pool.supportedModels || []),
+  routeMode: pool.routeMode || 'allow_all',
+  routeRulesText: joinRules(pool.routeRules || []),
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),
   modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
@@ -246,6 +252,21 @@ export function poolSupportedModelsSummary(pool: ExternalPool): string {
   if (models.length === 0) return '支持：不限制'
   if (models.length <= 2) return `支持：${models.join(', ')}`
   return `支持：${models[0]}, ${models[1]} 等 ${models.length} 个`
+}
+
+export function poolRouteSummary(pool: ExternalPool): string {
+  const rules = pool.routeRules || []
+  if (!pool.routeMode || pool.routeMode === 'allow_all') return '入口：不限制'
+  if (pool.routeMode === 'allow_list') {
+    if (rules.length === 0) return '入口：不允许'
+    return rules.length <= 2
+      ? `入口：仅 ${rules.join(', ')}`
+      : `入口：仅 ${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
+  }
+  if (rules.length === 0) return '入口：不限制'
+  return rules.length <= 2
+    ? `入口：排除 ${rules.join(', ')}`
+    : `入口：排除 ${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
 }
 
 export function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined): string {

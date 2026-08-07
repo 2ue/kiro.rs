@@ -1483,6 +1483,8 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExtern
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
         supported_models: Vec::new(),
+        route_mode: ExternalPoolRouteMode::AllowAll,
+        route_rules: Vec::new(),
         notes: None,
     }
 }
@@ -5453,6 +5455,85 @@ async fn external_pool_model_unavailable_cooldown_is_model_scoped_and_does_not_q
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_route_mode_is_applied_per_pool_for_selection_and_eligibility() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
+    let model = "claude-sonnet-4-6".to_string();
+
+    let mut cc_request = create_pool_request("route-allow-cc", 1, true);
+    cc_request.supported_models = vec![model.clone()];
+    cc_request.route_mode = ExternalPoolRouteMode::AllowList;
+    cc_request.route_rules = vec!["/cc".to_string()];
+    let cc_pool = postgres.create_external_pool(cc_request).await.unwrap();
+
+    let mut v1_request = create_pool_request("route-allow-v1", 2, true);
+    v1_request.supported_models = vec![model.clone()];
+    v1_request.route_mode = ExternalPoolRouteMode::AllowList;
+    v1_request.route_rules = vec!["/v1".to_string()];
+    let v1_pool = postgres.create_external_pool(v1_request).await.unwrap();
+
+    let mut ha_request = create_pool_request("route-deny-cc-v1", 3, true);
+    ha_request.supported_models = vec![model.clone()];
+    ha_request.route_mode = ExternalPoolRouteMode::DenyList;
+    ha_request.route_rules = vec!["/cc".to_string(), "/v1".to_string()];
+    let ha_pool = postgres.create_external_pool(ha_request).await.unwrap();
+
+    manager.invalidate_static_pool_snapshot();
+
+    let mut cc_route = test_route(&model);
+    cc_route.endpoint = "/cc/v1/messages".to_string();
+    let cc_selection = manager
+        .select_pool_for_route(&HashSet::new(), &config, &cc_route)
+        .await;
+    assert_eq!(
+        cc_selection.selected_pool.as_ref().map(|pool| pool.id),
+        Some(cc_pool.id)
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_route_and_model(&config, &cc_route.endpoint, &model)
+            .await
+    );
+
+    let mut v1_route = test_route(&model);
+    v1_route.endpoint = "/v1/messages".to_string();
+    let v1_selection = manager
+        .select_pool_for_route(&HashSet::new(), &config, &v1_route)
+        .await;
+    assert_eq!(
+        v1_selection.selected_pool.as_ref().map(|pool| pool.id),
+        Some(v1_pool.id)
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_route_and_model(&config, &v1_route.endpoint, &model)
+            .await
+    );
+
+    let mut ha_route = test_route(&model);
+    ha_route.endpoint = "/ha/v1/messages".to_string();
+    let ha_selection = manager
+        .select_pool_for_route(&HashSet::new(), &config, &ha_route)
+        .await;
+    assert_eq!(
+        ha_selection.selected_pool.as_ref().map(|pool| pool.id),
+        Some(ha_pool.id)
+    );
+    assert!(
+        manager
+            .has_eligible_pool_for_route_and_model(&config, &ha_route.endpoint, &model)
+            .await
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_redis_hot_path_is_repeatable_across_selection_and_acquire() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -7675,6 +7756,7 @@ async fn external_pool_selection_runtime_snapshot_coalesces_128_waiters_for_five
             None,
             None,
             None,
+            None,
         )
         .await;
     assert_eq!(
@@ -7703,6 +7785,7 @@ async fn external_pool_selection_runtime_snapshot_coalesces_128_waiters_for_five
                 &excluded,
                 &config,
                 true,
+                None,
                 None,
                 None,
                 None,
@@ -9856,6 +9939,8 @@ fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
         supported_models: Vec::new(),
+        route_mode: ExternalPoolRouteMode::AllowAll,
+        route_rules: Vec::new(),
         notes: None,
         created_at: now,
         updated_at: now,
@@ -10257,6 +10342,39 @@ fn direct_external_policy_respects_external_pool_route_policy() {
             .as_deref(),
         Some("explicit_direct")
     );
+}
+
+#[test]
+fn external_pool_route_policy_applies_per_pool_rules() {
+    let mut pool = test_pool("https://example.com/v1", true);
+
+    assert!(external_pool_route_allowed(&pool, Some("/cc/v1/messages")));
+    assert!(external_pool_route_allowed(&pool, None));
+
+    pool.route_mode = crate::model::config::ExternalPoolRouteMode::AllowList;
+    pool.route_rules = vec!["/cc".to_string(), "/dfcache/team".to_string()];
+    assert!(external_pool_route_allowed(&pool, Some("/cc/v1/messages")));
+    assert!(external_pool_route_allowed(
+        &pool,
+        Some("/dfcache/team/v1/messages")
+    ));
+    assert!(!external_pool_route_allowed(
+        &pool,
+        Some("/dfcache/team-a/v1/messages")
+    ));
+    assert!(!external_pool_route_allowed(&pool, Some("/v1/messages")));
+
+    pool.route_rules = vec!["*".to_string()];
+    assert!(external_pool_route_allowed(&pool, Some("/v1/messages")));
+    assert!(external_pool_route_allowed(&pool, Some("/ha/v1/messages")));
+
+    pool.route_mode = crate::model::config::ExternalPoolRouteMode::DenyList;
+    pool.route_rules = vec!["/cc".to_string()];
+    assert!(!external_pool_route_allowed(&pool, Some("/cc/v1/messages")));
+    assert!(external_pool_route_allowed(&pool, Some("/v1/messages")));
+
+    pool.route_rules = vec!["*".to_string()];
+    assert!(!external_pool_route_allowed(&pool, Some("/v1/messages")));
 }
 
 #[test]

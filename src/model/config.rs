@@ -2712,6 +2712,29 @@ pub enum ExternalPoolRouteMode {
     DenyList,
 }
 
+impl ExternalPoolRouteMode {
+    pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allow_all" | "allow-all" | "all" => Some(Self::AllowAll),
+            "allow_list" | "allow-list" | "allowlist" => Some(Self::AllowList),
+            "deny_list" | "deny-list" | "denylist" => Some(Self::DenyList),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowAll => "allow_all",
+            Self::AllowList => "allow_list",
+            Self::DenyList => "deny_list",
+        }
+    }
+}
+
 /// 外部池返回模型不可用时的冷却范围。
 ///
 /// `model` 是默认值：只短暂避开当前外部池的当前模型，避免一个不支持模型把

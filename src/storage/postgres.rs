@@ -32,11 +32,15 @@ use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
     ExternalPoolEligibility, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
     ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
-    UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_model_mapping_rules,
+    UpdateExternalPoolRequest, mask_external_pool_key,
+    normalize_external_pool_model_mapping_rules,
 };
 use crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::model::config::{Config, ExternalPoolStreamResponseMode, ModelMappingRule};
+use crate::model::config::{
+    Config, ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ModelMappingRule,
+    normalize_route_rules,
+};
 use crate::model::model_support::normalize_supported_models;
 
 const ACTIVE_CREDENTIALS_SELECT_SQL: &str = r#"
@@ -59,7 +63,8 @@ SELECT id, name, base_url, api_key, auth_type, enabled, priority,
        auto_disabled, auto_disabled_reason, auto_disabled_at,
        auto_disabled_until, auto_disabled_last_error, preserve_path,
        normalize_model_version_dots, model_mapping_mode,
-       model_mapping_require_match, model_mapping_rules, supported_models, notes,
+       model_mapping_require_match, model_mapping_rules, supported_models,
+       route_mode, route_rules, notes,
        revision, created_at, updated_at
 FROM external_upstream_pools
 WHERE deleted_at IS NULL
@@ -112,6 +117,14 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "external_upstream_pools",
         column_name: "pre_output_stream_retry_mode",
+    },
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "route_mode",
+    },
+    RequiredPostgresColumn {
+        table_name: "external_upstream_pools",
+        column_name: "route_rules",
     },
     RequiredPostgresColumn {
         table_name: "usage_records",
@@ -1242,7 +1255,8 @@ impl PostgresStore {
                    stream_response_mode, request_body_mode, raw_model_mode,
                    auto_disable_policy, pre_output_stream_retry_mode, model_mapping_mode,
                    model_mapping_require_match, model_mapping_rules,
-                   auto_disabled, auto_disabled_until, supported_models
+                   auto_disabled, auto_disabled_until, supported_models,
+                   route_mode, route_rules
             FROM external_upstream_pools
             WHERE deleted_at IS NULL
             ORDER BY priority ASC, id ASC
@@ -1293,7 +1307,8 @@ impl PostgresStore {
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
                    normalize_model_version_dots, model_mapping_mode,
-                   model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                   model_mapping_require_match, model_mapping_rules, supported_models,
+                   route_mode, route_rules, notes,
                    revision, created_at, updated_at
             FROM external_upstream_pools
             WHERE id = $1 AND deleted_at IS NULL
@@ -1372,6 +1387,9 @@ impl PostgresStore {
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let supported_models = normalize_supported_models(request.supported_models);
         let supported_models_value = serde_json::to_value(&supported_models)?;
+        validate_external_pool_route_rules(&request.route_rules)?;
+        let route_rules = normalize_route_rules(&request.route_rules);
+        let route_rules_value = serde_json::to_value(&route_rules)?;
         let row = sqlx::query(
             r#"
             INSERT INTO external_upstream_pools (
@@ -1379,16 +1397,18 @@ impl PostgresStore {
                 max_concurrent_requests, usage_projection_mode, stream_response_mode,
                 request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                 preserve_path, normalize_model_version_dots, model_mapping_mode,
-                model_mapping_require_match, model_mapping_rules, supported_models, notes, updated_at
+                model_mapping_require_match, model_mapping_rules, supported_models,
+                route_mode, route_rules, notes, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, stream_response_mode,
                       request_body_mode, raw_model_mode, auto_disable_policy, pre_output_stream_retry_mode,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models,
+                      route_mode, route_rules, notes,
                       revision, created_at, updated_at
             "#,
         )
@@ -1411,6 +1431,8 @@ impl PostgresStore {
         .bind(request.model_mapping_require_match)
         .bind(model_mapping_rules_value)
         .bind(supported_models_value)
+        .bind(request.route_mode.as_str())
+        .bind(route_rules_value)
         .bind(request.notes.map(|notes| notes.trim().to_string()))
         .fetch_one(&self.pool)
         .await?;
@@ -1499,6 +1521,16 @@ impl PostgresStore {
             .map(normalize_supported_models)
             .unwrap_or(current.supported_models);
         let supported_models_value = serde_json::to_value(&supported_models)?;
+        let route_mode = request.route_mode.unwrap_or(current.route_mode);
+        let route_rules = request
+            .route_rules
+            .map(|rules| {
+                validate_external_pool_route_rules(&rules)?;
+                Ok::<_, anyhow::Error>(normalize_route_rules(&rules))
+            })
+            .transpose()?
+            .unwrap_or(current.route_rules);
+        let route_rules_value = serde_json::to_value(&route_rules)?;
         let notes = request.notes.or(current.notes);
         validate_external_pool_input(&name, &base_url, max_concurrent_requests)?;
         let row = sqlx::query(
@@ -1523,7 +1555,9 @@ impl PostgresStore {
                 model_mapping_require_match = $18,
                 model_mapping_rules = $19,
                 supported_models = $20,
-                notes = $21,
+                route_mode = $21,
+                route_rules = $22,
+                notes = $23,
                 revision = revision + 1,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
@@ -1533,7 +1567,8 @@ impl PostgresStore {
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models,
+                      route_mode, route_rules, notes,
                       revision, created_at, updated_at
             "#,
         )
@@ -1557,6 +1592,8 @@ impl PostgresStore {
         .bind(model_mapping_require_match)
         .bind(model_mapping_rules_value)
         .bind(supported_models_value)
+        .bind(route_mode.as_str())
+        .bind(route_rules_value)
         .bind(notes)
         .fetch_one(&self.pool)
         .await?;
@@ -1601,7 +1638,8 @@ impl PostgresStore {
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models,
+                      route_mode, route_rules, notes,
                       revision, created_at, updated_at
             "#,
         )
@@ -1653,7 +1691,8 @@ impl PostgresStore {
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models,
+                      route_mode, route_rules, notes,
                       revision, created_at, updated_at
             "#,
         )
@@ -1714,7 +1753,8 @@ impl PostgresStore {
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models,
+                      route_mode, route_rules, notes,
                       revision, created_at, updated_at
             "#,
         )
@@ -9406,6 +9446,13 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     let pre_output_stream_retry_mode: String = row.try_get("pre_output_stream_retry_mode")?;
     ExternalPoolStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
         .ok_or_else(|| anyhow::anyhow!("pre_output_stream_retry_mode 值无效"))?;
+    let route_mode: String = row.try_get("route_mode")?;
+    let route_mode = ExternalPoolRouteMode::parse_known(&route_mode)
+        .ok_or_else(|| anyhow::anyhow!("route_mode 值无效"))?;
+    let route_rules_value: serde_json::Value = row
+        .try_get("route_rules")
+        .map_err(|_| anyhow::anyhow!("route_rules 字段类型无效"))?;
+    let route_rules = decode_external_pool_route_rules(route_rules_value, true)?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
     ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
         .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?;
@@ -9438,7 +9485,33 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
                 .into_iter()
                 .collect::<HashSet<_>>(),
         ),
+        route_mode,
+        route_rules: Arc::new(route_rules),
     })
+}
+
+fn decode_external_pool_route_rules(
+    value: serde_json::Value,
+    strict_dispatch: bool,
+) -> anyhow::Result<Vec<String>> {
+    let rules = if strict_dispatch {
+        serde_json::from_value::<Vec<String>>(value)
+            .map_err(|_| anyhow::anyhow!("route_rules 必须是字符串数组"))?
+    } else {
+        serde_json::from_value::<Vec<String>>(value).unwrap_or_default()
+    };
+    validate_external_pool_route_rules(&rules)?;
+    Ok(normalize_route_rules(&rules))
+}
+
+fn validate_external_pool_route_rules(rules: &[String]) -> anyhow::Result<()> {
+    if rules.len() > 200 {
+        anyhow::bail!("route_rules 不能超过 200 条");
+    }
+    if rules.iter().any(|rule| rule.len() > 256) {
+        anyhow::bail!("route_rules 单条长度不能超过 256");
+    }
+    Ok(())
 }
 
 fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<ExternalPool> {
@@ -9479,6 +9552,19 @@ fn external_pool_from_row_with_policy(
         row.try_get("pre_output_stream_retry_mode")
             .unwrap_or_else(|_| "inherit".to_string())
     };
+    let route_mode: String = if strict_dispatch {
+        row.try_get("route_mode")?
+    } else {
+        row.try_get("route_mode")
+            .unwrap_or_else(|_| "allow_all".to_string())
+    };
+    let route_rules_value: serde_json::Value = if strict_dispatch {
+        row.try_get("route_rules")?
+    } else {
+        row.try_get("route_rules")
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+    };
+    let route_rules = decode_external_pool_route_rules(route_rules_value, strict_dispatch)?;
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
     let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
@@ -9557,6 +9643,12 @@ fn external_pool_from_row_with_policy(
     } else {
         ExternalPoolStreamRetryMode::parse(&pre_output_stream_retry_mode)
     };
+    let route_mode = if strict_dispatch {
+        ExternalPoolRouteMode::parse_known(&route_mode)
+            .ok_or_else(|| anyhow::anyhow!("route_mode 值无效"))?
+    } else {
+        ExternalPoolRouteMode::parse(&route_mode)
+    };
     let model_mapping_mode = if strict_dispatch {
         ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
             .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?
@@ -9619,6 +9711,8 @@ fn external_pool_from_row_with_policy(
         model_mapping_require_match,
         model_mapping_rules: normalize_external_pool_model_mapping_rules(model_mapping_rules),
         supported_models,
+        route_mode,
+        route_rules,
         notes: row.try_get("notes")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -10123,6 +10217,8 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     model_mapping_require_match BOOLEAN NOT NULL DEFAULT false,
     model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
     supported_models JSONB NOT NULL DEFAULT '[]'::jsonb,
+    route_mode TEXT NOT NULL DEFAULT 'allow_all',
+    route_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -10197,6 +10293,12 @@ ALTER TABLE external_upstream_pools
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS supported_models JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'allow_all';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS route_rules JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS notes TEXT;
@@ -11014,6 +11116,8 @@ mod tests {
         for pair in [
             ("external_upstream_pools", "revision"),
             ("external_upstream_pools", "pre_output_stream_retry_mode"),
+            ("external_upstream_pools", "route_mode"),
+            ("external_upstream_pools", "route_rules"),
             ("usage_records", "rollup_active"),
             ("usage_cleanup_jobs", "batch_size"),
             ("usage_records", "original_cost_usd"),
@@ -17461,6 +17565,8 @@ mod tests {
                     note: None,
                 }],
                 supported_models: Vec::new(),
+                route_mode: ExternalPoolRouteMode::AllowList,
+                route_rules: vec!["/CC".to_string(), "/ha".to_string()],
                 notes: None,
             })
             .await
@@ -17481,6 +17587,11 @@ mod tests {
         assert_eq!(
             created.pre_output_stream_retry_mode,
             ExternalPoolStreamRetryMode::Enabled
+        );
+        assert_eq!(created.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(
+            created.route_rules,
+            vec!["/cc".to_string(), "/ha".to_string()]
         );
 
         let listed = store.list_external_pools(false).await.unwrap();
@@ -17523,6 +17634,8 @@ mod tests {
             loaded.pre_output_stream_retry_mode,
             ExternalPoolStreamRetryMode::Enabled
         );
+        assert_eq!(loaded.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(loaded.route_rules, vec!["/cc".to_string(), "/ha".to_string()]);
 
         let updated = store
             .update_external_pool(
@@ -17534,6 +17647,8 @@ mod tests {
                     request_body_mode: Some(ExternalPoolRequestBodyMode::RawPassthrough),
                     raw_model_mode: Some(ExternalPoolRawModelMode::None),
                     pre_output_stream_retry_mode: Some(ExternalPoolStreamRetryMode::Disabled),
+                    route_mode: Some(ExternalPoolRouteMode::DenyList),
+                    route_rules: Some(vec!["/V1".to_string()]),
                     ..UpdateExternalPoolRequest::default()
                 },
             )
@@ -17553,6 +17668,8 @@ mod tests {
             updated.pre_output_stream_retry_mode,
             ExternalPoolStreamRetryMode::Disabled
         );
+        assert_eq!(updated.route_mode, ExternalPoolRouteMode::DenyList);
+        assert_eq!(updated.route_rules, vec!["/v1".to_string()]);
 
         let inherited = store
             .update_external_pool(
@@ -17570,6 +17687,8 @@ mod tests {
             inherited.pre_output_stream_retry_mode,
             ExternalPoolStreamRetryMode::Disabled
         );
+        assert_eq!(inherited.route_mode, ExternalPoolRouteMode::DenyList);
+        assert_eq!(inherited.route_rules, vec!["/v1".to_string()]);
 
         store.drop_test_schema().await.unwrap();
     }
