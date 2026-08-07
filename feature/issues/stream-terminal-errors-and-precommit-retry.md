@@ -1,6 +1,6 @@
 # Stream Terminal Errors And Precommit Retry
 
-Status: `focused-router-and-release-2mib-unit-passed / external-pool-pre-output-stream-retry-implemented / focused-fake-http-and-routing-validated / normal-routing-rerun-passed-20260807 / frozen-cli-load-passed-20260807 / production-rollout-observation-pending / release-candidate-v0.0.134`
+Status: `focused-router-and-release-2mib-unit-passed / external-pool-pre-output-stream-retry-implemented / focused-fake-http-and-routing-validated / normal-routing-rerun-passed-20260807 / frozen-cli-load-passed-20260807 / released-v0.0.134 / production-rollout-observation-pending`
 
 Severity: P0 release gate
 
@@ -78,6 +78,8 @@ focused validation 已通过，但 final release gate 仍未关闭：
 2026-08-07 最终冻结候选动态 gate 也已通过：`kiro-rs` SHA-256 `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688`，`kiro_loadtest` SHA-256 `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d`；真实 Claude Code CLI `2.1.221` fake-upstream gate 为 bare `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire rerun `60/60`；load/chaos 为 L3 `9/9`、L4 `12/12`、L5 `900s` soak `6820/6820` success，`300s` idle 后 RSS/FD 回落并通过 post-soak recovery。生产 rollout 观察和必要的 `yuenan` / `yuenan-1` 复核仍留给发布后执行；本状态不冒领生产观察。详细实现/验证状态见 [外部池流式首语义输出前错误恢复](../../docs/plantree/plans/rust-runtime-scheduler-stabilization/topics/external-pool-stream-pre-output-retry-20260806.md)。采样摘要见 [Yuenan stream-error sampling 2026-08-06](../evidence/external-pool-stream-error-yuenan-sampling-20260806.md)，focused/final candidate evidence 见 [External-pool stream pre-output retry focused validation 2026-08-06](../evidence/external-pool-stream-pre-output-retry-validation-20260806.md)。
 
 首次远端 `v0.0.134` tag 发布触发的 GitHub Actions `Publish Docker Images #165` 在 `quality / Frontend and Rust quality gate` 失败，原因是新增代码触发 Clippy baseline bucket：`ExternalPoolStreamRetryMode` 的手写 `Default` 和 SSE commit classifier 的单分支 `match`。本轮已用无行为变化的 lint 修复恢复 release-quality baseline，`feature/tests/run-cargo-scoped.sh release-clippy-baseline-fix-20260807 -- rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs` 通过，当前 `813 <= 849`。
+
+发布恢复已完成：修复提交 `87f79b7` 推送到 `main`，旧远端 `v0.0.134` tag 删除后重建到该提交，GitHub Actions `Publish Docker Images #166`（`31145966147`）完成成功。生产 rollout 观察和 `yuenan` / `yuenan-1` 复核仍是发布后事项，不能在本文件中提前冒领。
 
 ## 根因与修复
 

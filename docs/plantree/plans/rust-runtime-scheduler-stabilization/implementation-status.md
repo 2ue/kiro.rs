@@ -129,6 +129,12 @@ Current phase:
   now passes with `813 <= 849`. Final local static/UI/document/artifact gates also passed after
   this lint fix. The failed tag must be deleted/recreated before republishing so GitHub treats
   the replacement tag as a new tag-created event.
+- 2026-08-07 `v0.0.134` release recovery completed: repaired commit `87f79b7` was pushed to
+  `main`, the failed remote `v0.0.134` tag was deleted/recreated so `v0.0.134^{}` peels to
+  `87f79b7a32b2668f2213d7a4f0702abf5680473b`, and GitHub Actions `Publish Docker Images #166`
+  (`31145966147`) completed successfully for the quality gate, image build matrix and manifest.
+  Production rollout observation and renewed `yuenan` / `yuenan-1` recurrence checks remain
+  post-release work.
 
 Last landed evidence:
 
@@ -147,6 +153,7 @@ Last landed evidence:
   The release-quality Clippy recovery rerun passed after the behavior-neutral lint fix:
   `813 <= 849`; the post-fix Rust fmt/check, diff hygiene, feature docs, UI/admin-ui builds and
   build artifact inventory also passed.
+  The repaired tag was published as `v0.0.134` by GitHub Actions `Publish Docker Images #166`.
   Production rollout observation remains pending.
 - `external_pool_cached_immediate_availability` real local PgSQL/Redis: `2 passed / 0 failed`.
 - `external_pool_immediate_availability_requires_current_capacity_and_recovers`: `1 passed / 0 failed`.
@@ -216,22 +223,21 @@ Last landed evidence:
 
 Active TODO:
 
-1. Publish the verified `v0.0.134` candidate.
-2. Observe the three production deployments after rollout without changing the local `9022`
+1. Observe the three production deployments after rollout without changing the local `9022`
    service or usage calculation chain.
-3. Finish first archive batch for old slow-first-token/stream-fluidity analysis.
-4. Continue candidate rejection observability and model-field display improvements as separate
+2. Finish first archive batch for old slow-first-token/stream-fluidity analysis.
+3. Continue candidate rejection observability and model-field display improvements as separate
    follow-up work.
 
 Blocked by:
 
 - External-pool HA P0 `v0.0.133` release candidate itself has no local blocker. The current
-  working tree contains a separate stream pre-output retry release candidate whose local CLI/load
-  gates have passed. Production observation is post-release and must not be claimed before rollout.
+  stream pre-output retry fix is published as `v0.0.134`; production observation is post-release
+  and must not be claimed before rollout.
 - Thinking signature Branch A vs B, image-source matrix, browser follow-up, and broader
   architecture gates remain independent open items and are not part of this P0 release.
 
 Next target:
 
-- Publish `v0.0.134`. Keep production observation for the new stream follow-up separate from
+- Observe the `v0.0.134` rollout and keep that production observation separate from
   already-published `v0.0.133`.

@@ -1,6 +1,6 @@
 # 外部池流式首语义输出前恢复 focused 验证（2026-08-06）
 
-Status: `focused-fake-http-and-routing-validated / normal-routing-rerun-passed-20260807 / storage-ui-wired / frozen-cli-load-passed-20260807 / production-rollout-observation-pending / release-candidate-v0.0.134`
+Status: `focused-fake-http-and-routing-validated / normal-routing-rerun-passed-20260807 / storage-ui-wired / frozen-cli-load-passed-20260807 / released-v0.0.134 / production-rollout-observation-pending`
 
 Date: 2026-08-06 Asia/Shanghai
 
@@ -268,6 +268,13 @@ Local release-quality rerun:
 | `pnpm --dir ui check` | Passed |
 | `pnpm --dir ui build` | Passed with the existing chunk-size warning |
 | `pnpm --dir admin-ui build` | Passed |
+
+Remote release recovery:
+
+- The old remote `v0.0.134` tag, which peeled to failed commit `973491a`, was deleted.
+- `main` was pushed to `87f79b7a32b2668f2213d7a4f0702abf5680473b`.
+- The annotated `v0.0.134` tag was recreated and pushed; remote `v0.0.134^{}` now peels to `87f79b7a32b2668f2213d7a4f0702abf5680473b`.
+- GitHub Actions `Publish Docker Images #166` (`31145966147`) completed successfully for commit `87f79b7` on `v0.0.134`, replacing the failed `#165` attempt.
 
 ## Remaining Gates
 
