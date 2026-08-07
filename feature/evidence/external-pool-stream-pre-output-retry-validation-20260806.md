@@ -247,6 +247,28 @@ After the evidence/status document update, the final pre-release local gates pas
 | `pnpm --dir ui build` | Passed with the existing chunk-size warning |
 | `pnpm --dir admin-ui build` | Passed |
 
+## Release CI Recovery
+
+The first remote tag publish attempt for `v0.0.134` reached GitHub Actions `Publish Docker Images #165` and failed in the `quality / Frontend and Rust quality gate` before image publication. Local reproduction with the release-quality Clippy baseline found only lint-bucket regressions in `src/external_pool.rs`: `clippy::derivable_impls` for the new `ExternalPoolStreamRetryMode` default implementation and `clippy::single_match` in the new pre-output stream commit classifier.
+
+The repair is behavior-neutral:
+
+- `ExternalPoolStreamRetryMode` now uses `#[derive(Default)]` with `Inherit` marked as `#[default]`.
+- The single-pattern `match` in `external_sse_event_commits_pre_output_stream` is now an equivalent `if let`.
+
+Local release-quality rerun:
+
+| Gate | Result |
+| --- | --- |
+| `feature/tests/run-cargo-scoped.sh release-clippy-baseline-fix-20260807 -- rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs` | Passed: Clippy emitted `813` warnings; checked-in baseline allows `849` |
+| `feature/tests/run-cargo-scoped.sh final-static-after-clippy-fix-20260807b -- bash -lc 'cargo +1.92.0 fmt --all -- --check && cargo +1.92.0 check --all-targets --locked'` | Passed; scoped target cleanup `removed=true` / `reservation_released=true` |
+| `git diff --check` | Passed |
+| `node feature/tests/check-feature-docs.mjs` | Passed: `75` issue docs, `354` relative links |
+| `node feature/tests/inventory-build-artifacts.mjs --gate` | Passed: `targets=0 reservations=0 target_processes=0 blockers=0`; Docker inspected read-only, cleanup remains manual-only |
+| `pnpm --dir ui check` | Passed |
+| `pnpm --dir ui build` | Passed with the existing chunk-size warning |
+| `pnpm --dir admin-ui build` | Passed |
+
 ## Remaining Gates
 
 - Production rollout observation remains pending.

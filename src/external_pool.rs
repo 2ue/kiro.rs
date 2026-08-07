@@ -345,18 +345,13 @@ impl ExternalPoolAutoDisablePolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalPoolStreamRetryMode {
+    #[default]
     Inherit,
     Enabled,
     Disabled,
-}
-
-impl Default for ExternalPoolStreamRetryMode {
-    fn default() -> Self {
-        Self::Inherit
-    }
 }
 
 impl ExternalPoolStreamRetryMode {
@@ -8193,9 +8188,9 @@ fn external_sse_event_is_error_event(event: &[u8]) -> bool {
 }
 
 fn external_sse_event_commits_pre_output_stream(event: &[u8]) -> bool {
-    match external_sse_event_name(event).as_deref() {
-        Some("content_block_start" | "message_stop") => return true,
-        _ => {}
+    if let Some("content_block_start" | "message_stop") = external_sse_event_name(event).as_deref()
+    {
+        return true;
     }
     let text = match std::str::from_utf8(event) {
         Ok(text) => text,

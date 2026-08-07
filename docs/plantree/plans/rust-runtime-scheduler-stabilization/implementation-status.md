@@ -120,6 +120,15 @@ Current phase:
   L3 `9/9`, L4 `12/12`, and L5 `900s` soak with `6820/6820` long-stream successes plus
   `300s` idle RSS/FD recovery and post-soak normal recovery. Production rollout observation and
   renewed `yuenan` / `yuenan-1` recurrence checks remain post-release work.
+- 2026-08-07 first remote `v0.0.134` tag publish attempt failed in GitHub Actions
+  `Publish Docker Images #165` at the `quality / Frontend and Rust quality gate` before image
+  publication. Local release-quality reproduction found only Clippy baseline bucket regressions
+  in the new stream pre-output retry code (`derivable_impls` for the retry-mode default and
+  `single_match` in the SSE commit classifier). The fix derives `Default` and rewrites the
+  single-pattern match without changing runtime behavior; local release-quality Clippy baseline
+  now passes with `813 <= 849`. Final local static/UI/document/artifact gates also passed after
+  this lint fix. The failed tag must be deleted/recreated before republishing so GitHub treats
+  the replacement tag as a new tag-created event.
 
 Last landed evidence:
 
@@ -135,6 +144,9 @@ Last landed evidence:
   exact external normal-output/usage checks plus UI/admin-ui build reruns. Final frozen candidate
   CLI/load gates also passed: Claude CLI bare `20/20`, long-session `110 turns`, thinking-wire
   rerun `60/60`, load L3 `9/9`, L4 `12/12`, L5 `900s` soak `6820/6820` with RSS/FD recovery.
+  The release-quality Clippy recovery rerun passed after the behavior-neutral lint fix:
+  `813 <= 849`; the post-fix Rust fmt/check, diff hygiene, feature docs, UI/admin-ui builds and
+  build artifact inventory also passed.
   Production rollout observation remains pending.
 - `external_pool_cached_immediate_availability` real local PgSQL/Redis: `2 passed / 0 failed`.
 - `external_pool_immediate_availability_requires_current_capacity_and_recovers`: `1 passed / 0 failed`.
@@ -143,7 +155,7 @@ Last landed evidence:
 - `preflight_external_error`: `1 passed / 0 failed`.
 - `cargo fmt --check`: pass.
 - `cargo check --all-targets --locked`: pass.
-- clippy baseline: `811 <= 849`.
+- clippy baseline: `813 <= 849`.
 - build artifact inventory: `targets=0 reservations=0 target_processes=0 blockers=0`.
 - 2026-07-31 documentation governance:
   - [Current issue status index](../../../../feature/issues/current-issue-status-index-20260731.md) created.
