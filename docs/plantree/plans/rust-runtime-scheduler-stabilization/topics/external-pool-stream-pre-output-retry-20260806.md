@@ -1,6 +1,6 @@
 # 外部池流式首语义输出前错误恢复
 
-Status: `implemented / focused-fake-http-and-routing-validated / normal-routing-rerun-passed-20260807 / frozen-cli-load-passed-20260807 / production-rollout-observation-pending / release-candidate-v0.0.134`
+Status: `implemented / focused-fake-http-and-routing-validated / normal-routing-rerun-passed-20260807 / frozen-cli-load-passed-20260807 / released-v0.0.134 / production-rollout-observation-pending`
 
 Last reviewed: 2026-08-07 Asia/Shanghai
 
@@ -316,10 +316,11 @@ HTTP 200
 5. `cargo fmt --check`、`cargo check --all-targets --locked` 和差异检查通过；
 6. issue、当前索引、plan-tree 和 evidence 均记录实际 focused 结果与剩余 gate。
 
-发版前最后门禁：
+发版完成状态：
 
-1. 确认没有本轮残留进程、数据库、Redis prefix 或大 raw artifact；
-2. 提交并打 `v0.0.134` tag。
+1. 发布前已确认没有本轮残留进程、数据库、Redis prefix 或大 raw artifact；
+2. `v0.0.134` tag 已发布，远端 `v0.0.134^{}` 指向 `87f79b7a32b2668f2213d7a4f0702abf5680473b`；
+3. GitHub Actions `Publish Docker Images #166`（`31145966147`）已成功完成 quality、镜像构建矩阵和 manifest。
 
 发布后观察：
 

@@ -94,15 +94,15 @@ Last reviewed: 2026-08-07 Asia/Shanghai
     before content/thinking/tool output, while non-stream succeeds;
   - current code state: focused implementation, 2026-08-07 normal-routing/output rerun, frozen
     Claude CLI and L3-L5 load/chaos gates have passed; final pre-release static/UI/docs/artifact
-    gates also passed; remaining work is publication, production rollout observation and renewed `yuenan` / `yuenan-1`
+    gates also passed; `v0.0.134` was published by GitHub Actions `Publish Docker Images #166`;
+    remaining work is production rollout observation and renewed `yuenan` / `yuenan-1`
     recurrence checks.
 
 ## Next
 
-1. Publish `v0.0.134`.
-2. After publication of the verified candidate, perform read-only production observation and update the issue/evidence
+1. Perform read-only `v0.0.134` production observation and update the issue/evidence
    indexes without changing usage semantics.
-3. Continue the independent documentation archive and scheduler observability follow-ups.
+2. Continue the independent documentation archive and scheduler observability follow-ups.
 
 ## Deferred
 
