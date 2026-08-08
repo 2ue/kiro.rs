@@ -1135,6 +1135,17 @@ struct PreparedExternalForwardRequest {
     response_body_timeout_secs: u64,
 }
 
+struct ExternalStreamUsageRecordContext {
+    config: ExternalPoolsConfig,
+    route: ExternalRouteRequest,
+    pool: ExternalPool,
+    attempts: Vec<ExternalPoolAttempt>,
+    outbound_model: Option<String>,
+    outbound_body: Bytes,
+    usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
+    usage_projection: Option<ExternalUsageProjectionContext>,
+}
+
 struct ExternalForwardError {
     err: ExternalPoolError,
     outbound_model: Option<String>,
@@ -1677,17 +1688,30 @@ fn external_pool_usage_debug_header_context(headers: &HeaderMap) -> serde_json::
     })
 }
 
-fn external_pool_usage_debug_non_stream_record(
-    config: &ExternalPoolsConfig,
-    route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-    outbound_model: Option<&str>,
+struct ExternalUsageDebugNonStreamRecordContext<'a> {
+    config: &'a ExternalPoolsConfig,
+    route: &'a ExternalRouteRequest,
+    pool: &'a ExternalPool,
+    outbound_model: Option<&'a str>,
     status: StatusCode,
-    response_headers: &HeaderMap,
-    outbound_body: &Bytes,
-    upstream_body: &Bytes,
-    projected: &ProjectedNonStreamBody,
-) {
+    response_headers: &'a HeaderMap,
+    outbound_body: &'a Bytes,
+    upstream_body: &'a Bytes,
+    projected: &'a ProjectedNonStreamBody,
+}
+
+fn external_pool_usage_debug_non_stream_record(ctx: ExternalUsageDebugNonStreamRecordContext<'_>) {
+    let ExternalUsageDebugNonStreamRecordContext {
+        config,
+        route,
+        pool,
+        outbound_model,
+        status,
+        response_headers,
+        outbound_body,
+        upstream_body,
+        projected,
+    } = ctx;
     if !external_pool_usage_debug_enabled(config) {
         return;
     }
@@ -1719,20 +1743,36 @@ fn external_pool_usage_debug_non_stream_record(
     spawn_external_pool_usage_debug_write(config, route, "non-stream", payload);
 }
 
-fn external_pool_usage_debug_stream_record(
-    config: &ExternalPoolsConfig,
-    route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-    outbound_model: Option<&str>,
+struct ExternalUsageDebugStreamRecordContext<'a> {
+    config: &'a ExternalPoolsConfig,
+    route: &'a ExternalRouteRequest,
+    pool: &'a ExternalPool,
+    outbound_model: Option<&'a str>,
     status: UsageRecordStatus,
     response_status: StatusCode,
-    response_content_type: Option<&str>,
-    outbound_body: &Bytes,
-    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
-    billing: Option<&ExternalPoolBilling>,
+    response_content_type: Option<&'a str>,
+    outbound_body: &'a Bytes,
+    capture: Option<&'a Arc<SyncMutex<ExternalUsageCapture>>>,
+    billing: Option<&'a ExternalPoolBilling>,
     estimated_output_tokens: i32,
-    terminal_message: Option<&str>,
-) {
+    terminal_message: Option<&'a str>,
+}
+
+fn external_pool_usage_debug_stream_record(ctx: ExternalUsageDebugStreamRecordContext<'_>) {
+    let ExternalUsageDebugStreamRecordContext {
+        config,
+        route,
+        pool,
+        outbound_model,
+        status,
+        response_status,
+        response_content_type,
+        outbound_body,
+        capture,
+        billing,
+        estimated_output_tokens,
+        terminal_message,
+    } = ctx;
     if !external_pool_usage_debug_enabled(config) {
         return;
     }
@@ -5468,14 +5508,16 @@ impl ExternalPoolManager {
                         return ExternalPoolForwardOutcome::Response(
                             self.wrap_external_stream_usage_record(
                                 forwarded.response,
-                                config.clone(),
-                                route.clone(),
-                                pool,
-                                attempts.clone(),
-                                forwarded.outbound_model,
-                                forwarded.outbound_body,
-                                forwarded.stream_usage_capture,
-                                forwarded.stream_usage_projection,
+                                ExternalStreamUsageRecordContext {
+                                    config: config.clone(),
+                                    route: route.clone(),
+                                    pool,
+                                    attempts: attempts.clone(),
+                                    outbound_model: forwarded.outbound_model,
+                                    outbound_body: forwarded.outbound_body,
+                                    usage_capture: forwarded.stream_usage_capture,
+                                    usage_projection: forwarded.stream_usage_projection,
+                                },
                             ),
                         );
                     }
@@ -6271,17 +6313,17 @@ impl ExternalPoolManager {
                 projection_context.as_ref(),
                 known_tool_names.iter().cloned(),
             );
-            external_pool_usage_debug_non_stream_record(
+            external_pool_usage_debug_non_stream_record(ExternalUsageDebugNonStreamRecordContext {
                 config,
                 route,
                 pool,
-                outbound_model.as_deref(),
+                outbound_model: outbound_model.as_deref(),
                 status,
-                &response_headers,
-                &outbound_body,
-                &upstream_body,
-                &projected,
-            );
+                response_headers: &response_headers,
+                outbound_body: &outbound_body,
+                upstream_body: &upstream_body,
+                projected: &projected,
+            });
             if projected.protocol_contamination {
                 return Err(ExternalForwardError::new(
                     external_protocol_contamination_error(config),
@@ -7947,15 +7989,18 @@ impl ExternalPoolManager {
     fn wrap_external_stream_usage_record(
         &self,
         response: Response,
-        config: ExternalPoolsConfig,
-        route: ExternalRouteRequest,
-        pool: ExternalPool,
-        attempts: Vec<ExternalPoolAttempt>,
-        outbound_model: Option<String>,
-        outbound_body: Bytes,
-        usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
-        usage_projection: Option<ExternalUsageProjectionContext>,
+        ctx: ExternalStreamUsageRecordContext,
     ) -> Response {
+        let ExternalStreamUsageRecordContext {
+            config,
+            route,
+            pool,
+            attempts,
+            outbound_model,
+            outbound_body,
+            usage_capture,
+            usage_projection,
+        } = ctx;
         let (parts, body) = response.into_parts();
         let response_status = parts.status;
         let response_content_type = parts
@@ -8296,20 +8341,20 @@ impl ExternalStreamUsageGuard {
             .as_ref()
             .and_then(|capture| capture.lock().stream_error_message.clone());
         if let Some(message) = stream_error_message {
-            external_pool_usage_debug_stream_record(
-                &self.config,
-                &self.route,
-                &self.pool,
-                self.outbound_model.as_deref(),
-                UsageRecordStatus::StreamError,
-                self.response_status,
-                self.response_content_type.as_deref(),
-                &self.outbound_body,
-                self.usage_capture.as_ref(),
-                None,
-                self.estimated_output_tokens,
-                Some(&message),
-            );
+            external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+                config: &self.config,
+                route: &self.route,
+                pool: &self.pool,
+                outbound_model: self.outbound_model.as_deref(),
+                status: UsageRecordStatus::StreamError,
+                response_status: self.response_status,
+                response_content_type: self.response_content_type.as_deref(),
+                outbound_body: &self.outbound_body,
+                capture: self.usage_capture.as_ref(),
+                billing: None,
+                estimated_output_tokens: self.estimated_output_tokens,
+                terminal_message: Some(&message),
+            });
             self.manager.record_external(
                 &self.route,
                 Some(&self.pool),
@@ -8353,20 +8398,20 @@ impl ExternalStreamUsageGuard {
         if let Some(projection) = self.usage_projection.as_ref() {
             projection.record_success();
         }
-        external_pool_usage_debug_stream_record(
-            &self.config,
-            &self.route,
-            &self.pool,
-            self.outbound_model.as_deref(),
-            UsageRecordStatus::Success,
-            self.response_status,
-            self.response_content_type.as_deref(),
-            &self.outbound_body,
-            self.usage_capture.as_ref(),
-            billing.as_ref(),
-            self.estimated_output_tokens,
-            None,
-        );
+        external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+            config: &self.config,
+            route: &self.route,
+            pool: &self.pool,
+            outbound_model: self.outbound_model.as_deref(),
+            status: UsageRecordStatus::Success,
+            response_status: self.response_status,
+            response_content_type: self.response_content_type.as_deref(),
+            outbound_body: &self.outbound_body,
+            capture: self.usage_capture.as_ref(),
+            billing: billing.as_ref(),
+            estimated_output_tokens: self.estimated_output_tokens,
+            terminal_message: None,
+        });
         self.manager.record_external_success(
             &self.route,
             &self.pool,
@@ -8380,20 +8425,20 @@ impl ExternalStreamUsageGuard {
         if self.completed {
             return;
         }
-        external_pool_usage_debug_stream_record(
-            &self.config,
-            &self.route,
-            &self.pool,
-            self.outbound_model.as_deref(),
-            UsageRecordStatus::StreamError,
-            self.response_status,
-            self.response_content_type.as_deref(),
-            &self.outbound_body,
-            self.usage_capture.as_ref(),
-            None,
-            self.estimated_output_tokens,
-            Some(message),
-        );
+        external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+            config: &self.config,
+            route: &self.route,
+            pool: &self.pool,
+            outbound_model: self.outbound_model.as_deref(),
+            status: UsageRecordStatus::StreamError,
+            response_status: self.response_status,
+            response_content_type: self.response_content_type.as_deref(),
+            outbound_body: &self.outbound_body,
+            capture: self.usage_capture.as_ref(),
+            billing: None,
+            estimated_output_tokens: self.estimated_output_tokens,
+            terminal_message: Some(message),
+        });
         self.manager.record_external(
             &self.route,
             Some(&self.pool),
@@ -8422,20 +8467,20 @@ impl ExternalStreamUsageGuard {
             return;
         }
         let message = "external stream body dropped before completion";
-        external_pool_usage_debug_stream_record(
-            &self.config,
-            &self.route,
-            &self.pool,
-            self.outbound_model.as_deref(),
-            UsageRecordStatus::ClientDropped,
-            self.response_status,
-            self.response_content_type.as_deref(),
-            &self.outbound_body,
-            self.usage_capture.as_ref(),
-            None,
-            self.estimated_output_tokens,
-            Some(message),
-        );
+        external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+            config: &self.config,
+            route: &self.route,
+            pool: &self.pool,
+            outbound_model: self.outbound_model.as_deref(),
+            status: UsageRecordStatus::ClientDropped,
+            response_status: self.response_status,
+            response_content_type: self.response_content_type.as_deref(),
+            outbound_body: &self.outbound_body,
+            capture: self.usage_capture.as_ref(),
+            billing: None,
+            estimated_output_tokens: self.estimated_output_tokens,
+            terminal_message: Some(message),
+        });
         self.manager.record_external(
             &self.route,
             Some(&self.pool),
