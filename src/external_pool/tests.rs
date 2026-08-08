@@ -13396,7 +13396,10 @@ fn usage_projection_cost_floor_repairs_reported_usage_before_billing() {
         usage["input_tokens"].as_i64().expect("final input"),
         i64::from(billing.reported_usage.input_tokens)
     );
-    assert!(billing.reported_usage.input_tokens > billing.shaped_usage.input_tokens);
+    assert!(
+        billing.reported_usage.input_tokens <= 96,
+        "cost floor should not bypass the /cc path input policy"
+    );
     assert_eq!(
         billing.reported_usage.total_input_tokens,
         billing
@@ -13431,6 +13434,45 @@ fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
     assert!(usage["input_tokens"].as_i64().expect("input") > 1);
     assert!(usage["output_tokens"].as_i64().expect("output") > 0);
     assert!(billing.reported_cost_usd > billing.raw_cost_usd);
+}
+
+#[test]
+fn usage_projection_cost_floor_keeps_path_shaped_usage_when_cost_already_covers_raw() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    route.reported_usage.path_overrides.insert(
+        "/cc".to_string(),
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::raw(),
+            output: ReportedUsageFieldPolicy::raw(),
+            cache_read: ReportedUsageFieldPolicy::preserve(),
+            cache_creation: ReportedUsageFieldPolicy::preserve(),
+            output_uplift_min_tokens: 0,
+            output_uplift_percent: 0,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let baseline_projection =
+        projection_context_with_output_uplift(&route, &pool, 0, false, 0, 0).expect("baseline");
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":40,"output_tokens":120,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let baseline = maybe_project_non_stream_usage(body.clone(), Some(&baseline_projection));
+    let baseline_billing =
+        external_pool_billing_from_capture(&route, &pool, baseline.usage_capture)
+            .expect("baseline billing");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+
+    assert!(baseline_billing.reported_cost_usd >= baseline_billing.raw_cost_usd);
+    assert_eq!(billing.reported_usage, baseline_billing.reported_usage);
+    assert!((billing.reported_cost_usd - baseline_billing.reported_cost_usd).abs() < 0.000000001);
+    assert_eq!(projected.body, baseline.body);
 }
 
 #[test]
@@ -13472,6 +13514,214 @@ fn usage_projection_cost_floor_keeps_no_cache_route_cache_free() {
 }
 
 #[test]
+fn usage_projection_sample_rows_stay_within_path_usage_policy_after_cost_floor() {
+    struct Sample {
+        name: &'static str,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_input_tokens: i32,
+        cache_creation_input_tokens: i32,
+        cache_read_cap: i32,
+        cache_creation_cap: i32,
+        output_cap: i32,
+        expect_output_repair: bool,
+    }
+
+    let samples = [
+        Sample {
+            name: "tiny-uncached-user-example",
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_cap: 128,
+            cache_creation_cap: 4_096,
+            output_cap: 256,
+            expect_output_repair: true,
+        },
+        Sample {
+            name: "tiny-cache-read-upstream-row",
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_input_tokens: 16,
+            cache_creation_input_tokens: 0,
+            cache_read_cap: 128,
+            cache_creation_cap: 4_096,
+            output_cap: 256,
+            expect_output_repair: false,
+        },
+        Sample {
+            name: "large-cache-upstream-row",
+            input_tokens: 44,
+            output_tokens: 665,
+            cache_read_input_tokens: 47_778,
+            cache_creation_input_tokens: 48_629,
+            cache_read_cap: 90_000,
+            cache_creation_cap: 40_000,
+            output_cap: 900,
+            expect_output_repair: false,
+        },
+        Sample {
+            name: "huge-cache-and-output-row",
+            input_tokens: 301_153,
+            output_tokens: 7_476,
+            cache_read_input_tokens: 764_772,
+            cache_creation_input_tokens: 764_107,
+            cache_read_cap: 700_000,
+            cache_creation_cap: 400_000,
+            output_cap: 4_096,
+            expect_output_repair: false,
+        },
+    ];
+
+    for sample in samples {
+        let mut route = test_route("claude-sonnet-4-5");
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                output: ReportedUsageFieldPolicy::raw(),
+                cache_read: ReportedUsageFieldPolicy::preserve(),
+                cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+                final_cache_read_max_tokens: sample.cache_read_cap,
+                final_cache_read_jitter_min_tokens: 0,
+                final_cache_read_jitter_max_tokens: 0,
+                final_cache_creation_max_tokens: sample.cache_creation_cap,
+                final_cache_creation_jitter_min_tokens: 0,
+                final_cache_creation_jitter_max_tokens: 0,
+                final_output_guard_enabled: true,
+                output_uplift_min_tokens: 0,
+                output_uplift_percent: 0,
+                final_output_max_tokens: sample.output_cap,
+                final_output_jitter_min_tokens: 0,
+                final_output_jitter_max_tokens: 0,
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context_with_cost_floor(&route, &pool, 0)
+            .unwrap_or_else(|| panic!("projection for {}", sample.name));
+
+        let nested_cache_creation = if sample.cache_creation_input_tokens > 0 {
+            format!(
+                r#","cache_creation":{{"ephemeral_5m_input_tokens":{},"ephemeral_1h_input_tokens":0}}"#,
+                sample.cache_creation_input_tokens
+            )
+        } else {
+            String::new()
+        };
+        let body = Bytes::from(format!(
+            r#"{{"type":"message","content":[{{"type":"text","text":"sample response body for usage policy regression"}}],"usage":{{"input_tokens":{},"output_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{}{}}}}}"#,
+            sample.input_tokens,
+            sample.output_tokens,
+            sample.cache_creation_input_tokens,
+            sample.cache_read_input_tokens,
+            nested_cache_creation,
+        ));
+
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+            .unwrap_or_else(|| panic!("billing for {}", sample.name));
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+
+        assert_eq!(
+            billing.raw_usage.input_tokens, sample.input_tokens,
+            "{} raw input",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.output_tokens, sample.output_tokens,
+            "{} raw output",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.cache_read_input_tokens, sample.cache_read_input_tokens,
+            "{} raw cache read",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.cache_creation_input_tokens, sample.cache_creation_input_tokens,
+            "{} raw cache creation",
+            sample.name
+        );
+
+        assert!(
+            billing.reported_usage.input_tokens <= 96,
+            "{} final input {} should respect path input sample max",
+            sample.name,
+            billing.reported_usage.input_tokens
+        );
+        assert!(
+            billing.reported_usage.cache_read_input_tokens <= sample.cache_read_cap,
+            "{} final cache read {} should respect path final cache read cap {}",
+            sample.name,
+            billing.reported_usage.cache_read_input_tokens,
+            sample.cache_read_cap
+        );
+        assert!(
+            billing.reported_usage.cache_creation_input_tokens <= sample.cache_creation_cap,
+            "{} final cache creation {} should respect path final cache creation cap {}",
+            sample.name,
+            billing.reported_usage.cache_creation_input_tokens,
+            sample.cache_creation_cap
+        );
+        assert!(
+            billing.reported_usage.output_tokens <= sample.output_cap,
+            "{} final output {} should respect path final output cap {}",
+            sample.name,
+            billing.reported_usage.output_tokens,
+            sample.output_cap
+        );
+        if sample.expect_output_repair {
+            assert!(
+                billing.reported_usage.output_tokens > sample.output_tokens,
+                "{} should use response body output estimate",
+                sample.name
+            );
+        }
+        assert_eq!(
+            billing.reported_usage.total_input_tokens,
+            billing
+                .reported_usage
+                .input_tokens
+                .saturating_add(billing.reported_usage.cache_read_input_tokens)
+                .saturating_add(billing.reported_usage.cache_creation_input_tokens),
+            "{} total input should match final standard fields",
+            sample.name
+        );
+        assert_eq!(
+            usage["input_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.input_tokens)),
+            "{} returned input",
+            sample.name
+        );
+        assert_eq!(
+            usage["output_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.output_tokens)),
+            "{} returned output",
+            sample.name
+        );
+        assert_eq!(
+            usage["cache_read_input_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.cache_read_input_tokens)),
+            "{} returned cache read",
+            sample.name
+        );
+        assert_eq!(
+            usage["cache_creation_input_tokens"].as_i64(),
+            Some(i64::from(
+                billing.reported_usage.cache_creation_input_tokens
+            )),
+            "{} returned cache creation",
+            sample.name
+        );
+    }
+}
+
+#[test]
 fn sse_usage_projection_cost_floor_repairs_final_stream_usage() {
     let event = br#"event: message_delta
 data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
@@ -13494,7 +13744,18 @@ data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":1,"cache
         event_usage_i64(text, "input_tokens"),
         i64::from(billing.reported_usage.input_tokens)
     );
-    assert!(billing.reported_usage.input_tokens > billing.shaped_usage.input_tokens);
+    assert!(
+        billing.reported_usage.input_tokens <= 96,
+        "final stream input should still respect the /cc path input policy"
+    );
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(billing.reported_usage.cache_read_input_tokens)
+            .saturating_add(billing.reported_usage.cache_creation_input_tokens)
+    );
 }
 
 #[test]

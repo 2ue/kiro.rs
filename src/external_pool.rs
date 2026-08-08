@@ -11377,8 +11377,20 @@ fn effective_external_raw_usage_for_cost_floor(
     }
 }
 
+fn apply_external_pool_usage_final_path_guards(
+    usage: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+) -> CacheUsage {
+    let Some(policy) = projection.reported_policy.clone() else {
+        return usage;
+    };
+    let usage = policy.apply_final_input_guard(usage);
+    let usage = policy.apply_final_standard_cache_guards(usage);
+    policy.apply_final_output_guard_to_usage(usage)
+}
+
 fn apply_external_pool_usage_cost_floor(
-    mut reported: CacheUsage,
+    reported: CacheUsage,
     raw: CacheUsage,
     projection: &ExternalUsageProjectionContext,
 ) -> CacheUsage {
@@ -11400,47 +11412,82 @@ fn apply_external_pool_usage_cost_floor(
         return reported;
     }
 
-    let input_unit_cost = external_usage_input_unit_cost(reported, projection);
-    if input_unit_cost <= 0.0 || !input_unit_cost.is_finite() {
+    let unit_cost = external_usage_effective_input_repair_unit_cost(reported, projection)
+        .or_else(|| external_usage_input_unit_cost(reported, projection));
+    let Some(unit_cost) = unit_cost.filter(|cost| *cost > 0.0 && cost.is_finite()) else {
         return reported;
-    }
+    };
 
+    // Repair once, then re-apply path guards. Repeatedly chasing the target
+    // through hard caps would flatten many requests at the configured limits.
     let missing_cost = target_cost - current_cost;
-    let repair_tokens = (missing_cost / input_unit_cost)
+    let repair_tokens = (missing_cost / unit_cost)
         .ceil()
         .clamp(1.0, i32::MAX as f64) as i32;
-    reported.input_tokens = reported.input_tokens.max(0).saturating_add(repair_tokens);
-    reported.total_input_tokens = reported
+    let candidate = apply_external_pool_usage_final_path_guards(
+        add_input_repair_tokens(reported, repair_tokens),
+        projection,
+    );
+    let candidate_estimate = projection
+        .pricing_catalog
+        .estimate(&projection.model, candidate);
+    if !candidate_estimate.available {
+        return reported;
+    }
+    if candidate_estimate.cost_usd.max(0.0) <= current_cost + f64::EPSILON {
+        return reported;
+    }
+    candidate
+}
+
+fn add_input_repair_tokens(mut usage: CacheUsage, tokens: i32) -> CacheUsage {
+    usage.input_tokens = usage.input_tokens.max(0).saturating_add(tokens.max(0));
+    usage.total_input_tokens = usage
         .input_tokens
         .max(0)
-        .saturating_add(reported.cache_read_input_tokens.max(0))
-        .saturating_add(reported.cache_creation_input_tokens.max(0));
-    reported
+        .saturating_add(usage.cache_read_input_tokens.max(0))
+        .saturating_add(usage.cache_creation_input_tokens.max(0));
+    usage
+}
+
+fn external_usage_effective_input_repair_unit_cost(
+    usage: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+) -> Option<f64> {
+    let base = projection
+        .pricing_catalog
+        .estimate(&projection.model, usage);
+    if !base.available {
+        return None;
+    }
+
+    let next =
+        apply_external_pool_usage_final_path_guards(add_input_repair_tokens(usage, 1), projection);
+    let estimate = projection.pricing_catalog.estimate(&projection.model, next);
+    if !estimate.available {
+        return None;
+    }
+    let delta = estimate.cost_usd - base.cost_usd;
+    (delta > 0.0 && delta.is_finite()).then_some(delta)
 }
 
 fn external_usage_input_unit_cost(
     usage: CacheUsage,
     projection: &ExternalUsageProjectionContext,
-) -> f64 {
+) -> Option<f64> {
     let base = projection
         .pricing_catalog
         .estimate(&projection.model, usage);
     if !base.available {
-        return 0.0;
+        return None;
     }
 
-    let mut next = usage;
-    next.input_tokens = next.input_tokens.max(0).saturating_add(1);
-    next.total_input_tokens = next
-        .input_tokens
-        .max(0)
-        .saturating_add(next.cache_read_input_tokens.max(0))
-        .saturating_add(next.cache_creation_input_tokens.max(0));
+    let next = add_input_repair_tokens(usage, 1);
     let estimate = projection.pricing_catalog.estimate(&projection.model, next);
     if !estimate.available {
-        return 0.0;
+        return None;
     }
-    (estimate.cost_usd - base.cost_usd).max(0.0)
+    Some((estimate.cost_usd - base.cost_usd).max(0.0))
 }
 
 fn apply_projected_cache_creation_breakdown(
