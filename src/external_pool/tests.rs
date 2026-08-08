@@ -11559,13 +11559,22 @@ fn projection_context(
     pool: &ExternalPool,
     uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
-    projection_context_with_output_uplift(route, pool, uplift_percent, 0, 0)
+    projection_context_with_output_uplift(route, pool, uplift_percent, false, 0, 0)
+}
+
+fn projection_context_with_cost_floor(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    uplift_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    projection_context_with_output_uplift(route, pool, uplift_percent, true, 0, 0)
 }
 
 fn projection_context_with_output_uplift(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     uplift_percent: u32,
+    cost_floor_enabled: bool,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
@@ -11573,6 +11582,7 @@ fn projection_context_with_output_uplift(
         route,
         pool,
         uplift_percent,
+        cost_floor_enabled,
         output_uplift_min_tokens,
         output_uplift_percent,
     )
@@ -12304,7 +12314,7 @@ fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
     let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1, 100).expect("projection");
+        projection_context_with_output_uplift(&route, &pool, 0, false, 1, 100).expect("projection");
     let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
 
     assert_ne!(projected.body, body);
@@ -12979,8 +12989,8 @@ fn usage_projection_output_uplift_only_applies_above_threshold() {
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 1_000, 50)
+        .expect("projection");
     let projected = maybe_project_non_stream_usage(body, Some(&projection));
     let shaped = projected.usage_capture.shaped.expect("shaped usage");
     let reported = projected.usage_capture.reported.expect("reported usage");
@@ -13000,8 +13010,8 @@ fn usage_projection_output_uplift_changes_only_final_reported_usage() {
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 1_000, 50)
+        .expect("projection");
     let projected = maybe_project_non_stream_usage(body, Some(&projection));
     let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
     let usage = value.get("usage").expect("usage object");
@@ -13359,6 +13369,170 @@ fn external_pool_billing_tracks_raw_shaped_uplifted_costs() {
 }
 
 #[test]
+fn usage_projection_cost_floor_repairs_reported_usage_before_billing() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(billing.shaped_cost_usd < billing.raw_cost_usd);
+    assert!(
+        billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd,
+        "reported cost {} should cover raw cost {}",
+        billing.reported_cost_usd,
+        billing.raw_cost_usd
+    );
+    assert_eq!(
+        usage["input_tokens"].as_i64().expect("final input"),
+        i64::from(billing.reported_usage.input_tokens)
+    );
+    assert!(billing.reported_usage.input_tokens > billing.shaped_usage.input_tokens);
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(billing.reported_usage.cache_read_input_tokens)
+            .saturating_add(billing.reported_usage.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","content":[{"type":"text","text":"hello world from response"}],"usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let route = test_route("claude-sonnet-4-5");
+    assert!(route.request_input_tokens >= 512);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert!(billing.reported_usage.input_tokens > 1);
+    assert!(billing.reported_usage.output_tokens > 0);
+    assert!(usage["input_tokens"].as_i64().expect("input") > 1);
+    assert!(usage["output_tokens"].as_i64().expect("output") > 0);
+    assert!(billing.reported_cost_usd > billing.raw_cost_usd);
+}
+
+#[test]
+fn usage_projection_cost_floor_keeps_no_cache_route_cache_free() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    route.reported_usage.path_overrides.insert(
+        "/cc".to_string(),
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(64),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000,"cache_creation":{"ephemeral_5m_input_tokens":50000,"ephemeral_1h_input_tokens":0}}}"#,
+        );
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd);
+    assert_eq!(usage["cache_creation_input_tokens"].as_i64(), Some(0));
+    assert_eq!(usage["cache_read_input_tokens"].as_i64(), Some(0));
+    assert!(usage.get("cache_creation").is_none());
+    assert_eq!(billing.reported_usage.cache_creation_input_tokens, 0);
+    assert_eq!(billing.reported_usage.cache_read_input_tokens, 0);
+    assert!(
+        billing.reported_usage.input_tokens
+            > count_external_route_input_tokens(payload_ref(&route))
+    );
+}
+
+#[test]
+fn sse_usage_projection_cost_floor_repairs_final_stream_usage() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        external_pool_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert!(billing.pricing_available);
+    assert!(billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd);
+    assert_eq!(
+        event_usage_i64(text, "input_tokens"),
+        i64::from(billing.reported_usage.input_tokens)
+    );
+    assert!(billing.reported_usage.input_tokens > billing.shaped_usage.input_tokens);
+}
+
+#[test]
+fn sse_usage_projection_cost_floor_repairs_zero_output_after_stream_text() {
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world from stream"}}
+
+"#;
+    let usage_event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let route = test_route("claude-sonnet-4-5");
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+    let plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+
+    let text_out =
+        process_sse_event_with_plan(text_event, Some(&projection), Some(&capture), None, plan);
+    assert_eq!(text_out, text_event);
+
+    let projected =
+        process_sse_event_with_plan(usage_event, Some(&projection), Some(&capture), None, plan);
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        external_pool_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert!(billing.reported_usage.input_tokens > 1);
+    assert!(billing.reported_usage.output_tokens > 0);
+    assert!(event_usage_i64(text, "output_tokens") > 0);
+}
+
+#[test]
 fn external_pool_billing_uses_output_uplift_as_final_reported_cost() {
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":1200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
@@ -13368,8 +13542,8 @@ fn external_pool_billing_uses_output_uplift_as_final_reported_cost() {
     disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 1_000, 50)
+        .expect("projection");
 
     let projected = maybe_project_non_stream_usage(body, Some(&projection));
     let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
@@ -13733,8 +13907,9 @@ data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role"
         "cache_creation_input_tokens": 50000,
         "cache_read_input_tokens": 0
     });
-    let final_projected = project_usage_value(&mut final_usage, Some(&second_projection), true)
-        .expect("final projected usage");
+    let final_projected =
+        project_usage_value(&mut final_usage, Some(&second_projection), true, None)
+            .expect("final projected usage");
     assert_eq!(final_projected.reported.cache_read_input_tokens, 0);
 }
 
@@ -13947,8 +14122,8 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":120
     disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 1_000, 50)
+        .expect("projection");
     let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
     let text = std::str::from_utf8(&projected).expect("projected sse");
     assert!(text.contains(r#""output_tokens":1800"#));

@@ -23,7 +23,9 @@ pub(super) struct ExternalUsageProjectionContext {
     pub(super) prompt_cache_bounds: PromptCacheBounds,
     pub(super) prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pub(super) prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    pub(super) pricing_catalog: Arc<PricingCatalog>,
     pub(super) uplift_percent: u32,
+    pub(super) cost_floor_enabled: bool,
     pub(super) output_uplift_min_tokens: i32,
     pub(super) output_uplift_percent: u32,
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
@@ -32,6 +34,7 @@ pub(super) struct ExternalUsageProjectionContext {
 #[derive(Clone)]
 pub(super) struct ExternalUsageProjectionTemplate {
     uplift_percent: u32,
+    cost_floor_enabled: bool,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
     raw_input_tokens: i32,
@@ -47,16 +50,19 @@ pub(super) struct ExternalUsageProjectionTemplate {
     prompt_cache_bounds: PromptCacheBounds,
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    pricing_catalog: Arc<PricingCatalog>,
 }
 
 impl ExternalUsageProjectionTemplate {
     fn matches_config(
         &self,
         uplift_percent: u32,
+        cost_floor_enabled: bool,
         output_uplift_min_tokens: i32,
         output_uplift_percent: u32,
     ) -> bool {
         self.uplift_percent == uplift_percent
+            && self.cost_floor_enabled == cost_floor_enabled
             && self.output_uplift_min_tokens == output_uplift_min_tokens.max(0)
             && self.output_uplift_percent == output_uplift_percent.min(200)
     }
@@ -78,7 +84,9 @@ impl ExternalUsageProjectionTemplate {
             prompt_cache_bounds: self.prompt_cache_bounds,
             prompt_cache_creation_controller: self.prompt_cache_creation_controller.clone(),
             prompt_cache_creation_control: self.prompt_cache_creation_control,
+            pricing_catalog: self.pricing_catalog.clone(),
             uplift_percent: self.uplift_percent,
+            cost_floor_enabled: self.cost_floor_enabled,
             output_uplift_min_tokens: self.output_uplift_min_tokens,
             output_uplift_percent: self.output_uplift_percent,
             state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
@@ -90,6 +98,7 @@ pub(super) fn build_context(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     uplift_percent: u32,
+    cost_floor_enabled: bool,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
@@ -104,6 +113,7 @@ pub(super) fn build_context(
             build_template(
                 route,
                 uplift_percent,
+                cost_floor_enabled,
                 output_uplift_min_tokens,
                 output_uplift_percent,
             )
@@ -113,6 +123,7 @@ pub(super) fn build_context(
         Some(template)
             if template.matches_config(
                 uplift_percent,
+                cost_floor_enabled,
                 output_uplift_min_tokens,
                 output_uplift_percent,
             ) =>
@@ -122,6 +133,7 @@ pub(super) fn build_context(
         Some(_) => Arc::new(build_template(
             route,
             uplift_percent,
+            cost_floor_enabled,
             output_uplift_min_tokens,
             output_uplift_percent,
         )?),
@@ -133,6 +145,7 @@ pub(super) fn build_context(
 fn build_template(
     route: &ExternalRouteRequest,
     uplift_percent: u32,
+    cost_floor_enabled: bool,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionTemplate> {
@@ -264,6 +277,7 @@ fn build_template(
     };
     Some(ExternalUsageProjectionTemplate {
         uplift_percent,
+        cost_floor_enabled,
         output_uplift_min_tokens: output_uplift_min_tokens.max(0),
         output_uplift_percent: output_uplift_percent.min(200),
         raw_input_tokens,
@@ -279,6 +293,7 @@ fn build_template(
         prompt_cache_bounds: route.prompt_cache_bounds,
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
         prompt_cache_creation_control: route.prompt_cache_creation_control,
+        pricing_catalog: route.pricing_catalog.clone(),
     })
 }
 

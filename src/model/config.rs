@@ -2938,6 +2938,8 @@ pub struct ExternalPoolsConfig {
     pub external_pool_auto_disable_on_channel_disabled: bool,
     #[serde(default = "default_external_pool_usage_projection_uplift_percent")]
     pub external_pool_usage_projection_uplift_percent: u32,
+    #[serde(default = "default_true")]
+    pub external_pool_usage_projection_cost_floor_enabled: bool,
     #[serde(default)]
     pub external_pool_usage_projection_output_uplift_min_tokens: i32,
     #[serde(default)]
@@ -3023,6 +3025,7 @@ impl Default for ExternalPoolsConfig {
             external_pool_auto_disable_on_channel_disabled: true,
             external_pool_usage_projection_uplift_percent:
                 default_external_pool_usage_projection_uplift_percent(),
+            external_pool_usage_projection_cost_floor_enabled: true,
             external_pool_usage_projection_output_uplift_min_tokens: 0,
             external_pool_usage_projection_output_uplift_percent: 0,
             external_pool_stream_response_mode: ExternalPoolStreamResponseMode::default(),

@@ -1408,6 +1408,7 @@ export interface ExternalPoolsConfig {
   externalPoolStreamPreOutputRetryEnabled: boolean
   externalPoolAutoDisableOnChannelDisabled: boolean
   externalPoolUsageProjectionUpliftPercent: number
+  externalPoolUsageProjectionCostFloorEnabled: boolean
   externalPoolUsageProjectionOutputUpliftMinTokens: number
   externalPoolUsageProjectionOutputUpliftPercent: number
   externalPoolStreamResponseMode: ExternalPoolStreamResponseMode

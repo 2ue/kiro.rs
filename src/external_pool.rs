@@ -1389,6 +1389,7 @@ impl ExternalPoolFinalError {
 #[derive(Debug, Clone, Default)]
 struct ExternalUsageCapture {
     request_input_tokens: Option<i32>,
+    estimated_output_tokens: i32,
     raw: Option<CacheUsage>,
     shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
@@ -5473,6 +5474,7 @@ impl ExternalPoolManager {
                 route,
                 pool,
                 config.external_pool_usage_projection_uplift_percent,
+                config.external_pool_usage_projection_cost_floor_enabled,
                 config.external_pool_usage_projection_output_uplift_min_tokens,
                 config.external_pool_usage_projection_output_uplift_percent,
             );
@@ -5810,6 +5812,7 @@ impl ExternalPoolManager {
                 route,
                 pool,
                 config.external_pool_usage_projection_uplift_percent,
+                config.external_pool_usage_projection_cost_floor_enabled,
                 config.external_pool_usage_projection_output_uplift_min_tokens,
                 config.external_pool_usage_projection_output_uplift_percent,
             );
@@ -9754,6 +9757,7 @@ fn process_non_stream_response_usage(
 
     if let Some((candidate_path, pointer)) = select_non_stream_usage_candidate(&value) {
         usage_capture.usage_candidate_path = Some(candidate_path.to_string());
+        let response_output_estimate = estimate_non_stream_output_tokens(&value);
         let mut changed = false;
         {
             let Some(usage) = value.pointer_mut(pointer) else {
@@ -9768,7 +9772,9 @@ fn process_non_stream_response_usage(
             usage_capture.reported = normalized.usage;
             changed |= normalized.changed;
 
-            if let Some(projected) = project_usage_value(usage, projection, true) {
+            if let Some(projected) =
+                project_usage_value(usage, projection, true, response_output_estimate)
+            {
                 usage_capture.request_input_tokens = Some(projected.request_input_tokens);
                 usage_capture.shaped = Some(projected.shaped);
                 usage_capture.reported = cache_usage_from_value(usage)
@@ -10172,7 +10178,9 @@ fn estimated_external_usage_from_parts(
         cache_creation_1h_input_tokens: 0,
     };
     let mut usage_value = raw.to_anthropic_usage_json();
-    if let Some(projected) = project_usage_value(&mut usage_value, projection, commit_cache_state) {
+    if let Some(projected) =
+        project_usage_value(&mut usage_value, projection, commit_cache_state, None)
+    {
         return EstimatedExternalUsage {
             request_input_tokens: projected.request_input_tokens,
             raw,
@@ -10309,7 +10317,13 @@ fn process_single_usage_value(
     // the bytes forwarded to the downstream client.
     let normalized = normalize_external_usage_value(usage);
     let raw_usage = normalized.usage;
-    let Some(projected_usage) = project_usage_value(usage, projection, commit_cache_state) else {
+    let response_output_estimate = external_usage_capture_output_estimate(capture);
+    let Some(projected_usage) = project_usage_value(
+        usage,
+        projection,
+        commit_cache_state,
+        response_output_estimate,
+    ) else {
         update_external_usage_capture(capture, raw_usage, raw_usage, raw_usage, false);
         return normalized.changed && rewrite;
     };
@@ -10903,11 +10917,16 @@ fn process_sse_event_with_plan_and_transcript(
         }
         event.to_vec()
     };
-    if let Some(state) = transcript_state {
+    let output = if let Some(state) = transcript_state {
         process_external_transcript_state(state, &processed, capture)
     } else {
         processed
-    }
+    };
+    update_external_usage_capture_output_estimate(
+        capture,
+        estimate_external_stream_output_tokens(&Bytes::from(output.clone())),
+    );
+    output
 }
 
 fn process_external_transcript_state(
@@ -11123,6 +11142,29 @@ fn update_external_usage_capture_request_input(
     capture.request_input_tokens = Some(request_input_tokens.max(0));
 }
 
+fn update_external_usage_capture_output_estimate(
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    output_tokens: i32,
+) {
+    if output_tokens <= 0 {
+        return;
+    }
+    let Some(capture) = capture else {
+        return;
+    };
+    let mut capture = capture.lock();
+    capture.estimated_output_tokens = capture
+        .estimated_output_tokens
+        .saturating_add(output_tokens.max(0));
+}
+
+fn external_usage_capture_output_estimate(
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+) -> Option<i32> {
+    let output_tokens = capture?.lock().estimated_output_tokens.max(0);
+    (output_tokens > 0).then_some(output_tokens)
+}
+
 fn merge_external_usage(existing: Option<CacheUsage>, incoming: CacheUsage) -> CacheUsage {
     let Some(existing) = existing else {
         return incoming;
@@ -11184,12 +11226,17 @@ fn project_usage_value(
     usage: &mut serde_json::Value,
     projection: Option<&ExternalUsageProjectionContext>,
     commit_cache_state: bool,
+    response_output_estimate: Option<i32>,
 ) -> Option<ProjectedExternalUsage> {
     let projection = projection?;
     if projection.mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
-    let output_tokens = usage_i32(usage, "output_tokens");
+    let upstream_raw_usage = cache_usage_from_any_value(usage);
+    let response_output_estimate = response_output_estimate.unwrap_or(0).max(0);
+    let output_tokens = upstream_raw_usage
+        .map(|usage| usage.output_tokens.max(response_output_estimate))
+        .unwrap_or_else(|| usage_i32(usage, "output_tokens").max(response_output_estimate));
     let upstream_cache_read_evidence =
         projection.observe_cache_read_evidence(usage_i32(usage, "cache_read_input_tokens") > 0);
     let computed = projection
@@ -11258,6 +11305,21 @@ fn project_usage_value(
         .clone()
         .map(|policy| policy.apply_final_output_guard_to_usage(projected))
         .unwrap_or(projected);
+    let parsed_or_estimated_raw = upstream_raw_usage.unwrap_or(CacheUsage {
+        total_input_tokens: projection.raw_input_tokens,
+        input_tokens: projection.raw_input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    });
+    let raw_for_floor = effective_external_raw_usage_for_cost_floor(
+        parsed_or_estimated_raw,
+        projection.raw_input_tokens,
+        response_output_estimate,
+    );
+    let projected = apply_external_pool_usage_cost_floor(projected, raw_for_floor, projection);
     let projected_json = projected.to_anthropic_usage_json();
     let obj = usage.as_object_mut()?;
     let projected_obj = projected_json.as_object()?;
@@ -11272,6 +11334,113 @@ fn project_usage_value(
         shaped,
         reported: projected,
     })
+}
+
+fn effective_external_raw_usage_for_cost_floor(
+    raw: CacheUsage,
+    request_input_tokens: i32,
+    response_output_estimate: i32,
+) -> CacheUsage {
+    let request_input_tokens = request_input_tokens.max(0);
+    let response_output_estimate = response_output_estimate.max(0);
+    let raw_total = raw
+        .input_tokens
+        .max(0)
+        .saturating_add(raw.cache_read_input_tokens.max(0))
+        .saturating_add(raw.cache_creation_input_tokens.max(0));
+    let raw_has_cache = raw.cache_read_input_tokens > 0 || raw.cache_creation_input_tokens > 0;
+    let suspicious_small_input = !raw_has_cache
+        && request_input_tokens >= 512
+        && (raw_total <= 1 || i64::from(raw_total) * 20 < i64::from(request_input_tokens));
+
+    if !suspicious_small_input && raw.output_tokens >= response_output_estimate {
+        return raw;
+    }
+
+    let input_tokens = if suspicious_small_input {
+        request_input_tokens.max(raw.input_tokens.max(0))
+    } else {
+        raw.input_tokens.max(0)
+    };
+    let output_tokens = raw.output_tokens.max(response_output_estimate);
+
+    CacheUsage {
+        total_input_tokens: input_tokens
+            .saturating_add(raw.cache_read_input_tokens.max(0))
+            .saturating_add(raw.cache_creation_input_tokens.max(0)),
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: raw.cache_creation_input_tokens.max(0),
+        cache_read_input_tokens: raw.cache_read_input_tokens.max(0),
+        cache_creation_5m_input_tokens: raw.cache_creation_5m_input_tokens.max(0),
+        cache_creation_1h_input_tokens: raw.cache_creation_1h_input_tokens.max(0),
+    }
+}
+
+fn apply_external_pool_usage_cost_floor(
+    mut reported: CacheUsage,
+    raw: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+) -> CacheUsage {
+    if !projection.cost_floor_enabled {
+        return reported;
+    }
+
+    let raw_estimate = projection.pricing_catalog.estimate(&projection.model, raw);
+    let reported_estimate = projection
+        .pricing_catalog
+        .estimate(&projection.model, reported);
+    if !raw_estimate.available || !reported_estimate.available {
+        return reported;
+    }
+
+    let target_cost = raw_estimate.cost_usd.max(0.0);
+    let current_cost = reported_estimate.cost_usd.max(0.0);
+    if current_cost + f64::EPSILON >= target_cost {
+        return reported;
+    }
+
+    let input_unit_cost = external_usage_input_unit_cost(reported, projection);
+    if input_unit_cost <= 0.0 || !input_unit_cost.is_finite() {
+        return reported;
+    }
+
+    let missing_cost = target_cost - current_cost;
+    let repair_tokens = (missing_cost / input_unit_cost)
+        .ceil()
+        .clamp(1.0, i32::MAX as f64) as i32;
+    reported.input_tokens = reported.input_tokens.max(0).saturating_add(repair_tokens);
+    reported.total_input_tokens = reported
+        .input_tokens
+        .max(0)
+        .saturating_add(reported.cache_read_input_tokens.max(0))
+        .saturating_add(reported.cache_creation_input_tokens.max(0));
+    reported
+}
+
+fn external_usage_input_unit_cost(
+    usage: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+) -> f64 {
+    let base = projection
+        .pricing_catalog
+        .estimate(&projection.model, usage);
+    if !base.available {
+        return 0.0;
+    }
+
+    let mut next = usage;
+    next.input_tokens = next.input_tokens.max(0).saturating_add(1);
+    next.total_input_tokens = next
+        .input_tokens
+        .max(0)
+        .saturating_add(next.cache_read_input_tokens.max(0))
+        .saturating_add(next.cache_creation_input_tokens.max(0));
+    let estimate = projection.pricing_catalog.estimate(&projection.model, next);
+    if !estimate.available {
+        return 0.0;
+    }
+    (estimate.cost_usd - base.cost_usd).max(0.0)
 }
 
 fn apply_projected_cache_creation_breakdown(
@@ -11577,6 +11746,7 @@ fn build_external_usage_projection_context(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     uplift_percent: u32,
+    cost_floor_enabled: bool,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
@@ -11584,6 +11754,7 @@ fn build_external_usage_projection_context(
         route,
         pool,
         uplift_percent,
+        cost_floor_enabled,
         output_uplift_min_tokens,
         output_uplift_percent,
     )

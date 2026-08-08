@@ -180,6 +180,7 @@ export function ExternalPoolsPage() {
           externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
           externalPoolStreamPreOutputRetryEnabled: Boolean(configDraft.externalPoolStreamPreOutputRetryEnabled),
           externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
+          externalPoolUsageProjectionCostFloorEnabled: Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled),
           externalPoolUsageProjectionOutputUpliftMinTokens: whole(configDraft.externalPoolUsageProjectionOutputUpliftMinTokens),
           externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
         },
@@ -278,7 +279,9 @@ export function ExternalPoolsPage() {
   const outputUpliftActive = externalEnabled
     && configDraft.externalPoolUsageProjectionOutputUpliftMinTokens > 0
     && configDraft.externalPoolUsageProjectionOutputUpliftPercent > 0
-  const usageCompensationActive = cacheUpliftActive || outputUpliftActive
+  const usageCompensationActive = cacheUpliftActive
+    || outputUpliftActive
+    || configDraft.externalPoolUsageProjectionCostFloorEnabled
 
   const poolStatuses = status.data?.pools ?? []
   const totalPools = pools.data?.pools.length ?? poolStatuses.length
@@ -471,6 +474,9 @@ export function ExternalPoolsPage() {
             description={'仅对下游 usage 口径为“按当前入口路径整理 usage”的外部账号生效；选择“透传上游 usage”的账号不受影响。'}
           >
             <div className="space-y-4">
+              <FormSection title="成本底线" description="用最终返回给调用方的 usage 兜住原始上游成本；只补 input，不凭空补缓存。">
+                <ToggleRow disabled={!externalEnabled} label="启用成本底线" checked={Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled)} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageProjectionCostFloorEnabled: v }))} />
+              </FormSection>
               <div className="grid gap-4 lg:grid-cols-2">
                 <FormSection title="缓存读写补偿">
                   <div className="grid gap-3 sm:grid-cols-2">
