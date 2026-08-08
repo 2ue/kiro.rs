@@ -11588,6 +11588,18 @@ fn projection_context_with_output_uplift(
     )
 }
 
+fn configure_usage_projection_test_path(
+    route: &mut ExternalRouteRequest,
+    policy: ReportedUsagePathPolicy,
+) {
+    route.endpoint = "/usage-policy/v1/messages".to_string();
+    route
+        .reported_usage
+        .path_overrides
+        .insert("/usage-policy".to_string(), policy);
+    route.reset_preparation_cache();
+}
+
 fn disable_path_output_postprocess(route: &mut ExternalRouteRequest) {
     route.reported_usage.default.final_output_guard_enabled = false;
     for policy in route.reported_usage.path_overrides.values_mut() {
@@ -13373,7 +13385,16 @@ fn usage_projection_cost_floor_repairs_reported_usage_before_billing() {
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
-    let route = test_route("claude-sonnet-4-5");
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
@@ -13397,8 +13418,8 @@ fn usage_projection_cost_floor_repairs_reported_usage_before_billing() {
         i64::from(billing.reported_usage.input_tokens)
     );
     assert!(
-        billing.reported_usage.input_tokens <= 96,
-        "cost floor should not bypass the /cc path input policy"
+        billing.reported_usage.input_tokens <= input_cap,
+        "cost floor should not bypass the configured path input policy"
     );
     assert_eq!(
         billing.reported_usage.total_input_tokens,
@@ -13440,8 +13461,8 @@ fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
 fn usage_projection_cost_floor_keeps_path_shaped_usage_when_cost_already_covers_raw() {
     let mut route = test_route("claude-sonnet-4-5");
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
+    configure_usage_projection_test_path(
+        &mut route,
         ReportedUsagePathPolicy {
             input: ReportedUsageFieldPolicy::raw(),
             output: ReportedUsageFieldPolicy::raw(),
@@ -13480,8 +13501,8 @@ fn usage_projection_cost_floor_keeps_no_cache_route_cache_free() {
     let mut route = test_route("claude-sonnet-4-5");
     route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
-    route.reported_usage.path_overrides.insert(
-        "/cc".to_string(),
+    configure_usage_projection_test_path(
+        &mut route,
         ReportedUsagePathPolicy {
             input: ReportedUsageFieldPolicy::sample_input_max(64),
             ..ReportedUsagePathPolicy::default()
@@ -13576,10 +13597,11 @@ fn usage_projection_sample_rows_stay_within_path_usage_policy_after_cost_floor()
 
     for sample in samples {
         let mut route = test_route("claude-sonnet-4-5");
-        route.reported_usage.path_overrides.insert(
-            "/cc".to_string(),
+        let input_cap = 96;
+        configure_usage_projection_test_path(
+            &mut route,
             ReportedUsagePathPolicy {
-                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
                 output: ReportedUsageFieldPolicy::raw(),
                 cache_read: ReportedUsageFieldPolicy::preserve(),
                 cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
@@ -13649,7 +13671,7 @@ fn usage_projection_sample_rows_stay_within_path_usage_policy_after_cost_floor()
         );
 
         assert!(
-            billing.reported_usage.input_tokens <= 96,
+            billing.reported_usage.input_tokens <= input_cap,
             "{} final input {} should respect path input sample max",
             sample.name,
             billing.reported_usage.input_tokens
@@ -13728,7 +13750,16 @@ data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":1,"cache
 
 "#;
     let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
-    let route = test_route("claude-sonnet-4-5");
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
@@ -13745,8 +13776,8 @@ data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":1,"cache
         i64::from(billing.reported_usage.input_tokens)
     );
     assert!(
-        billing.reported_usage.input_tokens <= 96,
-        "final stream input should still respect the /cc path input policy"
+        billing.reported_usage.input_tokens <= input_cap,
+        "final stream input should still respect the configured path input policy"
     );
     assert_eq!(
         billing.reported_usage.total_input_tokens,
@@ -13769,7 +13800,16 @@ data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":0,"cache
 
 "#;
     let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
-    let route = test_route("claude-sonnet-4-5");
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
     let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
@@ -13788,8 +13828,16 @@ data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":0,"cache
 
     assert_eq!(billing.raw_usage.input_tokens, 1);
     assert_eq!(billing.raw_usage.output_tokens, 0);
-    assert!(billing.reported_usage.input_tokens > 1);
+    assert!(
+        billing.reported_usage.total_input_tokens > billing.raw_usage.total_input_tokens,
+        "tiny stream usage should still be repaired even when input sampling keeps input small"
+    );
+    assert!(
+        billing.reported_usage.input_tokens <= input_cap,
+        "tiny stream repair should still respect the configured path input policy"
+    );
     assert!(billing.reported_usage.output_tokens > 0);
+    assert!(billing.reported_cost_usd > billing.raw_cost_usd);
     assert!(event_usage_i64(text, "output_tokens") > 0);
 }
 
