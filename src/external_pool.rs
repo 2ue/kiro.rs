@@ -9483,6 +9483,7 @@ fn should_forward_header(name: &HeaderName) -> bool {
             | "upgrade"
             | "authorization"
             | "x-api-key"
+            | "accept-encoding"
     )
 }
 

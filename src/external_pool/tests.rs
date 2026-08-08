@@ -243,6 +243,7 @@ enum TestRawHttpBody {
     Chunked(Vec<u8>),
     StallAfterPrefix,
     Fixed(Vec<u8>),
+    GzipJson(Vec<u8>),
 }
 
 async fn spawn_test_raw_http_response(
@@ -296,6 +297,17 @@ async fn spawn_test_raw_http_response(
             TestRawHttpBody::Fixed(bytes) => {
                 let headers = format!(
                     "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&bytes).await;
+                }
+            }
+            TestRawHttpBody::GzipJson(bytes) => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     status.as_u16(),
                     reason,
                     bytes.len()
@@ -1726,6 +1738,7 @@ fn stream_response_headers_disable_proxy_buffering() {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),
     );
+    upstream_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
 
     let mut builder = Response::builder().status(StatusCode::OK);
     apply_forwarded_response_headers(&mut builder, &upstream_headers, "req_01abc");
@@ -8934,6 +8947,45 @@ async fn external_pool_error_and_non_stream_bodies_are_bounded_and_recover_for_f
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_client_decodes_gzip_non_stream_usage_before_projection() {
+    let raw_body = br#"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":20,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, raw_body).expect("write gzip body");
+    let gzipped = encoder.finish().expect("finish gzip body");
+    let (url, server) =
+        spawn_test_raw_http_response(StatusCode::OK, TestRawHttpBody::GzipJson(gzipped)).await;
+
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("build external pool client");
+    let response = client.get(url).send().await.expect("send request");
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    let body = response_bytes_with_limit_and_body_timeout(
+        response,
+        2,
+        EXTERNAL_POOL_NON_STREAM_RESPONSE_MAX_BYTES,
+    )
+    .await
+    .expect("read decoded body");
+    server.await.unwrap();
+
+    assert_eq!(body.as_ref(), raw_body);
+    let projected = maybe_project_non_stream_usage(body, None);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.output_tokens),
+        Some(7)
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .map(|usage| usage.output_tokens),
+        Some(7)
+    );
+    assert!(!projected.usage_capture.usage_estimated);
+}
+
 #[tokio::test]
 async fn external_pool_error_response_masks_raw_error_body_with_trace_id() {
     let mut headers = HeaderMap::new();
@@ -10231,6 +10283,7 @@ fn forward_headers_preserves_client_anthropic_version() {
         HeaderName::from_static("anthropic-version"),
         HeaderValue::from_static("2024-02-29"),
     );
+    headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
     let pool = test_pool("https://example.com/v1", true);
 
     let forwarded = forward_headers(&headers, &pool).expect("headers");
@@ -10240,6 +10293,7 @@ fn forward_headers_preserves_client_anthropic_version() {
             .and_then(|value| value.to_str().ok()),
         Some("2024-02-29")
     );
+    assert!(forwarded.get(header::ACCEPT_ENCODING).is_none());
 }
 
 fn test_external_pool_outbound_body(route: &ExternalRouteRequest, pool: &ExternalPool) -> Bytes {
