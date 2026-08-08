@@ -26,6 +26,7 @@ pub(super) struct ExternalUsageProjectionContext {
     pub(super) pricing_catalog: Arc<PricingCatalog>,
     pub(super) uplift_percent: u32,
     pub(super) cost_floor_enabled: bool,
+    pub(super) cost_floor_margin_percent: u32,
     pub(super) output_uplift_min_tokens: i32,
     pub(super) output_uplift_percent: u32,
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
@@ -35,6 +36,7 @@ pub(super) struct ExternalUsageProjectionContext {
 pub(super) struct ExternalUsageProjectionTemplate {
     uplift_percent: u32,
     cost_floor_enabled: bool,
+    cost_floor_margin_percent: u32,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
     raw_input_tokens: i32,
@@ -58,11 +60,13 @@ impl ExternalUsageProjectionTemplate {
         &self,
         uplift_percent: u32,
         cost_floor_enabled: bool,
+        cost_floor_margin_percent: u32,
         output_uplift_min_tokens: i32,
         output_uplift_percent: u32,
     ) -> bool {
         self.uplift_percent == uplift_percent
             && self.cost_floor_enabled == cost_floor_enabled
+            && self.cost_floor_margin_percent == cost_floor_margin_percent.min(200)
             && self.output_uplift_min_tokens == output_uplift_min_tokens.max(0)
             && self.output_uplift_percent == output_uplift_percent.min(200)
     }
@@ -87,6 +91,7 @@ impl ExternalUsageProjectionTemplate {
             pricing_catalog: self.pricing_catalog.clone(),
             uplift_percent: self.uplift_percent,
             cost_floor_enabled: self.cost_floor_enabled,
+            cost_floor_margin_percent: self.cost_floor_margin_percent,
             output_uplift_min_tokens: self.output_uplift_min_tokens,
             output_uplift_percent: self.output_uplift_percent,
             state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
@@ -99,6 +104,7 @@ pub(super) fn build_context(
     pool: &ExternalPool,
     uplift_percent: u32,
     cost_floor_enabled: bool,
+    cost_floor_margin_percent: u32,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
@@ -114,6 +120,7 @@ pub(super) fn build_context(
                 route,
                 uplift_percent,
                 cost_floor_enabled,
+                cost_floor_margin_percent,
                 output_uplift_min_tokens,
                 output_uplift_percent,
             )
@@ -124,6 +131,7 @@ pub(super) fn build_context(
             if template.matches_config(
                 uplift_percent,
                 cost_floor_enabled,
+                cost_floor_margin_percent,
                 output_uplift_min_tokens,
                 output_uplift_percent,
             ) =>
@@ -134,6 +142,7 @@ pub(super) fn build_context(
             route,
             uplift_percent,
             cost_floor_enabled,
+            cost_floor_margin_percent,
             output_uplift_min_tokens,
             output_uplift_percent,
         )?),
@@ -146,6 +155,7 @@ fn build_template(
     route: &ExternalRouteRequest,
     uplift_percent: u32,
     cost_floor_enabled: bool,
+    cost_floor_margin_percent: u32,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionTemplate> {
@@ -278,6 +288,7 @@ fn build_template(
     Some(ExternalUsageProjectionTemplate {
         uplift_percent,
         cost_floor_enabled,
+        cost_floor_margin_percent: cost_floor_margin_percent.min(200),
         output_uplift_min_tokens: output_uplift_min_tokens.max(0),
         output_uplift_percent: output_uplift_percent.min(200),
         raw_input_tokens,

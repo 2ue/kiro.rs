@@ -372,6 +372,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolAutoDisableOnChannelDisabled: true,
     externalPoolUsageProjectionUpliftPercent: 25,
     externalPoolUsageProjectionCostFloorEnabled: true,
+    externalPoolUsageProjectionCostFloorMarginPercent: 10,
     externalPoolUsageProjectionOutputUpliftMinTokens: 0,
     externalPoolUsageProjectionOutputUpliftPercent: 0,
     externalPoolStreamResponseMode: 'event_passthrough' as const,

@@ -5729,6 +5729,9 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_usage_projection_uplift_percent > 200 {
         return Err("externalPoolUsageProjectionUpliftPercent 不能大于 200".to_string());
     }
+    if config.external_pool_usage_projection_cost_floor_margin_percent > 200 {
+        return Err("externalPoolUsageProjectionCostFloorMarginPercent 不能大于 200".to_string());
+    }
     if config.external_pool_usage_projection_output_uplift_min_tokens < 0 {
         return Err("externalPoolUsageProjectionOutputUpliftMinTokens 不能小于 0".to_string());
     }

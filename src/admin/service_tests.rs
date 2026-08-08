@@ -155,6 +155,22 @@ fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
 }
 
 #[test]
+fn external_pool_cost_floor_margin_validation_is_bounded() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_usage_projection_cost_floor_margin_percent: 200,
+        ..ExternalPoolsConfig::default()
+    };
+    validate_external_pools_config(&config).expect("upper bound should be accepted");
+
+    config.external_pool_usage_projection_cost_floor_margin_percent = 201;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(
+        err.contains("externalPoolUsageProjectionCostFloorMarginPercent"),
+        "unexpected validation error: {err}"
+    );
+}
+
+#[test]
 fn request_admission_admin_save_refresh_returns_canonical_queue_fields() {
     let queue_only = RequestAdmissionConfig {
         rpm: 0,

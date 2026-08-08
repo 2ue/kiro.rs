@@ -5964,6 +5964,7 @@ impl ExternalPoolManager {
                 pool,
                 config.external_pool_usage_projection_uplift_percent,
                 config.external_pool_usage_projection_cost_floor_enabled,
+                config.external_pool_usage_projection_cost_floor_margin_percent,
                 config.external_pool_usage_projection_output_uplift_min_tokens,
                 config.external_pool_usage_projection_output_uplift_percent,
             );
@@ -6303,6 +6304,7 @@ impl ExternalPoolManager {
                 pool,
                 config.external_pool_usage_projection_uplift_percent,
                 config.external_pool_usage_projection_cost_floor_enabled,
+                config.external_pool_usage_projection_cost_floor_margin_percent,
                 config.external_pool_usage_projection_output_uplift_min_tokens,
                 config.external_pool_usage_projection_output_uplift_percent,
             );
@@ -10340,6 +10342,7 @@ fn process_non_stream_response_usage(
     if let Some((candidate_path, pointer)) = select_non_stream_usage_candidate(&value) {
         usage_capture.usage_candidate_path = Some(candidate_path.to_string());
         let response_output_estimate = estimate_non_stream_output_tokens(&value);
+        usage_capture.estimated_output_tokens = response_output_estimate.unwrap_or(0).max(0);
         let mut changed = false;
         {
             let Some(usage) = value.pointer_mut(pointer) else {
@@ -10469,6 +10472,7 @@ fn apply_estimated_usage_capture(
     usage_capture.usage_estimated = true;
     usage_capture.usage_estimate_reason = Some(reason.to_string());
     usage_capture.request_input_tokens = Some(estimated.request_input_tokens);
+    usage_capture.estimated_output_tokens = estimated.raw.output_tokens.max(0);
 }
 
 fn select_non_stream_usage_candidate(
@@ -12019,7 +12023,7 @@ fn project_usage_value(
         cache_creation_5m_input_tokens: 0,
         cache_creation_1h_input_tokens: 0,
     });
-    let raw_for_floor = effective_external_raw_usage_for_cost_floor(
+    let raw_for_floor = effective_external_raw_usage_for_estimate_repair(
         parsed_or_estimated_raw,
         projection.raw_input_tokens,
         response_output_estimate,
@@ -12041,7 +12045,7 @@ fn project_usage_value(
     })
 }
 
-fn effective_external_raw_usage_for_cost_floor(
+fn effective_external_raw_usage_for_estimate_repair(
     raw: CacheUsage,
     request_input_tokens: i32,
     response_output_estimate: i32,
@@ -12111,53 +12115,238 @@ fn apply_external_pool_usage_cost_floor(
         return reported;
     }
 
-    let target_cost = raw_estimate.cost_usd.max(0.0);
+    let target_cost = external_usage_cost_floor_target_cost(
+        raw_estimate.cost_usd,
+        projection.cost_floor_margin_percent,
+    );
     let current_cost = reported_estimate.cost_usd.max(0.0);
     if current_cost + f64::EPSILON >= target_cost {
         return reported;
     }
 
-    let unit_cost = external_usage_effective_input_repair_unit_cost(reported, projection)
-        .or_else(|| external_usage_input_unit_cost(reported, projection));
-    let Some(unit_cost) = unit_cost.filter(|cost| *cost > 0.0 && cost.is_finite()) else {
+    let mut candidate = reported;
+    let raw_has_cache_creation = raw.cache_creation_input_tokens > 0;
+    let raw_has_cache_read = raw.cache_read_input_tokens > 0;
+    if external_usage_cache_repair_allowed(projection)
+        && (raw_has_cache_creation || raw_has_cache_read)
+    {
+        if raw_has_cache_creation {
+            candidate = repair_external_usage_cost_floor_field(
+                candidate,
+                raw,
+                projection,
+                target_cost,
+                ExternalUsageRepairField::CacheCreation,
+            );
+            if external_usage_cost_covers(candidate, projection, target_cost) {
+                return candidate;
+            }
+        }
+        candidate = repair_external_usage_cost_floor_field(
+            candidate,
+            raw,
+            projection,
+            target_cost,
+            ExternalUsageRepairField::CacheRead,
+        );
+        return external_usage_best_improved_candidate(
+            reported,
+            candidate,
+            projection,
+            current_cost,
+        );
+    }
+
+    if raw_has_cache_creation || raw_has_cache_read {
         return reported;
+    }
+
+    candidate = repair_external_usage_cost_floor_field(
+        candidate,
+        raw,
+        projection,
+        target_cost,
+        ExternalUsageRepairField::Input,
+    );
+    external_usage_best_improved_candidate(reported, candidate, projection, current_cost)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalUsageRepairField {
+    Input,
+    CacheCreation,
+    CacheRead,
+}
+
+fn external_usage_cost_floor_target_cost(raw_cost_usd: f64, margin_percent: u32) -> f64 {
+    let margin_percent = margin_percent.min(200) as f64;
+    raw_cost_usd.max(0.0) * (1.0 + margin_percent / 100.0)
+}
+
+fn external_usage_cache_repair_allowed(projection: &ExternalUsageProjectionContext) -> bool {
+    projection.cache_state_enabled && projection.reported_policy.is_some()
+}
+
+fn repair_external_usage_cost_floor_field(
+    usage: CacheUsage,
+    raw: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+    target_cost: f64,
+    field: ExternalUsageRepairField,
+) -> CacheUsage {
+    let current_cost = match external_usage_cost_usd(usage, projection) {
+        Some(cost) => cost,
+        None => return usage,
+    };
+    if current_cost + f64::EPSILON >= target_cost {
+        return usage;
+    }
+
+    let Some(unit_cost) = external_usage_effective_repair_unit_cost(usage, raw, projection, field)
+        .or_else(|| external_usage_repair_unit_cost(usage, raw, projection, field))
+        .filter(|cost| *cost > 0.0 && cost.is_finite())
+    else {
+        return usage;
     };
 
-    // Repair once, then re-apply path guards. Repeatedly chasing the target
-    // through hard caps would flatten many requests at the configured limits.
+    // Repair each field at most once, then re-apply path guards. This keeps the
+    // compensation bounded by the route policy instead of repeatedly chasing a
+    // target through jittered caps.
     let missing_cost = target_cost - current_cost;
     let repair_tokens = (missing_cost / unit_cost)
         .ceil()
         .clamp(1.0, i32::MAX as f64) as i32;
     let candidate = apply_external_pool_usage_final_path_guards(
-        add_input_repair_tokens(reported, repair_tokens),
+        add_external_usage_repair_tokens(usage, raw, repair_tokens, field),
         projection,
     );
-    let candidate_estimate = projection
-        .pricing_catalog
-        .estimate(&projection.model, candidate);
-    if !candidate_estimate.available {
-        return reported;
-    }
-    if candidate_estimate.cost_usd.max(0.0) <= current_cost + f64::EPSILON {
-        return reported;
+    external_usage_best_improved_candidate(usage, candidate, projection, current_cost)
+}
+
+fn external_usage_cost_covers(
+    usage: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+    target_cost: f64,
+) -> bool {
+    external_usage_cost_usd(usage, projection)
+        .map(|cost| cost + f64::EPSILON >= target_cost)
+        .unwrap_or(false)
+}
+
+fn external_usage_best_improved_candidate(
+    base: CacheUsage,
+    candidate: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+    base_cost: f64,
+) -> CacheUsage {
+    let Some(candidate_cost) = external_usage_cost_usd(candidate, projection) else {
+        return base;
+    };
+    if candidate_cost <= base_cost + f64::EPSILON {
+        return base;
     }
     candidate
 }
 
+fn external_usage_cost_usd(
+    usage: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+) -> Option<f64> {
+    let estimate = projection
+        .pricing_catalog
+        .estimate(&projection.model, usage);
+    estimate.available.then_some(estimate.cost_usd.max(0.0))
+}
+
+fn add_external_usage_repair_tokens(
+    usage: CacheUsage,
+    raw: CacheUsage,
+    tokens: i32,
+    field: ExternalUsageRepairField,
+) -> CacheUsage {
+    match field {
+        ExternalUsageRepairField::Input => add_input_repair_tokens(usage, tokens),
+        ExternalUsageRepairField::CacheCreation => {
+            add_cache_creation_repair_tokens(usage, raw, tokens)
+        }
+        ExternalUsageRepairField::CacheRead => add_cache_read_repair_tokens(usage, tokens),
+    }
+}
+
 fn add_input_repair_tokens(mut usage: CacheUsage, tokens: i32) -> CacheUsage {
     usage.input_tokens = usage.input_tokens.max(0).saturating_add(tokens.max(0));
+    update_usage_total_input_tokens(&mut usage);
+    usage
+}
+
+fn add_cache_read_repair_tokens(mut usage: CacheUsage, tokens: i32) -> CacheUsage {
+    usage.cache_read_input_tokens = usage
+        .cache_read_input_tokens
+        .max(0)
+        .saturating_add(tokens.max(0));
+    update_usage_total_input_tokens(&mut usage);
+    usage
+}
+
+fn add_cache_creation_repair_tokens(
+    mut usage: CacheUsage,
+    raw: CacheUsage,
+    tokens: i32,
+) -> CacheUsage {
+    let tokens = tokens.max(0);
+    usage.cache_creation_input_tokens = usage
+        .cache_creation_input_tokens
+        .max(0)
+        .saturating_add(tokens);
+    let (additional_5m, additional_1h) = split_cache_creation_repair_tokens(tokens, raw);
+    usage.cache_creation_5m_input_tokens = usage
+        .cache_creation_5m_input_tokens
+        .max(0)
+        .saturating_add(additional_5m)
+        .min(usage.cache_creation_input_tokens);
+    usage.cache_creation_1h_input_tokens = usage
+        .cache_creation_1h_input_tokens
+        .max(0)
+        .saturating_add(additional_1h)
+        .min(
+            usage
+                .cache_creation_input_tokens
+                .saturating_sub(usage.cache_creation_5m_input_tokens),
+        );
+    update_usage_total_input_tokens(&mut usage);
+    usage
+}
+
+fn split_cache_creation_repair_tokens(tokens: i32, raw: CacheUsage) -> (i32, i32) {
+    let tokens = tokens.max(0);
+    if tokens == 0 {
+        return (0, 0);
+    }
+    let raw_5m = raw.cache_creation_5m_input_tokens.max(0);
+    let raw_1h = raw.cache_creation_1h_input_tokens.max(0);
+    let raw_split_total = raw_5m.saturating_add(raw_1h);
+    if raw_split_total <= 0 {
+        return (tokens, 0);
+    }
+    let one_hour =
+        ((tokens as i64 * raw_1h as i64) + (raw_split_total as i64 / 2)) / raw_split_total as i64;
+    let one_hour = one_hour.clamp(0, tokens as i64) as i32;
+    (tokens.saturating_sub(one_hour), one_hour)
+}
+
+fn update_usage_total_input_tokens(usage: &mut CacheUsage) {
     usage.total_input_tokens = usage
         .input_tokens
         .max(0)
         .saturating_add(usage.cache_read_input_tokens.max(0))
         .saturating_add(usage.cache_creation_input_tokens.max(0));
-    usage
 }
 
-fn external_usage_effective_input_repair_unit_cost(
+fn external_usage_effective_repair_unit_cost(
     usage: CacheUsage,
+    raw: CacheUsage,
     projection: &ExternalUsageProjectionContext,
+    field: ExternalUsageRepairField,
 ) -> Option<f64> {
     let base = projection
         .pricing_catalog
@@ -12166,8 +12355,10 @@ fn external_usage_effective_input_repair_unit_cost(
         return None;
     }
 
-    let next =
-        apply_external_pool_usage_final_path_guards(add_input_repair_tokens(usage, 1), projection);
+    let next = apply_external_pool_usage_final_path_guards(
+        add_external_usage_repair_tokens(usage, raw, 1, field),
+        projection,
+    );
     let estimate = projection.pricing_catalog.estimate(&projection.model, next);
     if !estimate.available {
         return None;
@@ -12176,9 +12367,11 @@ fn external_usage_effective_input_repair_unit_cost(
     (delta > 0.0 && delta.is_finite()).then_some(delta)
 }
 
-fn external_usage_input_unit_cost(
+fn external_usage_repair_unit_cost(
     usage: CacheUsage,
+    raw: CacheUsage,
     projection: &ExternalUsageProjectionContext,
+    field: ExternalUsageRepairField,
 ) -> Option<f64> {
     let base = projection
         .pricing_catalog
@@ -12187,7 +12380,7 @@ fn external_usage_input_unit_cost(
         return None;
     }
 
-    let next = add_input_repair_tokens(usage, 1);
+    let next = add_external_usage_repair_tokens(usage, raw, 1, field);
     let estimate = projection.pricing_catalog.estimate(&projection.model, next);
     if !estimate.available {
         return None;
@@ -12499,6 +12692,7 @@ fn build_external_usage_projection_context(
     pool: &ExternalPool,
     uplift_percent: u32,
     cost_floor_enabled: bool,
+    cost_floor_margin_percent: u32,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
@@ -12507,6 +12701,7 @@ fn build_external_usage_projection_context(
         pool,
         uplift_percent,
         cost_floor_enabled,
+        cost_floor_margin_percent,
         output_uplift_min_tokens,
         output_uplift_percent,
     )

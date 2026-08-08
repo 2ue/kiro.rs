@@ -182,6 +182,7 @@ export function ExternalPoolsPage() {
           externalPoolStreamPreOutputRetryEnabled: Boolean(configDraft.externalPoolStreamPreOutputRetryEnabled),
           externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
           externalPoolUsageProjectionCostFloorEnabled: Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled),
+          externalPoolUsageProjectionCostFloorMarginPercent: whole(configDraft.externalPoolUsageProjectionCostFloorMarginPercent),
           externalPoolUsageProjectionOutputUpliftMinTokens: whole(configDraft.externalPoolUsageProjectionOutputUpliftMinTokens),
           externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
           externalPoolUsageDebugEnabled: Boolean(configDraft.externalPoolUsageDebugEnabled),
@@ -480,8 +481,11 @@ export function ExternalPoolsPage() {
             description={'仅对下游 usage 口径为“按当前入口路径整理 usage”的外部账号生效；选择“透传上游 usage”的账号不受影响。'}
           >
             <div className="space-y-4">
-              <FormSection title="成本底线" description="用最终返回给调用方的 usage 兜住原始上游成本；只补 input，不凭空补缓存。">
-                <ToggleRow disabled={!externalEnabled} label="启用成本底线" checked={Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled)} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageProjectionCostFloorEnabled: v }))} />
+              <FormSection title="成本底线" description="用最终返回给调用方的 usage 覆盖原始上游成本；有上游缓存证据时优先补缓存字段，并遵守当前路径上限。">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <ToggleRow disabled={!externalEnabled} label="启用成本底线" checked={Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled)} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageProjectionCostFloorEnabled: v }))} />
+                  <NumberBox disabled={!externalEnabled || !configDraft.externalPoolUsageProjectionCostFloorEnabled} label="成本补齐余量" suffix="%" min={0} value={configDraft.externalPoolUsageProjectionCostFloorMarginPercent} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageProjectionCostFloorMarginPercent: v }))} />
+                </div>
               </FormSection>
               <div className="grid gap-4 lg:grid-cols-2">
                 <FormSection title="缓存读写补偿">

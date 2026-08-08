@@ -318,7 +318,7 @@ export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }
   if (config.externalPoolUsageProjectionCostFloorEnabled) {
-    parts.push('成本底线')
+    parts.push(`成本底线 +${config.externalPoolUsageProjectionCostFloorMarginPercent}%`)
   }
   if (config.externalPoolUsageProjectionOutputUpliftMinTokens > 0 && config.externalPoolUsageProjectionOutputUpliftPercent > 0) {
     parts.push(`输出 >= ${config.externalPoolUsageProjectionOutputUpliftMinTokens} 后 +${config.externalPoolUsageProjectionOutputUpliftPercent}%`)

@@ -397,6 +397,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolRouteRules: normalizeRuleList(draft.externalPools.externalPoolRouteRules),
       externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
       externalPoolUsageProjectionCostFloorEnabled: Boolean(draft.externalPools.externalPoolUsageProjectionCostFloorEnabled),
+      externalPoolUsageProjectionCostFloorMarginPercent: toWhole(draft.externalPools.externalPoolUsageProjectionCostFloorMarginPercent),
       externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
       externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
       externalPoolUsageDebugEnabled: Boolean(draft.externalPools.externalPoolUsageDebugEnabled),

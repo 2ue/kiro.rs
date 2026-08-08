@@ -2940,6 +2940,8 @@ pub struct ExternalPoolsConfig {
     pub external_pool_usage_projection_uplift_percent: u32,
     #[serde(default = "default_true")]
     pub external_pool_usage_projection_cost_floor_enabled: bool,
+    #[serde(default = "default_external_pool_usage_projection_cost_floor_margin_percent")]
+    pub external_pool_usage_projection_cost_floor_margin_percent: u32,
     #[serde(default)]
     pub external_pool_usage_projection_output_uplift_min_tokens: i32,
     #[serde(default)]
@@ -3036,6 +3038,8 @@ impl Default for ExternalPoolsConfig {
             external_pool_usage_projection_uplift_percent:
                 default_external_pool_usage_projection_uplift_percent(),
             external_pool_usage_projection_cost_floor_enabled: true,
+            external_pool_usage_projection_cost_floor_margin_percent:
+                default_external_pool_usage_projection_cost_floor_margin_percent(),
             external_pool_usage_projection_output_uplift_min_tokens: 0,
             external_pool_usage_projection_output_uplift_percent: 0,
             external_pool_stream_response_mode: ExternalPoolStreamResponseMode::default(),
@@ -4523,6 +4527,10 @@ fn default_external_pool_usage_projection_uplift_percent() -> u32 {
     25
 }
 
+fn default_external_pool_usage_projection_cost_floor_margin_percent() -> u32 {
+    10
+}
+
 fn default_external_pool_usage_debug_dir() -> String {
     "/tmp/kiro-rs/external-pool-usage-debug".to_string()
 }
@@ -5797,6 +5805,12 @@ mod tests {
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
             ExternalPoolStreamResponseMode::EventPassthrough
+        );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_usage_projection_cost_floor_margin_percent,
+            10
         );
         assert_eq!(
             config
