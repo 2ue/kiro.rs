@@ -1412,6 +1412,10 @@ export interface ExternalPoolsConfig {
   externalPoolUsageProjectionOutputUpliftMinTokens: number
   externalPoolUsageProjectionOutputUpliftPercent: number
   externalPoolStreamResponseMode: ExternalPoolStreamResponseMode
+  externalPoolUsageDebugEnabled: boolean
+  externalPoolUsageDebugDir: string
+  externalPoolUsageDebugMaxBodyBytes: number
+  externalPoolUsageDebugMaxFiles: number
 }
 
 export interface ExternalPool {

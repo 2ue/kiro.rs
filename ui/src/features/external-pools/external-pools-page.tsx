@@ -67,6 +67,7 @@ import {
   FormSection,
   NumberBox,
   SelectBox,
+  TextBox,
   TextAreaBox,
   ToggleRow,
 } from './external-pool-components'
@@ -183,6 +184,10 @@ export function ExternalPoolsPage() {
           externalPoolUsageProjectionCostFloorEnabled: Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled),
           externalPoolUsageProjectionOutputUpliftMinTokens: whole(configDraft.externalPoolUsageProjectionOutputUpliftMinTokens),
           externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
+          externalPoolUsageDebugEnabled: Boolean(configDraft.externalPoolUsageDebugEnabled),
+          externalPoolUsageDebugDir: String(configDraft.externalPoolUsageDebugDir || '').trim(),
+          externalPoolUsageDebugMaxBodyBytes: whole(configDraft.externalPoolUsageDebugMaxBodyBytes),
+          externalPoolUsageDebugMaxFiles: whole(configDraft.externalPoolUsageDebugMaxFiles),
         },
       })
       toast.success('外部账号策略已保存')
@@ -282,6 +287,7 @@ export function ExternalPoolsPage() {
   const usageCompensationActive = cacheUpliftActive
     || outputUpliftActive
     || configDraft.externalPoolUsageProjectionCostFloorEnabled
+  const usageDebugActive = externalEnabled && configDraft.externalPoolUsageDebugEnabled
 
   const poolStatuses = status.data?.pools ?? []
   const totalPools = pools.data?.pools.length ?? poolStatuses.length
@@ -492,6 +498,20 @@ export function ExternalPoolsPage() {
                   </div>
                 </FormSection>
               </div>
+            </div>
+          </PolicyBlock>
+
+          <PolicyBlock
+            title="诊断记录"
+            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            active={usageDebugActive}
+            description="临时保存外部池上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；用于排查 output_tokens 为 0 等异常。"
+          >
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <ToggleRow disabled={!externalEnabled} label="启用 usage 原始数据诊断" checked={configDraft.externalPoolUsageDebugEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugEnabled: v }))} />
+              <TextBox className="xl:col-span-3" disabled={!usageDebugActive} label="诊断目录" description="容器内路径；记录失败只写服务日志，不影响请求。" value={configDraft.externalPoolUsageDebugDir} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugDir: v }))} />
+              <NumberBox disabled={!usageDebugActive} label="单条原始片段上限" suffix="Bytes" value={configDraft.externalPoolUsageDebugMaxBodyBytes} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugMaxBodyBytes: v }))} />
+              <NumberBox disabled={!usageDebugActive} label="最多诊断文件" suffix="个" value={configDraft.externalPoolUsageDebugMaxFiles} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugMaxFiles: v }))} />
             </div>
           </PolicyBlock>
         </div>

@@ -399,6 +399,10 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolUsageProjectionCostFloorEnabled: Boolean(draft.externalPools.externalPoolUsageProjectionCostFloorEnabled),
       externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
       externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
+      externalPoolUsageDebugEnabled: Boolean(draft.externalPools.externalPoolUsageDebugEnabled),
+      externalPoolUsageDebugDir: String(draft.externalPools.externalPoolUsageDebugDir || '').trim(),
+      externalPoolUsageDebugMaxBodyBytes: toWhole(draft.externalPools.externalPoolUsageDebugMaxBodyBytes),
+      externalPoolUsageDebugMaxFiles: toWhole(draft.externalPools.externalPoolUsageDebugMaxFiles),
     },
   }
   return next
@@ -847,6 +851,49 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolLocalRescueEnabled')}
                   />
                 </TwoCol>
+
+                <div className="rounded-lg border border-warning/30 bg-warning/5 p-4">
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <TogField
+                      label="外部池 usage 原始数据诊断"
+                      desc="临时记录外部池上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；默认关闭。"
+                      checked={draft.externalPools.externalPoolUsageDebugEnabled}
+                      onChange={setExternalPools('externalPoolUsageDebugEnabled')}
+                    />
+                    <label className="space-y-1.5 text-sm">
+                      <span className="text-muted-foreground">诊断目录</span>
+                      <Input
+                        className="font-mono text-xs"
+                        value={draft.externalPools.externalPoolUsageDebugDir}
+                        placeholder="/tmp/kiro-rs/external-pool-usage-debug"
+                        onChange={(event) => setExternalPools('externalPoolUsageDebugDir')(event.target.value)}
+                      />
+                      <span className="block text-xs leading-4 text-muted-foreground">
+                        写入容器内路径；记录失败只写服务日志，不影响请求。
+                      </span>
+                    </label>
+                    <NumField
+                      label="单条原始片段上限"
+                      desc="限制原始请求/响应 body 与 SSE 前缀保存大小。"
+                      value={draft.externalPools.externalPoolUsageDebugMaxBodyBytes}
+                      min={0}
+                      max={1024 * 1024}
+                      suffix="Bytes"
+                      disabled={!draft.externalPools.externalPoolUsageDebugEnabled}
+                      onChange={setExternalPools('externalPoolUsageDebugMaxBodyBytes')}
+                    />
+                    <NumField
+                      label="最多诊断文件"
+                      desc="进程启动后最多写入的诊断 JSON 文件数；超出后跳过写入。"
+                      value={draft.externalPools.externalPoolUsageDebugMaxFiles}
+                      min={0}
+                      max={100_000}
+                      suffix="个"
+                      disabled={!draft.externalPools.externalPoolUsageDebugEnabled}
+                      onChange={setExternalPools('externalPoolUsageDebugMaxFiles')}
+                    />
+                  </div>
+                </div>
 
                 <div className="grid gap-4 md:grid-cols-[minmax(16rem,22rem)_1fr]">
                   <div className="space-y-1.5">

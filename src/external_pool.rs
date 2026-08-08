@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     future::Future,
+    path::PathBuf,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,6 +14,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::Response,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
@@ -126,6 +128,14 @@ const EXTERNAL_POOL_COORDINATOR_RECOVERY_GRACE_SECS: u64 = 35;
 const EXTERNAL_POOL_COORDINATOR_RUN_ID_PROBE_INTERVAL_SECS: u64 = 5;
 const EXTERNAL_POOL_COORDINATOR_RUNTIME_CONFIG_ID: &str = "external_pool_redis_coordination_epoch";
 const EXTERNAL_POOL_COORDINATOR_POSTGRES_LOCK_ID: i64 = 0x4b49_524f_4558_5450;
+const EXTERNAL_POOL_USAGE_DEBUG_DEFAULT_DIR: &str = "/tmp/kiro-rs/external-pool-usage-debug";
+const EXTERNAL_POOL_USAGE_DEBUG_DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024;
+const EXTERNAL_POOL_USAGE_DEBUG_MAX_BODY_BYTES: usize = 1024 * 1024;
+const EXTERNAL_POOL_USAGE_DEBUG_DEFAULT_MAX_FILES: u64 = 1_000;
+const EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT: usize = 20;
+const EXTERNAL_POOL_USAGE_DEBUG_EVENT_SAMPLE_BYTES: usize = 2 * 1024;
+const EXTERNAL_POOL_USAGE_DEBUG_USAGE_JSON_BYTES: usize = 4 * 1024;
+static EXTERNAL_POOL_USAGE_DEBUG_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
 const EXTERNAL_POOL_STATIC_SNAPSHOT_FRESH_TTL: Duration = Duration::from_secs(5);
@@ -1111,6 +1121,7 @@ fn external_dispatch_deadline(
 struct ExternalForwardResponse {
     response: Response,
     outbound_model: Option<String>,
+    outbound_body: Bytes,
     billing: Option<ExternalPoolBilling>,
     stream_usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
     stream_usage_projection: Option<ExternalUsageProjectionContext>,
@@ -1119,6 +1130,7 @@ struct ExternalForwardResponse {
 struct PreparedExternalForwardRequest {
     request: reqwest::RequestBuilder,
     outbound_model: Option<String>,
+    outbound_body: Bytes,
     known_tool_names: Arc<Vec<String>>,
     response_body_timeout_secs: u64,
 }
@@ -1400,6 +1412,44 @@ struct ExternalUsageCapture {
     body_usage_projection_applied: bool,
     stream_error_message: Option<String>,
     stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+    debug_stream: ExternalUsageDebugStreamCapture,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalUsageDebugStreamCapture {
+    events_seen: u64,
+    data_lines_seen: u64,
+    done_events_seen: u64,
+    json_parse_errors: u64,
+    usage_events_seen: u64,
+    raw_stream_bytes_seen: u64,
+    raw_stream_preview_base64: String,
+    raw_stream_preview_utf8: String,
+    raw_stream_preview_truncated: bool,
+    event_types: BTreeMap<String, u64>,
+    usage_paths: BTreeMap<String, u64>,
+    raw_usage_event_samples: Vec<ExternalUsageDebugRawEventSample>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalUsageDebugRawEventSample {
+    event: Option<String>,
+    payload_type: Option<String>,
+    raw_event_utf8: String,
+    raw_event_base64: String,
+    raw_event_truncated: bool,
+    usage_candidates: Vec<ExternalUsageDebugUsageCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalUsageDebugUsageCandidate {
+    path: String,
+    raw_json: String,
+    raw_json_truncated: bool,
+    normalized_anthropic_usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1407,6 +1457,8 @@ struct ExternalStreamProcessingPlan {
     response_mode: ExternalPoolStreamResponseMode,
     mask_errors: bool,
     capture_usage: bool,
+    usage_debug_enabled: bool,
+    usage_debug_max_body_bytes: usize,
 }
 
 impl ExternalStreamProcessingPlan {
@@ -1416,12 +1468,19 @@ impl ExternalStreamProcessingPlan {
                 response_mode,
                 mask_errors: true,
                 capture_usage: true,
+                usage_debug_enabled: false,
+                usage_debug_max_body_bytes: 0,
             },
         }
     }
 
     fn for_pool(pool: &ExternalPool, config: &ExternalPoolsConfig) -> Self {
-        Self::from_mode(effective_external_pool_stream_response_mode(pool, config))
+        let mut plan = Self::from_mode(effective_external_pool_stream_response_mode(pool, config));
+        if external_pool_usage_debug_enabled(config) {
+            plan.usage_debug_enabled = true;
+            plan.usage_debug_max_body_bytes = external_pool_usage_debug_max_body_bytes(config);
+        }
+        plan
     }
 }
 
@@ -1431,6 +1490,388 @@ fn effective_external_pool_stream_response_mode(
 ) -> ExternalPoolStreamResponseMode {
     pool.stream_response_mode
         .unwrap_or(config.external_pool_stream_response_mode)
+}
+
+fn external_pool_usage_debug_enabled(config: &ExternalPoolsConfig) -> bool {
+    config.external_pool_usage_debug_enabled && config.external_pool_usage_debug_max_files > 0
+}
+
+fn external_pool_usage_debug_dir(config: &ExternalPoolsConfig) -> PathBuf {
+    let configured = config.external_pool_usage_debug_dir.trim();
+    if configured.is_empty() {
+        PathBuf::from(EXTERNAL_POOL_USAGE_DEBUG_DEFAULT_DIR)
+    } else {
+        PathBuf::from(configured)
+    }
+}
+
+fn external_pool_usage_debug_max_body_bytes(config: &ExternalPoolsConfig) -> usize {
+    let configured = config.external_pool_usage_debug_max_body_bytes as usize;
+    if configured == 0 {
+        EXTERNAL_POOL_USAGE_DEBUG_DEFAULT_MAX_BODY_BYTES
+    } else {
+        configured.min(EXTERNAL_POOL_USAGE_DEBUG_MAX_BODY_BYTES)
+    }
+}
+
+fn external_pool_usage_debug_max_files(config: &ExternalPoolsConfig) -> u64 {
+    let configured = config.external_pool_usage_debug_max_files as u64;
+    if configured == 0 {
+        EXTERNAL_POOL_USAGE_DEBUG_DEFAULT_MAX_FILES
+    } else {
+        configured
+    }
+}
+
+fn spawn_external_pool_usage_debug_write(
+    config: &ExternalPoolsConfig,
+    route: &ExternalRouteRequest,
+    stage: &'static str,
+    payload: serde_json::Value,
+) {
+    if !external_pool_usage_debug_enabled(config) {
+        return;
+    }
+    let max_files = external_pool_usage_debug_max_files(config);
+    let sequence = EXTERNAL_POOL_USAGE_DEBUG_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if sequence >= max_files {
+        if sequence == max_files {
+            tracing::warn!(
+                request_id = %route.request_id,
+                max_files,
+                "external pool usage debug file limit reached"
+            );
+        }
+        return;
+    }
+    let dir = external_pool_usage_debug_dir(config);
+    let request_id = sanitize_usage_debug_filename_part(&route.request_id);
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let file_name = format!("{timestamp}-{request_id}-{sequence:06}-{stage}.json");
+    let path = dir.join(file_name);
+    let request_id_for_log = route.request_id.clone();
+    tokio::spawn(async move {
+        let result = async {
+            tokio::fs::create_dir_all(&dir).await?;
+            let body = serde_json::to_vec_pretty(&payload)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            tokio::fs::write(&path, body).await
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                request_id = %request_id_for_log,
+                path = %path.display(),
+                error = %err,
+                "external pool usage debug write failed"
+            );
+        }
+    });
+}
+
+fn sanitize_usage_debug_filename_part(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(64));
+    for ch in value.chars().take(80) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "request".to_string()
+    } else {
+        out
+    }
+}
+
+fn external_pool_usage_debug_route_context(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    outbound_model: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "requestId": route.request_id.as_str(),
+        "errorId": route.error_id.as_str(),
+        "createdAt": Utc::now().to_rfc3339(),
+        "endpoint": route.endpoint.as_str(),
+        "stream": route.is_stream(),
+        "requestedModel": route.requested_model(),
+        "requestedMaxTokens": route.requested_max_tokens(),
+        "upstreamModel": route.upstream_model.as_deref(),
+        "externalOutboundModel": outbound_model,
+        "conversationId": route.stable_conversation_id(),
+        "requestApiKeyId": route.request_api_key_id.as_deref(),
+        "routeSubtype": route.route_subtype,
+        "fallbackReason": route.fallback_reason.as_deref(),
+        "directPolicyReason": route.direct_policy_reason.as_deref(),
+        "localAttempted": route.local_attempted,
+        "requestInputTokens": route.request_input_tokens,
+        "pool": {
+            "id": pool.id,
+            "name": pool.name.as_str(),
+            "usageProjectionMode": pool.usage_projection_mode.as_str(),
+        },
+    })
+}
+
+fn external_pool_usage_debug_bytes(value: &[u8], max_bytes: usize) -> serde_json::Value {
+    let capped = value.len().min(max_bytes);
+    let preview = &value[..capped];
+    let mut hasher = Sha256::new();
+    hasher.update(value);
+    json!({
+        "bytes": value.len(),
+        "sha256": hex::encode(hasher.finalize()),
+        "previewBytes": capped,
+        "previewTruncated": value.len() > capped,
+        "previewUtf8": String::from_utf8_lossy(preview),
+        "previewBase64": BASE64_STANDARD.encode(preview),
+    })
+}
+
+fn truncate_usage_debug_text(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_string(), true)
+}
+
+fn external_pool_usage_debug_cache_usage(value: Option<CacheUsage>) -> Option<serde_json::Value> {
+    value.map(|usage| usage.to_anthropic_usage_json())
+}
+
+fn external_pool_usage_debug_capture(capture: &ExternalUsageCapture) -> serde_json::Value {
+    json!({
+        "requestInputTokens": capture.request_input_tokens,
+        "estimatedOutputTokens": capture.estimated_output_tokens,
+        "rawUsage": external_pool_usage_debug_cache_usage(capture.raw),
+        "shapedUsage": external_pool_usage_debug_cache_usage(capture.shaped),
+        "reportedUsage": external_pool_usage_debug_cache_usage(capture.reported),
+        "projected": capture.projected,
+        "usageEstimated": capture.usage_estimated,
+        "usageEstimateReason": capture.usage_estimate_reason.as_deref(),
+        "usageCandidatePath": capture.usage_candidate_path.as_deref(),
+        "bodyUsageProjectionApplied": capture.body_usage_projection_applied,
+        "streamErrorMessage": capture.stream_error_message.as_deref(),
+        "streamResponseMode": capture.stream_response_mode.map(|mode| mode.as_str()),
+    })
+}
+
+fn external_pool_usage_debug_header_context(headers: &HeaderMap) -> serde_json::Value {
+    json!({
+        "contentType": headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "anthropicRequestId": headers
+            .get("request-id")
+            .or_else(|| headers.get("x-request-id"))
+            .or_else(|| headers.get("anthropic-request-id"))
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    })
+}
+
+fn external_pool_usage_debug_non_stream_record(
+    config: &ExternalPoolsConfig,
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    outbound_model: Option<&str>,
+    status: StatusCode,
+    response_headers: &HeaderMap,
+    outbound_body: &Bytes,
+    upstream_body: &Bytes,
+    projected: &ProjectedNonStreamBody,
+) {
+    if !external_pool_usage_debug_enabled(config) {
+        return;
+    }
+    let max_bytes = external_pool_usage_debug_max_body_bytes(config);
+    let raw_json = serde_json::from_slice::<serde_json::Value>(upstream_body).ok();
+    let payload = json!({
+        "kind": "external_pool_usage_debug",
+        "stage": "non_stream_success",
+        "route": external_pool_usage_debug_route_context(route, pool, outbound_model),
+        "upstream": {
+            "status": status.as_u16(),
+            "headers": external_pool_usage_debug_header_context(response_headers),
+            "body": external_pool_usage_debug_bytes(upstream_body, max_bytes),
+            "rawUsageCandidates": raw_json
+                .as_ref()
+                .map(collect_external_pool_usage_debug_candidates)
+                .unwrap_or_default(),
+        },
+        "outboundRequest": {
+            "body": external_pool_usage_debug_bytes(outbound_body, max_bytes),
+        },
+        "kiroRsProcessing": {
+            "usageCapture": external_pool_usage_debug_capture(&projected.usage_capture),
+            "protocolContamination": projected.protocol_contamination,
+            "downstreamBodyChanged": projected.body.as_ref() != upstream_body.as_ref(),
+            "downstreamBody": external_pool_usage_debug_bytes(&projected.body, max_bytes),
+        },
+    });
+    spawn_external_pool_usage_debug_write(config, route, "non-stream", payload);
+}
+
+fn external_pool_usage_debug_stream_record(
+    config: &ExternalPoolsConfig,
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    outbound_model: Option<&str>,
+    status: UsageRecordStatus,
+    response_status: StatusCode,
+    response_content_type: Option<&str>,
+    outbound_body: &Bytes,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    billing: Option<&ExternalPoolBilling>,
+    estimated_output_tokens: i32,
+    terminal_message: Option<&str>,
+) {
+    if !external_pool_usage_debug_enabled(config) {
+        return;
+    }
+    let max_bytes = external_pool_usage_debug_max_body_bytes(config);
+    let capture_snapshot = capture.map(|capture| capture.lock().clone());
+    let payload = json!({
+        "kind": "external_pool_usage_debug",
+        "stage": "stream_final",
+        "route": external_pool_usage_debug_route_context(route, pool, outbound_model),
+        "upstream": {
+            "status": response_status.as_u16(),
+            "headers": {
+                "contentType": response_content_type.unwrap_or_default(),
+            },
+            "rawStream": capture_snapshot
+                .as_ref()
+                .map(|capture| &capture.debug_stream),
+        },
+        "outboundRequest": {
+            "body": external_pool_usage_debug_bytes(outbound_body, max_bytes),
+        },
+        "kiroRsProcessing": {
+            "terminalStatus": status,
+            "terminalMessage": terminal_message,
+            "estimatedOutputTokensFromForwardedStream": estimated_output_tokens,
+            "usageCapture": capture_snapshot
+                .as_ref()
+                .map(external_pool_usage_debug_capture),
+            "billing": billing.map(|billing| {
+                json!({
+                    "rawUsage": billing.raw_usage,
+                    "shapedUsage": billing.shaped_usage,
+                    "reportedUsage": billing.reported_usage,
+                    "usageEstimated": billing.usage_estimated,
+                    "usageEstimateReason": billing.usage_estimate_reason.as_deref(),
+                    "usageCandidatePath": billing.usage_candidate_path.as_deref(),
+                    "usageProjectionApplied": billing.usage_projection_applied,
+                    "bodyUsageProjectionApplied": billing.body_usage_projection_applied,
+                })
+            }),
+        },
+    });
+    spawn_external_pool_usage_debug_write(config, route, "stream", payload);
+}
+
+fn collect_external_pool_usage_debug_candidates(
+    value: &serde_json::Value,
+) -> Vec<ExternalUsageDebugUsageCandidate> {
+    let mut out = Vec::new();
+    collect_external_pool_usage_debug_candidates_inner(value, "$", false, &mut out);
+    out
+}
+
+fn collect_external_pool_usage_debug_candidates_inner(
+    value: &serde_json::Value,
+    path: &str,
+    key_is_usage: bool,
+    out: &mut Vec<ExternalUsageDebugUsageCandidate>,
+) {
+    if out.len() >= EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT {
+        return;
+    }
+    if (key_is_usage || external_pool_usage_debug_value_has_usage_tokens(value))
+        && value.is_object()
+    {
+        let normalized =
+            cache_usage_from_any_value(value).map(|usage| usage.to_anthropic_usage_json());
+        let raw_json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+        let (raw_json, raw_json_truncated) =
+            truncate_usage_debug_text(&raw_json, EXTERNAL_POOL_USAGE_DEBUG_USAGE_JSON_BYTES);
+        out.push(ExternalUsageDebugUsageCandidate {
+            path: path.to_string(),
+            raw_json,
+            raw_json_truncated,
+            normalized_anthropic_usage: normalized,
+        });
+    }
+    if out.len() >= EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if out.len() >= EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT {
+                    break;
+                }
+                let child_path = external_pool_usage_debug_object_path(path, key);
+                collect_external_pool_usage_debug_candidates_inner(
+                    child,
+                    &child_path,
+                    key.eq_ignore_ascii_case("usage"),
+                    out,
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, child) in items.iter().enumerate() {
+                if out.len() >= EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT {
+                    break;
+                }
+                let child_path = format!("{path}[{idx}]");
+                collect_external_pool_usage_debug_candidates_inner(child, &child_path, false, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn external_pool_usage_debug_object_path(parent: &str, key: &str) -> String {
+    let needs_brackets = key
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+    if needs_brackets {
+        format!(
+            "{parent}[{}]",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string())
+        )
+    } else if parent == "$" {
+        format!("$.{key}")
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+fn external_pool_usage_debug_value_has_usage_tokens(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    ]
+    .into_iter()
+    .any(|key| obj.get(key).is_some())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5027,9 +5468,12 @@ impl ExternalPoolManager {
                         return ExternalPoolForwardOutcome::Response(
                             self.wrap_external_stream_usage_record(
                                 forwarded.response,
+                                config.clone(),
                                 route.clone(),
                                 pool,
                                 attempts.clone(),
+                                forwarded.outbound_model,
+                                forwarded.outbound_body,
                                 forwarded.stream_usage_capture,
                                 forwarded.stream_usage_projection,
                             ),
@@ -5320,6 +5764,7 @@ impl ExternalPoolManager {
         }
         let prepared = external_pool_prepare_request(route, pool)?;
         let outbound_model = prepared.outbound_model.clone();
+        let outbound_body = prepared.body.clone();
         let known_tool_names = external_route_known_tool_names(route);
         let mut request = self.client.post(url).headers(headers).body(prepared.body);
         if route.is_stream() {
@@ -5341,6 +5786,7 @@ impl ExternalPoolManager {
         Ok(PreparedExternalForwardRequest {
             request,
             outbound_model,
+            outbound_body,
             known_tool_names,
             response_body_timeout_secs,
         })
@@ -5371,6 +5817,7 @@ impl ExternalPoolManager {
         let PreparedExternalForwardRequest {
             request,
             outbound_model,
+            outbound_body,
             known_tool_names,
             response_body_timeout_secs,
         } = prepared;
@@ -5756,6 +6203,7 @@ impl ExternalPoolManager {
             Ok(ExternalForwardResponse {
                 response,
                 outbound_model,
+                outbound_body,
                 billing: None,
                 stream_usage_capture: Some(stream_usage_capture),
                 stream_usage_projection,
@@ -5816,11 +6264,23 @@ impl ExternalPoolManager {
                 config.external_pool_usage_projection_output_uplift_min_tokens,
                 config.external_pool_usage_projection_output_uplift_percent,
             );
+            let upstream_body = bytes.clone();
             let projected = process_non_stream_response_usage(
                 bytes,
                 Some(route),
                 projection_context.as_ref(),
                 known_tool_names.iter().cloned(),
+            );
+            external_pool_usage_debug_non_stream_record(
+                config,
+                route,
+                pool,
+                outbound_model.as_deref(),
+                status,
+                &response_headers,
+                &outbound_body,
+                &upstream_body,
+                &projected,
             );
             if projected.protocol_contamination {
                 return Err(ExternalForwardError::new(
@@ -5860,6 +6320,7 @@ impl ExternalPoolManager {
             Ok(ExternalForwardResponse {
                 response,
                 outbound_model,
+                outbound_body,
                 billing,
                 stream_usage_capture: None,
                 stream_usage_projection: projection_context,
@@ -7486,21 +7947,35 @@ impl ExternalPoolManager {
     fn wrap_external_stream_usage_record(
         &self,
         response: Response,
+        config: ExternalPoolsConfig,
         route: ExternalRouteRequest,
         pool: ExternalPool,
         attempts: Vec<ExternalPoolAttempt>,
+        outbound_model: Option<String>,
+        outbound_body: Bytes,
         usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
         usage_projection: Option<ExternalUsageProjectionContext>,
     ) -> Response {
         let (parts, body) = response.into_parts();
+        let response_status = parts.status;
+        let response_content_type = parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let data_stream = body.into_data_stream();
         let guard = ExternalStreamUsageGuard {
             manager: self.clone(),
+            config,
             route,
             pool,
             attempts,
+            outbound_model,
+            outbound_body,
             usage_capture,
             usage_projection,
+            response_status,
+            response_content_type,
             chunks_before_first_output: 0,
             events_before_first_output: 0,
             estimated_output_tokens: 0,
@@ -7763,11 +8238,16 @@ fn external_usage_latency_trace(route: &ExternalRouteRequest) -> UsageLatencyTra
 
 struct ExternalStreamUsageGuard {
     manager: ExternalPoolManager,
+    config: ExternalPoolsConfig,
     route: ExternalRouteRequest,
     pool: ExternalPool,
     attempts: Vec<ExternalPoolAttempt>,
+    outbound_model: Option<String>,
+    outbound_body: Bytes,
     usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
     usage_projection: Option<ExternalUsageProjectionContext>,
+    response_status: StatusCode,
+    response_content_type: Option<String>,
     chunks_before_first_output: u32,
     events_before_first_output: u32,
     estimated_output_tokens: i32,
@@ -7816,6 +8296,20 @@ impl ExternalStreamUsageGuard {
             .as_ref()
             .and_then(|capture| capture.lock().stream_error_message.clone());
         if let Some(message) = stream_error_message {
+            external_pool_usage_debug_stream_record(
+                &self.config,
+                &self.route,
+                &self.pool,
+                self.outbound_model.as_deref(),
+                UsageRecordStatus::StreamError,
+                self.response_status,
+                self.response_content_type.as_deref(),
+                &self.outbound_body,
+                self.usage_capture.as_ref(),
+                None,
+                self.estimated_output_tokens,
+                Some(&message),
+            );
             self.manager.record_external(
                 &self.route,
                 Some(&self.pool),
@@ -7859,6 +8353,20 @@ impl ExternalStreamUsageGuard {
         if let Some(projection) = self.usage_projection.as_ref() {
             projection.record_success();
         }
+        external_pool_usage_debug_stream_record(
+            &self.config,
+            &self.route,
+            &self.pool,
+            self.outbound_model.as_deref(),
+            UsageRecordStatus::Success,
+            self.response_status,
+            self.response_content_type.as_deref(),
+            &self.outbound_body,
+            self.usage_capture.as_ref(),
+            billing.as_ref(),
+            self.estimated_output_tokens,
+            None,
+        );
         self.manager.record_external_success(
             &self.route,
             &self.pool,
@@ -7872,6 +8380,20 @@ impl ExternalStreamUsageGuard {
         if self.completed {
             return;
         }
+        external_pool_usage_debug_stream_record(
+            &self.config,
+            &self.route,
+            &self.pool,
+            self.outbound_model.as_deref(),
+            UsageRecordStatus::StreamError,
+            self.response_status,
+            self.response_content_type.as_deref(),
+            &self.outbound_body,
+            self.usage_capture.as_ref(),
+            None,
+            self.estimated_output_tokens,
+            Some(message),
+        );
         self.manager.record_external(
             &self.route,
             Some(&self.pool),
@@ -7900,6 +8422,20 @@ impl ExternalStreamUsageGuard {
             return;
         }
         let message = "external stream body dropped before completion";
+        external_pool_usage_debug_stream_record(
+            &self.config,
+            &self.route,
+            &self.pool,
+            self.outbound_model.as_deref(),
+            UsageRecordStatus::ClientDropped,
+            self.response_status,
+            self.response_content_type.as_deref(),
+            &self.outbound_body,
+            self.usage_capture.as_ref(),
+            None,
+            self.estimated_output_tokens,
+            Some(message),
+        );
         self.manager.record_external(
             &self.route,
             Some(&self.pool),
@@ -10268,6 +10804,128 @@ fn capture_sse_event_usage(
     }
 }
 
+fn record_external_usage_debug_sse_event(
+    event: &[u8],
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    plan: ExternalStreamProcessingPlan,
+) {
+    if !plan.usage_debug_enabled {
+        return;
+    }
+    let Some(capture) = capture else {
+        return;
+    };
+    let text = String::from_utf8_lossy(event);
+    let mut event_name: Option<String> = None;
+    let mut payload_type: Option<String> = None;
+    let mut usage_candidates = Vec::new();
+    let mut saw_usage = false;
+    let mut data_lines_seen = 0u64;
+    let mut done_events_seen = 0u64;
+    let mut json_parse_errors = 0u64;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed_line_end = line.trim_end_matches(['\r', '\n']);
+        if let Some(value) = trimmed_line_end.strip_prefix("event:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                event_name = Some(value.to_string());
+            }
+            continue;
+        }
+        let Some(data) = trimmed_line_end.strip_prefix("data:") else {
+            continue;
+        };
+        data_lines_seen = data_lines_seen.saturating_add(1);
+        let data_json = data.trim();
+        if data_json.is_empty() {
+            continue;
+        }
+        if data_json == "[DONE]" {
+            done_events_seen = done_events_seen.saturating_add(1);
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(data_json) {
+            Ok(value) => {
+                payload_type = payload_type.or_else(|| {
+                    value
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                });
+                let candidates = collect_external_pool_usage_debug_candidates(&value);
+                if !candidates.is_empty() {
+                    saw_usage = true;
+                    usage_candidates.extend(candidates);
+                    if usage_candidates.len() > EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT {
+                        usage_candidates.truncate(EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT);
+                    }
+                }
+            }
+            Err(_) => {
+                json_parse_errors = json_parse_errors.saturating_add(1);
+            }
+        }
+    }
+
+    let mut capture = capture.lock();
+    let debug = &mut capture.debug_stream;
+    debug.events_seen = debug.events_seen.saturating_add(1);
+    debug.data_lines_seen = debug.data_lines_seen.saturating_add(data_lines_seen);
+    debug.done_events_seen = debug.done_events_seen.saturating_add(done_events_seen);
+    debug.json_parse_errors = debug.json_parse_errors.saturating_add(json_parse_errors);
+    debug.raw_stream_bytes_seen = debug
+        .raw_stream_bytes_seen
+        .saturating_add(event.len() as u64);
+    if let Some(event_name) = event_name.as_deref().or(payload_type.as_deref()) {
+        *debug.event_types.entry(event_name.to_string()).or_default() += 1;
+    }
+    if saw_usage {
+        debug.usage_events_seen = debug.usage_events_seen.saturating_add(1);
+        for candidate in &usage_candidates {
+            *debug.usage_paths.entry(candidate.path.clone()).or_default() += 1;
+        }
+        if debug.raw_usage_event_samples.len() < EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT {
+            let raw_event_cap = event
+                .len()
+                .min(EXTERNAL_POOL_USAGE_DEBUG_EVENT_SAMPLE_BYTES);
+            let raw_event_preview = &event[..raw_event_cap];
+            debug
+                .raw_usage_event_samples
+                .push(ExternalUsageDebugRawEventSample {
+                    event: event_name,
+                    payload_type,
+                    raw_event_utf8: String::from_utf8_lossy(raw_event_preview).to_string(),
+                    raw_event_base64: BASE64_STANDARD.encode(raw_event_preview),
+                    raw_event_truncated: event.len() > raw_event_cap,
+                    usage_candidates,
+                });
+        }
+    }
+    let max_preview = plan.usage_debug_max_body_bytes;
+    if max_preview > 0 && debug.raw_stream_preview_base64.len() < max_preview.saturating_mul(2) {
+        let existing = BASE64_STANDARD
+            .decode(debug.raw_stream_preview_base64.as_bytes())
+            .unwrap_or_default();
+        if existing.len() < max_preview {
+            let remaining = max_preview - existing.len();
+            let append = &event[..event.len().min(remaining)];
+            let mut combined = existing;
+            combined.extend_from_slice(append);
+            debug.raw_stream_preview_base64 = BASE64_STANDARD.encode(&combined);
+            debug.raw_stream_preview_utf8 = String::from_utf8_lossy(&combined).to_string();
+            if event.len() > append.len() {
+                debug.raw_stream_preview_truncated = true;
+            }
+        } else {
+            debug.raw_stream_preview_truncated = true;
+        }
+    }
+    if max_preview > 0 && debug.raw_stream_bytes_seen as usize > max_preview {
+        debug.raw_stream_preview_truncated = true;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SseUsageProcessingResult {
     changed: bool,
@@ -10900,6 +11558,7 @@ fn process_sse_event_with_plan_and_transcript(
     plan: ExternalStreamProcessingPlan,
     transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
 ) -> Vec<u8> {
+    record_external_usage_debug_sse_event(event, capture, plan);
     let masked = plan
         .mask_errors
         .then(|| maybe_mask_external_stream_error_event(event, capture, stream_error_mask))

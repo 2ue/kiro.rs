@@ -5735,6 +5735,15 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_usage_projection_output_uplift_percent > 200 {
         return Err("externalPoolUsageProjectionOutputUpliftPercent 不能大于 200".to_string());
     }
+    if config.external_pool_usage_debug_dir.chars().count() > 512 {
+        return Err("externalPoolUsageDebugDir 不能超过 512 个字符".to_string());
+    }
+    if config.external_pool_usage_debug_max_body_bytes > 1024 * 1024 {
+        return Err("externalPoolUsageDebugMaxBodyBytes 不能大于 1048576".to_string());
+    }
+    if config.external_pool_usage_debug_max_files > 100_000 {
+        return Err("externalPoolUsageDebugMaxFiles 不能大于 100000".to_string());
+    }
     Ok(())
 }
 

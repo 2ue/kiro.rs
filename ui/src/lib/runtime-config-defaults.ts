@@ -375,6 +375,10 @@ export function defaultExternalPoolsConfig() {
     externalPoolUsageProjectionOutputUpliftMinTokens: 0,
     externalPoolUsageProjectionOutputUpliftPercent: 0,
     externalPoolStreamResponseMode: 'event_passthrough' as const,
+    externalPoolUsageDebugEnabled: false,
+    externalPoolUsageDebugDir: '/tmp/kiro-rs/external-pool-usage-debug',
+    externalPoolUsageDebugMaxBodyBytes: 8192,
+    externalPoolUsageDebugMaxFiles: 1000,
   }
 }
 

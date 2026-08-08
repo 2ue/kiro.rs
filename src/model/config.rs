@@ -2946,6 +2946,16 @@ pub struct ExternalPoolsConfig {
     pub external_pool_usage_projection_output_uplift_percent: u32,
     #[serde(default)]
     pub external_pool_stream_response_mode: ExternalPoolStreamResponseMode,
+    /// 外部池 usage 诊断文件记录。默认关闭，只用于生产临时排查上游原始
+    /// usage/响应形状与本系统解析结果不一致的问题。
+    #[serde(default)]
+    pub external_pool_usage_debug_enabled: bool,
+    #[serde(default = "default_external_pool_usage_debug_dir")]
+    pub external_pool_usage_debug_dir: String,
+    #[serde(default = "default_external_pool_usage_debug_max_body_bytes")]
+    pub external_pool_usage_debug_max_body_bytes: u32,
+    #[serde(default = "default_external_pool_usage_debug_max_files")]
+    pub external_pool_usage_debug_max_files: u32,
 }
 
 impl Default for ExternalPoolsConfig {
@@ -3029,6 +3039,11 @@ impl Default for ExternalPoolsConfig {
             external_pool_usage_projection_output_uplift_min_tokens: 0,
             external_pool_usage_projection_output_uplift_percent: 0,
             external_pool_stream_response_mode: ExternalPoolStreamResponseMode::default(),
+            external_pool_usage_debug_enabled: false,
+            external_pool_usage_debug_dir: default_external_pool_usage_debug_dir(),
+            external_pool_usage_debug_max_body_bytes:
+                default_external_pool_usage_debug_max_body_bytes(),
+            external_pool_usage_debug_max_files: default_external_pool_usage_debug_max_files(),
         }
     }
 }
@@ -4506,6 +4521,18 @@ fn default_external_pool_stream_pre_output_retry_enabled() -> bool {
 
 fn default_external_pool_usage_projection_uplift_percent() -> u32 {
     25
+}
+
+fn default_external_pool_usage_debug_dir() -> String {
+    "/tmp/kiro-rs/external-pool-usage-debug".to_string()
+}
+
+fn default_external_pool_usage_debug_max_body_bytes() -> u32 {
+    8 * 1024
+}
+
+fn default_external_pool_usage_debug_max_files() -> u32 {
+    1_000
 }
 
 fn default_postgres_max_connections() -> u32 {

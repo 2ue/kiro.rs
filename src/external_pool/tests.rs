@@ -7,7 +7,92 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{AcquireMode, MultiTokenManager};
 use crate::model::config::Config;
 use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
-use base64::Engine as _;
+
+#[test]
+fn external_usage_debug_candidates_collect_raw_usage_from_unusual_paths() {
+    let value = json!({
+        "wrapper": {
+            "nested": {
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        },
+        "choices": [
+            {
+                "message": { "content": "ok" },
+                "provider_usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 4
+                }
+            }
+        ]
+    });
+
+    let candidates = collect_external_pool_usage_debug_candidates(&value);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.wrapper.nested.usage"
+                && candidate.raw_json.contains("\"output_tokens\":5")),
+        "must keep raw Anthropic usage from non-standard wrapper path"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.choices[0].provider_usage"
+                && candidate
+                    .normalized_anthropic_usage
+                    .as_ref()
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(|value| value.as_i64())
+                    == Some(4)),
+        "must normalize OpenAI-style raw usage without losing original raw json"
+    );
+}
+
+#[test]
+fn external_usage_debug_sse_event_keeps_raw_usage_event_sample() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+    plan.usage_debug_enabled = true;
+    plan.usage_debug_max_body_bytes = 128;
+    let event = br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}
+
+"#;
+
+    record_external_usage_debug_sse_event(event, Some(&capture), plan);
+
+    let snapshot = capture.lock().debug_stream.clone();
+    assert_eq!(snapshot.events_seen, 1);
+    assert_eq!(snapshot.usage_events_seen, 1);
+    assert_eq!(snapshot.usage_paths.get("$.usage"), Some(&1));
+    let sample = snapshot
+        .raw_usage_event_samples
+        .first()
+        .expect("usage event sample should be present");
+    assert_eq!(sample.event.as_deref(), Some("message_delta"));
+    assert!(sample.raw_event_utf8.contains("\"output_tokens\":4"));
+    assert!(
+        sample
+            .usage_candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.usage"
+                && candidate.raw_json.contains("\"output_tokens\":4")),
+        "raw SSE usage candidate should be kept for single-request analysis"
+    );
+    let preview = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        snapshot.raw_stream_preview_base64.as_bytes(),
+    )
+    .expect("stream preview should be valid base64");
+    assert_eq!(preview, event);
+}
 
 #[test]
 fn persisted_external_pool_enum_parsers_reject_unknown_values_for_five_rounds() {
@@ -10844,8 +10929,10 @@ fn raw_failover_shares_tool_and_usage_projection_parsing_across_pools() {
 
 #[test]
 fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_for_five_rounds() {
-    let jpeg = base64::engine::general_purpose::STANDARD
-        .encode([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00]);
+    let jpeg = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00],
+    );
     let original_value = json!({
         "model": "claude-sonnet-4-5",
         "max_tokens": 128,
