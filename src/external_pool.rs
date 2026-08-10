@@ -5574,16 +5574,26 @@ impl ExternalPoolManager {
                         continue;
                     }
                     let cooldown_hint = err.cooldown.clone();
+                    let mut soft_failure_cooldown = false;
+                    let mut soft_failure_streak = None;
                     if let Some((_, reason)) = &cooldown_hint {
                         if should_record_external_pool_soft_failure(reason) {
-                            self.record_external_pool_soft_failure(pool_id, reason)
+                            soft_failure_streak = self
+                                .record_external_pool_soft_failure(pool_id, reason)
                                 .await;
+                            if should_escalate_external_pool_soft_failure(
+                                &config,
+                                soft_failure_streak,
+                            ) {
+                                soft_failure_cooldown = true;
+                            }
                         }
                     }
                     let same_pool_retry_count = same_pool_retry_counts.entry(pool_id).or_insert(0);
                     let same_pool_retry_limit =
                         retry_pipeline::same_pool_retry_limit(&config, &err);
-                    if *same_pool_retry_count < same_pool_retry_limit
+                    if !soft_failure_cooldown
+                        && *same_pool_retry_count < same_pool_retry_limit
                         && route.inference_attempt_budget.available_attempts(0) > 0
                     {
                         *same_pool_retry_count = (*same_pool_retry_count).saturating_add(1);
@@ -5648,6 +5658,20 @@ impl ExternalPoolManager {
                         } else if should_mark_external_pool_hard_cooldown(reason) {
                             self.mark_pool_cooldown(pool_id, *duration, reason.clone())
                                 .await;
+                        } else if soft_failure_cooldown {
+                            self.mark_pool_cooldown(pool_id, *duration, reason.clone())
+                                .await;
+                            tracing::warn!(
+                                request_id = %route.request_id,
+                                error_id = %route.error_id,
+                                pool_id,
+                                pool_name = %pool.name,
+                                reason,
+                                streak = soft_failure_streak.unwrap_or_default(),
+                                threshold = config.external_pool_transient_failure_cooldown_threshold,
+                                cooldown_ms = duration.as_millis(),
+                                "external pool repeated soft failures escalated to short cooldown"
+                            );
                         }
                     }
                     if let Some(reason) = &err.auto_disable_reason {
@@ -7433,7 +7457,7 @@ impl ExternalPoolManager {
         }
     }
 
-    async fn record_external_pool_soft_failure(&self, pool_id: u64, reason: &str) {
+    async fn record_external_pool_soft_failure(&self, pool_id: u64, reason: &str) -> Option<u64> {
         let key = external_pool_transient_failure_key(pool_id);
         match timeout(
             EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT,
@@ -7468,8 +7492,37 @@ impl ExternalPoolManager {
                 );
             }
         }
+        let reason_key = external_pool_transient_failure_reason_key(pool_id, reason);
+        let reason_streak = match timeout(
+            EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT,
+            self.redis
+                .incr_with_ttl(&reason_key, EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS),
+        )
+        .await
+        {
+            Ok(Ok(streak)) => Some(streak.max(1)),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    pool_id,
+                    reason,
+                    error = %err,
+                    "外部池按错误原因统计软失败计数写入失败"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    pool_id,
+                    reason,
+                    timeout_ms = EXTERNAL_POOL_AUTO_DISABLE_REDIS_TIMEOUT.as_millis(),
+                    "外部池按错误原因统计软失败计数写入超时"
+                );
+                None
+            }
+        };
         self.invalidate_external_pool_runtime_capacity_state();
         self.capacity_signal.notify_state_changed();
+        reason_streak
     }
 
     async fn mark_pool_cooldown(&self, pool_id: u64, duration: Duration, reason: String) {
@@ -7538,9 +7591,15 @@ impl ExternalPoolManager {
             .redis
             .del_pattern(format!("external_pool:{pool_id}:model_cooldown:*"))
             .await?;
+        let reason_deleted = self
+            .redis
+            .del_pattern(format!("external_pool:{pool_id}:transient_failures:*"))
+            .await?;
         self.invalidate_external_pool_runtime_capacity_state();
         self.capacity_signal.notify_state_changed();
-        Ok(pool_deleted.saturating_add(model_deleted))
+        Ok(pool_deleted
+            .saturating_add(model_deleted)
+            .saturating_add(reason_deleted))
     }
 
     #[cfg(test)]
@@ -9359,6 +9418,26 @@ fn external_pool_transient_failure_key(pool_id: u64) -> String {
     format!("external_pool:{}:transient_failures", pool_id)
 }
 
+fn external_pool_transient_failure_reason_key(pool_id: u64, reason: &str) -> String {
+    let normalized = reason
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    let reason = if normalized.is_empty() {
+        "unknown"
+    } else {
+        normalized.as_str()
+    };
+    format!("external_pool:{pool_id}:transient_failures:{reason}")
+}
+
 fn decode_pool_runtime_snapshot(
     pool_id: u64,
     models: &[String],
@@ -9982,6 +10061,14 @@ fn external_pool_cooldown_duration(
 
 fn should_record_external_pool_soft_failure(reason: &str) -> bool {
     !matches!(reason, "model_mapping_miss" | "model_unavailable")
+}
+
+fn should_escalate_external_pool_soft_failure(
+    config: &ExternalPoolsConfig,
+    streak: Option<u64>,
+) -> bool {
+    let threshold = config.external_pool_transient_failure_cooldown_threshold;
+    threshold > 0 && streak.is_some_and(|streak| streak >= threshold as u64)
 }
 
 fn should_mark_external_pool_hard_cooldown(reason: &str) -> bool {

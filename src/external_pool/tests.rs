@@ -1080,6 +1080,7 @@ fn external_stream_config_for_test() -> ExternalPoolsConfig {
         external_pool_protocol_error_cooldown_secs: 1,
         external_pool_network_error_cooldown_secs: 1,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     }
 }
@@ -4985,6 +4986,16 @@ async fn external_pool_soft_failure_streak_accumulates_and_requires_manual_clear
         .unwrap()
         .expect("soft failure streak should exist");
     assert_eq!(streak, 2);
+    let reason_streak = manager
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_reason_key(
+            pool_id,
+            "server_error",
+        ))
+        .await
+        .unwrap()
+        .expect("reason-scoped soft failure streak should exist");
+    assert_eq!(reason_streak, 2);
 
     manager.reset_pool_auto_disable_failure_counts(pool_id);
     timeout(Duration::from_secs(2), async {
@@ -5023,6 +5034,18 @@ async fn external_pool_soft_failure_streak_accumulates_and_requires_manual_clear
     assert!(
         after_clear.is_none(),
         "manual clear should reset the soft failure streak"
+    );
+    let after_reason_clear = manager
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_reason_key(
+            pool_id,
+            "server_error",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        after_reason_clear.is_none(),
+        "manual clear should reset reason-scoped soft failure streak"
     );
 
     postgres.drop_test_schema().await.unwrap();
@@ -6704,6 +6727,85 @@ async fn external_pool_retry_after_header_records_soft_failure_without_pool_cool
     postgres.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_repeated_soft_failures_escalate_to_short_cooldown() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let pool =
+        create_messages_pool(&postgres, "repeated-soft-cooldown", 1, &failing.base_url).await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 4,
+        external_pool_retry_max_attempts: 1,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        external_pool_server_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 3,
+        ..ExternalPoolsConfig::default()
+    };
+
+    for index in 0..3 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_repeated_soft_cooldown_{index}");
+        route.error_id = format!("err_repeated_soft_cooldown_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("repeated failing request should finish");
+        assert!(
+            matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+            "single failing pool should return bounded final errors"
+        );
+    }
+    assert_eq!(failing.snapshot(), 3);
+
+    let runtime = manager
+        .load_pool_runtime_snapshot(pool.id, &[])
+        .await
+        .expect("read runtime after repeated soft failures");
+    assert!(
+        runtime.pool_cooldown_remaining_secs > 0,
+        "third same-reason soft failure should create a short hard cooldown"
+    );
+    assert_eq!(
+        runtime.pool_cooldown_reason.as_deref(),
+        Some("server_error")
+    );
+    assert_eq!(runtime.transient_failure_streak, 3);
+
+    let mut blocked_route = test_route("claude-sonnet-4-6");
+    blocked_route.request_id = "req_repeated_soft_cooldown_blocked".to_string();
+    blocked_route.error_id = "err_repeated_soft_cooldown_blocked".to_string();
+    blocked_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+    let blocked = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, blocked_route),
+    )
+    .await
+    .expect("cooldown-blocked request should finish");
+    assert!(
+        matches!(blocked, ExternalPoolForwardOutcome::FinalError(_)),
+        "cooldown should fail fast when no other pool is available"
+    );
+    assert_eq!(
+        failing.snapshot(),
+        3,
+        "active cooldown must prevent immediately hitting the failing upstream again"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_transient_failure_penalty_moves_sustained_traffic_to_healthy_backup() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
@@ -6757,6 +6859,7 @@ async fn external_pool_transient_failure_penalty_moves_sustained_traffic_to_heal
         external_pool_same_pool_retry_count: 0,
         external_pool_server_error_cooldown_secs: 1,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -6949,6 +7052,7 @@ async fn external_pool_one_wave_all_pools_transient_502_does_not_blackout_recove
         external_pool_same_pool_retry_count: 0,
         external_pool_server_error_cooldown_secs: 30,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7062,6 +7166,7 @@ async fn external_pool_high_concurrency_sustained_primary_502_transfers_to_backu
         external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7212,6 +7317,7 @@ async fn external_pool_high_concurrency_random_mixed_status_turbulence_transfers
         external_pool_retry_max_attempts: 4,
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7366,6 +7472,7 @@ async fn external_pool_mock_error_matrix_limits_repeated_failures_and_preserves_
         external_pool_same_pool_retry_status_codes: vec![429, 500, 502, 503, 504, 523],
         external_pool_same_pool_retry_delay_ms: 1,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7533,6 +7640,7 @@ async fn external_pool_mock_sporadic_failures_recover_without_long_blackout() {
         external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
         external_pool_same_pool_retry_delay_ms: 1,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7630,6 +7738,7 @@ async fn external_pool_high_concurrency_network_turbulence_transfers_to_healthy_
         external_pool_retry_on_network_error: true,
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7767,6 +7876,7 @@ async fn external_pool_all_pools_sustained_502_recovers_without_long_blackout() 
         external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7888,6 +7998,7 @@ async fn external_pool_one_wave_account_capacity_and_quota_errors_soft_recover()
             external_pool_rate_limit_cooldown_secs: 30,
             external_pool_protocol_error_cooldown_secs: 30,
             external_pool_transient_failure_priority_penalty: 20,
+            external_pool_transient_failure_cooldown_threshold: 0,
             ..ExternalPoolsConfig::default()
         };
 

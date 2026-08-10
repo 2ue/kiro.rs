@@ -5676,6 +5676,9 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_transient_failure_priority_penalty > 10_000 {
         return Err("externalPoolTransientFailurePriorityPenalty 不能大于 10000".to_string());
     }
+    if config.external_pool_transient_failure_cooldown_threshold > 1_000 {
+        return Err("externalPoolTransientFailureCooldownThreshold 不能大于 1000".to_string());
+    }
     if config.external_pool_local_rescue_max_wait_secs > 300 {
         return Err("externalPoolLocalRescueMaxWaitSecs 不能大于 300".to_string());
     }

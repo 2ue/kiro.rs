@@ -329,6 +329,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolSamePoolRetryStatusCodes: [401, 403, 429, 500, 502, 503, 504],
     externalPoolSamePoolRetryDelayMs: 500,
     externalPoolTransientFailurePriorityPenalty: 20,
+    externalPoolTransientFailureCooldownThreshold: 3,
     externalDirectPolicyEnabled: false,
     directExternalOnLocalMaintenance: false,
     directExternalModelRules: [],

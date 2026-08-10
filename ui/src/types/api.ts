@@ -1532,6 +1532,7 @@ export interface ExternalPoolsConfig {
   externalPoolSamePoolRetryStatusCodes: number[]
   externalPoolSamePoolRetryDelayMs: number
   externalPoolTransientFailurePriorityPenalty: number
+  externalPoolTransientFailureCooldownThreshold: number
   externalDirectPolicyEnabled: boolean
   directExternalOnLocalMaintenance: boolean
   directExternalModelRules: string[]

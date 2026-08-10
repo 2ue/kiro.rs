@@ -320,6 +320,7 @@ export function ExternalPoolsPanel() {
           externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(samePoolRetryStatusCodesText),
           externalPoolSamePoolRetryDelayMs: whole(configDraft.externalPoolSamePoolRetryDelayMs),
           externalPoolTransientFailurePriorityPenalty: whole(configDraft.externalPoolTransientFailurePriorityPenalty),
+          externalPoolTransientFailureCooldownThreshold: whole(configDraft.externalPoolTransientFailureCooldownThreshold),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
@@ -567,6 +568,7 @@ export function ExternalPoolsPanel() {
                   <NumberBox disabled={!externalEnabled} label="同池重试次数" description="命中下面状态码时，先在同一个外部池上重试；重试耗尽后才冷却并尝试其他外部池。" value={configDraft.externalPoolSamePoolRetryCount} onChange={(externalPoolSamePoolRetryCount) => setConfigDraft((prev) => ({ ...prev, externalPoolSamePoolRetryCount }))} />
                   <NumberBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试间隔毫秒" value={configDraft.externalPoolSamePoolRetryDelayMs} onChange={(externalPoolSamePoolRetryDelayMs) => setConfigDraft((prev) => ({ ...prev, externalPoolSamePoolRetryDelayMs }))} />
                   <NumberBox disabled={!externalEnabled} label="失败池临时降权" description="每个瞬态失败窗口内的失败次数都会临时增加有效优先级；默认 20，可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。" value={configDraft.externalPoolTransientFailurePriorityPenalty} onChange={(externalPoolTransientFailurePriorityPenalty) => setConfigDraft((prev) => ({ ...prev, externalPoolTransientFailurePriorityPenalty }))} />
+                  <NumberBox disabled={!externalEnabled} label="连续失败冷却阈值" description="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；0 表示关闭。" value={configDraft.externalPoolTransientFailureCooldownThreshold} min={0} onChange={(externalPoolTransientFailureCooldownThreshold) => setConfigDraft((prev) => ({ ...prev, externalPoolTransientFailureCooldownThreshold }))} />
                   <TextArea disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试状态码" value={samePoolRetryStatusCodesText} onChange={setSamePoolRetryStatusCodesText} />
                   <SelectBox disabled={!externalEnabled} label="流式 SSE 默认转发" value={configDraft.externalPoolStreamResponseMode} onChange={(externalPoolStreamResponseMode) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamResponseMode: externalPoolStreamResponseMode as ExternalPoolsConfig['externalPoolStreamResponseMode'] }))}>
                     <option value="event_passthrough">事件级透传</option>

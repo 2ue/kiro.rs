@@ -162,6 +162,7 @@ export function ExternalPoolsPage() {
           externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(samePoolRetryStatusCodesText),
           externalPoolSamePoolRetryDelayMs: whole(configDraft.externalPoolSamePoolRetryDelayMs),
           externalPoolTransientFailurePriorityPenalty: whole(configDraft.externalPoolTransientFailurePriorityPenalty),
+          externalPoolTransientFailureCooldownThreshold: whole(configDraft.externalPoolTransientFailureCooldownThreshold),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
@@ -407,6 +408,7 @@ export function ExternalPoolsPage() {
                   <NumberBox disabled={!externalEnabled} label="同池重试次数" description="命中下面状态码时，先在同一个外部账号上重试；重试耗尽后才冷却并尝试其他外部账号。" suffix="次" value={configDraft.externalPoolSamePoolRetryCount} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryCount: v }))} />
                   <NumberBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试间隔" suffix="毫秒" value={configDraft.externalPoolSamePoolRetryDelayMs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryDelayMs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="失败池临时降权" description="每个瞬态失败窗口内的失败次数都会临时增加有效优先级；默认 20，可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。" suffix="优先级" min={0} value={configDraft.externalPoolTransientFailurePriorityPenalty} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailurePriorityPenalty: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="连续失败冷却阈值" description="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；0 表示关闭。" suffix="次" min={0} value={configDraft.externalPoolTransientFailureCooldownThreshold} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailureCooldownThreshold: v }))} />
                   <TextAreaBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试状态码" value={samePoolRetryStatusCodesText} onChange={setSamePoolRetryStatusCodesText} />
                 </div>
               </FormSection>

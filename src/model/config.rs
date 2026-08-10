@@ -2840,6 +2840,13 @@ pub struct ExternalPoolsConfig {
     /// 优先级 10/20 的健康池；填 0 会退回只按配置优先级和负载排序。
     #[serde(default = "default_external_pool_transient_failure_priority_penalty")]
     pub external_pool_transient_failure_priority_penalty: u32,
+    /// 连续瞬态失败升级为池级短冷却的阈值。
+    ///
+    /// 0 表示关闭升级，只保留短期优先级罚分。默认 3 表示同一个外部池在
+    /// Redis 瞬态失败窗口内连续出现 3 次同类失败后，才按该错误类型的
+    /// 冷却秒数临时避让，避免一次抖动就把流量全部切走。
+    #[serde(default = "default_external_pool_transient_failure_cooldown_threshold")]
+    pub external_pool_transient_failure_cooldown_threshold: u32,
     #[serde(default)]
     pub external_direct_policy_enabled: bool,
     #[serde(default)]
@@ -2981,6 +2988,8 @@ impl Default for ExternalPoolsConfig {
             ),
             external_pool_transient_failure_priority_penalty:
                 default_external_pool_transient_failure_priority_penalty(),
+            external_pool_transient_failure_cooldown_threshold:
+                default_external_pool_transient_failure_cooldown_threshold(),
             external_direct_policy_enabled: false,
             direct_external_on_local_maintenance: false,
             direct_external_model_rules: Vec::new(),
@@ -4483,6 +4492,10 @@ fn default_external_pool_transient_failure_priority_penalty() -> u32 {
     20
 }
 
+fn default_external_pool_transient_failure_cooldown_threshold() -> u32 {
+    3
+}
+
 fn default_external_pool_max_input_tokens() -> i32 {
     1_000_000
 }
@@ -5447,6 +5460,12 @@ mod tests {
             20
         );
         assert_eq!(
+            config
+                .external_pools
+                .external_pool_transient_failure_cooldown_threshold,
+            3
+        );
+        assert_eq!(
             config.external_pools.external_pool_max_input_tokens,
             1_000_000
         );
@@ -5512,6 +5531,12 @@ mod tests {
                 .external_pools
                 .external_pool_transient_failure_priority_penalty,
             20
+        );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_transient_failure_cooldown_threshold,
+            3
         );
         assert_eq!(
             config.external_pools.external_pool_dispatch_max_wait_secs,
