@@ -5108,6 +5108,40 @@ impl MultiTokenManager {
         })
     }
 
+    fn has_alternate_dispatchable_credential_for_slot_race(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+        current_priority: u32,
+        request_weight_units: u32,
+    ) -> bool {
+        let priority_mode = self.load_balancing_mode.lock().as_str() == "priority";
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        let config = self.config.lock().clone();
+        let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
+        if self.redis_store.is_none() {
+            refresh_local_selection_windows_locked(&mut entries, now);
+        }
+        let proxy_resources = self.proxy_resources.lock();
+        entries.iter().any(|entry| {
+            entry.id != current_id
+                && !excluded_ids.contains(&entry.id)
+                && (!priority_mode || entry.credentials.priority == current_priority)
+                && credential_is_dispatchable(
+                    &proxy_resources,
+                    entry,
+                    model,
+                    now,
+                    max_concurrent_requests,
+                    global_rpm,
+                    request_weight_units,
+                )
+        })
+    }
+
     fn exclude_credentials_requiring_refresh(&self, excluded_ids: &mut HashSet<u64>) -> usize {
         let entries = self.entries.lock();
         let before = excluded_ids.len();
@@ -6340,6 +6374,23 @@ impl MultiTokenManager {
                         credential_id = id,
                         excluded_count = local_excluded_ids.len(),
                         "fail-fast 预检选中账号后并发槽已满，本次请求临时排除并重选"
+                    );
+                    continue;
+                }
+                if self.has_alternate_dispatchable_credential_for_slot_race(
+                    model,
+                    &local_excluded_ids,
+                    id,
+                    credentials.priority,
+                    request_weight_units,
+                ) {
+                    local_excluded_ids.insert(id);
+                    attempt_count += 1;
+                    slot_race_excluded_count += 1;
+                    tracing::debug!(
+                        credential_id = id,
+                        excluded_count = local_excluded_ids.len(),
+                        "选中凭据后并发槽已被其他请求占用，本次请求临时排除并重选其他可用凭据"
                     );
                     continue;
                 }

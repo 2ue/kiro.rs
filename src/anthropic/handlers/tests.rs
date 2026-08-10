@@ -10097,7 +10097,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
@@ -10242,7 +10242,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        None
+        Some("external_error")
     );
 }
 
@@ -10282,7 +10282,7 @@ fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
 }
 
 #[test]
-fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fallbacks() {
+fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
     let config = ExternalPoolsConfig::default();
     let rate_limit = ExternalPoolFinalError {
         status: StatusCode::TOO_MANY_REQUESTS,
@@ -10330,7 +10330,7 @@ fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fall
             Some("local_capacity_full"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
@@ -10339,7 +10339,7 @@ fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fall
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
@@ -10348,7 +10348,7 @@ fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fall
             Some("local_attempt_reserved_for_fallback"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
 }
 

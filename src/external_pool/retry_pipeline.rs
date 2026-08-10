@@ -71,6 +71,17 @@ pub(super) fn should_retry_same_pool(
     retry_status_matches(status, &config.same_pool_retry_status_codes())
 }
 
+pub(super) fn same_pool_retry_limit(config: &ExternalPoolsConfig, err: &ExternalPoolError) -> u32 {
+    if !should_retry_same_pool(config, err) {
+        return 0;
+    }
+    // Keep same-pool replay bounded to a single retry. More than one retry on the
+    // same pool tends to amplify one upstream fault into repeated failures for
+    // the same request, while the scheduler-level transient penalty already
+    // handles future requests.
+    config.external_pool_same_pool_retry_count.min(1)
+}
+
 pub(super) fn should_retry_cross_pool(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolError,

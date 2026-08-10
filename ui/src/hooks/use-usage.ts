@@ -11,6 +11,7 @@ import {
   getUsageDashboard,
   getUsageDashboardBreakdown,
   getUsageDashboardExternalPoolBilling,
+  getUsageDashboardExternalPoolRisk,
   getUsageDashboardSeries,
   getUsageDashboardTop,
   getUsageDashboardWindows,
@@ -25,7 +26,7 @@ import {
   syncModelPricing,
   upsertManualModel,
 } from '@/api/usage'
-import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageExternalPoolRiskQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 type RefetchInterval = number | false
 
@@ -133,6 +134,19 @@ export function useUsageDashboardExternalPoolBilling(
   })
 }
 
+export function useUsageDashboardExternalPoolRisk(
+  query: UsageExternalPoolRiskQuery,
+  refetchInterval: RefetchInterval = false,
+  enabled = true
+) {
+  return useQuery({
+    queryKey: ['usage-dashboard-external-pool-risk', query],
+    queryFn: () => getUsageDashboardExternalPoolRisk(query),
+    refetchInterval,
+    enabled,
+  })
+}
+
 function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQueryClient>) {
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-windows'] })
@@ -140,6 +154,7 @@ function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQuery
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-top'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-breakdown'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-billing'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-risk'] })
   queryClient.invalidateQueries({ queryKey: ['usage-writer-stats'] })
 }
 

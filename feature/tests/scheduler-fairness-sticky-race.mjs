@@ -34,6 +34,7 @@ const POSTGRES_URL_TEMPLATE = requiredEnvironment('KIRO_E01_E02_POSTGRES_URL_TEM
 const REDIS_URL = requiredEnvironment('KIRO_E01_E02_REDIS_URL')
 const REDIS_PREFIX = requiredEnvironment('KIRO_E01_E02_REDIS_PREFIX')
 const VALIDATE_ONLY = process.env.KIRO_E01_E02_VALIDATE_ONLY === '1'
+const EXTRA_LOCAL_MATRIX = process.env.KIRO_E01_E02_EXTRA_LOCAL_MATRIX === '1'
 const RUN_ID = `e0102-${new Date().toISOString().replace(/[-:.TZ]/g, '')}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = path.join(ARTIFACT_ROOT, 'runtime', 'e01-e02', RUN_ID)
 const REPORT_ROOT = path.join(ARTIFACT_ROOT, 'reports', 'e01-e02')
@@ -387,7 +388,7 @@ async function isPortOpen(port) {
 async function waitForCondition(predicate, description, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (predicate()) return
+    if (await predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   throw new Error(`timeout waiting for ${description}`)
@@ -468,6 +469,7 @@ function createFakeUpstreams() {
   const externalRecords = []
   const currentByCredential = new Map()
   const peakByCredential = new Map()
+  const extraFailureHits = new Map()
   const holds = new Map()
   let globalInFlight = 0
   let globalPeakInFlight = 0
@@ -500,6 +502,76 @@ function createFakeUpstreams() {
     for (const entry of [...holds.values()]) entry.release()
   }
 
+  function controlledLocalFailure(marker, selectedCredential) {
+    if (marker.includes('-EXTRA-MIXED-')) {
+      if (selectedCredential <= 10) {
+        return {
+          status: 500,
+          body: { message: 'controlled extra local server error', reason: 'SERVER_ERROR' },
+        }
+      }
+      if (selectedCredential <= 20) {
+        return {
+          status: 429,
+          body: { message: 'controlled extra local rate limit', reason: 'THROTTLING_EXCEPTION' },
+        }
+      }
+      if (selectedCredential <= 30) {
+        return {
+          status: 403,
+          body: {
+            message: 'User is not authorized to make this call.',
+            reason: 'ACCESS_DENIED',
+          },
+        }
+      }
+    }
+
+    if (marker.includes('-EXTRA-RECOVER-A-')) {
+      const caseKey = marker.split('-EXTRA-RECOVER-A-', 1)[0]
+      const key = `recover-a:${caseKey}:${selectedCredential}`
+      const hit = (extraFailureHits.get(key) || 0) + 1
+      extraFailureHits.set(key, hit)
+      if (hit === 1) {
+        return {
+          status: 500,
+          body: { message: 'controlled recoverable local server error', reason: 'SERVER_ERROR' },
+        }
+      }
+    }
+
+    if ((marker.includes('-EXTRA-DISABLE-')
+      || marker.includes('-EXTRA-FALLBACK-AFTER-LOCAL-403-'))
+      && selectedCredential <= 10) {
+      return {
+        status: 403,
+        body: {
+          message: 'User is not authorized to make this call.',
+          reason: 'ACCESS_DENIED',
+        },
+      }
+    }
+
+    if (marker.includes('-EXTRA-RECOVER-FLAKE-') && selectedCredential <= 10) {
+      const key = `recover-flake:${marker.split('-EXTRA-RECOVER-FLAKE-', 1)[0]}:${selectedCredential}`
+      const hit = (extraFailureHits.get(key) || 0) + 1
+      extraFailureHits.set(key, hit)
+      if (hit <= 2) {
+        return {
+          status: 500,
+          body: { message: 'controlled local flake before recovery', reason: 'SERVER_ERROR' },
+        }
+      }
+    }
+
+    return null
+  }
+
+  function extraLocalDelayMs(marker, selectedCredential) {
+    if (marker.includes('-EXTRA-SLOW-') && selectedCredential <= 10) return 450
+    return upstreamDelayMs(marker)
+  }
+
   const local = http.createServer(async (request, response) => {
     const raw = await readBody(request)
     const marker = extractMarker(raw)
@@ -519,6 +591,7 @@ function createFakeUpstreams() {
       selectedCredential,
       startedAt: Date.now(),
       completedAt: null,
+      status: null,
     }
     records.push(record)
 
@@ -549,7 +622,16 @@ function createFakeUpstreams() {
     if (held) {
       await held.gate
     } else {
-      await new Promise((resolve) => setTimeout(resolve, upstreamDelayMs(marker)))
+      await new Promise((resolve) => setTimeout(resolve, extraLocalDelayMs(marker, selectedCredential)))
+    }
+    const failure = controlledLocalFailure(marker, selectedCredential)
+    if (failure) {
+      record.status = failure.status
+      writeJson(response, failure.status, failure.body)
+      record.completedAt = Date.now()
+      currentByCredential.set(selectedCredential, current - 1)
+      globalInFlight -= 1
+      return
     }
     const body = Buffer.concat([
       eventFrame('assistantResponseEvent', {
@@ -572,6 +654,7 @@ function createFakeUpstreams() {
       connection: 'close',
     })
     response.end(body)
+    record.status = 200
     record.completedAt = Date.now()
     currentByCredential.set(selectedCredential, current - 1)
     globalInFlight -= 1
@@ -580,7 +663,13 @@ function createFakeUpstreams() {
   const external = http.createServer(async (request, response) => {
     const raw = await readBody(request)
     const marker = extractMarker(raw)
-    externalRecords.push({ marker, at: Date.now() })
+    const record = {
+      marker,
+      startedAt: Date.now(),
+      completedAt: null,
+      status: 200,
+    }
+    externalRecords.push(record)
     writeJson(response, 200, {
       id: `msg_external_${externalRecords.length}`,
       type: 'message',
@@ -591,6 +680,7 @@ function createFakeUpstreams() {
       stop_sequence: null,
       usage: { input_tokens: 8, output_tokens: 2 },
     })
+    record.completedAt = Date.now()
   })
 
   return {
@@ -607,6 +697,9 @@ function createFakeUpstreams() {
     },
     externalHits(prefix) {
       return externalRecords.filter((record) => record.marker.startsWith(prefix)).length
+    },
+    externalRecords(prefix) {
+      return externalRecords.filter((record) => record.marker.startsWith(prefix))
     },
     async listen(localPort, externalPort) {
       await Promise.all([
@@ -745,7 +838,12 @@ async function sendMessage(baseUrl, marker, sessionSeed = marker) {
     response.text.match(/selected-(\d+)/)?.[1] || '0',
     10,
   )
-  return { marker, selectedCredential, ...response }
+  return {
+    marker,
+    selectedCredential,
+    external: response.text.includes('external-unexpected'),
+    ...response,
+  }
 }
 
 function credentialsFor(mode) {
@@ -797,6 +895,12 @@ function serviceConfig({ databaseUrl, redisUrl, redisPrefix, servicePort, localP
     credentialRpm: 0,
     credentialMaxConcurrentRequests: 1,
     credentialDispatchMaxWaitSecs: 5,
+    credentialRateLimitCooldownSecs: 1,
+    credentialServerErrorCooldownSecs: 1,
+    credentialAuthErrorCooldownSecs: 1,
+    credentialMaxCooldownSecs: 3,
+    credentialCooldownJitterPercent: 0,
+    credentialProbationSecs: 2,
     dispatchGlobalMaxConcurrentRequests: 160,
     dispatchMaxQueuedRequests: 160,
     loadBalancingMode: mode,
@@ -846,6 +950,18 @@ async function configureExternalPool(baseUrl, externalPort, name) {
   })
   assert.equal(response.status, 200, response.text)
   await new Promise((resolve) => setTimeout(resolve, 350))
+  return JSON.parse(response.text)
+}
+
+async function setExternalPoolEnabled(baseUrl, id, enabled) {
+  const response = await timedRequest(`${baseUrl}/api/admin/external-pools/${id}/enabled`, {
+    method: 'POST',
+    headers: adminHeaders(),
+    body: JSON.stringify({ enabled }),
+  })
+  assert.equal(response.status, 200, response.text)
+  await new Promise((resolve) => setTimeout(resolve, 350))
+  return JSON.parse(response.text)
 }
 
 function quantiles(values) {
@@ -955,6 +1071,14 @@ async function fetchRuntime(baseUrl) {
   return JSON.parse(response.text)
 }
 
+async function fetchCredentialList(baseUrl) {
+  const response = await timedRequest(`${baseUrl}/api/admin/credentials/list?limit=${ACCOUNT_COUNT}`, {
+    headers: adminHeaders(),
+  })
+  assert.equal(response.status, 200, response.text)
+  return JSON.parse(response.text)
+}
+
 async function fetchExternalStatus(baseUrl) {
   const response = await timedRequest(`${baseUrl}/api/admin/external-pools/status`, {
     headers: adminHeaders(),
@@ -963,7 +1087,26 @@ async function fetchExternalStatus(baseUrl) {
   return JSON.parse(response.text)
 }
 
-async function waitForExternalReady(services, timeoutMs = 15_000) {
+function externalStatusRecovering(response) {
+  if (response.status === 200) return false
+  return response.status === 500 && response.text.includes('external pool coordinator is recovering')
+}
+
+async function fetchExternalStatusProbe(baseUrl) {
+  const response = await timedRequest(`${baseUrl}/api/admin/external-pools/status`, {
+    headers: adminHeaders(),
+  })
+  if (response.status === 200) {
+    return { ready: true, status: JSON.parse(response.text), probe: response }
+  }
+  if (externalStatusRecovering(response)) {
+    return { ready: false, status: null, probe: response }
+  }
+  assert.equal(response.status, 200, response.text)
+  return { ready: false, status: null, probe: response }
+}
+
+async function waitForExternalReady(services, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   let latest = []
   let lastError = null
@@ -971,9 +1114,9 @@ async function waitForExternalReady(services, timeoutMs = 15_000) {
     try {
       latest = await Promise.all(services.map(async (service) => ({
         name: service.name,
-        status: await fetchExternalStatus(service.baseUrl),
+        ...(await fetchExternalStatusProbe(service.baseUrl)),
       })))
-      if (latest.every(({ status }) => status.pools.length > 0
+      if (latest.every(({ status }) => status?.pools?.length > 0
         && status.pools.some((pool) => pool.dispatchable))) {
         return latest
       }
@@ -1026,6 +1169,87 @@ async function setCredentialValue(baseUrl, id, field, value) {
     body: JSON.stringify(body),
   })
   assert.equal(response.status, 200, response.text)
+}
+
+async function setCredentialDisabled(baseUrl, id, disabled) {
+  const response = await timedRequest(`${baseUrl}/api/admin/credentials/${id}/disabled`, {
+    method: 'POST',
+    headers: adminHeaders(),
+    body: JSON.stringify({ disabled }),
+  })
+  assert.equal(response.status, 200, response.text)
+}
+
+async function resetCredential(baseUrl, id) {
+  const response = await timedRequest(`${baseUrl}/api/admin/credentials/${id}/reset`, {
+    method: 'POST',
+    headers: adminHeaders(),
+  })
+  assert.equal(response.status, 200, response.text)
+}
+
+async function waitForCredentialCoolingToEnd(baseUrl, id, label) {
+  await waitForCondition(
+    async () => {
+      const runtime = await fetchRuntime(baseUrl)
+      if (!runtime.fresh) return false
+      const item = runtime.items.find((entry) => entry.id === id)
+      return item && !item.cooledDown && item.inFlightRequests === 0
+    },
+    `${label} credential #${id} cooldown to end`,
+    15_000,
+  )
+}
+
+async function waitForCredentialsCoolingToEnd(baseUrl, ids, label) {
+  const uniqueIds = [...new Set(ids)].sort((a, b) => a - b)
+  if (uniqueIds.length === 0) return
+  await waitForCondition(
+    async () => {
+      const runtime = await fetchRuntime(baseUrl)
+      if (!runtime.fresh) return false
+      const byId = new Map(runtime.items.map((entry) => [entry.id, entry]))
+      return uniqueIds.every((id) => {
+        const item = byId.get(id)
+        return item && !item.cooledDown && item.inFlightRequests === 0
+      })
+    },
+    `${label} credentials ${uniqueIds.join(',')} cooldown to end`,
+    15_000,
+  )
+}
+
+async function waitForCredentialEnabledState(baseUrl, id, disabled, label) {
+  await waitForCondition(
+    async () => {
+      const list = await fetchCredentialList(baseUrl)
+      const item = list.items.find((entry) => entry.id === id)
+      return item && Boolean(item.disabled) === disabled
+    },
+    `${label} credential #${id} disabled=${disabled}`,
+    15_000,
+  )
+}
+
+async function focusedCredentialDiagnostics(baseUrl, ids = [1, 2]) {
+  const [runtime, credentialList] = await Promise.all([
+    fetchRuntime(baseUrl),
+    fetchCredentialList(baseUrl),
+  ])
+  const runtimeById = new Map(runtime.items.map((item) => [item.id, item]))
+  const listById = new Map(credentialList.items.map((item) => [item.id, item]))
+  return ids.map((id) => ({
+    id,
+    disabled: Boolean(listById.get(id)?.disabled),
+    disabledReason: listById.get(id)?.disabledReason || null,
+    failureCount: runtimeById.get(id)?.failureCount || 0,
+    cooledDown: Boolean(runtimeById.get(id)?.cooledDown),
+    cooldownRemainingSecs: runtimeById.get(id)?.cooldownRemainingSecs || 0,
+    cooldownReason: runtimeById.get(id)?.cooldownReason || null,
+    inFlightRequests: runtimeById.get(id)?.inFlightRequests || 0,
+    lastErrorKind: runtimeById.get(id)?.lastErrorKind || null,
+    lastErrorReason: runtimeById.get(id)?.lastErrorReason || null,
+  }))
 }
 
 async function waitForRuntimeConcurrency(baseUrl, expectedById, label) {
@@ -1084,7 +1308,7 @@ async function startCaseService({
   const baseUrl = `http://127.0.0.1:${servicePort}`
   try {
     await waitForHealth(baseUrl, handle)
-    await configureExternalPool(baseUrl, externalPort, poolName)
+    const externalPool = await configureExternalPool(baseUrl, externalPort, poolName)
     const summary = await fetchSummary(baseUrl)
     assert.equal(summary.total, ACCOUNT_COUNT, JSON.stringify(summary))
     assert.equal(summary.available, ACCOUNT_COUNT, JSON.stringify(summary))
@@ -1094,6 +1318,7 @@ async function startCaseService({
       servicePort,
       handle,
       logPath,
+      externalPool,
       resourcesStart: processResources(handle.pid),
     }
   } catch (error) {
@@ -1441,6 +1666,365 @@ async function weightedCapacityWorkload(primary, fake, casePrefix) {
   }
 }
 
+function responseStatusCounts(responses) {
+  const counts = {}
+  for (const response of responses) {
+    const key = String(response.status)
+    counts[key] = (counts[key] || 0) + 1
+  }
+  return counts
+}
+
+function responseRouteSummary(responses) {
+  return {
+    statusCounts: responseStatusCounts(responses),
+    localSuccesses: responses.filter((response) => response.selectedCredential > 0).length,
+    externalSuccesses: responses.filter((response) => response.external).length,
+    samples: responses.map((response) => ({
+      marker: response.marker,
+      status: response.status,
+      selectedCredential: response.selectedCredential,
+      external: response.external,
+      requestId: response.requestId,
+      errorId: response.errorId,
+      text: response.text.slice(0, 180),
+    })),
+  }
+}
+
+function recordStatusCounts(records) {
+  const counts = {}
+  for (const record of records) {
+    const key = String(record.status)
+    counts[key] = (counts[key] || 0) + 1
+  }
+  return counts
+}
+
+function recordSelectionSummary(records) {
+  const counts = new Map()
+  for (const record of records) {
+    counts.set(record.selectedCredential, (counts.get(record.selectedCredential) || 0) + 1)
+  }
+  const values = [...counts.values()]
+  const total = values.reduce((sum, value) => sum + value, 0)
+  return {
+    total,
+    coverage: counts.size,
+    firstTen: records.filter((record) => record.selectedCredential >= 1
+      && record.selectedCredential <= 10).length,
+    middleTen: records.filter((record) => record.selectedCredential >= 11
+      && record.selectedCredential <= 20).length,
+    thirdTen: records.filter((record) => record.selectedCredential >= 21
+      && record.selectedCredential <= 30).length,
+    healthyTail: records.filter((record) => record.selectedCredential >= 31).length,
+    max: values.length ? Math.max(...values) : 0,
+    min: values.length ? Math.min(...values) : 0,
+    counts: Object.fromEntries([...counts.entries()].sort((a, b) => a[0] - b[0])),
+  }
+}
+
+async function runLocalBatch(baseUrl, prefix, count, concurrency) {
+  const responses = []
+  for (let offset = 0; offset < count; offset += concurrency) {
+    const size = Math.min(concurrency, count - offset)
+    const batch = await Promise.all(Array.from({ length: size }, (_, batchIndex) => {
+      const index = offset + batchIndex + 1
+      return sendMessage(
+        baseUrl,
+        `${prefix}-${index}`,
+        `${prefix}-session-${index}`,
+      )
+    }))
+    responses.push(...batch)
+  }
+  return responses
+}
+
+async function runLocalSequence(baseUrl, prefix, count, delayMs) {
+  const responses = []
+  for (let index = 1; index <= count; index += 1) {
+    responses.push(await sendMessage(
+      baseUrl,
+      `${prefix}-${index}`,
+      `${prefix}-session-${index}`,
+    ))
+    if (delayMs > 0 && index < count) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs))
+    }
+  }
+  return responses
+}
+
+async function biasFirstCredentials(primary, preferredCount, fallbackPriority) {
+  for (let id = 1; id <= preferredCount; id += 1) {
+    await setCredentialValue(primary.baseUrl, id, 'priority', 0)
+  }
+  for (let id = preferredCount + 1; id <= ACCOUNT_COUNT; id += 1) {
+    await setCredentialValue(primary.baseUrl, id, 'priority', fallbackPriority)
+  }
+}
+
+async function extraLocalMatrixWorkload(primary, fake, casePrefix, mode) {
+  const slowPrefix = `${casePrefix}-EXTRA-SLOW`
+  const slowResponses = await runLocalBatch(primary.baseUrl, slowPrefix, 72, 24)
+  const slowStatuses = responseStatusCounts(slowResponses)
+  assert.equal(slowStatuses['200'], slowResponses.length,
+    `${casePrefix}: slow scenario should be all local successes: ${JSON.stringify(slowStatuses)}`)
+  const slowRecords = fake.inferenceRecords(slowPrefix)
+
+  const mixedPrefix = `${casePrefix}-EXTRA-MIXED`
+  const mixedResponses = await runLocalBatch(primary.baseUrl, mixedPrefix, 96, 24)
+  const mixedStatuses = responseStatusCounts(mixedResponses)
+  const mixedRecords = fake.inferenceRecords(mixedPrefix)
+  const mixedRawStatuses = recordStatusCounts(mixedRecords)
+  assert.ok(
+    (mixedStatuses['200'] || 0) > 0,
+    `${casePrefix}: mixed scenario had no healthy local successes: ${JSON.stringify(mixedStatuses)}`,
+  )
+  assert.ok(
+    (mixedStatuses['200'] || 0) < mixedResponses.length,
+    `${casePrefix}: mixed scenario did not expose any client-visible failure: ${JSON.stringify({
+      responseStatuses: mixedStatuses,
+      rawStatuses: mixedRawStatuses,
+    })}`,
+  )
+  assert.ok(
+    (mixedRawStatuses['500'] || 0)
+      + (mixedRawStatuses['429'] || 0)
+      + (mixedRawStatuses['403'] || 0) > 0,
+    `${casePrefix}: mixed scenario did not hit controlled local upstream errors: ${JSON.stringify({
+      responseStatuses: mixedStatuses,
+      rawStatuses: mixedRawStatuses,
+    })}`,
+  )
+  await new Promise((resolve) => setTimeout(resolve, 1_300))
+
+  await biasFirstCredentials(primary, 2, 500)
+
+  const recoverAPrefix = `${casePrefix}-EXTRA-RECOVER-A`
+  const recoverAResponses = await runLocalSequence(primary.baseUrl, recoverAPrefix, 4, 1_150)
+  const recoverAStatuses = responseStatusCounts(recoverAResponses)
+  const recoverARecords = fake.inferenceRecords(recoverAPrefix)
+  const recoverARawStatuses = recordStatusCounts(recoverARecords)
+  assert.ok(
+    (recoverAStatuses['200'] || 0) < recoverAResponses.length,
+    `${casePrefix}: recovery phase A did not expose a client-visible failure: ${JSON.stringify({
+      responseStatuses: recoverAStatuses,
+      rawStatuses: recoverARawStatuses,
+    })}`,
+  )
+  assert.ok(
+    (recoverARawStatuses['500'] || 0) > 0,
+    `${casePrefix}: recovery phase A did not hit the controlled local upstream error: ${JSON.stringify({
+      responseStatuses: recoverAStatuses,
+      rawStatuses: recoverARawStatuses,
+    })}`,
+  )
+  const recoverAFailedIds = recoverARecords
+    .filter((record) => record.status !== 200)
+    .map((record) => record.selectedCredential)
+  await waitForCredentialsCoolingToEnd(primary.baseUrl, recoverAFailedIds, `${casePrefix} recovery phase A`)
+
+  const recoverBPrefix = `${casePrefix}-EXTRA-RECOVER-B`
+  const recoverBResponses = await runLocalBatch(primary.baseUrl, recoverBPrefix, 24, 12)
+  const recoverBStatuses = responseStatusCounts(recoverBResponses)
+  const recoverBExternalRecords = fake.externalRecords(recoverBPrefix)
+  assert.equal(
+    recoverBStatuses['200'],
+    recoverBResponses.length,
+    `${casePrefix}: recovery phase B should return to local success: ${JSON.stringify(recoverBStatuses)}`,
+  )
+  const recoverBRecords = fake.inferenceRecords(recoverBPrefix)
+  const recoverBRawStatuses = recordStatusCounts(recoverBRecords)
+  assert.equal(
+    recoverBRawStatuses['200'],
+    recoverBRecords.length,
+    `${casePrefix}: recovery phase B raw upstream records should all be successful: ${JSON.stringify({
+      responseStatuses: recoverBStatuses,
+      rawStatuses: recoverBRawStatuses,
+      records: recoverBRecords,
+    })}`,
+  )
+  assert.equal(
+    recoverBExternalRecords.length,
+    0,
+    `${casePrefix}: recovery phase B unexpectedly used external fallback while local credentials had recovered: ${JSON.stringify({
+      mode,
+      responses: responseRouteSummary(recoverBResponses),
+      rawStatuses: recoverBRawStatuses,
+      records: recoverBRecords,
+      externalRecords: recoverBExternalRecords,
+    })}`,
+  )
+
+  for (let id = 2; id <= ACCOUNT_COUNT; id += 1) {
+    await setCredentialDisabled(primary.baseUrl, id, true)
+  }
+  await waitForCondition(
+    async () => {
+      const list = await fetchCredentialList(primary.baseUrl)
+      const byId = new Map(list.items.map((item) => [item.id, item]))
+      return Array.from({ length: ACCOUNT_COUNT - 1 }, (_, index) => index + 2)
+        .every((id) => byId.get(id)?.disabled === true)
+    },
+    `${casePrefix}: manual disable propagation for focused auto-disable fixture`,
+    15_000,
+  )
+
+  await resetCredential(primary.baseUrl, 1)
+  await waitForCredentialEnabledState(primary.baseUrl, 1, false, `${casePrefix} fallback fixture`)
+  await waitForCredentialCoolingToEnd(primary.baseUrl, 1, `${casePrefix} fallback fixture`)
+  const fallbackPrefix = `${casePrefix}-EXTRA-FALLBACK-AFTER-LOCAL-403`
+  const fallbackResponses = await runLocalSequence(primary.baseUrl, fallbackPrefix, 2, 50)
+  const fallbackRecords = fake.inferenceRecords(fallbackPrefix)
+  const fallbackRawStatuses = recordStatusCounts(fallbackRecords)
+  const fallbackExternalRecords = fake.externalRecords(fallbackPrefix)
+  assert.ok(
+    (fallbackRawStatuses['403'] || 0) >= 1,
+    `${casePrefix}: fallback fixture did not first hit the controlled local 403: ${JSON.stringify({
+      responses: responseRouteSummary(fallbackResponses),
+      rawStatuses: fallbackRawStatuses,
+      records: fallbackRecords,
+      externalRecords: fallbackExternalRecords,
+      focusedCredentials: await focusedCredentialDiagnostics(primary.baseUrl),
+    })}`,
+  )
+  assert.ok(
+    fallbackExternalRecords.length >= 1,
+    `${casePrefix}: fallback-enabled fixture did not expose external fallback after local auth cooldown: ${JSON.stringify({
+      responses: responseRouteSummary(fallbackResponses),
+      rawStatuses: fallbackRawStatuses,
+      records: fallbackRecords,
+      externalRecords: fallbackExternalRecords,
+      focusedCredentials: await focusedCredentialDiagnostics(primary.baseUrl),
+    })}`,
+  )
+
+  await setExternalPoolEnabled(primary.baseUrl, primary.externalPool.id, false)
+  await resetCredential(primary.baseUrl, 1)
+  await waitForCredentialEnabledState(primary.baseUrl, 1, false, `${casePrefix} focused disable`)
+  await waitForCredentialCoolingToEnd(primary.baseUrl, 1, `${casePrefix} focused disable`)
+
+  const disablePrefix = `${casePrefix}-EXTRA-DISABLE`
+  const disableResponses = []
+  for (let index = 1; index <= 3; index += 1) {
+    disableResponses.push(await sendMessage(
+      primary.baseUrl,
+      `${disablePrefix}-${index}`,
+      `${disablePrefix}-session-${index}`,
+    ))
+    if (index < 3) {
+      await waitForCredentialCoolingToEnd(primary.baseUrl, 1, `${casePrefix} focused disable`)
+    }
+  }
+  const disableStatuses = responseStatusCounts(disableResponses)
+  const disableRecords = fake.inferenceRecords(disablePrefix)
+  const runtime = await fetchRuntime(primary.baseUrl)
+  const credentialList = await fetchCredentialList(primary.baseUrl)
+  const runtimeById = new Map(runtime.items.map((item) => [item.id, item]))
+  const listById = new Map(credentialList.items.map((item) => [item.id, item]))
+  const disabledFocused = [1]
+    .map((id) => {
+      const runtimeItem = runtimeById.get(id) || {}
+      const listItem = listById.get(id) || {}
+      return {
+      id,
+      disabled: Boolean(listItem.disabled),
+      disabledReason: listItem.disabledReason || null,
+      failureCount: runtimeItem.failureCount || 0,
+      cooldownRemainingSecs: runtimeItem.cooldownRemainingSecs || 0,
+      cooldownReason: runtimeItem.cooldownReason || null,
+      lastErrorKind: runtimeItem.lastErrorKind || null,
+    }
+  })
+    .filter((item) => item.disabled)
+  const disableRawStatuses = recordStatusCounts(disableRecords)
+  assert.equal(
+    disableRawStatuses['403'],
+    3,
+    `${casePrefix}: focused disable fixture did not send three controlled 403s to the same local credential: ${JSON.stringify({
+      responseStatuses: disableStatuses,
+      responses: responseRouteSummary(disableResponses),
+      rawStatuses: disableRawStatuses,
+      records: disableRecords,
+      externalRecords: fake.externalRecords(disablePrefix),
+    })}`,
+  )
+  assert.ok(
+    disableRecords.every((record) => record.selectedCredential === 1),
+    `${casePrefix}: focused disable fixture selected an unexpected credential: ${JSON.stringify(disableRecords)}`,
+  )
+  assert.ok(
+    disabledFocused.length === 1,
+    `${casePrefix}: repeated 403 did not auto-disable the focused credential: ${JSON.stringify({
+      statuses: disableStatuses,
+      responses: responseRouteSummary(disableResponses),
+      records: disableRecords,
+      runtime: runtime.items.filter((item) => item.id <= 2),
+      credentialList: credentialList.items.filter((item) => item.id <= 2),
+      externalRecords: fake.externalRecords(disablePrefix),
+    })}`,
+  )
+
+  return {
+    mode,
+    slow: {
+      requestCount: slowResponses.length,
+      statusCounts: slowStatuses,
+      selection: recordSelectionSummary(slowRecords),
+      latency: {
+        headerMs: quantiles(slowResponses.map((response) => response.headerMs)),
+        totalMs: quantiles(slowResponses.map((response) => response.totalMs)),
+      },
+    },
+    mixed: {
+      requestCount: mixedResponses.length,
+      statusCounts: mixedStatuses,
+      selection: recordSelectionSummary(mixedRecords),
+      sampleErrors: mixedResponses
+        .filter((response) => response.status !== 200)
+        .slice(0, 8)
+        .map((response) => ({
+          status: response.status,
+          requestId: response.requestId,
+          errorId: response.errorId,
+          text: response.text.slice(0, 220),
+        })),
+    },
+    recovery: {
+      phaseA: {
+        statusCounts: recoverAStatuses,
+        rawStatusCounts: recoverARawStatuses,
+        selection: recordSelectionSummary(recoverARecords),
+      },
+      phaseB: {
+        statusCounts: recoverBStatuses,
+        rawStatusCounts: recoverBRawStatuses,
+        externalRecords: recoverBExternalRecords,
+        expectedRecoveredSelection: 'local credentials recover without external fallback after controlled local failures cool down',
+        selection: recordSelectionSummary(recoverBRecords),
+      },
+    },
+    fallbackAfterLocal403: {
+      requestCount: fallbackResponses.length,
+      responses: responseRouteSummary(fallbackResponses),
+      rawStatusCounts: fallbackRawStatuses,
+      selection: recordSelectionSummary(fallbackRecords),
+      externalRecords: fallbackExternalRecords,
+    },
+    disable: {
+      requestCount: disableResponses.length,
+      statusCounts: disableStatuses,
+      rawStatusCounts: disableRawStatuses,
+      selection: recordSelectionSummary(disableRecords),
+      responses: responseRouteSummary(disableResponses),
+      externalRecords: fake.externalRecords(disablePrefix),
+      disabledFocused,
+    },
+  }
+}
+
 function summarizeSamples(samples, service) {
   const selected = samples
     .flatMap((sample) => sample.services)
@@ -1546,6 +2130,9 @@ async function runCase({
     const weightedCapacity = mode === 'weighted_least_inflight'
       ? await weightedCapacityWorkload(primary, fake, casePrefix)
       : null
+    const extraLocalMatrix = EXTRA_LOCAL_MATRIX && round === 1
+      ? await extraLocalMatrixWorkload(primary, fake, casePrefix, mode)
+      : null
 
     const samples = await sampler.stop()
     sampler = null
@@ -1604,8 +2191,14 @@ async function runCase({
       JSON.stringify(logs))
     assert.equal(logs.primary.pgSuccessSlowOver100 + logs.secondary.pgSuccessSlowOver100, 0,
       `steady success path synchronously rewrote PgSQL runtime state: ${JSON.stringify(logs)}`)
-    assert.equal(fake.externalHits(casePrefix), 0,
-      `${casePrefix}: local capacity existed but external pool was used`)
+    const allowedExternalPrefixes = extraLocalMatrix
+      ? [`${casePrefix}-EXTRA-FALLBACK-AFTER-LOCAL-403`]
+      : []
+    const unexpectedExternalRecords = fake.externalRecords(casePrefix).filter((record) => (
+      !allowedExternalPrefixes.some((prefix) => record.marker.startsWith(prefix))
+    ))
+    assert.equal(unexpectedExternalRecords.length, 0,
+      `${casePrefix}: local capacity existed but external pool was used unexpectedly: ${JSON.stringify(unexpectedExternalRecords)}`)
     const auxiliaryAfterWorkloads = fake.records
       .filter((record) => record.kind === 'auxiliary').length
     assert.equal(auxiliaryAfterWorkloads - auxiliaryBeforeWorkloads, 0,
@@ -1632,6 +2225,7 @@ async function runCase({
       race,
       healthWeight,
       weightedCapacity,
+      extraLocalMatrix,
       hits: {
         localInference: caseRecords.length,
         startupAuxiliary: auxiliaryBeforeWorkloads - auxiliaryAtCaseStart,
@@ -1675,6 +2269,7 @@ async function main() {
       protected9022ProbeSkipped: true,
       rounds: ROUNDS,
       modes: MODES,
+      extraLocalMatrix: EXTRA_LOCAL_MATRIX,
       requiredDatabaseCount: REQUIRED_DATABASE_COUNT,
       postgresHost: validated.postgresHost,
       postgresPort: validated.postgresPort,
@@ -1773,6 +2368,7 @@ async function main() {
     acceptanceContract: ACCEPTANCE_CONTRACT,
     roundsPerMode: ROUNDS,
     modes: MODES,
+    extraLocalMatrix: EXTRA_LOCAL_MATRIX,
     gitRevision,
     dirty: Boolean(dirty),
     dirtyDiffSha256: sha256(diff),

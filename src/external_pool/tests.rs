@@ -775,6 +775,178 @@ impl Drop for TurbulentExternalMessagesFakeServer {
     }
 }
 
+#[derive(Clone)]
+enum PatternExternalMessagesBehavior {
+    AlwaysSuccess,
+    AlwaysFail {
+        status: StatusCode,
+        message: String,
+    },
+    FailFirst {
+        count: u64,
+        status: StatusCode,
+        message: String,
+    },
+    Intermittent {
+        fail_percent: u8,
+        seed: u64,
+        statuses: Arc<Vec<(StatusCode, String)>>,
+    },
+}
+
+#[derive(Clone)]
+struct PatternExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    behavior: PatternExternalMessagesBehavior,
+    success_body: serde_json::Value,
+}
+
+struct PatternExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PatternExternalMessagesFakeServer {
+    async fn start(
+        behavior: PatternExternalMessagesBehavior,
+        success_body: serde_json::Value,
+    ) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<PatternExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            let hit = state.hits.fetch_add(1, Ordering::Relaxed) + 1;
+            let failure = match &state.behavior {
+                PatternExternalMessagesBehavior::AlwaysSuccess => None,
+                PatternExternalMessagesBehavior::AlwaysFail { status, message } => {
+                    Some((*status, message.as_str()))
+                }
+                PatternExternalMessagesBehavior::FailFirst {
+                    count,
+                    status,
+                    message,
+                } if hit <= *count => Some((*status, message.as_str())),
+                PatternExternalMessagesBehavior::FailFirst { .. } => None,
+                PatternExternalMessagesBehavior::Intermittent {
+                    fail_percent,
+                    seed,
+                    statuses,
+                } if deterministic_failure_percent(hit, *seed)
+                    < (*fail_percent).min(100) as u64 =>
+                {
+                    let index = deterministic_failure_percent(hit, *seed ^ 0x0ddc_0ffe) as usize
+                        % statuses.len();
+                    let (status, message) = &statuses[index];
+                    Some((*status, message.as_str()))
+                }
+                PatternExternalMessagesBehavior::Intermittent { .. } => None,
+            };
+            if let Some((status, message)) = failure {
+                state.failures.fetch_add(1, Ordering::Relaxed);
+                return (status, axum::Json(fake_external_error_body(message)));
+            }
+            (StatusCode::OK, axum::Json(state.success_body.clone()))
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let state = PatternExternalMessagesFakeState {
+            hits: hits.clone(),
+            failures: failures.clone(),
+            behavior,
+            success_body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pattern external messages fake server");
+        let address = listener
+            .local_addr()
+            .expect("pattern external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve pattern external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            failures,
+            task,
+        }
+    }
+
+    async fn always_success(text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::AlwaysSuccess,
+            fake_external_success_body(text),
+        )
+        .await
+    }
+
+    async fn always_fail(status: StatusCode, message: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::AlwaysFail {
+                status,
+                message: message.to_string(),
+            },
+            fake_external_success_body("unused"),
+        )
+        .await
+    }
+
+    async fn fail_first(count: u64, status: StatusCode, message: &str, success_text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::FailFirst {
+                count,
+                status,
+                message: message.to_string(),
+            },
+            fake_external_success_body(success_text),
+        )
+        .await
+    }
+
+    async fn intermittent(
+        fail_percent: u8,
+        seed: u64,
+        statuses: Vec<(StatusCode, &str)>,
+        success_text: &str,
+    ) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::Intermittent {
+                fail_percent,
+                seed,
+                statuses: Arc::new(
+                    statuses
+                        .into_iter()
+                        .map(|(status, message)| (status, message.to_string()))
+                        .collect(),
+                ),
+            },
+            fake_external_success_body(success_text),
+        )
+        .await
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Acquire),
+            self.failures.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl Drop for PatternExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 fn deterministic_failure_percent(index: u64, seed: u64) -> u64 {
     let mut mixed = index.wrapping_add(seed).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     mixed ^= mixed >> 33;
@@ -6227,6 +6399,65 @@ async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configur
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_same_pool_retry_is_capped_to_one_before_cross_pool_failover() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("capped-ok"))
+            .await;
+    create_messages_pool(&postgres, "same-pool-capped-primary", 1, &failing.base_url).await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-capped-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_retry_capped".to_string();
+    route.error_id = "err_same_pool_retry_capped".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("capped same-pool failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("capped same-pool retry should still fail over: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        2,
+        "same-pool retry must be capped to one even when config allows more"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -7059,6 +7290,293 @@ async fn external_pool_high_concurrency_random_mixed_status_turbulence_transfers
     assert!(
         secondary.snapshot().saturating_add(tertiary.snapshot()) >= 220,
         "healthy backup pools should carry most successful traffic under sustained mixed turbulence"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn external_pool_mock_error_matrix_limits_repeated_failures_and_preserves_recovery() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let sustained_bad = PatternExternalMessagesFakeServer::always_fail(
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+    )
+    .await;
+    let intermittent = PatternExternalMessagesFakeServer::intermittent(
+        35,
+        0x9bad_f00d,
+        vec![
+            (StatusCode::TOO_MANY_REQUESTS, "rate limit"),
+            (StatusCode::FORBIDDEN, "security precaution"),
+            (
+                StatusCode::from_u16(523).expect("523 is a valid HTTP status"),
+                "origin unreachable",
+            ),
+        ],
+        "intermittent-ok",
+    )
+    .await;
+    let healthy_secondary =
+        PatternExternalMessagesFakeServer::always_success("healthy-secondary-ok").await;
+    let healthy_tertiary =
+        PatternExternalMessagesFakeServer::always_success("healthy-tertiary-ok").await;
+
+    let sustained_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-sustained-502-primary",
+        1,
+        &sustained_bad.base_url,
+        128,
+    )
+    .await;
+    let intermittent_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-intermittent-mixed-secondary",
+        10,
+        &intermittent.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-healthy-tertiary",
+        20,
+        &healthy_secondary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-healthy-quaternary",
+        40,
+        &healthy_tertiary.base_url,
+        128,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 512,
+        external_pool_retry_max_attempts: 4,
+        external_pool_retry_status_codes: vec![403, 408, 425, 429, 500, 502, 503, 504, 523],
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![429, 500, 502, 503, 504, 523],
+        external_pool_same_pool_retry_delay_ms: 1,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let run_wave = |wave: &'static str, size: usize| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..size).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_mock_matrix_{wave}_{index}");
+                    route.error_id = format!("err_mock_matrix_{wave}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("mock matrix request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_wave("warmup", 32).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb warmup failures: {error:?}")
+            }
+        }
+    }
+    let (sustained_wave1_hits, sustained_wave1_failures) = sustained_bad.snapshot();
+    let (intermittent_wave1_hits, intermittent_wave1_failures) = intermittent.snapshot();
+    assert!(
+        sustained_wave1_hits > 0 && sustained_wave1_failures == sustained_wave1_hits,
+        "sustained failing pool must be exercised in first wave"
+    );
+    assert!(
+        intermittent_wave1_hits > 0,
+        "intermittent pool must be exercised in first wave"
+    );
+
+    let sustained_runtime = manager
+        .load_pool_runtime_snapshot(sustained_pool.id, &[])
+        .await
+        .expect("read sustained pool runtime");
+    assert_eq!(sustained_runtime.pool_cooldown_remaining_secs, 0);
+    assert!(
+        sustained_runtime.transient_failure_streak >= sustained_wave1_failures as u32,
+        "sustained failures should leave soft scheduling evidence"
+    );
+
+    let intermittent_runtime = manager
+        .load_pool_runtime_snapshot(intermittent_pool.id, &[])
+        .await
+        .expect("read intermittent pool runtime");
+    assert_eq!(intermittent_runtime.pool_cooldown_remaining_secs, 0);
+    assert!(
+        intermittent_runtime.transient_failure_streak >= intermittent_wave1_failures as u32,
+        "intermittent failures should leave soft scheduling evidence without hard blackout"
+    );
+    let healthy_wave1_hits = healthy_secondary
+        .snapshot()
+        .0
+        .saturating_add(healthy_tertiary.snapshot().0);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_wave("sustained", 128).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb sustained mixed failures: {error:?}")
+            }
+        }
+    }
+    let (sustained_total_hits, _) = sustained_bad.snapshot();
+    let (intermittent_total_hits, _) = intermittent.snapshot();
+    let healthy_total_hits = healthy_secondary
+        .snapshot()
+        .0
+        .saturating_add(healthy_tertiary.snapshot().0);
+    let sustained_wave2_hits = sustained_total_hits.saturating_sub(sustained_wave1_hits);
+    let intermittent_wave2_hits = intermittent_total_hits.saturating_sub(intermittent_wave1_hits);
+    let healthy_wave2_hits = healthy_total_hits.saturating_sub(healthy_wave1_hits);
+    let bad_wave2_hits = sustained_wave2_hits.saturating_add(intermittent_wave2_hits);
+    assert!(
+        sustained_wave2_hits <= 4,
+        "soft penalty plus one same-pool cap should stop repeated hits on sustained bad pool; got {sustained_wave2_hits}"
+    );
+    assert!(
+        intermittent_wave2_hits <= 32,
+        "intermittent error pool should lose most of the next high-concurrency wave; got {intermittent_wave2_hits}"
+    );
+    assert!(
+        healthy_secondary
+            .snapshot()
+            .0
+            .saturating_add(healthy_tertiary.snapshot().0)
+            > bad_wave2_hits,
+        "healthy pools should receive more traffic than failing pools after failures are observed; healthy_wave2_hits={healthy_wave2_hits}, bad_wave2_hits={bad_wave2_hits}"
+    );
+
+    for outcome in run_wave("recovery", 16).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!(
+                    "normal low-concurrency traffic should keep succeeding after burst: {error:?}"
+                )
+            }
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_mock_sporadic_failures_recover_without_long_blackout() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let sporadic_primary = PatternExternalMessagesFakeServer::fail_first(
+        2,
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+        "sporadic-primary-recovered",
+    )
+    .await;
+    let healthy_backup =
+        PatternExternalMessagesFakeServer::always_success("sporadic-backup-ok").await;
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "sporadic-primary",
+        1,
+        &sporadic_primary.base_url,
+        32,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "sporadic-backup",
+        10,
+        &healthy_backup.base_url,
+        32,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 64,
+        external_pool_retry_max_attempts: 2,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..ExternalPoolsConfig::default()
+    };
+
+    for index in 0..4 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_mock_sporadic_{index}");
+        route.error_id = format!("err_mock_sporadic_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("sporadic request should finish");
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("backup should absorb sporadic failures: {error:?}")
+            }
+        }
+    }
+
+    let (primary_hits, primary_failures) = sporadic_primary.snapshot();
+    assert_eq!(
+        primary_failures, 2,
+        "mock primary should fail only the configured sporadic attempts"
+    );
+    assert!(
+        primary_hits >= 2,
+        "primary should be exercised before being temporarily deprioritized"
+    );
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read sporadic primary runtime");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "sporadic 502 must not hard-blackout the recovered pool"
+    );
+    assert!(
+        healthy_backup.snapshot().0 >= 1,
+        "backup should absorb at least one failed primary request"
     );
 
     postgres.drop_test_schema().await.unwrap();
@@ -9422,6 +9940,72 @@ fn external_pool_error_classifies_model_unavailable_without_cooldown_when_disabl
     assert!(err.retryable);
     assert_eq!(error_type_for_external_error(&err), "model_unavailable");
     assert!(err.cooldown.is_none());
+}
+
+#[test]
+fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![401, 403, 429, 500, 502, 503, 504],
+        ..ExternalPoolsConfig::default()
+    };
+
+    let retryable_server_error = ExternalPoolError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "temporary upstream failure".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(10), "server_error".to_string())),
+        protocol_error: None,
+    };
+    let terminal_auth_error = ExternalPoolError {
+        status: Some(StatusCode::FORBIDDEN),
+        message: "security lock".to_string(),
+        retryable: true,
+        auto_disable_reason: Some("security_lock".to_string()),
+        cooldown: Some((Duration::from_secs(10), "security_lock".to_string())),
+        protocol_error: None,
+    };
+    let terminal_quota_error = ExternalPoolError {
+        status: Some(StatusCode::PAYMENT_REQUIRED),
+        message: "quota exhausted".to_string(),
+        retryable: true,
+        auto_disable_reason: Some("quota_exhausted".to_string()),
+        cooldown: Some((Duration::from_secs(10), "quota_exhausted".to_string())),
+        protocol_error: None,
+    };
+
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &retryable_server_error),
+        1,
+        "server errors must be capped to one same-pool retry"
+    );
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &terminal_auth_error),
+        0,
+        "security lock should not retry the same pool"
+    );
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &terminal_quota_error),
+        0,
+        "quota exhaustion should not retry the same pool"
+    );
+
+    config.external_pool_same_pool_retry_status_codes =
+        vec![StatusCode::TOO_MANY_REQUESTS.as_u16()];
+    let rate_limit_error = ExternalPoolError {
+        status: Some(StatusCode::TOO_MANY_REQUESTS),
+        message: "rate limit".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(4), "rate_limit".to_string())),
+        protocol_error: None,
+    };
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &rate_limit_error),
+        1,
+        "rate limit may retry once on the same pool, not more"
+    );
 }
 
 #[test]

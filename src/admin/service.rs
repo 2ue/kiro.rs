@@ -56,7 +56,8 @@ use crate::anthropic::{
     prompt_cache_creation_control::PromptCacheCreationController,
     request_admission::RequestAdmissionController,
     usage::{
-        UsageDashboardResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
+        UsageDashboardResponse, UsageExternalPoolRiskCostConfig, UsageExternalPoolRiskQuery,
+        UsageExternalPoolRiskResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
         UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
@@ -3830,6 +3831,24 @@ impl AdminService {
     {
         self.usage_recorder
             .dashboard_external_pool_billing(timezone.as_deref(), &window_key)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    pub fn get_usage_dashboard_external_pool_risk(
+        &self,
+        query: UsageExternalPoolRiskQuery,
+    ) -> Result<UsageExternalPoolRiskResponse, AdminServiceError> {
+        let config = self.token_manager.runtime_config();
+        let cost_config = UsageExternalPoolRiskCostConfig {
+            cost_floor_enabled: config
+                .external_pools
+                .external_pool_usage_projection_cost_floor_enabled,
+            cost_floor_margin_percent: config
+                .external_pools
+                .external_pool_usage_projection_cost_floor_margin_percent,
+        };
+        self.usage_recorder
+            .external_pool_usage_risk(query, cost_config)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 

@@ -124,7 +124,8 @@ pub(super) async fn handle_messages_endpoint(
         {
             return response;
         }
-        if let Some(response) = maybe_raw_external_preflight_response(
+        let mut raw_preflight_failure = None;
+        if let Some(decision) = maybe_raw_external_preflight_response(
             &state,
             headers.clone(),
             effective_raw_body.clone(),
@@ -135,9 +136,66 @@ pub(super) async fn handle_messages_endpoint(
         )
         .await
         {
-            return response;
+            match decision {
+                RawExternalPreflightDecision::Response(response) => return response,
+                RawExternalPreflightDecision::ContinueWithLocalRescue(failure) => {
+                    raw_preflight_failure = Some(failure);
+                }
+            }
         }
+        return continue_messages_endpoint_after_raw_external_routes(
+            state,
+            headers,
+            effective_raw_body,
+            effective_raw_probe,
+            raw_body,
+            parsed_raw_probe,
+            endpoint,
+            inference_attempt_budget,
+            request_api_key_id,
+            request_history_contaminated,
+            attribution,
+            raw_preflight_failure,
+        )
+        .await;
     }
+    continue_messages_endpoint_after_raw_external_routes(
+        state,
+        headers,
+        effective_raw_body,
+        effective_raw_probe,
+        raw_body,
+        parsed_raw_probe,
+        endpoint,
+        inference_attempt_budget,
+        request_api_key_id,
+        request_history_contaminated,
+        attribution,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn continue_messages_endpoint_after_raw_external_routes(
+    state: AppState,
+    headers: HeaderMap,
+    effective_raw_body: Bytes,
+    effective_raw_probe: Arc<RawMessagesBodyProbe>,
+    raw_body: Bytes,
+    parsed_raw_probe: Arc<RawMessagesBodyProbe>,
+    endpoint: String,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    request_history_contaminated: bool,
+    attribution: Option<RequestRejectionAttribution>,
+    raw_preflight_failure: Option<RawExternalPreflightFailure>,
+) -> Response {
+    let runtime_config = state
+        .kiro_provider
+        .as_ref()
+        .map(|provider| request_runtime_config(&state, provider))
+        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
     if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
         &state,
         &runtime_config,
@@ -168,6 +226,7 @@ pub(super) async fn handle_messages_endpoint(
         request_api_key_id,
         request_history_contaminated,
         attribution,
+        raw_preflight_failure,
     )
     .await
 }

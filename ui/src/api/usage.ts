@@ -15,6 +15,8 @@ import type {
   UsageCleanupPreviewResponse,
   UsageCleanupRequest,
   UsageCleanupStatusResponse,
+  UsageExternalPoolRiskQuery,
+  UsageExternalPoolRiskResponse,
   UsageRecorderStats,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
@@ -90,6 +92,15 @@ export async function getUsageDashboardExternalPoolBilling(
 ): Promise<UsageDashboardExternalPoolBillingResponse> {
   const { data } = await api.get<UsageDashboardExternalPoolBillingResponse>('/usage-dashboard/external-pool-billing', {
     params: { timezone, windowKey },
+  })
+  return data
+}
+
+export async function getUsageDashboardExternalPoolRisk(
+  query: UsageExternalPoolRiskQuery = {}
+): Promise<UsageExternalPoolRiskResponse> {
+  const { data } = await api.get<UsageExternalPoolRiskResponse>('/usage-dashboard/external-pool-risk', {
+    params: query,
   })
   return data
 }

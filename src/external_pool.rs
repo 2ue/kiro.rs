@@ -5581,8 +5581,9 @@ impl ExternalPoolManager {
                         }
                     }
                     let same_pool_retry_count = same_pool_retry_counts.entry(pool_id).or_insert(0);
-                    if should_retry_external_same_pool(&config, &err)
-                        && *same_pool_retry_count < config.external_pool_same_pool_retry_count
+                    let same_pool_retry_limit =
+                        retry_pipeline::same_pool_retry_limit(&config, &err);
+                    if *same_pool_retry_count < same_pool_retry_limit
                         && route.inference_attempt_budget.available_attempts(0) > 0
                     {
                         *same_pool_retry_count = (*same_pool_retry_count).saturating_add(1);
@@ -5596,7 +5597,7 @@ impl ExternalPoolManager {
                             pool_name = %pool.name,
                             status = err.status.map(|status| status.as_u16()),
                             same_pool_retry_count = *same_pool_retry_count,
-                            same_pool_retry_max = config.external_pool_same_pool_retry_count,
+                            same_pool_retry_max = same_pool_retry_limit,
                             "external pool retryable status will be retried on the same pool before cross-pool failover"
                         );
                         last_error = Some((pool.clone(), err));
@@ -10183,10 +10184,6 @@ fn external_payload_guard_retry_route(
     route: &ExternalRouteRequest,
 ) -> Option<ExternalRouteRequest> {
     retry_pipeline::payload_guard_retry_route(route)
-}
-
-fn should_retry_external_same_pool(config: &ExternalPoolsConfig, err: &ExternalPoolError) -> bool {
-    retry_pipeline::should_retry_same_pool(config, err)
 }
 
 fn should_retry_external_cross_pool(config: &ExternalPoolsConfig, err: &ExternalPoolError) -> bool {

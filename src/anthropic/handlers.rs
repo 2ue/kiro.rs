@@ -39,7 +39,7 @@ use reqwest::header::CONTENT_TYPE as REQWEST_CONTENT_TYPE;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tokio::time::{Instant, interval, sleep_until};
+use tokio::time::{Instant, interval, sleep, sleep_until};
 
 use super::body_capabilities::ParsedAnthropicBodyPlan;
 use super::body_processing;
@@ -101,7 +101,7 @@ use crate::kiro::call_trace::{
     SelectionFailureStage,
 };
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion, McpCallAttribution};
-use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteStateKind};
+use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteState, LocalPoolRouteStateKind};
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
@@ -118,6 +118,7 @@ const SLOW_STREAM_GAP_MS: u64 = 10_000;
 const SLOW_RESPONSE_MS: u64 = 60_000;
 const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
 const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const LOCAL_CAPACITY_PREFLIGHT_GRACE_MAX_MS: u64 = 250;
 const EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy)]
@@ -776,11 +777,23 @@ struct ExternalFallbackContext {
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     requires_normalized_body: bool,
+    raw_preflight_failure: Option<RawExternalPreflightFailure>,
 }
 
 struct LocalPoolPreflightExternalOutcome {
     outcome: ExternalPoolForwardOutcome,
     local_reason: String,
+}
+
+#[derive(Clone)]
+struct RawExternalPreflightFailure {
+    local_reason: String,
+    error: ExternalPoolFinalError,
+}
+
+enum RawExternalPreflightDecision {
+    Response(Response),
+    ContinueWithLocalRescue(RawExternalPreflightFailure),
 }
 
 #[derive(Clone)]
@@ -1316,7 +1329,7 @@ async fn maybe_raw_external_preflight_response(
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
-) -> Option<Response> {
+) -> Option<RawExternalPreflightDecision> {
     let provider = state.kiro_provider.as_ref()?.clone();
     let manager = state.external_pool_manager.clone()?;
     let runtime_config = request_runtime_config(state, &provider);
@@ -1328,18 +1341,19 @@ async fn maybe_raw_external_preflight_response(
         return None;
     }
 
-    let local_state = provider.local_pool_route_state_fresh(raw_probe.model.as_deref());
-    let Some(reason) = local_pool_fallback_reason_for_fresh_state(
-        local_state.kind,
-        local_state.dispatchable,
+    let (reason, local_state) = local_pool_preflight_reason_after_capacity_grace(
+        provider.as_ref(),
         &config,
-    ) else {
-        return None;
-    };
+        raw_probe.model.as_deref(),
+        bounded_preflight_capacity_wait(&config, inference_attempt_budget.as_ref()),
+        "raw_before_parse",
+        None,
+    )
+    .await?;
     if !raw_external_pool_ready_for_route_reason(
         &manager,
         &config,
-        reason,
+        reason.as_str(),
         endpoint,
         raw_probe.model.as_deref(),
     )
@@ -1348,7 +1362,6 @@ async fn maybe_raw_external_preflight_response(
         return None;
     }
 
-    let reason = reason.to_string();
     let request_id = envelope::request_id();
     tracing::warn!(
         request_id,
@@ -1367,7 +1380,7 @@ async fn maybe_raw_external_preflight_response(
         headers,
         raw_body,
         endpoint,
-        request_id,
+        request_id.clone(),
         UsageRouteSubtype::ExternalFallbackPreflight,
         Some(reason.clone()),
         None,
@@ -1377,12 +1390,49 @@ async fn maybe_raw_external_preflight_response(
             "preflightStage": "before_parse",
             "requiredBodyMode": ExternalPoolRequestBodyMode::RawPassthrough.as_str(),
         })),
-        inference_attempt_budget,
+        inference_attempt_budget.clone(),
         request_api_key_id,
-        raw_probe,
+        raw_probe.clone(),
     );
 
-    Some(manager.forward_with_failover(config, route).await)
+    let outcome = manager
+        .forward_with_failover_result(config.clone(), route)
+        .await;
+    Some(match outcome {
+        ExternalPoolForwardOutcome::Response(response) => {
+            RawExternalPreflightDecision::Response(response)
+        }
+        ExternalPoolForwardOutcome::FinalError(err) => {
+            let current_local_dispatchable = provider
+                .local_pool_route_state_fresh(raw_probe.model.as_deref())
+                .dispatchable;
+            if let Some(rescue_reason) = budgeted_local_rescue_reason_after_external_route_error(
+                UsageRouteSubtype::ExternalFallbackPreflight,
+                &config,
+                &err,
+                Some(reason.as_str()),
+                Some(current_local_dispatchable),
+                inference_attempt_budget.as_ref(),
+            ) {
+                tracing::warn!(
+                    request_id,
+                    reason = rescue_reason,
+                    local_fallback_reason = %reason,
+                    max_wait_secs = config.external_pool_local_rescue_max_wait_secs,
+                    external_status = err.status.as_u16(),
+                    external_error_type = %err.route_error_type,
+                    external_attempt_count = err.attempts.len(),
+                    "raw external preflight failed with a rescuable error; continuing into parsed local rescue path"
+                );
+                RawExternalPreflightDecision::ContinueWithLocalRescue(RawExternalPreflightFailure {
+                    local_reason: reason,
+                    error: err,
+                })
+            } else {
+                RawExternalPreflightDecision::Response(err.into_response(&request_id))
+            }
+        }
+    })
 }
 
 async fn raw_external_pool_has_eligible_pool(
@@ -1549,6 +1599,7 @@ fn build_external_fallback_context(
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     requires_normalized_body: bool,
+    raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Option<ExternalFallbackContext> {
     let provider = state.kiro_provider.clone()?;
     let manager = state.external_pool_manager.clone()?;
@@ -1598,6 +1649,7 @@ fn build_external_fallback_context(
         inference_attempt_budget,
         request_api_key_id,
         requires_normalized_body,
+        raw_preflight_failure,
     })
 }
 
@@ -1749,23 +1801,23 @@ impl ExternalFallbackContext {
         if !self.config.local_pool_preflight_enabled {
             return None;
         }
-        let state = self.provider.local_pool_route_state_fresh(model);
-        let Some(reason) = local_pool_fallback_reason_for_fresh_state(
-            state.kind,
-            state.dispatchable,
+        let (reason, state) = local_pool_preflight_reason_after_capacity_grace(
+            self.provider.as_ref(),
             &self.config,
-        ) else {
-            return None;
-        };
+            model,
+            bounded_preflight_capacity_wait(&self.config, self.inference_attempt_budget.as_ref()),
+            "parsed_preflight",
+            Some(request_id),
+        )
+        .await?;
         let route_model = model.unwrap_or(&self.payload.model);
         if !self
-            .external_pool_ready_for_route_reason(reason, route_model)
+            .external_pool_ready_for_route_reason(reason.as_str(), route_model)
             .await
         {
             return None;
         }
 
-        let reason = reason.to_string();
         tracing::warn!(
             request_id,
             reason = %reason,
@@ -2157,6 +2209,85 @@ fn local_pool_fallback_reason_for_fresh_state(
         return None;
     }
     local_pool_route_fallback_reason(kind, config)
+}
+
+fn local_preflight_capacity_reason(reason: &str) -> bool {
+    matches!(reason, "local_capacity_full")
+}
+
+fn bounded_preflight_capacity_wait(
+    config: &ExternalPoolsConfig,
+    inference_attempt_budget: &InferenceAttemptBudget,
+) -> Duration {
+    let configured = Duration::from_secs(config.effective_dispatch_max_wait_secs())
+        .min(Duration::from_millis(LOCAL_CAPACITY_PREFLIGHT_GRACE_MAX_MS));
+    inference_attempt_budget
+        .dispatch_remaining()
+        .map(|remaining| configured.min(remaining))
+        .unwrap_or(configured)
+}
+
+async fn local_pool_preflight_reason_after_capacity_grace(
+    provider: &KiroProvider,
+    config: &ExternalPoolsConfig,
+    model: Option<&str>,
+    max_wait: Duration,
+    stage: &'static str,
+    request_id: Option<&str>,
+) -> Option<(String, LocalPoolRouteState)> {
+    let mut state = provider.local_pool_route_state_fresh(model);
+    let mut reason =
+        local_pool_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)?;
+    if !local_preflight_capacity_reason(reason) || max_wait.is_zero() {
+        return Some((reason.to_string(), state));
+    }
+
+    let started = Instant::now();
+    let deadline = started + max_wait;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            tracing::warn!(
+                request_id = request_id.unwrap_or(""),
+                stage,
+                reason,
+                local_total = state.total,
+                local_available = state.available,
+                local_dispatchable = state.dispatchable,
+                local_usable = state.usable,
+                local_in_flight = state.global_in_flight_requests,
+                local_queued = state.queued_requests,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                max_wait_ms = max_wait.as_millis() as u64,
+                "local capacity preflight wait expired; external fallback remains eligible"
+            );
+            return Some((reason.to_string(), state));
+        }
+
+        sleep((deadline - now).min(Duration::from_millis(50))).await;
+        state = provider.local_pool_route_state_fresh(model);
+        let Some(next_reason) =
+            local_pool_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)
+        else {
+            tracing::debug!(
+                request_id = request_id.unwrap_or(""),
+                stage,
+                local_total = state.total,
+                local_available = state.available,
+                local_dispatchable = state.dispatchable,
+                local_usable = state.usable,
+                local_in_flight = state.global_in_flight_requests,
+                local_queued = state.queued_requests,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "local capacity recovered during preflight wait; keeping request on local credentials"
+            );
+            return None;
+        };
+        reason = next_reason;
+        if !local_preflight_capacity_reason(reason) {
+            return Some((reason.to_string(), state));
+        }
+    }
 }
 
 fn local_route_reason_requires_immediate_external_capacity(reason: &str) -> bool {
@@ -5773,6 +5904,7 @@ async fn post_messages_inner(
     request_api_key_id: Option<String>,
     request_history_contaminated: bool,
     attribution: Option<RequestRejectionAttribution>,
+    raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Response {
     tracing::debug!(
         endpoint = endpoint,
@@ -5816,6 +5948,7 @@ async fn post_messages_inner(
         inference_attempt_budget.clone(),
         request_api_key_id.clone(),
         request_history_contaminated,
+        raw_preflight_failure,
     );
     let parsed_body_plan =
         ParsedAnthropicBodyPlan::shared_compatible(runtime_config.image_processing);
@@ -6392,6 +6525,30 @@ async fn maybe_local_pool_preflight_external_outcome(
         .await
 }
 
+async fn maybe_local_pool_preflight_external_outcome_for_local_request(
+    external_fallback: Option<&ExternalFallbackContext>,
+    request_id: &str,
+    model: Option<&str>,
+) -> Option<LocalPoolPreflightExternalOutcome> {
+    if let Some(external) = external_fallback {
+        if let Some(failure) = external.raw_preflight_failure.as_ref() {
+            tracing::warn!(
+                request_id,
+                local_fallback_reason = %failure.local_reason,
+                external_status = failure.error.status.as_u16(),
+                external_error_type = %failure.error.route_error_type,
+                external_attempt_count = failure.error.attempts.len(),
+                "using raw external preflight final error to drive parsed local rescue"
+            );
+            return Some(LocalPoolPreflightExternalOutcome {
+                outcome: ExternalPoolForwardOutcome::FinalError(failure.error.clone()),
+                local_reason: failure.local_reason.clone(),
+            });
+        }
+    }
+    maybe_local_pool_preflight_external_outcome(external_fallback, request_id, model).await
+}
+
 fn websearch_mcp_external_fallback_signal(
     internal_reason: &str,
     attribution: &McpCallAttribution,
@@ -6548,7 +6705,7 @@ fn external_fallback_route_subtype_for_attempts(
 
 fn local_fallback_reason_blocks_local_rescue(
     reason: Option<&str>,
-    current_local_dispatchable: Option<usize>,
+    _current_local_dispatchable: Option<usize>,
 ) -> bool {
     matches!(
         reason,
@@ -6569,7 +6726,7 @@ fn local_fallback_reason_blocks_local_rescue(
             "local_capacity_full"
             | "local_capacity_exhausted"
             | "local_attempt_reserved_for_fallback",
-        ) => current_local_dispatchable.unwrap_or(0) == 0,
+        ) => false,
         None => true,
         _ => false,
     }
@@ -6907,12 +7064,13 @@ async fn handle_stream_request(
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
     let mut successful_derived_request: Option<(String, KiroRequest)> = None;
-    let response = if let Some(outcome) = maybe_local_pool_preflight_external_outcome(
-        external_fallback.as_ref(),
-        &request_id,
-        Some(model),
-    )
-    .await
+    let response = if let Some(outcome) =
+        maybe_local_pool_preflight_external_outcome_for_local_request(
+            external_fallback.as_ref(),
+            &request_id,
+            Some(model),
+        )
+        .await
     {
         let local_reason = outcome.local_reason;
         match outcome.outcome {
@@ -9101,12 +9259,13 @@ async fn handle_non_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
-    let api_response = if let Some(outcome) = maybe_local_pool_preflight_external_outcome(
-        external_fallback.as_ref(),
-        &request_id,
-        Some(model),
-    )
-    .await
+    let api_response = if let Some(outcome) =
+        maybe_local_pool_preflight_external_outcome_for_local_request(
+            external_fallback.as_ref(),
+            &request_id,
+            Some(model),
+        )
+        .await
     {
         let local_reason = outcome.local_reason;
         match outcome.outcome {

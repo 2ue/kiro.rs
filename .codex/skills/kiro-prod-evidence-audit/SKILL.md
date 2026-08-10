@@ -25,6 +25,7 @@ The primary evidence source is not container stdout. For kiro.rs, start from cod
 Before any SSH command, confirm or infer:
 
 - SSH target: user, host, port, and auth mechanism. Password auth is allowed when the user explicitly supplies the password or asks to use password login for the audit. Direct login is permitted and should proceed directly; still avoid copying the password into durable evidence or final output.
+- If the user provides only an IPv4 host and a password for a production audit, infer `root@host` on port `22` and connect directly with password auth instead of stopping to ask for the default SSH user or port. Do not record the password in evidence, reports, archives, or final answers.
 - Deployment directory, for example `~/docker-compose/<project>`.
 - Time window, for example last 2 hours, last 24 hours, or around specific request IDs.
 - Scope: request IDs, usage/business diagnostics, runtime/config state, tool-format debug files, gateway evidence, Docker state, container logs, PostgreSQL metadata, Redis metadata, or all of the above.

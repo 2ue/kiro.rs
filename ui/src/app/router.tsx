@@ -21,6 +21,9 @@ const ProxiesPage = React.lazy(() =>
 const UsagePage = React.lazy(() =>
   import('@/features/usage/usage-page').then((m) => ({ default: m.UsagePage }))
 )
+const ExternalPoolRiskPage = React.lazy(() =>
+  import('@/features/external-pool-risk/external-pool-risk-page').then((m) => ({ default: m.ExternalPoolRiskPage }))
+)
 const AuditPage = React.lazy(() =>
   import('@/features/audit/audit-page').then((m) => ({ default: m.AuditPage }))
 )
@@ -69,6 +72,7 @@ const router = createBrowserRouter(
         { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },
         // 分析域
         { path: 'usage', element: <Lazy><UsagePage /></Lazy> },
+        { path: 'external-pool-risk', element: <Lazy><ExternalPoolRiskPage /></Lazy> },
         { path: 'audit', element: <Lazy><AuditPage /></Lazy> },
         // 设置域
         { path: 'runtime', element: <Lazy><RuntimePage /></Lazy> },
