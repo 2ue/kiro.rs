@@ -11180,6 +11180,32 @@ fn test_payload(model: &str) -> MessagesRequest {
 }
 
 #[test]
+fn external_route_requested_max_tokens_prefers_payload_and_falls_back_to_raw_body() {
+    let mut route = test_route("claude-sonnet-5");
+    route.effective_raw_body =
+        Bytes::from_static(br#"{"model":"claude-sonnet-5","max_tokens":64}"#);
+    route.raw_body = route.effective_raw_body.clone();
+    assert_eq!(route.requested_max_tokens(), Some(8));
+
+    let route = raw_test_route(br#"{"model":"claude-sonnet-5","max_tokens":64}"#);
+    assert_eq!(route.requested_max_tokens(), Some(64));
+}
+
+#[test]
+fn external_route_requested_max_tokens_ignores_invalid_raw_body_values() {
+    for body in [
+        br#"{"model":"claude-sonnet-5","max_tokens":0}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":-1}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":"64"}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":2147483648}"#.as_slice(),
+        b"not-json".as_slice(),
+    ] {
+        let route = raw_test_route(body);
+        assert_eq!(route.requested_max_tokens(), None);
+    }
+}
+
+#[test]
 fn direct_external_policy_enabled_is_global_direct_reason() {
     let mut config = ExternalPoolsConfig::default();
 

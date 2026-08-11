@@ -940,9 +940,21 @@ impl ExternalRouteRequest {
     }
 
     fn requested_max_tokens(&self) -> Option<i32> {
-        self.payload
+        if let Some(max_tokens) = self
+            .payload
             .as_ref()
             .and_then(|payload| (payload.max_tokens > 0).then_some(payload.max_tokens))
+        {
+            return Some(max_tokens);
+        }
+
+        requested_max_tokens_from_raw_body(&self.effective_raw_body).or_else(|| {
+            if self.raw_body == self.effective_raw_body {
+                None
+            } else {
+                requested_max_tokens_from_raw_body(&self.raw_body)
+            }
+        })
     }
 
     fn stable_conversation_id(&self) -> Option<String> {
@@ -978,6 +990,17 @@ fn external_route_raw_projection_payload(
                 .map(Arc::new)
         })
         .clone()
+}
+
+fn requested_max_tokens_from_raw_body(body: &Bytes) -> Option<i32> {
+    if body.is_empty() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("max_tokens").and_then(|value| value.as_i64()))
+        .filter(|value| *value > 0 && *value <= i32::MAX as i64)
+        .map(|value| value as i32)
 }
 
 #[derive(Debug, Default)]
