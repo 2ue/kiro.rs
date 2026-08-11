@@ -167,6 +167,7 @@ const EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS: usize = 30;
 const EXTERNAL_POOL_STATIC_SNAPSHOT_JITTER_PERCENT: u8 = 10;
 const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
 const EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
+const EXTERNAL_POOL_STREAM_KEEPALIVE_INTERVAL_SECS: u64 = 5;
 const EXTERNAL_POOL_ERROR_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 const EXTERNAL_POOL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const EXTERNAL_POOL_DEFAULT_RESPONSE_BODY_TIMEOUT_SECS: u64 = 180;
@@ -1123,6 +1124,7 @@ struct ExternalForwardResponse {
     outbound_model: Option<String>,
     outbound_body: Bytes,
     billing: Option<ExternalPoolBilling>,
+    downstream_stop_reason: Option<String>,
     stream_usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
     stream_usage_projection: Option<ExternalUsageProjectionContext>,
 }
@@ -1413,6 +1415,7 @@ impl ExternalPoolFinalError {
 struct ExternalUsageCapture {
     request_input_tokens: Option<i32>,
     estimated_output_tokens: i32,
+    downstream_stop_reason: Option<String>,
     raw: Option<CacheUsage>,
     shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
@@ -1660,6 +1663,7 @@ fn external_pool_usage_debug_capture(capture: &ExternalUsageCapture) -> serde_js
     json!({
         "requestInputTokens": capture.request_input_tokens,
         "estimatedOutputTokens": capture.estimated_output_tokens,
+        "downstreamStopReason": capture.downstream_stop_reason.as_deref(),
         "rawUsage": external_pool_usage_debug_cache_usage(capture.raw),
         "shapedUsage": external_pool_usage_debug_cache_usage(capture.shaped),
         "reportedUsage": external_pool_usage_debug_cache_usage(capture.reported),
@@ -5530,6 +5534,7 @@ impl ExternalPoolManager {
                         &pool,
                         attempts.clone(),
                         forwarded.billing,
+                        forwarded.downstream_stop_reason,
                     );
                     return ExternalPoolForwardOutcome::Response(forwarded.response);
                 }
@@ -6019,6 +6024,8 @@ impl ExternalPoolManager {
             let mut prefix = Vec::<u8>::new();
             let mut buffer = Vec::<u8>::new();
             let mut last_chunk_at = Instant::now();
+            let stream_keepalive_interval =
+                external_pool_stream_keepalive_interval(stream_idle_timeout);
             if effective_external_pool_pre_output_stream_retry_enabled(pool, config) {
                 last_chunk_at = match pre_read_external_stream_before_commit(
                     &mut body_stream,
@@ -6052,6 +6059,7 @@ impl ExternalPoolManager {
                     buffer,
                     Some(lease),
                     last_chunk_at,
+                    Instant::now(),
                     false,
                 ),
                 move |(
@@ -6060,6 +6068,7 @@ impl ExternalPoolManager {
                     mut buffer,
                     lease,
                     mut last_chunk_at,
+                    mut last_keepalive_at,
                     finished,
                 )| {
                     let projection_context = projection_context.clone();
@@ -6073,9 +6082,18 @@ impl ExternalPoolManager {
                         }
                         if let Some(prefix_chunk) = prefix.take().filter(|chunk| !chunk.is_empty())
                         {
+                            last_keepalive_at = Instant::now();
                             return Some((
                                 Ok(Bytes::from(prefix_chunk)),
-                                (body_stream, None, buffer, lease, last_chunk_at, false),
+                                (
+                                    body_stream,
+                                    None,
+                                    buffer,
+                                    lease,
+                                    last_chunk_at,
+                                    last_keepalive_at,
+                                    false,
+                                ),
                             ));
                         }
                         loop {
@@ -6088,12 +6106,22 @@ impl ExternalPoolManager {
                                 Some(&mut transcript_state.lock()),
                             );
                             if !projected.is_empty() {
+                                last_keepalive_at = Instant::now();
                                 return Some((
                                     Ok(Bytes::from(projected)),
-                                    (body_stream, None, buffer, lease, last_chunk_at, false),
+                                    (
+                                        body_stream,
+                                        None,
+                                        buffer,
+                                        lease,
+                                        last_chunk_at,
+                                        last_keepalive_at,
+                                        false,
+                                    ),
                                 ));
                             }
                             tokio::select! {
+                                biased;
                                 chunk = body_stream.next() => {
                                     match chunk {
                                         Some(Ok(chunk)) => {
@@ -6110,6 +6138,7 @@ impl ExternalPoolManager {
                                                 Some(&mut transcript_state.lock()),
                                             );
                                             if !projected.is_empty() {
+                                                last_keepalive_at = Instant::now();
                                                 return Some((
                                                     Ok(Bytes::from(projected)),
                                                     (
@@ -6118,6 +6147,7 @@ impl ExternalPoolManager {
                                                         buffer,
                                                         lease,
                                                         last_chunk_at,
+                                                        last_keepalive_at,
                                                         false,
                                                     ),
                                                 ));
@@ -6143,6 +6173,7 @@ impl ExternalPoolManager {
                                                         Vec::new(),
                                                         None,
                                                         last_chunk_at,
+                                                        last_keepalive_at,
                                                         true,
                                                     ),
                                                 ));
@@ -6168,6 +6199,7 @@ impl ExternalPoolManager {
                                                     Vec::new(),
                                                     None,
                                                     last_chunk_at,
+                                                    last_keepalive_at,
                                                     true,
                                                 ),
                                             ));
@@ -6204,6 +6236,7 @@ impl ExternalPoolManager {
                                                     Vec::new(),
                                                     None,
                                                     last_chunk_at,
+                                                    last_keepalive_at,
                                                     true,
                                                 ),
                                             ));
@@ -6222,6 +6255,7 @@ impl ExternalPoolManager {
                                             Vec::new(),
                                             None,
                                             last_chunk_at,
+                                            last_keepalive_at,
                                             true,
                                         ),
                                     ));
@@ -6242,7 +6276,28 @@ impl ExternalPoolManager {
                                             Vec::new(),
                                             None,
                                             last_chunk_at,
+                                            last_keepalive_at,
                                             true,
+                                        ),
+                                    ));
+                                }
+                                _ = external_pool_stream_keepalive_deadline(
+                                    last_keepalive_at,
+                                    stream_keepalive_interval,
+                                ) => {
+                                    last_keepalive_at = Instant::now();
+                                    return Some((
+                                        Ok(Bytes::from_static(
+                                            b"event: ping\ndata: {\"type\": \"ping\"}\n\n",
+                                        )),
+                                        (
+                                            body_stream,
+                                            None,
+                                            buffer,
+                                            lease,
+                                            last_chunk_at,
+                                            last_keepalive_at,
+                                            false,
                                         ),
                                     ));
                                 }
@@ -6273,6 +6328,7 @@ impl ExternalPoolManager {
                 outbound_model,
                 outbound_body,
                 billing: None,
+                downstream_stop_reason: None,
                 stream_usage_capture: Some(stream_usage_capture),
                 stream_usage_projection,
             })
@@ -6357,6 +6413,7 @@ impl ExternalPoolManager {
                     outbound_model.clone(),
                 ));
             }
+            let downstream_stop_reason = projected.usage_capture.downstream_stop_reason.clone();
             let billing = external_pool_billing_from_capture(route, pool, projected.usage_capture);
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
@@ -6391,6 +6448,7 @@ impl ExternalPoolManager {
                 outbound_model,
                 outbound_body,
                 billing,
+                downstream_stop_reason,
                 stream_usage_capture: None,
                 stream_usage_projection: projection_context,
             })
@@ -7997,6 +8055,7 @@ impl ExternalPoolManager {
         pool: &ExternalPool,
         attempts: Vec<ExternalPoolAttempt>,
         billing: Option<ExternalPoolBilling>,
+        downstream_stop_reason: Option<String>,
     ) {
         self.reset_pool_auto_disable_failure_counts(pool.id);
         self.record_external(
@@ -8009,6 +8068,7 @@ impl ExternalPoolManager {
             None,
             UsageErrorDiagnostics::default(),
             billing,
+            downstream_stop_reason,
         );
     }
 
@@ -8044,6 +8104,7 @@ impl ExternalPoolManager {
             Some(error_message.to_string()),
             Some(error_detail),
             diagnostics,
+            None,
             None,
         );
     }
@@ -8147,6 +8208,7 @@ impl ExternalPoolManager {
         error_detail: Option<String>,
         error_diagnostics: UsageErrorDiagnostics,
         billing: Option<ExternalPoolBilling>,
+        downstream_stop_reason: Option<String>,
     ) {
         let request_input_tokens = if route.request_input_tokens > 0 {
             route.request_input_tokens
@@ -8198,7 +8260,7 @@ impl ExternalPoolManager {
             stream: route.is_stream(),
             model: route.requested_model(),
             requested_max_tokens: route.requested_max_tokens(),
-            downstream_stop_reason: None,
+            downstream_stop_reason,
             upstream_model: route.upstream_model.clone(),
             external_outbound_model,
             model_resolution_source: route.model_resolution_source.clone(),
@@ -8436,10 +8498,15 @@ impl ExternalStreamUsageGuard {
                     )),
                 },
                 None,
+                None,
             );
             self.completed = true;
             return;
         }
+        let downstream_stop_reason = self
+            .usage_capture
+            .as_ref()
+            .and_then(|capture| capture.lock().downstream_stop_reason.clone());
         let billing = self
             .usage_capture
             .as_ref()
@@ -8479,6 +8546,7 @@ impl ExternalStreamUsageGuard {
             &self.pool,
             self.attempts.clone(),
             billing,
+            downstream_stop_reason,
         );
         self.completed = true;
     }
@@ -8520,6 +8588,7 @@ impl ExternalStreamUsageGuard {
                 )),
             },
             None,
+            None,
         );
         self.completed = true;
     }
@@ -8558,6 +8627,7 @@ impl ExternalStreamUsageGuard {
                 metadata: None,
                 public_error: None,
             },
+            None,
             None,
         );
         self.completed = true;
@@ -8820,6 +8890,24 @@ async fn external_pool_stream_idle_deadline(
         tokio::time::sleep_until(last_chunk_at + idle_timeout).await;
     } else {
         std::future::pending::<()>().await;
+    }
+}
+
+async fn external_pool_stream_keepalive_deadline(
+    last_keepalive_at: Instant,
+    keepalive_interval: Duration,
+) {
+    tokio::time::sleep_until(last_keepalive_at + keepalive_interval).await;
+}
+
+fn external_pool_stream_keepalive_interval(idle_timeout: Option<Duration>) -> Duration {
+    match idle_timeout {
+        Some(idle_timeout) => {
+            let secs =
+                (idle_timeout.as_secs() / 2).clamp(1, EXTERNAL_POOL_STREAM_KEEPALIVE_INTERVAL_SECS);
+            Duration::from_secs(secs)
+        }
+        None => Duration::from_secs(EXTERNAL_POOL_STREAM_KEEPALIVE_INTERVAL_SECS),
     }
 }
 
@@ -10420,6 +10508,7 @@ fn process_non_stream_response_usage(
         }
         return ProjectedNonStreamBody::without_protocol_contamination(bytes, usage_capture);
     };
+    usage_capture.downstream_stop_reason = external_stop_reason_from_value(&value);
     let sanitization = sanitize_response_content(&mut value, known_tool_names);
     let sanitized = sanitization.blocks > 0;
 
@@ -11072,6 +11161,7 @@ fn process_usage_slots_in_sse_value(
     rewrite: bool,
 ) -> SseUsageProcessingResult {
     let mut result = SseUsageProcessingResult::default();
+    update_external_usage_capture_stop_reason(capture, external_stop_reason_from_value(value));
     let mut handled_top_level = false;
     if let Some(usage) = value.get_mut("usage") {
         handled_top_level = true;
@@ -11935,6 +12025,19 @@ fn update_external_usage_capture_request_input(
     capture.request_input_tokens = Some(request_input_tokens.max(0));
 }
 
+fn update_external_usage_capture_stop_reason(
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stop_reason: Option<String>,
+) {
+    let Some(stop_reason) = stop_reason else {
+        return;
+    };
+    let Some(capture) = capture else {
+        return;
+    };
+    capture.lock().downstream_stop_reason = Some(stop_reason);
+}
+
 fn update_external_usage_capture_output_estimate(
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
     output_tokens: i32,
@@ -11956,6 +12059,49 @@ fn external_usage_capture_output_estimate(
 ) -> Option<i32> {
     let output_tokens = capture?.lock().estimated_output_tokens.max(0);
     (output_tokens > 0).then_some(output_tokens)
+}
+
+fn external_stop_reason_from_value(value: &serde_json::Value) -> Option<String> {
+    const ANTHROPIC_STOP_REASON_POINTERS: [&str; 5] = [
+        "/delta/stop_reason",
+        "/stop_reason",
+        "/message/stop_reason",
+        "/data/stop_reason",
+        "/response/stop_reason",
+    ];
+    for pointer in ANTHROPIC_STOP_REASON_POINTERS {
+        if let Some(reason) = value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalize_external_stop_reason)
+        {
+            return Some(reason);
+        }
+    }
+    value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| {
+            choices.iter().find_map(|choice| {
+                choice
+                    .get("finish_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(normalize_external_stop_reason)
+            })
+        })
+}
+
+fn normalize_external_stop_reason(reason: &str) -> Option<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match trimmed {
+        "stop" => "end_turn".to_string(),
+        "length" => "max_tokens".to_string(),
+        "tool_calls" | "function_call" => "tool_use".to_string(),
+        other => other.to_string(),
+    })
 }
 
 fn merge_external_usage(existing: Option<CacheUsage>, incoming: CacheUsage) -> CacheUsage {

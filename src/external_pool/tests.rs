@@ -1295,6 +1295,71 @@ async fn external_pool_stream_pre_output_error_event_fails_over_and_keeps_succes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_keepalive_emits_ping_during_silent_gap_before_output() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_keepalive_a", 111)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("after-gap")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_messages_pool(&postgres, "stream-keepalive-ping", 1, &upstream.base_url).await;
+
+    let request_id = "req_stream_keepalive_ping";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_keepalive_ping");
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("keepalive stream should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("keepalive stream should not fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("msg_keepalive_a"));
+    assert!(body.contains("after-gap"));
+    assert!(body.contains("event: ping"));
+    let message_start_pos = body
+        .find("msg_keepalive_a")
+        .expect("message_start should be present");
+    let ping_pos = body
+        .find("event: ping")
+        .expect("keepalive ping should be present");
+    let text_start_pos = body
+        .find("content_block_start")
+        .expect("delayed content_block_start should be present");
+    assert!(
+        message_start_pos < ping_pos,
+        "ping must come after initial stream output"
+    );
+    assert!(
+        ping_pos < text_start_pos,
+        "ping must arrive before delayed semantic output"
+    );
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.downstream_stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(record.output_tokens, 4);
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+    assert_eq!(upstream.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_stream_protocol_only_then_error_event_fails_over_without_leaking_prefix() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -12672,6 +12737,37 @@ data: {"type":"message_delta","usage":{"prompt_tokens":1234,"completion_tokens":
 }
 
 #[test]
+fn stream_stop_reason_is_captured_for_external_pool_usage_records() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+
+    capture_sse_event_usage(
+        br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+    assert_eq!(
+        capture.lock().downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    capture_sse_event_usage(
+        br#"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+    assert_eq!(
+        capture.lock().downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+}
+
+#[test]
 fn openai_stream_usage_keeps_local_shaping_separate_from_raw_billing() {
     let route = test_route("claude-opus-4-6");
     let mut pool = test_pool("http://pool.example.com", false);
@@ -12733,6 +12829,37 @@ fn non_stream_missing_usage_injects_estimated_billing_body() {
     );
     assert_eq!(billing.usage_candidate_path, None);
     assert!(billing.reported_usage.input_tokens > 0);
+}
+
+#[test]
+fn non_stream_stop_reason_is_captured_for_external_pool_usage_records() {
+    let route = test_route("claude-opus-4-6");
+
+    let anthropic = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"type":"message","content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens","usage":{"input_tokens":10,"output_tokens":20}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        anthropic.usage_capture.downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+
+    let openai = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        openai.usage_capture.downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
 }
 
 #[test]
