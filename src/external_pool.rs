@@ -1157,9 +1157,13 @@ fn external_request_send_timeout(
         (config.external_pool_request_timeout_secs > 0)
             .then(|| Duration::from_secs(config.external_pool_request_timeout_secs))
     };
-    let remaining = dispatch_deadline
-        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-        .filter(|duration| !duration.is_zero());
+    let remaining = (!route.is_stream())
+        .then(|| {
+            dispatch_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .filter(|duration| !duration.is_zero())
+        })
+        .flatten();
     match (configured, remaining) {
         (Some(configured), Some(remaining)) => Some(configured.min(remaining)),
         (Some(configured), None) => Some(configured),

@@ -1102,6 +1102,29 @@ fn external_stream_config_for_test() -> ExternalPoolsConfig {
     }
 }
 
+#[test]
+fn external_stream_request_timeout_zero_does_not_inherit_non_stream_timeout() {
+    let config = ExternalPoolsConfig {
+        external_pool_request_timeout_secs: 2,
+        external_pool_stream_request_timeout_secs: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    payload_mut(&mut route).stream = true;
+    refresh_test_route_derived_state(&mut route);
+    let dispatch_deadline = external_dispatch_deadline(&route, &config);
+
+    assert!(
+        dispatch_deadline.is_some(),
+        "overall stream dispatch capacity wait still has a bounded deadline"
+    );
+    assert_eq!(
+        external_request_send_timeout(&route, &config, dispatch_deadline),
+        None,
+        "stream request_timeout=0 must keep long stream semantics and rely on idle timeout"
+    );
+}
+
 fn external_stream_route(
     request_id: impl Into<String>,
     error_id: impl Into<String>,
