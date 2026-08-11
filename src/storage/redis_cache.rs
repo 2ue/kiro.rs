@@ -7415,6 +7415,7 @@ mod tests {
                 .then(|| "local_account".to_string()),
             error_id: None,
             error_metadata: None,
+            raw_upstream_error: None,
             public_error_status_code: None,
             public_error_type: None,
             public_error_message: None,

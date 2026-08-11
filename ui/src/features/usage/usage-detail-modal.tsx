@@ -201,17 +201,61 @@ function appendDiagnostic(
   items.push({ label, value: text, tone })
 }
 
+function formatRawUpstreamError(error?: UsageRecord['rawUpstreamError'] | null): string | undefined {
+  if (!error) return undefined
+  const lines = [
+    `source: ${error.source || '-'}`,
+    `status: ${error.statusCode ?? '-'}`,
+    `content-type: ${error.contentType || '-'}`,
+    `body-bytes: ${formatNumber(error.bodyBytes || 0)}`,
+    `truncated: ${error.truncated ? 'yes' : 'no'}`,
+    '',
+    error.body || '-',
+  ]
+  return lines.join('\n')
+}
+
+function formatSystemError(record: UsageRecord): string | undefined {
+  const message = record.errorDetail || record.errorMessage
+  if (!message && !record.errorStatusCode && !record.errorType && !record.errorSource) return undefined
+  return [
+    `source: ${record.errorSource || '-'}`,
+    `status: ${record.errorStatusCode ?? '-'}`,
+    `type: ${record.errorType || '-'}`,
+    '',
+    message || '-',
+  ].join('\n')
+}
+
+function formatClientError(record: UsageRecord): string | undefined {
+  if (!record.publicErrorMessage && !record.publicErrorStatusCode && !record.publicErrorType) return undefined
+  return [
+    `status: ${record.publicErrorStatusCode ?? '-'}`,
+    `type: ${record.publicErrorType || '-'}`,
+    '',
+    record.publicErrorMessage || '-',
+  ].join('\n')
+}
+
 function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
   const items: ErrorDiagnosticItem[] = []
   const seen = new Set<string>()
   const selectionFailure = extractSelectionFailure(record.errorMetadata)
 
-  appendDiagnostic(items, seen, '处理 / 内部错误', record.errorDetail || record.errorMessage, 'error')
+  appendDiagnostic(items, seen, '上游错误片段', formatRawUpstreamError(record.rawUpstreamError), 'warning')
+  appendDiagnostic(items, seen, '系统处理 / 限制错误', formatSystemError(record), 'error')
   if (record.errorDetail && record.errorMessage && record.errorDetail !== record.errorMessage) {
     appendDiagnostic(items, seen, '内部错误摘要', record.errorMessage, 'error')
   }
 
   record.credentialAttempts?.forEach((attempt) => {
+    appendDiagnostic(
+      items,
+      seen,
+      `本地上游错误片段 #${attempt.attempt} · 账号 #${attempt.credentialId} · ${attempt.statusText || attempt.status || attempt.action || '-'}`,
+      formatRawUpstreamError(attempt.rawUpstreamError),
+      'warning'
+    )
     appendDiagnostic(
       items,
       seen,
@@ -222,6 +266,13 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
   })
 
   record.externalAttempts?.forEach((attempt) => {
+    appendDiagnostic(
+      items,
+      seen,
+      `外部池上游错误片段 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
+      formatRawUpstreamError(attempt.rawUpstreamError),
+      'warning'
+    )
     appendDiagnostic(
       items,
       seen,
@@ -241,7 +292,7 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     )
   }
 
-  appendDiagnostic(items, seen, '客户端归一化错误', record.publicErrorMessage, 'muted')
+  appendDiagnostic(items, seen, '返回给下游的错误', formatClientError(record), 'muted')
   return items
 }
 
@@ -331,9 +382,9 @@ export function UsageDetailModal({
             <Badge tone="neutral">{sourceLabel(record.usageSource)}</Badge>
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
-            {record.publicErrorType && <DetailField label="客户端错误类型" value={record.publicErrorType} />}
-            {record.publicErrorStatusCode != null && <DetailField label="客户端状态码" value={String(record.publicErrorStatusCode)} />}
-            {record.publicErrorMessage && <DetailField label="客户端收到的错误" value={record.publicErrorMessage} />}
+            {record.publicErrorType && <DetailField label="下游错误类型" value={record.publicErrorType} />}
+            {record.publicErrorStatusCode != null && <DetailField label="下游状态码" value={String(record.publicErrorStatusCode)} />}
+            {record.publicErrorMessage && <DetailField label="下游收到的错误" value={record.publicErrorMessage} />}
             {record.errorType && <DetailField label="错误类型" value={record.errorType} />}
             {record.errorStatusCode != null && <DetailField label="内部状态码" value={String(record.errorStatusCode)} />}
             {record.errorSource && <DetailField label="错误阶段" value={record.errorSource} />}

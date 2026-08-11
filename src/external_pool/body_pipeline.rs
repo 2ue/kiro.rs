@@ -52,6 +52,7 @@ pub(super) fn prepare_request(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         })?)
     } else {
         None
@@ -119,6 +120,7 @@ pub(super) fn prepare_request(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         })?,
         None => normalized_base.body.clone(),
     };
@@ -427,6 +429,7 @@ fn prepare_raw_request(
                 auto_disable_reason: None,
                 cooldown: Some((Duration::ZERO, "model_rewrite_failed".to_string())),
                 protocol_error: None,
+                raw_upstream_error: None,
             })?;
             Ok(PreparedExternalRequest {
                 body,
@@ -454,6 +457,7 @@ fn effective_raw_probe<'a>(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         })?;
     if let Some(error) = probe.scan_error() {
         return Err(ExternalPoolError {
@@ -463,6 +467,7 @@ fn effective_raw_probe<'a>(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         });
     }
     Ok(probe)
@@ -522,5 +527,6 @@ fn payload_guard_error(pool: &ExternalPool, err: PayloadGuardError) -> ExternalP
         auto_disable_reason: None,
         cooldown: None,
         protocol_error: None,
+        raw_upstream_error: None,
     }
 }

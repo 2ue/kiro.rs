@@ -65,7 +65,10 @@ use crate::{
             UsageSource,
         },
     },
-    common::capacity_signal::{CapacitySignal, CapacityWaiter},
+    common::{
+        capacity_signal::{CapacitySignal, CapacityWaiter},
+        upstream_error::RawUpstreamError,
+    },
     http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout},
     kiro::token_manager::storage_task::spawn_critical_storage_task,
     model::config::{
@@ -1142,6 +1145,46 @@ fn external_dispatch_deadline(
     }
 }
 
+fn external_request_send_timeout(
+    route: &ExternalRouteRequest,
+    config: &ExternalPoolsConfig,
+    dispatch_deadline: Option<Instant>,
+) -> Option<Duration> {
+    let configured = if route.is_stream() {
+        (config.external_pool_stream_request_timeout_secs > 0)
+            .then(|| Duration::from_secs(config.external_pool_stream_request_timeout_secs))
+    } else {
+        (config.external_pool_request_timeout_secs > 0)
+            .then(|| Duration::from_secs(config.external_pool_request_timeout_secs))
+    };
+    let remaining = dispatch_deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .filter(|duration| !duration.is_zero());
+    match (configured, remaining) {
+        (Some(configured), Some(remaining)) => Some(configured.min(remaining)),
+        (Some(configured), None) => Some(configured),
+        (None, Some(remaining)) => Some(remaining),
+        (None, None) => None,
+    }
+}
+
+fn external_response_body_timeout_secs(
+    config: &ExternalPoolsConfig,
+    dispatch_deadline: Option<Instant>,
+) -> u64 {
+    let configured = if config.external_pool_request_timeout_secs == 0 {
+        EXTERNAL_POOL_DEFAULT_RESPONSE_BODY_TIMEOUT_SECS
+    } else {
+        config.external_pool_request_timeout_secs
+    };
+    dispatch_deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .filter(|duration| !duration.is_zero())
+        .map(|duration| duration.as_secs().max(1))
+        .map(|remaining_secs| configured.min(remaining_secs))
+        .unwrap_or(configured)
+}
+
 struct ExternalForwardResponse {
     response: Response,
     outbound_model: Option<String>,
@@ -1214,6 +1257,7 @@ fn external_pool_lease_lost_forward_error(outbound_model: Option<String>) -> Ext
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         },
         outbound_model,
     )
@@ -1251,6 +1295,7 @@ fn external_response_body_read_error(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         },
         outbound_model,
     )
@@ -1370,8 +1415,10 @@ impl ExternalPoolFinalError {
     fn public_message(&self, external_error_id: &str) -> String {
         let message = if self.is_rate_limit() {
             envelope::PUBLIC_RATE_LIMIT_MESSAGE
-        } else if self.is_external_prompt_too_long() {
-            "Prompt is too long for the external model context window. Reduce conversation history, system prompt, tools, documents, images, or tool results and retry."
+        } else if self.is_external_payload_too_large() {
+            "Request input content length exceeded the external upstream threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history and retry."
+        } else if self.is_external_context_window_full() {
+            "Context window is full for the external model. Reduce conversation history, system prompt, tools, documents, images, or tool results and retry."
         } else if self.is_public_invalid_request() {
             envelope::PUBLIC_INVALID_REQUEST_MESSAGE
         } else {
@@ -1411,15 +1458,24 @@ impl ExternalPoolFinalError {
             || lower.contains("deadline")
     }
 
-    pub fn is_external_prompt_too_long(&self) -> bool {
+    pub fn is_external_payload_too_large(&self) -> bool {
         if self.status != StatusCode::BAD_REQUEST {
             return false;
         }
         let lower = self.message.to_ascii_lowercase();
-        lower.contains("prompt is too long")
-            || lower.contains("input is too long")
-            || lower.contains("context window is full")
+        lower.contains("request payload is too large")
+            || lower.contains("content length exceeded")
             || lower.contains("content_length_exceeds_threshold")
+    }
+
+    pub fn is_external_context_window_full(&self) -> bool {
+        if self.status != StatusCode::BAD_REQUEST {
+            return false;
+        }
+        let lower = self.message.to_ascii_lowercase();
+        lower.contains("context window is full")
+            || lower.contains("prompt is too long")
+            || lower.contains("input is too long")
     }
 
     pub fn is_capacity_like(&self) -> bool {
@@ -1448,6 +1504,7 @@ struct ExternalUsageCapture {
     usage_candidate_path: Option<String>,
     body_usage_projection_applied: bool,
     stream_error_message: Option<String>,
+    raw_upstream_error: Option<RawUpstreamError>,
     stream_response_mode: Option<ExternalPoolStreamResponseMode>,
     debug_stream: ExternalUsageDebugStreamCapture,
 }
@@ -3310,6 +3367,14 @@ struct ExternalPoolError {
     auto_disable_reason: Option<String>,
     cooldown: Option<(Duration, String)>,
     protocol_error: Option<&'static str>,
+    raw_upstream_error: Option<RawUpstreamError>,
+}
+
+impl ExternalPoolError {
+    fn with_raw_upstream_error(mut self, raw_upstream_error: Option<RawUpstreamError>) -> Self {
+        self.raw_upstream_error = raw_upstream_error;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3319,6 +3384,7 @@ struct UsageErrorDiagnostics {
     error_id: Option<String>,
     metadata: Option<serde_json::Value>,
     public_error: Option<UsagePublicError>,
+    raw_upstream_error: Option<RawUpstreamError>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5454,9 +5520,13 @@ impl ExternalPoolManager {
             };
             capacity_waiter.finish_acquired();
             drop(queue_guard.take());
+            if dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                drop(lease);
+                return self.external_dispatch_deadline_outcome(&route, attempts, &config);
+            }
             let started = std::time::Instant::now();
             let current_attempt = send_attempt_index.saturating_add(1) as u32;
-            let prepared = self.prepare_forward_once(&pool, &route, &config);
+            let prepared = self.prepare_forward_once(&pool, &route, &config, dispatch_deadline);
             let result = match prepared {
                 Ok(prepared) => {
                     #[cfg(test)]
@@ -5530,6 +5600,7 @@ impl ExternalPoolManager {
                         duration_ms: started.elapsed().as_millis() as u64,
                         error_type: None,
                         error_message: None,
+                        raw_upstream_error: None,
                     });
                     if route.is_stream() {
                         return ExternalPoolForwardOutcome::Response(
@@ -5585,6 +5656,7 @@ impl ExternalPoolManager {
                         duration_ms: started.elapsed().as_millis() as u64,
                         error_type: Some(error_type_for_external_error(&err).to_string()),
                         error_message: Some(err.message.clone()),
+                        raw_upstream_error: err.raw_upstream_error.clone(),
                     });
                     if let Some(retry_route) = (pool.request_body_mode
                         == ExternalPoolRequestBodyMode::Normalized
@@ -5848,6 +5920,7 @@ impl ExternalPoolManager {
         pool: &ExternalPool,
         route: &ExternalRouteRequest,
         config: &ExternalPoolsConfig,
+        dispatch_deadline: Option<Instant>,
     ) -> Result<PreparedExternalForwardRequest, ExternalForwardError> {
         let url = external_pool_url(pool, &route.endpoint, config)?;
         let mut headers = forward_headers(&route.headers, pool)?;
@@ -5862,22 +5935,11 @@ impl ExternalPoolManager {
         let outbound_body = prepared.body.clone();
         let known_tool_names = external_route_known_tool_names(route);
         let mut request = self.client.post(url).headers(headers).body(prepared.body);
-        if route.is_stream() {
-            if config.external_pool_stream_request_timeout_secs > 0 {
-                request = request.timeout(Duration::from_secs(
-                    config.external_pool_stream_request_timeout_secs,
-                ));
-            }
-        } else if config.external_pool_request_timeout_secs > 0 {
-            request = request.timeout(Duration::from_secs(
-                config.external_pool_request_timeout_secs,
-            ));
+        if let Some(timeout) = external_request_send_timeout(route, config, dispatch_deadline) {
+            request = request.timeout(timeout);
         }
-        let response_body_timeout_secs = if config.external_pool_request_timeout_secs == 0 {
-            EXTERNAL_POOL_DEFAULT_RESPONSE_BODY_TIMEOUT_SECS
-        } else {
-            config.external_pool_request_timeout_secs
-        };
+        let response_body_timeout_secs =
+            external_response_body_timeout_secs(config, dispatch_deadline);
         Ok(PreparedExternalForwardRequest {
             request,
             outbound_model,
@@ -5935,6 +5997,7 @@ impl ExternalPoolManager {
                     auto_disable_reason: None,
                     cooldown: None,
                     protocol_error: None,
+                    raw_upstream_error: None,
                 },
                 outbound_model,
                 rejection,
@@ -5962,6 +6025,7 @@ impl ExternalPoolManager {
                             "network_error".to_string(),
                         )),
                         protocol_error: None,
+                        raw_upstream_error: None,
                     },
                     outbound_model.clone(),
                 )
@@ -6342,6 +6406,7 @@ impl ExternalPoolManager {
                         auto_disable_reason: None,
                         cooldown: None,
                         protocol_error: None,
+                        raw_upstream_error: None,
                     },
                     outbound_model.clone(),
                 )
@@ -6454,6 +6519,7 @@ impl ExternalPoolManager {
                                 auto_disable_reason: None,
                                 cooldown: None,
                                 protocol_error: None,
+                                raw_upstream_error: None,
                             },
                             outbound_model.clone(),
                         )
@@ -8239,7 +8305,8 @@ impl ExternalPoolManager {
             billing
                 .as_ref()
                 .and_then(|billing| billing.request_input_tokens)
-                .unwrap_or(0)
+                .filter(|tokens| *tokens > 0)
+                .unwrap_or_else(|| estimated_external_request_input_tokens(route, None))
         };
         let usage = billing
             .as_ref()
@@ -8355,6 +8422,7 @@ impl ExternalPoolManager {
             error_source: error_diagnostics.source,
             error_id: error_diagnostics.error_id,
             error_metadata: error_diagnostics.metadata,
+            raw_upstream_error: error_diagnostics.raw_upstream_error,
             public_error_status_code: error_diagnostics
                 .public_error
                 .as_ref()
@@ -8395,7 +8463,7 @@ fn external_standard_usage_for_status(
     }
 
     ExternalPoolUsageSnapshot {
-        total_input_tokens: 0,
+        total_input_tokens: request_input_tokens.max(0),
         input_tokens: 0,
         billable_input_tokens: 0,
         output_tokens: 0,
@@ -8519,6 +8587,10 @@ impl ExternalStreamUsageGuard {
                         "api_error",
                         &self.route.error_id,
                     )),
+                    raw_upstream_error: self
+                        .usage_capture
+                        .as_ref()
+                        .and_then(|capture| capture.lock().raw_upstream_error.clone()),
                 },
                 None,
                 None,
@@ -8609,6 +8681,7 @@ impl ExternalStreamUsageGuard {
                     "api_error",
                     &self.route.error_id,
                 )),
+                raw_upstream_error: None,
             },
             None,
             None,
@@ -8649,6 +8722,7 @@ impl ExternalStreamUsageGuard {
                 error_id: Some(self.route.error_id.clone()),
                 metadata: None,
                 public_error: None,
+                raw_upstream_error: None,
             },
             None,
             None,
@@ -8964,6 +9038,7 @@ fn external_pre_output_stream_protocol_error(
                 "protocol_error".to_string(),
             )),
             protocol_error: Some(protocol_error),
+            raw_upstream_error: None,
         },
         outbound_model,
     )
@@ -8985,6 +9060,7 @@ fn external_pre_output_stream_network_error(
                 "network_error".to_string(),
             )),
             protocol_error: None,
+            raw_upstream_error: None,
         },
         outbound_model,
     )
@@ -9285,6 +9361,7 @@ fn external_pool_url(
             "misconfigured_endpoint".to_string(),
         )),
         protocol_error: None,
+        raw_upstream_error: None,
     })
 }
 
@@ -9333,6 +9410,7 @@ fn forward_headers(
                     auto_disable_reason: Some("auth_error".to_string()),
                     cooldown: Some((Duration::from_secs(10), "auth_error".to_string())),
                     protocol_error: None,
+                    raw_upstream_error: None,
                 }
             })?;
             out.insert(header::AUTHORIZATION, value);
@@ -9346,6 +9424,7 @@ fn forward_headers(
                 auto_disable_reason: Some("auth_error".to_string()),
                 cooldown: Some((Duration::from_secs(10), "auth_error".to_string())),
                 protocol_error: None,
+                raw_upstream_error: None,
             })?;
             out.insert(HeaderName::from_static("x-api-key"), value);
         }
@@ -9781,6 +9860,7 @@ fn success_error_body_protocol_error(
             "server_error".to_string(),
         )),
         protocol_error: Some("success_error_envelope"),
+        raw_upstream_error: None,
     }
 }
 
@@ -9795,6 +9875,7 @@ fn external_protocol_contamination_error(config: &ExternalPoolsConfig) -> Extern
             "protocol_contamination".to_string(),
         )),
         protocol_error: None,
+        raw_upstream_error: None,
     }
 }
 
@@ -9826,6 +9907,7 @@ fn success_protocol_error(
             "misconfigured_endpoint".to_string(),
         )),
         protocol_error: Some("unexpected_response_shape"),
+        raw_upstream_error: None,
     }
 }
 
@@ -10026,6 +10108,7 @@ fn external_error_diagnostics(
         error_id: Some(route.error_id.clone()),
         metadata: (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata)),
         public_error,
+        raw_upstream_error: err.raw_upstream_error.clone(),
     }
 }
 
@@ -10040,6 +10123,7 @@ fn synthetic_external_error_diagnostics(
         error_id: Some(route.error_id.clone()),
         metadata: Some(json!({ "syntheticStatus": true })),
         public_error: None,
+        raw_upstream_error: None,
     }
 }
 
@@ -10101,6 +10185,7 @@ fn synthetic_external_capacity_error_diagnostics(
         error_id: Some(route.error_id.clone()),
         metadata: Some(serde_json::Value::Object(metadata)),
         public_error: None,
+        raw_upstream_error: None,
     }
 }
 
@@ -10111,13 +10196,18 @@ fn external_error_message_indicates_model_unavailable(lower_message: &str) -> bo
         || lower_message.contains("model is unavailable")
 }
 
-fn external_error_message_indicates_payload_too_long(lower_message: &str) -> bool {
+fn external_error_message_indicates_payload_too_large(lower_message: &str) -> bool {
+    lower_message.contains("content_length_exceeds_threshold")
+        || lower_message.contains("request payload is too large")
+        || lower_message.contains("payload is too large")
+        || lower_message.contains("request body is too large")
+        || lower_message.contains("content length exceeded")
+}
+
+fn external_error_message_indicates_context_window_full(lower_message: &str) -> bool {
     lower_message.contains("context window is full")
         || lower_message.contains("input is too long")
         || lower_message.contains("prompt is too long")
-        || lower_message.contains("content_length_exceeds_threshold")
-        || lower_message.contains("request payload is too large")
-        || lower_message.contains("payload is too large")
 }
 
 fn classified_external_error(
@@ -10134,6 +10224,7 @@ fn classified_external_error(
         auto_disable_reason: auto_disable_reason.map(str::to_string),
         cooldown: cooldown.map(|(duration, reason)| (duration, reason.to_string())),
         protocol_error: None,
+        raw_upstream_error: None,
     }
 }
 
@@ -10193,6 +10284,14 @@ fn classify_external_error(
     config: &ExternalPoolsConfig,
 ) -> ExternalPoolError {
     let retry_after = external_retry_after_duration(&headers);
+    let raw_upstream_error = RawUpstreamError::from_bytes(
+        "external_pool",
+        Some(status.as_u16()),
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        &body,
+    );
     let lower = String::from_utf8_lossy(&body).to_ascii_lowercase();
     if lower.contains("too many requests")
         || lower.contains("service_request_rate_exceeded")
@@ -10211,7 +10310,8 @@ fn classify_external_error(
                 ),
                 "rate_limit",
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if lower.contains("database is locked") || lower.contains("sqlite_busy") {
         return classified_external_error(
@@ -10226,7 +10326,8 @@ fn classify_external_error(
                 ),
                 "database_busy",
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if lower.contains("invalid token") {
         return classified_external_error(
@@ -10241,7 +10342,8 @@ fn classify_external_error(
                 ),
                 "auth_error",
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if lower.contains("channel affinity") && lower.contains("disabled") {
         return classified_external_error(
@@ -10256,7 +10358,8 @@ fn classify_external_error(
                 ),
                 "channel_disabled",
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if external_error_message_indicates_model_unavailable(&lower) {
         return classified_external_error(
@@ -10275,15 +10378,19 @@ fn classify_external_error(
                         "model_unavailable",
                     )
                 }),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if status == StatusCode::BAD_REQUEST {
-        let message = if external_error_message_indicates_payload_too_long(&lower) {
+        let message = if external_error_message_indicates_payload_too_large(&lower) {
+            "external upstream rejected the request because the request payload is too large"
+        } else if external_error_message_indicates_context_window_full(&lower) {
             "external upstream rejected the request because the prompt is too long"
         } else {
             "external upstream rejected the request"
         };
-        return classified_external_error(status, message, false, None, None);
+        return classified_external_error(status, message, false, None, None)
+            .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
         return classified_external_error(
@@ -10298,7 +10405,8 @@ fn classify_external_error(
                 ),
                 "rate_limit",
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         let reason = if lower.contains("suspended")
@@ -10322,7 +10430,8 @@ fn classify_external_error(
                 ),
                 reason,
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if status.as_u16() == 402
         || lower.contains("quota")
@@ -10345,7 +10454,8 @@ fn classify_external_error(
                 ),
                 "quota_exhausted",
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
         return classified_external_error(
@@ -10360,7 +10470,8 @@ fn classify_external_error(
                 ),
                 "server_error",
             )),
-        );
+        )
+        .with_raw_upstream_error(Some(raw_upstream_error));
     }
     classified_external_error(
         status,
@@ -10369,6 +10480,7 @@ fn classify_external_error(
         None,
         None,
     )
+    .with_raw_upstream_error(Some(raw_upstream_error))
 }
 
 fn should_retry_external_payload_guard(
@@ -10827,6 +10939,11 @@ fn estimated_external_request_input_tokens(
             route
                 .payload
                 .as_ref()
+                .map(count_external_route_input_tokens)
+        })
+        .or_else(|| {
+            external_route_raw_projection_payload(route)
+                .as_deref()
                 .map(count_external_route_input_tokens)
         })
         .unwrap_or(0)
@@ -11962,6 +12079,14 @@ fn maybe_mask_external_stream_error_event(
         let mut capture = capture.lock();
         if capture.stream_error_message.is_none() {
             capture.stream_error_message = Some(SAFE_EXTERNAL_STREAM_ERROR_EVENT.to_string());
+        }
+        if capture.raw_upstream_error.is_none() {
+            capture.raw_upstream_error = Some(RawUpstreamError::from_bytes(
+                "external_pool_stream",
+                Some(StatusCode::OK.as_u16()),
+                Some("text/event-stream"),
+                event,
+            ));
         }
     }
     tracing::warn!(

@@ -241,6 +241,8 @@ async fn external_pool_local_mutations_keep_all_pools_when_own_event_is_observed
 enum TestRawHttpBody {
     DeclaredOnly(usize),
     Chunked(Vec<u8>),
+    DelayedFixed(Duration, Vec<u8>),
+    StallBeforeHeaders(Duration),
     StallAfterPrefix,
     Fixed(Vec<u8>),
     GzipJson(Vec<u8>),
@@ -284,6 +286,21 @@ async fn spawn_test_raw_http_response(
                 {
                     let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
                 }
+            }
+            TestRawHttpBody::DelayedFixed(delay, bytes) => {
+                tokio::time::sleep(delay).await;
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&bytes).await;
+                }
+            }
+            TestRawHttpBody::StallBeforeHeaders(delay) => {
+                tokio::time::sleep(delay).await;
             }
             TestRawHttpBody::StallAfterPrefix => {
                 let headers = format!(
@@ -1157,6 +1174,241 @@ async fn create_messages_pool_with_concurrency(
     request.max_concurrent_requests = max_concurrent_requests;
     request.supported_models = vec!["claude-sonnet-4-6".to_string()];
     postgres.create_external_pool(request).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_slow_upstream_status_keeps_status_and_error_body_fragment() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream_status = StatusCode::from_u16(524).expect("test status");
+    let (url, server) = spawn_test_raw_http_response(
+        upstream_status,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(200),
+            br#"{"error":{"message":"cf edge timeout marker"}}"#.to_vec(),
+        ),
+    )
+    .await;
+    let pool = create_messages_pool(&postgres, "slow-upstream-status", 1, &url).await;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 1,
+        external_pool_request_timeout_secs: 2,
+        external_pool_server_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_slow_upstream_status".to_string();
+    route.error_id = "err_slow_upstream_status".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("delayed upstream status should finish");
+    assert!(
+        started.elapsed() >= Duration::from_millis(150),
+        "the fake upstream must really delay before returning the status"
+    );
+    let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
+        panic!("single 524 pool must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 1);
+    let attempt = &error.attempts[0];
+    assert_eq!(attempt.pool_id, pool.id);
+    assert_eq!(attempt.status, Some(524));
+    assert_eq!(attempt.error_type.as_deref(), Some("server_error"));
+    assert!(
+        attempt.duration_ms >= 150 && attempt.duration_ms < 1500,
+        "status attempt duration should reflect upstream delay, got {}ms",
+        attempt.duration_ms
+    );
+    let raw = attempt
+        .raw_upstream_error
+        .as_ref()
+        .expect("HTTP status error should keep bounded upstream error fragment");
+    assert_eq!(raw.status_code, Some(524));
+    assert!(raw.body.contains("cf edge timeout marker"));
+
+    let record = usage_record_for_request(&recorder, "req_slow_upstream_status");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.external_pool_id, Some(pool.id));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].status, Some(524));
+    assert!(record.external_attempts[0].raw_upstream_error.is_some());
+    assert!(record.raw_upstream_error.is_some());
+
+    server.await.expect("delayed status server should exit");
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_no_response_headers_becomes_client_timeout_without_raw_body() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let (url, server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::StallBeforeHeaders(Duration::from_secs(5)),
+    )
+    .await;
+    let pool = create_messages_pool(&postgres, "no-response-headers", 1, &url).await;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 1,
+        external_pool_request_timeout_secs: 1,
+        external_pool_network_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_no_response_headers_timeout".to_string();
+    route.error_id = "err_no_response_headers_timeout".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("client request timeout should finish before fake server wakes up");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(2500),
+        "client timeout should be governed by request timeout, got {elapsed:?}"
+    );
+    let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
+        panic!("single stalled pool must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 1);
+    let attempt = &error.attempts[0];
+    assert_eq!(attempt.pool_id, pool.id);
+    assert_eq!(attempt.status, None);
+    assert_eq!(attempt.error_type.as_deref(), Some("network_error"));
+    assert!(
+        attempt
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("request send failed: timeout")),
+        "timeout attempt should keep system send-timeout error, got {:?}",
+        attempt.error_message
+    );
+    assert!(
+        attempt.raw_upstream_error.is_none(),
+        "no response headers means there is no upstream response body to record"
+    );
+
+    let record = usage_record_for_request(&recorder, "req_no_response_headers_timeout");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.external_pool_id, Some(pool.id));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].status, None);
+    assert!(record.external_attempts[0].raw_upstream_error.is_none());
+    assert!(record.raw_upstream_error.is_none());
+    assert!(
+        record
+            .error_detail
+            .as_deref()
+            .or(record.error_message.as_deref())
+            .is_some_and(|message| message.contains("request send failed: timeout"))
+    );
+
+    server.abort();
+    let _ = server.await;
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_retry_send_timeout_uses_remaining_dispatch_deadline() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let (slow_502_url, slow_502_server) = spawn_test_raw_http_response(
+        StatusCode::BAD_GATEWAY,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(1200),
+            br#"{"error":{"message":"upstream returned 502 after edge wait"}}"#.to_vec(),
+        ),
+    )
+    .await;
+    let (stalled_url, stalled_server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::StallBeforeHeaders(Duration::from_secs(5)),
+    )
+    .await;
+    let pool_a = create_messages_pool(&postgres, "deadline-slow-502", 1, &slow_502_url).await;
+    let pool_b = create_messages_pool(&postgres, "deadline-stalled-next", 10, &stalled_url).await;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 2,
+        external_pool_request_timeout_secs: 2,
+        external_pool_server_error_cooldown_secs: 1,
+        external_pool_network_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_retry_uses_remaining_deadline".to_string();
+    route.error_id = "err_retry_uses_remaining_deadline".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(4),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("remaining dispatch deadline should cap the second send");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2800),
+        "second attempt must not consume a full extra request timeout; got {elapsed:?}"
+    );
+    let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
+        panic!("both failing pools must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 2);
+    assert_eq!(error.attempts[0].pool_id, pool_a.id);
+    assert_eq!(error.attempts[0].status, Some(502));
+    assert_eq!(
+        error.attempts[0].error_type.as_deref(),
+        Some("server_error")
+    );
+    assert_eq!(error.attempts[1].pool_id, pool_b.id);
+    assert_eq!(error.attempts[1].status, None);
+    assert_eq!(
+        error.attempts[1].error_type.as_deref(),
+        Some("network_error")
+    );
+    assert!(
+        error.attempts[1].duration_ms < 1500,
+        "second send should use the remaining request deadline, got {}ms",
+        error.attempts[1].duration_ms
+    );
+
+    let record = usage_record_for_request(&recorder, "req_retry_uses_remaining_deadline");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].status, Some(502));
+    assert_eq!(record.external_attempts[1].status, None);
+    assert!(record.external_attempts[0].raw_upstream_error.is_some());
+    assert!(record.external_attempts[1].raw_upstream_error.is_none());
+
+    slow_502_server
+        .await
+        .expect("delayed 502 server should exit");
+    stalled_server.abort();
+    let _ = stalled_server.await;
+    postgres.drop_test_schema().await.unwrap();
 }
 
 #[test]
@@ -2703,6 +2955,7 @@ fn inference_attempt_rejection_never_creates_pool_cooldown_for_five_rounds() {
                     auto_disable_reason: None,
                     cooldown: None,
                     protocol_error: None,
+                    raw_upstream_error: None,
                 },
                 Some("claude-sonnet-4-5".to_string()),
                 rejection,
@@ -9776,10 +10029,29 @@ fn external_public_error_reports_prompt_too_long_without_raw_pool_message() {
 
     assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
     assert_eq!(public_error.error_type, "invalid_request_error");
-    assert!(public_error.message.contains("Prompt is too long"));
+    assert!(public_error.message.contains("Context window is full"));
     assert!(public_error.message.contains("error ID: req_01long"));
     assert!(!public_error.message.contains("1000000 maximum"));
     assert!(!public_error.message.contains("buy credits"));
+}
+
+#[test]
+fn external_public_error_reports_payload_limit_without_context_window_message() {
+    let public_error = external_public_error_from_parts(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        false,
+        "external upstream rejected the request because the request payload is too large CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        "req_01payload",
+    );
+
+    assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
+    assert_eq!(public_error.error_type, "invalid_request_error");
+    assert!(public_error.message.contains("content length exceeded"));
+    assert!(public_error.message.contains("external upstream threshold"));
+    assert!(public_error.message.contains("error ID: req_01payload"));
+    assert!(!public_error.message.contains("Context window is full"));
+    assert!(!public_error.message.contains("Prompt is too long"));
 }
 
 #[tokio::test]
@@ -9942,7 +10214,7 @@ fn external_error_diagnostics_records_status_and_non_duplicate_metadata() {
 }
 
 #[test]
-fn external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuses() {
+fn external_failure_standard_usage_keeps_diagnostic_input_and_zeroes_billable_fields() {
     let huge_usage = ExternalPoolUsageSnapshot {
         total_input_tokens: 2_648_439,
         input_tokens: 1_100_000,
@@ -9962,7 +10234,10 @@ fn external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuse
     ] {
         let standard_usage =
             external_standard_usage_for_status(status, 2_648_439, Some(huge_usage));
-        assert_eq!(standard_usage.total_input_tokens, 0, "status={status:?}");
+        assert_eq!(
+            standard_usage.total_input_tokens, 2_648_439,
+            "status={status:?}"
+        );
         assert_eq!(standard_usage.input_tokens, 0, "status={status:?}");
         assert_eq!(standard_usage.billable_input_tokens, 0, "status={status:?}");
         assert_eq!(standard_usage.output_tokens, 0, "status={status:?}");
@@ -9989,7 +10264,25 @@ fn external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuse
 }
 
 #[test]
-fn external_error_classification_attempt_usage_and_final_error_never_retain_raw_bodies() {
+fn raw_passthrough_failure_keeps_estimated_total_input_but_zeroes_billable_usage() {
+    let route = raw_test_route(
+        br#"{"model":"claude-sonnet-5","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hello from raw passthrough"}],"system":"You are concise."}"#,
+    );
+    let estimated = estimated_external_request_input_tokens(&route, None);
+    assert!(estimated > 0);
+
+    let standard_usage =
+        external_standard_usage_for_status(UsageRecordStatus::Error, estimated, None);
+    assert_eq!(standard_usage.total_input_tokens, estimated);
+    assert_eq!(standard_usage.input_tokens, 0);
+    assert_eq!(standard_usage.billable_input_tokens, 0);
+    assert_eq!(standard_usage.output_tokens, 0);
+    assert_eq!(standard_usage.cache_creation_input_tokens, 0);
+    assert_eq!(standard_usage.cache_read_input_tokens, 0);
+}
+
+#[test]
+fn external_error_classification_keeps_raw_body_only_in_usage_diagnostics() {
     for round in 0..5 {
         for (status, body) in [
             (
@@ -10038,14 +10331,37 @@ fn external_error_classification_attempt_usage_and_final_error_never_retain_raw_
                     duration_ms: 1,
                     error_type: Some(error_type_for_external_error(&err)),
                     error_message: Some(err.message.clone()),
+                    raw_upstream_error: err.raw_upstream_error.clone(),
                 }],
                 &err,
                 "req_01safe",
             );
-            let retained = format!("{err:?} {record_message} {diagnostics:?} {final_error:?}");
+            assert!(
+                err.raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "classified error must keep upstream raw body for usage detail"
+            );
+            assert!(
+                diagnostics
+                    .raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "usage diagnostics must keep upstream raw body"
+            );
+            assert!(
+                final_error
+                    .attempts
+                    .first()
+                    .and_then(|attempt| attempt.raw_upstream_error.as_ref())
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "attempt diagnostics must keep matching upstream raw body"
+            );
+            let public_error = final_error.public_error();
+            let retained = format!("{record_message} {public_error:?}");
             assert!(
                 !retained.contains(&marker),
-                "retained raw marker: {retained}"
+                "system summary or downstream error retained raw marker: {retained}"
             );
         }
     }
@@ -10133,6 +10449,7 @@ fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors()
         auto_disable_reason: None,
         cooldown: Some((Duration::from_secs(10), "server_error".to_string())),
         protocol_error: None,
+        raw_upstream_error: None,
     };
     let terminal_auth_error = ExternalPoolError {
         status: Some(StatusCode::FORBIDDEN),
@@ -10141,6 +10458,7 @@ fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors()
         auto_disable_reason: Some("security_lock".to_string()),
         cooldown: Some((Duration::from_secs(10), "security_lock".to_string())),
         protocol_error: None,
+        raw_upstream_error: None,
     };
     let terminal_quota_error = ExternalPoolError {
         status: Some(StatusCode::PAYMENT_REQUIRED),
@@ -10149,6 +10467,7 @@ fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors()
         auto_disable_reason: Some("quota_exhausted".to_string()),
         cooldown: Some((Duration::from_secs(10), "quota_exhausted".to_string())),
         protocol_error: None,
+        raw_upstream_error: None,
     };
 
     assert_eq!(
@@ -10176,6 +10495,7 @@ fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors()
         auto_disable_reason: None,
         cooldown: Some((Duration::from_secs(4), "rate_limit".to_string())),
         protocol_error: None,
+        raw_upstream_error: None,
     };
     assert_eq!(
         retry_pipeline::same_pool_retry_limit(&config, &rate_limit_error),

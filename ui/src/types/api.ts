@@ -743,7 +743,17 @@ export interface KiroCredentialAttempt {
   model?: string
   errorType?: string
   errorMessage?: string
+  rawUpstreamError?: RawUpstreamError
   durationMs: number
+}
+
+export interface RawUpstreamError {
+  source: string
+  statusCode?: number
+  contentType?: string
+  body: string
+  bodyBytes: number
+  truncated: boolean
 }
 
 export interface UsageRecord {
@@ -802,6 +812,7 @@ export interface UsageRecord {
   errorSource?: string
   errorId?: string
   errorMetadata?: unknown
+  rawUpstreamError?: RawUpstreamError
   publicErrorStatusCode?: number
   publicErrorType?: string
   publicErrorMessage?: string
@@ -869,6 +880,7 @@ export interface ExternalPoolAttempt {
   durationMs: number
   errorType?: string
   errorMessage?: string
+  rawUpstreamError?: RawUpstreamError
 }
 
 export interface UsageRecordsResult {

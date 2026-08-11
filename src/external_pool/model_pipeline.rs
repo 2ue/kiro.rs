@@ -93,6 +93,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         },
         ModelProcessingError::MappingMiss { model } => ExternalPoolError {
             status: Some(StatusCode::BAD_GATEWAY),
@@ -104,6 +105,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
             auto_disable_reason: None,
             cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
             protocol_error: None,
+            raw_upstream_error: None,
         },
     }
 }

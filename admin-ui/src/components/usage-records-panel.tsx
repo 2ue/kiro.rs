@@ -476,17 +476,61 @@ function appendErrorDiagnostic(
   items.push({ label, value: text, tone })
 }
 
+function formatRawUpstreamError(error?: UsageRecord['rawUpstreamError'] | null): string | undefined {
+  if (!error) return undefined
+  const lines = [
+    `source: ${error.source || '-'}`,
+    `status: ${error.statusCode ?? '-'}`,
+    `content-type: ${error.contentType || '-'}`,
+    `body-bytes: ${formatNumber(error.bodyBytes || 0)}`,
+    `truncated: ${error.truncated ? 'yes' : 'no'}`,
+    '',
+    error.body || '-',
+  ]
+  return lines.join('\n')
+}
+
+function formatSystemError(record: UsageRecord): string | undefined {
+  const message = record.errorDetail || record.errorMessage
+  if (!message && !record.errorStatusCode && !record.errorType && !record.errorSource) return undefined
+  return [
+    `source: ${record.errorSource || '-'}`,
+    `status: ${record.errorStatusCode ?? '-'}`,
+    `type: ${record.errorType || '-'}`,
+    '',
+    message || '-',
+  ].join('\n')
+}
+
+function formatClientError(record: UsageRecord): string | undefined {
+  if (!record.publicErrorMessage && !record.publicErrorStatusCode && !record.publicErrorType) return undefined
+  return [
+    `status: ${record.publicErrorStatusCode ?? '-'}`,
+    `type: ${record.publicErrorType || '-'}`,
+    '',
+    record.publicErrorMessage || '-',
+  ].join('\n')
+}
+
 function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
   const items: ErrorDiagnosticItem[] = []
   const seen = new Set<string>()
   const selectionFailure = extractSelectionFailure(record.errorMetadata)
 
-  appendErrorDiagnostic(items, seen, '处理 / 内部错误', record.errorDetail || record.errorMessage, 'error')
+  appendErrorDiagnostic(items, seen, '上游错误片段', formatRawUpstreamError(record.rawUpstreamError), 'warning')
+  appendErrorDiagnostic(items, seen, '系统处理 / 限制错误', formatSystemError(record), 'error')
   if (record.errorDetail && record.errorMessage && record.errorDetail !== record.errorMessage) {
     appendErrorDiagnostic(items, seen, '内部错误摘要', record.errorMessage, 'error')
   }
 
   record.credentialAttempts?.forEach((attempt) => {
+    appendErrorDiagnostic(
+      items,
+      seen,
+      `本地上游错误片段 #${attempt.attempt} · 账号 #${attempt.credentialId} · ${attempt.statusText || attempt.status || attempt.action || '-'}`,
+      formatRawUpstreamError(attempt.rawUpstreamError),
+      'warning'
+    )
     appendErrorDiagnostic(
       items,
       seen,
@@ -497,6 +541,13 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
   })
 
   record.externalAttempts?.forEach((attempt) => {
+    appendErrorDiagnostic(
+      items,
+      seen,
+      `外部池上游错误片段 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
+      formatRawUpstreamError(attempt.rawUpstreamError),
+      'warning'
+    )
     appendErrorDiagnostic(
       items,
       seen,
@@ -516,7 +567,7 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     )
   }
 
-  appendErrorDiagnostic(items, seen, '客户端归一化错误', record.publicErrorMessage, 'muted')
+  appendErrorDiagnostic(items, seen, '返回给下游的错误', formatClientError(record), 'muted')
   return items
 }
 
@@ -1431,19 +1482,19 @@ export function UsageRecordsPanel() {
                 </div>
                 {selectedRecord.publicErrorType && (
                   <div>
-                    <div className="text-xs text-muted-foreground">客户端错误类型</div>
+                    <div className="text-xs text-muted-foreground">下游错误类型</div>
                     <div className="break-all">{selectedRecord.publicErrorType}</div>
                   </div>
                 )}
                 {selectedRecord.publicErrorStatusCode != null && (
                   <div>
-                    <div className="text-xs text-muted-foreground">客户端状态码</div>
+                    <div className="text-xs text-muted-foreground">下游状态码</div>
                     <div>{selectedRecord.publicErrorStatusCode}</div>
                   </div>
                 )}
                 {selectedRecord.publicErrorMessage && (
                   <div className="md:col-span-2">
-                    <div className="text-xs text-muted-foreground">客户端收到的错误</div>
+                    <div className="text-xs text-muted-foreground">下游收到的错误</div>
                     <div className="break-all">{selectedRecord.publicErrorMessage}</div>
                   </div>
                 )}

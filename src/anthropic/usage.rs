@@ -13,6 +13,7 @@ use tokio::runtime::{Runtime, RuntimeFlavor};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::common::upstream_error::RawUpstreamError;
 use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
 use crate::storage::postgres::PostgresUsageStore;
 use crate::storage::redis_cache::RedisStore;
@@ -89,6 +90,8 @@ pub struct ExternalPoolAttempt {
     pub error_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_upstream_error: Option<RawUpstreamError>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -492,6 +495,8 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_metadata: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_upstream_error: Option<RawUpstreamError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_error_status_code: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_error_type: Option<String>,
@@ -580,6 +585,7 @@ pub(crate) fn sampled_request_rejection_usage_record(
             "stage": stage,
             "reason": reason,
         })),
+        raw_upstream_error: None,
         public_error_status_code: None,
         public_error_type: None,
         public_error_message: None,
@@ -1570,6 +1576,7 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         && record.error_message.is_none()
         && record.error_detail.is_none()
         && record.error_metadata.is_none()
+        && record.raw_upstream_error.is_none()
         && record.public_error_message.is_none()
     {
         return record;
@@ -1593,6 +1600,22 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         public_message_truncated,
         ERROR_DIAGNOSTIC_MAX_METADATA_BYTES,
     );
+    record.raw_upstream_error = record
+        .raw_upstream_error
+        .take()
+        .map(RawUpstreamError::normalize);
+    for attempt in &mut record.credential_attempts {
+        attempt.raw_upstream_error = attempt
+            .raw_upstream_error
+            .take()
+            .map(RawUpstreamError::normalize);
+    }
+    for attempt in &mut record.external_attempts {
+        attempt.raw_upstream_error = attempt
+            .raw_upstream_error
+            .take()
+            .map(RawUpstreamError::normalize);
+    }
     record
 }
 
@@ -3706,6 +3729,7 @@ mod tests {
             error_source: None,
             error_id: None,
             error_metadata: None,
+            raw_upstream_error: None,
             public_error_status_code: None,
             public_error_type: None,
             public_error_message: None,
