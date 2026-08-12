@@ -17,6 +17,7 @@ pub(super) struct NormalizedRequestBase {
     guard_fallback_error: Option<PayloadGuardError>,
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -385,6 +386,7 @@ fn raw_model_stage_plan(mode: ExternalPoolRawModelMode) -> RawModelStagePlan {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn prepare_raw_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -439,6 +441,7 @@ fn prepare_raw_request(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn effective_raw_probe<'a>(
     route: &'a ExternalRouteRequest,
     pool: &ExternalPool,

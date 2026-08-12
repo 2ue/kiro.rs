@@ -4480,15 +4480,13 @@ fn wrap_websearch_stream_usage_record(
         move |(mut data_stream, mut guard)| async move {
             match data_stream.next().await {
                 Some(Ok(chunk)) => {
-                    if !chunk.is_empty() {
-                        if let Some(guard) = guard.as_ref() {
-                            guard
-                                .context()
-                                .request
-                                .latency
-                                .inference_attempt_budget
-                                .mark_downstream_committed();
-                        }
+                    if let Some(guard) = guard.as_ref().filter(|_| !chunk.is_empty()) {
+                        guard
+                            .context()
+                            .request
+                            .latency
+                            .inference_attempt_budget
+                            .mark_downstream_committed();
                     }
                     Some((Ok(chunk), (data_stream, guard)))
                 }
@@ -5561,10 +5559,11 @@ fn merge_warning_headers(
     if let Some(value) = conversion_warnings.filter(|value| !value.trim().is_empty()) {
         warnings.push(value);
     }
-    if let Some(fragment) = payload_report.and_then(PayloadGuardReport::warning_header_fragment) {
-        if !fragment.trim().is_empty() {
-            warnings.push(fragment);
-        }
+    if let Some(fragment) = payload_report
+        .and_then(PayloadGuardReport::warning_header_fragment)
+        .filter(|fragment| !fragment.trim().is_empty())
+    {
+        warnings.push(fragment);
     }
     (!warnings.is_empty()).then(|| warnings.join(","))
 }
@@ -6568,21 +6567,21 @@ async fn maybe_local_pool_preflight_external_outcome_for_local_request(
     request_id: &str,
     model: Option<&str>,
 ) -> Option<LocalPoolPreflightExternalOutcome> {
-    if let Some(external) = external_fallback {
-        if let Some(failure) = external.raw_preflight_failure.as_ref() {
-            tracing::warn!(
-                request_id,
-                local_fallback_reason = %failure.local_reason,
-                external_status = failure.error.status.as_u16(),
-                external_error_type = %failure.error.route_error_type,
-                external_attempt_count = failure.error.attempts.len(),
-                "using raw external preflight final error to drive parsed local rescue"
-            );
-            return Some(LocalPoolPreflightExternalOutcome {
-                outcome: ExternalPoolForwardOutcome::FinalError(failure.error.clone()),
-                local_reason: failure.local_reason.clone(),
-            });
-        }
+    if let Some(failure) =
+        external_fallback.and_then(|external| external.raw_preflight_failure.as_ref())
+    {
+        tracing::warn!(
+            request_id,
+            local_fallback_reason = %failure.local_reason,
+            external_status = failure.error.status.as_u16(),
+            external_error_type = %failure.error.route_error_type,
+            external_attempt_count = failure.error.attempts.len(),
+            "using raw external preflight final error to drive parsed local rescue"
+        );
+        return Some(LocalPoolPreflightExternalOutcome {
+            outcome: ExternalPoolForwardOutcome::FinalError(failure.error.clone()),
+            local_reason: failure.local_reason.clone(),
+        });
     }
     maybe_local_pool_preflight_external_outcome(external_fallback, request_id, model).await
 }
@@ -7869,17 +7868,19 @@ impl JsonStreamErrorSniffer {
         // non-whitespace byte of an EventStream prelude is normally binary, so
         // decide it in place and keep the hot path zero-copy. Buffering is only
         // needed for a JSON-looking body that may span chunks.
-        if self.buffer.is_empty() {
-            if let Some(first_non_ws) = chunk
-                .iter()
-                .copied()
-                .find(|byte| !byte.is_ascii_whitespace())
-            {
-                if !matches!(first_non_ws, b'{' | b'[') {
-                    self.decided = true;
-                    return JsonStreamSniffResult::Pass(chunk);
-                }
-            }
+        let first_non_ws = self
+            .buffer
+            .is_empty()
+            .then(|| {
+                chunk
+                    .iter()
+                    .copied()
+                    .find(|byte| !byte.is_ascii_whitespace())
+            })
+            .flatten();
+        if first_non_ws.is_some_and(|byte| !matches!(byte, b'{' | b'[')) {
+            self.decided = true;
+            return JsonStreamSniffResult::Pass(chunk);
         }
 
         self.buffer.extend_from_slice(&chunk);
@@ -8232,6 +8233,7 @@ fn classify_json_stream_error(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn inspect_complete_upstream_body(
     content_type: Option<&str>,
     body: Bytes,

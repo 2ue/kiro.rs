@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::result_large_err)]
 pub(super) fn outbound_model_for_raw(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -18,6 +19,7 @@ pub(super) fn outbound_model_for_raw(
     process_external_pool_model(pool, original_model, processed_model)
 }
 
+#[allow(clippy::result_large_err)]
 fn process_external_pool_model(
     pool: &ExternalPool,
     original_model: Option<&str>,

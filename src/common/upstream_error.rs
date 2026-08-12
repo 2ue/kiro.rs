@@ -74,10 +74,11 @@ fn upstream_error_fragment(body: &[u8], content_type: Option<&str>) -> (String, 
     if body.is_empty() {
         return (String::new(), false);
     }
-    if upstream_error_looks_like_json(body, content_type) {
-        if let Some(fragment) = upstream_json_error_fragment(body) {
-            return bounded_utf8_fragment(fragment.as_bytes(), RAW_UPSTREAM_ERROR_BODY_MAX_BYTES);
-        }
+    if let Some(fragment) = upstream_error_looks_like_json(body, content_type)
+        .then(|| upstream_json_error_fragment(body))
+        .flatten()
+    {
+        return bounded_utf8_fragment(fragment.as_bytes(), RAW_UPSTREAM_ERROR_BODY_MAX_BYTES);
     }
     bounded_utf8_fragment(body, RAW_UPSTREAM_ERROR_BODY_MAX_BYTES)
 }

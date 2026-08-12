@@ -4455,20 +4455,25 @@ impl ExternalPoolManager {
         let result = match result {
             Ok(pools) => Ok(pools),
             Err(err) => {
-                if let Some(existing) = snapshot.as_ref().filter(|existing| {
-                    existing.generation == generation
-                        && existing.stale_until > now
-                        && existing.result.is_ok()
-                }) {
-                    if let Ok(pools) = &existing.result {
-                        *snapshot = Some(CachedAuthoritativePoolSnapshot {
-                            generation,
-                            result: Ok(pools.clone()),
-                            fresh_until: now + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_FAILURE_RETRY,
-                            stale_until: existing.stale_until,
-                        });
-                        return true;
-                    }
+                let existing_pools = snapshot
+                    .as_ref()
+                    .filter(|existing| {
+                        existing.generation == generation
+                            && existing.stale_until > now
+                            && existing.result.is_ok()
+                    })
+                    .and_then(|existing| match &existing.result {
+                        Ok(pools) => Some((existing.stale_until, pools.clone())),
+                        Err(_) => None,
+                    });
+                if let Some((stale_until, pools)) = existing_pools {
+                    *snapshot = Some(CachedAuthoritativePoolSnapshot {
+                        generation,
+                        result: Ok(pools),
+                        fresh_until: now + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_FAILURE_RETRY,
+                        stale_until,
+                    });
+                    return true;
                 }
                 Err(err)
             }
@@ -4764,19 +4769,19 @@ impl ExternalPoolManager {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty());
 
-            if let (Some(run_id), Some(epoch)) = (existing_run_id, existing_epoch) {
-                if run_id == current_run_id {
-                    match self
-                        .redis
-                        .external_pool_coordinator_guard_state_for_epoch(epoch)
-                        .await?
-                    {
-                        ExternalPoolCoordinatorGuardState::Ready { .. }
-                        | ExternalPoolCoordinatorGuardState::Recovering { .. } => {
-                            return Ok(epoch.to_string());
-                        }
-                        ExternalPoolCoordinatorGuardState::EpochMismatch { .. } => {}
+            let existing_epoch =
+                existing_epoch.filter(|_| existing_run_id == Some(current_run_id.as_str()));
+            if let Some(epoch) = existing_epoch {
+                match self
+                    .redis
+                    .external_pool_coordinator_guard_state_for_epoch(epoch)
+                    .await?
+                {
+                    ExternalPoolCoordinatorGuardState::Ready { .. }
+                    | ExternalPoolCoordinatorGuardState::Recovering { .. } => {
+                        return Ok(epoch.to_string());
                     }
+                    ExternalPoolCoordinatorGuardState::EpochMismatch { .. } => {}
                 }
             }
 
@@ -5392,25 +5397,25 @@ impl ExternalPoolManager {
                     .await
                 }
             };
-            if selection.selected_pool.is_none()
+            let degraded_selection = (selection.selected_pool.is_none()
                 && selection.availability.coordinator_unavailable
-                && route_allows_degraded_fallback_local_lease(&route)
-            {
-                if let Some(degraded_selection) = self
-                    .select_degraded_fallback_local_pool_from_snapshot(
-                        &authoritative_pools,
-                        &excluded,
-                        &route,
-                        &config,
-                    )
-                {
-                    tracing::warn!(
-                        request_id = %route.request_id,
-                        fallback_reason = ?route.fallback_reason,
-                        "外部池 Redis coordinator 与本地 scheduler 同时不可用，使用进程内有界 emergency external lease"
-                    );
-                    selection = degraded_selection;
-                }
+                && route_allows_degraded_fallback_local_lease(&route))
+            .then(|| {
+                self.select_degraded_fallback_local_pool_from_snapshot(
+                    &authoritative_pools,
+                    &excluded,
+                    &route,
+                    &config,
+                )
+            })
+            .flatten();
+            if let Some(degraded_selection) = degraded_selection {
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    fallback_reason = ?route.fallback_reason,
+                    "外部池 Redis coordinator 与本地 scheduler 同时不可用，使用进程内有界 emergency external lease"
+                );
+                selection = degraded_selection;
             }
             if max_pool_attempts.is_none() {
                 max_pool_attempts = Some(
@@ -5919,6 +5924,7 @@ impl ExternalPoolManager {
         ))
     }
 
+    #[allow(clippy::result_large_err)]
     fn prepare_forward_once(
         &self,
         pool: &ExternalPool,
@@ -6793,12 +6799,13 @@ impl ExternalPoolManager {
             let mut cooldown_reason = runtime.pool_cooldown_reason;
             let mut cooldown_scope =
                 (cooldown_remaining_secs > 0).then_some(PoolCooldownScope::Pool);
-            if cooldown_remaining_secs == 0 {
-                if let Some((model_remaining_secs, model_reason)) = runtime.model_cooldown {
-                    cooldown_remaining_secs = model_remaining_secs;
-                    cooldown_reason = model_reason;
-                    cooldown_scope = Some(PoolCooldownScope::Model);
-                }
+            if let Some((model_remaining_secs, model_reason)) = (cooldown_remaining_secs == 0)
+                .then_some(runtime.model_cooldown)
+                .flatten()
+            {
+                cooldown_remaining_secs = model_remaining_secs;
+                cooldown_reason = model_reason;
+                cooldown_scope = Some(PoolCooldownScope::Model);
             }
             // Soft failures are a short-lived health signal, not a hard filter.
             // They must affect ranking even when no pool cooldown exists so a
@@ -9350,6 +9357,7 @@ pub(crate) fn external_pool_messages_url(base_url: &str) -> Result<Url, url::Par
     Url::parse(&base)
 }
 
+#[allow(clippy::result_large_err)]
 fn external_pool_url(
     pool: &ExternalPool,
     _endpoint: &str,
@@ -9387,6 +9395,7 @@ fn base_url_ends_with_v1(base: &str) -> bool {
         })
 }
 
+#[allow(clippy::result_large_err)]
 fn forward_headers(
     headers: &HeaderMap,
     pool: &ExternalPool,
@@ -9437,6 +9446,7 @@ fn forward_headers(
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 fn external_pool_outbound_body(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -9457,10 +9467,10 @@ fn normalize_external_pool_support_candidates<'a>(
 ) -> Vec<String> {
     let mut normalized = Vec::new();
     for candidate in candidates {
-        if let Some(candidate) = normalize_model_id(candidate) {
-            if !normalized.iter().any(|existing| existing == &candidate) {
-                normalized.push(candidate);
-            }
+        if let Some(candidate) = normalize_model_id(candidate)
+            .filter(|candidate| !normalized.iter().any(|existing| existing == candidate))
+        {
+            normalized.push(candidate);
         }
     }
     normalized
@@ -9707,6 +9717,7 @@ fn decode_pool_runtime_snapshot(
     Ok(snapshot)
 }
 
+#[allow(clippy::result_large_err)]
 fn external_pool_prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -11800,11 +11811,9 @@ impl ExternalAnthropicTranscriptState {
         }
 
         let mut out = Vec::new();
-        if !pending.is_empty() {
-            if let Some(index) = self.current_text_index {
-                out.extend(external_text_delta_event(index, &pending));
-                self.current_text_visible = true;
-            }
+        if let Some(index) = self.current_text_index.filter(|_| !pending.is_empty()) {
+            out.extend(external_text_delta_event(index, &pending));
+            self.current_text_visible = true;
         }
         out
     }
@@ -11979,12 +11988,10 @@ fn capture_external_transcript_fatal_error(
     state: &mut ExternalAnthropicTranscriptState,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
 ) {
-    if let Some(detail) = state.take_pending_fatal_error() {
-        if let Some(capture) = capture {
-            let mut capture = capture.lock();
-            if capture.stream_error_message.is_none() {
-                capture.stream_error_message = Some(detail);
-            }
+    if let Some((detail, capture)) = state.take_pending_fatal_error().zip(capture) {
+        let mut capture = capture.lock();
+        if capture.stream_error_message.is_none() {
+            capture.stream_error_message = Some(detail);
         }
     }
 }
