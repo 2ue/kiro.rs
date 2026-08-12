@@ -512,6 +512,7 @@ pub struct UsageRecord {
 ///
 /// `observed_count` is the monotonic count observed when the sample was selected. It is not the
 /// exact number of rejected requests represented by this record.
+#[cfg(test)]
 pub(crate) fn sampled_request_rejection_usage_record(
     request_id: &str,
     endpoint: &str,
@@ -521,6 +522,40 @@ pub(crate) fn sampled_request_rejection_usage_record(
     status: http::StatusCode,
     observed_count: u64,
 ) -> UsageRecord {
+    sampled_request_rejection_usage_record_with_metadata(
+        request_id,
+        endpoint,
+        request_api_key_id,
+        reason,
+        stage,
+        status,
+        observed_count,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
+    request_id: &str,
+    endpoint: &str,
+    request_api_key_id: Option<String>,
+    reason: &'static str,
+    stage: &'static str,
+    status: http::StatusCode,
+    observed_count: u64,
+    extra_metadata: Option<serde_json::Value>,
+) -> UsageRecord {
+    let mut error_metadata = serde_json::json!({
+        "sampled": true,
+        "observedCount": observed_count,
+        "observedCountIsExact": false,
+        "stage": stage,
+        "reason": reason,
+    });
+    if let Some(extra_metadata) = extra_metadata {
+        merge_usage_error_metadata(&mut error_metadata, extra_metadata);
+    }
+
     UsageRecord {
         id: request_id.to_string(),
         created_at: Utc::now().to_rfc3339(),
@@ -578,19 +613,24 @@ pub(crate) fn sampled_request_rejection_usage_record(
         error_status_code: Some(status.as_u16()),
         error_source: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
         error_id: Some(request_id.to_string()),
-        error_metadata: Some(serde_json::json!({
-            "sampled": true,
-            "observedCount": observed_count,
-            "observedCountIsExact": false,
-            "stage": stage,
-            "reason": reason,
-        })),
+        error_metadata: Some(error_metadata),
         raw_upstream_error: None,
         public_error_status_code: None,
         public_error_type: None,
         public_error_message: None,
         payload_breakdown: None,
         payload_guard_report: None,
+    }
+}
+
+fn merge_usage_error_metadata(target: &mut serde_json::Value, extra: serde_json::Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in extra {
+        if !target.contains_key(key) {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 

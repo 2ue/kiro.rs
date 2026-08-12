@@ -30,7 +30,7 @@ use crate::{common::auth::RequestApiKeyIdentity, model::config::RequestAdmission
 
 use super::{
     envelope,
-    usage::{UsageRecorder, sampled_request_rejection_usage_record},
+    usage::{UsageRecorder, sampled_request_rejection_usage_record_with_metadata},
 };
 
 const STATE_SHARDS: usize = 16;
@@ -352,6 +352,18 @@ impl RequestRejectionAttribution {
         request_id: &str,
         endpoint: &str,
     ) -> bool {
+        self.record_with_metadata(reason, stage, status, request_id, endpoint, None)
+    }
+
+    pub(crate) fn record_with_metadata(
+        &self,
+        reason: RequestRejectionReason,
+        stage: &'static str,
+        status: StatusCode,
+        request_id: &str,
+        endpoint: &str,
+        extra_metadata: Option<serde_json::Value>,
+    ) -> bool {
         let key_state = if reason == RequestRejectionReason::AdmissionStateCapacity {
             None
         } else {
@@ -370,15 +382,17 @@ impl RequestRejectionAttribution {
         ) else {
             return false;
         };
-        self.recorder.record(sampled_request_rejection_usage_record(
-            request_id,
-            endpoint,
-            Some(sample.request_api_key_id),
-            reason.as_str(),
-            stage,
-            status,
-            sample.observed_count,
-        ));
+        self.recorder
+            .record(sampled_request_rejection_usage_record_with_metadata(
+                request_id,
+                endpoint,
+                Some(sample.request_api_key_id),
+                reason.as_str(),
+                stage,
+                status,
+                sample.observed_count,
+                extra_metadata,
+            ));
         true
     }
 }

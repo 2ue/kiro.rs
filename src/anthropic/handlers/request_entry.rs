@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_ENTRY_ERROR_MESSAGE_CHARS: usize = 512;
+
 pub(super) async fn handle_messages_endpoint(
     state: AppState,
     headers: HeaderMap,
@@ -533,14 +535,25 @@ fn record_entry_request_error(
     error: &EntryRequestError,
 ) {
     if let Some(attribution) = attribution {
-        attribution.record(
+        attribution.record_with_metadata(
             error.rejection_reason(),
             "request_entry",
             error.status,
             request_id,
             endpoint,
+            Some(serde_json::json!({
+                "entryReason": error.reason,
+                "entryMessage": bounded_entry_error_message(&error.message),
+            })),
         );
     }
+}
+
+fn bounded_entry_error_message(message: &str) -> String {
+    message
+        .chars()
+        .take(MAX_ENTRY_ERROR_MESSAGE_CHARS)
+        .collect()
 }
 
 #[cfg(test)]
@@ -733,6 +746,8 @@ mod tests {
                 let metadata = record.error_metadata.as_ref().expect("metadata");
                 assert_eq!(metadata["stage"], "request_entry");
                 assert_eq!(metadata["reason"], "request_entry_invalid");
+                assert_eq!(metadata["entryReason"], "missing_max_tokens");
+                assert_eq!(metadata["entryMessage"], "max_tokens: field is required");
                 assert_eq!(metadata["sampled"], true);
                 assert_eq!(metadata["observedCountIsExact"], false);
                 assert!(!metadata.to_string().contains("secret-body"));
@@ -769,6 +784,22 @@ mod tests {
                     .and_then(|value| value.get("reason"))
                     .and_then(serde_json::Value::as_str)
                     == Some("request_entry_invalid")
+                && record
+                    .error_metadata
+                    .as_ref()
+                    .and_then(|value| value.get("entryReason"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("invalid_json_body")
+                && record
+                    .error_metadata
+                    .as_ref()
+                    .and_then(|value| value.get("entryMessage"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| {
+                        !message.is_empty()
+                            && message.chars().count() <= MAX_ENTRY_ERROR_MESSAGE_CHARS
+                            && !message.contains("claude-sonnet-4-5")
+                    })
         }));
     }
 
