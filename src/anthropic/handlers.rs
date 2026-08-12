@@ -120,6 +120,7 @@ const SLOW_RESPONSE_MS: u64 = 60_000;
 const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
 const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_CAPACITY_PREFLIGHT_GRACE_MAX_MS: u64 = 250;
+const LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS: u64 = 250;
 const EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy)]
@@ -1698,24 +1699,35 @@ impl ExternalFallbackContext {
     }
 
     async fn local_attempt_policy(&self) -> (AcquireMode, bool) {
-        let fallback_enabled = self.config.fallback_on_local_capacity_exhausted
-            || self.config.fallback_on_scheduler_redis_degraded
-            || self.config.fallback_on_no_available_credentials
-            || self.config.fallback_on_local_transient_exhausted
-            || self.config.fallback_on_unsupported_model;
-        if !fallback_enabled
-            || !self.has_cached_immediately_available_external_pool_for_model(&self.payload.model)
-        {
-            return (AcquireMode::WaitForCapacity, false);
+        if self.has_cached_immediately_available_external_pool_for_model(&self.payload.model) {
+            let acquire_mode = local_pool_acquire_mode(&self.config);
+            if acquire_mode != AcquireMode::WaitForCapacity {
+                return (
+                    clamp_acquire_mode_to_dispatch_deadline(
+                        acquire_mode,
+                        self.inference_attempt_budget.as_ref(),
+                    ),
+                    true,
+                );
+            }
         }
-        let acquire_mode = local_pool_acquire_mode(&self.config);
-        (
-            clamp_acquire_mode_to_dispatch_deadline(
-                acquire_mode,
-                self.inference_attempt_budget.as_ref(),
-            ),
-            true,
-        )
+        if self.config.local_pool_preflight_enabled
+            && self.config.fallback_on_scheduler_redis_degraded
+            && self
+                .has_eligible_external_pool_for_model(&self.payload.model)
+                .await
+        {
+            return (
+                clamp_acquire_mode_to_dispatch_deadline(
+                    AcquireMode::WaitForCapacityRedisDegradedMax(
+                        local_scheduler_redis_degraded_fallback_wait(&self.config),
+                    ),
+                    self.inference_attempt_budget.as_ref(),
+                ),
+                true,
+            );
+        }
+        (AcquireMode::WaitForCapacity, false)
     }
 
     fn has_cached_eligible_external_pool_for_model(&self, model: &str) -> bool {
@@ -2121,11 +2133,22 @@ fn local_pool_capacity_fail_fast_enabled(config: &ExternalPoolsConfig) -> bool {
 
 fn local_pool_acquire_mode(config: &ExternalPoolsConfig) -> AcquireMode {
     if local_pool_capacity_fail_fast_enabled(config) {
-        AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(
-            config.effective_dispatch_max_wait_secs(),
+        AcquireMode::FailFastOnCapacityWaitForRedis(local_scheduler_redis_degraded_fallback_wait(
+            config,
         ))
     } else {
         AcquireMode::WaitForCapacity
+    }
+}
+
+fn local_scheduler_redis_degraded_fallback_wait(config: &ExternalPoolsConfig) -> Duration {
+    let configured = Duration::from_secs(config.effective_dispatch_max_wait_secs());
+    if config.fallback_on_scheduler_redis_degraded {
+        configured.min(Duration::from_millis(
+            LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS,
+        ))
+    } else {
+        configured
     }
 }
 
@@ -2143,6 +2166,9 @@ fn clamp_acquire_mode_to_dispatch_deadline(
         }
         AcquireMode::FailFastOnCapacityWaitForRedis(max_wait) => {
             AcquireMode::FailFastOnCapacityWaitForRedis(max_wait.min(remaining))
+        }
+        AcquireMode::WaitForCapacityRedisDegradedMax(max_wait) => {
+            AcquireMode::WaitForCapacityRedisDegradedMax(max_wait.min(remaining))
         }
         AcquireMode::FailFastOnCapacity => AcquireMode::FailFastOnCapacity,
     }
@@ -2296,7 +2322,6 @@ fn local_route_reason_requires_immediate_external_capacity(reason: &str) -> bool
     matches!(
         reason,
         "local_capacity_full"
-            | "local_scheduler_redis_degraded"
             | "local_all_cooling_down"
             | "local_pool_risk_circuit_open"
             | "local_transient_exhausted"

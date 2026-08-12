@@ -5738,6 +5738,9 @@ impl MultiTokenManager {
         // One request uses one stable queue deadline. Runtime config updates apply to later
         // requests instead of changing an already-admitted Redis lease lifetime mid-wait.
         let dispatch_max_wait = self.dispatch_max_wait(acquire_mode);
+        let redis_degraded_max_wait = acquire_mode
+            .redis_degraded_max_wait_override()
+            .or(dispatch_max_wait);
         let mut queue_guard: Option<DispatchQueueGuard> = None;
         let mut local_excluded_ids = excluded_ids.clone();
         let mut slot_race_excluded_count = 0usize;
@@ -6259,7 +6262,7 @@ impl MultiTokenManager {
                         }
                         if queue_guard.is_none() {
                             queue_guard =
-                                self.try_enter_local_only_dispatch_queue(dispatch_max_wait);
+                                self.try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                             if queue_guard.is_none() {
                                 anyhow::bail!(
                                     "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -6270,7 +6273,7 @@ impl MultiTokenManager {
                         }
                         let now = Instant::now();
                         if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
-                            dispatch_max_wait,
+                            redis_degraded_max_wait,
                             dispatch_wait_started_at,
                             now,
                         ) {
@@ -6295,7 +6298,7 @@ impl MultiTokenManager {
                         self.sleep_for_scheduler_redis_recovery(
                             wait_for,
                             self.dispatch_wait_remaining(
-                                dispatch_max_wait,
+                                redis_degraded_max_wait,
                                 dispatch_wait_started_at,
                                 now,
                             ),
@@ -6483,8 +6486,8 @@ impl MultiTokenManager {
                                 return Err(err);
                             }
                             if queue_guard.is_none() {
-                                queue_guard =
-                                    self.try_enter_local_only_dispatch_queue(dispatch_max_wait);
+                                queue_guard = self
+                                    .try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                                 if queue_guard.is_none() {
                                     anyhow::bail!(
                                         "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -6495,7 +6498,7 @@ impl MultiTokenManager {
                             }
                             let now = Instant::now();
                             if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
-                                dispatch_max_wait,
+                                redis_degraded_max_wait,
                                 dispatch_wait_started_at,
                                 now,
                             ) {
@@ -6520,7 +6523,7 @@ impl MultiTokenManager {
                             self.sleep_for_scheduler_redis_recovery(
                                 wait_for,
                                 self.dispatch_wait_remaining(
-                                    dispatch_max_wait,
+                                    redis_degraded_max_wait,
                                     dispatch_wait_started_at,
                                     now,
                                 ),

@@ -80,6 +80,7 @@ const REPORT_PATH = path.join(REPORT_ROOT, `${RUN_ID}.json`)
 const CHILDREN = new Set()
 const SERVERS = new Set()
 const MOCK_NAMES = ['primary', 'backup_a', 'backup_b']
+let lastScenarioReport = null
 
 const BEHAVIOR = {
   jsonSuccess: { type: 'json_success' },
@@ -214,7 +215,7 @@ const SCENARIOS = [
     stream: false,
     requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
     concurrency: Math.min(MAX_CONCURRENCY, 8),
-    localHolder: { delayMs: 5600 },
+    localHolder: { delayMs: 9000 },
     waitBeforeMs: 6000,
     externalPoolsOverrides: {
       externalDirectPolicyEnabled: false,
@@ -1225,7 +1226,7 @@ function requestBody(marker, stream) {
   }
 }
 
-function postMessage(baseUrl, marker, stream) {
+function postMessage(baseUrl, marker, stream, options = {}) {
   return requestTimed(`${baseUrl}${ROUTE}`, {
     method: 'POST',
     headers: {
@@ -1233,7 +1234,7 @@ function postMessage(baseUrl, marker, stream) {
       'content-type': 'application/json',
     },
     body: JSON.stringify(requestBody(marker, stream)),
-    timeoutMs: CLIENT_TIMEOUT_MS,
+    timeoutMs: options.timeoutMs || CLIENT_TIMEOUT_MS,
   })
 }
 
@@ -1475,7 +1476,13 @@ async function runScenario(baseUrl, scenario, upstreams, localUpstream, serviceP
 
   let localHolder = null
   if (scenario.localHolder) {
-    localHolder = postMessage(baseUrl, `${scenario.id}-LOCAL-HOLDER`, false)
+    const holderTimeoutMs = Math.max(
+      CLIENT_TIMEOUT_MS,
+      (scenario.localHolder.delayMs || 0) + ((scenario.requestCount || REQUESTS_PER_SCENARIO) * 750) + 10_000,
+    )
+    localHolder = postMessage(baseUrl, `${scenario.id}-LOCAL-HOLDER`, false, {
+      timeoutMs: holderTimeoutMs,
+    })
     await waitForCondition(
       () => localUpstream.state.activeBusinessInFlight > 0,
       `${scenario.id} local holder in-flight`,
@@ -1562,7 +1569,7 @@ async function runScenario(baseUrl, scenario, upstreams, localUpstream, serviceP
     upstreamHits,
     localHits,
     summary,
-    responses: responses.slice(0, 10).map((response) => ({
+    responses: responses.map((response) => ({
       status: response.status,
       totalMs: response.totalMs,
       ttfbMs: response.ttfbMs,
@@ -1580,6 +1587,7 @@ async function runScenario(baseUrl, scenario, upstreams, localUpstream, serviceP
     poolStatus,
     resources,
   }
+  lastScenarioReport = report
   evaluateScenario(report, scenario)
   return report
 }
@@ -1789,6 +1797,7 @@ async function main() {
       error: redact(error?.stack || error?.message || error),
       binarySha256: fs.existsSync(BINARY) ? sha256(fs.readFileSync(BINARY)) : null,
       scenarioReports,
+      lastScenarioReport,
       serviceLogTail: redact(readTail(logPath)),
       tempRoot: KEEP_TEMP ? TEMP_ROOT : null,
     }

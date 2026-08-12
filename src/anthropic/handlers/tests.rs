@@ -6437,9 +6437,19 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
     for round in 1..=5 {
         assert_eq!(
             local_pool_acquire_mode(&config),
-            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
-            "round {round}: external eligibility was already established, so local capacity races still fail fast for reselect/fallback, while Redis degraded uses the external fallback's bounded wait window"
+            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_millis(
+                LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS
+            )),
+            "round {round}: external eligibility was already established, so local capacity races still fail fast for reselect/fallback, while Redis degraded only consumes a short fallback grace"
         );
+
+        config.fallback_on_scheduler_redis_degraded = false;
+        assert_eq!(
+            local_pool_acquire_mode(&config),
+            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
+            "round {round}: disabling Redis degraded fallback keeps the configured local dispatch wait"
+        );
+        config.fallback_on_scheduler_redis_degraded = true;
 
         config.fallback_on_local_capacity_exhausted = false;
         assert_eq!(
@@ -9893,7 +9903,6 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
 fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
     for reason in [
         "local_capacity_full",
-        "local_scheduler_redis_degraded",
         "local_all_cooling_down",
         "local_pool_risk_circuit_open",
         "local_transient_exhausted",
@@ -9908,6 +9917,7 @@ fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
     }
 
     for reason in [
+        "local_scheduler_redis_degraded",
         "local_no_credentials",
         "local_all_disabled",
         "local_proxy_blocked",
@@ -9917,7 +9927,7 @@ fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
     ] {
         assert!(
             !local_route_reason_requires_immediate_external_capacity(reason),
-            "{reason} has no viable local route, so external fallback may use the external pool's own capacity policy"
+            "{reason} may use the external pool's own capacity policy instead of the local preflight immediate-capacity gate"
         );
     }
 }

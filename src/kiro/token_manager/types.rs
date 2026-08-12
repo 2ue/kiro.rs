@@ -123,6 +123,7 @@ pub enum AcquireMode {
     WaitForCapacity,
     FailFastOnCapacity,
     FailFastOnCapacityWaitForRedis(StdDuration),
+    WaitForCapacityRedisDegradedMax(StdDuration),
     WaitForCapacityMax(StdDuration),
 }
 
@@ -143,6 +144,14 @@ impl AcquireMode {
             Self::FailFastOnCapacityWaitForRedis(duration) | Self::WaitForCapacityMax(duration) => {
                 Some(duration)
             }
+            _ => None,
+        }
+    }
+
+    pub(super) fn redis_degraded_max_wait_override(self) -> Option<StdDuration> {
+        match self {
+            Self::FailFastOnCapacityWaitForRedis(duration)
+            | Self::WaitForCapacityRedisDegradedMax(duration) => Some(duration),
             _ => None,
         }
     }
