@@ -1602,6 +1602,8 @@ export interface ExternalPoolsConfig {
   externalPoolUsageDebugMaxFiles: number
 }
 
+export type AccountRuntimeConfig = ExternalPoolsConfig
+
 export interface ExternalPool {
   id: number
   name: string
@@ -1768,6 +1770,8 @@ export interface DiscoverExternalPoolSupportedModelsRequest {
   authType?: 'bearer' | 'x_api_key' | null
 }
 
+export type DiscoverAccountSupportedModelsRequest = DiscoverExternalPoolSupportedModelsRequest
+
 export interface SupportedModelsResponse {
   supportedModels: string[]
   count: number
@@ -1927,7 +1931,7 @@ export interface RuntimeConfig {
   promptCacheEstimatedBytesLimit: number
   reportedUsage: ReportedUsageConfig
   cachePolicy: CachePolicyConfig
-  accountRuntime: ExternalPoolsConfig
+  accountRuntime: AccountRuntimeConfig
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile

@@ -35,11 +35,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account Admin responses now have account-named DTOs for list/status/mutation/test surfaces, with a focused serialization test proving `/accounts` uses `accounts/account` fields rather than legacy `pools/pool` wrappers.
 - `AccountRuntimeConfig` is now the config facade for new runtime/Admin/router/handler boundaries, while old persisted `external_pools` fields remain as the compatibility storage and wire mirror.
 - The Admin account feature directory has moved from `features/external-pools` to `features/accounts`; account page, form modal, test modal, components and utilities now use account component/file names, with `/external-pools` kept as a redirect.
+- Frontend account runtime config and supported-model discovery now have account-named type/default aliases, so the account page and new account API helpers no longer depend directly on `ExternalPoolsConfig` or external-pool discovery request names.
 
 ## In Progress
 
 - Migrate account runtime internals away from legacy external-pool names behind the `account_runtime` facade while preserving current scheduler, proxy, body-mode, retry, usage projection and compatibility behavior.
-- Convert remaining frontend runtime-config names and backend config DTO names from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
+- Convert remaining runtime-config field names and backend config DTO names from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
 
 ## Next
 

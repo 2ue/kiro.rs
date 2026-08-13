@@ -384,6 +384,8 @@ export function defaultExternalPoolsConfig() {
   }
 }
 
+export const defaultAccountRuntimeConfig = defaultExternalPoolsConfig
+
 export function defaultModelMappingConfig() {
   return {
     enabled: true,
@@ -517,7 +519,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   promptCacheEstimatedBytesLimit: 268435456,
   reportedUsage: defaultReportedUsage(),
   cachePolicy: defaultCachePolicy(),
-  accountRuntime: defaultExternalPoolsConfig(),
+  accountRuntime: defaultAccountRuntimeConfig(),
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',

@@ -1,4 +1,4 @@
-import type { Account, ExternalPoolModelMappingRule, ExternalPoolsConfig, CreateAccountRequest, ExternalPoolStreamResponseMode, ExternalPoolStreamRetryMode } from '@/types/api'
+import type { Account, AccountRuntimeConfig, ExternalPoolModelMappingRule, CreateAccountRequest, ExternalPoolStreamResponseMode, ExternalPoolStreamRetryMode } from '@/types/api'
 
 export const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 export const joinRules = (value: string[] = []) => value.join('\n')
@@ -293,7 +293,7 @@ export function streamRetryDescription(mode: AccountStreamRetryDraft): string {
   return '当前外部账号继承全局“流式首输出前错误换池”开关。'
 }
 
-export function streamRetrySummary(account: Account, config: ExternalPoolsConfig): string {
+export function streamRetrySummary(account: Account, config: AccountRuntimeConfig): string {
   const mode = account.preOutputStreamRetryMode || 'inherit'
   if (mode === 'enabled') return '首输出恢复：启用'
   if (mode === 'disabled') return '首输出恢复：禁用'
@@ -302,7 +302,7 @@ export function streamRetrySummary(account: Account, config: ExternalPoolsConfig
     : '首输出恢复：继承禁用'
 }
 
-export function accountUsageSummary(account: Account, config: ExternalPoolsConfig): string {
+export function accountUsageSummary(account: Account, config: AccountRuntimeConfig): string {
   const parts = account.usageProjectionMode === 'current_path_policy'
     ? ['Usage：按路径整理']
     : ['Usage：透传上游']

@@ -24,10 +24,10 @@ import {
   updateAccount,
   updateRuntimeConfig,
 } from '@/api/credentials'
-import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
+import { defaultAccountRuntimeConfig } from '@/lib/runtime-config-defaults'
 import { useRuntimeConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage, cn } from '@/lib/utils'
-import type { Account, ExternalPoolsConfig, UpdateAccountRequest } from '@/types/api'
+import type { Account, AccountRuntimeConfig, UpdateAccountRequest } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import {
   EmptyState,
@@ -108,7 +108,7 @@ export function AccountsPage() {
   const status = useQuery({ queryKey: ['accounts-status'], queryFn: getAccountsStatus, refetchInterval: 5000 })
 
   const [savingConfig, setSavingConfig] = useState(false)
-  const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
+  const [configDraft, setConfigDraft] = useState<AccountRuntimeConfig>(defaultAccountRuntimeConfig())
   const [modelRulesText, setModelRulesText] = useState('')
   const [pathRulesText, setPathRulesText] = useState('')
   const [retryStatusCodesText, setRetryStatusCodesText] = useState('')
@@ -121,7 +121,7 @@ export function AccountsPage() {
   const [editForm, setEditForm] = useState<AccountFormDraft>(() => defaultAccountForm())
 
   useEffect(() => {
-    const accountRuntime = { ...defaultExternalPoolsConfig(), ...runtimeConfig.data?.accountRuntime }
+    const accountRuntime = { ...defaultAccountRuntimeConfig(), ...runtimeConfig.data?.accountRuntime }
     setConfigDraft(accountRuntime)
     setModelRulesText(joinRules(accountRuntime.directExternalModelRules))
     setPathRulesText(joinRules(accountRuntime.directExternalPathRules))
@@ -395,7 +395,7 @@ export function AccountsPage() {
             <div className="space-y-4">
               <FormSection title="容量与排队" description={waitModeActive ? '外部账号满并发时会等待容量。' : '外部账号满并发时不会排队。'}>
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolCapacityMode: v as ExternalPoolsConfig['externalPoolCapacityMode'] }))}>
+                  <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolCapacityMode: v as AccountRuntimeConfig['externalPoolCapacityMode'] }))}>
                     <SelectItem value="fail_fast">立即失败</SelectItem>
                     <SelectItem value="wait">等待容量</SelectItem>
                   </SelectBox>
@@ -420,7 +420,7 @@ export function AccountsPage() {
                   <NumberBox disabled={!externalEnabled} label="5xx 冷却" suffix="秒" value={configDraft.externalPoolServerErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolServerErrorCooldownSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="网络错误冷却" suffix="秒" value={configDraft.externalPoolNetworkErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolNetworkErrorCooldownSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="协议/认证冷却" suffix="秒" value={configDraft.externalPoolProtocolErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolProtocolErrorCooldownSecs: v }))} />
-                  <SelectBox disabled={!externalEnabled} label="模型不可用冷却范围" value={configDraft.externalPoolModelUnavailableCooldownMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownMode: v as ExternalPoolsConfig['externalPoolModelUnavailableCooldownMode'] }))}>
+                  <SelectBox disabled={!externalEnabled} label="模型不可用冷却范围" value={configDraft.externalPoolModelUnavailableCooldownMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownMode: v as AccountRuntimeConfig['externalPoolModelUnavailableCooldownMode'] }))}>
                     <SelectItem value="model">仅当前模型</SelectItem>
                     <SelectItem value="account">整个外部账号</SelectItem>
                     <SelectItem value="disabled">不写冷却</SelectItem>
@@ -440,7 +440,7 @@ export function AccountsPage() {
                     value={configDraft.externalPoolStreamResponseMode}
                     onChange={(v) => setConfigDraft((p) => ({
                       ...p,
-                      externalPoolStreamResponseMode: v as ExternalPoolsConfig['externalPoolStreamResponseMode'],
+                      externalPoolStreamResponseMode: v as AccountRuntimeConfig['externalPoolStreamResponseMode'],
                     }))}
                   >
                     <SelectItem value="event_passthrough">SSE 事件级透传</SelectItem>

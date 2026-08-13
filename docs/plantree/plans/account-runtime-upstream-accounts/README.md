@@ -73,6 +73,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `/api/admin/accounts` now uses account-named wire DTOs for list/status/mutation/test responses. The JSON field shape remains compatible with the current upstream account page, while legacy `/api/admin/external-pools` keeps its old pool DTOs.
 - `AccountRuntimeConfig` now fronts the legacy external-pool config structure at new integration boundaries. App state, Anthropic router config, request-runtime config, Admin runtime-config DTOs and runtime reload invalidation use account runtime terminology while persisted `external_pools` storage and compatibility JSON remain mirrored.
 - The Admin frontend account page has moved from `features/external-pools` to `features/accounts`. Its page, modal, test modal, helper components and utilities now use account component names, while `/external-pools` remains only a redirect compatibility route.
+- The frontend account runtime boundary now has `AccountRuntimeConfig`, `defaultAccountRuntimeConfig` and `DiscoverAccountSupportedModelsRequest` aliases. New account UI/API code uses those account-named types while legacy `ExternalPoolsConfig` and discovery request names remain only for compatibility functions and mirrored wire fields.
 
 Last verified on 2026-08-14:
 

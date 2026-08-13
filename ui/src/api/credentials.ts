@@ -1,6 +1,6 @@
 import { api } from '@/api/http'
 export { validateAdminApiKey } from '@/api/http'
-import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
+import { defaultAccountRuntimeConfig } from '@/lib/runtime-config-defaults'
 import type {
   AddCredentialRequest,
   AddCredentialResponse,
@@ -41,6 +41,7 @@ import type {
   ValidateExistingCredentialsRequest,
   ValidateExternalCredentialsRequest,
   CredentialValidationResponse,
+  DiscoverAccountSupportedModelsRequest,
   DiscoverExternalPoolSupportedModelsRequest,
   ProxyResource,
   ProxyResourceTestRequest,
@@ -74,7 +75,7 @@ type RuntimeConfigWire = Omit<RuntimeConfig, 'accountRuntime' | 'externalPools'>
   Partial<Pick<RuntimeConfig, 'accountRuntime' | 'externalPools'>>
 
 function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
-  const accountRuntime = data.accountRuntime ?? data.externalPools ?? defaultExternalPoolsConfig()
+  const accountRuntime = data.accountRuntime ?? data.externalPools ?? defaultAccountRuntimeConfig()
   return {
     ...data,
     accountRuntime,
@@ -510,7 +511,7 @@ export async function syncExternalPoolSupportedModels(
 
 export async function syncAccountSupportedModels(
   id: number,
-  req: DiscoverExternalPoolSupportedModelsRequest = {}
+  req: DiscoverAccountSupportedModelsRequest = {}
 ): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models/sync`, req)
   return data
@@ -524,7 +525,7 @@ export async function discoverExternalPoolSupportedModels(
 }
 
 export async function discoverAccountSupportedModels(
-  req: DiscoverExternalPoolSupportedModelsRequest
+  req: DiscoverAccountSupportedModelsRequest
 ): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>('/accounts/supported-models/discover', req)
   return data
@@ -540,7 +541,7 @@ export async function discoverStoredExternalPoolSupportedModels(
 
 export async function discoverStoredAccountSupportedModels(
   id: number,
-  req: DiscoverExternalPoolSupportedModelsRequest = {}
+  req: DiscoverAccountSupportedModelsRequest = {}
 ): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models/discover`, req)
   return data
