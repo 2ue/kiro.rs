@@ -10,9 +10,9 @@ use axum::{
     response::Response,
 };
 
+use crate::account_runtime::AccountRuntimeManager;
 use crate::common::auth;
 use crate::common::auth::RequestApiKeyStore;
-use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
@@ -123,8 +123,8 @@ pub struct AppState {
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池和直连策略配置。
     pub external_pools: ExternalPoolsConfig,
-    /// 外部备用号池管理器。
-    pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
+    /// 上游账号运行时管理器。
+    pub account_runtime_manager: Option<Arc<AccountRuntimeManager>>,
 }
 
 impl AppState {
@@ -184,7 +184,7 @@ impl AppState {
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: ExternalPoolsConfig::default(),
-            external_pool_manager: None,
+            account_runtime_manager: None,
         }
     }
 
@@ -313,11 +313,11 @@ impl AppState {
         self
     }
 
-    pub fn with_external_pool_manager(
+    pub fn with_account_runtime_manager(
         mut self,
-        external_pool_manager: Arc<ExternalPoolManager>,
+        account_runtime_manager: Arc<AccountRuntimeManager>,
     ) -> Self {
-        self.external_pool_manager = Some(external_pool_manager);
+        self.account_runtime_manager = Some(account_runtime_manager);
         self
     }
 

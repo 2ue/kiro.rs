@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod attempt;
+pub mod runtime;
 pub mod scheduler;
 pub mod usage;
 
@@ -14,5 +15,6 @@ pub use account::{
 pub use attempt::{
     AccountAttemptAction, AccountAttemptTrace, DeliveryEvidence, UpstreamErrorClass,
 };
+pub use runtime::AccountRuntimeManager;
 pub use scheduler::{AccountDispatchCandidate, AccountDispatchDecision, select_account_candidate};
 pub use usage::{RawUsageFacts, TokenUsage, UsageConfidence};

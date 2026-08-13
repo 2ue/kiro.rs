@@ -31,11 +31,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Runtime config now exposes `accountRuntime` as the account-policy field, accepts it on update, mirrors legacy `externalPools` for compatibility, and has frontend normalization so old and new callers stay consistent.
 - Usage admin queries now accept `accountId` and `routeKind=account`, and the dashboard exposes `/usage-dashboard/account-billing` plus `/usage-dashboard/account-risk` while legacy external-pool paths remain compatibility aliases.
 - Usage and risk UI entry points now use account terminology and account-named hooks/API functions for upstream account filters and risk views.
+- `AccountRuntimeManager` is now the injection boundary for App state, Anthropic router dependencies, Admin service dependencies and process lifecycle wiring. It currently aliases the legacy external-pool manager so the scheduler/transport internals can be migrated behind an account runtime facade in smaller verified steps.
 
 ## In Progress
 
-- Convert remaining backend Admin/API/DTO names from external-pool/local-credential terminology toward account terminology while preserving temporary compatibility aliases.
-- Remove remaining startup/runtime Kiro vocabulary and migrate account policy internals away from legacy external-pool field names.
+- Migrate account runtime internals away from legacy external-pool names behind the `account_runtime` facade while preserving current scheduler, proxy, body-mode, retry, usage projection and compatibility behavior.
+- Convert remaining backend Admin/API/DTO names from external-pool/local-credential terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
 
 ## Next
 

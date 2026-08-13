@@ -20,6 +20,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use account_runtime::AccountRuntimeManager;
 use anyhow::Context as _;
 use axum::{
     Json, Router,
@@ -31,7 +32,6 @@ use axum::{
 use chrono::Utc;
 use clap::Parser;
 use common::auth::RequestApiKeyStore;
-use external_pool::ExternalPoolManager;
 use futures::StreamExt;
 use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -541,7 +541,7 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
-    let external_pool_manager = Arc::new(ExternalPoolManager::new(
+    let account_runtime_manager = Arc::new(AccountRuntimeManager::new(
         postgres_store.clone(),
         redis_store.clone(),
     ));
@@ -549,7 +549,7 @@ async fn main() {
     let runtime_event_listener = spawn_redis_runtime_event_listener(
         redis_store.clone(),
         token_manager.clone(),
-        external_pool_manager.clone(),
+        account_runtime_manager.clone(),
         request_api_key_store.clone(),
         request_admission.clone(),
         runtime_event_health.clone(),
@@ -648,7 +648,7 @@ async fn main() {
             prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
             pricing_catalog: pricing_catalog.clone(),
             model_capabilities: model_capabilities.clone(),
-            external_pool_manager: Some(external_pool_manager.clone()),
+            account_runtime_manager: Some(account_runtime_manager.clone()),
         },
         anthropic::AnthropicRouterConfig::from_runtime_config(&config),
     );
@@ -679,7 +679,7 @@ async fn main() {
                 observability_redis_store: observability_redis_store.clone(),
                 request_api_key_store: request_api_key_store.clone(),
                 request_admission: request_admission.clone(),
-                external_pool_manager: external_pool_manager.clone(),
+                account_runtime_manager: account_runtime_manager.clone(),
             });
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
@@ -804,7 +804,7 @@ async fn main() {
     let (usage_drain, storage_drain, external_release_drain, scheduler_release_drained) = tokio::join!(
         usage_recorder.drain(usage_drain_timeout),
         kiro::token_manager::drain_best_effort_storage_tasks(storage_drain_timeout),
-        external_pool_manager.drain_release_intents(external_release_drain_timeout),
+        account_runtime_manager.drain_release_intents(external_release_drain_timeout),
         token_manager.drain_scheduler_redis_releases(scheduler_release_drain_timeout),
     );
     tracing::info!(
@@ -1310,7 +1310,7 @@ async fn new_ui_index_redirect() -> Redirect {
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
-    external_pool_manager: Arc<ExternalPoolManager>,
+    account_runtime_manager: Arc<AccountRuntimeManager>,
     request_api_key_store: Arc<RequestApiKeyStore>,
     request_admission: Arc<anthropic::request_admission::RequestAdmissionController>,
     health: Arc<RuntimeEventHealth>,
@@ -1352,7 +1352,7 @@ fn spawn_redis_runtime_event_listener(
                                 Ok(true) => {
                                     let config = token_manager.runtime_config();
                                     if config.external_pools != previous_external_pools {
-                                        external_pool_manager
+                                        account_runtime_manager
                                             .invalidate_external_pool_policy_state();
                                     }
                                     request_api_key_store.replace_keys(config.request_api_keys());
@@ -1374,7 +1374,7 @@ fn spawn_redis_runtime_event_listener(
                                 tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");
                             }
                         } else if channel == external_pool_data_channel {
-                            if external_pool_manager.observe_external_pool_data_event(&payload) {
+                            if account_runtime_manager.observe_external_pool_data_event(&payload) {
                                 tracing::debug!(payload, "已失效跨实例外部池数据快照");
                             } else {
                                 tracing::debug!(payload, "忽略已观察或无效的外部池数据通知");
@@ -1388,7 +1388,7 @@ fn spawn_redis_runtime_event_listener(
                             Ok(true) => {
                                 let config = token_manager.runtime_config();
                                 if config.external_pools != previous_external_pools {
-                                    external_pool_manager
+                                    account_runtime_manager
                                         .invalidate_external_pool_policy_state();
                                 }
                                 request_api_key_store.replace_keys(config.request_api_keys());

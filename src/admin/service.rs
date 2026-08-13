@@ -42,6 +42,7 @@ use super::types::{
     UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
     ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
 };
+use crate::account_runtime::AccountRuntimeManager;
 use crate::anthropic::{
     inference_attempt_budget::{
         MAX_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
@@ -63,9 +64,9 @@ use crate::anthropic::{
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
 use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolManager,
-    ExternalPoolTestResponse, ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest,
-    UpdateExternalPoolRequest, external_pool_messages_url, external_pool_models_url,
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolTestResponse,
+    ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
+    external_pool_messages_url, external_pool_models_url,
 };
 use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
@@ -539,7 +540,7 @@ pub struct AdminService {
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
     kiro_provider: Option<Arc<KiroProvider>>,
-    external_pool_manager: Arc<ExternalPoolManager>,
+    account_runtime_manager: Arc<AccountRuntimeManager>,
     /// Serializes credential imports so duplicate preflight cannot fan out auxiliary model calls.
     credential_import_lock: Arc<tokio::sync::Mutex<()>>,
     usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
@@ -559,7 +560,7 @@ pub struct AdminServiceDependencies {
     pub observability_redis_store: Option<Arc<RedisStore>>,
     pub request_api_key_store: Arc<RequestApiKeyStore>,
     pub request_admission: Arc<RequestAdmissionController>,
-    pub external_pool_manager: Arc<ExternalPoolManager>,
+    pub account_runtime_manager: Arc<AccountRuntimeManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -634,7 +635,7 @@ impl AdminService {
             observability_redis_store,
             request_api_key_store,
             request_admission,
-            external_pool_manager,
+            account_runtime_manager,
         } = dependencies;
         assert!(
             observability_redis_store
@@ -655,7 +656,7 @@ impl AdminService {
             pricing_catalog,
             model_capabilities,
             kiro_provider,
-            external_pool_manager,
+            account_runtime_manager,
             credential_import_lock: Arc::new(tokio::sync::Mutex::new(())),
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
             admin_cache_shadow: Arc::new(Mutex::new(HashMap::new())),
@@ -800,13 +801,13 @@ impl AdminService {
         reason: &'static str,
         pool: &ExternalPool,
     ) {
-        self.external_pool_manager
+        self.account_runtime_manager
             .notify_external_pool_data_changed_with_local_pool(reason, pool);
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
     }
 
     fn invalidate_external_pool_admin_cache_for_delete(&self, reason: &'static str, pool_id: u64) {
-        self.external_pool_manager
+        self.account_runtime_manager
             .notify_external_pool_deleted(reason, pool_id);
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
     }
@@ -1435,7 +1436,7 @@ impl AdminService {
         let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
-        let manager = self.external_pool_manager.clone();
+        let manager = self.account_runtime_manager.clone();
         let deleted = block_on_admin_store(async move { manager.clear_pool_cooldowns(id).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.audit(
@@ -1455,7 +1456,7 @@ impl AdminService {
         let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
-        let manager = self.external_pool_manager.clone();
+        let manager = self.account_runtime_manager.clone();
         let deleted = block_on_admin_store(async move { manager.clear_pool_cooldowns(id).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.audit(
@@ -1478,7 +1479,7 @@ impl AdminService {
             return Ok(cached);
         }
 
-        let manager = self.external_pool_manager.clone();
+        let manager = self.account_runtime_manager.clone();
         let config = self.token_manager.runtime_config().external_pools;
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
@@ -5409,7 +5410,7 @@ impl AdminService {
             json!({}),
         );
         if external_pool_policy_changed {
-            self.external_pool_manager
+            self.account_runtime_manager
                 .invalidate_external_pool_policy_state();
             self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
         }

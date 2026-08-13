@@ -9,8 +9,8 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::account_runtime::AccountRuntimeManager;
 use crate::common::auth::RequestApiKeyStore;
-use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig,
@@ -52,7 +52,7 @@ pub struct AnthropicRouterDependencies {
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
+    pub account_runtime_manager: Option<Arc<AccountRuntimeManager>>,
 }
 
 pub struct AnthropicRouterConfig {
@@ -170,7 +170,7 @@ pub fn create_router_with_provider(
         prompt_cache_creation_controller,
         pricing_catalog,
         model_capabilities,
-        external_pool_manager,
+        account_runtime_manager,
     } = dependencies;
     let AnthropicRouterConfig {
         extract_thinking,
@@ -261,8 +261,8 @@ pub fn create_router_with_provider(
     if let Some(provider) = kiro_provider {
         base_state = base_state.with_kiro_provider(provider);
     }
-    if let Some(manager) = external_pool_manager {
-        base_state = base_state.with_external_pool_manager(manager);
+    if let Some(manager) = account_runtime_manager {
+        base_state = base_state.with_account_runtime_manager(manager);
     }
 
     let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) = route_prompt_cache_states(base_state);
@@ -572,7 +572,7 @@ mod tests {
                     ),
                     pricing_catalog: Arc::new(PricingCatalog::new()),
                     model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                    external_pool_manager: None,
+                    account_runtime_manager: None,
                 },
                 AnthropicRouterConfig::from_runtime_config(&config),
             );
@@ -622,7 +622,7 @@ mod tests {
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
                 pricing_catalog: Arc::new(PricingCatalog::new()),
                 model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                external_pool_manager: None,
+                account_runtime_manager: None,
             },
             AnthropicRouterConfig::from_runtime_config(&config),
         );
@@ -698,7 +698,7 @@ mod tests {
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
                 pricing_catalog: Arc::new(PricingCatalog::new()),
                 model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-                external_pool_manager: None,
+                account_runtime_manager: None,
             },
             AnthropicRouterConfig::from_runtime_config(&config),
         );

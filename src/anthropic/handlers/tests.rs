@@ -673,7 +673,7 @@ fn multimodal_handler_test_router_from_config(config: Config) -> (Router, Arc<Us
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            external_pool_manager: None,
+            account_runtime_manager: None,
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );
@@ -896,7 +896,7 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            external_pool_manager: None,
+            account_runtime_manager: None,
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );
@@ -1035,7 +1035,7 @@ fn websearch_handler_test_router_with_external_options(
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            external_pool_manager: Some(external_pool_manager),
+            account_runtime_manager: Some(external_pool_manager),
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );
@@ -1071,7 +1071,7 @@ fn account_only_handler_test_router(
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            external_pool_manager: Some(external_pool_manager),
+            account_runtime_manager: Some(external_pool_manager),
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );
@@ -3572,7 +3572,7 @@ fn handler_eventstream_fault_router_with_limits(
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            external_pool_manager: None,
+            account_runtime_manager: None,
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );

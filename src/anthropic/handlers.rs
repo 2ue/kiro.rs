@@ -92,9 +92,10 @@ use super::usage::{
     UsageSource,
 };
 use super::websearch;
+use crate::account_runtime::AccountRuntimeManager;
 use crate::external_pool::{
-    ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager,
-    ExternalPoolRequestBodyMode, ExternalRouteRequest, ExternalRouteRequestPreparationCache,
+    ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolRequestBodyMode,
+    ExternalRouteRequest, ExternalRouteRequestPreparationCache,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
 use crate::kiro::call_trace::{
@@ -743,7 +744,7 @@ fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
 #[derive(Clone)]
 struct ExternalFallbackContext {
     provider: Option<Arc<KiroProvider>>,
-    manager: Arc<ExternalPoolManager>,
+    manager: Arc<AccountRuntimeManager>,
     config: ExternalPoolsConfig,
     effective_raw_body: Bytes,
     effective_raw_probe: Arc<RawMessagesBodyProbe>,
@@ -1269,7 +1270,7 @@ async fn maybe_raw_external_direct_response(
     request_api_key_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<Response> {
-    let manager = state.external_pool_manager.clone()?;
+    let manager = state.account_runtime_manager.clone()?;
     let runtime_config = state
         .kiro_provider
         .as_ref()
@@ -1341,7 +1342,7 @@ async fn maybe_raw_external_preflight_response(
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<RawExternalPreflightDecision> {
     let provider = state.kiro_provider.as_ref()?.clone();
-    let manager = state.external_pool_manager.clone()?;
+    let manager = state.account_runtime_manager.clone()?;
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
@@ -1446,7 +1447,7 @@ async fn maybe_raw_external_preflight_response(
 }
 
 async fn raw_external_pool_has_eligible_pool(
-    manager: &ExternalPoolManager,
+    manager: &AccountRuntimeManager,
     config: &ExternalPoolsConfig,
     endpoint: &str,
     model: Option<&str>,
@@ -1470,7 +1471,7 @@ async fn raw_external_pool_has_eligible_pool(
 }
 
 async fn raw_external_pool_ready_for_route_reason(
-    manager: &ExternalPoolManager,
+    manager: &AccountRuntimeManager,
     config: &ExternalPoolsConfig,
     route_reason: &str,
     endpoint: &str,
@@ -1625,7 +1626,7 @@ fn build_external_fallback_context(
     requires_normalized_body: bool,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Option<ExternalFallbackContext> {
-    let manager = state.external_pool_manager.clone()?;
+    let manager = state.account_runtime_manager.clone()?;
     let config = runtime_config.external_pools.clone();
     if !external_pool_enabled_for_endpoint(&config, endpoint) {
         return None;

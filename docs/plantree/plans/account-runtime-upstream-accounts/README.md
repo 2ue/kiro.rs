@@ -69,6 +69,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - the upstream account page now consumes the account-shaped `accounts` responses, with frontend compatibility normalization retained for older server responses during migration.
 - runtime config now exposes and accepts `accountRuntime` as the account policy surface while mirroring the old `externalPools` field for compatibility; the frontend normalizes both names and the upstream account page writes the account-named field.
 - usage query/admin dashboard surfaces now accept account-named filters and paths: `accountId`, `routeKind=account`, `/usage-dashboard/account-billing`, and `/usage-dashboard/account-risk`, with frontend usage and risk pages moved to account terminology while old external-pool paths remain compatibility aliases.
+- App state, Anthropic router dependencies, Admin service dependencies and process wiring now inject `AccountRuntimeManager` from the `account_runtime` boundary. The current manager facade still delegates to the legacy external-pool implementation, but new integration points no longer depend on `ExternalPoolManager` as their primary type.
 
 Last verified on 2026-08-14:
 
@@ -91,4 +92,7 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-usage-api-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-api-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-usage-api-test2 -- cargo test usage_records_query_accepts_account_aliases -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-facade-fmt3 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-facade-check3 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-facade-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `pnpm --dir ui check`

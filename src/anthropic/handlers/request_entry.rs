@@ -253,7 +253,8 @@ fn maybe_local_pool_unavailable_fast_fail_response(
 
     // If external pools are globally enabled and wired, the normalized external fallback path may
     // still be eligible after typed parsing. Do not preempt it with a local-only response.
-    if runtime_config.external_pools.external_pools_enabled && state.external_pool_manager.is_some()
+    if runtime_config.external_pools.external_pools_enabled
+        && state.account_runtime_manager.is_some()
     {
         return None;
     }
