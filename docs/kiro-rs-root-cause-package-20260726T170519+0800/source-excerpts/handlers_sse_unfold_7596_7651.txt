@@ -1,0 +1,56 @@
+  7596	/// 创建 SSE 事件流
+  7597	#[allow(clippy::too_many_arguments)]
+  7598	fn create_sse_stream(
+  7599	    response: reqwest::Response,
+  7600	    ctx: StreamContext,
+  7601	    initial_events: Vec<SseEvent>,
+  7602	    completion: KiroStreamCompletion,
+  7603	    usage_context: CredentialUsageContext,
+  7604	    stream_idle_timeout_secs: u64,
+  7605	    retry_plan: Option<StreamRetryPlan>,
+  7606	    claude_code_noop_delta_keepalive: bool,
+  7607	) -> impl Stream<Item = Result<Bytes, Infallible>> {
+  7608	    let usage_guard = StreamUsageGuard::new(usage_context);
+  7609	    let stream_idle_timeout_secs = normalize_stream_idle_timeout_secs(stream_idle_timeout_secs);
+  7610	    let state = SseStreamState::from_attempt(
+  7611	        response,
+  7612	        ctx,
+  7613	        initial_events,
+  7614	        completion,
+  7615	        usage_guard,
+  7616	        stream_idle_timeout_secs,
+  7617	        retry_plan,
+  7618	    );
+  7619	
+  7620	    stream::unfold(
+  7621	        state,
+  7622	        move |mut state| async move {
+  7623	            if state.finished {
+  7624	                return None;
+  7625	            }
+  7626	
+  7627	            if !state.downstream_committed && state.retry_plan.is_none() {
+  7628	                let bytes = sse_bytes_from_events(std::mem::take(&mut state.initial_events));
+  7629	                mark_stream_downstream_committed(&mut state);
+  7630	                return Some((stream::iter(bytes), state));
+  7631	            }
+  7632	
+  7633	            let idle_sleep = sleep_until(state.idle_deadline);
+  7634	            tokio::pin!(idle_sleep);
+  7635	
+  7636	            // 使用 select! 同时等待数据、ping 定时器和上游空闲超时。
+  7637	            // 如果开启了首输出前重试，在未向客户端发送任何 SSE 字节前不发送 ping，
+  7638	            // 防止 ping 本身提交下游流导致后续无法安全换号重试。
+  7639	            tokio::select! {
+  7640	                chunk_result = state.body_stream.next() => {
+  7641	                    match chunk_result {
+  7642	                        Some(Ok(chunk)) => {
+  7643	                            state
+  7644	                                .usage_guard
+  7645	                                .context()
+  7646	                                .request
+  7647	                                .mark_first_upstream_chunk();
+  7648	                            state.idle_deadline = Instant::now()
+  7649	                                + Duration::from_secs(state.stream_idle_timeout_secs);
+  7650	                            state.completion.touch();
+  7651	

@@ -20,6 +20,9 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 资源仍被使用，不能直接删除或变更
+    Conflict(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -31,6 +34,7 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::Conflict(msg) => write!(f, "资源冲突: {}", msg),
         }
     }
 }
@@ -45,6 +49,7 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::Conflict(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -59,6 +64,7 @@ impl AdminServiceError {
             AdminServiceError::InvalidCredential(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
+            AdminServiceError::Conflict(_) => AdminErrorResponse::invalid_request(self.to_string()),
         }
     }
 }

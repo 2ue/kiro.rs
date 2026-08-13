@@ -1,0 +1,214 @@
+  1605	        let initial_cleanup_watermark_micros = initial_cleanup_watermark
+  1606	            .as_ref()
+  1607	            .map(|cutoff| cutoff.timestamp_micros().max(0))
+  1608	            .unwrap_or(0);
+  1609	        let runtime_available = tokio::runtime::Handle::try_current().is_ok();
+  1610	        let dropped_persist_records = Arc::new(AtomicU64::new(0));
+  1611	        let dropped_redis_records = Arc::new(AtomicU64::new(0));
+  1612	        let writer = if runtime_available {
+  1613	            let (tx, rx) = mpsc::channel(USAGE_WRITER_QUEUE_CAPACITY);
+  1614	            let progress = Arc::new(UsageWriterProgress::default());
+  1615	            let task = tokio::spawn(usage_writer_loop(
+  1616	                postgres_store.clone(),
+  1617	                rx,
+  1618	                dropped_persist_records.clone(),
+  1619	                progress.clone(),
+  1620	            ));
+  1621	            Some(Arc::new(UsageWriterControl::new(tx, task, progress)))
+  1622	        } else {
+  1623	            tracing::warn!(
+  1624	                "创建 UsageRecorder 时没有运行中的 Tokio runtime，将同步写入 PgSQL usage"
+  1625	            );
+  1626	            None
+  1627	        };
+  1628	        let redis_writer = redis_store.as_ref().and_then(|redis| {
+  1629	            if runtime_available {
+  1630	                let (tx, rx) = mpsc::channel(USAGE_REDIS_WRITER_QUEUE_CAPACITY);
+  1631	                let progress = Arc::new(UsageWriterProgress::default());
+  1632	                let task = tokio::spawn(usage_redis_writer_loop(
+  1633	                    redis.clone(),
+  1634	                    rx,
+  1635	                    dropped_redis_records.clone(),
+  1636	                    progress.clone(),
+  1637	                ));
+  1638	                Some(Arc::new(UsageWriterControl::new(tx, task, progress)))
+  1639	            } else {
+  1640	                tracing::warn!(
+  1641	                    "创建 UsageRecorder 时没有运行中的 Tokio runtime，将同步写入 Redis usage summary"
+  1642	                );
+  1643	                None
+  1644	            }
+  1645	        });
+  1646	        Self {
+  1647	            records: Mutex::new(VecDeque::with_capacity(limit.max(1).min(1024))),
+  1648	            limit: limit.max(1),
+  1649	            postgres_store: Some(postgres_store),
+  1650	            redis_store,
+  1651	            writer,
+  1652	            redis_writer,
+  1653	            dashboard_query_gate: Arc::new(Semaphore::new(USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES)),
+  1654	            lifecycle: Arc::new(RwLock::new(())),
+  1655	            accepting: Arc::new(AtomicBool::new(true)),
+  1656	            shutdown: Arc::new(UsageShutdownState::default()),
+  1657	            rejected_after_shutdown: AtomicU64::new(0),
+  1658	            cleanup_watermark_micros: AtomicI64::new(initial_cleanup_watermark_micros),
+  1659	            rejected_by_cleanup_watermark: AtomicU64::new(0),
+  1660	            backpressured_persist_records: AtomicU64::new(0),
+  1661	            backpressured_redis_records: AtomicU64::new(0),
+  1662	            dropped_persist_records,
+  1663	            dropped_redis_records,
+  1664	        }
+  1665	    }
+  1666	
+  1667	    /// Build the production recorder with PostgreSQL as the only usage data store.
+  1668	    ///
+  1669	    /// Scheduler coordination may use Redis independently, but it must not be attached here:
+  1670	    /// per-request usage materialization can otherwise contend with scheduler operations on the
+  1671	    /// same single-threaded Redis server.
+  1672	    #[cfg(test)]
+  1673	    pub fn with_postgres(limit: usize, postgres_store: Arc<PostgresUsageStore>) -> Self {
+  1674	        Self::with_postgres_internal(limit, postgres_store, None)
+  1675	    }
+  1676	
+  1677	    /// Build the production recorder with an optional, independently configured observability
+  1678	    /// Redis. Startup validates that this store does not share the business Redis authority.
+  1679	    /// `None` deliberately means PostgreSQL-only; it must never be replaced by scheduler Redis.
+  1680	    pub fn with_postgres_and_observability_redis(
+  1681	        limit: usize,
+  1682	        postgres_store: Arc<PostgresUsageStore>,
+  1683	        observability_redis_store: Option<Arc<RedisStore>>,
+  1684	    ) -> Self {
+  1685	        assert!(
+  1686	            observability_redis_store
+  1687	                .as_ref()
+  1688	                .is_none_or(|redis| redis.is_observability()),
+  1689	            "UsageRecorder observability materialization must not use business Redis"
+  1690	        );
+  1691	        Self::with_postgres_internal(limit, postgres_store, observability_redis_store)
+  1692	    }
+  1693	
+  1694	    pub fn record(&self, record: UsageRecord) -> UsageRecordOutcome {
+  1695	        let _lifecycle = self.lifecycle.read();
+  1696	        if !self.accepting.load(Ordering::Acquire) {
+  1697	            let rejected = self.rejected_after_shutdown.fetch_add(1, Ordering::Relaxed) + 1;
+  1698	            if should_log_usage_counter(rejected) {
+  1699	                tracing::warn!(rejected, "UsageRecorder 已停止接收，拒绝新的 usage record");
+  1700	            }
+  1701	            return UsageRecordOutcome::RejectedShuttingDown;
+  1702	        }
+  1703	        let record = normalize_error_diagnostics(record);
+  1704	        let record_micros = parse_record_time(&record.created_at)
+  1705	            .unwrap_or_else(Utc::now)
+  1706	            .timestamp_micros()
+  1707	            .max(0);
+  1708	        let cleanup_watermark = self.cleanup_watermark_micros.load(Ordering::Acquire);
+  1709	        if record_micros < cleanup_watermark {
+  1710	            let rejected = self
+  1711	                .rejected_by_cleanup_watermark
+  1712	                .fetch_add(1, Ordering::Relaxed)
+  1713	                + 1;
+  1714	            if should_log_usage_counter(rejected) {
+  1715	                tracing::debug!(
+  1716	                    rejected,
+  1717	                    request_id = %record.id,
+  1718	                    record_micros,
+  1719	                    cleanup_watermark,
+  1720	                    "usage record 早于清理 watermark，拒绝晚到重放"
+  1721	                );
+  1722	            }
+  1723	            return UsageRecordOutcome::RejectedCleanupWatermark;
+  1724	        }
+  1725	
+  1726	        self.record_usage_postgres(record.clone());
+  1727	
+  1728	        {
+  1729	            let mut records = self.records.lock();
+  1730	            if let Some(index) = records.iter().position(|existing| existing.id == record.id) {
+  1731	                records.remove(index);
+  1732	            }
+  1733	            records.push_back(record.clone());
+  1734	            while records.len() > self.limit {
+  1735	                records.pop_front();
+  1736	            }
+  1737	        }
+  1738	
+  1739	        self.record_usage_redis(record);
+  1740	        UsageRecordOutcome::Accepted
+  1741	    }
+  1742	
+  1743	    fn record_usage_postgres(&self, record: UsageRecord) {
+  1744	        if let Some(writer) = &self.writer {
+  1745	            match writer.enqueue(record) {
+  1746	                Ok(false) => {}
+  1747	                Ok(true) => {
+  1748	                    self.backpressured_persist_records
+  1749	                        .fetch_add(1, Ordering::Relaxed);
+  1750	                }
+  1751	                Err(UsageWriterEnqueueError::Full(_record)) => {
+  1752	                    let count = self
+  1753	                        .backpressured_persist_records
+  1754	                        .fetch_add(1, Ordering::Relaxed)
+  1755	                        + 1;
+  1756	                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+  1757	                    if should_log_usage_counter(count) {
+  1758	                        tracing::warn!(
+  1759	                            count,
+  1760	                            dropped,
+  1761	                            "PgSQL usage 队列已满，已丢弃本条持久化记录以避免阻塞主请求"
+  1762	                        );
+  1763	                    }
+  1764	                }
+  1765	                Err(UsageWriterEnqueueError::Closed(_record)) => {
+  1766	                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+  1767	                    if should_log_usage_counter(dropped) {
+  1768	                        tracing::warn!(
+  1769	                            dropped,
+  1770	                            "PgSQL usage writer 已关闭，已丢弃本条持久化记录以避免阻塞主请求"
+  1771	                        );
+  1772	                    }
+  1773	                }
+  1774	            }
+  1775	        } else {
+  1776	            let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+  1777	            if should_log_usage_counter(dropped) {
+  1778	                tracing::warn!(
+  1779	                    dropped,
+  1780	                    "PgSQL usage writer 不可用，已丢弃本条持久化记录以避免阻塞主请求"
+  1781	                );
+  1782	            }
+  1783	        }
+  1784	    }
+  1785	
+  1786	    fn record_usage_redis(&self, record: UsageRecord) {
+  1787	        if self.redis_store.is_none() {
+  1788	            return;
+  1789	        }
+  1790	        if let Some(writer) = &self.redis_writer {
+  1791	            match writer.enqueue(record) {
+  1792	                Ok(false) => {}
+  1793	                Ok(true) => {
+  1794	                    self.backpressured_redis_records
+  1795	                        .fetch_add(1, Ordering::Relaxed);
+  1796	                }
+  1797	                Err(UsageWriterEnqueueError::Full(_record)) => {
+  1798	                    let count = self
+  1799	                        .backpressured_redis_records
+  1800	                        .fetch_add(1, Ordering::Relaxed)
+  1801	                        + 1;
+  1802	                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+  1803	                    if should_log_usage_counter(count) {
+  1804	                        tracing::warn!(
+  1805	                            count,
+  1806	                            dropped,
+  1807	                            "Redis usage 队列已满，已丢弃本条 summary 记录以避免阻塞主请求"
+  1808	                        );
+  1809	                    }
+  1810	                }
+  1811	                Err(UsageWriterEnqueueError::Closed(_record)) => {
+  1812	                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+  1813	                    if should_log_usage_counter(dropped) {
+  1814	                        tracing::warn!(
+  1815	                            dropped,
+  1816	                            "Redis usage writer 已关闭，已丢弃本条 summary 记录以避免阻塞主请求"
+  1817	                        );
+  1818	                    }

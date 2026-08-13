@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.nmc.cn)",
+      "WebFetch(domain:www.accuweather.com)"
+    ]
+  }
+}

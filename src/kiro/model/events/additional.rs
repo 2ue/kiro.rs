@@ -51,10 +51,26 @@ impl MetadataTokenUsage {
         self.uncached_input_tokens
     }
 
-    pub fn total_input_tokens(&self) -> i32 {
-        self.uncached_input_tokens
-            .saturating_add(self.cache_read_input_tokens)
-            .saturating_add(self.cache_write_input_tokens)
+    /// Metadata can arrive in both `metadataEvent` and
+    /// `messageMetadataEvent`. Some upstream versions only populate a subset
+    /// of fields in the later event, so zero values must not erase an earlier
+    /// positive measurement.
+    pub fn merge_positive_from(&mut self, newer: &Self) {
+        if newer.uncached_input_tokens > 0 {
+            self.uncached_input_tokens = newer.uncached_input_tokens;
+        }
+        if newer.output_tokens > 0 {
+            self.output_tokens = newer.output_tokens;
+        }
+        if newer.total_tokens > 0 {
+            self.total_tokens = newer.total_tokens;
+        }
+        if newer.cache_read_input_tokens > 0 {
+            self.cache_read_input_tokens = newer.cache_read_input_tokens;
+        }
+        if newer.cache_write_input_tokens > 0 {
+            self.cache_write_input_tokens = newer.cache_write_input_tokens;
+        }
     }
 }
 
@@ -80,9 +96,43 @@ pub struct MessageMetadataEvent {
     pub conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utterance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<MetadataTokenUsage>,
 }
 
 impl EventPayload for MessageMetadataEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+/// Metering event emitted by Kiro with credit usage information.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MeteringEvent {
+    #[serde(default)]
+    pub usage: f64,
+    #[serde(default)]
+    pub input_tokens: i32,
+    #[serde(default)]
+    pub output_tokens: i32,
+}
+
+impl EventPayload for MeteringEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+/// Code content event emitted by Amazon Q CLI style streams.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeEvent {
+    #[serde(default)]
+    pub content: String,
+}
+
+impl EventPayload for CodeEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
         frame.payload_as_json()
     }
@@ -135,7 +185,12 @@ mod tests {
 
         let usage = event.token_usage.unwrap();
         assert_eq!(usage.input_tokens(), 120);
-        assert_eq!(usage.total_input_tokens(), 157);
+        assert_eq!(
+            usage.uncached_input_tokens
+                + usage.cache_read_input_tokens
+                + usage.cache_write_input_tokens,
+            157
+        );
         assert_eq!(usage.output_tokens, 11);
         assert_eq!(usage.cache_write_input_tokens, 7);
     }
@@ -157,10 +212,79 @@ mod tests {
 
         let usage = event.token_usage.unwrap();
         assert_eq!(usage.input_tokens(), 1200);
-        assert_eq!(usage.total_input_tokens(), 205200);
+        assert_eq!(
+            usage.uncached_input_tokens
+                + usage.cache_read_input_tokens
+                + usage.cache_write_input_tokens,
+            205200
+        );
         assert_eq!(usage.cache_read_input_tokens, 180000);
         assert_eq!(usage.cache_write_input_tokens, 24000);
         assert_eq!(usage.output_tokens, 900);
+    }
+
+    #[test]
+    fn metadata_usage_merge_keeps_earlier_positive_fields() {
+        let mut usage = MetadataTokenUsage {
+            uncached_input_tokens: 120,
+            output_tokens: 0,
+            total_tokens: 157,
+            cache_read_input_tokens: 30,
+            cache_write_input_tokens: 7,
+        };
+
+        usage.merge_positive_from(&MetadataTokenUsage {
+            uncached_input_tokens: 0,
+            output_tokens: 11,
+            total_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+        });
+        usage.merge_positive_from(&MetadataTokenUsage::default());
+
+        assert_eq!(usage.uncached_input_tokens, 120);
+        assert_eq!(usage.output_tokens, 11);
+        assert_eq!(usage.total_tokens, 157);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.cache_write_input_tokens, 7);
+    }
+
+    #[test]
+    fn message_metadata_usage_deserializes_token_usage() {
+        let event: MessageMetadataEvent = serde_json::from_str(
+            r#"{
+                "conversationId": "conv-1",
+                "utteranceId": "utt-1",
+                "tokenUsage": {
+                    "uncachedInputTokens": 12,
+                    "cacheReadInputTokens": 345,
+                    "cacheWriteInputTokens": 67,
+                    "outputTokens": 8,
+                    "totalTokens": 432
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(event.conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(event.utterance_id.as_deref(), Some("utt-1"));
+        let usage = event.token_usage.unwrap();
+        assert_eq!(usage.input_tokens(), 12);
+        assert_eq!(usage.cache_read_input_tokens, 345);
+        assert_eq!(usage.cache_write_input_tokens, 67);
+        assert_eq!(usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn metering_and_code_events_deserialize_without_extra_requirements() {
+        let metering: MeteringEvent =
+            serde_json::from_str(r#"{"usage":1.25,"inputTokens":30,"outputTokens":10}"#).unwrap();
+        assert_eq!(metering.usage, 1.25);
+        assert_eq!(metering.input_tokens, 30);
+        assert_eq!(metering.output_tokens, 10);
+
+        let code: CodeEvent = serde_json::from_str(r#"{"content":"println!(\"hi\");"}"#).unwrap();
+        assert_eq!(code.content, "println!(\"hi\");");
     }
 
     #[test]

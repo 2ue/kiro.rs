@@ -1,0 +1,8 @@
+[build]
+target-dir = "/tmp/kiro-rs-rust-analyzer-target"
+
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[env]
+CC_aarch64_apple_darwin = "/usr/bin/cc"

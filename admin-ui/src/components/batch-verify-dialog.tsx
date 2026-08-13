@@ -10,7 +10,8 @@ import { Badge } from '@/components/ui/badge'
 export interface VerifyResult {
   id: number
   status: 'pending' | 'verifying' | 'success' | 'failed'
-  usage?: string
+  model?: string
+  response?: string
   error?: string
 }
 
@@ -88,9 +89,9 @@ export function BatchVerifyDialog({
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex items-center gap-2">
                       <span className="font-medium">凭据 #{result.id}</span>
-                      {result.status === 'success' && result.usage && (
+                      {result.status === 'success' && result.model && (
                         <Badge variant="secondary" className="text-xs">
-                          {result.usage}
+                          {result.model}
                         </Badge>
                       )}
                     </div>
@@ -106,6 +107,11 @@ export function BatchVerifyDialog({
                       错误: {result.error}
                     </div>
                   )}
+                  {result.response && (
+                    <div className="text-xs mt-1 opacity-90 line-clamp-2">
+                      响应: {result.response}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -114,7 +120,7 @@ export function BatchVerifyDialog({
           {/* 提示信息 */}
           {verifying && (
             <p className="text-xs text-muted-foreground">
-              💡 验活过程中每次请求间隔 2 秒，防止被封号。你可以关闭此窗口，验活会在后台继续进行。
+              验活使用模型调用，每次请求间隔 2 秒。你可以关闭此窗口，验活会在后台继续进行。
             </p>
           )}
         </div>

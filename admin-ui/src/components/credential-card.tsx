@@ -1,12 +1,13 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle, Router, Gauge, Globe, Eye, EyeOff } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Progress } from '@/components/ui/progress'
 import {
   Dialog,
   DialogContent,
@@ -17,22 +18,39 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { formatUsd } from '@/lib/format'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetWarmup,
+  useClearInFlight,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useProxyResources,
+  useRuntimeConfig,
+  useSetCredentialRegions,
+  useSetCredentialProxy,
+  useSetCredentialConcurrency,
+  useSetCredentialRpm,
+  useSetCredentialRateLimitAutoDisable,
+  useSetCredentialOverage,
+  useSetCredentialSupportedModels,
+  useDiscoverCredentialSupportedModels,
 } from '@/hooks/use-credentials'
+import { SupportedModelTagsEditor, mergeSupportedModels } from '@/components/supported-model-tags-editor'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
-  onViewBalance: (id: number) => void
+  onQueryBalance: (id: number) => void
+  onTestCredential: (credential: CredentialStatusItem) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
 }
+
+const EMPTY_SUPPORTED_MODELS: string[] = []
 
 function formatLastUsed(lastUsedAt: string | null): string {
   if (!lastUsedAt) return '从未使用'
@@ -50,16 +68,178 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatApproxElapsedMs(value?: number | null): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  const diff = Date.now() - value
+  if (diff < 0) return '约刚刚'
+  const seconds = Math.floor(diff / 1000)
+  if (seconds < 60) return `约${seconds}秒前`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `约${minutes}分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `约${hours}小时前`
+  const days = Math.floor(hours / 24)
+  return `约${days}天前`
+}
+
+function formatDateTime(value: string | null): string {
+  if (!value) return '未知'
+  return new Date(value).toLocaleString('zh-CN', {
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function formatMeteringUsage(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return new Intl.NumberFormat('zh-CN', {
+    maximumFractionDigits: value >= 1 ? 3 : 6,
+  }).format(value)
+}
+
+function formatQuota(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return new Intl.NumberFormat('zh-CN', {
+    minimumFractionDigits: value >= 1 ? 2 : 6,
+    maximumFractionDigits: value >= 1 ? 2 : 6,
+  }).format(value)
+}
+
+function numberOrZero(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function sourceLabel(source?: CredentialStatusItem['effectiveProxySource']) {
+  if (source === 'credential') return '直接代理'
+  if (source === 'resource') return '代理资源'
+  if (source === 'resource_disabled') return '代理资源已禁用'
+  if (source === 'resource_missing') return '代理资源不存在'
+  if (source === 'global') return '全局代理'
+  if (source === 'direct') return '直连'
+  return '未配置代理'
+}
+
+function proxySummary(credential: CredentialStatusItem): string {
+  const label = sourceLabel(credential.effectiveProxySource)
+  if (
+    credential.proxyResourceName &&
+    (credential.effectiveProxySource === 'resource' ||
+      credential.effectiveProxySource === 'resource_disabled' ||
+      credential.effectiveProxySource === 'resource_missing')
+  ) {
+    return `${label}：${credential.proxyResourceName}`
+  }
+  return label
+}
+
+function concurrencyLimitLabel(credential: CredentialStatusItem): string {
+  const effective = credential.maxConcurrentRequests > 0 ? `${credential.maxConcurrentRequests}` : '不限'
+  if (typeof credential.maxConcurrentRequestsOverride === 'number') {
+    return credential.maxConcurrentRequestsOverride > 0
+      ? `账号覆盖：${credential.maxConcurrentRequestsOverride}`
+      : '账号覆盖：不限'
+  }
+  return `继承全局：${effective}`
+}
+
+function rpmLimitLabel(credential: CredentialStatusItem): string {
+  const effective = credential.rpm > 0 ? `${credential.rpm} RPM` : '不限'
+  if (typeof credential.rpmOverride === 'number') {
+    return credential.rpmOverride > 0
+      ? `账号覆盖：${credential.rpmOverride} RPM`
+      : '账号覆盖：不限'
+  }
+  return `继承全局：${effective}`
+}
+
+function supportedModelsSummary(models?: string[]) {
+  if (!models || models.length === 0) return '不限制'
+  if (models.length <= 2) return models.join(', ')
+  return `${models[0]}, ${models[1]} 等 ${models.length} 个`
+}
+
+function SecretInput({
+  value,
+  onChange,
+  visible,
+  onToggle,
+  disabled,
+  placeholder,
+}: {
+  value: string
+  onChange: (value: string) => void
+  visible: boolean
+  onToggle: () => void
+  disabled?: boolean
+  placeholder?: string
+}) {
+  return (
+    <div className="relative">
+      <Input
+        className="pr-10"
+        type={visible ? 'text' : 'password'}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="absolute right-1 top-1 h-8 w-8"
+        onClick={onToggle}
+        disabled={disabled}
+        title={visible ? '隐藏' : '显示'}
+      >
+        {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+      </Button>
+    </div>
+  )
+}
+
 export function CredentialCard({
   credential,
-  onViewBalance,
+  onQueryBalance,
+  onTestCredential,
   selected,
   onToggleSelect,
   balance,
   loadingBalance,
 }: CredentialCardProps) {
+  const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
+  const [editingRegions, setEditingRegions] = useState(false)
+  const [editingProxy, setEditingProxy] = useState(false)
+  const [editingConcurrency, setEditingConcurrency] = useState(false)
+  const [editingRpm, setEditingRpm] = useState(false)
+  const [editingSupportedModels, setEditingSupportedModels] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [regionValue, setRegionValue] = useState(credential.region || '')
+  const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
+  const [apiRegionValue, setApiRegionValue] = useState(credential.apiRegion || '')
+  const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
+  const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
+  const [proxyUsername, setProxyUsername] = useState(credential.proxyUsername || '')
+  const [proxyPassword, setProxyPassword] = useState(credential.proxyPassword || '')
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
+  const [concurrencyValue, setConcurrencyValue] = useState(
+    typeof credential.maxConcurrentRequestsOverride === 'number'
+      ? String(credential.maxConcurrentRequestsOverride)
+      : ''
+  )
+  const [rpmValue, setRpmValue] = useState(
+    typeof credential.rpmOverride === 'number'
+      ? String(credential.rpmOverride)
+      : ''
+  )
+  const [supportedModelsDraft, setSupportedModelsDraft] = useState<string[]>(supportedModels)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -67,7 +247,151 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const setWarmup = useSetWarmup()
+  const clearInFlight = useClearInFlight()
+  const setCredentialProxy = useSetCredentialProxy()
+  const setCredentialConcurrency = useSetCredentialConcurrency()
+  const setCredentialRpm = useSetCredentialRpm()
+  const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
+  const setCredentialOverage = useSetCredentialOverage()
+  const setCredentialRegions = useSetCredentialRegions()
+  const setCredentialSupportedModels = useSetCredentialSupportedModels()
+  const discoverCredentialSupportedModels = useDiscoverCredentialSupportedModels()
+  const proxyResources = useProxyResources()
+  const runtimeConfig = useRuntimeConfig()
+  const proxyResourceOptions = proxyResources.data?.resources || []
   const displayName = credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+  const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
+  const accountInfo = balance || credential.accountInfo
+  const subscriptionTitle = balance?.subscriptionTitle || credential.accountInfo?.subscriptionTitle || credential.subscriptionTitle || '未知'
+  const quotaUsagePercent = accountInfo && accountInfo.usageLimit > 0
+    ? Math.min(100, Math.max(0, (accountInfo.currentUsage / accountInfo.usageLimit) * 100))
+    : 0
+  const overageStatus = (accountInfo?.overageStatus || '').toUpperCase()
+  const overageCapability = (accountInfo?.overageCapability || '').toUpperCase()
+  const overageEnabled = overageStatus === 'ENABLED'
+  const overageCapable = overageCapability === '' || overageCapability === 'OVERAGE_CAPABLE'
+  const overageKnown = overageStatus === 'ENABLED' || overageStatus === 'DISABLED'
+  const overageLabel = accountInfo
+    ? !overageCapable
+      ? '不支持'
+      : overageEnabled
+        ? '已开启'
+        : overageStatus === 'DISABLED'
+          ? '已关闭'
+          : '未知'
+    : '未查询'
+  const overageDetail = accountInfo
+    ? [
+        accountInfo.overageCap > 0 ? `上限 ${formatUsd(accountInfo.overageCap)}` : null,
+        accountInfo.overageRate > 0 ? `单价 ${formatUsd(accountInfo.overageRate)}` : null,
+        accountInfo.currentOverages > 0 ? `已用 ${formatUsd(accountInfo.currentOverages)}` : null,
+      ].filter(Boolean).join(' · ') || (overageKnown ? '额度耗尽后是否继续计费' : '查询额度后同步状态')
+    : undefined
+  const transientFailureStreak = numberOrZero(credential.transientFailureStreak)
+  const probationRemainingSecs = numberOrZero(credential.probationRemainingSecs)
+  const recentErrorRate = numberOrZero(credential.recentErrorRate)
+  const schedulerScore = numberOrZero(credential.schedulerScore)
+  const schedulerSelectionCount = numberOrZero(credential.schedulerSelectionCount)
+  const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
+  const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
+  const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
+  const projectedRpm10s = recentSelection10s * 6
+  const averageRpm5m = Math.round(recentSelection5m / 5)
+  const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
+  const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
+
+  const resetProxyDraft = () => {
+    setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
+    setProxyUrl(credential.proxyUrl || '')
+    setProxyUsername(credential.proxyUsername || '')
+    setProxyPassword(credential.proxyPassword || '')
+    setShowProxyUsername(false)
+    setShowProxyPassword(false)
+  }
+
+  const openProxyEditor = () => {
+    resetProxyDraft()
+    setEditingProxy(true)
+  }
+
+  const closeProxyEditor = () => {
+    if (setCredentialProxy.isPending) return
+    resetProxyDraft()
+    setEditingProxy(false)
+  }
+
+  const openRegionsEditor = () => {
+    setRegionValue(credential.region || '')
+    setAuthRegionValue(credential.authRegion || '')
+    setApiRegionValue(credential.apiRegion || '')
+    setEditingRegions(true)
+  }
+
+  const closeRegionsEditor = () => {
+    if (setCredentialRegions.isPending) return
+    setRegionValue(credential.region || '')
+    setAuthRegionValue(credential.authRegion || '')
+    setApiRegionValue(credential.apiRegion || '')
+    setEditingRegions(false)
+  }
+
+  const handleRegionValueChange = (value: string) => {
+    setRegionValue(value)
+    if (value.trim() && !authRegionValue.trim()) {
+      setAuthRegionValue(value)
+    }
+  }
+
+  const setProxyResourceDraft = (value: string) => {
+    setProxyResourceId(value)
+    if (value) {
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+    }
+  }
+
+  const setDirectProxyDraft = (setter: (value: string) => void, value: string) => {
+    setter(value)
+    if (value.trim()) {
+      setProxyResourceId('')
+    }
+  }
+
+  useEffect(() => {
+    setPriorityValue(String(credential.priority))
+  }, [credential.priority])
+
+  useEffect(() => {
+    setRegionValue(credential.region || '')
+    setAuthRegionValue(credential.authRegion || '')
+    setApiRegionValue(credential.apiRegion || '')
+  }, [credential.id, credential.region, credential.authRegion, credential.apiRegion])
+
+  useEffect(() => {
+    resetProxyDraft()
+  }, [credential.id, credential.proxyResourceId, credential.proxyUrl, credential.proxyUsername, credential.proxyPassword])
+
+  useEffect(() => {
+    setConcurrencyValue(
+      typeof credential.maxConcurrentRequestsOverride === 'number'
+        ? String(credential.maxConcurrentRequestsOverride)
+        : ''
+    )
+  }, [credential.id, credential.maxConcurrentRequestsOverride])
+
+  useEffect(() => {
+    setRpmValue(
+      typeof credential.rpmOverride === 'number'
+        ? String(credential.rpmOverride)
+        : ''
+    )
+  }, [credential.id, credential.rpmOverride])
+
+  useEffect(() => {
+    setSupportedModelsDraft(supportedModels)
+  }, [credential.id, supportedModels])
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -103,6 +427,166 @@ export function CredentialCard({
     )
   }
 
+  const handleRegionsSave = () => {
+    setCredentialRegions.mutate(
+      {
+        id: credential.id,
+        request: {
+          region: regionValue.trim() || null,
+          authRegion: authRegionValue.trim() || null,
+          apiRegion: apiRegionValue.trim() || null,
+        },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRegions(false)
+        },
+        onError: (err) => {
+          toast.error('Region 设置失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleProxySave = () => {
+    const directProxyUrl = proxyUrl.trim()
+    const directProxyUsername = proxyUsername.trim()
+    const directProxyPassword = proxyPassword.trim()
+    if (!proxyResourceId && !directProxyUrl && (directProxyUsername || directProxyPassword)) {
+      toast.error('直接代理 URL 为空时不能单独保存代理账号或密码')
+      return
+    }
+    setCredentialProxy.mutate(
+      {
+        id: credential.id,
+        request: {
+          proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
+          proxyUrl: proxyResourceId ? undefined : directProxyUrl || undefined,
+          proxyUsername: proxyResourceId ? undefined : directProxyUsername || undefined,
+          proxyPassword: proxyResourceId ? undefined : directProxyPassword || undefined,
+        },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingProxy(false)
+        },
+        onError: (err) => {
+          toast.error('代理设置失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleConcurrencySave = () => {
+    const trimmed = concurrencyValue.trim()
+    let maxConcurrentRequests: number | null = null
+    if (trimmed) {
+      const parsed = Number(trimmed)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号并发限制必须是非负整数')
+        return
+      }
+      maxConcurrentRequests = parsed
+    }
+    setCredentialConcurrency.mutate(
+      {
+        id: credential.id,
+        request: { maxConcurrentRequests },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingConcurrency(false)
+        },
+        onError: (err) => {
+          toast.error('并发限制设置失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleRpmSave = () => {
+    const trimmed = rpmValue.trim()
+    let rpm: number | null = null
+    if (trimmed) {
+      const parsed = Number(trimmed)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号 RPM 限制必须是非负整数')
+        return
+      }
+      rpm = parsed
+    }
+    setCredentialRpm.mutate(
+      {
+        id: credential.id,
+        request: { rpm },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRpm(false)
+        },
+        onError: (err) => {
+          toast.error('RPM 限制设置失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleRateLimitAutoDisableToggle = (enabled: boolean) => {
+    setCredentialRateLimitAutoDisable.mutate(
+      {
+        id: credential.id,
+        request: { enabled },
+      },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('429 自动禁用设置失败: ' + extractErrorMessage(err)),
+      }
+    )
+  }
+
+  const handleOverageToggle = (enabled: boolean) => {
+    setCredentialOverage.mutate(
+      { id: credential.id, enabled },
+      {
+        onSuccess: () => toast.success(`超额调用已${enabled ? '开启' : '关闭'}`),
+        onError: (err) => toast.error('超额开关设置失败: ' + extractErrorMessage(err)),
+      }
+    )
+  }
+
+  const handleSupportedModelsSave = () => {
+    const supportedModels = mergeSupportedModels([], supportedModelsDraft)
+    setCredentialSupportedModels.mutate(
+      { id: credential.id, request: { supportedModels } },
+      {
+        onSuccess: (res) => {
+          toast.success(`已保存 ${res.count} 个支持模型`)
+          setSupportedModelsDraft(res.supportedModels)
+          setEditingSupportedModels(false)
+        },
+        onError: (err) => {
+          toast.error('支持模型保存失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleSupportedModelsDiscover = () => {
+    discoverCredentialSupportedModels.mutate(credential.id, {
+      onSuccess: (res) => {
+        toast.success(`已拉取并生成 ${res.count} 个支持模型，保存后生效`)
+        setSupportedModelsDraft(res.supportedModels)
+      },
+      onError: (err) => {
+        toast.error('模型发现失败: ' + extractErrorMessage(err))
+      },
+    })
+  }
+
   const handleReset = () => {
     resetFailure.mutate(credential.id, {
       onSuccess: (res) => {
@@ -123,6 +607,34 @@ export function CredentialCard({
         toast.error('刷新失败: ' + extractErrorMessage(err))
       },
     })
+  }
+
+  const handleClearInFlight = () => {
+    if (!confirm(`确定清理凭据 #${credential.id} 的当前并发占用吗？真实仍在运行的请求可能因此不再计入并发限制。`)) {
+      return
+    }
+    clearInFlight.mutate(
+      { id: credential.id },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('清理失败: ' + extractErrorMessage(err)),
+      }
+    )
+  }
+
+  const handleToggleWarmup = () => {
+    const nextWarmup = credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget)
+    setWarmup.mutate(
+      { id: credential.id, warmupRemaining: nextWarmup },
+      {
+        onSuccess: () => {
+          toast.success(nextWarmup > 0 ? `凭据 #${credential.id} 已开启预热` : `凭据 #${credential.id} 已关闭预热`)
+        },
+        onError: (err) => {
+          toast.error('预热设置失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
   }
 
   const handleDelete = () => {
@@ -165,6 +677,43 @@ export function CredentialCard({
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
+                {!credential.disabled && credential.cooledDown && (
+                  <Badge
+                    variant="outline"
+                    title={(credential.cooldowns || [])
+                      .map((item) => `${item.global ? '全部模型' : item.model || '-'} ${item.remainingSecs}s${item.reason ? ` ${item.reason}` : ''}`)
+                      .join('\n')}
+                  >
+                    冷却 {credential.cooldownRemainingSecs}s
+                  </Badge>
+                )}
+                {!credential.disabled && credential.rateLimited && (
+                  <Badge variant="outline">限流 {credential.rateLimitRemainingSecs}s</Badge>
+                )}
+                {!credential.disabled && credential.maxConcurrentRequests > 0 && (
+                  <Badge
+                    variant={credential.inFlightRequests >= credential.maxConcurrentRequests ? 'destructive' : 'outline'}
+                    title={
+                      credential.inFlightRequests > 0
+                        ? `最老占用 ${credential.oldestInFlightAgeSecs}s，最近活跃 ${credential.newestInFlightIdleSecs}s 前`
+                        : undefined
+                    }
+                  >
+                    并发 {credential.inFlightRequests}/{credential.maxConcurrentRequests}
+                  </Badge>
+                )}
+                {!credential.disabled && credential.warmupRemaining > 0 && (
+                  <Badge variant="secondary">预热 {credential.warmupRemaining}</Badge>
+                )}
+                {supportedModels.length > 0 && (
+                  <Badge variant="outline" title={supportedModels.join('\n')}>模型 {supportedModels.length}</Badge>
+                )}
+                {!credential.disabled && credential.inProbation && (
+                  <Badge variant="secondary">观察 {probationRemainingSecs}s</Badge>
+                )}
+                {transientFailureStreak > 0 && (
+                  <Badge variant="outline">瞬态错误 {transientFailureStreak}</Badge>
+                )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
                     {credential.authMethod === 'api_key' ? 'API Key' :
@@ -175,6 +724,23 @@ export function CredentialCard({
                 )}
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
+                )}
+                {(credential.effectiveAuthRegion || credential.effectiveApiRegion) && (
+                  <Badge variant="outline">
+                    {credential.effectiveAuthRegion || credential.effectiveApiRegion}
+                  </Badge>
+                )}
+                {credential.hasProxy && (
+                  <Badge variant="outline">代理</Badge>
+                )}
+                {typeof credential.maxConcurrentRequestsOverride === 'number' && (
+                  <Badge variant="outline">并发覆盖</Badge>
+                )}
+                {typeof credential.rpmOverride === 'number' && (
+                  <Badge variant="outline">RPM 覆盖</Badge>
+                )}
+                {credential.rateLimitAutoDisableEnabled === false && (
+                  <Badge variant="outline">429 仅冷却</Badge>
                 )}
               </CardTitle>
             </div>
@@ -250,16 +816,202 @@ export function CredentialCard({
               <span className="font-medium">
                 {loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                ) : subscriptionTitle}
               </span>
             </div>
             <div>
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
+            <div>
+              <span className="text-muted-foreground">当前并发：</span>
+              <span className="font-medium">
+                {credential.inFlightRequests}
+                {credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : '（不限）'}
+              </span>
+              {credential.inFlightRequests > 0 && (
+                <span className="ml-1 text-xs text-muted-foreground">
+                  最老 {credential.oldestInFlightAgeSecs}s
+                  {credential.inFlightLeaseMaxSecs > 0 ? ` / 回收 ${credential.inFlightLeaseMaxSecs}s` : ''}
+                </span>
+              )}
+            </div>
+            <div>
+              <span className="text-muted-foreground">并发限制：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex items-center gap-1 font-medium hover:underline"
+                onClick={() => setEditingConcurrency(true)}
+              >
+                <Gauge className="h-3.5 w-3.5" />
+                {concurrencyLimitLabel(credential)}
+              </button>
+            </div>
+            <div>
+              <span className="text-muted-foreground">RPM 限制：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex items-center gap-1 font-medium hover:underline"
+                onClick={() => setEditingRpm(true)}
+              >
+                <Gauge className="h-3.5 w-3.5" />
+                {rpmLimitLabel(credential)}
+              </button>
+            </div>
+            <div>
+              <span className="text-muted-foreground">429 自动禁用：</span>
+              <span className="ml-1 inline-flex items-center gap-2 align-middle">
+                <Switch
+                  checked={credential.rateLimitAutoDisableEnabled !== false}
+                  onCheckedChange={handleRateLimitAutoDisableToggle}
+                  disabled={setCredentialRateLimitAutoDisable.isPending}
+                />
+                <span className="font-medium">
+                  {credential.rateLimitAutoDisableEnabled === false ? '关闭' : '开启'}
+                </span>
+              </span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">支持模型：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
+                title={supportedModels.length > 0 ? supportedModels.join('\n') : '未设置，不限制模型'}
+                onClick={() => setEditingSupportedModels(true)}
+              >
+                <Gauge className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{supportedModelsSummary(supportedModels)}</span>
+              </button>
+              <span className="ml-1 text-xs text-muted-foreground">
+                {supportedModels.length > 0 ? '账号调度白名单' : '未设置'}
+              </span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">Region：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
+                onClick={openRegionsEditor}
+                title="配置该凭据的 Region"
+              >
+                <Globe className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">
+                  Auth {credential.effectiveAuthRegion || '默认'} · API {credential.effectiveApiRegion || '默认'}
+                </span>
+              </button>
+              {(credential.region || credential.authRegion || credential.apiRegion) && (
+                <span className="ml-1 text-xs text-muted-foreground">账号覆盖</span>
+              )}
+            </div>
+            <div>
+              <span className="text-muted-foreground">近期错误率：</span>
+              <span className={recentErrorRate > 0 ? 'font-medium text-red-500' : 'font-medium'}>
+                {(recentErrorRate * 100).toFixed(1)}%
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">耗时 EWMA：</span>
+              <span className="font-medium">
+                {credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">调度评分：</span>
+              <span className="font-medium">{schedulerScore.toFixed(2)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">总调度：</span>
+              <span className="font-medium">{schedulerSelectionCount}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">当前 RPM：</span>
+              <span className={credential.rpm > 0 && recentSelection60s >= credential.rpm ? 'font-medium text-amber-600' : 'font-medium'}>
+                {recentSelection60s}/min
+              </span>
+              <span className="ml-1 text-xs text-muted-foreground">
+                10s折算 {projectedRpm10s}/min / 5m均 {averageRpm5m}/min
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">调度压力：</span>
+              <span className={schedulerSelectionPressure > 1 ? 'font-medium text-amber-600' : 'font-medium'}>
+                {schedulerSelectionPressure.toFixed(2)}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">本地估算成本：</span>
+              <span className="font-medium">{formatUsd(credential.estimatedCostUsd || 0)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">原始计费：</span>
+              <span className="font-medium">{formatUsd(credential.originalCostUsd || 0)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Kiro计量：</span>
+              <span className="font-medium">{formatMeteringUsage(credential.kiroMeteringUsage || 0)}</span>
+            </div>
+            {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
+              <div>
+                <span className="text-muted-foreground">计价请求：</span>
+                <span className="font-medium">
+                  {credential.pricedRequests}/{credential.pricedRequests + credential.unpricedRequests}
+                </span>
+              </div>
+            )}
+            {(credential.cooledDown || credential.rateLimited || credential.inProbation || credential.warmupRemaining > 0 || (credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests)) && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">调度状态：</span>
+                <span className="font-medium">
+                  {credential.cooledDown
+                    ? `冷却中 ${credential.cooldownRemainingSecs}s`
+                    : credential.rateLimited
+                      ? `本地限流 ${credential.rateLimitRemainingSecs}s`
+                      : credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests
+                        ? `并发已满 ${credential.inFlightRequests}/${credential.maxConcurrentRequests}`
+                        : credential.inProbation
+                          ? `恢复观察 ${probationRemainingSecs}s`
+                        : `预热剩余 ${credential.warmupRemaining} 次`}
+                </span>
+                {credential.cooldownReason && (
+                  <span className="ml-1 text-xs text-muted-foreground">
+                    {credential.cooldownReason}
+                  </span>
+                )}
+                {credential.cooldowns && credential.cooldowns.length > 0 && (
+                  <div className="mt-1 flex flex-wrap gap-1 text-xs text-muted-foreground">
+                    {credential.cooldowns.map((cooldown) => (
+                      <span
+                        key={`${cooldown.global ? 'global' : cooldown.model}-${cooldown.remainingSecs}`}
+                        className="rounded border px-1.5 py-0.5"
+                        title={cooldown.reason || undefined}
+                      >
+                        {cooldown.global ? '全部模型' : cooldown.model || '-'} · {cooldown.remainingSecs}s
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {credential.lastErrorReason && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">
+                  最近瞬态错误{lastTransientErrorAgo ? `(${lastTransientErrorAgo})` : ''}：
+                </span>
+                <span className="font-medium">{credential.lastErrorKind || 'unknown'}</span>
+                <span className="ml-1 text-xs text-muted-foreground">{credential.lastErrorReason}</span>
+              </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">创建时间：</span>
+              <span className="font-medium">{formatDateTime(credential.createdAt)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">更新时间：</span>
+              <span className="font-medium">{formatDateTime(credential.updatedAt)}</span>
             </div>
             {credential.email && (
               <div className="col-span-2">
@@ -274,28 +1026,63 @@ export function CredentialCard({
               </div>
             )}
             <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
+              <span className="text-muted-foreground">额度：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
-              ) : balance ? (
-                <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
-                  </span>
-                </span>
+              ) : accountInfo ? (
+                <div className="mt-1 space-y-1">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="font-medium">
+                      {formatQuota(accountInfo.currentUsage)} / {formatQuota(accountInfo.usageLimit)}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      剩余 {formatQuota(accountInfo.remaining)}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      检查 {formatDateTime(accountInfo.checkedAt)}
+                    </span>
+                    {accountInfo.nextResetAt && (
+                      <span className="text-xs text-muted-foreground">
+                        重置 {new Date(accountInfo.nextResetAt * 1000).toLocaleString('zh-CN', { hour12: false })}
+                      </span>
+                    )}
+                  </div>
+                  <Progress value={quotaUsagePercent} className="h-1.5" aria-label="用量额度已用比例" />
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                    <span className="text-muted-foreground">超额调用：</span>
+                    {setCredentialOverage.isPending ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Switch
+                        checked={overageEnabled}
+                        disabled={!accountInfo || !overageCapable}
+                        onCheckedChange={handleOverageToggle}
+                      />
+                    )}
+                    <span className={overageEnabled ? 'font-medium text-amber-600' : 'font-medium'}>
+                      {overageLabel}
+                    </span>
+                    {overageDetail && <span className="text-muted-foreground">{overageDetail}</span>}
+                  </div>
+                </div>
               ) : (
                 <span className="text-sm text-muted-foreground ml-1">未知</span>
               )}
             </div>
-            {credential.hasProxy && (
-              <div className="col-span-2">
-                <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
+            <div className="col-span-2">
+              <span className="text-muted-foreground">代理：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
+                onClick={openProxyEditor}
+                title="配置该凭据的代理"
+              >
+                <Router className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{proxySummary(credential)}</span>
+              </button>
+            </div>
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -318,11 +1105,28 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={handleForceRefresh}
-              disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'}
-              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+              disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}
+              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : '强制刷新 Token'}
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleToggleWarmup}
+              disabled={setWarmup.isPending}
+            >
+              {credential.warmupRemaining > 0 ? '关闭预热' : `预热 ${warmupTarget} 次`}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleClearInFlight}
+              disabled={clearInFlight.isPending || credential.inFlightRequests === 0}
+              title={credential.inFlightRequests === 0 ? '当前没有并发占用' : '清理异常并发占用'}
+            >
+              清理并发
             </Button>
             <Button
               size="sm"
@@ -363,10 +1167,21 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="default"
-              onClick={() => onViewBalance(credential.id)}
+              onClick={() => onTestCredential(credential)}
+              title="测试模型调用"
             >
-              <Wallet className="h-4 w-4 mr-1" />
-              查看余额
+              <PlayCircle className="h-4 w-4 mr-1" />
+              测试
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onQueryBalance(credential.id)}
+              disabled={loadingBalance}
+              title="查询订阅、额度和用量并更新卡片"
+            >
+              {loadingBalance ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Wallet className="h-4 w-4 mr-1" />}
+              {loadingBalance ? '查询中' : '查询信息'}
             </Button>
             <Button
               size="sm"
@@ -381,6 +1196,433 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
+
+      <Dialog
+        open={editingRegions}
+        onOpenChange={(open) => {
+          if (open) {
+            openRegionsEditor()
+          } else {
+            closeRegionsEditor()
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Region 设置：{displayName}</DialogTitle>
+            <DialogDescription>
+              `us-east-1` 这类值是 AWS 区域。Auth Region 用于刷新 Token，API Region 用于请求 Kiro API；清空字段表示回退全局配置。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前生效 Auth Region</span>
+                <span className="font-mono font-medium">{credential.effectiveAuthRegion || '默认'}</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前生效 API Region</span>
+                <span className="font-mono font-medium">{credential.effectiveApiRegion || '默认'}</span>
+              </div>
+            </div>
+            <label className="block">
+              <span className="text-sm font-medium">Region 兼容字段</span>
+              <Input
+                className="mt-2 font-mono"
+                value={regionValue}
+                placeholder="us-east-1"
+                disabled={setCredentialRegions.isPending}
+                onChange={(event) => handleRegionValueChange(event.target.value)}
+              />
+            </label>
+            <label className="block">
+              <span className="text-sm font-medium">Auth Region</span>
+              <Input
+                className="mt-2 font-mono"
+                value={authRegionValue}
+                placeholder="us-east-1"
+                disabled={setCredentialRegions.isPending}
+                onChange={(event) => setAuthRegionValue(event.target.value)}
+              />
+            </label>
+            <label className="block">
+              <span className="text-sm font-medium">API Region</span>
+              <Input
+                className="mt-2 font-mono"
+                value={apiRegionValue}
+                placeholder="us-east-1"
+                disabled={setCredentialRegions.isPending}
+                onChange={(event) => setApiRegionValue(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={closeRegionsEditor} disabled={setCredentialRegions.isPending}>
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setRegionValue('')
+                setAuthRegionValue('')
+                setApiRegionValue('')
+                setCredentialRegions.mutate(
+                  { id: credential.id, request: { region: null, authRegion: null, apiRegion: null } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success(res.message)
+                      setEditingRegions(false)
+                    },
+                    onError: (err) => toast.error('Region 设置失败: ' + extractErrorMessage(err)),
+                  }
+                )
+              }}
+              disabled={setCredentialRegions.isPending || (!credential.region && !credential.authRegion && !credential.apiRegion)}
+            >
+              继承全局
+            </Button>
+            <Button onClick={handleRegionsSave} disabled={setCredentialRegions.isPending}>
+              {setCredentialRegions.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={editingProxy}
+        onOpenChange={(open) => {
+          if (open) {
+            openProxyEditor()
+          } else {
+            closeProxyEditor()
+          }
+        }}
+      >
+        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>绑定代理：{displayName}</DialogTitle>
+            <DialogDescription>
+              选择代理资源会使用资源里的代理 URL/账号/密码；不绑定资源时，可以为该凭据单独配置直接代理。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <button
+              type="button"
+              className={`w-full rounded-md border p-3 text-left text-sm transition ${proxyResourceId ? 'hover:bg-muted/50' : 'border-primary bg-primary/5'}`}
+              onClick={() => setProxyResourceDraft('')}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-medium">不绑定代理资源</span>
+                {!proxyResourceId && <Badge variant="default">已选</Badge>}
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">使用全局代理或直连配置。</div>
+            </button>
+
+            <div className={`rounded-md border p-3 ${proxyResourceId ? 'bg-muted/30 opacity-70' : 'bg-background'}`}>
+              <div className="mb-3">
+                <div className="text-sm font-medium">凭据直连代理</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  不绑定代理资源时生效；选择代理资源保存后会清除这些直连代理字段。
+                </div>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="block md:col-span-2">
+                  <span className="text-sm font-medium">代理 URL</span>
+                  <Input
+                    className="mt-2"
+                    value={proxyUrl}
+                    placeholder="socks5h://127.0.0.1:1080"
+                    disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)}
+                    onChange={(event) => setDirectProxyDraft(setProxyUrl, event.target.value)}
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-sm font-medium">代理用户名</span>
+                  <div className="mt-2">
+                    <SecretInput
+                      value={proxyUsername}
+                      onChange={(value) => setDirectProxyDraft(setProxyUsername, value)}
+                      visible={showProxyUsername}
+                      onToggle={() => setShowProxyUsername((value) => !value)}
+                      disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)}
+                      placeholder="可选"
+                    />
+                  </div>
+                </label>
+                <label className="block">
+                  <span className="text-sm font-medium">代理密码</span>
+                  <div className="mt-2">
+                    <SecretInput
+                      value={proxyPassword}
+                      onChange={(value) => setDirectProxyDraft(setProxyPassword, value)}
+                      visible={showProxyPassword}
+                      onToggle={() => setShowProxyPassword((value) => !value)}
+                      disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)}
+                      placeholder="可选"
+                    />
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            {proxyResources.isLoading ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">
+                <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-b-2 border-primary" />
+                加载代理资源...
+              </div>
+            ) : proxyResourceOptions.length === 0 ? (
+              <Card>
+                <CardContent className="py-8 text-center text-sm text-muted-foreground">暂无代理资源，请先在代理页新增</CardContent>
+              </Card>
+            ) : (
+              <div className="max-h-80 space-y-2 overflow-y-auto">
+                {proxyResourceOptions.map((resource) => {
+                  const selected = proxyResourceId === String(resource.id)
+                  return (
+                    <button
+                      key={resource.id}
+                      type="button"
+                      className={`w-full rounded-md border p-3 text-left text-sm transition ${
+                        selected ? 'border-primary bg-primary/5' : resource.enabled ? 'hover:bg-muted/50' : 'border-red-200 bg-red-50 opacity-80 hover:bg-red-100 dark:border-red-900 dark:bg-red-950/30'
+                      }`}
+                      onClick={() => setProxyResourceDraft(String(resource.id))}
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{resource.name}</span>
+                        <Badge variant="outline">#{resource.id}</Badge>
+                        <Badge variant={resource.enabled ? 'success' : 'destructive'}>{resource.enabled ? '启用' : '已禁用'}</Badge>
+                        {selected && <Badge variant="default">已选</Badge>}
+                      </div>
+                      <div className="mt-1 truncate text-xs text-muted-foreground">{resource.proxyUrl}</div>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={closeProxyEditor} disabled={setCredentialProxy.isPending}>
+              取消
+            </Button>
+            <Button onClick={handleProxySave} disabled={setCredentialProxy.isPending}>
+              {setCredentialProxy.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存绑定
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editingConcurrency} onOpenChange={setEditingConcurrency}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>并发限制：{displayName}</DialogTitle>
+            <DialogDescription>
+              留空表示继承全局“单凭据最大并发请求数”；填 0 表示该账号不限并发；填正整数表示该账号自己的并发上限。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前生效</span>
+                <span className="font-medium">
+                  {credential.maxConcurrentRequests > 0 ? `${credential.maxConcurrentRequests} 并发` : '不限并发'}
+                </span>
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {typeof credential.maxConcurrentRequestsOverride === 'number'
+                  ? '当前账号已覆盖全局配置。'
+                  : '当前账号继承全局配置。'}
+              </div>
+            </div>
+            <label className="block">
+              <span className="text-sm font-medium">账号级最大并发</span>
+              <Input
+                className="mt-2"
+                type="number"
+                min="0"
+                value={concurrencyValue}
+                placeholder="留空继承全局，0 表示不限"
+                disabled={setCredentialConcurrency.isPending}
+                onChange={(event) => setConcurrencyValue(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingConcurrency(false)} disabled={setCredentialConcurrency.isPending}>
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setConcurrencyValue('')
+                setCredentialConcurrency.mutate(
+                  { id: credential.id, request: { maxConcurrentRequests: null } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success(res.message)
+                      setEditingConcurrency(false)
+                    },
+                    onError: (err) => toast.error('并发限制设置失败: ' + extractErrorMessage(err)),
+                  }
+                )
+              }}
+              disabled={setCredentialConcurrency.isPending || typeof credential.maxConcurrentRequestsOverride !== 'number'}
+            >
+              继承全局
+            </Button>
+            <Button onClick={handleConcurrencySave} disabled={setCredentialConcurrency.isPending}>
+              {setCredentialConcurrency.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editingRpm} onOpenChange={setEditingRpm}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>RPM 限制：{displayName}</DialogTitle>
+            <DialogDescription>
+              留空表示继承全局“单凭据每分钟请求上限”；填 0 表示该账号不限 RPM；填正整数表示该账号自己的每分钟请求上限。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前生效</span>
+                <span className="font-medium">
+                  {credential.rpm > 0 ? `${credential.rpm} RPM` : '不限 RPM'}
+                </span>
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {typeof credential.rpmOverride === 'number'
+                  ? '当前账号已覆盖全局配置。'
+                  : '当前账号继承全局配置。'}
+              </div>
+            </div>
+            <label className="block">
+              <span className="text-sm font-medium">账号级 RPM</span>
+              <Input
+                className="mt-2"
+                type="number"
+                min="0"
+                value={rpmValue}
+                placeholder="留空继承全局，0 表示不限"
+                disabled={setCredentialRpm.isPending}
+                onChange={(event) => setRpmValue(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingRpm(false)} disabled={setCredentialRpm.isPending}>
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setRpmValue('')
+                setCredentialRpm.mutate(
+                  { id: credential.id, request: { rpm: null } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success(res.message)
+                      setEditingRpm(false)
+                    },
+                    onError: (err) => toast.error('RPM 限制设置失败: ' + extractErrorMessage(err)),
+                  }
+                )
+              }}
+              disabled={setCredentialRpm.isPending || typeof credential.rpmOverride !== 'number'}
+            >
+              继承全局
+            </Button>
+            <Button onClick={handleRpmSave} disabled={setCredentialRpm.isPending}>
+              {setCredentialRpm.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={editingSupportedModels}
+        onOpenChange={(open) => {
+          if (!open && (setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending)) return
+          setEditingSupportedModels(open)
+          if (open) {
+            setSupportedModelsDraft(supportedModels)
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>支持模型：{displayName}</DialogTitle>
+            <DialogDescription>
+              空列表表示不限制；非空时，只有匹配模型的请求才会调度到该凭据。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              当前限制：{supportedModels.length > 0 ? `${supportedModels.length} 个模型` : '不限制'}
+            </div>
+            <label className="block space-y-2">
+              <span className="text-sm font-medium">支持模型</span>
+              <SupportedModelTagsEditor
+                value={supportedModelsDraft}
+                disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}
+                onChange={setSupportedModelsDraft}
+                placeholder={'claude-sonnet-4.5\nclaude-haiku-4.5'}
+              />
+              <span className="text-xs text-muted-foreground">可以粘贴多个模型，空格、逗号、分号或换行都会自动拆分。</span>
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setSupportedModelsDraft([])
+                setCredentialSupportedModels.mutate(
+                  { id: credential.id, request: { supportedModels: [] } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success('已清空模型限制')
+                      setSupportedModelsDraft(res.supportedModels)
+                      setEditingSupportedModels(false)
+                    },
+                    onError: (err) => toast.error('清空失败: ' + extractErrorMessage(err)),
+                  }
+                )
+              }}
+              disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending || supportedModels.length === 0}
+            >
+              不限制
+            </Button>
+            <Button
+              variant="outline"
+              onClick={handleSupportedModelsDiscover}
+              disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}
+            >
+              {discoverCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              拉取并生成官方写法
+            </Button>
+            <Button onClick={handleSupportedModelsSave} disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}>
+              {setCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 删除确认对话框 */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>

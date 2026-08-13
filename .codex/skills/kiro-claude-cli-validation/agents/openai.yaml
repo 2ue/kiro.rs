@@ -1,0 +1,5 @@
+interface:
+  display_name: "Kiro Claude CLI Validation"
+  short_description: "Validate Claude CLI compatibility."
+  default_prompt: "Validate the current kiro.rs change against real Claude Code CLI behavior using the project validation tiers."
+

@@ -1,0 +1,1981 @@
+export interface CredentialsStatusResponse {
+  total: number
+  available: number
+  currentId: number
+  globalInFlightRequests: number
+  queuedRequests: number
+  globalMaxConcurrentRequests: number
+  maxQueuedRequests: number
+  credentials: CredentialStatusItem[]
+}
+
+export interface CredentialsPageResponse extends CredentialsStatusResponse {
+  page: number
+  limit: number
+  totalPages: number
+  filteredTotal: number
+  filteredAvailable: number
+}
+
+export interface CredentialListResponse {
+  page: number
+  limit: number
+  total: number
+  available: number
+  filteredTotal: number
+  filteredAvailable: number
+  totalPages: number
+  items: CredentialListItem[]
+}
+
+export interface CredentialSummaryResponse {
+  total: number
+  available: number
+  disabled: number
+  currentId: number | null
+  globalInFlightRequests: number
+  queuedRequests: number
+  globalMaxConcurrentRequests: number
+  maxQueuedRequests: number
+  updatedAt: string
+  runtimeFresh: boolean
+}
+
+export interface SystemVersionResponse {
+  version: string
+}
+
+export type CredentialSortBy =
+  | 'default'
+  | 'id'
+  | 'created_at'
+  | 'updated_at'
+  | 'priority'
+  | 'last_used_at'
+  | 'success_count'
+  | 'failure_count'
+  | 'refresh_failure_count'
+  | 'estimated_cost'
+  | 'usage_percentage'
+  | 'remaining_quota'
+  | 'in_flight_requests'
+  | 'scheduler_score'
+
+export type CredentialSortOrder = 'asc' | 'desc'
+
+export interface CredentialsPageQuery {
+  page: number
+  limit: number
+  q?: string
+  credentialId?: number
+  account?: string
+  region?: string
+  model?: string
+  endpoint?: string
+  priority?: number
+  rpm?: number
+  concurrency?: number
+  status?: string
+  authMethod?: string
+  subscription?: string
+  proxyResourceId?: number
+  sortBy?: CredentialSortBy
+  sortOrder?: CredentialSortOrder
+}
+
+export interface CredentialStatusItem {
+  id: number
+  createdAt: string | null
+  updatedAt: string | null
+  priority: number
+  disabled: boolean
+  failureCount: number
+  isCurrent: boolean
+  expiresAt: string | null
+  authMethod: string | null
+  provider?: string
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  effectiveAuthRegion: string
+  effectiveApiRegion: string
+  hasProfileArn: boolean
+  email?: string
+  refreshTokenHash?: string
+  apiKeyHash?: string
+  maskedApiKey?: string
+  subscriptionTitle?: string
+  accountInfo?: CredentialAccountInfo
+  successCount: number
+  lastUsedAt: string | null
+  hasProxy: boolean
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyResourceId?: number
+  proxyResourceName?: string
+  effectiveProxyUrl?: string
+  effectiveProxySource: 'credential' | 'resource' | 'resource_disabled' | 'resource_missing' | 'global' | 'direct' | 'none'
+  refreshFailureCount: number
+  disabledReason?: string
+  endpoint: string
+  cooledDown: boolean
+  cooldownRemainingSecs: number
+  cooldownReason?: string
+  cooldowns?: CredentialCooldown[]
+  rateLimited: boolean
+  rateLimitRemainingSecs: number
+  inFlightRequests: number
+  oldestInFlightAgeSecs: number
+  newestInFlightIdleSecs: number
+  maxConcurrentRequests: number
+  maxConcurrentRequestsOverride?: number
+  inFlightLeaseMaxSecs: number
+  warmupRemaining: number
+  transientFailureStreak?: number
+  recentErrorRate?: number
+  latencyEwmaMs?: number | null
+  lastErrorKind?: string
+  lastErrorReason?: string
+  lastErrorAtMs?: number | null
+  supportedModels?: string[]
+  inProbation?: boolean
+  probationRemainingSecs?: number
+  schedulerSelectionCount?: number
+  recentSchedulerSelectionCount10s?: number
+  recentSchedulerSelectionCount60s?: number
+  recentSchedulerSelectionCount5m?: number
+  schedulerSelectionPressure?: number
+  schedulerScore?: number
+  estimatedCostUsd: number
+  originalCostUsd: number
+  kiroMeteringUsage: number
+  pricedRequests: number
+  unpricedRequests: number
+  rpm: number
+  rpmOverride?: number
+  rateLimitAutoDisableEnabled: boolean
+}
+
+export type CredentialListItem = Pick<
+  CredentialStatusItem,
+  | 'id'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'priority'
+  | 'disabled'
+  | 'authMethod'
+  | 'provider'
+  | 'region'
+  | 'authRegion'
+  | 'apiRegion'
+  | 'effectiveAuthRegion'
+  | 'effectiveApiRegion'
+  | 'hasProfileArn'
+  | 'email'
+  | 'refreshTokenHash'
+  | 'apiKeyHash'
+  | 'maskedApiKey'
+  | 'subscriptionTitle'
+  | 'hasProxy'
+  | 'proxyUrl'
+  | 'proxyUsername'
+  | 'proxyPassword'
+  | 'proxyResourceId'
+  | 'proxyResourceName'
+  | 'effectiveProxyUrl'
+  | 'effectiveProxySource'
+  | 'disabledReason'
+  | 'endpoint'
+  | 'maxConcurrentRequests'
+  | 'maxConcurrentRequestsOverride'
+  | 'rpm'
+  | 'rpmOverride'
+  | 'rateLimitAutoDisableEnabled'
+  | 'warmupRemaining'
+  | 'supportedModels'
+>
+
+export type CredentialRuntimeItem = Pick<
+  CredentialStatusItem,
+  | 'id'
+  | 'failureCount'
+  | 'isCurrent'
+  | 'expiresAt'
+  | 'successCount'
+  | 'lastUsedAt'
+  | 'refreshFailureCount'
+  | 'cooledDown'
+  | 'cooldownRemainingSecs'
+  | 'cooldownReason'
+  | 'cooldowns'
+  | 'rateLimited'
+  | 'rateLimitRemainingSecs'
+  | 'inFlightRequests'
+  | 'oldestInFlightAgeSecs'
+  | 'newestInFlightIdleSecs'
+  | 'maxConcurrentRequests'
+  | 'rpm'
+  | 'inFlightLeaseMaxSecs'
+  | 'transientFailureStreak'
+  | 'recentErrorRate'
+  | 'latencyEwmaMs'
+  | 'lastErrorKind'
+  | 'lastErrorReason'
+  | 'lastErrorAtMs'
+  | 'supportedModels'
+  | 'inProbation'
+  | 'probationRemainingSecs'
+  | 'schedulerSelectionCount'
+  | 'recentSchedulerSelectionCount10s'
+  | 'recentSchedulerSelectionCount60s'
+  | 'recentSchedulerSelectionCount5m'
+  | 'schedulerSelectionPressure'
+  | 'schedulerScore'
+>
+
+export interface CredentialRuntimeResponse {
+  items: CredentialRuntimeItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export type CredentialAccountInfoItem = CredentialAccountInfo & {
+  id: number
+}
+
+export interface CredentialAccountInfoListResponse {
+  items: CredentialAccountInfoItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export type CredentialUsageSummaryItem = Pick<
+  CredentialStatusItem,
+  'id' | 'estimatedCostUsd' | 'originalCostUsd' | 'kiroMeteringUsage' | 'pricedRequests' | 'unpricedRequests'
+>
+
+export interface CredentialUsageSummaryResponse {
+  items: CredentialUsageSummaryItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export interface BulkCredentialActionResponse {
+  totalMatched: number
+  totalAttempted: number
+  success: number
+  failed: number
+  skipped: number
+  errors: Array<{ id: number; message: string }>
+}
+
+export interface CredentialCooldown {
+  model?: string
+  global: boolean
+  remainingSecs: number
+  reason?: string
+}
+
+export interface CredentialAccountInfo {
+  subscriptionTitle: string | null
+  currentUsage: number
+  usageLimit: number
+  remaining: number
+  usagePercentage: number
+  creditLimit: number
+  creditRemaining: number
+  creditBase: number
+  creditBonus: number
+  overageStatus?: string | null
+  overageCapability?: string | null
+  overageCap: number
+  overageRate: number
+  currentOverages: number
+  nextResetAt: number | null
+  checkedAt: string
+}
+
+export interface BalanceResponse {
+  id: number
+  checkedAt: string
+  subscriptionTitle: string | null
+  currentUsage: number
+  usageLimit: number
+  remaining: number
+  usagePercentage: number
+  creditLimit: number
+  creditRemaining: number
+  creditBase: number
+  creditBonus: number
+  overageStatus?: string | null
+  overageCapability?: string | null
+  overageCap: number
+  overageRate: number
+  currentOverages: number
+  nextResetAt: number | null
+}
+
+export type CredentialInfoResponse = BalanceResponse
+
+export interface CredentialCreditSummaryResponse {
+  totalCredentials: number
+  enabledCredentials: number
+  disabledCredentials: number
+  totalCreditLimit: number
+  totalCreditRemaining: number
+  totalCurrentUsage: number
+  enabledCreditLimit: number
+  enabledCreditRemaining: number
+  disabledCreditLimit: number
+  disabledCreditRemaining: number
+  totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
+  enabledEstimatedCostUsd: number
+  enabledOriginalCostUsd: number
+  disabledEstimatedCostUsd: number
+  disabledOriginalCostUsd: number
+  lastCheckedAt: string | null
+}
+
+export interface RefreshCredentialInfoRequest {
+  ids: number[]
+  force?: boolean
+}
+
+export interface CredentialInfoRefreshItem {
+  id: number
+  email?: string | null
+  disabled: boolean
+  ok: boolean
+  info?: CredentialInfoResponse | null
+  error?: string | null
+}
+
+export interface CredentialInfoRefreshResponse {
+  total: number
+  success: number
+  failed: number
+  items: CredentialInfoRefreshItem[]
+}
+
+export interface ValidateExistingCredentialsRequest {
+  scope?: 'all' | 'enabled' | 'disabled' | 'selected'
+  ids?: number[]
+  force?: boolean
+}
+
+export interface ValidateExternalCredentialsRequest {
+  credentials: AddCredentialRequest[]
+  querySubscription?: boolean
+  queryUsage?: boolean
+  checkLiveness?: boolean
+  livenessModel?: string
+  livenessPrompt?: string
+}
+
+export interface CredentialValidationInfo {
+  subscriptionTitle: string | null
+  currentUsage: number
+  usageLimit: number
+  usagePercentage: number
+  checkedAt: string
+}
+
+export interface CredentialValidationItem {
+  id?: number | null
+  index?: number | null
+  email?: string | null
+  disabled?: boolean | null
+  ok: boolean
+  previous?: CredentialValidationInfo | null
+  current?: CredentialValidationInfo | null
+  changeKind: string
+  subscriptionKey: string
+  subscriptionTitle: string
+  error?: string | null
+  subscriptionChecked?: boolean
+  usageChecked?: boolean
+  livenessChecked?: boolean
+  subscriptionOk?: boolean | null
+  usageOk?: boolean | null
+  livenessOk?: boolean | null
+  usageError?: string | null
+  livenessError?: string | null
+  livenessModel?: string | null
+  livenessResponse?: string | null
+  matchedExistingCredentialId?: number | null
+  existingDisabled?: boolean | null
+}
+
+export interface CredentialValidationGroup {
+  key: string
+  title: string
+  count: number
+  items: CredentialValidationItem[]
+}
+
+export interface CredentialValidationResponse {
+  total: number
+  success: number
+  failed: number
+  downgraded: number
+  upgraded: number
+  unchanged: number
+  groups: CredentialValidationGroup[]
+}
+
+export interface SuccessResponse {
+  success: boolean
+  message: string
+}
+
+export type UsageCleanupMode = 'soft_delete' | 'hard_delete'
+export type UsageCleanupJobStatus = 'idle' | 'queued' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed'
+export type UsageCleanupPhase = 'idle' | 'postgres' | 'redis_admin_cache' | 'redis_snapshots' | 'complete'
+
+export interface UsageCleanupRequest {
+  mode?: UsageCleanupMode
+  olderThanDays?: number
+  cutoffBefore?: string
+  batchSize?: number
+  maxBatches?: number
+  pauseMsBetweenBatches?: number
+}
+
+export interface UsageCleanupPreviewResponse {
+  mode: UsageCleanupMode
+  cutoffAt: string
+  matchedRows: number
+  oldestCreatedAt?: string
+  newestCreatedAt?: string
+}
+
+export interface UsageCleanupStatusResponse {
+  jobId?: string
+  status: UsageCleanupJobStatus
+  phase: UsageCleanupPhase
+  mode?: UsageCleanupMode
+  cutoffAt?: string
+  batchSize: number
+  maxBatches: number
+  pauseMsBetweenBatches: number
+  matchedRows?: number
+  remainingRows?: number
+  processedRows: number
+  lastBatchRows: number
+  batches: number
+  redisDeletedKeys: number
+  redisDeleteCommands: number
+  redisMaxCommandKeys: number
+  redisScanPasses: number
+  redisUsedDelFallback: boolean
+  redisPassLimitReached: boolean
+  cancelRequested: boolean
+  stopReason?: string
+  startedAt?: string
+  updatedAt?: string
+  finishedAt?: string
+  lastError?: string
+}
+
+export interface SetDisabledRequest {
+  disabled: boolean
+}
+
+export interface SetPriorityRequest {
+  priority: number
+}
+
+export interface SetWarmupRequest {
+  warmupRemaining: number
+}
+
+export interface SetCredentialConcurrencyRequest {
+  maxConcurrentRequests?: number | null
+}
+
+export interface SetCredentialRpmRequest {
+  rpm?: number | null
+}
+
+export interface SetCredentialRateLimitAutoDisableRequest {
+  enabled: boolean
+}
+
+export interface SetCredentialRegionsRequest {
+  region?: string | null
+  authRegion?: string | null
+  apiRegion?: string | null
+}
+
+export interface BatchUpdateCredentialsRequest {
+  ids: number[]
+  priority?: SetPriorityRequest
+  regions?: SetCredentialRegionsRequest
+  concurrency?: SetCredentialConcurrencyRequest
+  rpm?: SetCredentialRpmRequest
+  rateLimitAutoDisable?: SetCredentialRateLimitAutoDisableRequest
+  proxy?: SetCredentialProxyRequest
+}
+
+export interface BatchUpdateCredentialItem {
+  id: number
+  ok: boolean
+  error?: string
+}
+
+export interface BatchUpdateCredentialsResponse {
+  total: number
+  success: number
+  failed: number
+  items: BatchUpdateCredentialItem[]
+}
+
+export interface AddCredentialRequest {
+  accessToken?: string
+  expiresAt?: string
+  refreshToken?: string
+  authMethod?: 'social' | 'idc' | 'external_idp' | 'api_key'
+  provider?: string
+  clientId?: string
+  clientSecret?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  email?: string
+  profileArn?: string
+  priority?: number
+  maxConcurrentRequests?: number | null
+  rpm?: number | null
+  rateLimitAutoDisableEnabled?: boolean | null
+  disabled?: boolean | null
+  enableOverageAfterImport?: boolean | null
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  machineId?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyResourceId?: number | null
+  kiroApiKey?: string
+  endpoint?: string
+  supportedModels?: string[]
+  autoDiscoverSupportedModels?: boolean | null
+}
+
+export interface AddCredentialResponse {
+  success: boolean
+  message: string
+  credentialId: number
+  email?: string
+  warning?: string
+}
+
+export interface TestCredentialRequest {
+  model: string
+  prompt?: string
+}
+
+export interface TestCredentialResponse {
+  success: boolean
+  credentialId: number
+  model: string
+  modelId: string
+  prompt: string
+  response: string
+  durationMs: number
+}
+
+export interface ProxyResource {
+  id: number
+  name: string
+  proxyUrl: string
+  proxyUsername?: string | null
+  proxyPassword?: string | null
+  hasPassword: boolean
+  enabled: boolean
+  notes?: string | null
+  createdAt: string
+  updatedAt: string
+  credentialCount: number
+}
+
+export interface ProxyResourcesResponse {
+  resources: ProxyResource[]
+}
+
+export interface ProxyResourceTestRequest {
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  testUrl?: string
+}
+
+export interface ProxyResourceTestResponse {
+  success: boolean
+  message: string
+  proxyUrl: string
+  testUrl: string
+  status?: number | null
+  durationMs: number
+  responsePreview?: string
+}
+
+export interface CreateProxyResourceRequest {
+  name: string
+  proxyUrl: string
+  proxyUsername?: string
+  proxyPassword?: string
+  enabled?: boolean
+  notes?: string
+}
+
+export interface UpdateProxyResourceRequest {
+  name?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  clearUsername?: boolean
+  clearPassword?: boolean
+  enabled?: boolean
+  notes?: string
+  clearNotes?: boolean
+}
+
+export interface SetCredentialProxyRequest {
+  proxyResourceId?: number | null
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+}
+
+export type UsageRecordStatus =
+  | 'success'
+  | 'error'
+  | 'stream_error'
+  | 'upstream_timeout'
+  | 'client_dropped'
+
+export type UsageSource =
+  | 'upstream_metadata'
+  | 'local_prompt_cache'
+  | 'context_estimate'
+  | 'request_estimate'
+  | 'none'
+
+export type UsageRouteKindFilter = 'local_credential' | 'external_pool'
+
+export interface InferenceAttemptSnapshot {
+  maxAttempts: number
+  consumed: number
+  localAttempts: number
+  externalAttempts: number
+  mcpAttempts: number
+  exhausted: boolean
+  downstreamCommitted: boolean
+}
+
+export interface AuxiliaryAttemptSnapshot {
+  maxAttempts: number
+  consumed: number
+  tokenRefreshAttempts: number
+  profileDiscoveryAttempts: number
+  exhausted: boolean
+}
+
+export interface UsageLatencyTrace {
+  inferenceAttempts?: InferenceAttemptSnapshot
+  auxiliaryAttempts?: AuxiliaryAttemptSnapshot
+  capacityWeightUnits?: number
+  estimatedInputTokens?: number
+  payloadGuardMs?: number
+  upstreamHeaderMs?: number
+  firstUpstreamChunkMs?: number
+  firstOutputDeltaMs?: number
+  firstThinkingDeltaMs?: number
+  firstVisibleTextDeltaMs?: number
+  streamGapToFirstOutputMs?: number
+  chunksBeforeFirstOutput?: number
+  eventsBeforeFirstOutput?: number
+  upstreamBytesBeforeFirstOutput?: number
+  upstreamFramesBeforeFirstOutput?: number
+  upstreamEventsBeforeFirstOutput?: number
+  upstreamFramesWithoutDownstreamEventsBeforeFirstOutput?: number
+  upstreamPendingChunksBeforeFirstOutput?: number
+  upstreamFrameDecodeErrorsBeforeFirstOutput?: number
+  upstreamEventParseErrorsBeforeFirstOutput?: number
+  upstreamEventTypesBeforeFirstOutput?: Record<string, number>
+  streamRetryAttempts?: number
+  streamRetryDispatchFailures?: number
+  streamRetryReasons?: string[]
+  clientDroppedMs?: number
+  terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
+  upstreamMessageStatus?: string
+  sawUpstreamCompleted?: boolean
+  stopReasonSource?: string
+  suspectedIntentPreambleEndTurn?: boolean
+  intentPreambleRisk?: 'none' | 'low' | 'medium' | 'high' | string
+  suspectedToolContextLeakEndTurn?: boolean
+  toolContextLeakMarkers?: string[]
+  assistantTailIntentHint?: boolean
+  endTurnAnomalyReason?: string
+  endTurnAnomalyRisk?: 'none' | 'low' | 'medium' | 'high' | string
+  upstreamEofWithoutCompleted?: boolean
+  lastUpstreamEventType?: string
+  lastUpstreamEvents?: string[]
+  sawUpstreamAssistantResponse?: boolean
+  sawUpstreamToolUse?: boolean
+  sawUpstreamMetadata?: boolean
+  lastAssistantContentChars?: number
+  filteredTrivialTextBlocks?: number
+  filteredTrivialTextChars?: number
+}
+
+export interface KiroCredentialAttempt {
+  attempt: number
+  credentialId: number
+  credentialLabel?: string
+  status?: number
+  statusText?: string
+  action: string
+  model?: string
+  errorType?: string
+  errorMessage?: string
+  rawUpstreamError?: RawUpstreamError
+  durationMs: number
+}
+
+export interface RawUpstreamError {
+  source: string
+  statusCode?: number
+  contentType?: string
+  body: string
+  bodyBytes: number
+  truncated: boolean
+}
+
+export interface UsageRecord {
+  id: string
+  createdAt: string
+  endpoint: string
+  stream: boolean
+  model: string
+  requestedMaxTokens?: number
+  upstreamModel?: string
+  externalOutboundModel?: string
+  modelResolutionSource?: string
+  modelResolutionNote?: string
+  conversationId?: string
+  requestApiKeyId?: string
+  credentialId?: number
+  credentialLabel?: string
+  status: UsageRecordStatus
+  usageSource: UsageSource
+  totalInputTokens: number
+  compatInputTokens: number
+  billableInputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  cacheCreation5mInputTokens: number
+  cacheCreation1hInputTokens: number
+  estimatedCostUsd: number
+  originalCostUsd: number
+  kiroMeteringUsage: number
+  pricingAvailable: boolean
+  pricingModel?: string
+  durationMs: number
+  firstTokenLatencyMs?: number
+  responseLatencyMs?: number
+  latencyTrace?: UsageLatencyTrace
+  simulated: boolean
+  stickyBound: boolean
+  fallbackFromSticky: boolean
+  credentialAttempts?: KiroCredentialAttempt[]
+  routeKind?: 'local_credential' | 'external_pool'
+  routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_external' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
+  fallbackReason?: string
+  directPolicyReason?: string
+  localAttempted?: boolean
+  localPreflight?: unknown
+  externalPoolId?: number
+  externalPoolName?: string
+  externalAttempts?: ExternalPoolAttempt[]
+  usageProjectionApplied?: boolean
+  externalPoolBilling?: ExternalPoolBilling
+  errorType?: string
+  errorMessage?: string
+  errorDetail?: string
+  errorStatusCode?: number
+  errorSource?: string
+  errorId?: string
+  errorMetadata?: unknown
+  rawUpstreamError?: RawUpstreamError
+  publicErrorStatusCode?: number
+  publicErrorType?: string
+  publicErrorMessage?: string
+  payloadBreakdown?: unknown
+  payloadGuardReport?: unknown
+}
+
+export interface UsageRecorderStats {
+  inMemoryLimit: number
+  inMemoryRecords: number
+  redisEnabled: boolean
+  redisQueueEnabled: boolean
+  redisQueueCapacity: number
+  redisQueueAvailable: number
+  droppedRedisRecords: number
+  postgresEnabled: boolean
+  writerQueueEnabled: boolean
+  writerQueueCapacity: number
+  writerQueueAvailable: number
+  droppedPersistRecords: number
+}
+
+export interface ExternalPoolUsageSnapshot {
+  totalInputTokens: number
+  inputTokens: number
+  billableInputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  cacheCreation5mInputTokens: number
+  cacheCreation1hInputTokens: number
+}
+
+export interface ExternalPoolBilling {
+  requestInputTokens?: number
+  rawUsage: ExternalPoolUsageSnapshot
+  shapedUsage?: ExternalPoolUsageSnapshot
+  reportedUsage: ExternalPoolUsageSnapshot
+  usageProjectionApplied: boolean
+  rawCostUsd: number
+  shapedCostUsd?: number
+  upliftedCostUsd?: number
+  profitUsd?: number
+  reportedCostUsd: number
+  billableCostUsd: number
+  costFloorDeltaUsd: number
+  costFloorApplied: boolean
+  pricingAvailable: boolean
+  pricingModel?: string
+  usageProjectionMode: string
+  streamResponseMode?: ExternalPoolStreamResponseMode
+  usageEstimated?: boolean
+  usageEstimateReason?: string
+  usageCandidatePath?: string
+  bodyUsageProjectionApplied?: boolean
+}
+
+export interface ExternalPoolAttempt {
+  attempt: number
+  poolId: number
+  poolName: string
+  outboundModel?: string
+  status?: number
+  action: string
+  durationMs: number
+  errorType?: string
+  errorMessage?: string
+  rawUpstreamError?: RawUpstreamError
+}
+
+export interface UsageRecordsResult {
+  total: number
+  records: UsageRecord[]
+}
+
+export interface UsageRecordsPageResult {
+  page: number
+  limit: number
+  hasNext: boolean
+  records: UsageRecord[]
+}
+
+export interface UsageAggregate {
+  key: string
+  label?: string
+  requests: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  estimatedCostUsd: number
+  originalCostUsd: number
+}
+
+export interface UsageRealtimeStats {
+  windowSeconds: number
+  requests: number
+  successRequests?: number
+  errorRequests?: number
+  rpm: number
+  successRpm?: number
+  errorRpm?: number
+  inputTpm: number
+  outputTpm: number
+  totalTpm: number
+  billableTpm: number
+}
+
+export interface UsageSummary {
+  totalRequests: number
+  successRequests: number
+  errorRequests: number
+  highCacheRequests: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadInputTokens: number
+  totalCacheCreationInputTokens: number
+  totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
+  pricedRequests: number
+  unpricedRequests: number
+  localPromptCacheRequests: number
+  localPromptCacheInputTokens: number
+  localPromptCacheReadInputTokens: number
+  localPromptCacheCreationInputTokens: number
+  simulatedRequests: number
+  upstreamMetadataRequests: number
+  externalPoolBilling?: UsageExternalPoolBillingSummary
+  realtime: UsageRealtimeStats
+  topCredentials: UsageAggregate[]
+  topConversations: UsageAggregate[]
+}
+
+export interface UsageExternalPoolBillingSummary {
+  requests: number
+  pricedRequests: number
+  unpricedRequests: number
+  costFloorAppliedRequests: number
+  rawCostUsd: number
+  shapedCostUsd?: number
+  upliftedCostUsd?: number
+  profitUsd?: number
+  reportedCostUsd: number
+  billableCostUsd: number
+  costFloorDeltaUsd: number
+}
+
+export interface UsageExternalPoolBillingByPool extends UsageExternalPoolBillingSummary {
+  poolId: number
+  poolName: string
+}
+
+export interface UsageDashboardResponse {
+  generatedAt: string
+  timezone: string
+  windows: UsageDashboardWindow[]
+  series: UsageDashboardSeries
+  top: UsageDashboardTop
+}
+
+export interface UsageDashboardWindowsResponse {
+  generatedAt: string
+  timezone: string
+  windows: UsageDashboardWindow[]
+}
+
+export interface UsageDashboardSeriesResponse {
+  generatedAt: string
+  timezone: string
+  series: UsageDashboardSeries
+}
+
+export interface UsageDashboardTopResponse {
+  generatedAt: string
+  top: UsageDashboardTop
+}
+
+export interface UsageDashboardBreakdownResponse {
+  generatedAt: string
+  timezone: string
+  windowKey: string
+  statusBreakdown: UsageBreakdownItem[]
+  usageSourceBreakdown: UsageBreakdownItem[]
+}
+
+export interface UsageDashboardExternalPoolBillingResponse {
+  generatedAt: string
+  timezone: string
+  windowKey: string
+  externalPoolBillingByPool: UsageExternalPoolBillingByPool[]
+}
+
+export interface UsageExternalPoolRiskQuery {
+  timezone?: string
+  windowKey?: string
+  since?: string
+  until?: string
+  warningThresholdTokens?: number
+  criticalThresholdTokens?: number
+  externalPoolId?: number
+  endpoint?: string
+  model?: string
+  stream?: boolean
+  limit?: number
+}
+
+export interface UsageExternalPoolRiskWindow {
+  key: string
+  label: string
+  from: string
+  to: string
+}
+
+export interface UsageExternalPoolRiskThresholds {
+  warningTokens: number
+  criticalTokens: number
+  costFloorEnabled: boolean
+  costFloorMarginPercent: number
+  costTargetMultiplier: number
+}
+
+export interface UsageExternalPoolRiskFilters {
+  poolId?: number
+  endpoint?: string
+  model?: string
+  stream?: boolean
+}
+
+export interface UsageExternalPoolRiskTotals {
+  records: number
+  successRecords: number
+  errorRecords: number
+  streamRecords: number
+  nonStreamRecords: number
+  pricedRecords: number
+  unpricedRecords: number
+  rawUsageRecords: number
+  reportedUsageRecords: number
+  missingExternalPoolBillingRecords: number
+  outputZeroRecords: number
+}
+
+export interface UsageExternalPoolRiskCacheStats {
+  minReadTokens: number
+  maxReadTokens: number
+  avgReadTokens: number
+  totalReadTokens: number
+  minWriteTokens: number
+  maxWriteTokens: number
+  avgWriteTokens: number
+  totalWriteTokens: number
+  readWarningCount: number
+  writeWarningCount: number
+  eitherWarningCount: number
+  readCriticalCount: number
+  writeCriticalCount: number
+  eitherCriticalCount: number
+}
+
+export interface UsageExternalPoolRiskCostStats {
+  rawCostUsd: number
+  reportedCostUsd: number
+  targetCostUsd: number
+  profitUsd: number
+  totalLossUsd: number
+  totalTargetGapUsd: number
+  maxLossUsd: number
+  maxTargetGapUsd: number
+  maxRawCostUsd: number
+  maxReportedCostUsd: number
+  belowRawCount: number
+  belowTargetCount: number
+  costFloorAppliedRecords: number
+  minCostRatio?: number | null
+  avgCostRatio?: number | null
+  maxCostRatio?: number | null
+}
+
+export interface UsageExternalPoolRiskBucket {
+  key: string
+  label: string
+  minTokens?: number | null
+  maxTokens?: number | null
+  rawReadCount: number
+  rawWriteCount: number
+  reportedReadCount: number
+  reportedWriteCount: number
+}
+
+export interface UsageExternalPoolRiskGroup {
+  key: string
+  label: string
+  records: number
+  successRecords: number
+  warningRecords: number
+  criticalRecords: number
+  outputZeroRecords: number
+  rawReadMax: number
+  rawWriteMax: number
+  reportedReadMax: number
+  reportedWriteMax: number
+  rawCostUsd: number
+  reportedCostUsd: number
+  targetCostUsd: number
+  profitUsd: number
+  totalLossUsd: number
+  totalTargetGapUsd: number
+  belowRawCount: number
+  belowTargetCount: number
+}
+
+export interface UsageExternalPoolRiskSample {
+  id: string
+  createdAt: string
+  endpoint: string
+  stream: boolean
+  model: string
+  status: string
+  externalPoolId?: number
+  externalPoolName?: string
+  pricingModel?: string
+  usageProjectionMode?: string
+  externalPoolBillingPresent: boolean
+  costFloorApplied: boolean
+  rawInputTokens: number
+  rawOutputTokens: number
+  rawCacheReadInputTokens: number
+  rawCacheCreationInputTokens: number
+  reportedInputTokens: number
+  reportedOutputTokens: number
+  reportedCacheReadInputTokens: number
+  reportedCacheCreationInputTokens: number
+  rawCostUsd: number
+  reportedCostUsd: number
+  targetCostUsd: number
+  lossUsd: number
+  targetGapUsd: number
+  costRatio?: number | null
+  riskReasons: string[]
+}
+
+export interface UsageExternalPoolRiskResponse {
+  generatedAt: string
+  timezone: string
+  window: UsageExternalPoolRiskWindow
+  thresholds: UsageExternalPoolRiskThresholds
+  filters: UsageExternalPoolRiskFilters
+  totals: UsageExternalPoolRiskTotals
+  rawCache: UsageExternalPoolRiskCacheStats
+  reportedCache: UsageExternalPoolRiskCacheStats
+  cost: UsageExternalPoolRiskCostStats
+  buckets: UsageExternalPoolRiskBucket[]
+  byPool: UsageExternalPoolRiskGroup[]
+  byPath: UsageExternalPoolRiskGroup[]
+  byModel: UsageExternalPoolRiskGroup[]
+  samples: UsageExternalPoolRiskSample[]
+}
+
+export interface UsageDashboardWindow {
+  key: string
+  label: string
+  from: string
+  to: string
+  summary: UsageDashboardSummary
+}
+
+export interface UsageDashboardSummary {
+  totalRequests: number
+  successRequests: number
+  errorRequests: number
+  errorRate: number
+  streamRequests: number
+  nonStreamRequests: number
+  highCacheRequests: number
+  totalInputTokens: number
+  billableInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadInputTokens: number
+  totalCacheCreationInputTokens: number
+  cacheReadRatio: number
+  totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
+  pricedRequests: number
+  unpricedRequests: number
+  averageDurationMs: number
+  p95DurationMs: number
+  stickyBoundRequests: number
+  fallbackFromStickyRequests: number
+  simulatedRequests: number
+  upstreamMetadataRequests: number
+  externalPoolBilling?: UsageExternalPoolBillingSummary
+  externalPoolBillingByPool?: UsageExternalPoolBillingByPool[]
+  statusBreakdown: UsageBreakdownItem[]
+  usageSourceBreakdown: UsageBreakdownItem[]
+}
+
+export interface UsageBreakdownItem {
+  key: string
+  label: string
+  requests: number
+  ratio: number
+}
+
+export interface UsageDashboardSeries {
+  hourly24h: UsageSeriesPoint[]
+  daily7d: UsageSeriesPoint[]
+}
+
+export interface UsageSeriesPoint {
+  key: string
+  label: string
+  from: string
+  to: string
+  requests: number
+  successRequests: number
+  errorRequests: number
+  totalInputTokens: number
+  billableInputTokens: number
+  totalOutputTokens: number
+  totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
+}
+
+export interface UsageDashboardTop {
+  windowKey: string
+  models: UsageTopAggregate[]
+  credentials: UsageTopAggregate[]
+  endpoints: UsageTopAggregate[]
+  errors: UsageTopAggregate[]
+}
+
+export interface UsageTopAggregate {
+  key: string
+  label?: string
+  requests: number
+  errorRequests: number
+  totalInputTokens: number
+  billableInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadInputTokens: number
+  totalCacheCreationInputTokens: number
+  totalEstimatedCostUsd: number
+  totalOriginalCostUsd: number
+  totalKiroMeteringUsage: number
+}
+
+export interface UsageRecordsQuery {
+  limit?: number
+  requestId?: string
+  requestApiKeyId?: string
+  q?: string
+  endpoint?: string
+  conversationId?: string
+  credentialId?: number
+  externalPoolId?: number
+  routeKind?: UsageRouteKindFilter
+  model?: string
+  status?: UsageRecordStatus
+  source?: UsageSource
+  stream?: boolean
+  minCacheRead?: number
+  minFirstTokenLatencyMs?: number
+  since?: string
+  until?: string
+}
+
+export interface UsageRecordsPageQuery extends UsageRecordsQuery {
+  page: number
+  limit: number
+}
+
+export interface AdminAuditLogRow {
+  id: number
+  createdAt: string
+  actor: string
+  action: string
+  objectType: string
+  objectId?: string
+  success: boolean
+  errorMessage?: string
+  detail: unknown
+}
+
+export interface AdminAuditLogPage {
+  page: number
+  limit: number
+  hasNext: boolean
+  records: AdminAuditLogRow[]
+}
+
+export interface AdminAuditLogPageQuery {
+  page: number
+  limit: number
+}
+
+export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
+export type KiroAgentModeStrategy = 'vibe' | 'spec' | 'auto'
+export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
+export type ThinkingTriggerMode = 'real_request' | 'always'
+export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
+export type PayloadGuardMode = 'preemptive' | 'on_too_long'
+export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
+export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
+export type ExternalPoolStreamResponseMode = 'event_passthrough'
+export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled'
+export type ExternalPoolModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
+export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
+export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
+export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
+export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
+export type ExternalPoolRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
+
+export interface ExternalPoolModelMappingRule {
+  enabled?: boolean
+  source: string
+  target: string
+  kind?: 'version_equivalent' | 'alias' | 'fallback'
+  note?: string
+}
+
+export type ReportedUsageFieldMode = 'raw' | 'preserve' | 'sample-max' | 'sample-target'
+
+export interface ModelMappingRule {
+  enabled: boolean
+  source: string
+  target: string
+  kind: ModelMappingRuleKind
+  note?: string | null
+}
+
+export interface ModelMappingConfig {
+  enabled: boolean
+  autoGenerateRules: boolean
+  rules: ModelMappingRule[]
+}
+
+export interface ReportedUsageFieldPolicy {
+  mode: ReportedUsageFieldMode
+  maxTokens: number
+  targetTokens: number
+  normalMaxMultiplier: number
+  moveDeltaToCacheRead: boolean
+}
+
+export interface ReportedUsagePathPolicy {
+  enabled: boolean
+  skipNonStreamUsageProjection: boolean
+  finalCacheReadMaxTokens: number
+  finalCacheReadJitterMinTokens: number
+  finalCacheReadJitterMaxTokens: number
+  finalCacheCreationMaxTokens: number
+  finalCacheCreationJitterMinTokens: number
+  finalCacheCreationJitterMaxTokens: number
+  finalOutputGuardEnabled: boolean
+  outputUpliftMinTokens: number
+  outputUpliftPercent: number
+  finalOutputMaxTokens: number
+  finalOutputJitterMinTokens: number
+  finalOutputJitterMaxTokens: number
+  input: ReportedUsageFieldPolicy
+  output: ReportedUsageFieldPolicy
+  cacheRead: ReportedUsageFieldPolicy
+  cacheCreation: ReportedUsageFieldPolicy
+}
+
+export interface ReportedUsageConfig {
+  default: ReportedUsagePathPolicy
+  pathOverrides: Record<string, ReportedUsagePathPolicy>
+}
+
+export interface CacheSimulationPolicyPatch {
+  enabled?: boolean
+  targetReadRatio?: number
+  tokenScale?: number
+  maxSimulatedInputTokens?: number
+  capJitterMinTokens?: number
+  capJitterMaxTokens?: number
+  scaleMinInputTokens?: number
+}
+
+export interface CachePointPolicyPatch {
+  enabled?: boolean
+  toolsOnly?: boolean
+  recordPlan?: boolean
+}
+
+export interface CacheBoundsPolicyPatch {
+  maxEntriesPerAccount?: number
+  maxEntriesGlobal?: number
+  entryTtlSecs?: number
+  estimatedBytesLimit?: number
+}
+
+export interface KiroRsToolCachePolicyPatch {
+  coverageRatio?: number
+  maxCoverageTokens?: number
+  incrementalCreateEnabled?: boolean
+  maxNewCreationTokensPerRequest?: number
+  cacheCurrentUserStablePrefix?: boolean
+  currentUserStablePrefixMaxTokens?: number
+}
+
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool'
+
+export interface CacheRoutePolicyPatch {
+  cacheType?: PromptCacheStrategyType
+  routeNamespace?: boolean
+  simulation?: CacheSimulationPolicyPatch
+  creationControl?: PromptCacheCreationControlConfig
+  reportedUsage?: ReportedUsagePathPolicy
+  cachePoint?: CachePointPolicyPatch
+  bounds?: CacheBoundsPolicyPatch
+  kiroRsTool?: KiroRsToolCachePolicyPatch
+}
+
+export interface CachePolicyConfig {
+  default: CacheRoutePolicyPatch
+  currentHighCache: CacheRoutePolicyPatch
+  kiroRsTool: CacheRoutePolicyPatch
+  pathOverrides: Record<string, CacheRoutePolicyPatch>
+}
+
+export interface PromptCacheCreationControlConfig {
+  enabled: boolean
+  scopeMode: 'credential_conversation_model' | 'conversation_model'
+  minSuccessfulRequestsBetweenCreation: number
+  minCreationIntervalSecs: number
+  minCreationDeltaTokens: number
+  maxCreationTokensPerEvent: number
+  creationBudgetWindowSecs: number
+  maxCreationTokensPerWindow: number
+  expireAfterIdleSecs: number
+}
+
+export type OversizedImageHandling = 'drop-with-placeholder' | 'reject'
+export type ImageProcessingMode = 'safe' | 'light'
+
+export interface ImageProcessingConfig {
+  mode: ImageProcessingMode
+  safeMaterializeFileSources: boolean
+  safeDownloadRemoteSources: boolean
+  safeNormalizeBase64MediaTypes: boolean
+}
+
+export interface BodyConversionConfig {
+  toolSchemaNormalization: boolean
+  toolNameMapping: boolean
+  toolSchemaKeyMapping: 'sanitize' | 'reject' | 'disabled'
+  toolSchemaKeyValidationRegex: string
+  toolChoiceSteering: boolean
+  chunkedToolPolicy: boolean
+  thinkingPromptControls: boolean
+  nativeReasoningFields: boolean
+  toolPairingRepair: boolean
+  historyPlaceholderTools: boolean
+}
+
+export type PromptSteeringScope = 'route_rules' | 'cc_only' | 'claude_code_profile' | 'all_routes'
+export type PromptSteeringRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
+
+export interface PromptSteeringTextBlock {
+  enabled: boolean
+  prompt: string
+}
+
+export interface PromptSteeringToggle {
+  enabled: boolean
+}
+
+export interface ChunkedWritePromptSteeringConfig {
+  enabled: boolean
+  systemPromptEnabled: boolean
+  toolDescriptionEnabled: boolean
+}
+
+export interface PromptSteeringConfig {
+  enabled: boolean
+  scope: PromptSteeringScope
+  routeMode: PromptSteeringRouteMode
+  routeRules: string[]
+  applyToExternalPool: boolean
+  applyToCountTokens: boolean
+  languageConstraint: PromptSteeringTextBlock
+  taskQuality: PromptSteeringTextBlock
+  toolChoice: PromptSteeringToggle
+  chunkedWrite: ChunkedWritePromptSteeringConfig
+  thinking: PromptSteeringToggle
+  custom: PromptSteeringTextBlock
+}
+
+export interface PayloadShapingConfig {
+  enabled: boolean
+  truncateHistoricalToolResults: boolean
+  historicalToolResultMaxChars: number
+  historicalToolResultHeadLines: number
+  historicalToolResultTailLines: number
+  discardHistoricalThinking: boolean
+  compressToolDefinitions: boolean
+  toolDefinitionsBudgetBytes: number
+  toolDescriptionMaxChars: number
+  toolSchemaAnnotationMaxChars: number
+  webFetchTrimEnabled: boolean
+  webFetchBodyMaxChars: number
+  fitCurrentPayloadToBudget: boolean
+  truncateCurrentToolResults: boolean
+  currentToolResultMaxChars: number
+  truncateCurrentUserContent: boolean
+  currentUserContentMaxChars: number
+  truncateCurrentDocuments: boolean
+  currentDocumentMaxChars: number
+  truncateCurrentImages: boolean
+  currentImagesMaxBytes: number
+  oversizedImageHandling: OversizedImageHandling
+}
+
+export interface ExternalPoolsConfig {
+  externalPoolsEnabled: boolean
+  externalPoolGlobalMaxConcurrentRequests: number
+  externalPoolMaxQueuedRequests: number
+  externalPoolMaxInputTokens: number
+  externalPoolCapacityMode: 'fail_fast' | 'wait'
+  externalPoolDispatchMaxWaitSecs: number
+  externalPoolRetryMaxAttempts: number
+  externalPoolRetryStatusCodes: number[]
+  externalPoolRetryOnNetworkError: boolean
+  externalPoolRetryOnProtocolError: boolean
+  externalPoolSamePoolRetryCount: number
+  externalPoolSamePoolRetryStatusCodes: number[]
+  externalPoolSamePoolRetryDelayMs: number
+  externalPoolTransientFailurePriorityPenalty: number
+  externalPoolTransientFailureCooldownThreshold: number
+  externalDirectPolicyEnabled: boolean
+  directExternalOnLocalMaintenance: boolean
+  directExternalModelRules: string[]
+  directExternalPathRules: string[]
+  externalPoolRouteMode: ExternalPoolRouteMode
+  externalPoolRouteRules: string[]
+  fallbackOnLocalCapacityExhausted: boolean
+  fallbackOnSchedulerRedisDegraded: boolean
+  fallbackOnNoAvailableCredentials: boolean
+  fallbackOnLocalTransientExhausted: boolean
+  fallbackOnUnsupportedModel: boolean
+  localPoolPreflightEnabled: boolean
+  externalPoolLocalRescueEnabled: boolean
+  externalPoolLocalRescueOnRateLimit: boolean
+  externalPoolLocalRescueOnTimeout: boolean
+  externalPoolLocalRescueOnCapacity: boolean
+  externalPoolLocalRescueMaxWaitSecs: number
+  localPoolCircuitEnabled: boolean
+  localPoolCircuitWindowSecs: number
+  localPoolCircuitOpenAfterFailures: number
+  localPoolCircuitRequireDistinctCredentials: number
+  localPoolCircuitOpenSecs: number
+  externalPoolAutoDisableEnabled: boolean
+  externalPoolAutoDisableOnAuthError: boolean
+  externalPoolAutoDisableOnSecurityLock: boolean
+  externalPoolAutoDisableOnQuotaExhausted: boolean
+  externalPoolAutoDisableOnMisconfiguredEndpoint: boolean
+  externalPoolAutoDisableFailureThreshold: number
+  externalPoolAutoDisableWindowSecs: number
+  externalPoolAutoDisableDurationSecs: number
+  externalPoolRateLimitCooldownSecs: number
+  externalPoolServerErrorCooldownSecs: number
+  externalPoolNetworkErrorCooldownSecs: number
+  externalPoolProtocolErrorCooldownSecs: number
+  externalPoolModelUnavailableCooldownMode: ExternalPoolModelUnavailableCooldownMode
+  externalPoolModelUnavailableCooldownSecs: number
+  externalPoolRequestTimeoutSecs: number
+  externalPoolStreamRequestTimeoutSecs: number
+  externalPoolStreamIdleTimeoutSecs: number
+  externalPoolStreamPreOutputRetryEnabled: boolean
+  externalPoolAutoDisableOnChannelDisabled: boolean
+  externalPoolUsageProjectionUpliftPercent: number
+  externalPoolUsageProjectionCostFloorEnabled: boolean
+  externalPoolUsageProjectionCostFloorMarginPercent: number
+  externalPoolUsageProjectionOutputUpliftMinTokens: number
+  externalPoolUsageProjectionOutputUpliftPercent: number
+  externalPoolStreamResponseMode: ExternalPoolStreamResponseMode
+  externalPoolUsageDebugEnabled: boolean
+  externalPoolUsageDebugDir: string
+  externalPoolUsageDebugMaxBodyBytes: number
+  externalPoolUsageDebugMaxFiles: number
+}
+
+export interface ExternalPool {
+  id: number
+  name: string
+  baseUrl: string
+  apiKey?: string
+  maskedApiKey?: string
+  authType: ExternalPoolAuthType
+  enabled: boolean
+  priority: number
+  maxConcurrentRequests: number
+  usageProjectionMode: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode
+  requestBodyMode: ExternalPoolRequestBodyMode
+  rawModelMode: ExternalPoolRawModelMode
+  autoDisablePolicy: ExternalPoolAutoDisablePolicy
+  preOutputStreamRetryMode: ExternalPoolStreamRetryMode
+  autoDisabled: boolean
+  autoDisabledReason?: string
+  autoDisabledAt?: string
+  autoDisabledUntil?: string
+  autoDisabledLastError?: string
+  preservePath: boolean
+  normalizeModelVersionDots: boolean
+  modelMappingMode: ExternalPoolModelMappingMode
+  modelMappingRequireMatch: boolean
+  modelMappingRules: ExternalPoolModelMappingRule[]
+  supportedModels: string[]
+  routeMode: ExternalPoolRouteMode
+  routeRules: string[]
+  notes?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ExternalPoolsListResponse {
+  pools: ExternalPool[]
+}
+
+export interface ExternalPoolStatus {
+  pool: ExternalPool
+  inFlight: number
+  cooldownRemainingSecs: number
+  cooldownReason?: string
+  transientFailureStreak: number
+  transientFailureTtlSecs: number
+  dispatchable: boolean
+  skippedReason?: string
+}
+
+export interface ExternalPoolsStatusResponse {
+  pools: ExternalPoolStatus[]
+}
+
+export interface CreateExternalPoolRequest {
+  name: string
+  baseUrl: string
+  apiKey: string
+  authType?: ExternalPoolAuthType
+  enabled?: boolean
+  priority?: number
+  maxConcurrentRequests?: number
+  usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
+  requestBodyMode?: ExternalPoolRequestBodyMode
+  rawModelMode?: ExternalPoolRawModelMode
+  autoDisablePolicy?: ExternalPoolAutoDisablePolicy
+  preOutputStreamRetryMode?: ExternalPoolStreamRetryMode
+  preservePath?: boolean
+  normalizeModelVersionDots?: boolean
+  modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingRequireMatch?: boolean
+  modelMappingRules?: ExternalPoolModelMappingRule[]
+  supportedModels?: string[]
+  routeMode?: ExternalPoolRouteMode
+  routeRules?: string[]
+  notes?: string
+}
+
+export interface UpdateExternalPoolRequest {
+  name?: string
+  baseUrl?: string
+  apiKey?: string
+  authType?: ExternalPoolAuthType
+  enabled?: boolean
+  priority?: number
+  maxConcurrentRequests?: number
+  usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
+  requestBodyMode?: ExternalPoolRequestBodyMode
+  rawModelMode?: ExternalPoolRawModelMode
+  autoDisablePolicy?: ExternalPoolAutoDisablePolicy
+  preOutputStreamRetryMode?: ExternalPoolStreamRetryMode
+  preservePath?: boolean
+  normalizeModelVersionDots?: boolean
+  modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingRequireMatch?: boolean
+  modelMappingRules?: ExternalPoolModelMappingRule[]
+  supportedModels?: string[]
+  routeMode?: ExternalPoolRouteMode
+  routeRules?: string[]
+  notes?: string
+}
+
+export interface SetSupportedModelsRequest {
+  supportedModels: string[]
+}
+
+export interface DiscoverExternalPoolSupportedModelsRequest {
+  baseUrl?: string | null
+  apiKey?: string | null
+  authType?: 'bearer' | 'x_api_key' | null
+}
+
+export interface SupportedModelsResponse {
+  supportedModels: string[]
+  count: number
+}
+
+export interface ExternalPoolTestResponse {
+  ok: boolean
+  status?: number
+  message: string
+  model?: string
+  response?: string
+}
+
+export interface ExternalPoolTestRequest {
+  model: string
+  prompt?: string
+}
+
+export interface WeightedCapacityTier {
+  minTokens: number
+  units: number
+}
+
+export interface WeightedCapacityConfig {
+  enabled: boolean
+  maxUnitsPerRequest: number
+  tiers: WeightedCapacityTier[]
+}
+
+export type MissingMaxTokensPolicy = 'reject' | 'default_value'
+
+export interface MissingMaxTokensConfig {
+  policy: MissingMaxTokensPolicy
+  defaultValue: number
+}
+
+export interface RequestAdmissionConfig {
+  rpm: number
+  maxConcurrentRequests: number
+  maxQueuedRequests: number
+  queueTimeoutMs: number
+}
+
+export interface AuxiliaryUpstreamRuntime {
+  configuredLimit: number
+  inFlight: number
+  peakInFlight: number
+  rejected: number
+  refreshClientCacheEntries: number
+  refreshClientCacheMaxEntries: number
+  refreshClientBuilds: number
+  refreshClientHits: number
+  refreshClientMisses: number
+  refreshClientCacheSaturated: number
+}
+
+export interface TokenRefreshAdmissionRuntime {
+  authority: 'process_local' | 'redis_global' | 'redis_global_degraded'
+  configuredRpm: number
+  configuredBurst: number
+  admitted: number
+  rateLimited: number
+  coordinationRejected: number
+  redisErrors: number
+  lastRetryAfterMs: number
+  remainingMilliTokens: number
+}
+
+export interface RuntimeConfig {
+  proxyUrl?: string | null
+  proxyUsername?: string | null
+  proxyPassword?: string | null
+  credentialRpm: number
+  requestAdmission: RequestAdmissionConfig
+  credentialMaxConcurrentRequests: number
+  credentialTransientCooldownSecs: number
+  credentialRateLimitCooldownSecs: number
+  credentialServerErrorCooldownSecs: number
+  credentialNetworkErrorCooldownSecs: number
+  credentialStreamErrorCooldownSecs: number
+  credentialProtocolErrorCooldownSecs: number
+  credentialAuthErrorCooldownSecs: number
+  credentialCooldownBackoffMultiplier: number
+  credentialCooldownJitterPercent: number
+  credentialProbationSecs: number
+  credentialMaxCooldownSecs: number
+  credentialDispatchMaxWaitSecs: number
+  kiroUpstreamResponseTimeoutSecs: number
+  kiroUpstreamStreamIdleTimeoutSecs: number
+  kiroUpstreamStreamRetryEnabled: boolean
+  kiroUpstreamStreamRetryMaxAttempts: number
+  inferenceUpstreamMaxAttempts: number
+  auxiliaryUpstreamMaxAttempts: number
+  auxiliaryUpstreamMaxConcurrentRequests: number
+  auxiliaryUpstreamRuntime: AuxiliaryUpstreamRuntime
+  tokenRefreshMaxRpm: number
+  tokenRefreshBurst: number
+  tokenRefreshAdmissionRuntime: TokenRefreshAdmissionRuntime
+  kiroUpstreamStreamRetryOnIdleTimeout: boolean
+  kiroUpstreamStreamRetryOnReadError: boolean
+  kiroUpstreamStreamRetryOnStatusError: boolean
+  credentialRetryMaxAttempts: number
+  credentialPromptLogicRetryEnabled: boolean
+  credentialPromptLogicRetryMaxAttempts: number
+  credentialInFlightLeaseMaxSecs: number
+  dispatchGlobalMaxConcurrentRequests: number
+  dispatchMaxQueuedRequests: number
+  weightedCapacity: WeightedCapacityConfig
+  credentialWarmupRequests: number
+  credentialWarmupSelectionPercent: number
+  credentialWarmupMaxSelectionPercent: number
+  schedulerErrorEwmaAlpha: number
+  schedulerPriorityWeight: number
+  schedulerLoadWeight: number
+  schedulerErrorWeight: number
+  schedulerLatencyWeight: number
+  schedulerProbationWeight: number
+  schedulerSelectionPressureWeight: number
+  schedulerTotalSelectionWeight: number
+  schedulerTopK: number
+  selectionFailureSampleLimit: number
+  selectionFailureRecordEnabled: boolean
+  compressionEnabled: boolean
+  whitespaceCompression: boolean
+  imageProcessing: ImageProcessingConfig
+  bodyConversion: BodyConversionConfig
+  promptSteering: PromptSteeringConfig
+  missingMaxTokens: MissingMaxTokensConfig
+  payloadGuardEnabled: boolean
+  payloadGuardMode: PayloadGuardMode
+  payloadGuardMaxBytes: number
+  payloadGuardSafetyMarginBytes: number
+  payloadGuardTrimHistory: boolean
+  payloadGuardExternalEnabled: boolean
+  kiroCachePointEnabled: boolean
+  kiroCachePointToolsOnly: boolean
+  kiroCachePointRecordPlan: boolean
+  payloadShaping: PayloadShapingConfig
+  promptCacheTargetReadRatio: number
+  promptCacheTokenScale: number
+  promptCacheMaxSimulatedInputTokens: number
+  promptCacheCapJitterMinTokens: number
+  promptCacheCapJitterMaxTokens: number
+  promptCacheScaleMinInputTokens: number
+  promptCacheCreationControl: PromptCacheCreationControlConfig
+  promptCacheMaxEntriesPerAccount: number
+  promptCacheMaxEntriesGlobal: number
+  promptCacheEntryTtlSecs: number
+  promptCacheEstimatedBytesLimit: number
+  reportedUsage: ReportedUsageConfig
+  cachePolicy: CachePolicyConfig
+  externalPools: ExternalPoolsConfig
+  highCacheThreshold: number
+  compatProfile: CompatProfile
+  kiroAgentModeStrategy: KiroAgentModeStrategy
+  modelResolutionMode: ModelResolutionMode
+  modelMapping: ModelMappingConfig
+  extractThinking: boolean
+  thinkingTriggerMode: ThinkingTriggerMode
+  exposeProxyWarnings: boolean
+  definedCacheRoutes: string[]
+}
+
+export type UpdateRuntimeConfigRequest = RuntimeConfig
+
+export interface AccessKeysResponse {
+  requestApiKey: string
+  maskedRequestApiKey: string
+  requestApiKeys: RequestApiKeyItem[]
+  adminApiKey: string
+  maskedAdminApiKey: string
+}
+
+export interface RequestApiKeyItem {
+  id: string
+  apiKey: string
+  maskedApiKey: string
+  primary: boolean
+}
+
+export interface CreateRequestApiKeyRequest {
+  apiKey?: string
+}
+
+export interface UpdateRequestApiKeyRequest {
+  apiKey?: string
+}
+
+export interface UpdateAdminApiKeyRequest {
+  adminApiKey: string
+}
+
+export type LoadBalancingMode = 'priority' | 'balanced' | 'health_balanced' | 'weighted_least_inflight'
+
+export interface ModelPricing {
+  inputCostPerToken: number
+  outputCostPerToken: number
+  cacheCreationInputTokenCost: number
+  cacheReadInputTokenCost: number
+}
+
+export interface ModelPriceItem {
+  model: string
+  pricing: ModelPricing
+  source?: string
+}
+
+export interface ModelPricingStatus {
+  available: boolean
+  source: string
+  sourceUrl: string
+  modelCount: number
+  lastSyncedAt?: string
+  lastError?: string
+  models: ModelPriceItem[]
+}
+
+export interface ModelCapabilityItem {
+  model: string
+  displayName: string
+  description?: string
+  maxInputTokens?: number
+  maxOutputTokens?: number
+  supportsPromptCaching?: boolean
+  supportedInputTypes: string[]
+  source?: string
+}
+
+export interface ModelCapabilitiesStatus {
+  available: boolean
+  source: string
+  modelCount: number
+  lastSyncedAt?: string
+  lastError?: string
+  models: ModelCapabilityItem[]
+  reasoningFields?: Record<string, {
+    path: 'output_config' | 'reasoning'
+    efforts: string[]
+    defaultEffort?: string
+  }>
+}
+
+export interface ManualModelPricingRequest {
+  inputCostPerMillion: number
+  outputCostPerMillion: number
+  cacheCreationInputCostPerMillion?: number
+  cacheReadInputCostPerMillion?: number
+}
+
+export interface UpsertManualModelRequest {
+  model: string
+  displayName?: string
+  description?: string
+  maxInputTokens?: number
+  maxOutputTokens?: number
+  supportsPromptCaching?: boolean
+  supportedInputTypes: string[]
+  pricing?: ManualModelPricingRequest
+  clearPricing?: boolean
+}
+
+export interface ManualModelResponse {
+  success: boolean
+  message: string
+  model: string
+}
+
+export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'

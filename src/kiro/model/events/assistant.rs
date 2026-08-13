@@ -34,11 +34,18 @@ pub struct AssistantResponseEvent {
     #[serde(default)]
     pub content: String,
 
+    /// 上游 assistant 响应状态，例如 `COMPLETED`。
+    ///
+    /// 该字段只用于完成性观测；下游 Anthropic SSE 行为仍由本地
+    /// `SseStateManager` 生成，避免改变现有协议输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_status: Option<String>,
+
     /// 捕获其他未使用的字段，确保反序列化兼容性
     #[serde(flatten)]
     #[serde(skip_serializing)]
     #[allow(dead_code)]
-    extra: serde_json::Value,
+    pub(crate) extra: serde_json::Value,
 }
 
 impl EventPayload for AssistantResponseEvent {
@@ -51,6 +58,7 @@ impl Default for AssistantResponseEvent {
     fn default() -> Self {
         Self {
             content: String::new(),
+            message_status: None,
             extra: serde_json::Value::Null,
         }
     }
@@ -88,6 +96,7 @@ mod tests {
         }"#;
         let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.content, "Done");
+        assert_eq!(event.message_status.as_deref(), Some("COMPLETED"));
     }
 
     #[test]

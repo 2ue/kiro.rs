@@ -1,9 +1,88 @@
 {
+  "postgres": {
+    "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
+  },
+  "redis": {
+    "url": "redis://127.0.0.1:26379/0"
+  },
+  "observabilityRedis": {
+    "url": null,
+    "keyPrefix": "kiro_rs:observability"
+  },
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-  "tlsBackend": "rustls",
-  "region": "us-east-1",
+  "apiKeys": [],
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "requestAdmission": {
+    "rpm": 300,
+    "maxConcurrentRequests": 32,
+    "maxQueuedRequests": 64,
+    "queueTimeoutMs": 1000
+  },
+  "kiroUpstreamResponseTimeoutSecs": 180,
+  "credentialRetryMaxAttempts": 0,
+  "inferenceUpstreamMaxAttempts": 4,
+  "auxiliaryUpstreamMaxAttempts": 2,
+  "auxiliaryUpstreamMaxConcurrentRequests": 16,
+  "tokenRefreshMaxRpm": 60,
+  "tokenRefreshBurst": 8,
+  "weightedCapacity": {
+    "enabled": false,
+    "maxUnitsPerRequest": 8,
+    "tiers": [
+      { "minTokens": 0, "units": 1 },
+      { "minTokens": 100000, "units": 2 },
+      { "minTokens": 300000, "units": 4 },
+      { "minTokens": 700000, "units": 8 }
+    ]
+  },
+  "payloadGuardEnabled": true,
+  "payloadGuardMode": "on_too_long",
+  "payloadGuardMaxBytes": 460800,
+  "payloadGuardTrimHistory": true,
+  "payloadGuardExternalEnabled": true,
+  "imageProcessing": {
+    "mode": "safe",
+    "safeMaterializeFileSources": true,
+    "safeDownloadRemoteSources": true,
+    "safeNormalizeBase64MediaTypes": true
+  },
+  "bodyConversion": {
+    "toolSchemaNormalization": true,
+    "toolNameMapping": true,
+    "toolSchemaKeyMapping": "sanitize",
+    "toolSchemaKeyValidationRegex": "^[a-zA-Z0-9_.-]{1,64}$",
+    "toolChoiceSteering": true,
+    "chunkedToolPolicy": true,
+    "thinkingPromptControls": true,
+    "nativeReasoningFields": true,
+    "toolPairingRepair": true,
+    "historyPlaceholderTools": true
+  },
+  "payloadShaping": {
+    "enabled": true,
+    "truncateHistoricalToolResults": true,
+    "historicalToolResultMaxChars": 8000,
+    "historicalToolResultHeadLines": 80,
+    "historicalToolResultTailLines": 40,
+    "discardHistoricalThinking": true,
+    "compressToolDefinitions": true,
+    "toolDefinitionsBudgetBytes": 20000,
+    "toolDescriptionMaxChars": 4000,
+    "toolSchemaAnnotationMaxChars": 1000,
+    "webFetchTrimEnabled": true,
+    "webFetchBodyMaxChars": 12000,
+    "fitCurrentPayloadToBudget": false,
+    "truncateCurrentToolResults": false,
+    "currentToolResultMaxChars": 80000,
+    "truncateCurrentUserContent": false,
+    "currentUserContentMaxChars": 120000,
+    "truncateCurrentDocuments": false,
+    "currentDocumentMaxChars": 80000,
+    "truncateCurrentImages": false,
+    "currentImagesMaxBytes": 180000,
+    "oversizedImageHandling": "drop-with-placeholder"
+  },
+  "kiroAgentModeStrategy": "vibe"
 }

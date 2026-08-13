@@ -1,133 +1,190 @@
-name: Build Artifacts
+name: Quality Gate
 
 on:
-  push:
+  pull_request:
     branches:
-      - master
-    tags:
-      - 'v*'
+      - main
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version label for artifacts (e.g., 2025.12.1)'
-        required: true
-        default: '2026.1.1'
+      profile:
+        description: 'Quality profile to run: full or release'
+        required: false
+        type: choice
+        options:
+          - full
+          - release
+        default: full
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Optional release tag that must match the Cargo package version
+        required: false
+        type: string
+        default: ''
+      profile:
+        description: 'Quality profile to run: full or release'
+        required: false
+        type: string
+        default: full
 
 permissions:
   contents: read
 
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22.23.0'
+  PNPM_VERSION: '11.11.0'
+  RUST_TOOLCHAIN: '1.92.0'
+  KIRO_RS_TEST_POSTGRES_URL: postgres://kiro_rs:kiro_rs_test@127.0.0.1:5432/kiro_rs_test
+  KIRO_RS_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+  KIRO_RS_REQUIRE_STORAGE_TESTS: '1'
+  CARGO_PROFILE_RELEASE_LTO: 'false'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  CARGO_TERM_COLOR: always
+  QUALITY_PROFILE: ${{ inputs.profile || 'full' }}
+
 jobs:
-  pre-check:
-    runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
-        with:
-          fetch-depth: 0
-      - name: Check if commit has release tag
-        id: check
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "::notice::Skipping beta build: commit already has a release tag"
-          else
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          fi
+  quality:
+    name: Frontend and Rust quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
-  build:
-    needs: pre-check
-    if: needs.pre-check.outputs.should_build == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-            name: macOS-arm64
-          - platform: macos-latest
-            target: x86_64-apple-darwin
-            name: macOS-x64
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: Windows-x64
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            name: Linux-x64
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            name: Linux-arm64
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            name: Linux-musl-x64
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            name: Linux-musl-arm64
-
-    runs-on: ${{ matrix.platform }}
+    services:
+      postgres:
+        image: postgres:16.9-alpine3.21
+        env:
+          POSTGRES_USER: kiro_rs
+          POSTGRES_PASSWORD: kiro_rs_test
+          POSTGRES_DB: kiro_rs_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kiro_rs -d kiro_rs_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7.4.5-alpine3.21
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Determine version
-        id: version
+      - name: Validate quality profile
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          else
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
-          fi
+          case "$QUALITY_PROFILE" in
+            full|release) ;;
+            *)
+              echo "::error::Unsupported quality profile: $QUALITY_PROFILE"
+              exit 1
+              ;;
+          esac
+          echo "QUALITY_PROFILE=$QUALITY_PROFILE"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+      - name: Check changed lines for whitespace errors
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/ci/check-diff.sh "$BASE_SHA" "$GITHUB_SHA"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 11
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
 
-      - name: Install admin-ui dependencies
-        working-directory: admin-ui
-        run: pnpm install --frozen-lockfile
-
-      - name: Build admin-ui
-        working-directory: admin-ui
-        run: pnpm build
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: |
+            admin-ui/pnpm-lock.yaml
+            ui/pnpm-lock.yaml
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: ${{ matrix.target }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "rust-cache-${{ matrix.target }}"
           cache-on-failure: true
 
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
+      - name: Validate release tag
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: node scripts/ci/check-release-version.mjs "$RELEASE_TAG"
+
+      - name: Verify integration-test services
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          : "${KIRO_RS_TEST_POSTGRES_URL:?KIRO_RS_TEST_POSTGRES_URL must be set}"
+          : "${KIRO_RS_TEST_REDIS_URL:?KIRO_RS_TEST_REDIS_URL must be set}"
+          docker exec "${{ job.services.postgres.id }}" pg_isready -U kiro_rs -d kiro_rs_test
+          test "$(docker exec "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
 
-      - name: Build app
-        run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+      - name: Install admin-ui dependencies
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
-          if-no-files-found: error
-          compression-level: 6
-          path: |
-            target/${{ matrix.target }}/release/kiro-rs
-            target/${{ matrix.target }}/release/kiro-rs.exe
+      - name: Install ui dependencies
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Check shared frontend contracts
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        run: node scripts/check-frontend-contracts.mjs
+
+      - name: Build admin-ui
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        working-directory: admin-ui
+        run: pnpm build
+
+      - name: Build ui
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        working-directory: ui
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Clippy warning baseline
+        run: node scripts/ci/check-clippy-baseline.mjs
+
+      - name: Test without default features
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        run: cargo test --locked --all-targets --no-default-features -- --test-threads=1
+
+      - name: Test with default features
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        run: cargo test --locked --all-targets -- --test-threads=1
+
+      - name: Check no-default Rust compilation
+        if: ${{ env.QUALITY_PROFILE == 'release' }}
+        run: cargo check --locked --all-targets --no-default-features
+
+      - name: Run release PostgreSQL dashboard smoke test
+        if: ${{ env.QUALITY_PROFILE == 'release' }}
+        run: cargo test --locked --bin kiro-rs storage::postgres::tests::postgres_persists_runtime_config_credentials_stats_usage_and_pricing -- --exact --test-threads=1
+
+      - name: Build release with default features
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        run: cargo build --release --locked

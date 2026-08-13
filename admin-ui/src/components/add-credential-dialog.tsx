@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { Eye, EyeOff } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -9,52 +10,274 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { useAddCredential } from '@/hooks/use-credentials'
+import { Checkbox } from '@/components/ui/checkbox'
+import { useAddCredential, useProxyResources } from '@/hooks/use-credentials'
+import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { parseCredentialImportFiles } from '@/lib/credential-import'
 
 interface AddCredentialDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
+
+function SecretInput({
+  value,
+  onChange,
+  visible,
+  onToggle,
+  disabled,
+  placeholder,
+}: {
+  value: string
+  onChange: (value: string) => void
+  visible: boolean
+  onToggle: () => void
+  disabled?: boolean
+  placeholder?: string
+}) {
+  return (
+    <div className="relative">
+      <Input
+        className="pr-10"
+        type={visible ? 'text' : 'password'}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="absolute right-1 top-1 h-8 w-8"
+        onClick={onToggle}
+        disabled={disabled}
+        title={visible ? '隐藏' : '显示'}
+      >
+        {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+      </Button>
+    </div>
+  )
+}
+
+function splitKiroApiKeyDraft(value: string): { key: string; region?: string } {
+  const trimmed = value.trim()
+  const [rawKey, rawRegion] = trimmed.split('|', 2)
+  return {
+    key: rawKey?.trim() || value,
+    region: rawRegion?.trim() || undefined,
+  }
+}
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
+  const [profileArn, setProfileArn] = useState('')
+  const [region, setRegion] = useState('')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [tokenEndpoint, setTokenEndpoint] = useState('')
+  const [issuerUrl, setIssuerUrl] = useState('')
+  const [scopes, setScopes] = useState('')
   const [email, setEmail] = useState('')
   const [priority, setPriority] = useState('0')
+  const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('')
+  const [rpm, setRpm] = useState('')
+  const [disabled, setDisabled] = useState(false)
   const [machineId, setMachineId] = useState('')
+  const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [endpoint, setEndpoint] = useState('')
+  const [enableOverageAfterImport, setEnableOverageAfterImport] = useState(false)
 
   const { mutate, isPending } = useAddCredential()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
 
   const resetForm = () => {
     setRefreshToken('')
     setKiroApiKey('')
     setAuthMethod('social')
+    setProfileArn('')
+    setRegion('')
     setAuthRegion('')
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setTokenEndpoint('')
+    setIssuerUrl('')
+    setScopes('')
     setEmail('')
     setPriority('0')
+    setMaxConcurrentRequests('')
+    setRpm('')
+    setDisabled(false)
     setMachineId('')
+    setProxyResourceId('')
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
+    setShowProxyUsername(false)
+    setShowProxyPassword(false)
     setEndpoint('')
+    setEnableOverageAfterImport(false)
   }
 
   const isApiKey = authMethod === 'api_key'
+
+  const fillFromCredential = (credential: {
+    authMethod?: AuthMethod
+    refreshToken?: string
+    kiroApiKey?: string
+    profileArn?: string
+    region?: string
+    authRegion?: string
+    apiRegion?: string
+    clientId?: string
+    clientSecret?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    email?: string
+    priority?: number
+    maxConcurrentRequests?: number | null
+    rpm?: number | null
+    disabled?: boolean | null
+    machineId?: string
+    proxyUrl?: string
+    proxyUsername?: string
+    proxyPassword?: string
+    proxyResourceId?: number | null
+    endpoint?: string
+    enableOverageAfterImport?: boolean | null
+  }) => {
+    setAuthMethod(credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
+    setRefreshToken(credential.refreshToken || '')
+    setKiroApiKey(credential.kiroApiKey || '')
+    setProfileArn(credential.profileArn || '')
+    setRegion(credential.region || '')
+    setAuthRegion(credential.authRegion || '')
+    setApiRegion(credential.apiRegion || '')
+    setClientId(credential.clientId || '')
+    setClientSecret(credential.clientSecret || '')
+    setTokenEndpoint(credential.tokenEndpoint || '')
+    setIssuerUrl(credential.issuerUrl || '')
+    setScopes(credential.scopes || '')
+    setEmail(credential.email || '')
+    setPriority(String(credential.priority ?? 0))
+    setMaxConcurrentRequests(typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '')
+    setRpm(typeof credential.rpm === 'number' ? String(credential.rpm) : '')
+    setDisabled(Boolean(credential.disabled))
+    setMachineId(credential.machineId || '')
+    if (credential.proxyResourceId) {
+      setProxyResourceId(String(credential.proxyResourceId))
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+    } else {
+      setProxyResourceId('')
+      setProxyUrl(credential.proxyUrl || '')
+      setProxyUsername(credential.proxyUsername || '')
+      setProxyPassword(credential.proxyPassword || '')
+    }
+    setShowProxyUsername(false)
+    setShowProxyPassword(false)
+    setEndpoint(credential.endpoint || '')
+    setEnableOverageAfterImport(credential.enableOverageAfterImport === true)
+  }
+
+  const handleAuthMethodChange = (nextAuthMethod: AuthMethod) => {
+    setAuthMethod(nextAuthMethod)
+    if (nextAuthMethod === 'api_key') {
+      setRefreshToken('')
+      setClientId('')
+      setClientSecret('')
+      setTokenEndpoint('')
+      setIssuerUrl('')
+      setScopes('')
+      return
+    }
+    setKiroApiKey('')
+    if (nextAuthMethod === 'social') {
+      setClientId('')
+      setClientSecret('')
+      setTokenEndpoint('')
+      setIssuerUrl('')
+      setScopes('')
+    } else if (nextAuthMethod === 'idc') {
+      setTokenEndpoint('')
+      setIssuerUrl('')
+      setScopes('')
+    } else if (nextAuthMethod === 'external_idp') {
+      setClientSecret('')
+    }
+  }
+
+  const handleRegionChange = (value: string) => {
+    setRegion(value)
+    if (value.trim() && !authRegion.trim()) {
+      setAuthRegion(value)
+    }
+  }
+
+  const handleKiroApiKeyChange = (value: string) => {
+    const parsed = splitKiroApiKeyDraft(value)
+    setKiroApiKey(parsed.region ? parsed.key : value)
+    if (parsed.region) {
+      if (!region.trim()) setRegion(parsed.region)
+      if (!authRegion.trim()) setAuthRegion(parsed.region)
+      if (!apiRegion.trim()) setApiRegion(parsed.region)
+      if (!endpoint.trim()) setEndpoint('cli')
+    }
+  }
+
+  const handleProxyResourceChange = (value: string) => {
+    setProxyResourceId(value)
+    if (value) {
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+    }
+  }
+
+  const setDirectProxyDraft = (setter: (value: string) => void, value: string) => {
+    setter(value)
+    if (value.trim()) {
+      setProxyResourceId('')
+    }
+  }
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (files.length === 0) {
+      return
+    }
+
+    const result = await parseCredentialImportFiles(files)
+    const first = result.credentials[0]
+    if (!first) {
+      toast.error(result.errors[0] || '文件中没有有效凭据')
+      return
+    }
+
+    fillFromCredential(first)
+    const suffix = result.credentials.length > 1 ? `，已取第一条，另有 ${result.credentials.length - 1} 条可用批量导入` : ''
+    toast.success(`已从文件填充凭据${suffix}`)
+    if (result.errors.length > 0) {
+      toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
+    }
+  }
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -75,11 +298,40 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
+      if (authMethod === 'external_idp' && !clientId.trim()) {
+        toast.error('External IdP 认证需要填写 Client ID')
+        return
+      }
     }
 
     const parsedPriority = Number(priority)
     if (!Number.isInteger(parsedPriority) || parsedPriority < 0) {
       toast.error('优先级必须是非负整数')
+      return
+    }
+    let parsedMaxConcurrentRequests: number | undefined
+    if (maxConcurrentRequests.trim()) {
+      const parsed = Number(maxConcurrentRequests)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号并发覆盖必须是非负整数')
+        return
+      }
+      parsedMaxConcurrentRequests = parsed
+    }
+    let parsedRpm: number | undefined
+    if (rpm.trim()) {
+      const parsed = Number(rpm)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号 RPM 覆盖必须是非负整数')
+        return
+      }
+      parsedRpm = parsed
+    }
+    const directProxyUrl = proxyUrl.trim()
+    const directProxyUsername = proxyUsername.trim()
+    const directProxyPassword = proxyPassword.trim()
+    if (!proxyResourceId && !directProxyUrl && (directProxyUsername || directProxyPassword)) {
+      toast.error('直接代理 URL 为空时不能单独保存代理账号或密码')
       return
     }
 
@@ -88,21 +340,36 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
+        profileArn: profileArn.trim() || undefined,
+        region: region.trim() || undefined,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
-        clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
+        clientSecret: authMethod === 'idc' ? clientSecret.trim() || undefined : undefined,
+        tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint.trim() || undefined : undefined,
+        issuerUrl: authMethod === 'external_idp' ? issuerUrl.trim() || undefined : undefined,
+        scopes: authMethod === 'external_idp' ? scopes.trim() || undefined : undefined,
         email: email.trim() || undefined,
         priority: parsedPriority,
+        maxConcurrentRequests: parsedMaxConcurrentRequests,
+        rpm: parsedRpm,
+        disabled,
         machineId: machineId.trim() || undefined,
-        proxyUrl: proxyUrl.trim() || undefined,
-        proxyUsername: proxyUsername.trim() || undefined,
-        proxyPassword: proxyPassword.trim() || undefined,
+        proxyResourceId: proxyResourceId ? Number(proxyResourceId) : undefined,
+        proxyUrl: proxyResourceId ? undefined : directProxyUrl || undefined,
+        proxyUsername: proxyResourceId ? undefined : directProxyUsername || undefined,
+        proxyPassword: proxyResourceId ? undefined : directProxyPassword || undefined,
         endpoint: endpoint.trim() || undefined,
+        enableOverageAfterImport,
       },
       {
-        onSuccess: (data) => {
-          toast.success(data.message)
+        onSuccess: async (data) => {
+          try {
+            const info = await getCredentialBalance(data.credentialId)
+            toast.success(`${data.message}，订阅: ${info.subscriptionTitle || '未知'}`)
+          } catch (error) {
+            toast.warning(`${data.message}，但查询订阅失败: ${extractErrorMessage(error)}`)
+          }
           onOpenChange(false)
           resetForm()
         },
@@ -117,11 +384,37 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>添加凭据</DialogTitle>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <DialogTitle>添加凭据</DialogTitle>
+            <Button type="button" variant="outline" size="sm" disabled={isPending} asChild>
+              <label className="cursor-pointer">
+                从文件填充
+                <input
+                  type="file"
+                  accept=".json,.jsonl,.txt,application/json"
+                  className="hidden"
+                  onChange={handleFileSelect}
+                  disabled={isPending}
+                />
+              </label>
+            </Button>
+          </div>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            <div className="flex items-center gap-2 rounded-md bg-muted/30 px-3 py-2">
+              <Checkbox
+                id="add-enable-overage"
+                checked={enableOverageAfterImport}
+                disabled={isPending}
+                onCheckedChange={(checked) => setEnableOverageAfterImport(checked === true)}
+              />
+              <label htmlFor="add-enable-overage" className="cursor-pointer text-sm">
+                添加后尝试开启超额
+              </label>
+            </div>
+
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">
@@ -130,12 +423,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <select
                 id="authMethod"
                 value={authMethod}
-                onChange={(e) => setAuthMethod(e.target.value as AuthMethod)}
+                onChange={(e) => handleAuthMethodChange(e.target.value as AuthMethod)}
                 disabled={isPending}
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <option value="social">Social</option>
                 <option value="idc">IdC/Builder-ID/IAM</option>
+                <option value="external_idp">External IdP</option>
                 <option value="api_key">API Key</option>
               </select>
             </div>
@@ -149,9 +443,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <Input
                   id="kiroApiKey"
                   type="password"
-                  placeholder="格式: ksk_xxxxxxxx"
+                  placeholder="格式: ksk_xxxxxxxx 或 ksk_xxxxxxxx|eu-central-1"
                   value={kiroApiKey}
-                  onChange={(e) => setKiroApiKey(e.target.value)}
+                  onChange={(e) => handleKiroApiKeyChange(e.target.value)}
                   disabled={isPending}
                 />
               </div>
@@ -192,7 +486,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <div>
+                  <Input
+                    id="region"
+                    placeholder="Region 兼容字段"
+                    value={region}
+                    onChange={(e) => handleRegionChange(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
+                  />
+                </div>
                 <div>
                   <Input
                     id="authRegion"
@@ -200,6 +504,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={authRegion}
                     onChange={(e) => setAuthRegion(e.target.value)}
                     disabled={isPending}
+                    className="font-mono"
                   />
                 </div>
                 <div>
@@ -209,11 +514,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={apiRegion}
                     onChange={(e) => setApiRegion(e.target.value)}
                     disabled={isPending}
+                    className="font-mono"
                   />
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                `us-east-1` 这类值是 AWS 区域。Region 是兼容字段；Auth Region 用于 Token 刷新，API Region 用于 API 请求，均可留空使用全局配置。
               </p>
             </div>
 
@@ -248,6 +554,62 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </>
             )}
 
+            {authMethod === 'external_idp' && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="externalClientId" className="text-sm font-medium">
+                    Client ID <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="externalClientId"
+                    placeholder="请输入 Client ID"
+                    value={clientId}
+                    onChange={(e) => setClientId(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="tokenEndpoint" className="text-sm font-medium">
+                    Token Endpoint
+                  </label>
+                  <Input
+                    id="tokenEndpoint"
+                    placeholder="https://.../oauth2/v2.0/token"
+                    value={tokenEndpoint}
+                    onChange={(e) => setTokenEndpoint(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="issuerUrl" className="text-sm font-medium">
+                    Issuer URL
+                  </label>
+                  <Input
+                    id="issuerUrl"
+                    placeholder="https://..."
+                    value={issuerUrl}
+                    onChange={(e) => setIssuerUrl(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="scopes" className="text-sm font-medium">
+                    Scopes
+                  </label>
+                  <Input
+                    id="scopes"
+                    placeholder="offline_access ..."
+                    value={scopes}
+                    onChange={(e) => setScopes(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
+                  />
+                </div>
+              </>
+            )}
+
             {/* 优先级 */}
             <div className="space-y-2">
               <label htmlFor="priority" className="text-sm font-medium">
@@ -264,6 +626,61 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 数字越小优先级越高，默认为 0
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="initialStatus" className="text-sm font-medium">
+                初始状态
+              </label>
+              <select
+                id="initialStatus"
+                value={disabled ? 'disabled' : 'enabled'}
+                onChange={(e) => setDisabled(e.target.value === 'disabled')}
+                disabled={isPending}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="enabled">启用</option>
+                <option value="disabled">禁用</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                新增后会默认查询订阅信息；不会发送模型测试请求。
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="maxConcurrentRequests" className="text-sm font-medium">
+                账号并发覆盖
+              </label>
+              <Input
+                id="maxConcurrentRequests"
+                type="number"
+                min="0"
+                placeholder="留空继承全局，0 表示不限"
+                value={maxConcurrentRequests}
+                onChange={(e) => setMaxConcurrentRequests(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                只作用于当前凭据；留空时继承全局单凭据并发配置。
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="rpm" className="text-sm font-medium">
+                账号 RPM 覆盖
+              </label>
+              <Input
+                id="rpm"
+                type="number"
+                min="0"
+                placeholder="留空继承全局，0 表示不限"
+                value={rpm}
+                onChange={(e) => setRpm(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                限制当前账号每分钟被分配的请求数。
               </p>
             </div>
 
@@ -303,34 +720,69 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
             {/* 代理配置 */}
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理配置</label>
-              <Input
-                id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
+              <label className="text-sm font-medium">代理资源</label>
+              <select
+                id="proxyResourceId"
+                value={proxyResourceId}
+                onChange={(e) => handleProxyResourceChange(e.target.value)}
                 disabled={isPending}
-              />
-              <div className="grid grid-cols-2 gap-2">
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">不绑定代理资源</option>
+                {proxyResourceOptions.map((resource) => (
+                  <option key={resource.id} value={resource.id}>
+                    {resource.name}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                新增凭据会立即验证 Token，只能选择已启用的代理资源；选择资源会清空直连代理，填写直连代理会自动取消资源。
+              </p>
+            </div>
+
+            <div className={`space-y-3 rounded-md border p-3 ${proxyResourceId ? 'bg-muted/30 opacity-70' : 'bg-background'}`}>
+              <div>
+                <div className="text-sm font-medium">凭据直连代理</div>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  不绑定代理资源时生效；选择代理资源时这些字段不会随新增请求提交。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="proxyUrl" className="text-sm font-medium">
+                  代理 URL
+                </label>
                 <Input
-                  id="proxyUsername"
-                  placeholder="代理用户名"
-                  value={proxyUsername}
-                  onChange={(e) => setProxyUsername(e.target.value)}
-                  disabled={isPending}
-                />
-                <Input
-                  id="proxyPassword"
-                  type="password"
-                  placeholder="代理密码"
-                  value={proxyPassword}
-                  onChange={(e) => setProxyPassword(e.target.value)}
-                  disabled={isPending}
+                  id="proxyUrl"
+                  placeholder="socks5h://127.0.0.1:1080"
+                  value={proxyUrl}
+                  onChange={(event) => setDirectProxyDraft(setProxyUrl, event.target.value)}
+                  disabled={isPending || Boolean(proxyResourceId)}
                 />
               </div>
-              <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
-              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">代理用户名</label>
+                  <SecretInput
+                    value={proxyUsername}
+                    onChange={(value) => setDirectProxyDraft(setProxyUsername, value)}
+                    visible={showProxyUsername}
+                    onToggle={() => setShowProxyUsername((value) => !value)}
+                    disabled={isPending || Boolean(proxyResourceId)}
+                    placeholder="可选"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">代理密码</label>
+                  <SecretInput
+                    value={proxyPassword}
+                    onChange={(value) => setDirectProxyDraft(setProxyPassword, value)}
+                    visible={showProxyPassword}
+                    onToggle={() => setShowProxyPassword((value) => !value)}
+                    disabled={isPending || Boolean(proxyResourceId)}
+                    placeholder="可选"
+                  />
+                </div>
+              </div>
             </div>
           </div>
 

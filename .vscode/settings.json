@@ -1,0 +1,10 @@
+{
+  "rust-analyzer.checkOnSave": false,
+  "rust-analyzer.cargo.targetDir": "/tmp/kiro-rs-rust-analyzer-target",
+  "rust-analyzer.cargo.extraEnv": {
+    "CARGO_TARGET_DIR": "/tmp/kiro-rs-rust-analyzer-target"
+  },
+  "rust-analyzer.check.extraEnv": {
+    "CARGO_TARGET_DIR": "/tmp/kiro-rs-rust-analyzer-target"
+  }
+}

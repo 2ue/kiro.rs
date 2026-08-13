@@ -1,0 +1,347 @@
+use super::*;
+use crate::anthropic::body_capabilities::{BodyStageState, LocalKiroBodyPlan};
+use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
+
+pub(super) struct PreparedLocalKiroBody {
+    pub(super) request_body: String,
+    pub(super) kiro_request: KiroRequest,
+    pub(super) conversation_id: String,
+    pub(super) input_tokens: i32,
+    pub(super) payload_breakdown: Option<PayloadByteBreakdown>,
+    pub(super) payload_guard_report: Option<PayloadGuardReport>,
+    pub(super) payload_guard_elapsed: Option<Duration>,
+    pub(super) thinking_enabled: bool,
+    pub(super) tool_name_map: HashMap<String, String>,
+    pub(super) tool_schema_key_map: ToolSchemaKeyMap,
+    pub(super) known_tool_names: HashSet<String>,
+    pub(super) warnings_header: Option<String>,
+    pub(super) extract_xml_thinking: bool,
+    pub(super) too_long_retry: Option<PayloadTooLongRetryRequest>,
+    pub(super) cache_point_retry: Option<CachePointRetryRequest>,
+}
+
+pub(super) fn prepare(
+    endpoint: &str,
+    payload: &MessagesRequest,
+    runtime_config: &RequestRuntimeConfig,
+    cache_route: &ResolvedCacheRoutePolicy,
+    model_resolution: &ModelResolution,
+    native_reasoning_capability: KiroReasoningCapabilityState,
+) -> Result<PreparedLocalKiroBody, Response> {
+    let plan = LocalKiroBodyPlan::compatible_with_config(
+        runtime_config.initial_payload_guard_config(),
+        runtime_config.body_conversion.clone(),
+    );
+    prepare_with_plan(
+        endpoint,
+        payload,
+        runtime_config,
+        cache_route,
+        model_resolution,
+        native_reasoning_capability,
+        plan,
+    )
+}
+
+pub(super) fn prepare_with_plan(
+    endpoint: &str,
+    payload: &MessagesRequest,
+    runtime_config: &RequestRuntimeConfig,
+    cache_route: &ResolvedCacheRoutePolicy,
+    model_resolution: &ModelResolution,
+    native_reasoning_capability: KiroReasoningCapabilityState,
+    plan: LocalKiroBodyPlan,
+) -> Result<PreparedLocalKiroBody, Response> {
+    debug_assert_eq!(plan.profile.as_str(), "local_credential");
+    debug_assert_eq!(plan.conversion, BodyStageState::Enabled);
+    let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
+    let discovered_reasoning_capability = matches!(
+        &native_reasoning_capability,
+        KiroReasoningCapabilityState::Supported(_)
+    );
+    let conversion_result = match convert_request_with_resolved_model(
+        payload,
+        ConverterOptions {
+            compat_profile: runtime_config.compat_profile,
+            conversion: plan.converter,
+            prompt_cache_simulation_mode: converter_prompt_cache_mode,
+            kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
+            kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
+            kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
+            force_visible_thinking: should_force_visible_thinking(payload, runtime_config),
+            native_reasoning_capability,
+            prompt_steering: runtime_config.prompt_steering.clone().normalized(),
+        },
+        model_resolution,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            return Err(conversion_error_response(&e));
+        }
+    };
+
+    let mut kiro_request = KiroRequest {
+        conversation_state: conversion_result.conversation_state,
+        profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
+        tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
+        cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
+    };
+    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
+
+    let too_long_retry = if plan.retry_payloads.is_enabled() {
+        PayloadTooLongRetryRequest::new(
+            &kiro_request,
+            runtime_config,
+            endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            &conversation_id,
+            should_expose_proxy_warnings(runtime_config)
+                .then(|| conversion_result.warnings.encode_header())
+                .flatten(),
+        )
+    } else {
+        None
+    };
+    let prepared_payload =
+        match prepare_kiro_request_body(&mut kiro_request, plan.payload_guard.config) {
+            Ok(result) => result,
+            Err(err) => return Err(payload_guard_error_response(err)),
+        };
+    let request_body = prepared_payload.body;
+    let payload_guard_report = prepared_payload.report;
+    if let Some(report) = payload_guard_report.as_ref() {
+        log_payload_guard_report(
+            report,
+            endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            Some(&conversation_id),
+        );
+    }
+    let payload_breakdown = if plan.diagnostics.is_enabled() {
+        payload_guard_report.as_ref().and_then(|report| {
+            should_log_payload_byte_breakdown(report)
+                .then(|| breakdown_kiro_request(&kiro_request, &request_body))
+        })
+    } else {
+        None
+    };
+    if let Some(report) = payload_guard_report.as_ref() {
+        log_payload_byte_breakdown(
+            payload_breakdown,
+            report,
+            endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            Some(&conversation_id),
+        );
+    }
+    log_kiro_conversion_summary(
+        endpoint,
+        payload,
+        model_resolution,
+        &kiro_request,
+        request_body.len(),
+        payload_guard_report.as_ref(),
+        &conversion_result.warnings,
+        discovered_reasoning_capability,
+    );
+    if model_resolution.is_remapped() {
+        tracing::info!(
+            endpoint,
+            requested_model = %model_resolution.requested_model,
+            upstream_model = ?model_resolution.upstream_model,
+            resolution = %model_resolution.source.as_str(),
+            note = ?model_resolution.note,
+            conversation_id = %conversation_id,
+            "Kiro upstream model mapping applied to request payload"
+        );
+    };
+
+    tracing::debug!(
+        endpoint = endpoint,
+        requested_model = %payload.model,
+        upstream_model = ?model_resolution.upstream_model,
+        conversation_id = %conversation_id,
+        request_bytes = request_body.len(),
+        history_entries = payload_guard_report
+            .as_ref()
+            .map(|report| report.final_history_entries)
+            .unwrap_or_else(|| kiro_request.conversation_state.history.len()),
+        current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
+        current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
+        current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
+        "Kiro request prepared"
+    );
+    let input_tokens = if plan.token_counting.is_enabled() {
+        token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32
+    } else {
+        0
+    };
+    let thinking_enabled = should_expose_downstream_thinking(payload, &kiro_request);
+    let warnings_header = if should_expose_proxy_warnings(runtime_config) {
+        merge_warning_headers(
+            conversion_result.warnings.encode_header(),
+            payload_guard_report.as_ref(),
+        )
+    } else {
+        None
+    };
+    let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
+    let cache_point_retry = if plan.retry_payloads.is_enabled() {
+        CachePointRetryRequest::new(
+            &kiro_request,
+            endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            &conversation_id,
+        )
+    } else {
+        None
+    };
+
+    Ok(PreparedLocalKiroBody {
+        request_body,
+        kiro_request,
+        conversation_id,
+        input_tokens,
+        payload_breakdown,
+        payload_guard_report,
+        payload_guard_elapsed: prepared_payload.guard_elapsed,
+        thinking_enabled,
+        tool_name_map: conversion_result.tool_name_map,
+        tool_schema_key_map: conversion_result.tool_schema_key_map,
+        known_tool_names: conversion_result.known_tool_names,
+        warnings_header,
+        extract_xml_thinking,
+        too_long_retry,
+        cache_point_retry,
+    })
+}
+
+fn should_expose_downstream_thinking(
+    payload: &MessagesRequest,
+    kiro_request: &KiroRequest,
+) -> bool {
+    if payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "disabled")
+    {
+        return false;
+    }
+    payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false)
+        || payload.output_config.is_some()
+        || kiro_request
+            .additional_model_request_fields
+            .as_ref()
+            .is_some_and(|fields| {
+                fields.output_config.is_some()
+                    || fields.reasoning.is_some()
+                    || fields.thinking.is_some()
+            })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+    use crate::kiro::model::requests::{
+        conversation::{ConversationState, CurrentMessage, UserInputMessage},
+        kiro::{AdditionalModelRequestFields, KiroOutputConfig, KiroThinkingConfig},
+    };
+
+    fn messages_request(
+        thinking_type: Option<&str>,
+        output_effort: Option<&str>,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-4.8".to_string(),
+            max_tokens: 64_000,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: thinking_type.map(|thinking_type| Thinking {
+                thinking_type: thinking_type.to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: output_effort.map(|effort| OutputConfig {
+                effort: Some(effort.to_string()),
+            }),
+            metadata: None,
+        }
+    }
+
+    fn kiro_request_with_native_output_config() -> KiroRequest {
+        KiroRequest {
+            conversation_state: ConversationState::new("conv").with_current_message(
+                CurrentMessage::new(UserInputMessage::new("hello", "claude-opus-4.8")),
+            ),
+            profile_arn: None,
+            additional_model_request_fields: Some(AdditionalModelRequestFields {
+                thinking: Some(KiroThinkingConfig {
+                    thinking_type: "adaptive".to_string(),
+                    display: None,
+                }),
+                output_config: Some(KiroOutputConfig {
+                    effort: "max".to_string(),
+                }),
+                reasoning: None,
+            }),
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
+        }
+    }
+
+    #[test]
+    fn disabled_thinking_suppresses_downstream_thinking_even_with_native_effort_for_five_rounds() {
+        let kiro_request = kiro_request_with_native_output_config();
+        for round in 0..5 {
+            assert!(
+                !should_expose_downstream_thinking(
+                    &messages_request(Some("disabled"), Some("max")),
+                    &kiro_request,
+                ),
+                "round {round}: client disabled thinking must control downstream visibility"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_or_omitted_thinking_with_output_effort_exposes_downstream_thinking_for_five_rounds()
+    {
+        let kiro_request = kiro_request_with_native_output_config();
+        for round in 0..5 {
+            assert!(
+                should_expose_downstream_thinking(
+                    &messages_request(Some("adaptive"), Some("max")),
+                    &kiro_request,
+                ),
+                "round {round}: adaptive thinking remains visible"
+            );
+            assert!(
+                should_expose_downstream_thinking(
+                    &messages_request(None, Some("max")),
+                    &kiro_request
+                ),
+                "round {round}: omitted thinking with explicit effort keeps prior output_config behavior"
+            );
+        }
+    }
+}

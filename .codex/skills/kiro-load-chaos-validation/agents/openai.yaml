@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kiro Load Chaos Validation"
+  short_description: "Validate load chaos and resource stability."
+  default_prompt: "Run or plan kiro.rs load and chaos validation for scheduler, rate limit, cache, and resource stability."

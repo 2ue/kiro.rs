@@ -1,0 +1,16 @@
+probe_time=2026-07-26 16:17:14 CST +0800
+host GET /
+curl: (28) Operation timed out after 3002 milliseconds with 0 bytes received
+http=000 time=3.002259
+
+host POST /v1/messages empty body
+curl: (28) Operation timed out after 5002 milliseconds with 0 bytes received
+http=000 time=5.002591
+
+container wget /v1/messages
+Connecting to 127.0.0.1:8990 (127.0.0.1:8990)
+Terminated
+rc=143
+
+TCP check
+Connection to 127.0.0.1 59137 port [tcp/*] succeeded!

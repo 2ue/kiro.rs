@@ -1,0 +1,35 @@
+captured_at_host=2026-07-26T16:26:03+08:00
+NAME                         IMAGE                        COMMAND                  SERVICE    CREATED        STATUS                    PORTS
+kiro-rs-2ue-59137-app        ghcr.io/2ue/kiro-rs:latest   "./kiro-rs -c /app/c…"   kiro-rs    7 hours ago    Up 35 seconds (healthy)   0.0.0.0:59137->8990/tcp, [::]:59137->8990/tcp
+kiro-rs-2ue-59137-postgres   postgres:18-alpine           "docker-entrypoint.s…"   postgres   20 hours ago   Up 20 hours (healthy)     5432/tcp
+kiro-rs-2ue-59137-redis      redis:8-alpine               "docker-entrypoint.s…"   redis      20 hours ago   Up 20 hours (healthy)     6379/tcp
+
+## HTTP probes after app restart
+http://127.0.0.1:59137/healthz
+  HTTP/1.1 200 OK
+  content-type: application/json
+  content-length: 35
+  date: Sun, 26 Jul 2026 08:26:04 GMT
+{"service":"kiro-rs","status":"ok"}exit=0
+http://127.0.0.1:59137/readyz
+  HTTP/1.1 200 OK
+  content-type: application/json
+  content-length: 146
+  date: Sun, 26 Jul 2026 08:26:04 GMT
+{"checks":{"postgres":true,"redis":true,"redisRuntimeEvents":true},"lastRedisRuntimeEventAtMs":0,"lastRedisSubscribeErrorAtMs":0,"status":"ready"}exit=0
+http://127.0.0.1:59137/v1/models
+  HTTP/1.1 401 Unauthorized
+  content-type: application/json
+  request-id: req_01UzPifocSjXMBYb86yEgw78
+  anthropic-request-id: req_01UzPifocSjXMBYb86yEgw78
+  vary: origin, access-control-request-method, access-control-request-headers
+  access-control-allow-origin: *
+  content-length: 128
+  date: Sun, 26 Jul 2026 08:26:04 GMT
+exit=0
+
+## socket summary after restart
+LISTEN 1
+TIME_WAIT 1
+total_8990=2
+tcp        0      0 0.0.0.0:8990            0.0.0.0:*               LISTEN      

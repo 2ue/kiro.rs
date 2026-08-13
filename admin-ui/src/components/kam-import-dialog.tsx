@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp, RotateCw } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -9,9 +9,18 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { useCredentials, useAddCredential, useDeleteCredential, useProxyResources } from '@/hooks/use-credentials'
+import {
+  CredentialParameterDefaultsPanel,
+  initialParameterDefaults,
+  mergeCredentialDefaults,
+  optionalTrimmed,
+} from '@/components/credential-parameter-defaults'
+import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import { camelizeKeys } from '@/lib/object-keys'
+import type { AddCredentialRequest } from '@/types/api'
 
 interface KamImportDialogProps {
   open: boolean
@@ -24,10 +33,17 @@ interface KamAccount {
   userId?: string | null
   nickname?: string
   credentials: {
+    accessToken?: string
+    expiresAt?: string
     refreshToken: string
     clientId?: string
     clientSecret?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
+    profileArn?: string
     region?: string
+    apiRegion?: string
     authMethod?: string
     startUrl?: string
   }
@@ -37,57 +53,130 @@ interface KamAccount {
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
+  status: 'pending' | 'checking' | 'importing' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
+  account?: KamAccount
   error?: string
-  usage?: string
+  model?: string
+  response?: string
   email?: string
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
 }
 
+type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 
+type JsonObject = Record<string, unknown>
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function profileArnRegion(profileArn: string | undefined): string | undefined {
+  if (!profileArn) return undefined
+  const parts = profileArn.trim().split(':')
+  if (parts.length < 6 || parts[0] !== 'arn' || parts[2] !== 'codewhisperer') return undefined
+  return parts[3]?.trim() || undefined
+}
+
+function stringLikeField(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) {
+    const trimmed = value.trim()
+    if (/^\d+(\.\d+)?$/.test(trimmed)) return timestampToIsoString(Number(trimmed))
+    return trimmed
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return timestampToIsoString(value)
+  }
+  return undefined
+}
+
+function timestampToIsoString(value: number): string | undefined {
+  if (!Number.isFinite(value)) return undefined
+  const millis = value > 10_000_000_000 ? value : value * 1000
+  const date = new Date(millis)
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined
+}
+
+async function verifyImportedCredential(
+  credentialId: number,
+  mode: ImportVerificationMode,
+  refreshInfoAfterModelTest: boolean
+): Promise<{ model: string; response: string }> {
+  if (mode === 'subscription_only') {
+    const info = await getCredentialBalance(credentialId)
+    return {
+      model: '订阅查询',
+      response: `订阅: ${info.subscriptionTitle || '未知'}，用量 ${info.currentUsage}/${info.usageLimit}`,
+    }
+  }
+
+  const testResult = await testCredential(credentialId, {
+    model: DEFAULT_TEST_MODEL,
+    prompt: DEFAULT_TEST_PROMPT,
+  })
+  if (refreshInfoAfterModelTest) {
+    try {
+      await getCredentialBalance(credentialId)
+    } catch (error) {
+      toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+    }
+  }
+  return {
+    model: testModelLabel(testResult.model),
+    response: testResult.response,
+  }
+}
 
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
 function normalizeKamAccount(item: unknown): unknown {
-  if (typeof item !== 'object' || item === null) return item
-  const obj = item as Record<string, unknown>
-  // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    const email = typeof obj.email === 'string' ? obj.email : undefined
-    const userId =
-      typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
-    const nickname =
-      typeof obj.nickname === 'string'
-        ? obj.nickname
-        : typeof obj.label === 'string'
-          ? (obj.label as string)
-          : undefined
-    const status = typeof obj.status === 'string' ? obj.status : undefined
-    const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
-    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
-    const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
-    const region = typeof obj.region === 'string' ? obj.region : undefined
-    const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
-    const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
-
-    return {
-      email,
-      userId,
-      nickname,
-      status,
-      machineId,
-      credentials: {
-        refreshToken: obj.refreshToken,
-        clientId,
-        clientSecret,
-        region,
-        authMethod,
-        startUrl,
-      },
-    }
+  const normalized = camelizeKeys(item)
+  if (!isObject(normalized)) return normalized
+  const obj = normalized
+  const nested = isObject(obj.credentials) ? obj.credentials : undefined
+  const source = nested ?? obj
+  const refreshToken = stringField(source.refreshToken)
+  if (!refreshToken) {
+    return normalized
   }
-  return item
+  const profileArn = stringField(source.profileArn)
+
+  return {
+    email: stringField(obj.email),
+    userId: typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined,
+    nickname: stringField(obj.nickname) ?? stringField(obj.label),
+    status: stringField(obj.status),
+    machineId: stringField(obj.machineId) ?? stringField(source.machineId),
+    credentials: {
+      accessToken: stringField(source.accessToken),
+      expiresAt: stringLikeField(source.expiresAt) ?? stringLikeField(source.expired),
+      refreshToken,
+      clientId: stringField(source.clientId),
+      clientSecret: stringField(source.clientSecret),
+      tokenEndpoint: stringField(source.tokenEndpoint),
+      issuerUrl: stringField(source.issuerUrl),
+      scopes: stringField(source.scopes) ?? stringField(source.scope),
+      profileArn,
+      region: stringField(source.region),
+      apiRegion: stringField(source.apiRegion) ?? profileArnRegion(profileArn),
+      authMethod: stringField(source.authMethod),
+      startUrl: stringField(source.startUrl),
+    },
+  }
+}
+
+function normalizedKamAuthMethod(method: unknown): AddCredentialRequest['authMethod'] | undefined {
+  const compact = stringField(method)?.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (!compact) return undefined
+  if (compact === 'externalidp' || compact === 'enterprise' || compact === 'iamsso' || compact === 'awsidc') return 'external_idp'
+  if (compact === 'idc' || compact === 'builderid' || compact === 'iam') return 'idc'
+  if (compact === 'social') return 'social'
+  if (compact === 'apikey') return 'api_key'
+  return undefined
 }
 
 // 校验元素是否为有效的 KAM 账号结构
@@ -101,7 +190,7 @@ function isValidKamAccount(item: unknown): item is KamAccount {
 
 // 解析 KAM 导出 JSON，支持单账号和多账号格式
 function parseKamJson(raw: string): KamAccount[] {
-  const parsed = JSON.parse(raw)
+  const parsed = camelizeKeys(JSON.parse(raw)) as Record<string, unknown>
 
   let rawItems: unknown[]
 
@@ -141,17 +230,43 @@ function parseKamJson(raw: string): KamAccount[] {
   return validAccounts
 }
 
+async function parseKamFiles(files: File[]): Promise<{ accounts: KamAccount[]; errors: string[] }> {
+  const accounts: KamAccount[] = []
+  const errors: string[] = []
+
+  for (const file of files) {
+    try {
+      const parsed = parseKamJson(await file.text())
+      if (parsed.length === 0) {
+        errors.push(`${file.name}: 未找到有效账号`)
+      } else {
+        accounts.push(...parsed)
+      }
+    } catch (error) {
+      errors.push(`${file.name}: ${extractErrorMessage(error)}`)
+    }
+  }
+
+  return { accounts, errors }
+}
+
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
+  const [skipVerification, setSkipVerification] = useState(true)
+  const [refreshInfoAfterModelTest, setRefreshInfoAfterModelTest] = useState(false)
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [defaults, setDefaults] = useState(initialParameterDefaults)
 
-  const { data: existingCredentials } = useCredentials()
+  const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -172,27 +287,64 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setDefaults(initialParameterDefaults())
+    setVerificationMode('subscription_only')
+    setSkipVerification(true)
+    setRefreshInfoAfterModelTest(false)
   }
 
-  const handleImport = async () => {
-    // 先单独解析 JSON，给出精准的错误提示
-    let validAccounts: KamAccount[]
-    try {
-      const accounts = parseKamJson(jsonInput)
-
-      if (accounts.length === 0) {
-        toast.error('没有可导入的账号')
-        return
-      }
-
-      validAccounts = accounts.filter(a => a.credentials?.refreshToken)
-      if (validAccounts.length === 0) {
-        toast.error('没有包含有效 refreshToken 的账号')
-        return
-      }
-    } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (files.length === 0) {
       return
+    }
+
+    const result = await parseKamFiles(files)
+    if (result.accounts.length > 0) {
+      const current = jsonInput.trim()
+      let existing: KamAccount[] = []
+      if (current) {
+        try {
+          existing = parseKamJson(current)
+        } catch {
+          existing = []
+        }
+      }
+      setJsonInput(JSON.stringify({ accounts: [...existing, ...result.accounts] }, null, 2))
+      toast.success(`已从 ${files.length} 个文件读取 ${result.accounts.length} 个账号`)
+    }
+    if (result.errors.length > 0) {
+      toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
+    }
+    if (result.accounts.length === 0 && result.errors.length === 0) {
+      toast.error('没有读取到有效账号')
+    }
+  }
+
+  const handleImport = async (retryAccounts?: KamAccount[]) => {
+    let validAccounts: KamAccount[]
+    if (retryAccounts) {
+      validAccounts = retryAccounts
+    } else {
+      // 先单独解析 JSON，给出精准的错误提示
+      try {
+        const accounts = parseKamJson(jsonInput)
+
+        if (accounts.length === 0) {
+          toast.error('没有可导入的账号')
+          return
+        }
+
+        validAccounts = accounts.filter(a => a.credentials?.refreshToken)
+        if (validAccounts.length === 0) {
+          toast.error('没有包含有效 refreshToken 的账号')
+          return
+        }
+      } catch (error) {
+        toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+        return
+      }
     }
 
     try {
@@ -203,9 +355,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       // 初始化结果，标记 error 状态的账号
       const initialResults: VerificationResult[] = validAccounts.map((account, i) => {
         if (skipErrorAccounts && account.status === 'error') {
-          return { index: i + 1, status: 'skipped' as const, email: account.email || account.nickname }
+          return { index: i + 1, status: 'skipped' as const, email: account.email || account.nickname, account }
         }
-        return { index: i + 1, status: 'pending' as const, email: account.email || account.nickname }
+        return { index: i + 1, status: 'pending' as const, email: account.email || account.nickname, account }
       })
       setResults(initialResults)
 
@@ -248,47 +400,88 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
           setResults(prev => {
             const next = [...prev]
-            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || account.email }
+            next[i] = { ...next[i], status: 'duplicate', error: '该账号已存在', email: existingCred?.email || account.email }
             return next
           })
           setProgress({ current: i + 1, total: validAccounts.length })
           continue
         }
 
-        // 验活中
+        // 导入/验活中
         setResults(prev => {
           const next = [...prev]
-          next[i] = { ...next[i], status: 'verifying' }
+          next[i] = { ...next[i], status: skipVerification ? 'importing' : 'verifying' }
           return next
         })
 
         let addedCredId: number | null = null
 
         try {
-          const clientId = cred.clientId?.trim() || undefined
-          const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const clientId = stringField(cred.clientId)
+          const clientSecret = stringField(cred.clientSecret)
+          const authMethod = normalizedKamAuthMethod(cred.authMethod) === 'external_idp'
+            ? 'external_idp'
+            : normalizedKamAuthMethod(cred.authMethod) === 'idc' || (clientId && clientSecret)
+              ? 'idc'
+              : 'social'
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
+          if (authMethod === 'external_idp' && !clientId) {
+            throw new Error('external_idp 模式需要提供 clientId')
+          }
+          if (authMethod === 'social' && (clientId || clientSecret)) {
+            throw new Error('social 模式不应提供 clientId 或 clientSecret；企业 SSO 请设置 authMethod 为 external_idp')
+          }
 
-          const addedCred = await addCredential({
+          const accountRegion = optionalTrimmed(cred.region) || optionalTrimmed(defaults.region)
+          const baseCredential: AddCredentialRequest = {
             refreshToken: token,
             authMethod,
-            email: account.email?.trim() || undefined,
-            authRegion: cred.region?.trim() || undefined,
+            accessToken: stringField(cred.accessToken),
+            expiresAt: stringLikeField(cred.expiresAt),
+            email: stringField(account.email),
+            profileArn: stringField(cred.profileArn),
+            region: stringField(cred.region),
+            authRegion: optionalTrimmed(defaults.authRegion) || accountRegion,
+            apiRegion: stringField(cred.apiRegion),
             clientId,
-            clientSecret,
-            machineId: account.machineId?.trim() || undefined,
-          })
+            clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+            tokenEndpoint: authMethod === 'external_idp' ? stringField(cred.tokenEndpoint) : undefined,
+            issuerUrl: authMethod === 'external_idp' ? stringField(cred.issuerUrl) : undefined,
+            scopes: authMethod === 'external_idp' ? stringField(cred.scopes) : undefined,
+            machineId: stringField(account.machineId),
+          }
+          const addedCred = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
 
           addedCredId = addedCred.credentialId
 
+          if (skipVerification) {
+            successCount++
+            existingTokenHashes.add(tokenHash)
+            setCurrentProcessing(`导入成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
+            setResults(prev => {
+              const next = [...prev]
+              next[i] = {
+                ...next[i],
+                status: 'verified',
+                email: addedCred.email || account.email,
+                credentialId: addedCred.credentialId,
+              }
+              return next
+            })
+            setProgress({ current: i + 1, total: validAccounts.length })
+            continue
+          }
+
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const balance = await getCredentialBalance(addedCred.credentialId)
+          const verification = await verifyImportedCredential(
+            addedCred.credentialId,
+            verificationMode,
+            refreshInfoAfterModelTest
+          )
 
           successCount++
           existingTokenHashes.add(tokenHash)
@@ -298,7 +491,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             next[i] = {
               ...next[i],
               status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
+              model: verification.model,
+              response: verification.response,
               email: addedCred.email || account.email,
               credentialId: addedCred.credentialId,
             }
@@ -343,7 +537,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
 
       if (failCount === 0 && duplicateCount === 0 && skippedCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个凭据`)
+        toast.success(skipVerification ? `成功导入 ${successCount} 个账号` : `成功导入并验活 ${successCount} 个账号`)
       } else {
         toast.info(`导入完成：${parts.join('，')}`)
       }
@@ -354,11 +548,26 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
   }
 
+  const failedAccounts = results
+    .filter((result): result is VerificationResult & { account: KamAccount } => (
+      result.status === 'failed' && Boolean(result.account)
+    ))
+    .map((result) => result.account)
+
+  const handleRetryFailed = async () => {
+    if (failedAccounts.length === 0) {
+      toast.error('没有可重试的失败账号')
+      return
+    }
+    await handleImport(failedAccounts)
+  }
+
   const getStatusIcon = (status: VerificationResult['status']) => {
     switch (status) {
       case 'pending':
         return <div className="w-5 h-5 rounded-full border-2 border-gray-300" />
       case 'checking':
+      case 'importing':
       case 'verifying':
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
       case 'verified':
@@ -376,11 +585,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     switch (result.status) {
       case 'pending': return '等待中'
       case 'checking': return '检查重复...'
+      case 'importing': return '导入中...'
       case 'verifying': return '验活中...'
-      case 'verified': return '验活成功'
-      case 'duplicate': return '重复凭据'
+      case 'verified': return result.model ? '验活成功' : '导入成功'
+      case 'duplicate': return '重复账号'
       case 'skipped': return '已跳过（error 状态）'
       case 'failed':
+        if (skipVerification) return '导入失败'
         if (result.rollbackStatus === 'success') return '验活失败（已排除）'
         if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
         return '验活失败（未创建）'
@@ -410,19 +621,88 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>KAM 账号导入（自动验活）</DialogTitle>
+          <DialogTitle>KAM 账号导入（默认查询订阅）</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-sm font-medium">KAM 导出 JSON</label>
+              <Button type="button" variant="outline" size="sm" disabled={importing} asChild>
+                <label className="cursor-pointer">
+                  <FileUp className="h-4 w-4 mr-2" />
+                  选择文件
+                  <input
+                    type="file"
+                    accept=".json,.jsonl,.txt,application/json"
+                    multiple
+                    className="hidden"
+                    onChange={handleFileSelect}
+                    disabled={importing}
+                  />
+                </label>
+              </Button>
+            </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON，或选择一个/多个文件\n\n每个文件可以包含单个账号，也可以包含 accounts 数组或账号数组。\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
+            <p className="text-xs text-muted-foreground">
+              支持单选或多选文件，每个文件可包含单个账号或多个账号。
+            </p>
+          </div>
+
+          <CredentialParameterDefaultsPanel
+            defaults={defaults}
+            onChange={setDefaults}
+            proxyResources={proxyResourceOptions}
+            disabled={importing}
+            title="KAM 导入默认参数"
+          />
+
+          <div className="rounded-md border bg-muted/20 p-3">
+            <div className="text-sm font-semibold">
+              验活方式
+            </div>
+            <label className="mt-2 flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={skipVerification}
+                onChange={(event) => setSkipVerification(event.target.checked)}
+                disabled={importing}
+                className="rounded border-gray-300"
+              />
+              跳过验活
+            </label>
+            {!skipVerification && (
+              <div className="mt-2 space-y-2">
+                <select
+                  id="kamImportVerificationMode"
+                  value={verificationMode}
+                  onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
+                  disabled={importing}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="subscription_only">查询订阅/积分</option>
+                  <option value="model_and_subscription">测试模型</option>
+                </select>
+                {verificationMode === 'model_and_subscription' && (
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={refreshInfoAfterModelTest}
+                      onChange={(event) => setRefreshInfoAfterModelTest(event.target.checked)}
+                      disabled={importing}
+                      className="rounded border-gray-300"
+                    />
+                    同步查询订阅/积分
+                  </label>
+                )}
+              </div>
+            )}
           </div>
 
           {/* 解析预览 */}
@@ -497,8 +777,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                             {getStatusText(result)}
                           </span>
                         </div>
-                        {result.usage && (
-                          <div className="text-xs text-muted-foreground mt-1">用量: {result.usage}</div>
+                        {result.model && (
+                          <div className="text-xs text-muted-foreground mt-1">模型: {result.model}</div>
+                        )}
+                        {result.response && (
+                          <div className="text-xs text-muted-foreground mt-1 line-clamp-2">
+                            响应: {result.response}
+                          </div>
                         )}
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>
@@ -524,13 +809,24 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           >
             {importing ? '导入中...' : results.length > 0 ? '关闭' : '取消'}
           </Button>
+          {results.length > 0 && failedAccounts.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleRetryFailed}
+              disabled={importing}
+            >
+              <RotateCw className="h-4 w-4 mr-2" />
+              重试失败账号
+            </Button>
+          )}
           {results.length === 0 && (
             <Button
               type="button"
-              onClick={handleImport}
+              onClick={() => handleImport()}
               disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
             >
-              开始导入并验活
+              开始导入
             </Button>
           )}
         </DialogFooter>

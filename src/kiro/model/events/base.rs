@@ -18,6 +18,8 @@ pub enum EventType {
     Metadata,
     /// 计费事件
     Metering,
+    /// 代码内容事件（Amazon Q CLI 风格流）
+    Code,
     /// 上下文使用率事件
     ContextUsage,
     /// 消息元数据事件
@@ -37,6 +39,7 @@ impl EventType {
             "reasoningContentEvent" => Self::ReasoningContent,
             "metadataEvent" => Self::Metadata,
             "meteringEvent" => Self::Metering,
+            "codeEvent" => Self::Code,
             "contextUsageEvent" => Self::ContextUsage,
             "messageMetadataEvent" => Self::MessageMetadata,
             "invalidStateEvent" => Self::InvalidState,
@@ -52,6 +55,7 @@ impl EventType {
             Self::ReasoningContent => "reasoningContentEvent",
             Self::Metadata => "metadataEvent",
             Self::Metering => "meteringEvent",
+            Self::Code => "codeEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::MessageMetadata => "messageMetadataEvent",
             Self::InvalidState => "invalidStateEvent",
@@ -88,7 +92,9 @@ pub enum Event {
     /// 元数据
     Metadata(super::MetadataEvent),
     /// 计费
-    Metering(()),
+    Metering(super::MeteringEvent),
+    /// 代码内容
+    Code(super::CodeEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
     /// 消息元数据
@@ -148,7 +154,14 @@ impl Event {
                 let payload = super::MetadataEvent::from_frame(&frame)?;
                 Ok(Self::Metadata(payload))
             }
-            EventType::Metering => Ok(Self::Metering(())),
+            EventType::Metering => {
+                let payload = super::MeteringEvent::from_frame(&frame)?;
+                Ok(Self::Metering(payload))
+            }
+            EventType::Code => {
+                let payload = super::CodeEvent::from_frame(&frame)?;
+                Ok(Self::Code(payload))
+            }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
@@ -208,6 +221,7 @@ mod tests {
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
+        assert_eq!(EventType::from_str("codeEvent"), EventType::Code);
         assert_eq!(
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
@@ -240,6 +254,8 @@ mod tests {
             "reasoningContentEvent"
         );
         assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
+        assert_eq!(EventType::Metering.as_str(), "meteringEvent");
+        assert_eq!(EventType::Code.as_str(), "codeEvent");
         assert_eq!(EventType::MessageMetadata.as_str(), "messageMetadataEvent");
         assert_eq!(EventType::InvalidState.as_str(), "invalidStateEvent");
     }

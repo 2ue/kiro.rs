@@ -7,17 +7,11 @@
 //! - 启用/禁用凭据
 //! - 修改凭据优先级
 //! - 重置失败计数
-//! - 查询凭据余额
+//! - 查询凭据账号信息
 //!
 //! # 使用
 //! ```ignore
-//! let admin_service = AdminService::new(
-//!     token_manager.clone(),
-//!     endpoint_names,
-//!     usage_recorder,
-//!     prompt_cache,
-//!     10_000,
-//! );
+//! let admin_service = AdminService::new(AdminServiceDependencies { /* ... */ });
 //! let admin_state = AdminState::new(admin_api_key, admin_service);
 //! let admin_router = create_admin_router(admin_state);
 //! ```
@@ -31,4 +25,4 @@ pub mod types;
 
 pub use middleware::AdminState;
 pub use router::create_admin_router;
-pub use service::AdminService;
+pub use service::{AdminService, AdminServiceDependencies};

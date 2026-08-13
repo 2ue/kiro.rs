@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kiro Prod Evidence Audit"
+  short_description: "Read-only production evidence collection and issue clustering"
+  default_prompt: "Use $kiro-prod-evidence-audit to collect read-only production evidence, classify errors, and package a local diagnostic archive."

@@ -1,0 +1,33 @@
+evidence_dir=/root/docker-compose/kiro-rs-2ue-59137/incident-evidence-20260726T161622+0800
+captured_at=2026-07-26 16:18:17 CST +0800
+
+compose images
+CONTAINER                    REPOSITORY            TAG                 PLATFORM            IMAGE ID            SIZE                CREATED
+kiro-rs-2ue-59137-app        ghcr.io/2ue/kiro-rs   latest              linux/amd64         ad8f06f15d20        18.8MB              10 hours ago
+kiro-rs-2ue-59137-postgres   postgres              18-alpine           linux/amd64         9a8afca54e78        120MB               2 weeks ago
+kiro-rs-2ue-59137-redis      redis                 8-alpine            linux/amd64         8096655e4377        37.6MB              39 hours ago
+
+app image inspect digest/id
+Id=sha256:ad8f06f15d200d4a812327012f3a74bd0ab439b1ed710e9655b84f3ca707cfe2 RepoDigests=["ghcr.io/2ue/kiro-rs@sha256:ad8f06f15d200d4a812327012f3a74bd0ab439b1ed710e9655b84f3ca707cfe2"] Created=2026-07-25T21:49:50.273941407Z
+
+source git
+6751bf043d260b072b7bb0704b69b0b4ac67362f
+?? docs/testing/apiv3-focused-direct-analysis-20260722.md
+?? docs/testing/apiv3-focused-direct-results-20260722.jsonl
+?? docs/testing/external-upstream-usage-direct-analysis-20260722.md
+?? docs/testing/external-upstream-usage-direct-cases-20260722.jsonl
+?? docs/testing/external-upstream-usage-direct-results-20260722.jsonl
+?? docs/testing/external-usage-zero-production-analysis-20260722.md
+?? docs/testing/kkkkyue-high-maxtokens-direct-analysis-20260722.md
+?? docs/testing/kkkkyue-high-maxtokens-direct-results-20260722.jsonl
+
+evidence files
+00-manifest.txt 1567 bytes
+01-process-and-containers.txt 1478 bytes
+02-sockets-and-fds.txt 2196 bytes
+03-http-probes.txt 445 bytes
+04-postgres-incident-summary.txt 26283 bytes
+05-redis-summary.txt 351 bytes
+06-app-docker-inspect.json 12347 bytes
+07-app-logs-0635-0647Z.txt 3033201 bytes
+08-app-logs-tail500.txt 243706 bytes

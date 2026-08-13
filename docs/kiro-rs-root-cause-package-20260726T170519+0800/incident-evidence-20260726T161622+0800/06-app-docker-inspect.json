@@ -1,0 +1,324 @@
+[
+    {
+        "Id": "058d2a6424d3ac7ba094897c9f48e6992071fc1c9b681c6047a8454bbac9b47c",
+        "Created": "2026-07-26T01:40:02.221557901Z",
+        "Path": "./kiro-rs",
+        "Args": [
+            "-c",
+            "/app/config/config.json",
+            "--credentials",
+            "/app/config/credentials.json"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 2173106,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-07-26T01:40:13.097964194Z",
+            "FinishedAt": "0001-01-01T00:00:00Z",
+            "Health": {
+                "Status": "healthy",
+                "FailingStreak": 0,
+                "Log": [
+                    {
+                        "Start": "2026-07-26T16:15:36.292623794+08:00",
+                        "End": "2026-07-26T16:15:36.358190898+08:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-26T16:16:06.358752198+08:00",
+                        "End": "2026-07-26T16:16:06.406149562+08:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-26T16:16:36.406758069+08:00",
+                        "End": "2026-07-26T16:16:36.4583676+08:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-26T16:17:06.458987977+08:00",
+                        "End": "2026-07-26T16:17:06.506227719+08:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    },
+                    {
+                        "Start": "2026-07-26T16:17:36.507228387+08:00",
+                        "End": "2026-07-26T16:17:36.554317457+08:00",
+                        "ExitCode": 0,
+                        "Output": ""
+                    }
+                ]
+            }
+        },
+        "Image": "sha256:ad8f06f15d200d4a812327012f3a74bd0ab439b1ed710e9655b84f3ca707cfe2",
+        "ResolvConfPath": "/var/lib/docker/containers/058d2a6424d3ac7ba094897c9f48e6992071fc1c9b681c6047a8454bbac9b47c/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/058d2a6424d3ac7ba094897c9f48e6992071fc1c9b681c6047a8454bbac9b47c/hostname",
+        "HostsPath": "/var/lib/docker/containers/058d2a6424d3ac7ba094897c9f48e6992071fc1c9b681c6047a8454bbac9b47c/hosts",
+        "LogPath": "/var/lib/docker/containers/058d2a6424d3ac7ba094897c9f48e6992071fc1c9b681c6047a8454bbac9b47c/058d2a6424d3ac7ba094897c9f48e6992071fc1c9b681c6047a8454bbac9b47c-json.log",
+        "Name": "/kiro-rs-2ue-59137-app",
+        "RestartCount": 0,
+        "Driver": "overlayfs",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "docker-default",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": [
+                "/root/docker-compose/kiro-rs-2ue-59137/config:/app/config:rw"
+            ],
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "kiro-rs-2ue-59137-net",
+            "PortBindings": {
+                "8990/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "59137"
+                    }
+                ]
+            },
+            "RestartPolicy": {
+                "Name": "unless-stopped",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": null,
+            "DnsSearch": null,
+            "ExtraHosts": [
+                "host.docker.internal:host-gateway"
+            ],
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": null,
+            "BlkioDeviceReadBps": null,
+            "BlkioDeviceWriteBps": null,
+            "BlkioDeviceReadIOps": null,
+            "BlkioDeviceWriteIOps": null,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": null,
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Source": "de510b373927a7ca02cf794c4f33a3ebbf00a7f75a90488b90c3d6415d3ba9a3",
+                    "Target": "/app/logs"
+                }
+            ],
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "Storage": {
+            "RootFS": {
+                "Snapshot": {
+                    "Name": "overlayfs"
+                }
+            }
+        },
+        "Mounts": [
+            {
+                "Type": "bind",
+                "Source": "/root/docker-compose/kiro-rs-2ue-59137/config",
+                "Destination": "/app/config",
+                "Mode": "rw",
+                "RW": true,
+                "Propagation": "rprivate"
+            },
+            {
+                "Type": "volume",
+                "Name": "de510b373927a7ca02cf794c4f33a3ebbf00a7f75a90488b90c3d6415d3ba9a3",
+                "Source": "/var/lib/docker/volumes/de510b373927a7ca02cf794c4f33a3ebbf00a7f75a90488b90c3d6415d3ba9a3/_data",
+                "Destination": "/app/logs",
+                "Driver": "local",
+                "Mode": "z",
+                "RW": true,
+                "Propagation": ""
+            }
+        ],
+        "Config": {
+            "Hostname": "058d2a6424d3",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "ExposedPorts": {
+                "8990/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "KIRO_RS_POSTGRES_URL=postgres://kiro_rs_59137:pg_a7e1b09aab26017aa808cdad98b588aa088bfc750b6a1d46@postgres:5432/kiro_rs_59137",
+                "KIRO_RS_REDIS_URL=redis://:redis_312c20f02a129cd84d724ab1985e7101122ed69b989d60c6@redis:6379/0",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ],
+            "Cmd": [
+                "./kiro-rs",
+                "-c",
+                "/app/config/config.json",
+                "--credentials",
+                "/app/config/credentials.json"
+            ],
+            "Healthcheck": {
+                "Test": [
+                    "CMD-SHELL",
+                    "nc -z 127.0.0.1 8990 || exit 1"
+                ],
+                "Interval": 30000000000,
+                "Timeout": 5000000000,
+                "StartPeriod": 20000000000,
+                "Retries": 3
+            },
+            "Image": "ghcr.io/2ue/kiro-rs:latest",
+            "Volumes": {
+                "/app/config": {},
+                "/app/logs": {}
+            },
+            "WorkingDir": "/app",
+            "Entrypoint": null,
+            "Labels": {
+                "com.docker.compose.config-hash": "b9c44c7562fea8119c3e353c03f0078ea90eef22da252a852c5503adb9ae96a9",
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.depends_on": "redis:service_healthy:false,postgres:service_healthy:false",
+                "com.docker.compose.image": "sha256:ad8f06f15d200d4a812327012f3a74bd0ab439b1ed710e9655b84f3ca707cfe2",
+                "com.docker.compose.oneoff": "False",
+                "com.docker.compose.project": "kiro-rs-2ue-59137",
+                "com.docker.compose.project.config_files": "/root/docker-compose/kiro-rs-2ue-59137/docker-compose.yml",
+                "com.docker.compose.project.working_dir": "/root/docker-compose/kiro-rs-2ue-59137",
+                "com.docker.compose.replace": "kiro-rs-2ue-59137-app",
+                "com.docker.compose.service": "kiro-rs",
+                "com.docker.compose.version": "5.3.0",
+                "org.opencontainers.image.description": "Kiro.rs Docker Image",
+                "org.opencontainers.image.revision": "3bfab8c9dc138062cad3c3cd1682c410bd6a263b",
+                "org.opencontainers.image.source": "https://github.com/2ue/kiro.rs",
+                "org.opencontainers.image.version": "0.0.118"
+            }
+        },
+        "NetworkSettings": {
+            "SandboxID": "34449b054c315277135da5b325f5e1358fef9d70c407c4e9af6e608b97cf0504",
+            "SandboxKey": "/var/run/docker/netns/34449b054c31",
+            "Ports": {
+                "8990/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "59137"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "59137"
+                    }
+                ]
+            },
+            "Networks": {
+                "kiro-rs-2ue-59137-net": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": [
+                        "kiro-rs-2ue-59137-app",
+                        "kiro-rs"
+                    ],
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "5e7dac0907e0510dfe021f245be388b4e10874e952fe9f2ce3e9d4bfaeecc210",
+                    "EndpointID": "0c7d4a49bcb9bcc1220a6757d1e13900e1bd74520b882724326d74a08be2e391",
+                    "Gateway": "172.18.0.1",
+                    "IPAddress": "172.18.0.4",
+                    "MacAddress": "aa:ae:f6:67:24:3f",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": [
+                        "kiro-rs-2ue-59137-app",
+                        "kiro-rs",
+                        "058d2a6424d3"
+                    ]
+                }
+            }
+        },
+        "ImageManifestDescriptor": {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": "sha256:164934794b2221689caaa65fc7bdf29fd60a3702f6f2f041ce91912176dec38f",
+            "size": 1052,
+            "platform": {
+                "architecture": "amd64",
+                "os": "linux"
+            }
+        }
+    }
+]

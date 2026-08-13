@@ -1,0 +1,311 @@
+  9440	    /// 报告指定凭据 API 调用成功
+  9441	    ///
+  9442	    /// 重置该凭据的失败计数
+  9443	    ///
+  9444	    /// # Arguments
+  9445	    /// * `id` - 凭据 ID（来自 CallContext）
+  9446	    #[allow(dead_code)]
+  9447	    pub fn report_success(&self, id: u64) {
+  9448	        self.report_success_with_latency(id, None, None);
+  9449	    }
+  9450	
+  9451	    pub fn report_success_with_latency(
+  9452	        &self,
+  9453	        id: u64,
+  9454	        model: Option<&str>,
+  9455	        latency: Option<StdDuration>,
+  9456	    ) {
+  9457	        let mut success: Option<(u64, String, bool)> = None;
+  9458	        let alpha = self
+  9459	            .config
+  9460	            .lock()
+  9461	            .scheduler_error_ewma_alpha
+  9462	            .clamp(0.01, 1.0);
+  9463	        {
+  9464	            let mut entries = self.entries.lock();
+  9465	            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+  9466	                let runtime_state_changed = entry.failure_count > 0
+  9467	                    || entry.refresh_failure_count > 0
+  9468	                    || entry.warmup_remaining > 0
+  9469	                    || entry.runtime_persistence_degraded
+  9470	                    || entry.disabled;
+  9471	                entry.failure_count = 0;
+  9472	                entry.refresh_failure_count = 0;
+  9473	                let expected_generation = entry.runtime_generation;
+  9474	                if entry.warmup_remaining > 0 {
+  9475	                    entry.warmup_remaining -= 1;
+  9476	                }
+  9477	                entry.success_count += 1;
+  9478	                let now = Utc::now().to_rfc3339();
+  9479	                entry.last_used_at = Some(now.clone());
+  9480	                {
+  9481	                    let health = entry_effective_health_mut(entry, model);
+  9482	                    health.recent_error_rate *= 1.0 - alpha;
+  9483	                    health.transient_failure_streak =
+  9484	                        health.transient_failure_streak.saturating_sub(1);
+  9485	                    if let Some(latency) = latency {
+  9486	                        let latency_ms = latency.as_millis() as f64;
+  9487	                        health.latency_ewma_ms = Some(
+  9488	                            health
+  9489	                                .latency_ewma_ms
+  9490	                                .map(|previous| previous + alpha * (latency_ms - previous))
+  9491	                                .unwrap_or(latency_ms),
+  9492	                        );
+  9493	                    }
+  9494	                }
+  9495	                success = Some((expected_generation, now, runtime_state_changed));
+  9496	                tracing::debug!(
+  9497	                    "凭据 #{} API 调用成功（累计 {} 次）",
+  9498	                    id,
+  9499	                    entry.success_count
+  9500	                );
+  9501	            }
+  9502	        }
+  9503	        let disabled = match success {
+  9504	            Some((expected_generation, last_used_at, true)) => {
+  9505	                self.persist_success_state(id, expected_generation, &last_used_at)
+  9506	            }
+  9507	            Some((expected_generation, last_used_at, false)) => {
+  9508	                if self.has_pending_runtime_mutations(id)
+  9509	                    || self.should_probe_persisted_runtime_success_state(id)
+  9510	                {
+  9511	                    self.persist_success_state(id, expected_generation, &last_used_at)
+  9512	                } else {
+  9513	                    self.record_success_stats_delta(id, &last_used_at);
+  9514	                    false
+  9515	                }
+  9516	            }
+  9517	            None => false,
+  9518	        };
+  9519	        if disabled {
+  9520	            self.select_highest_priority();
+  9521	            self.unbind_sessions_for_credential(id);
+  9522	            self.clear_scheduler_state_for_credential(id, false);
+  9523	        }
+  9524	        if let Some(redis) = &self.redis_store {
+  9525	            let redis = redis.clone();
+  9526	            let model_for_redis = model.map(str::to_string);
+  9527	            spawn_best_effort_storage_task("记录 Redis 调度成功健康状态", async move {
+  9528	                redis
+  9529	                    .record_scheduler_success(id, model_for_redis.as_deref(), latency, alpha)
+  9530	                    .await?;
+  9531	                Ok(())
+  9532	            });
+  9533	        }
+  9534	        self.notify_dispatch_state_changed();
+  9535	    }
+  9536	
+  9537	    /// 报告指定凭据遇到上游瞬态错误，按 Retry-After 或默认值临时冷却。
+  9538	    ///
+  9539	    /// 不增加 failure_count，不禁用凭据；冷却到期后自动重新参与调度。
+  9540	    #[allow(dead_code)]
+  9541	    pub fn report_transient_failure(
+  9542	        &self,
+  9543	        id: u64,
+  9544	        model: Option<&str>,
+  9545	        retry_after: Option<StdDuration>,
+  9546	        reason: impl Into<String>,
+  9547	    ) -> anyhow::Result<bool> {
+  9548	        self.report_transient_failure_kind(
+  9549	            id,
+  9550	            model,
+  9551	            TransientFailureKind::Protocol,
+  9552	            retry_after,
+  9553	            reason,
+  9554	        )
+  9555	    }
+  9556	
+  9557	    pub fn report_transient_failure_kind(
+  9558	        &self,
+  9559	        id: u64,
+  9560	        model: Option<&str>,
+  9561	        kind: TransientFailureKind,
+  9562	        retry_after: Option<StdDuration>,
+  9563	        reason: impl Into<String>,
+  9564	    ) -> anyhow::Result<bool> {
+  9565	        let reason = reason.into();
+  9566	        let (base, max, multiplier, jitter, probation, alpha) =
+  9567	            self.transient_failure_settings(kind);
+  9568	        let coalesce_window = Self::transient_failure_coalesce_window(base);
+  9569	        let now = Instant::now();
+  9570	        let now_ms = Utc::now().timestamp_millis();
+  9571	
+  9572	        {
+  9573	            let mut entries = self.entries.lock();
+  9574	            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+  9575	                return Ok(entries.iter().any(|e| !e.disabled));
+  9576	            };
+  9577	
+  9578	            if entry.disabled {
+  9579	                return Ok(entries.iter().any(|e| !e.disabled));
+  9580	            }
+  9581	        }
+  9582	
+  9583	        let (duration, coalesced) = {
+  9584	            let mut entries = self.entries.lock();
+  9585	            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+  9586	                return Ok(entries.iter().any(|entry| !entry.disabled));
+  9587	            };
+  9588	            let model = model.map(str::trim).filter(|value| !value.is_empty());
+  9589	            let model_key = model.map(model_state_key);
+  9590	            let existing_until = if let Some(key) = &model_key {
+  9591	                entry
+  9592	                    .model_cooldowns
+  9593	                    .get(key)
+  9594	                    .map(|cooldown| cooldown.until)
+  9595	            } else {
+  9596	                entry.cooldown_until
+  9597	            };
+  9598	            let coalesced = {
+  9599	                let health = entry_effective_health_mut(entry, model);
+  9600	                let same_kind = health.last_error_kind.as_deref() == Some(kind.as_str());
+  9601	                let in_same_failure_wave = health.last_error_at_ms.is_some_and(|last_at| {
+  9602	                    now_ms >= last_at
+  9603	                        && now_ms.saturating_sub(last_at) <= coalesce_window.as_millis() as i64
+  9604	                });
+  9605	                retry_after.is_none()
+  9606	                    && existing_until.is_some_and(|until| until > now)
+  9607	                    && same_kind
+  9608	                    && in_same_failure_wave
+  9609	            };
+  9610	            let streak = {
+  9611	                let health = entry_effective_health_mut(entry, model);
+  9612	                if coalesced {
+  9613	                    health.transient_failure_streak = health.transient_failure_streak.max(1);
+  9614	                } else {
+  9615	                    health.transient_failure_streak =
+  9616	                        health.transient_failure_streak.saturating_add(1);
+  9617	                }
+  9618	                health.recent_error_rate += alpha * (1.0 - health.recent_error_rate);
+  9619	                health.last_error_kind = Some(kind.as_str().to_string());
+  9620	                health.last_error_reason = Some(reason.clone());
+  9621	                health.last_error_at_ms = Some(now_ms);
+  9622	                health.transient_failure_streak
+  9623	            };
+  9624	            let duration =
+  9625	                Self::local_cooldown_duration(retry_after, base, max, multiplier, jitter, streak);
+  9626	            let candidate_until = now + duration;
+  9627	            let until = if coalesced {
+  9628	                existing_until.unwrap_or(candidate_until)
+  9629	            } else {
+  9630	                existing_until
+  9631	                    .filter(|existing| *existing >= candidate_until)
+  9632	                    .unwrap_or(candidate_until)
+  9633	            };
+  9634	            if let (Some(model), Some(key)) = (model, model_key) {
+  9635	                let should_update = entry
+  9636	                    .model_cooldowns
+  9637	                    .get(&key)
+  9638	                    .is_none_or(|existing| until > existing.until);
+  9639	                if should_update {
+  9640	                    entry.model_cooldowns.insert(
+  9641	                        key,
+  9642	                        CredentialModelCooldown {
+  9643	                            model: model.to_string(),
+  9644	                            until,
+  9645	                            reason: Some(reason.clone()),
+  9646	                        },
+  9647	                    );
+  9648	                }
+  9649	            } else if entry.cooldown_until.is_none_or(|existing| until > existing) {
+  9650	                entry.cooldown_until = Some(until);
+  9651	                entry.cooldown_reason = Some(reason.clone());
+  9652	            }
+  9653	            let health = entry_effective_health_mut(entry, model);
+  9654	            health.probation_until_ms = Some(health.probation_until_ms.unwrap_or(0).max(
+  9655	                now_ms
+  9656	                    + until.saturating_duration_since(now).as_millis() as i64
+  9657	                    + probation.as_millis() as i64,
+  9658	            ));
+  9659	            entry.last_used_at = Some(Utc::now().to_rfc3339());
+  9660	            (until.saturating_duration_since(now), coalesced)
+  9661	        };
+  9662	
+  9663	        if !coalesced {
+  9664	            if let Some(redis) = &self.redis_store {
+  9665	                let redis = redis.clone();
+  9666	                let reason_for_redis = reason.clone();
+  9667	                let model_for_redis = model.map(str::to_string);
+  9668	                spawn_best_effort_storage_task("写入 Redis 凭据临时冷却与健康状态", async move {
+  9669	                    redis
+  9670	                        .record_scheduler_transient_failure(
+  9671	                            id,
+  9672	                            model_for_redis.as_deref(),
+  9673	                            kind.as_str(),
+  9674	                            &reason_for_redis,
+  9675	                            retry_after,
+  9676	                            base,
+  9677	                            max,
+  9678	                            multiplier,
+  9679	                            jitter,
+  9680	                            probation,
+  9681	                            alpha,
+  9682	                            coalesce_window,
+  9683	                        )
+  9684	                        .await?;
+  9685	                    Ok(())
+  9686	                });
+  9687	            }
+  9688	        }
+  9689	
+  9690	        if coalesced {
+  9691	            tracing::debug!(
+  9692	                "凭据 #{} 因 {} 瞬态错误仍处于同一波冷却，未放大退避，剩余约 {} 秒: {}",
+  9693	                id,
+  9694	                kind.as_str(),
+  9695	                duration.as_secs(),
+  9696	                reason
+  9697	            );
+  9698	        } else {
+  9699	            tracing::warn!(
+  9700	                "凭据 #{} 因 {} 瞬态错误进入临时冷却 {} 秒: {}",
+  9701	                id,
+  9702	                kind.as_str(),
+  9703	                duration.as_secs(),
+  9704	                reason
+  9705	            );
+  9706	        }
+  9707	
+  9708	        let has_alternate = {
+  9709	            let entries = self.entries.lock();
+  9710	            let proxy_resources = self.proxy_resources.lock();
+  9711	            let config = self.config.lock().clone();
+  9712	            let max_concurrent_requests = config.credential_max_concurrent_requests;
+  9713	            let global_rpm = config.credential_rpm.unwrap_or(0);
+  9714	            entries.iter().any(|e| {
+  9715	                e.id != id
+  9716	                    && credential_is_dispatchable(
+  9717	                        &proxy_resources,
+  9718	                        e,
+  9719	                        model,
+  9720	                        Instant::now(),
+  9721	                        max_concurrent_requests,
+  9722	                        global_rpm,
+  9723	                        1,
+  9724	                    )
+  9725	            })
+  9726	        };
+  9727	        self.notify_dispatch_state_changed();
+  9728	        Ok(has_alternate)
+  9729	    }
+  9730	
+  9731	    /// 报告指定会话在该凭据上的 API 调用成功，并清理 sticky 软失败计数。
+  9732	    #[allow(dead_code)]
+  9733	    pub fn report_success_for_session(&self, id: u64, session_id: Option<&str>) {
+  9734	        self.report_success_for_session_with_latency(id, None, session_id, None);
+  9735	    }
+  9736	
+  9737	    pub fn report_success_for_session_with_latency(
+  9738	        &self,
+  9739	        id: u64,
+  9740	        model: Option<&str>,
+  9741	        session_id: Option<&str>,
+  9742	        latency: Option<StdDuration>,
+  9743	    ) {
+  9744	        self.report_success_with_latency(id, model, latency);
+  9745	        if let Some(sid) = session_id {
+  9746	            self.clear_session_soft_failure(sid, id);
+  9747	        }
+  9748	    }
+  9749	
+  9750	    /// 报告指定凭据 API 调用失败

@@ -1,0 +1,143 @@
+            db_now             | last_15m | last_1h | errors_1h |        latest_record        
+-------------------------------+----------+---------+-----------+-----------------------------
+ 2026-07-26 08:17:53.774021+00 |        0 |       0 |         0 | 2026-07-26 06:45:43.2332+00
+(1 row)
+
+ id  | priority | disabled | auth_kind |          created_at           |          updated_at           | failure_count | disabled_reason | warmup_remaining |       state_updated_at        
+-----+----------+----------+-----------+-------------------------------+-------------------------------+---------------+-----------------+------------------+-------------------------------
+ 791 |        0 | f        | idc       | 2026-07-26 05:05:31.387524+00 | 2026-07-26 06:00:31.734682+00 |             0 |                 |                0 | 2026-07-26 05:09:50.15692+00
+ 793 |        0 | f        | idc       | 2026-07-26 06:00:36.360358+00 | 2026-07-26 06:00:36.723831+00 |             0 |                 |                0 | 2026-07-26 06:12:59.616216+00
+ 794 |        0 | f        | idc       | 2026-07-26 06:00:37.974702+00 | 2026-07-26 06:00:38.322179+00 |             0 |                 |                0 | 2026-07-26 06:05:05.716329+00
+ 795 |        0 | f        | idc       | 2026-07-26 06:00:38.831421+00 | 2026-07-26 06:00:39.180787+00 |             0 |                 |                0 | 2026-07-26 06:08:31.483808+00
+ 796 |        0 | f        | idc       | 2026-07-26 06:00:39.663754+00 | 2026-07-26 06:00:40.003214+00 |             0 |                 |                0 | 2026-07-26 06:08:14.260034+00
+ 797 |        0 | f        | idc       | 2026-07-26 06:00:40.556387+00 | 2026-07-26 06:00:40.921516+00 |             0 |                 |                0 | 2026-07-26 06:07:22.986673+00
+(6 rows)
+
+ active_total | enabled_total | deleted_total |         first_created         |         latest_update         
+--------------+---------------+---------------+-------------------------------+-------------------------------
+            6 |             6 |           790 | 2026-07-02 14:14:29.631545+00 | 2026-07-26 06:00:40.921516+00
+(1 row)
+
+         event_type         |                  reason                  | n  |           first_at            |            last_at            
+----------------------------+------------------------------------------+----+-------------------------------+-------------------------------
+ credential_risk_controlled | TemporarilySuspended                     | 17 | 2026-07-26 03:37:40.399742+00 | 2026-07-26 05:50:45.043611+00
+ credentials_changed        | credential_risk_controlled               | 17 | 2026-07-26 03:37:40.400134+00 | 2026-07-26 05:50:45.043819+00
+ credentials_changed        | credential_deleted                       | 17 | 2026-07-26 03:45:32.930212+00 | 2026-07-26 05:50:51.160312+00
+ credentials_changed        | credential_added                         |  8 | 2026-07-26 03:47:47.589552+00 | 2026-07-26 06:00:40.57074+00
+ credentials_changed        | subscription_title_updated               |  8 | 2026-07-26 03:47:47.758624+00 | 2026-07-26 06:00:40.923961+00
+ credentials_changed        | credential_supported_models_updated      |  1 | 2026-07-26 03:48:17.429693+00 | 2026-07-26 03:48:17.429693+00
+ credentials_changed        | credential_runtime_persistence_recovered |  6 | 2026-07-26 05:04:35.243973+00 | 2026-07-26 06:12:59.705508+00
+(7 rows)
+
+         minute         | total | success | failures | local | external 
+------------------------+-------+---------+----------+-------+----------
+ 2026-07-26 06:39:00+00 |   256 |     256 |        0 |   256 |        0
+ 2026-07-26 06:41:00+00 |   237 |     237 |        0 |   237 |        0
+ 2026-07-26 06:38:00+00 |   229 |     229 |        0 |   229 |        0
+ 2026-07-26 06:37:00+00 |   222 |     222 |        0 |   222 |        0
+ 2026-07-26 06:40:00+00 |   210 |     210 |        0 |   210 |        0
+ 2026-07-26 06:42:00+00 |   205 |     205 |        0 |   205 |        0
+ 2026-07-26 06:44:00+00 |   180 |     180 |        0 |   180 |        0
+ 2026-07-26 04:37:00+00 |   163 |     162 |        1 |    28 |      135
+ 2026-07-26 06:30:00+00 |   163 |     163 |        0 |   163 |        0
+ 2026-07-26 04:31:00+00 |   161 |     158 |        3 |    10 |      151
+ 2026-07-26 04:29:00+00 |   158 |     155 |        3 |    12 |      146
+ 2026-07-26 06:36:00+00 |   155 |     154 |        1 |   155 |        0
+ 2026-07-26 04:35:00+00 |   154 |     153 |        1 |    10 |      143
+ 2026-07-26 04:36:00+00 |   154 |     153 |        1 |    13 |      140
+ 2026-07-26 04:30:00+00 |   153 |     148 |        5 |     9 |      143
+ 2026-07-26 04:28:00+00 |   152 |     150 |        2 |    10 |      142
+ 2026-07-26 04:39:00+00 |   151 |     151 |        0 |    57 |       94
+ 2026-07-26 04:27:00+00 |   149 |     148 |        1 |    20 |      129
+ 2026-07-26 04:38:00+00 |   149 |     149 |        0 |    31 |      118
+ 2026-07-26 04:33:00+00 |   142 |     142 |        0 |    11 |      131
+ 2026-07-26 04:34:00+00 |   142 |     141 |        1 |    16 |      126
+ 2026-07-26 04:26:00+00 |   139 |     139 |        0 |    19 |      120
+ 2026-07-26 04:32:00+00 |   135 |     135 |        0 |     5 |      130
+ 2026-07-26 06:43:00+00 |   135 |     135 |        0 |   135 |        0
+ 2026-07-26 06:09:00+00 |   122 |     122 |        0 |   122 |        0
+ 2026-07-26 06:11:00+00 |   120 |     120 |        0 |   120 |        0
+ 2026-07-26 05:59:00+00 |   116 |      95 |       21 |   108 |        8
+ 2026-07-26 06:15:00+00 |   114 |     114 |        0 |   114 |        0
+ 2026-07-26 06:29:00+00 |   114 |     114 |        0 |   114 |        0
+ 2026-07-26 04:00:00+00 |   113 |     109 |        4 |    13 |       99
+ 2026-07-26 06:06:00+00 |   113 |     113 |        0 |   113 |        0
+ 2026-07-26 03:59:00+00 |   112 |     105 |        7 |    29 |       82
+ 2026-07-26 04:51:00+00 |   111 |     109 |        2 |    33 |       78
+ 2026-07-26 05:13:00+00 |   111 |     110 |        1 |    98 |       13
+ 2026-07-26 06:35:00+00 |   109 |     109 |        0 |   109 |        0
+ 2026-07-26 06:08:00+00 |   107 |     107 |        0 |   107 |        0
+ 2026-07-26 04:54:00+00 |   106 |     103 |        3 |    12 |       94
+ 2026-07-26 06:33:00+00 |   106 |     103 |        3 |   106 |        0
+ 2026-07-26 04:40:00+00 |   105 |      98 |        7 |    62 |       43
+ 2026-07-26 05:12:00+00 |   105 |     101 |        4 |   105 |        0
+ 2026-07-26 05:56:00+00 |   105 |     104 |        1 |   101 |        4
+ 2026-07-26 06:34:00+00 |   105 |     105 |        0 |   105 |        0
+ 2026-07-26 04:53:00+00 |   104 |     100 |        4 |    13 |       91
+ 2026-07-26 05:11:00+00 |   104 |     102 |        2 |   104 |        0
+ 2026-07-26 06:23:00+00 |   104 |     104 |        0 |   104 |        0
+ 2026-07-26 04:25:00+00 |   103 |     103 |        0 |    21 |       82
+ 2026-07-26 05:43:00+00 |   103 |     102 |        1 |   103 |        0
+ 2026-07-26 06:32:00+00 |   103 |     103 |        0 |   103 |        0
+ 2026-07-26 03:49:00+00 |   102 |     102 |        0 |    92 |       10
+ 2026-07-26 04:01:00+00 |   102 |     102 |        0 |    11 |       91
+(50 rows)
+
+              error_type               |            error_source            |   public_error_type   | public_status |                                                                                                       message                                                                                                       |  n  |           first_at            |            last_at            
+---------------------------------------+------------------------------------+-----------------------+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+-----+-------------------------------+-------------------------------
+ api_error                             | local_account                      | rate_limit_error      | 429           | upstream_failure class=rate_limit upstream_status=429 public_status=429 body_bytes=165 retry_after_secs=unknown content_type=other reason=thinking_signature_retry                                                  | 109 | 2026-07-26 03:50:04.597832+00 | 2026-07-26 05:44:59.885724+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 本地账号调度容量暂不可用（本次请求因并发槽竞争临时排除了所有可用账号，可用: 1/1, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=none）                                  |  63 | 2026-07-26 05:58:07.2833+00   | 2026-07-26 05:59:12.468106+00
+ bad_request                           | external_account                   | invalid_request_error | 400           | external upstream rejected the request                                                                                                                                                                              |  49 | 2026-07-26 03:37:44.467969+00 | 2026-07-26 06:00:15.80646+00
+ request_rejection                     | request_rejection                  |                       |               | request rejected before upstream dispatch                                                                                                                                                                           |  26 | 2026-07-26 03:01:20.975102+00 | 2026-07-26 06:04:50.635428+00
+ api_error                             | local_account                      | api_error             | 502           | websearch_mcp_rpc_error                                                                                                                                                                                             |  22 | 2026-07-26 04:40:38.933724+00 | 2026-07-26 04:49:51.646883+00
+ client_dropped                        | downstream_client                  |                       |               | downstream client dropped before upstream stream completed                                                                                                                                                          |  13 | 2026-07-26 03:06:02.88491+00  | 2026-07-26 06:36:38.608742+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=72 retry_after_secs=unknown content_type=json reason=malformed_request                                                      |   9 | 2026-07-26 05:07:50.810509+00 | 2026-07-26 05:35:38.904137+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=196 retry_after_secs=unknown content_type=json reason=thinking_signature_retry                                              |   8 | 2026-07-26 05:18:38.95904+00  | 2026-07-26 06:05:31.031296+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=258 retry_after_secs=unknown content_type=other reason=thinking_signature_retry                                             |   7 | 2026-07-26 03:00:38.1021+00   | 2026-07-26 03:33:01.692743+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=8）                                                                                                                                            |   7 | 2026-07-26 05:59:18.868226+00 | 2026-07-26 05:59:18.956133+00
+ bad_request                           | external_prompt_too_long_preflight | invalid_request_error | 400           | prompt is too long: estimated input tokens 1191161 exceed configured external pool maximum 1000000                                                                                                                  |   6 | 2026-07-26 03:53:04.166513+00 | 2026-07-26 03:54:03.223766+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | upstream_failure class=rate_limit upstream_status=429 public_status=429 body_bytes=165 retry_after_secs=unknown content_type=other reason=api_rate_limit                                                            |   6 | 2026-07-26 03:55:02.927084+00 | 2026-07-26 05:04:50.178806+00
+ server_error                          | external_account                   | api_error             | 502           | external upstream server was temporarily unavailable                                                                                                                                                                |   4 | 2026-07-26 03:59:39.216779+00 | 2026-07-26 04:00:43.976888+00
+ api_error                             | local_account_stream               | api_error             | 200           | upstream stream read error: error decoding response body                                                                                                                                                            |   4 | 2026-07-26 05:42:17.509205+00 | 2026-07-26 06:14:32.892254+00
+ bad_request                           | external_prompt_too_long_preflight | invalid_request_error | 400           | prompt is too long: estimated input tokens 1192547 exceed configured external pool maximum 1000000                                                                                                                  |   3 | 2026-07-26 03:54:14.827564+00 | 2026-07-26 03:54:29.7641+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=134 retry_after_secs=unknown content_type=other reason=malformed_request                                                    |   3 | 2026-07-26 04:06:47.284262+00 | 2026-07-26 05:06:18.447478+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=1）                                                                                                                                            |   3 | 2026-07-26 05:58:19.688235+00 | 2026-07-26 05:59:18.921512+00
+ api_error                             | local_account_stream               | api_error             | 200           | {"message":"Encountered an unexpected error when processing the request, please try again."}                                                                                                                        |   2 | 2026-07-26 03:29:16.444185+00 | 2026-07-26 05:56:07.668754+00
+ api_error                             | local_account                      | api_error             | 503           | 本地账号池风险保护已打开（retry_after_secs=30）                                                                                                                                                                     |   2 | 2026-07-26 03:38:43.734488+00 | 2026-07-26 03:41:50.552194+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=5）                                      |   2 | 2026-07-26 03:53:00.69203+00  | 2026-07-26 05:03:40.152967+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=132 retry_after_secs=unknown content_type=other reason=invalid tool use format                                              |   2 | 2026-07-26 04:18:23.652694+00 | 2026-07-26 04:18:24.53867+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=17）                                     |   2 | 2026-07-26 04:55:15.519243+00 | 2026-07-26 05:05:02.382205+00
+ external_pool_coordinator_unavailable | external_dispatch                  | api_error             | 503           | Request capacity coordinator is temporarily unavailable                                                                                                                                                             |   2 | 2026-07-26 05:04:36.616634+00 | 2026-07-26 05:05:05.576295+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 本地账号调度容量暂不可用（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=30, retry_after_secs=1）                                             |   2 | 2026-07-26 05:58:39.83132+00  | 2026-07-26 05:58:40.091183+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=403 public_status=400 body_bytes=346 retry_after_secs=unknown content_type=other reason=thinking_signature_retry                                             |   1 | 2026-07-26 03:37:40.706821+00 | 2026-07-26 03:37:40.706821+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=7）                                      |   1 | 2026-07-26 03:52:46.941624+00 | 2026-07-26 03:52:46.941624+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=10）                                     |   1 | 2026-07-26 03:53:31.016267+00 | 2026-07-26 03:53:31.016267+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=14）                                     |   1 | 2026-07-26 03:53:47.355453+00 | 2026-07-26 03:53:47.355453+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=16）                                     |   1 | 2026-07-26 03:54:20.696807+00 | 2026-07-26 03:54:20.696807+00
+ bad_request                           | external_prompt_too_long_preflight | invalid_request_error | 400           | prompt is too long: estimated input tokens 1802957 exceed configured external pool maximum 1000000                                                                                                                  |   1 | 2026-07-26 03:55:21.055856+00 | 2026-07-26 03:55:21.055856+00
+ bad_request                           | external_prompt_too_long_preflight | invalid_request_error | 400           | prompt is too long: estimated input tokens 2684006 exceed configured external pool maximum 1000000                                                                                                                  |   1 | 2026-07-26 03:56:41.39192+00  | 2026-07-26 03:56:41.39192+00
+ bad_request                           | external_prompt_too_long_preflight | invalid_request_error | 400           | prompt is too long: estimated input tokens 1804550 exceed configured external pool maximum 1000000                                                                                                                  |   1 | 2026-07-26 03:57:14.614971+00 | 2026-07-26 03:57:14.614971+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=29）                                     |   1 | 2026-07-26 04:30:41.00119+00  | 2026-07-26 04:30:41.00119+00
+ bad_request                           | external_prompt_too_long_preflight | invalid_request_error | 400           | prompt is too long: estimated input tokens 1093185 exceed configured external pool maximum 1000000                                                                                                                  |   1 | 2026-07-26 04:31:58.16308+00  | 2026-07-26 04:31:58.16308+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=15）                                     |   1 | 2026-07-26 05:03:28.128052+00 | 2026-07-26 05:03:28.128052+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=9）                                      |   1 | 2026-07-26 05:03:29.634111+00 | 2026-07-26 05:03:29.634111+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=19）                                     |   1 | 2026-07-26 05:03:40.147205+00 | 2026-07-26 05:03:40.147205+00
+ api_error                             | local_account                      | rate_limit_error      | 429           | 所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, global_credential_max_concurrent_requests=20, effective_credential_max_concurrent_requests=100, retry_after_secs=2）                                      |   1 | 2026-07-26 05:03:42.074648+00 | 2026-07-26 05:03:42.074648+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=thinking_signature_retry_failed upstream_status=none public_status=502 body_bytes=unknown retry_after_secs=unknown content_type=unknown reason=thinking_signature_retry_send_limit_exhausted |   1 | 2026-07-26 05:04:46.484086+00 | 2026-07-26 05:04:46.484086+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=159 retry_after_secs=unknown content_type=other reason=thinking_signature_retry                                             |   1 | 2026-07-26 05:09:50.093585+00 | 2026-07-26 05:09:50.093585+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=76 retry_after_secs=unknown content_type=json reason=thinking_signature_retry                                               |   1 | 2026-07-26 05:10:34.913074+00 | 2026-07-26 05:10:34.913074+00
+ api_error                             | local_account                      | api_error             | 502           | upstream_failure class=server_error upstream_status=500 public_status=500 body_bytes=106 retry_after_secs=unknown content_type=json reason=thinking_signature_retry                                                 |   1 | 2026-07-26 05:42:39.53626+00  | 2026-07-26 05:42:39.53626+00
+(42 rows)
+
+ credential_rpm | credential_max_concurrent | dispatch_global_max_concurrent | dispatch_max_queue | credential_retry_max_attempts | credential_rate_limit_cooldown_secs | credential_cooldown_backoff_multiplier | pg_max_connections | external_enabled | external_direct | external_global_max_concurrent | external_max_queue 
+----------------+---------------------------+--------------------------------+--------------------+-------------------------------+-------------------------------------+----------------------------------------+--------------------+------------------+-----------------+--------------------------------+--------------------
+ 300            | 20                        | 1000                           | 200                | 0                             | 6                                   | 1.2                                    | 10                 | true             | false           | 500                            | 100
+(1 row)
+
+        state        | count 
+---------------------+-------
+ active              |     2
+ idle                |     8
+ idle in transaction |     3
+(3 rows)
+

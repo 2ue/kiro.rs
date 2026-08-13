@@ -1,0 +1,27 @@
+  7025	
+  7026	    // 创建 SSE 流
+  7027	    let response_request_id = credential_usage.request.request_id.clone();
+  7028	    let stream = create_sse_stream(
+  7029	        response,
+  7030	        ctx,
+  7031	        initial_events,
+  7032	        completion,
+  7033	        credential_usage,
+  7034	        stream_idle_timeout_secs,
+  7035	        retry_plan,
+  7036	        claude_code_noop_delta_keepalive,
+  7037	    );
+  7038	
+  7039	    // 返回 SSE 响应
+  7040	    let mut builder = envelope::sse_builder_with_id(&response_request_id);
+  7041	    if let Some(warnings) = warnings_header {
+  7042	        builder = builder.header("x-kiro-rs-warnings", warnings);
+  7043	    }
+  7044	    builder.body(Body::from_stream(stream)).unwrap()
+  7045	}
+  7046	
+  7047	/// Ping 事件间隔。Claude Code 的插件 UI 在长 thinking/tool_use 阶段可能没有可见正文；
+  7048	/// 更短的保活能避免中间代理或客户端误判流已经停住，且不会污染模型输出内容。
+  7049	const PING_INTERVAL_SECS: u64 = 5;
+  7050	/// 上游 eventstream 默认读空闲超时（180秒）
+  7051	const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;

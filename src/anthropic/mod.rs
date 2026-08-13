@@ -9,9 +9,20 @@
 //! - `POST /v1/messages` - 创建消息（对话）
 //! - `POST /v1/messages/count_tokens` - 计算 token 数量
 //!
+//! ## 内置端点 (/na/v1)
+//! - `GET /na/v1/models` - 获取可用模型列表
+//! - `POST /na/v1/messages` - 创建消息（策略由运行配置决定）
+//! - `POST /na/v1/messages/count_tokens` - 计算 token 数量
+//!
+//! ## 内置端点 (/ha/v1)
+//! - `GET /ha/v1/models` - 获取可用模型列表
+//! - `POST /ha/v1/messages` - 创建消息（策略由运行配置决定）
+//! - `POST /ha/v1/messages/count_tokens` - 计算 token 数量
+//!
 //! ## Claude Code 兼容端点 (/cc/v1)
-//! - `POST /cc/v1/messages` - 创建消息（流式响应会等待 contextUsageEvent 后再发送 message_start，确保 input_tokens 准确）
-//! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量（与 /v1 相同）
+//! - `GET /cc/v1/models` - 获取可用模型列表
+//! - `POST /cc/v1/messages` - 创建消息（实时流式返回，最终 message_delta.usage 修正用量）
+//! - `POST /cc/v1/messages/count_tokens` - 计算 token 数量
 //!
 //! # 使用示例
 //! ```rust,ignore
@@ -22,15 +33,32 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
+pub(crate) mod body_capabilities;
+pub(crate) mod body_processing;
 pub(crate) mod cache;
-mod converter;
+pub(crate) mod converter;
+pub(crate) mod envelope;
+pub(crate) mod files;
 mod handlers;
+pub(crate) mod inference_attempt_budget;
 mod middleware;
+pub(crate) mod model_capabilities;
+pub(crate) mod payload_guard;
+pub(crate) mod payload_guard_runtime;
+pub(crate) mod pricing;
 pub(crate) mod prompt_cache;
+pub(crate) mod prompt_cache_creation_control;
+pub(crate) mod prompt_steering;
+pub(crate) mod request_admission;
+pub(crate) mod request_body;
+pub(crate) mod request_facts;
 mod router;
 mod stream;
+pub(crate) mod tool_format_debug;
+pub(crate) mod tool_schema_keys;
+pub(crate) mod transcript_sanitizer;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;
 
-pub use router::create_router_with_provider;
+pub use router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider};
