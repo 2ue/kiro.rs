@@ -74,6 +74,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `AccountRuntimeConfig` now fronts the legacy external-pool config structure at new integration boundaries. App state, Anthropic router config, request-runtime config, Admin runtime-config DTOs and runtime reload invalidation use account runtime terminology while persisted `external_pools` storage and compatibility JSON remain mirrored.
 - The Admin frontend account page has moved from `features/external-pools` to `features/accounts`. Its page, modal, test modal, helper components and utilities now use account component names, while `/external-pools` remains only a redirect compatibility route.
 - The frontend account runtime boundary now has `AccountRuntimeConfig`, `defaultAccountRuntimeConfig` and `DiscoverAccountSupportedModelsRequest` aliases. New account UI/API code uses those account-named types while legacy `ExternalPoolsConfig` and discovery request names remain only for compatibility functions and mirrored wire fields.
+- `account_runtime::migration` now owns the temporary projection from legacy `ExternalPool` records into `UpstreamAccount`. The old `ExternalPool::to_upstream_account` method was removed so the account runtime boundary, not the legacy record, owns the migration bridge.
 
 Last verified on 2026-08-14:
 
@@ -108,3 +109,6 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `pnpm --dir ui check`
 - `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-migration-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-migration-test2 -- cargo test account_runtime -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-migration-check1 -- cargo check`
