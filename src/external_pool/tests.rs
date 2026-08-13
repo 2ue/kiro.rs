@@ -7069,6 +7069,70 @@ async fn external_pool_retry_after_header_records_soft_failure_without_pool_cool
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_repeated_soft_failures_default_to_penalty_without_pool_cooldown() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let pool = create_messages_pool(
+        &postgres,
+        "repeated-soft-default-no-cooldown",
+        1,
+        &failing.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 4,
+        external_pool_retry_max_attempts: 1,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        external_pool_server_error_cooldown_secs: 1,
+        ..ExternalPoolsConfig::default()
+    };
+
+    for index in 0..3 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_repeated_soft_default_no_cooldown_{index}");
+        route.error_id = format!("err_repeated_soft_default_no_cooldown_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("repeated failing request should finish");
+        assert!(
+            matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+            "single failing pool should return bounded final errors"
+        );
+    }
+    assert_eq!(
+        failing.snapshot(),
+        3,
+        "default policy should keep probing instead of hard-cooling ordinary soft failures"
+    );
+
+    let runtime = manager
+        .load_pool_runtime_snapshot(pool.id, &[])
+        .await
+        .expect("read runtime after repeated soft failures");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "ordinary repeated soft failures must not create a pool cooldown by default"
+    );
+    assert_eq!(runtime.pool_cooldown_reason.as_deref(), None);
+    assert_eq!(runtime.transient_failure_streak, 3);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_repeated_soft_failures_escalate_to_short_cooldown() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;

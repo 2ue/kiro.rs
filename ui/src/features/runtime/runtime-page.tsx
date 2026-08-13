@@ -1027,7 +1027,7 @@ export function RuntimePage() {
                   />
                   <NumField
                     label="连续失败冷却阈值"
-                    desc="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；0 表示关闭。"
+                    desc="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；默认 0，仅降权不池级冷却。"
                     value={draft.externalPools.externalPoolTransientFailureCooldownThreshold}
                     min={0}
                     max={1000}
