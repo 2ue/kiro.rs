@@ -1573,6 +1573,7 @@ pub struct RuntimeConfigResponse {
     pub reported_usage: ReportedUsageConfig,
     pub cache_policy: CachePolicyConfig,
     pub defined_cache_routes: Vec<String>,
+    pub account_runtime: ExternalPoolsConfig,
     pub external_pools: ExternalPoolsConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
@@ -1738,6 +1739,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub cache_policy: Option<CachePolicyConfig>,
     #[serde(default)]
     pub defined_cache_routes: Option<Vec<String>>,
+    #[serde(default)]
+    pub account_runtime: Option<ExternalPoolsConfig>,
     #[serde(default)]
     pub external_pools: Option<ExternalPoolsConfig>,
     #[serde(default)]

@@ -121,13 +121,13 @@ export function ExternalPoolsPage() {
   const [editForm, setEditForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
 
   useEffect(() => {
-    const externalPools = { ...defaultExternalPoolsConfig(), ...runtimeConfig.data?.externalPools }
-    setConfigDraft(externalPools)
-    setModelRulesText(joinRules(externalPools.directExternalModelRules))
-    setPathRulesText(joinRules(externalPools.directExternalPathRules))
-    setRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolRetryStatusCodes))
-    setSamePoolRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolSamePoolRetryStatusCodes))
-  }, [runtimeConfig.data?.externalPools])
+    const accountRuntime = { ...defaultExternalPoolsConfig(), ...runtimeConfig.data?.accountRuntime }
+    setConfigDraft(accountRuntime)
+    setModelRulesText(joinRules(accountRuntime.directExternalModelRules))
+    setPathRulesText(joinRules(accountRuntime.directExternalPathRules))
+    setRetryStatusCodesText(joinStatusCodeList(accountRuntime.externalPoolRetryStatusCodes))
+    setSamePoolRetryStatusCodesText(joinStatusCodeList(accountRuntime.externalPoolSamePoolRetryStatusCodes))
+  }, [runtimeConfig.data?.accountRuntime])
 
   const statusMap = useMemo(() => {
     const map = new Map<number, NonNullable<typeof status.data>['accounts'][number]>()
@@ -146,9 +146,7 @@ export function ExternalPoolsPage() {
     if (!runtimeConfig.data) return toast.error('运行配置尚未加载')
     setSavingConfig(true)
     try {
-      await updateRuntimeConfig({
-        ...runtimeConfig.data,
-        externalPools: {
+      const accountRuntime = {
           ...configDraft,
           directExternalModelRules: splitRules(modelRulesText),
           directExternalPathRules: splitRules(pathRulesText),
@@ -190,7 +188,11 @@ export function ExternalPoolsPage() {
           externalPoolUsageDebugDir: String(configDraft.externalPoolUsageDebugDir || '').trim(),
           externalPoolUsageDebugMaxBodyBytes: whole(configDraft.externalPoolUsageDebugMaxBodyBytes),
           externalPoolUsageDebugMaxFiles: whole(configDraft.externalPoolUsageDebugMaxFiles),
-        },
+        }
+      await updateRuntimeConfig({
+        ...runtimeConfig.data,
+        accountRuntime,
+        externalPools: accountRuntime,
       })
       toast.success('外部账号策略已保存')
       invalidate()

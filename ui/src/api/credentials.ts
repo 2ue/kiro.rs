@@ -1,5 +1,6 @@
 import { api } from '@/api/http'
 export { validateAdminApiKey } from '@/api/http'
+import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
 import type {
   AddCredentialRequest,
   AddCredentialResponse,
@@ -69,6 +70,27 @@ export type AccountTestRequest = ExternalPoolTestRequest
 export type AccountTestResponse = ExternalPoolTestResponse
 
 const CREDENTIALS_LIST_PAGE_LIMIT = 500
+
+type RuntimeConfigWire = Omit<RuntimeConfig, 'accountRuntime' | 'externalPools'> &
+  Partial<Pick<RuntimeConfig, 'accountRuntime' | 'externalPools'>>
+
+function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
+  const accountRuntime = data.accountRuntime ?? data.externalPools ?? defaultExternalPoolsConfig()
+  return {
+    ...data,
+    accountRuntime,
+    externalPools: accountRuntime,
+  } as RuntimeConfig
+}
+
+function runtimeConfigRequest(req: UpdateRuntimeConfigRequest): UpdateRuntimeConfigRequest {
+  const accountRuntime = req.accountRuntime ?? req.externalPools
+  return {
+    ...req,
+    accountRuntime,
+    externalPools: accountRuntime,
+  }
+}
 
 function credentialListItemToStatus(item: CredentialListItem): CredentialStatusItem {
   return {
@@ -337,8 +359,8 @@ export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ m
 }
 
 export async function getRuntimeConfig(): Promise<RuntimeConfig> {
-  const { data } = await api.get<RuntimeConfig>('/config/runtime')
-  return data
+  const { data } = await api.get<RuntimeConfigWire>('/config/runtime')
+  return normalizeRuntimeConfig(data)
 }
 
 export async function getSystemVersion(): Promise<SystemVersionResponse> {
@@ -347,8 +369,8 @@ export async function getSystemVersion(): Promise<SystemVersionResponse> {
 }
 
 export async function updateRuntimeConfig(req: UpdateRuntimeConfigRequest): Promise<RuntimeConfig> {
-  const { data } = await api.put<RuntimeConfig>('/config/runtime', req)
-  return data
+  const { data } = await api.put<RuntimeConfigWire>('/config/runtime', runtimeConfigRequest(req))
+  return normalizeRuntimeConfig(data)
 }
 
 export async function getAccessKeys(): Promise<AccessKeysResponse> {

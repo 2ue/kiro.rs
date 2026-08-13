@@ -4754,6 +4754,7 @@ impl AdminService {
                 .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
                 .normalized(),
             defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
+            account_runtime: config.external_pools.clone(),
             external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
@@ -5020,8 +5021,9 @@ impl AdminService {
             .with_legacy_defined_cache_route_defaults(&defined_cache_routes)
             .normalized();
         let external_pools = req
-            .external_pools
+            .account_runtime
             .clone()
+            .or_else(|| req.external_pools.clone())
             .unwrap_or_else(|| current_config.external_pools.clone());
         let external_pool_policy_changed = external_pools != current_config.external_pools;
         let high_cache_threshold = req

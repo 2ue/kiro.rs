@@ -517,6 +517,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   promptCacheEstimatedBytesLimit: 268435456,
   reportedUsage: defaultReportedUsage(),
   cachePolicy: defaultCachePolicy(),
+  accountRuntime: defaultExternalPoolsConfig(),
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',

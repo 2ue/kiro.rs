@@ -67,6 +67,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin service dependencies now treat the legacy provider as optional; old credential/model-test endpoints return explicit compatibility errors when the provider is absent while account management remains available.
 - `/api/admin/accounts` now has account-named handlers, service methods and response DTOs. List and status responses expose `accounts`, while legacy `/api/admin/external-pools` remains as a compatibility surface with `pools`.
 - the upstream account page now consumes the account-shaped `accounts` responses, with frontend compatibility normalization retained for older server responses during migration.
+- runtime config now exposes and accepts `accountRuntime` as the account policy surface while mirroring the old `externalPools` field for compatibility; the frontend normalizes both names and the upstream account page writes the account-named field.
 
 Last verified on 2026-08-14:
 
@@ -84,4 +85,6 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-startup-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-admin-boundary-fmt2 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-admin-boundary-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-check1 -- cargo check`
 - `pnpm --dir ui check`

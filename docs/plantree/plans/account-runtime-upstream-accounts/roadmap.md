@@ -28,11 +28,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin service construction accepts an absent legacy provider; old credential/model-test actions fail explicitly in that mode while account management and usage surfaces can remain mounted.
 - `/api/admin/accounts` now has account-named handlers, service wrappers and DTOs; list/status responses expose `accounts` while legacy `/external-pools` remains compatibility-only.
 - The upstream account page consumes the account-shaped responses through the account API client, with temporary normalization for older `pools` payloads.
+- Runtime config now exposes `accountRuntime` as the account-policy field, accepts it on update, mirrors legacy `externalPools` for compatibility, and has frontend normalization so old and new callers stay consistent.
 
 ## In Progress
 
 - Convert remaining backend Admin/API/DTO and usage-dashboard names from external-pool/local-credential terminology toward account terminology while preserving temporary compatibility aliases.
-- Remove remaining startup/runtime Kiro vocabulary and replace legacy external-pool runtime config fields with account-named compatibility wrappers.
+- Remove remaining startup/runtime Kiro vocabulary and migrate account policy internals away from legacy external-pool field names.
 
 ## Next
 

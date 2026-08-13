@@ -1881,6 +1881,7 @@ export interface RuntimeConfig {
   promptCacheEstimatedBytesLimit: number
   reportedUsage: ReportedUsageConfig
   cachePolicy: CachePolicyConfig
+  accountRuntime: ExternalPoolsConfig
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile
