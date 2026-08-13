@@ -539,6 +539,48 @@ fn external_pool_eligibility_from_pool(pool: &ExternalPool) -> ExternalPoolEligi
 }
 
 impl ExternalPool {
+    #[allow(dead_code)]
+    pub fn to_upstream_account(&self) -> Option<crate::account_runtime::UpstreamAccount> {
+        use crate::account_runtime::{
+            AccountAuthPolicy, AccountId, AccountLimits, AccountProxy, AccountSecretRef,
+            UpstreamAccount,
+        };
+
+        let id = AccountId::new(self.id)?;
+        let secret = self
+            .api_key
+            .as_ref()
+            .map(|_| AccountSecretRef::InlineRedacted("present".to_string()))
+            .or_else(|| {
+                self.masked_api_key
+                    .as_ref()
+                    .map(|masked| AccountSecretRef::InlineRedacted(masked.clone()))
+            })
+            .unwrap_or_else(|| AccountSecretRef::InlineRedacted("absent".to_string()));
+        let auth = match self.auth_type {
+            ExternalPoolAuthType::Bearer => AccountAuthPolicy::Bearer { secret },
+            ExternalPoolAuthType::XApiKey => AccountAuthPolicy::Header {
+                name: "x-api-key".to_string(),
+                secret,
+            },
+        };
+
+        Some(UpstreamAccount {
+            id,
+            name: self.name.clone(),
+            enabled: self.enabled && !self.is_auto_disabled_now(),
+            base_url: self.base_url.clone(),
+            auth,
+            supported_models: self.supported_models.clone(),
+            limits: AccountLimits {
+                priority: self.priority.max(0) as u32,
+                rpm: None,
+                max_concurrent_requests: Some(self.max_concurrent_requests),
+            },
+            proxy: AccountProxy::Inherit,
+        })
+    }
+
     pub fn is_auto_disabled_now(&self) -> bool {
         if !self.auto_disabled {
             return false;

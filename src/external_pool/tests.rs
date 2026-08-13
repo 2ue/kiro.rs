@@ -150,6 +150,61 @@ fn persisted_external_pool_enum_parsers_reject_unknown_values_for_five_rounds() 
 }
 
 #[test]
+fn external_pool_projects_to_upstream_account_boundary() {
+    let pool = ExternalPool {
+        id: 7,
+        revision: 3,
+        name: "account-primary".to_string(),
+        base_url: "https://upstream.example.test".to_string(),
+        api_key: Some("sk-sensitive".to_string()),
+        masked_api_key: None,
+        auth_type: ExternalPoolAuthType::XApiKey,
+        enabled: true,
+        priority: 12,
+        max_concurrent_requests: 4,
+        usage_projection_mode: ExternalPoolUsageProjectionMode::CurrentPathPolicy,
+        stream_response_mode: None,
+        request_body_mode: ExternalPoolRequestBodyMode::Normalized,
+        raw_model_mode: ExternalPoolRawModelMode::None,
+        auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+        pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
+        auto_disabled: false,
+        auto_disabled_reason: None,
+        auto_disabled_at: None,
+        auto_disabled_until: None,
+        auto_disabled_last_error: None,
+        preserve_path: true,
+        normalize_model_version_dots: false,
+        model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+        model_mapping_require_match: false,
+        model_mapping_rules: Vec::new(),
+        supported_models: vec!["claude-sonnet-*".to_string()],
+        route_mode: ExternalPoolRouteMode::AllowAll,
+        route_rules: Vec::new(),
+        notes: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let account = pool
+        .to_upstream_account()
+        .expect("positive pool id should project to account id");
+    assert_eq!(account.id.get(), 7);
+    assert_eq!(account.name, "account-primary");
+    assert_eq!(account.base_url, "https://upstream.example.test");
+    assert!(account.enabled);
+    assert_eq!(account.limits.priority, 12);
+    assert_eq!(account.limits.max_concurrent_requests, Some(4));
+    assert!(account.supports_model(Some("claude-sonnet-4-6")));
+    assert!(!account.supports_model(Some("claude-opus-4-1")));
+    assert!(matches!(
+        account.auth,
+        crate::account_runtime::AccountAuthPolicy::Header { ref name, .. }
+            if name == "x-api-key"
+    ));
+}
+
+#[test]
 fn finite_external_queue_lease_covers_wait_without_periodic_renewal() {
     for round in 1..=5 {
         let default_wait = ExternalPoolsConfig::default().effective_dispatch_max_wait_secs();

@@ -18,10 +18,11 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Current `feature/usage-correction-cost-floor` work was committed and merged into `master`.
 - Implementation branch `feature/account-runtime-upstream-accounts` was created from updated `master`.
 - Initial provider-neutral `account_runtime` domain module was added and verified with scoped `cargo test account_runtime` and `cargo check`.
+- Old `ExternalPool` records can now project into the new `UpstreamAccount` boundary for migration staging, with a focused bridge test.
 
 ## In Progress
 
-- Convert external-pool terminology and configuration boundaries toward account terminology.
+- Convert external-pool terminology and configuration/API/UI boundaries toward account terminology.
 
 ## Next
 
