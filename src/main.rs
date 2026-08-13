@@ -112,6 +112,10 @@ fn model_capability_retry_delay(consecutive_failures: u32) -> StdDuration {
     StdDuration::from_secs(seconds)
 }
 
+fn legacy_credential_provider_required(config: &Config) -> bool {
+    !config.external_pools.external_pools_enabled
+}
+
 #[tokio::main]
 async fn main() {
     // 解析命令行参数
@@ -182,15 +186,6 @@ async fn main() {
             std::process::exit(1);
         }),
     );
-    let env_kiro_api_key = match std::env::var("KIRO_API_KEY") {
-        Ok(value) if value.trim().is_empty() => {
-            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
-            None
-        }
-        Ok(value) => Some(value.trim().to_string()),
-        Err(_) => None,
-    };
-
     postgres_store
         .bootstrap_runtime_config_from_file(&file_config)
         .await
@@ -198,6 +193,33 @@ async fn main() {
             tracing::error!("从配置文件 bootstrap 运行配置到 PgSQL 失败: {}", e);
             std::process::exit(1);
         });
+    let mut config = postgres_store
+        .load_runtime_config()
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("从 PgSQL 加载运行配置失败: {}", e);
+            std::process::exit(1);
+        })
+        .unwrap_or_else(|| {
+            tracing::error!("PgSQL runtime_config 为空，且从配置文件 bootstrap 失败");
+            std::process::exit(1);
+        });
+    // Storage endpoints are deployment authority, not mutable runtime configuration. PostgreSQL
+    // may contain an older serialized copy, so always overlay the file/environment values that
+    // were used to connect this process before constructing dependent stores.
+    config.postgres = file_config.postgres.clone();
+    config.redis = file_config.redis.clone();
+    config.observability_redis = file_config.observability_redis.clone();
+    config.apply_storage_env_overrides();
+    config
+        .validate_redis_fault_domains()
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Redis fault-domain configuration is invalid");
+            std::process::exit(1);
+        });
+    config.set_config_path_for_runtime(None);
+    apply_service_bind_env_overrides(&mut config);
+
     let credentials_exist = postgres_store
         .credentials_exist()
         .await
@@ -205,7 +227,20 @@ async fn main() {
             tracing::error!("检查 PgSQL 凭据是否存在失败: {}", e);
             std::process::exit(1);
         });
-    if !credentials_exist {
+    let start_legacy_credential_provider = legacy_credential_provider_required(&config);
+    let env_kiro_api_key = if start_legacy_credential_provider {
+        match std::env::var("KIRO_API_KEY") {
+            Ok(value) if value.trim().is_empty() => {
+                tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+                None
+            }
+            Ok(value) => Some(value.trim().to_string()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if !credentials_exist && start_legacy_credential_provider {
         let credentials_path = args
             .credentials
             .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
@@ -248,33 +283,6 @@ async fn main() {
                 std::process::exit(1);
             });
     }
-
-    let mut config = postgres_store
-        .load_runtime_config()
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("从 PgSQL 加载运行配置失败: {}", e);
-            std::process::exit(1);
-        })
-        .unwrap_or_else(|| {
-            tracing::error!("PgSQL runtime_config 为空，且从配置文件 bootstrap 失败");
-            std::process::exit(1);
-        });
-    // Storage endpoints are deployment authority, not mutable runtime configuration. PostgreSQL
-    // may contain an older serialized copy, so always overlay the file/environment values that
-    // were used to connect this process before constructing dependent stores.
-    config.postgres = file_config.postgres.clone();
-    config.redis = file_config.redis.clone();
-    config.observability_redis = file_config.observability_redis.clone();
-    config.apply_storage_env_overrides();
-    config
-        .validate_redis_fault_domains()
-        .unwrap_or_else(|error| {
-            tracing::error!(error = %error, "Redis fault-domain configuration is invalid");
-            std::process::exit(1);
-        });
-    config.set_config_path_for_runtime(None);
-    apply_service_bind_env_overrides(&mut config);
 
     let observability_redis_store = if config
         .observability_redis
@@ -423,27 +431,30 @@ async fn main() {
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
     }
 
-    // 校验默认端点存在
-    if !endpoints.contains_key(&config.default_endpoint) {
-        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
-        std::process::exit(1);
-    }
-
-    // 校验所有凭据声明的端点都已注册
-    for cred in &credentials_list {
-        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
-        if !endpoints.contains_key(name) {
-            tracing::error!(
-                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
-                cred.id,
-                name,
-                endpoints.keys().collect::<Vec<_>>()
-            );
+    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    if start_legacy_credential_provider {
+        // 校验默认端点存在
+        if !endpoints.contains_key(&config.default_endpoint) {
+            tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
             std::process::exit(1);
         }
-    }
 
-    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+        // 校验所有凭据声明的端点都已注册
+        for cred in &credentials_list {
+            let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
+            if !endpoints.contains_key(name) {
+                tracing::error!(
+                    "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
+                    cred.id,
+                    name,
+                    endpoints.keys().collect::<Vec<_>>()
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        tracing::info!("上游账号运行时已启用；跳过旧凭据端点校验并不安装 Kiro provider");
+    }
     let usage_recorder = Arc::new(
         anthropic::usage::UsageRecorder::with_postgres_and_observability_redis(
             config.usage_record_limit,
@@ -514,7 +525,7 @@ async fn main() {
         ),
     }
 
-    // 创建 MultiTokenManager 和 KiroProvider
+    // 创建运行时管理器。旧凭据 provider 仅在未启用上游账号运行时时安装。
     let token_manager = MultiTokenManager::new_with_stores_and_runtime_state_and_account_info(
         config.clone(),
         credentials_list,
@@ -543,44 +554,53 @@ async fn main() {
         request_admission.clone(),
         runtime_event_health.clone(),
     );
-    let kiro_provider = KiroProvider::with_proxy(
-        token_manager.clone(),
-        proxy_config.clone(),
-        endpoints,
-        config.default_endpoint.clone(),
-    );
-    let kiro_provider = Arc::new(kiro_provider);
-    let initial_capability_cohort_keys = kiro_provider.model_capability_cohort_keys();
-    let initial_contract_match = model_capabilities
-        .reasoning_capability_cohort_contract_match(&initial_capability_cohort_keys);
-    match decide_native_reasoning_startup(
-        ModelCapabilityDiscoveryOutcome::Pending,
-        initial_capability_cohort_keys.len(),
-        initial_contract_match,
-    ) {
-        NativeReasoningStartupDecision::ContinueReady(contract_match) => tracing::info!(
-            cohort_count = initial_capability_cohort_keys.len(),
-            ?contract_match,
-            "已加载可覆盖当前账号 cohort 的 native reasoning 合同；能力恢复任务只检查内存 fence"
-        ),
-        NativeReasoningStartupDecision::ContinueReasoningUnknown(reason) => {
-            if model_capabilities.status().last_error.is_none() {
-                model_capabilities.record_sync_error(
-                    "native reasoning capability is Unknown while background cohort discovery is pending; ordinary and external-only service remains ready",
+    let kiro_provider = if start_legacy_credential_provider {
+        let provider = KiroProvider::with_proxy(
+            token_manager.clone(),
+            proxy_config.clone(),
+            endpoints,
+            config.default_endpoint.clone(),
+        );
+        Some(Arc::new(provider))
+    } else {
+        None
+    };
+    let model_capability_recovery_task = if let Some(kiro_provider) = kiro_provider.as_ref() {
+        let initial_capability_cohort_keys = kiro_provider.model_capability_cohort_keys();
+        let initial_contract_match = model_capabilities
+            .reasoning_capability_cohort_contract_match(&initial_capability_cohort_keys);
+        match decide_native_reasoning_startup(
+            ModelCapabilityDiscoveryOutcome::Pending,
+            initial_capability_cohort_keys.len(),
+            initial_contract_match,
+        ) {
+            NativeReasoningStartupDecision::ContinueReady(contract_match) => tracing::info!(
+                cohort_count = initial_capability_cohort_keys.len(),
+                ?contract_match,
+                "已加载可覆盖当前账号 cohort 的 native reasoning 合同；能力恢复任务只检查内存 fence"
+            ),
+            NativeReasoningStartupDecision::ContinueReasoningUnknown(reason) => {
+                if model_capabilities.status().last_error.is_none() {
+                    model_capabilities.record_sync_error(
+                        "native reasoning capability is Unknown while background cohort discovery is pending; ordinary and external-only service remains ready",
+                    );
+                }
+                tracing::warn!(
+                    cohort_count = initial_capability_cohort_keys.len(),
+                    ?reason,
+                    "native reasoning 能力当前为 Unknown；服务继续启动，显式 native reasoning fail closed，普通及 external-only 流量不受阻断"
                 );
             }
-            tracing::warn!(
-                cohort_count = initial_capability_cohort_keys.len(),
-                ?reason,
-                "native reasoning 能力当前为 Unknown；服务继续启动，显式 native reasoning fail closed，普通及 external-only 流量不受阻断"
-            );
         }
-    }
-    let model_capability_recovery_task = spawn_model_capability_recovery_worker(
-        kiro_provider.clone(),
-        model_capabilities.clone(),
-        postgres_store.clone(),
-    );
+        Some(spawn_model_capability_recovery_worker(
+            kiro_provider.clone(),
+            model_capabilities.clone(),
+            postgres_store.clone(),
+        ))
+    } else {
+        tracing::info!("上游账号运行时不启动旧模型能力恢复任务");
+        None
+    };
 
     let startup_pricing_sync_task = {
         let postgres_store = postgres_store.clone();
@@ -622,7 +642,7 @@ async fn main() {
         anthropic::AnthropicRouterDependencies {
             request_api_keys: request_api_key_store.clone(),
             request_admission: request_admission.clone(),
-            kiro_provider: Some(kiro_provider.clone()),
+            kiro_provider: kiro_provider.clone(),
             usage_recorder: usage_recorder.clone(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
@@ -741,7 +761,10 @@ async fn main() {
     runtime_event_health.mark_disconnected();
     tokio::join!(
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
-        abort_task_with_timeout("model capability recovery", model_capability_recovery_task),
+        abort_optional_task_with_timeout(
+            "model capability recovery",
+            model_capability_recovery_task
+        ),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 
@@ -1009,6 +1032,15 @@ async fn abort_task_with_timeout<T>(task_name: &'static str, task: tokio::task::
             timeout_ms = ABORTED_TASK_JOIN_TIMEOUT.as_millis() as u64,
             "等待已中止后台任务退出超时，丢弃任务句柄"
         );
+    }
+}
+
+async fn abort_optional_task_with_timeout<T>(
+    task_name: &'static str,
+    task: Option<tokio::task::JoinHandle<T>>,
+) {
+    if let Some(task) = task {
+        abort_task_with_timeout(task_name, task).await;
     }
 }
 
@@ -1616,6 +1648,23 @@ mod lifecycle_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn legacy_provider_is_not_required_when_upstream_accounts_are_enabled() {
+        let mut config = Config::default();
+
+        config.external_pools.external_pools_enabled = true;
+        assert!(
+            !legacy_credential_provider_required(&config),
+            "enabled upstream account runtime must not install the legacy provider"
+        );
+
+        config.external_pools.external_pools_enabled = false;
+        assert!(
+            legacy_credential_provider_required(&config),
+            "legacy provider remains the compatibility path until account runtime is enabled"
+        );
     }
 
     #[tokio::test]

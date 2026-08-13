@@ -63,6 +63,8 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - the upstream account page now calls the account-named Admin API aliases for list, status, create, update, enable, cooldown, supported-model discovery, delete and test actions.
 - `/cc/v1/messages` can now run through configured upstream accounts when no `KiroProvider` is installed, for both stream and non-stream normalized requests.
 - account selection now honors the configured request body mode during eligibility and immediate-availability checks, so raw-preparse routing does not steal normalized-only accounts and normalized routing does not select raw-only accounts.
+- startup can now run without installing a legacy `KiroProvider` when the upstream account runtime is enabled, so missing legacy credential files do not block account-only deployments.
+- Admin service dependencies now treat the legacy provider as optional; old credential/model-test endpoints return explicit compatibility errors when the provider is absent while account management remains available.
 
 Last verified on 2026-08-14:
 
@@ -74,3 +76,7 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-body-mode-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-only-slice-fmt2 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-only-slice-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-startup-decision-test2 -- cargo test legacy_provider_is_not_required_when_upstream_accounts_are_enabled -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-startup-account-only-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-startup-fmt3 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-startup-check2 -- cargo check`

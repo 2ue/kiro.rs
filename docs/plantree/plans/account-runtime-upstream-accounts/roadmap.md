@@ -24,14 +24,16 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - The upstream account page now uses account-named API calls, while component/type filenames remain to be migrated.
 - Account-only `/cc/v1/messages` routing now works through configured upstream accounts when no `KiroProvider` is installed, covering normalized stream and non-stream requests.
 - Account eligibility and availability checks now honor request body mode, so raw passthrough and normalized account routes are scheduled against compatible accounts only.
+- Startup no longer installs the legacy `KiroProvider` when upstream account runtime is enabled, and missing legacy credential files do not block account-only deployments.
+- Admin service construction accepts an absent legacy provider; old credential/model-test actions fail explicitly in that mode while account management and usage surfaces can remain mounted.
 
 ## In Progress
 
 - Convert remaining backend Admin/API/DTO and usage-dashboard names from external-pool/local-credential terminology toward account terminology while preserving temporary compatibility aliases.
+- Remove remaining startup/runtime Kiro vocabulary and replace legacy external-pool runtime config fields with account-named compatibility wrappers.
 
 ## Next
 
-- Introduce startup/runtime dependency paths that can boot with upstream accounts and no `KiroProvider`.
 - Split scheduler primitives from Kiro credential types before deleting Kiro modules.
 - Convert body and protocol paths to canonical/upstream-account logic with no Kiro envelope or Kiro event dependency.
 

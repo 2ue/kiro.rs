@@ -538,7 +538,7 @@ pub struct AdminService {
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    kiro_provider: Arc<KiroProvider>,
+    kiro_provider: Option<Arc<KiroProvider>>,
     external_pool_manager: Arc<ExternalPoolManager>,
     /// Serializes credential imports so duplicate preflight cannot fan out auxiliary model calls.
     credential_import_lock: Arc<tokio::sync::Mutex<()>>,
@@ -554,7 +554,7 @@ pub struct AdminServiceDependencies {
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    pub kiro_provider: Arc<KiroProvider>,
+    pub kiro_provider: Option<Arc<KiroProvider>>,
     pub postgres_store: Arc<PostgresStore>,
     pub observability_redis_store: Option<Arc<RedisStore>>,
     pub request_api_key_store: Arc<RequestApiKeyStore>,
@@ -2187,8 +2187,12 @@ impl AdminService {
         &self,
         id: u64,
     ) -> Result<Vec<String>, AdminServiceError> {
-        let models = self
-            .kiro_provider
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InvalidCredential(
+                "当前运行时未启用旧凭据模型发现；请使用上游账号模型发现".to_string(),
+            )
+        })?;
+        let models = provider
             .list_available_models_for_credential(id)
             .await
             .map_err(|err| {
@@ -2219,8 +2223,11 @@ impl AdminService {
         &self,
         credential: KiroCredentials,
     ) -> anyhow::Result<Vec<String>> {
-        let models = self
+        let provider = self
             .kiro_provider
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("当前运行时未启用旧凭据模型发现"))?;
+        let models = provider
             .list_available_models_for_external_credentials(credential)
             .await
             .map_err(|err| anyhow::anyhow!("API Key 模型发现失败: {}", err))?;
@@ -2685,9 +2692,13 @@ impl AdminService {
         let (model, model_id, prompt, request_body) =
             self.build_model_test_request(&req.model, &prompt)?;
 
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::InvalidCredential(
+                "当前运行时未启用旧凭据测试；请使用上游账号测试".to_string(),
+            )
+        })?;
         let started_at = std::time::Instant::now();
-        let api_response = self
-            .kiro_provider
+        let api_response = provider
             .call_api_with_credential(id, &request_body)
             .await
             .map_err(|e| self.classify_test_error(e, id))?;
@@ -2732,8 +2743,12 @@ impl AdminService {
     ) -> Result<String, AdminServiceError> {
         let (_, _, _, request_body) = self.build_model_test_request(model, prompt)?;
         let runtime_config = self.token_manager.runtime_config();
-        let api_response = self
-            .kiro_provider
+        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+            AdminServiceError::UpstreamError(
+                "当前运行时未启用旧凭据验活；请使用上游账号测试".to_string(),
+            )
+        })?;
+        let api_response = provider
             .call_api_with_external_credentials(credential, &request_body)
             .await
             .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
@@ -3898,11 +3913,19 @@ impl AdminService {
 
     /// 手动同步 Kiro 模型能力。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_capabilities(&self) -> ModelCapabilitiesStatus {
-        let status = match self.kiro_provider.list_available_models().await {
-            Ok(models) => self.model_capabilities.sync_from_kiro_catalog(models),
-            Err(err) => {
-                tracing::warn!("同步 Kiro 模型能力失败，不影响请求调度: {}", err);
-                self.model_capabilities.record_sync_error(err.to_string())
+        let status = match self.kiro_provider.as_ref() {
+            Some(provider) => match provider.list_available_models().await {
+                Ok(models) => self.model_capabilities.sync_from_kiro_catalog(models),
+                Err(err) => {
+                    tracing::warn!("同步 Kiro 模型能力失败，不影响请求调度: {}", err);
+                    self.model_capabilities.record_sync_error(err.to_string())
+                }
+            },
+            None => {
+                tracing::warn!("跳过旧模型能力同步：当前运行时未启用 Kiro provider");
+                self.model_capabilities.record_sync_error(
+                    "model capability sync skipped because the runtime has no legacy Kiro provider",
+                )
             }
         };
         let mut status = status;
