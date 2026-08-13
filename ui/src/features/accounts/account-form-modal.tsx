@@ -1,15 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Loader2, Plus, Save } from 'lucide-react'
 import { toast } from 'sonner'
-import type { ExternalPool } from '@/types/api'
+import type { Account } from '@/types/api'
 import { ModalShell } from '@/components/patterns'
 import { Button } from '@/components/ui'
 import { SelectItem } from '@/components/ui'
 import { cn } from '@/lib/utils'
 import { SupportedModelTagsEditor, parseSupportedModelItems } from '@/features/shared/supported-model-tags'
 import {
-  type ExternalPoolFormDraft,
-  type ExternalPoolModelMappingPreset,
+  type AccountFormDraft,
+  type AccountModelMappingPreset,
   modelMappingDescription,
   modelMappingPresetsForMode,
   modelMappingPresetClass,
@@ -21,7 +21,7 @@ import {
   streamRetryDescription,
   streamResponseDescription,
   usageProjectionDescription,
-} from './external-pool-utils'
+} from './account-utils'
 import {
   FormSection,
   HintBox,
@@ -30,10 +30,10 @@ import {
   TextAreaBox,
   TextBox,
   ToggleRow,
-} from './external-pool-components'
+} from './account-components'
 
 function ModelMappingPresetTags({ presets, disabled, onSelect }: {
-  presets: ExternalPoolModelMappingPreset[]; disabled?: boolean; onSelect: (p: ExternalPoolModelMappingPreset) => void
+  presets: AccountModelMappingPreset[]; disabled?: boolean; onSelect: (p: AccountModelMappingPreset) => void
 }) {
   if (!presets.length) return null
   return (
@@ -56,24 +56,24 @@ function ModelMappingPresetTags({ presets, disabled, onSelect }: {
 
 // --- Main modal ---
 
-export function ExternalPoolFormModal({
-  mode, pool, open, draft, saving, onDraftChange, onClose, onSubmit, onDiscoverSupportedModels,
+export function AccountFormModal({
+  mode, account, open, draft, saving, onDraftChange, onClose, onSubmit, onDiscoverSupportedModels,
 }: {
   mode: 'create' | 'edit'
-  pool?: ExternalPool | null
+  account?: Account | null
   open: boolean
-  draft: ExternalPoolFormDraft
+  draft: AccountFormDraft
   saving: boolean
-  onDraftChange: (value: ExternalPoolFormDraft | ((prev: ExternalPoolFormDraft) => ExternalPoolFormDraft)) => void
+  onDraftChange: (value: AccountFormDraft | ((prev: AccountFormDraft) => AccountFormDraft)) => void
   onClose: () => void
   onSubmit: () => void
   onDiscoverSupportedModels?: () => Promise<string[]>
 }) {
   const isEdit = mode === 'edit'
-  const title = isEdit ? `编辑外部账号${pool ? ` #${pool.id}` : ''}` : '添加外部账号'
+  const title = isEdit ? `编辑外部账号${account ? ` #${account.id}` : ''}` : '添加外部账号'
   const keyLabel = isEdit ? '新请求 Key' : '请求 Key'
   const keyDescription = isEdit
-    ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}`
+    ? `留空表示不修改当前 Key。当前：${account?.maskedApiKey || '未显示 Key'}`
     : '外部账号的请求密钥，保存后只显示脱敏值。'
   const [quickImportText, setQuickImportText] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
@@ -85,10 +85,10 @@ export function ExternalPoolFormModal({
     }
   }, [open])
 
-  const set = <K extends keyof ExternalPoolFormDraft>(key: K, value: ExternalPoolFormDraft[K]) =>
+  const set = <K extends keyof AccountFormDraft>(key: K, value: AccountFormDraft[K]) =>
     onDraftChange((prev) => ({ ...prev, [key]: value }))
 
-  const addMappingPreset = (preset: ExternalPoolModelMappingPreset) => {
+  const addMappingPreset = (preset: AccountModelMappingPreset) => {
     const result = appendModelMappingPreset(draft.modelMappingRulesText, preset)
     onDraftChange((prev) => ({ ...prev, modelMappingRulesText: result.text }))
     if (result.added) toast.success('模型映射规则已添加')
@@ -145,7 +145,7 @@ export function ExternalPoolFormModal({
         <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接外部账号。">
           <div className="grid gap-3 md:grid-cols-2">
             <TextBox label="名称" value={draft.name} disabled={saving} onChange={(v) => set('name', v)} />
-            <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(v) => set('authType', v as ExternalPoolFormDraft['authType'])}>
+            <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(v) => set('authType', v as AccountFormDraft['authType'])}>
               <SelectItem value="bearer">Authorization: Bearer &lt;key&gt;</SelectItem>
               <SelectItem value="x_api_key">x-api-key: &lt;key&gt;</SelectItem>
             </SelectBox>
@@ -169,7 +169,7 @@ export function ExternalPoolFormModal({
 
           <FormSection title="下游 usage 口径" description="只决定当前外部账号返回给下游的 usage 是透传上游，还是按当前入口路径整理；非 usage 内容不受影响。">
             <div className="space-y-3">
-              <SelectBox label="下游 usage" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as ExternalPoolFormDraft['usageProjectionMode'])}>
+              <SelectBox label="下游 usage" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as AccountFormDraft['usageProjectionMode'])}>
                 <SelectItem value="pass_through">透传上游 usage</SelectItem>
                 <SelectItem value="current_path_policy">按当前入口路径整理 usage</SelectItem>
               </SelectBox>
@@ -183,7 +183,7 @@ export function ExternalPoolFormModal({
                 label="SSE 转发"
                 value={draft.streamResponseMode}
                 disabled={saving}
-                onChange={(v) => set('streamResponseMode', v as ExternalPoolFormDraft['streamResponseMode'])}
+                onChange={(v) => set('streamResponseMode', v as AccountFormDraft['streamResponseMode'])}
               >
                 <SelectItem value="inherit">继承全局默认</SelectItem>
                 <SelectItem value="event_passthrough">SSE 事件级透传</SelectItem>
@@ -198,7 +198,7 @@ export function ExternalPoolFormModal({
                 label="首输出前流式恢复"
                 value={draft.preOutputStreamRetryMode}
                 disabled={saving}
-                onChange={(v) => set('preOutputStreamRetryMode', v as ExternalPoolFormDraft['preOutputStreamRetryMode'])}
+                onChange={(v) => set('preOutputStreamRetryMode', v as AccountFormDraft['preOutputStreamRetryMode'])}
               >
                 <SelectItem value="inherit">继承全局</SelectItem>
                 <SelectItem value="enabled">启用</SelectItem>
@@ -234,7 +234,7 @@ export function ExternalPoolFormModal({
               label="单池路由模式"
               value={draft.routeMode}
               disabled={saving}
-              onChange={(v) => set('routeMode', v as ExternalPoolFormDraft['routeMode'])}
+              onChange={(v) => set('routeMode', v as AccountFormDraft['routeMode'])}
             >
               <SelectItem value="allow_all">全部入口允许</SelectItem>
               <SelectItem value="allow_list">只允许下列入口</SelectItem>
@@ -257,7 +257,7 @@ export function ExternalPoolFormModal({
                 label="Body 模式"
                 value={draft.requestBodyMode}
                 disabled={saving}
-                onChange={(v) => set('requestBodyMode', v as ExternalPoolFormDraft['requestBodyMode'])}
+                onChange={(v) => set('requestBodyMode', v as AccountFormDraft['requestBodyMode'])}
               >
                 <SelectItem value="normalized">标准处理</SelectItem>
                 <SelectItem value="raw_passthrough">Raw 透传</SelectItem>
@@ -283,7 +283,7 @@ export function ExternalPoolFormModal({
                   </HintBox>
                 </>
               )}
-              <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(v) => set('modelMappingMode', v as ExternalPoolFormDraft['modelMappingMode'])}>
+              <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(v) => set('modelMappingMode', v as AccountFormDraft['modelMappingMode'])}>
                 <SelectItem value="passthrough">直接使用请求模型</SelectItem>
                 <SelectItem value="passthrough_mapping">请求模型优先映射</SelectItem>
                 <SelectItem value="direct_mapping">映射后内部处理</SelectItem>
@@ -326,7 +326,7 @@ export function ExternalPoolFormModal({
 
         <FormSection title="错误处理和备注" description="自动禁用策略只决定当前外部账号是否继承全局自动禁用规则。">
           <div className="grid gap-3 md:grid-cols-2">
-            <SelectBox label="自动禁用策略" value={draft.autoDisablePolicy} disabled={saving} onChange={(v) => set('autoDisablePolicy', v as ExternalPoolFormDraft['autoDisablePolicy'])}>
+            <SelectBox label="自动禁用策略" value={draft.autoDisablePolicy} disabled={saving} onChange={(v) => set('autoDisablePolicy', v as AccountFormDraft['autoDisablePolicy'])}>
               <SelectItem value="inherit">继承全局自动禁用</SelectItem>
               <SelectItem value="enabled">单独启用自动禁用</SelectItem>
               <SelectItem value="disabled">关闭自动禁用</SelectItem>

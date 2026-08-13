@@ -72,6 +72,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - App state, Anthropic router dependencies, Admin service dependencies and process wiring now inject `AccountRuntimeManager` from the `account_runtime` boundary. The current manager facade still delegates to the legacy external-pool implementation, but new integration points no longer depend on `ExternalPoolManager` as their primary type.
 - `/api/admin/accounts` now uses account-named wire DTOs for list/status/mutation/test responses. The JSON field shape remains compatible with the current upstream account page, while legacy `/api/admin/external-pools` keeps its old pool DTOs.
 - `AccountRuntimeConfig` now fronts the legacy external-pool config structure at new integration boundaries. App state, Anthropic router config, request-runtime config, Admin runtime-config DTOs and runtime reload invalidation use account runtime terminology while persisted `external_pools` storage and compatibility JSON remain mirrored.
+- The Admin frontend account page has moved from `features/external-pools` to `features/accounts`. Its page, modal, test modal, helper components and utilities now use account component names, while `/external-pools` remains only a redirect compatibility route.
 
 Last verified on 2026-08-14:
 
@@ -105,3 +106,4 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `pnpm --dir ui check`
+- `git diff --check`

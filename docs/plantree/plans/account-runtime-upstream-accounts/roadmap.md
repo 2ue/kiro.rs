@@ -34,11 +34,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - `AccountRuntimeManager` is now the injection boundary for App state, Anthropic router dependencies, Admin service dependencies and process lifecycle wiring. It currently aliases the legacy external-pool manager so the scheduler/transport internals can be migrated behind an account runtime facade in smaller verified steps.
 - Account Admin responses now have account-named DTOs for list/status/mutation/test surfaces, with a focused serialization test proving `/accounts` uses `accounts/account` fields rather than legacy `pools/pool` wrappers.
 - `AccountRuntimeConfig` is now the config facade for new runtime/Admin/router/handler boundaries, while old persisted `external_pools` fields remain as the compatibility storage and wire mirror.
+- The Admin account feature directory has moved from `features/external-pools` to `features/accounts`; account page, form modal, test modal, components and utilities now use account component/file names, with `/external-pools` kept as a redirect.
 
 ## In Progress
 
 - Migrate account runtime internals away from legacy external-pool names behind the `account_runtime` facade while preserving current scheduler, proxy, body-mode, retry, usage projection and compatibility behavior.
-- Convert remaining frontend account page/runtime-config names and backend config DTO names from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
+- Convert remaining frontend runtime-config names and backend config DTO names from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
 
 ## Next
 

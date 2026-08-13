@@ -12,8 +12,8 @@ const OverviewPage = React.lazy(() =>
 const CredentialsPage = React.lazy(() =>
   import('@/features/credentials/credentials-page').then((m) => ({ default: m.CredentialsPage }))
 )
-const ExternalPoolsPage = React.lazy(() =>
-  import('@/features/external-pools/external-pools-page').then((m) => ({ default: m.ExternalPoolsPage }))
+const AccountsPage = React.lazy(() =>
+  import('@/features/accounts/accounts-page').then((m) => ({ default: m.AccountsPage }))
 )
 const ProxiesPage = React.lazy(() =>
   import('@/features/proxies/proxies-page').then((m) => ({ default: m.ProxiesPage }))
@@ -68,7 +68,7 @@ const router = createBrowserRouter(
         // 资源域
         { path: 'credentials', element: <Lazy><CredentialsPage /></Lazy> },
         { path: 'validation', element: <Lazy><ValidationPage /></Lazy> },
-        { path: 'accounts', element: <Lazy><ExternalPoolsPage /></Lazy> },
+        { path: 'accounts', element: <Lazy><AccountsPage /></Lazy> },
         { path: 'external-pools', element: <Navigate to="/accounts" replace /> },
         { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },
         // 分析域

@@ -27,7 +27,7 @@ import {
 import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
 import { useRuntimeConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage, cn } from '@/lib/utils'
-import type { ExternalPool, ExternalPoolsConfig, UpdateExternalPoolRequest } from '@/types/api'
+import type { Account, ExternalPoolsConfig, UpdateAccountRequest } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import {
   EmptyState,
@@ -43,26 +43,26 @@ import { Badge, Button } from '@/components/ui'
 import { SelectItem } from '@/components/ui'
 import { ProgressRing } from '@/components/charts'
 import {
-  type ExternalPoolFormDraft,
+  type AccountFormDraft,
   authLabel,
-  defaultPoolForm,
+  defaultAccountForm,
   joinRules,
   joinStatusCodeList,
   parseModelMappingRules,
   parseStatusCodeList,
   parseSupportedModelsText,
-  poolFormFromPool,
-  poolBodyModeSummary,
-  poolModelMappingSummary,
-  poolRouteSummary,
+  accountFormFromAccount,
+  accountBodyModeSummary,
+  accountModelMappingSummary,
+  accountRouteSummary,
   streamRetrySummary,
-  poolSupportedModelsSummary,
-  poolUsageSummary,
+  accountSupportedModelsSummary,
+  accountUsageSummary,
   splitRules,
   whole,
-} from './external-pool-utils'
-import { ExternalPoolFormModal } from './external-pool-form-modal'
-import { ExternalPoolTestModal } from './external-pool-test-modal'
+} from './account-utils'
+import { AccountFormModal } from './account-form-modal'
+import { AccountTestModal } from './account-test-modal'
 import {
   FormSection,
   NumberBox,
@@ -70,7 +70,7 @@ import {
   TextBox,
   TextAreaBox,
   ToggleRow,
-} from './external-pool-components'
+} from './account-components'
 
 // ============================================================================
 // Local sub-components
@@ -97,14 +97,14 @@ function PolicyBlock({ title, titleSuffix, description, active, children }: {
 }
 
 // ============================================================================
-// ExternalPoolsPage
+// AccountsPage
 // ============================================================================
 
-export function ExternalPoolsPage() {
+export function AccountsPage() {
   const queryClient = useQueryClient()
   const confirmDialog = useConfirm()
   const runtimeConfig = useRuntimeConfig()
-  const pools = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
+  const accounts = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
   const status = useQuery({ queryKey: ['accounts-status'], queryFn: getAccountsStatus, refetchInterval: 5000 })
 
   const [savingConfig, setSavingConfig] = useState(false)
@@ -114,11 +114,11 @@ export function ExternalPoolsPage() {
   const [retryStatusCodesText, setRetryStatusCodesText] = useState('')
   const [samePoolRetryStatusCodesText, setSamePoolRetryStatusCodesText] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
-  const [editingPool, setEditingPool] = useState<ExternalPool | null>(null)
-  const [testingPool, setTestingPool] = useState<ExternalPool | null>(null)
-  const [savingPool, setSavingPool] = useState(false)
-  const [createForm, setCreateForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
-  const [editForm, setEditForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
+  const [editingAccount, setEditingAccount] = useState<Account | null>(null)
+  const [testingAccount, setTestingAccount] = useState<Account | null>(null)
+  const [savingAccount, setSavingAccount] = useState(false)
+  const [createForm, setCreateForm] = useState<AccountFormDraft>(() => defaultAccountForm())
+  const [editForm, setEditForm] = useState<AccountFormDraft>(() => defaultAccountForm())
 
   useEffect(() => {
     const accountRuntime = { ...defaultExternalPoolsConfig(), ...runtimeConfig.data?.accountRuntime }
@@ -203,10 +203,10 @@ export function ExternalPoolsPage() {
     }
   }
 
-  const submitPool = async () => {
-    if (savingPool) return
+  const submitAccount = async () => {
+    if (savingAccount) return
     if (!createForm.name?.trim() || !createForm.baseUrl?.trim() || !createForm.apiKey?.trim()) return toast.error('名称、Base URL 和 Key 必填')
-    setSavingPool(true)
+    setSavingAccount(true)
     try {
       const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = createForm
       await createAccount({
@@ -223,27 +223,27 @@ export function ExternalPoolsPage() {
       })
       toast.success('外部账号已添加')
       setCreateOpen(false)
-      setCreateForm(defaultPoolForm())
+      setCreateForm(defaultAccountForm())
       invalidate()
     } catch (error) {
       toast.error(extractErrorMessage(error))
     } finally {
-      setSavingPool(false)
+      setSavingAccount(false)
     }
   }
 
-  const startEdit = (pool: ExternalPool) => {
-    setEditingPool(pool)
-    setEditForm(poolFormFromPool(pool))
+  const startEdit = (account: Account) => {
+    setEditingAccount(account)
+    setEditForm(accountFormFromAccount(account))
   }
 
-  const savePoolEdit = async () => {
-    if (!editingPool || savingPool) return
+  const saveAccountEdit = async () => {
+    if (!editingAccount || savingAccount) return
     if (!editForm.name?.trim() || !editForm.baseUrl?.trim()) return toast.error('名称和 Base URL 必填')
-    setSavingPool(true)
+    setSavingAccount(true)
     try {
       const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = editForm
-      const payload: UpdateExternalPoolRequest = {
+      const payload: UpdateAccountRequest = {
         ...form,
         name: editForm.name.trim(),
         baseUrl: editForm.baseUrl.trim(),
@@ -255,19 +255,19 @@ export function ExternalPoolsPage() {
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
       }
-      await updateAccount(editingPool.id, payload)
+      await updateAccount(editingAccount.id, payload)
       toast.success('外部账号已更新')
-      setEditingPool(null)
-      setEditForm(defaultPoolForm())
+      setEditingAccount(null)
+      setEditForm(defaultAccountForm())
       invalidate()
     } catch (error) {
       toast.error(extractErrorMessage(error))
     } finally {
-      setSavingPool(false)
+      setSavingAccount(false)
     }
   }
 
-  const mutatePool = async (action: () => Promise<unknown>, success: string) => {
+  const mutateAccount = async (action: () => Promise<unknown>, success: string) => {
     try { await action(); toast.success(success); invalidate() }
     catch (error) { toast.error(extractErrorMessage(error)) }
   }
@@ -293,12 +293,12 @@ export function ExternalPoolsPage() {
     || configDraft.externalPoolUsageProjectionCostFloorEnabled
   const usageDebugActive = externalEnabled && configDraft.externalPoolUsageDebugEnabled
 
-  const poolStatuses = status.data?.accounts ?? []
-  const totalPools = pools.data?.accounts.length ?? poolStatuses.length
-  const dispatchablePools = poolStatuses.filter((item) => item.dispatchable).length
-  const totalInFlight = poolStatuses.reduce((sum, item) => sum + item.inFlight, 0)
-  const totalCapacity = poolStatuses.reduce((sum, item) => sum + item.account.maxConcurrentRequests, 0)
-  const currentPathPoolCount = pools.data?.accounts.filter((pool) => pool.usageProjectionMode === 'current_path_policy').length ?? 0
+  const accountStatuses = status.data?.accounts ?? []
+  const totalAccounts = accounts.data?.accounts.length ?? accountStatuses.length
+  const dispatchableAccounts = accountStatuses.filter((item) => item.dispatchable).length
+  const totalInFlight = accountStatuses.reduce((sum, item) => sum + item.inFlight, 0)
+  const totalCapacity = accountStatuses.reduce((sum, item) => sum + item.account.maxConcurrentRequests, 0)
+  const currentPathAccountCount = accounts.data?.accounts.filter((account) => account.usageProjectionMode === 'current_path_policy').length ?? 0
   const concurrencyPct = totalCapacity > 0 ? Math.round((totalInFlight / totalCapacity) * 100) : 0
 
   const setCacheUpliftEnabled = (enabled: boolean) =>
@@ -319,12 +319,12 @@ export function ExternalPoolsPage() {
       />
 
       <StatGrid>
-        <StatCard title="外部账号" value={totalPools} tone="info" icon={
+        <StatCard title="外部账号" value={totalAccounts} tone="info" icon={
           <ProgressRing value={concurrencyPct} size={40} strokeWidth={4} color="hsl(var(--info))" label={`${concurrencyPct}%`} />
         } />
-        <StatCard title="可调度" value={dispatchablePools} tone={dispatchablePools > 0 ? 'success' : 'warning'} />
+        <StatCard title="可调度" value={dispatchableAccounts} tone={dispatchableAccounts > 0 ? 'success' : 'warning'} />
         <StatCard title="外部并发" value={`${totalInFlight}/${totalCapacity || 0}`} tone="default" />
-        <StatCard title="按路径整理 usage" value={`${currentPathPoolCount} 个`} />
+        <StatCard title="按路径整理 usage" value={`${currentPathAccountCount} 个`} />
         <StatCard
           title="入口策略"
           value={fallbackActive || directPolicyActive ? '已配置' : '未配置'}
@@ -422,7 +422,7 @@ export function ExternalPoolsPage() {
                   <NumberBox disabled={!externalEnabled} label="协议/认证冷却" suffix="秒" value={configDraft.externalPoolProtocolErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolProtocolErrorCooldownSecs: v }))} />
                   <SelectBox disabled={!externalEnabled} label="模型不可用冷却范围" value={configDraft.externalPoolModelUnavailableCooldownMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownMode: v as ExternalPoolsConfig['externalPoolModelUnavailableCooldownMode'] }))}>
                     <SelectItem value="model">仅当前模型</SelectItem>
-                    <SelectItem value="pool">整个外部账号</SelectItem>
+                    <SelectItem value="account">整个外部账号</SelectItem>
                     <SelectItem value="disabled">不写冷却</SelectItem>
                   </SelectBox>
                   <NumberBox disabled={!externalEnabled || configDraft.externalPoolModelUnavailableCooldownMode === 'disabled'} label="模型不可用冷却" suffix="秒" value={configDraft.externalPoolModelUnavailableCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownSecs: v }))} />
@@ -525,61 +525,61 @@ export function ExternalPoolsPage() {
         </div>
       </SectionCard>
 
-      {/* Pool list */}
+      {/* Account list */}
       <SectionCard
         title="外部账号列表"
         description="单个外部账号配置只影响自身；全局调度、冷却、补偿策略在上方统一保存。"
         actions={
-          <Button size="sm" onClick={() => { setCreateForm(defaultPoolForm()); setCreateOpen(true) }}>
+          <Button size="sm" onClick={() => { setCreateForm(defaultAccountForm()); setCreateOpen(true) }}>
             <Plus className="h-4 w-4" />添加外部账号
           </Button>
         }
       >
-        {pools.isLoading ? (
+        {accounts.isLoading ? (
           <LoadingState />
-        ) : !pools.data?.accounts.length ? (
+        ) : !accounts.data?.accounts.length ? (
           <EmptyState title="暂无外部账号" description="点击右上角按钮添加第一个外部账号。" />
         ) : (
           <div className="space-y-3">
-            {pools.data.accounts.map((pool) => {
-              const runtime = statusMap.get(pool.id)
+            {accounts.data.accounts.map((account) => {
+              const runtime = statusMap.get(account.id)
               const inFlight = runtime?.inFlight ?? 0
-              const capacity = pool.maxConcurrentRequests
+              const capacity = account.maxConcurrentRequests
               const usePct = capacity > 0 ? Math.round((inFlight / capacity) * 100) : 0
               return (
-                <div key={pool.id} className="rounded-lg bg-card p-4 shadow-sm">
+                <div key={account.id} className="rounded-lg bg-card p-4 shadow-sm">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                     <div className="flex items-start gap-3">
                       <ProgressRing
                         value={usePct}
                         size={44}
                         strokeWidth={4}
-                        color={pool.enabled && !pool.autoDisabled ? 'hsl(var(--success))' : 'hsl(var(--destructive))'}
+                        color={account.enabled && !account.autoDisabled ? 'hsl(var(--success))' : 'hsl(var(--destructive))'}
                         label={`${usePct}%`}
                         className="mt-0.5 shrink-0"
                       />
                       <div className="min-w-0 space-y-1.5">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="font-semibold">#{pool.id} {pool.name}</span>
-                          <Badge tone={pool.enabled ? 'success' : 'neutral'}>{pool.enabled ? '启用' : '停用'}</Badge>
-                          {pool.autoDisabled && <Badge tone="error">自动禁用</Badge>}
+                          <span className="font-semibold">#{account.id} {account.name}</span>
+                          <Badge tone={account.enabled ? 'success' : 'neutral'}>{account.enabled ? '启用' : '停用'}</Badge>
+                          {account.autoDisabled && <Badge tone="error">自动禁用</Badge>}
                           <Badge tone={runtime?.dispatchable ? 'info' : 'neutral'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                         </div>
-                        <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {inFlight}/{capacity} · 优先级 {pool.priority}</div>
-                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {streamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} · {poolSupportedModelsSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
-                        {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
+                        <div className="text-sm text-muted-foreground">{account.baseUrl} · {account.maskedApiKey || '未显示 Key'} · 并发 {inFlight}/{capacity} · 优先级 {account.priority}</div>
+                        <div className="text-xs text-muted-foreground">{accountUsageSummary(account, configDraft)} · {streamRetrySummary(account, configDraft)} · {accountRouteSummary(account)} · {accountBodyModeSummary(account)} · 认证：{authLabel(account.authType)} · 模型：{accountModelMappingSummary(account)} · {accountSupportedModelsSummary(account)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
+                        {account.autoDisabledLastError && <div className="text-xs text-destructive">{account.autoDisabledLastError}</div>}
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-1.5 lg:shrink-0">
-                      <Button variant="ghost" size="xs" onClick={() => startEdit(pool)}><Pencil className="h-3.5 w-3.5" />编辑</Button>
-                      <Button variant="ghost" size="xs" onClick={() => setTestingPool(pool)}><FlaskConical className="h-3.5 w-3.5" />测试</Button>
-                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => setAccountEnabled(pool.id, !pool.enabled), pool.enabled ? '已停用' : '已启用')}>
-                        <Power className="h-3.5 w-3.5" />{pool.enabled ? '停用' : '启用'}
+                      <Button variant="ghost" size="xs" onClick={() => startEdit(account)}><Pencil className="h-3.5 w-3.5" />编辑</Button>
+                      <Button variant="ghost" size="xs" onClick={() => setTestingAccount(account)}><FlaskConical className="h-3.5 w-3.5" />测试</Button>
+                      <Button variant="ghost" size="xs" onClick={() => mutateAccount(() => setAccountEnabled(account.id, !account.enabled), account.enabled ? '已停用' : '已启用')}>
+                        <Power className="h-3.5 w-3.5" />{account.enabled ? '停用' : '启用'}
                       </Button>
-                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearAccountAutoDisabled(pool.id), '自动禁用状态已清除')}>
+                      <Button variant="ghost" size="xs" onClick={() => mutateAccount(() => clearAccountAutoDisabled(account.id), '自动禁用状态已清除')}>
                         <RotateCcw className="h-3.5 w-3.5" />清除禁用
                       </Button>
-                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearAccountCooldown(pool.id), '冷却状态已清除')}>
+                      <Button variant="ghost" size="xs" onClick={() => mutateAccount(() => clearAccountCooldown(account.id), '冷却状态已清除')}>
                         <RotateCcw className="h-3.5 w-3.5" />清除冷却
                       </Button>
                       <Button variant="ghost" size="xs" onClick={() => status.refetch()}><RefreshCw className="h-3.5 w-3.5" />刷新</Button>
@@ -587,8 +587,8 @@ export function ExternalPoolsPage() {
                         variant="ghost" size="xs"
                         className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                         onClick={async () => {
-                          const confirmed = await confirmDialog({ title: '删除外部账号', message: `删除外部账号「${pool.name}」？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
-                          if (confirmed) mutatePool(() => deleteAccount(pool.id), '外部账号已删除')
+                          const confirmed = await confirmDialog({ title: '删除外部账号', message: `删除外部账号「${account.name}」？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
+                          if (confirmed) mutateAccount(() => deleteAccount(account.id), '外部账号已删除')
                         }}
                       >
                         <Trash2 className="h-3.5 w-3.5" />删除
@@ -602,11 +602,11 @@ export function ExternalPoolsPage() {
         )}
       </SectionCard>
 
-      <ExternalPoolFormModal
+      <AccountFormModal
         mode="create"
         open={createOpen}
         draft={createForm}
-        saving={savingPool}
+        saving={savingAccount}
         onDraftChange={setCreateForm}
         onDiscoverSupportedModels={async () => {
           if (!createForm.baseUrl.trim() || !createForm.apiKey.trim()) {
@@ -619,32 +619,32 @@ export function ExternalPoolsPage() {
           })
           return response.supportedModels
         }}
-        onClose={() => { if (savingPool) return; setCreateOpen(false); setCreateForm(defaultPoolForm()) }}
-        onSubmit={submitPool}
+        onClose={() => { if (savingAccount) return; setCreateOpen(false); setCreateForm(defaultAccountForm()) }}
+        onSubmit={submitAccount}
       />
-      <ExternalPoolFormModal
+      <AccountFormModal
         mode="edit"
-        pool={editingPool}
-        open={Boolean(editingPool)}
+        account={editingAccount}
+        open={Boolean(editingAccount)}
         draft={editForm}
-        saving={savingPool}
+        saving={savingAccount}
         onDraftChange={setEditForm}
         onDiscoverSupportedModels={async () => {
-          if (!editingPool) return []
-          const response = await discoverStoredAccountSupportedModels(editingPool.id, {
+          if (!editingAccount) return []
+          const response = await discoverStoredAccountSupportedModels(editingAccount.id, {
             baseUrl: editForm.baseUrl.trim() || null,
             apiKey: editForm.apiKey.trim() || null,
             authType: editForm.authType,
           })
           return response.supportedModels
         }}
-        onClose={() => { if (savingPool) return; setEditingPool(null); setEditForm(defaultPoolForm()) }}
-        onSubmit={savePoolEdit}
+        onClose={() => { if (savingAccount) return; setEditingAccount(null); setEditForm(defaultAccountForm()) }}
+        onSubmit={saveAccountEdit}
       />
-      <ExternalPoolTestModal
-        pool={testingPool}
-        open={Boolean(testingPool)}
-        onClose={() => setTestingPool(null)}
+      <AccountTestModal
+        account={testingAccount}
+        open={Boolean(testingAccount)}
+        onClose={() => setTestingAccount(null)}
         onDone={invalidate}
       />
     </PageContainer>
