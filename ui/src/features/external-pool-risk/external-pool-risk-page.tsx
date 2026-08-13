@@ -9,7 +9,7 @@ import {
   RefreshCw,
   Search,
 } from 'lucide-react'
-import { useUsageDashboardExternalPoolRisk } from '@/hooks/use-usage'
+import { useUsageDashboardAccountRisk } from '@/hooks/use-usage'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
@@ -104,8 +104,8 @@ function streamValueToQuery(value: StreamFilter): boolean | undefined {
   return undefined
 }
 
-function poolLabel(id?: number, name?: string): string {
-  if (!id && !name) return '未知外部池'
+function accountLabel(id?: number, name?: string): string {
+  if (!id && !name) return '未知上游账号'
   return [`#${id ?? '-'}`, name].filter(Boolean).join(' ')
 }
 
@@ -133,7 +133,7 @@ export function ExternalPoolRiskPage() {
   const [windowKey, setWindowKey] = useState('last24h')
   const [warningInput, setWarningInput] = useState(String(DEFAULT_WARNING_TOKENS))
   const [criticalInput, setCriticalInput] = useState(String(DEFAULT_CRITICAL_TOKENS))
-  const [poolInput, setPoolInput] = useState('')
+  const [accountInput, setAccountInput] = useState('')
   const [endpointInput, setEndpointInput] = useState('')
   const [modelInput, setModelInput] = useState('')
   const [sinceInput, setSinceInput] = useState(() => recentDatetimeLocal(24))
@@ -147,7 +147,7 @@ export function ExternalPoolRiskPage() {
     limit: 50,
   })
 
-  const riskQuery = useUsageDashboardExternalPoolRisk(submitted)
+  const riskQuery = useUsageDashboardAccountRisk(submitted)
   const data = riskQuery.data
   const maxBucketCount = useMemo(() => {
     if (!data?.buckets.length) return 0
@@ -167,7 +167,7 @@ export function ExternalPoolRiskPage() {
       warningThresholdTokens,
       parsePositiveInt(criticalInput, DEFAULT_CRITICAL_TOKENS)
     )
-    const externalPoolId = poolInput.trim() ? Number.parseInt(poolInput.trim(), 10) : undefined
+    const accountId = accountInput.trim() ? Number.parseInt(accountInput.trim(), 10) : undefined
     setSubmitted({
       timezone: TIMEZONE,
       windowKey,
@@ -175,7 +175,7 @@ export function ExternalPoolRiskPage() {
       until: windowKey === 'custom' ? datetimeLocalToIso(untilInput) : undefined,
       warningThresholdTokens,
       criticalThresholdTokens,
-      externalPoolId: Number.isFinite(externalPoolId) && externalPoolId! > 0 ? externalPoolId : undefined,
+      accountId: Number.isFinite(accountId) && accountId! > 0 ? accountId : undefined,
       endpoint: endpointInput.trim() || undefined,
       model: modelInput.trim() || undefined,
       stream: streamValueToQuery(streamFilter),
@@ -196,7 +196,7 @@ export function ExternalPoolRiskPage() {
 
       <SectionCard
         title="查询条件"
-        description="只统计外部池 usage，查询是只读聚合，不会修改调度或计费记录。"
+        description="只统计上游账号 usage，查询是只读聚合，不会修改调度或计费记录。"
         icon={<Filter />}
         actions={
           <Button size="sm" onClick={applyFilters} disabled={riskQuery.isFetching}>
@@ -236,8 +236,8 @@ export function ExternalPoolRiskPage() {
           <Field label="严重阈值">
             <Input value={criticalInput} inputMode="numeric" onChange={(e) => setCriticalInput(e.target.value)} />
           </Field>
-          <Field label="外部池 ID">
-            <Input placeholder="全部" value={poolInput} onChange={(e) => setPoolInput(e.target.value)} />
+          <Field label="上游账号 ID">
+            <Input placeholder="全部" value={accountInput} onChange={(e) => setAccountInput(e.target.value)} />
           </Field>
           <Field label="路径">
             <Input placeholder="全部" value={endpointInput} onChange={(e) => setEndpointInput(e.target.value)} />
@@ -270,7 +270,7 @@ export function ExternalPoolRiskPage() {
         )}
       </SectionCard>
 
-      {riskQuery.isLoading && <LoadingState text="加载外部池风控数据..." />}
+      {riskQuery.isLoading && <LoadingState text="加载上游账号风控数据..." />}
       {riskQuery.isError && (
         <ErrorState
           title="风控数据加载失败"
@@ -282,7 +282,7 @@ export function ExternalPoolRiskPage() {
       {data && (
         <>
           <StatGrid min="12rem">
-            <StatCard title="外部池记录" value={formatCompact(data.totals.records)} valueTitle={formatNumber(data.totals.records)} desc={`成功 ${formatNumber(data.totals.successRecords)} / 失败 ${formatNumber(data.totals.errorRecords)}`} icon={<Boxes />} />
+            <StatCard title="上游账号记录" value={formatCompact(data.totals.records)} valueTitle={formatNumber(data.totals.records)} desc={`成功 ${formatNumber(data.totals.successRecords)} / 失败 ${formatNumber(data.totals.errorRecords)}`} icon={<Boxes />} />
             <StatCard title="上游缓存最大" value={`${formatCompact(Math.max(data.rawCache.maxReadTokens, data.rawCache.maxWriteTokens))}`} valueTitle={tokenTitle(Math.max(data.rawCache.maxReadTokens, data.rawCache.maxWriteTokens))} desc={`读 ${formatCompact(data.rawCache.maxReadTokens)} / 写 ${formatCompact(data.rawCache.maxWriteTokens)}`} icon={<Gauge />} tone={toneForRisk(data.rawCache.eitherCriticalCount, data.rawCache.eitherWarningCount)} />
             <StatCard title="最终缓存最大" value={`${formatCompact(Math.max(data.reportedCache.maxReadTokens, data.reportedCache.maxWriteTokens))}`} valueTitle={tokenTitle(Math.max(data.reportedCache.maxReadTokens, data.reportedCache.maxWriteTokens))} desc={`读 ${formatCompact(data.reportedCache.maxReadTokens)} / 写 ${formatCompact(data.reportedCache.maxWriteTokens)}`} icon={<BarChart3 />} tone={toneForRisk(data.reportedCache.eitherCriticalCount, data.reportedCache.eitherWarningCount)} />
             <StatCard title="低于目标成本" value={formatCompact(data.cost.belowTargetCount)} valueTitle={formatNumber(data.cost.belowTargetCount)} desc={`差额 ${formatUsd(data.cost.totalTargetGapUsd)}`} icon={<DollarSign />} tone={data.cost.belowTargetCount > 0 ? 'error' : 'success'} />
@@ -303,7 +303,7 @@ export function ExternalPoolRiskPage() {
             <BucketTable buckets={data.buckets} maxCount={maxBucketCount} />
           </SectionCard>
 
-          <SectionCard title="成本风控" description="目标成本按外部池全局成本底线配置计算。" icon={<DollarSign />}>
+          <SectionCard title="成本风控" description="目标成本按上游账号全局成本底线配置计算。" icon={<DollarSign />}>
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <Metric label="上游 raw 成本" value={formatUsd(data.cost.rawCostUsd)} />
               <Metric label="最终 reported 成本" value={formatUsd(data.cost.reportedCostUsd)} />
@@ -317,7 +317,7 @@ export function ExternalPoolRiskPage() {
           </SectionCard>
 
           <div className="grid gap-5 xl:grid-cols-3">
-            <GroupTable title="按外部池" groups={data.byPool} />
+            <GroupTable title="按上游账号" groups={data.byPool} />
             <GroupTable title="按路径" groups={data.byPath} />
             <GroupTable title="按模型" groups={data.byModel} />
           </div>
@@ -332,7 +332,7 @@ export function ExternalPoolRiskPage() {
 
           {data.totals.missingExternalPoolBillingRecords > 0 && (
             <Callout tone="warning">
-              当前窗口存在 {formatNumber(data.totals.missingExternalPoolBillingRecords)} 条外部池记录缺少 externalPoolBilling。raw/reported 成本和缓存统计会因此不完整，需要优先查这些请求的记录链路。
+              当前窗口存在 {formatNumber(data.totals.missingExternalPoolBillingRecords)} 条上游账号记录缺少账号计费明细。raw/reported 成本和缓存统计会因此不完整，需要优先查这些请求的记录链路。
             </Callout>
           )}
         </>
@@ -471,7 +471,7 @@ function SamplesTable({ samples }: { samples: UsageExternalPoolRiskSample[] }) {
         <TableHeader>
           <TableRow>
             <TableHead>时间 / 请求</TableHead>
-            <TableHead>外部池</TableHead>
+            <TableHead>上游账号</TableHead>
             <TableHead>路径 / 模型</TableHead>
             <TableHead className="text-right">raw 输入/输出</TableHead>
             <TableHead className="text-right">raw 读/写</TableHead>
@@ -489,8 +489,8 @@ function SamplesTable({ samples }: { samples: UsageExternalPoolRiskSample[] }) {
                 <div className="max-w-[12rem] truncate font-mono text-xs" title={sample.id}>{sample.id}</div>
               </TableCell>
               <TableCell>
-                <div className="max-w-[11rem] truncate" title={poolLabel(sample.externalPoolId, sample.externalPoolName)}>
-                  {poolLabel(sample.externalPoolId, sample.externalPoolName)}
+                <div className="max-w-[11rem] truncate" title={accountLabel(sample.externalPoolId, sample.externalPoolName)}>
+                  {accountLabel(sample.externalPoolId, sample.externalPoolName)}
                 </div>
                 <div className="text-xs text-muted-foreground">{sample.stream ? 'stream' : 'non-stream'}</div>
               </TableCell>

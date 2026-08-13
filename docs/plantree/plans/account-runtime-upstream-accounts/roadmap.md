@@ -29,10 +29,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - `/api/admin/accounts` now has account-named handlers, service wrappers and DTOs; list/status responses expose `accounts` while legacy `/external-pools` remains compatibility-only.
 - The upstream account page consumes the account-shaped responses through the account API client, with temporary normalization for older `pools` payloads.
 - Runtime config now exposes `accountRuntime` as the account-policy field, accepts it on update, mirrors legacy `externalPools` for compatibility, and has frontend normalization so old and new callers stay consistent.
+- Usage admin queries now accept `accountId` and `routeKind=account`, and the dashboard exposes `/usage-dashboard/account-billing` plus `/usage-dashboard/account-risk` while legacy external-pool paths remain compatibility aliases.
+- Usage and risk UI entry points now use account terminology and account-named hooks/API functions for upstream account filters and risk views.
 
 ## In Progress
 
-- Convert remaining backend Admin/API/DTO and usage-dashboard names from external-pool/local-credential terminology toward account terminology while preserving temporary compatibility aliases.
+- Convert remaining backend Admin/API/DTO names from external-pool/local-credential terminology toward account terminology while preserving temporary compatibility aliases.
 - Remove remaining startup/runtime Kiro vocabulary and migrate account policy internals away from legacy external-pool field names.
 
 ## Next

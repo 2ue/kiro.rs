@@ -107,6 +107,8 @@ pub struct UsageRecordsQueryParams {
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
+    #[serde(alias = "account_id")]
+    pub account_id: Option<u64>,
     pub external_pool_id: Option<u64>,
     pub route_kind: Option<String>,
     pub model: Option<String>,
@@ -131,6 +133,8 @@ pub struct UsageRecordsPageQueryParams {
     pub conversation_id: Option<String>,
     pub request_api_key_id: Option<String>,
     pub credential_id: Option<u64>,
+    #[serde(alias = "account_id")]
+    pub account_id: Option<u64>,
     pub external_pool_id: Option<u64>,
     pub route_kind: Option<String>,
     pub model: Option<String>,
@@ -165,6 +169,8 @@ pub struct UsageExternalPoolRiskQueryParams {
     pub until: Option<String>,
     pub warning_threshold_tokens: Option<i64>,
     pub critical_threshold_tokens: Option<i64>,
+    #[serde(alias = "account_id")]
+    pub account_id: Option<u64>,
     pub external_pool_id: Option<u64>,
     pub endpoint: Option<String>,
     pub model: Option<String>,
@@ -197,7 +203,7 @@ impl UsageRecordsQueryParams {
             conversation_id: non_blank(self.conversation_id),
             request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
-            external_pool_id: self.external_pool_id,
+            external_pool_id: self.account_id.or(self.external_pool_id),
             route_kind: parse_optional_usage_route_kind(self.route_kind)?,
             model: non_blank(self.model),
             status: parse_optional_usage_status(self.status)?,
@@ -231,7 +237,7 @@ impl UsageRecordsPageQueryParams {
             conversation_id: non_blank(self.conversation_id),
             request_api_key_id: parse_optional_request_api_key_id(self.request_api_key_id)?,
             credential_id: self.credential_id,
-            external_pool_id: self.external_pool_id,
+            external_pool_id: self.account_id.or(self.external_pool_id),
             route_kind: parse_optional_usage_route_kind(self.route_kind)?,
             model: non_blank(self.model),
             status: parse_optional_usage_status(self.status)?,
@@ -305,7 +311,7 @@ impl UsageExternalPoolRiskQueryParams {
             to,
             warning_threshold_tokens,
             critical_threshold_tokens,
-            pool_id: self.external_pool_id,
+            pool_id: self.account_id.or(self.external_pool_id),
             endpoint: non_blank(self.endpoint),
             model: non_blank(self.model),
             stream: self.stream,
@@ -372,7 +378,8 @@ fn parse_usage_source(value: &str) -> Result<UsageSource, String> {
 fn parse_usage_route_kind(value: &str) -> Result<UsageRouteKind, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "local_credential" | "local-credential" | "local" => Ok(UsageRouteKind::LocalCredential),
-        "external_pool" | "external-pool" | "external" => Ok(UsageRouteKind::ExternalPool),
+        "account" | "upstream_account" | "upstream-account" | "external_pool" | "external-pool"
+        | "external" => Ok(UsageRouteKind::ExternalPool),
         _ => Err(format!("无效 routeKind: {}", value)),
     }
 }
@@ -1594,6 +1601,15 @@ pub async fn get_usage_dashboard_external_pool_billing(
     }
 }
 
+/// GET /api/admin/usage-dashboard/account-billing
+/// 获取 usage 仪表盘单个窗口的上游账号费用明细。
+pub async fn get_usage_dashboard_account_billing(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardWindowQueryParams>,
+) -> impl IntoResponse {
+    get_usage_dashboard_external_pool_billing(State(state), Query(params)).await
+}
+
 /// GET /api/admin/usage-dashboard/external-pool-risk
 /// 获取外部池 usage 风控统计。
 pub async fn get_usage_dashboard_external_pool_risk(
@@ -1611,6 +1627,15 @@ pub async fn get_usage_dashboard_external_pool_risk(
         )
             .into_response(),
     }
+}
+
+/// GET /api/admin/usage-dashboard/account-risk
+/// 获取上游账号 usage 风控统计。
+pub async fn get_usage_dashboard_account_risk(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageExternalPoolRiskQueryParams>,
+) -> impl IntoResponse {
+    get_usage_dashboard_external_pool_risk(State(state), Query(params)).await
 }
 
 /// GET /api/admin/usage-writer-stats
@@ -1705,6 +1730,7 @@ mod tests {
             conversation_id: Some("   ".to_string()),
             request_api_key_id: Some("   ".to_string()),
             credential_id: Some(7),
+            account_id: None,
             external_pool_id: None,
             route_kind: Some("external".to_string()),
             model: Some("".to_string()),
@@ -1744,6 +1770,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
+            account_id: None,
             external_pool_id: None,
             route_kind: None,
             model: None,
@@ -1787,6 +1814,46 @@ mod tests {
     }
 
     #[test]
+    fn usage_records_query_accepts_account_aliases() {
+        let params: UsageRecordsPageQueryParams = serde_json::from_value(serde_json::json!({
+            "accountId": 42,
+            "externalPoolId": 7,
+            "routeKind": "account"
+        }))
+        .expect("account aliases should deserialize");
+        let (query, _, _) = params.into_query().expect("valid account query");
+
+        assert_eq!(query.external_pool_id, Some(42));
+        assert_eq!(query.route_kind, Some(UsageRouteKind::ExternalPool));
+
+        let query = UsageRecordsQueryParams {
+            limit: None,
+            request_id: None,
+            q: None,
+            conversation_id: None,
+            request_api_key_id: None,
+            credential_id: None,
+            account_id: Some(12),
+            external_pool_id: None,
+            route_kind: Some("upstream-account".to_string()),
+            model: None,
+            status: None,
+            source: None,
+            endpoint: None,
+            stream: None,
+            min_cache_read: None,
+            min_first_token_latency_ms: None,
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .expect("valid query");
+
+        assert_eq!(query.external_pool_id, Some(12));
+        assert_eq!(query.route_kind, Some(UsageRouteKind::ExternalPool));
+    }
+
+    #[test]
     fn usage_records_query_keeps_explicit_request_id_over_search_text() {
         let query = UsageRecordsQueryParams {
             limit: None,
@@ -1795,6 +1862,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
+            account_id: None,
             external_pool_id: None,
             route_kind: None,
             model: None,
@@ -1823,6 +1891,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
+            account_id: None,
             external_pool_id: None,
             route_kind: None,
             model: None,
@@ -1846,6 +1915,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
+            account_id: None,
             external_pool_id: None,
             route_kind: None,
             model: None,
@@ -1869,6 +1939,7 @@ mod tests {
             conversation_id: None,
             request_api_key_id: None,
             credential_id: None,
+            account_id: None,
             external_pool_id: None,
             route_kind: None,
             model: None,
@@ -1904,6 +1975,7 @@ mod tests {
             conversation_id: Some("session-a".to_string()),
             request_api_key_id: Some("A".repeat(64)),
             credential_id: None,
+            account_id: None,
             external_pool_id: None,
             route_kind: None,
             model: None,

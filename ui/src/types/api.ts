@@ -665,7 +665,7 @@ export type UsageSource =
   | 'request_estimate'
   | 'none'
 
-export type UsageRouteKindFilter = 'local_credential' | 'external_pool'
+export type UsageRouteKindFilter = 'local_credential' | 'account' | 'external_pool'
 
 export interface InferenceAttemptSnapshot {
   maxAttempts: number
@@ -794,7 +794,7 @@ export interface UsageRecord {
   stickyBound: boolean
   fallbackFromSticky: boolean
   credentialAttempts?: KiroCredentialAttempt[]
-  routeKind?: 'local_credential' | 'external_pool'
+  routeKind?: 'local_credential' | 'account' | 'external_pool'
   routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_external' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
   fallbackReason?: string
   directPolicyReason?: string
@@ -1004,6 +1004,8 @@ export interface UsageDashboardExternalPoolBillingResponse {
   externalPoolBillingByPool: UsageExternalPoolBillingByPool[]
 }
 
+export type UsageDashboardAccountBillingResponse = UsageDashboardExternalPoolBillingResponse
+
 export interface UsageExternalPoolRiskQuery {
   timezone?: string
   windowKey?: string
@@ -1011,6 +1013,7 @@ export interface UsageExternalPoolRiskQuery {
   until?: string
   warningThresholdTokens?: number
   criticalThresholdTokens?: number
+  accountId?: number
   externalPoolId?: number
   endpoint?: string
   model?: string
@@ -1268,6 +1271,7 @@ export interface UsageRecordsQuery {
   endpoint?: string
   conversationId?: string
   credentialId?: number
+  accountId?: number
   externalPoolId?: number
   routeKind?: UsageRouteKindFilter
   model?: string

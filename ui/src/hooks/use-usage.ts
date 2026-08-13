@@ -8,10 +8,10 @@ import {
   getUsageCleanupStatus,
   getModelCapabilities,
   getModelPricing,
+  getUsageDashboardAccountBilling,
+  getUsageDashboardAccountRisk,
   getUsageDashboard,
   getUsageDashboardBreakdown,
-  getUsageDashboardExternalPoolBilling,
-  getUsageDashboardExternalPoolRisk,
   getUsageDashboardSeries,
   getUsageDashboardTop,
   getUsageDashboardWindows,
@@ -126,9 +126,18 @@ export function useUsageDashboardExternalPoolBilling(
   refetchInterval: RefetchInterval = false,
   enabled = true
 ) {
+  return useUsageDashboardAccountBilling(timezone, windowKey, refetchInterval, enabled)
+}
+
+export function useUsageDashboardAccountBilling(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'today',
+  refetchInterval: RefetchInterval = false,
+  enabled = true
+) {
   return useQuery({
-    queryKey: ['usage-dashboard-external-pool-billing', timezone, windowKey],
-    queryFn: () => getUsageDashboardExternalPoolBilling(timezone, windowKey),
+    queryKey: ['usage-dashboard-account-billing', timezone, windowKey],
+    queryFn: () => getUsageDashboardAccountBilling(timezone, windowKey),
     refetchInterval,
     enabled,
   })
@@ -139,9 +148,17 @@ export function useUsageDashboardExternalPoolRisk(
   refetchInterval: RefetchInterval = false,
   enabled = true
 ) {
+  return useUsageDashboardAccountRisk(query, refetchInterval, enabled)
+}
+
+export function useUsageDashboardAccountRisk(
+  query: UsageExternalPoolRiskQuery,
+  refetchInterval: RefetchInterval = false,
+  enabled = true
+) {
   return useQuery({
-    queryKey: ['usage-dashboard-external-pool-risk', query],
-    queryFn: () => getUsageDashboardExternalPoolRisk(query),
+    queryKey: ['usage-dashboard-account-risk', query],
+    queryFn: () => getUsageDashboardAccountRisk(query),
     refetchInterval,
     enabled,
   })
@@ -153,6 +170,8 @@ function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQuery
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-series'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-top'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-breakdown'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-account-billing'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-account-risk'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-billing'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-risk'] })
   queryClient.invalidateQueries({ queryKey: ['usage-writer-stats'] })

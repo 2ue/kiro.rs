@@ -68,6 +68,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `/api/admin/accounts` now has account-named handlers, service methods and response DTOs. List and status responses expose `accounts`, while legacy `/api/admin/external-pools` remains as a compatibility surface with `pools`.
 - the upstream account page now consumes the account-shaped `accounts` responses, with frontend compatibility normalization retained for older server responses during migration.
 - runtime config now exposes and accepts `accountRuntime` as the account policy surface while mirroring the old `externalPools` field for compatibility; the frontend normalizes both names and the upstream account page writes the account-named field.
+- usage query/admin dashboard surfaces now accept account-named filters and paths: `accountId`, `routeKind=account`, `/usage-dashboard/account-billing`, and `/usage-dashboard/account-risk`, with frontend usage and risk pages moved to account terminology while old external-pool paths remain compatibility aliases.
 
 Last verified on 2026-08-14:
 
@@ -87,4 +88,7 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-admin-boundary-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-usage-api-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-usage-api-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-usage-api-test2 -- cargo test usage_records_query_accepts_account_aliases -- --nocapture`
 - `pnpm --dir ui check`

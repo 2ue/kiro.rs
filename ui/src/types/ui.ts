@@ -69,7 +69,7 @@ export const navPages: NavPage[] = [
 
   // 分析域
   { key: 'usage', path: 'usage', label: '用量', description: '请求趋势与明细', icon: BarChart3, domain: 'analytics' },
-  { key: 'externalPoolRisk', path: 'external-pool-risk', label: '外部池风控', description: '缓存与成本风险检查', icon: Gauge, domain: 'analytics' },
+  { key: 'externalPoolRisk', path: 'external-pool-risk', label: '账号风控', description: '缓存与成本风险检查', icon: Gauge, domain: 'analytics' },
   { key: 'audit', path: 'audit', label: '审计', description: '关键操作记录', icon: FileClock, domain: 'analytics' },
 
   // 设置域
@@ -89,7 +89,7 @@ export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   external: { title: '上游账号', subtitle: '管理上游账号调度与计费拆分' },
   proxies: { title: '代理', subtitle: '维护网络代理资源与连通状态' },
   usage: { title: '用量', subtitle: '请求趋势、Top 维度与明细记录' },
-  externalPoolRisk: { title: '外部池风控', subtitle: '检查外部池缓存分布与成本风险' },
+  externalPoolRisk: { title: '账号风控', subtitle: '检查上游账号缓存分布与成本风险' },
   audit: { title: '审计', subtitle: '关键操作与变更记录' },
   runtime: { title: '运行配置', subtitle: '调度、限流、冷却、缓存与兼容策略' },
   models: { title: '模型', subtitle: '模型能力与价格目录,支持同步与手动维护' },

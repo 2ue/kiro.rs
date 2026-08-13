@@ -6,6 +6,7 @@ import type {
   ManualModelResponse,
   ModelPricingStatus,
   UpsertManualModelRequest,
+  UsageDashboardAccountBillingResponse,
   UsageDashboardResponse,
   UsageDashboardBreakdownResponse,
   UsageDashboardExternalPoolBillingResponse,
@@ -25,13 +26,29 @@ import type {
   UsageSummary,
 } from '@/types/api'
 
+function usageQueryParams(query: UsageRecordsQuery | UsageRecordsPageQuery): Record<string, unknown> {
+  const accountId = query.accountId ?? query.externalPoolId
+  return {
+    ...query,
+    ...(accountId ? { accountId, externalPoolId: accountId } : {}),
+  }
+}
+
+function usageRiskQueryParams(query: UsageExternalPoolRiskQuery): Record<string, unknown> {
+  const accountId = query.accountId ?? query.externalPoolId
+  return {
+    ...query,
+    ...(accountId ? { accountId, externalPoolId: accountId } : {}),
+  }
+}
+
 export async function getUsageRecords(query: UsageRecordsQuery = {}): Promise<UsageRecordsResult> {
-  const { data } = await api.get<UsageRecordsResult>('/usage-records', { params: query })
+  const { data } = await api.get<UsageRecordsResult>('/usage-records', { params: usageQueryParams(query) })
   return data
 }
 
 export async function getUsageRecordsPage(query: UsageRecordsPageQuery): Promise<UsageRecordsPageResult> {
-  const { data } = await api.get<UsageRecordsPageResult>('/usage-records-paged', { params: query })
+  const { data } = await api.get<UsageRecordsPageResult>('/usage-records-paged', { params: usageQueryParams(query) })
   return data
 }
 
@@ -96,11 +113,30 @@ export async function getUsageDashboardExternalPoolBilling(
   return data
 }
 
+export async function getUsageDashboardAccountBilling(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'today'
+): Promise<UsageDashboardAccountBillingResponse> {
+  const { data } = await api.get<UsageDashboardAccountBillingResponse>('/usage-dashboard/account-billing', {
+    params: { timezone, windowKey },
+  })
+  return data
+}
+
 export async function getUsageDashboardExternalPoolRisk(
   query: UsageExternalPoolRiskQuery = {}
 ): Promise<UsageExternalPoolRiskResponse> {
   const { data } = await api.get<UsageExternalPoolRiskResponse>('/usage-dashboard/external-pool-risk', {
-    params: query,
+    params: usageRiskQueryParams(query),
+  })
+  return data
+}
+
+export async function getUsageDashboardAccountRisk(
+  query: UsageExternalPoolRiskQuery = {}
+): Promise<UsageExternalPoolRiskResponse> {
+  const { data } = await api.get<UsageExternalPoolRiskResponse>('/usage-dashboard/account-risk', {
+    params: usageRiskQueryParams(query),
   })
   return data
 }

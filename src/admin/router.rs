@@ -23,6 +23,7 @@ use super::{
         get_credentials_usage_summary, get_external_pool_status, get_external_pools,
         get_load_balancing_mode, get_model_capabilities, get_model_pricing, get_proxy_resources,
         get_runtime_config, get_system_version, get_usage_cleanup_status, get_usage_dashboard,
+        get_usage_dashboard_account_billing, get_usage_dashboard_account_risk,
         get_usage_dashboard_breakdown, get_usage_dashboard_external_pool_billing,
         get_usage_dashboard_external_pool_risk, get_usage_dashboard_series,
         get_usage_dashboard_top, get_usage_dashboard_windows, get_usage_records,
@@ -243,8 +244,16 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_usage_dashboard_external_pool_billing),
         )
         .route(
+            "/usage-dashboard/account-billing",
+            get(get_usage_dashboard_account_billing),
+        )
+        .route(
             "/usage-dashboard/external-pool-risk",
             get(get_usage_dashboard_external_pool_risk),
+        )
+        .route(
+            "/usage-dashboard/account-risk",
+            get(get_usage_dashboard_account_risk),
         )
         .route("/usage-writer-stats", get(get_usage_writer_stats))
         .route("/audit-logs", get(get_audit_logs))
