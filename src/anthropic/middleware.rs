@@ -10,16 +10,15 @@ use axum::{
     response::Response,
 };
 
-use crate::account_runtime::AccountRuntimeManager;
+use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::common::auth;
 use crate::common::auth::RequestApiKeyStore;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
-    ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode,
-    normalize_defined_cache_routes,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, ImageProcessingConfig,
+    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode, normalize_defined_cache_routes,
 };
 
 use super::{
@@ -122,7 +121,7 @@ pub struct AppState {
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池和直连策略配置。
-    pub external_pools: ExternalPoolsConfig,
+    pub external_pools: AccountRuntimeConfig,
     /// 上游账号运行时管理器。
     pub account_runtime_manager: Option<Arc<AccountRuntimeManager>>,
 }
@@ -183,7 +182,7 @@ impl AppState {
             prompt_steering: PromptSteeringConfig::default(),
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
-            external_pools: ExternalPoolsConfig::default(),
+            external_pools: AccountRuntimeConfig::default(),
             account_runtime_manager: None,
         }
     }
@@ -321,8 +320,8 @@ impl AppState {
         self
     }
 
-    pub fn with_external_pools(mut self, external_pools: ExternalPoolsConfig) -> Self {
-        self.external_pools = external_pools;
+    pub fn with_account_runtime_config(mut self, account_runtime: AccountRuntimeConfig) -> Self {
+        self.external_pools = account_runtime;
         self
     }
 }

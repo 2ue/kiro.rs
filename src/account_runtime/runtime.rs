@@ -5,3 +5,5 @@
 //! runtime boundary instead of importing the legacy scheduler manager directly.
 
 pub type AccountRuntimeManager = crate::external_pool::ExternalPoolManager;
+
+pub type AccountRuntimeConfig = crate::model::config::ExternalPoolsConfig;

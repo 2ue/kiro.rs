@@ -1346,12 +1346,12 @@ fn spawn_redis_runtime_event_listener(
                             .unwrap_or_else(|_| String::new());
                         health.mark_event();
                         if channel == config_channel {
-                            let previous_external_pools =
+                            let previous_account_runtime =
                                 token_manager.runtime_config().external_pools;
                             match token_manager.reload_runtime_config_from_postgres() {
                                 Ok(true) => {
                                     let config = token_manager.runtime_config();
-                                    if config.external_pools != previous_external_pools {
+                                    if config.external_pools != previous_account_runtime {
                                         account_runtime_manager
                                             .invalidate_external_pool_policy_state();
                                     }
@@ -1382,12 +1382,12 @@ fn spawn_redis_runtime_event_listener(
                         }
                     }
                     _ = periodic_reload.tick() => {
-                        let previous_external_pools =
+                        let previous_account_runtime =
                             token_manager.runtime_config().external_pools;
                         match token_manager.reload_runtime_config_from_postgres() {
                             Ok(true) => {
                                 let config = token_manager.runtime_config();
-                                if config.external_pools != previous_external_pools {
+                                if config.external_pools != previous_account_runtime {
                                     account_runtime_manager
                                         .invalidate_external_pool_policy_state();
                                 }

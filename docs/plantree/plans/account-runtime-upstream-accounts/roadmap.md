@@ -33,6 +33,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Usage and risk UI entry points now use account terminology and account-named hooks/API functions for upstream account filters and risk views.
 - `AccountRuntimeManager` is now the injection boundary for App state, Anthropic router dependencies, Admin service dependencies and process lifecycle wiring. It currently aliases the legacy external-pool manager so the scheduler/transport internals can be migrated behind an account runtime facade in smaller verified steps.
 - Account Admin responses now have account-named DTOs for list/status/mutation/test surfaces, with a focused serialization test proving `/accounts` uses `accounts/account` fields rather than legacy `pools/pool` wrappers.
+- `AccountRuntimeConfig` is now the config facade for new runtime/Admin/router/handler boundaries, while old persisted `external_pools` fields remain as the compatibility storage and wire mirror.
 
 ## In Progress
 

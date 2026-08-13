@@ -42,7 +42,7 @@ use super::types::{
     UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
     ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
 };
-use crate::account_runtime::AccountRuntimeManager;
+use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::anthropic::{
     inference_attempt_budget::{
         MAX_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
@@ -84,8 +84,8 @@ use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
 use crate::model::config::{
-    ExternalPoolsConfig, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM,
-    MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
+    MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
+    MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
 };
 use crate::model::model_support::{
     expand_claude_supported_model_variants, normalize_supported_models,
@@ -5025,12 +5025,12 @@ impl AdminService {
             .with_builtin_path_defaults()
             .with_legacy_defined_cache_route_defaults(&defined_cache_routes)
             .normalized();
-        let external_pools = req
+        let account_runtime = req
             .account_runtime
             .clone()
             .or_else(|| req.external_pools.clone())
             .unwrap_or_else(|| current_config.external_pools.clone());
-        let external_pool_policy_changed = external_pools != current_config.external_pools;
+        let account_runtime_policy_changed = account_runtime != current_config.external_pools;
         let high_cache_threshold = req
             .high_cache_threshold
             .unwrap_or(current_config.high_cache_threshold);
@@ -5288,7 +5288,7 @@ impl AdminService {
         cache_policy_raw
             .validate(cache_validation_config.legacy_cache_route_policy_default())
             .map_err(AdminServiceError::InvalidCredential)?;
-        validate_external_pools_config(&external_pools)
+        validate_external_pools_config(&account_runtime)
             .map_err(AdminServiceError::InvalidCredential)?;
         if high_cache_threshold < 0 {
             return Err(AdminServiceError::InvalidCredential(
@@ -5393,7 +5393,7 @@ impl AdminService {
                 config.reported_usage = reported_usage;
                 config.cache_policy = cache_policy;
                 config.defined_cache_routes = defined_cache_routes;
-                config.external_pools = external_pools;
+                config.external_pools = account_runtime;
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
                 config.kiro_agent_mode_strategy = kiro_agent_mode_strategy;
@@ -5413,7 +5413,7 @@ impl AdminService {
             None,
             json!({}),
         );
-        if external_pool_policy_changed {
+        if account_runtime_policy_changed {
             self.account_runtime_manager
                 .invalidate_external_pool_policy_state();
             self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
@@ -5891,7 +5891,7 @@ fn normalize_admin_request_admission(
     Ok(config.normalized())
 }
 
-fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {
+fn validate_external_pools_config(config: &AccountRuntimeConfig) -> Result<(), String> {
     if config.external_pool_global_max_concurrent_requests > 100_000 {
         return Err("externalPoolGlobalMaxConcurrentRequests 不能大于 100000".to_string());
     }

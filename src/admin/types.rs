@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::account_runtime::AccountRuntimeConfig;
 use crate::anthropic::pricing::ModelPricing;
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -11,11 +12,11 @@ use crate::external_pool::{
 };
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
-    ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ExternalPoolsConfig,
-    ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
-    ModelMappingRule, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PayloadShapingConfigPatch, PromptCacheCreationControlConfig, PromptSteeringConfig,
-    ReportedUsageConfig, RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
+    ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ImageProcessingConfig,
+    KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig, ModelMappingRule,
+    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
+    PromptCacheCreationControlConfig, PromptSteeringConfig, ReportedUsageConfig,
+    RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -1701,8 +1702,8 @@ pub struct RuntimeConfigResponse {
     pub reported_usage: ReportedUsageConfig,
     pub cache_policy: CachePolicyConfig,
     pub defined_cache_routes: Vec<String>,
-    pub account_runtime: ExternalPoolsConfig,
-    pub external_pools: ExternalPoolsConfig,
+    pub account_runtime: AccountRuntimeConfig,
+    pub external_pools: AccountRuntimeConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
     pub kiro_agent_mode_strategy: KiroAgentModeStrategy,
@@ -1868,9 +1869,9 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub defined_cache_routes: Option<Vec<String>>,
     #[serde(default)]
-    pub account_runtime: Option<ExternalPoolsConfig>,
+    pub account_runtime: Option<AccountRuntimeConfig>,
     #[serde(default)]
-    pub external_pools: Option<ExternalPoolsConfig>,
+    pub external_pools: Option<AccountRuntimeConfig>,
     #[serde(default)]
     pub high_cache_threshold: Option<i32>,
     #[serde(default)]

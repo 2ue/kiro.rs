@@ -5540,7 +5540,7 @@ fn runtime_config_for_payload_guard(
         prompt_steering: PromptSteeringConfig::default(),
         missing_max_tokens: MissingMaxTokensConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
-        external_pools: ExternalPoolsConfig::default(),
+        external_pools: AccountRuntimeConfig::default(),
     }
 }
 
@@ -5816,7 +5816,7 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
 
 #[test]
 fn thinking_signature_typed_failures_never_enter_external_fallback_five_rounds() {
-    let mut config = ExternalPoolsConfig::default();
+    let mut config = AccountRuntimeConfig::default();
     config.fallback_on_local_capacity_exhausted = true;
     config.fallback_on_no_available_credentials = true;
     config.fallback_on_local_transient_exhausted = true;
@@ -5967,7 +5967,7 @@ fn fallback_reservation_has_a_dedicated_internal_classification() {
     let reason = classify_local_error_for_external_fallback(
         "local inference attempt reserved for fallback",
         &[],
-        &ExternalPoolsConfig::default(),
+        &AccountRuntimeConfig::default(),
     );
     assert_eq!(
         reason.as_deref(),
@@ -5978,7 +5978,7 @@ fn fallback_reservation_has_a_dedicated_internal_classification() {
 #[test]
 fn auxiliary_focus_typed_failures_use_local_transient_fallback_policy_for_five_rounds() {
     for _ in 0..5 {
-        let mut config = ExternalPoolsConfig::default();
+        let mut config = AccountRuntimeConfig::default();
         config.fallback_on_local_transient_exhausted = true;
         for (kind, expected) in [
             (
@@ -6543,7 +6543,7 @@ fn thinking_trigger_always_preserves_unknown_type_without_implicit_activation() 
 
 #[test]
 fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
-    let mut config = ExternalPoolsConfig::default();
+    let mut config = AccountRuntimeConfig::default();
     config.external_pools_enabled = true;
     config.local_pool_preflight_enabled = true;
     config.fallback_on_local_capacity_exhausted = true;
@@ -9739,7 +9739,7 @@ fn strict_profile_suppresses_proxy_warning_header() {
 
 #[test]
 fn external_fallback_classifier_rejects_request_errors() {
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
 
     assert_eq!(
         classify_local_error_for_external_fallback(
@@ -9776,7 +9776,7 @@ fn external_fallback_classifier_rejects_request_errors() {
 
 #[test]
 fn external_fallback_classifier_allows_capacity_and_transient_errors() {
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
 
     assert_eq!(
         classify_local_error_for_external_fallback(
@@ -9796,7 +9796,7 @@ fn external_fallback_classifier_allows_capacity_and_transient_errors() {
 
 #[test]
 fn external_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard_retry() {
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
     let prior_too_long_attempt = KiroCredentialAttempt::new(
         0,
         63,
@@ -9851,7 +9851,7 @@ fn external_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard
 
 #[test]
 fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
-    let mut config = ExternalPoolsConfig {
+    let mut config = AccountRuntimeConfig {
         fallback_on_local_capacity_exhausted: false,
         fallback_on_scheduler_redis_degraded: false,
         ..Default::default()
@@ -9874,7 +9874,7 @@ fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
         None
     );
 
-    config = ExternalPoolsConfig::default();
+    config = AccountRuntimeConfig::default();
     assert_eq!(
         classify_local_error_for_external_fallback(
             "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
@@ -9894,7 +9894,7 @@ fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
         None
     );
 
-    config = ExternalPoolsConfig::default();
+    config = AccountRuntimeConfig::default();
     config.fallback_on_local_transient_exhausted = false;
     assert_eq!(
         classify_local_error_for_external_fallback("429 Too Many Requests", &[], &config),
@@ -9918,7 +9918,7 @@ fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
         None
     );
 
-    config = ExternalPoolsConfig::default();
+    config = AccountRuntimeConfig::default();
     config.fallback_on_no_available_credentials = false;
     assert_eq!(
         classify_local_error_for_external_fallback("所有凭据均已禁用（0/2）", &[], &config),
@@ -9935,7 +9935,7 @@ fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
 
 #[test]
 fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
-    let mut config = ExternalPoolsConfig::default();
+    let mut config = AccountRuntimeConfig::default();
 
     assert!(local_pool_capacity_fail_fast_enabled(&config));
     assert_eq!(
@@ -9981,14 +9981,14 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
         None
     );
 
-    config = ExternalPoolsConfig::default();
+    config = AccountRuntimeConfig::default();
     config.fallback_on_local_transient_exhausted = false;
     assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllCoolingDown, &config),
         None
     );
 
-    config = ExternalPoolsConfig::default();
+    config = AccountRuntimeConfig::default();
     config.fallback_on_local_capacity_exhausted = false;
     assert!(!local_pool_capacity_fail_fast_enabled(&config));
     assert_eq!(
@@ -9996,14 +9996,14 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
         None
     );
 
-    config = ExternalPoolsConfig::default();
+    config = AccountRuntimeConfig::default();
     config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::SchedulerRedisDegraded, &config),
         None
     );
 
-    config = ExternalPoolsConfig::default();
+    config = AccountRuntimeConfig::default();
     config.fallback_on_unsupported_model = true;
     assert_eq!(
         local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoModelCompatible, &config),
@@ -10049,7 +10049,7 @@ fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
 
 #[test]
 fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_states() {
-    let mut config = ExternalPoolsConfig::default();
+    let mut config = AccountRuntimeConfig::default();
 
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(LocalPoolRouteStateKind::Ready, 1, &config,),
@@ -10150,7 +10150,7 @@ fn classified_scheduler_degraded_fallback_is_not_suppressed_by_stale_ready_snaps
         local_pool_fallback_reason_for_fresh_state(
             LocalPoolRouteStateKind::Ready,
             1,
-            &ExternalPoolsConfig::default(),
+            &AccountRuntimeConfig::default(),
         ),
         None,
         "a fresh Ready snapshot alone must not trigger external fallback"
@@ -10159,7 +10159,7 @@ fn classified_scheduler_degraded_fallback_is_not_suppressed_by_stale_ready_snaps
 
 #[test]
 fn external_fallback_classifier_gates_unsupported_model() {
-    let mut config = ExternalPoolsConfig {
+    let mut config = AccountRuntimeConfig {
         fallback_on_unsupported_model: false,
         ..Default::default()
     };
@@ -10196,7 +10196,7 @@ fn external_fallback_classifier_gates_unsupported_model() {
 
 #[test]
 fn external_local_rescue_classifier_respects_error_type_and_toggles() {
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
     let rate_limit = ExternalPoolFinalError {
             status: StatusCode::TOO_MANY_REQUESTS,
             response_error_type: "rate_limit_error".to_string(),
@@ -10386,7 +10386,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
 
 #[test]
 fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
     let capacity = ExternalPoolFinalError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         response_error_type: "api_error".to_string(),
@@ -10421,7 +10421,7 @@ fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
 
 #[test]
 fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
     let rate_limit = ExternalPoolFinalError {
         status: StatusCode::TOO_MANY_REQUESTS,
         response_error_type: "rate_limit_error".to_string(),
@@ -10494,7 +10494,7 @@ fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
 fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
     let rate_limit = ExternalPoolFinalError {
         status: StatusCode::TOO_MANY_REQUESTS,
         response_error_type: "rate_limit_error".to_string(),
@@ -10554,7 +10554,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
 fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
-    let config = ExternalPoolsConfig {
+    let config = AccountRuntimeConfig {
         external_pools_enabled: true,
         external_direct_policy_enabled: true,
         ..Default::default()
@@ -10654,7 +10654,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
 fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_flag() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
-    let config = ExternalPoolsConfig {
+    let config = AccountRuntimeConfig {
         external_pools_enabled: true,
         external_direct_policy_enabled: false,
         external_pool_local_rescue_enabled: true,
@@ -10721,7 +10721,7 @@ fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_
 fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
-    let config = ExternalPoolsConfig::default();
+    let config = AccountRuntimeConfig::default();
     let capacity = ExternalPoolFinalError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         response_error_type: "api_error".to_string(),
@@ -10770,7 +10770,7 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
 
 #[test]
 fn external_pool_endpoint_gate_applies_global_enable_and_route_policy() {
-    let mut config = ExternalPoolsConfig::default();
+    let mut config = AccountRuntimeConfig::default();
 
     assert!(!external_pool_enabled_for_endpoint(
         &config,

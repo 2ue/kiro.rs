@@ -16,9 +16,9 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     BodyConversionConfig, CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
-    CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
-    KiroRsToolCachePolicy, MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
+    CacheSimulationPolicy, CompatProfile, Config, ImageProcessingConfig, KiroRsToolCachePolicy,
+    MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig, ModelResolutionMode,
+    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
     PromptCacheSimulationMode, PromptCacheStrategyType, PromptSteeringConfig, ReportedUsageConfig,
     ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, ThinkingTriggerMode,
     normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
@@ -92,7 +92,7 @@ use super::usage::{
     UsageSource,
 };
 use super::websearch;
-use crate::account_runtime::AccountRuntimeManager;
+use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::external_pool::{
     ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolRequestBodyMode,
     ExternalRouteRequest, ExternalRouteRequestPreparationCache,
@@ -745,7 +745,7 @@ fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
 struct ExternalFallbackContext {
     provider: Option<Arc<KiroProvider>>,
     manager: Arc<AccountRuntimeManager>,
-    config: ExternalPoolsConfig,
+    config: AccountRuntimeConfig,
     effective_raw_body: Bytes,
     effective_raw_probe: Arc<RawMessagesBodyProbe>,
     raw_body: Bytes,
@@ -859,7 +859,7 @@ struct RequestRuntimeConfig {
     prompt_steering: PromptSteeringConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
-    external_pools: ExternalPoolsConfig,
+    external_pools: AccountRuntimeConfig,
 }
 
 impl RequestRuntimeConfig {
@@ -1250,7 +1250,7 @@ fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
         .unwrap_or_else(|| state.image_processing.normalized())
 }
 
-fn external_pool_enabled_for_endpoint(config: &ExternalPoolsConfig, endpoint: &str) -> bool {
+fn external_pool_enabled_for_endpoint(config: &AccountRuntimeConfig, endpoint: &str) -> bool {
     config.external_pools_enabled && config.external_pool_route_allowed(endpoint)
 }
 
@@ -1448,7 +1448,7 @@ async fn maybe_raw_external_preflight_response(
 
 async fn raw_external_pool_has_eligible_pool(
     manager: &AccountRuntimeManager,
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     endpoint: &str,
     model: Option<&str>,
 ) -> bool {
@@ -1472,7 +1472,7 @@ async fn raw_external_pool_has_eligible_pool(
 
 async fn raw_external_pool_ready_for_route_reason(
     manager: &AccountRuntimeManager,
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     route_reason: &str,
     endpoint: &str,
     model: Option<&str>,
@@ -2157,11 +2157,11 @@ fn external_fallback_body_mode_filter(
     requires_normalized_body.then_some(ExternalPoolRequestBodyMode::Normalized)
 }
 
-fn local_pool_capacity_fail_fast_enabled(config: &ExternalPoolsConfig) -> bool {
+fn local_pool_capacity_fail_fast_enabled(config: &AccountRuntimeConfig) -> bool {
     config.local_pool_preflight_enabled && config.fallback_on_local_capacity_exhausted
 }
 
-fn local_pool_acquire_mode(config: &ExternalPoolsConfig) -> AcquireMode {
+fn local_pool_acquire_mode(config: &AccountRuntimeConfig) -> AcquireMode {
     if local_pool_capacity_fail_fast_enabled(config) {
         AcquireMode::FailFastOnCapacityWaitForRedis(local_scheduler_redis_degraded_fallback_wait(
             config,
@@ -2171,7 +2171,7 @@ fn local_pool_acquire_mode(config: &ExternalPoolsConfig) -> AcquireMode {
     }
 }
 
-fn local_scheduler_redis_degraded_fallback_wait(config: &ExternalPoolsConfig) -> Duration {
+fn local_scheduler_redis_degraded_fallback_wait(config: &AccountRuntimeConfig) -> Duration {
     let configured = Duration::from_secs(config.effective_dispatch_max_wait_secs());
     if config.fallback_on_scheduler_redis_degraded {
         configured.min(Duration::from_millis(
@@ -2217,7 +2217,7 @@ fn capacity_weight_units_for_local_request(provider: &KiroProvider, input_tokens
 
 fn local_pool_route_fallback_reason(
     kind: LocalPoolRouteStateKind,
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
 ) -> Option<&'static str> {
     match kind {
         LocalPoolRouteStateKind::Ready => None,
@@ -2254,7 +2254,7 @@ fn local_pool_route_fallback_reason(
 fn local_pool_fallback_reason_for_fresh_state(
     kind: LocalPoolRouteStateKind,
     dispatchable: usize,
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
 ) -> Option<&'static str> {
     if matches!(kind, LocalPoolRouteStateKind::Ready) {
         return None;
@@ -2274,7 +2274,7 @@ fn local_preflight_capacity_reason(reason: &str) -> bool {
 }
 
 fn bounded_preflight_capacity_wait(
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     inference_attempt_budget: &InferenceAttemptBudget,
 ) -> Duration {
     let configured = Duration::from_secs(config.effective_dispatch_max_wait_secs())
@@ -2287,7 +2287,7 @@ fn bounded_preflight_capacity_wait(
 
 async fn local_pool_preflight_reason_after_capacity_grace(
     provider: &KiroProvider,
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     model: Option<&str>,
     max_wait: Duration,
     stage: &'static str,
@@ -2384,7 +2384,7 @@ fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
 fn classify_local_error_for_external_fallback(
     message: &str,
     attempts: &[KiroCredentialAttempt],
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
 ) -> Option<String> {
     classify_local_error_for_external_fallback_with_kind(message, attempts, config, None)
 }
@@ -2392,7 +2392,7 @@ fn classify_local_error_for_external_fallback(
 fn classify_local_error_for_external_fallback_with_kind(
     message: &str,
     attempts: &[KiroCredentialAttempt],
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     call_failure_kind: Option<KiroCallFailureKind>,
 ) -> Option<String> {
     match call_failure_kind {
@@ -6698,7 +6698,7 @@ async fn maybe_external_fallback_after_websearch_mcp_failure(
 
 fn local_rescue_reason_after_external_route_error(
     route_subtype: UsageRouteSubtype,
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
@@ -6739,7 +6739,7 @@ fn local_rescue_reason_after_external_route_error(
 
 #[cfg(test)]
 fn local_rescue_reason_after_external_error(
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
@@ -6802,7 +6802,7 @@ fn local_fallback_reason_blocks_local_rescue(
 
 fn budgeted_local_rescue_reason_after_external_route_error(
     route_subtype: UsageRouteSubtype,
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
@@ -6822,7 +6822,7 @@ fn budgeted_local_rescue_reason_after_external_route_error(
 
 #[cfg(test)]
 fn budgeted_local_rescue_reason_after_external_error(
-    config: &ExternalPoolsConfig,
+    config: &AccountRuntimeConfig,
     err: &ExternalPoolFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,

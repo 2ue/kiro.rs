@@ -9,15 +9,14 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::account_runtime::AccountRuntimeManager;
+use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::common::auth::RequestApiKeyStore;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig,
-    ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode,
-    ToolFormatDebugConfig,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ImageProcessingConfig,
+    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
 };
 
 use super::{
@@ -88,7 +87,7 @@ pub struct AnthropicRouterConfig {
     prompt_steering: PromptSteeringConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
-    external_pools: ExternalPoolsConfig,
+    account_runtime: AccountRuntimeConfig,
     tool_format_debug: ToolFormatDebugConfig,
 }
 
@@ -132,7 +131,7 @@ impl AnthropicRouterConfig {
             prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
-            external_pools: config.external_pools.clone(),
+            account_runtime: config.external_pools.clone(),
             tool_format_debug: config.tool_format_debug.clone(),
         }
     }
@@ -205,7 +204,7 @@ pub fn create_router_with_provider(
         prompt_steering,
         missing_max_tokens,
         payload_shaping,
-        external_pools,
+        account_runtime,
         tool_format_debug,
     } = config;
     let tool_format_debug_recorder = ToolFormatDebugRecorder::new(tool_format_debug);
@@ -254,7 +253,7 @@ pub fn create_router_with_provider(
         payload_shaping,
     )
     .with_missing_max_tokens(missing_max_tokens)
-    .with_external_pools(external_pools)
+    .with_account_runtime_config(account_runtime)
     .with_tool_format_debug_recorder(tool_format_debug_recorder)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
