@@ -64,7 +64,7 @@ export const navPages: NavPage[] = [
   // 资源域
   { key: 'credentials', path: 'credentials', label: '账号', description: '本地账号池:筛选、批量、导入、校验', icon: Server, domain: 'resources' },
   { key: 'validation', path: 'validation', label: '校验', description: '账号可用性与订阅校验', icon: FileCheck2, domain: 'resources' },
-  { key: 'external', path: 'external-pools', label: '外部池', description: '外部账号池与计费', icon: Boxes, domain: 'resources' },
+  { key: 'external', path: 'accounts', label: '上游账号', description: '上游账号调度与计费', icon: Boxes, domain: 'resources' },
   { key: 'proxies', path: 'proxies', label: '代理', description: '网络代理资源', icon: Network, domain: 'resources' },
 
   // 分析域
@@ -86,7 +86,7 @@ export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   overview: { title: '总览', subtitle: '实时健康状态与关键指标一览' },
   credentials: { title: '账号', subtitle: '维护本地账号池,保持调度稳定' },
   validation: { title: '校验', subtitle: '账号可用性、订阅与用量校验' },
-  external: { title: '外部池', subtitle: '管理外部账号池与计费拆分' },
+  external: { title: '上游账号', subtitle: '管理上游账号调度与计费拆分' },
   proxies: { title: '代理', subtitle: '维护网络代理资源与连通状态' },
   usage: { title: '用量', subtitle: '请求趋势、Top 维度与明细记录' },
   externalPoolRisk: { title: '外部池风控', subtitle: '检查外部池缓存分布与成本风险' },

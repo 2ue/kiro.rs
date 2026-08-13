@@ -20,6 +20,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Initial provider-neutral `account_runtime` domain module was added and verified with scoped `cargo test account_runtime` and `cargo check`.
 - Old `ExternalPool` records can now project into the new `UpstreamAccount` boundary for migration staging, with a focused bridge test.
 - Account-named Admin/API aliases were added for the existing upstream account management surface while the old UI and DTO names are migrated.
+- Admin UI navigation now points to `/accounts` as "上游账号"; legacy `/external-pools` redirects to the account page.
 
 ## In Progress
 

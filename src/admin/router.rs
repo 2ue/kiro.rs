@@ -150,7 +150,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/external-pools",
             get(get_external_pools).post(create_external_pool),
         )
-        .route("/accounts", get(get_external_pools).post(create_external_pool))
+        .route(
+            "/accounts",
+            get(get_external_pools).post(create_external_pool),
+        )
         .route("/external-pools/status", get(get_external_pool_status))
         .route("/accounts/status", get(get_external_pool_status))
         .route(

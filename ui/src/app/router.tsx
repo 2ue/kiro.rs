@@ -68,7 +68,8 @@ const router = createBrowserRouter(
         // 资源域
         { path: 'credentials', element: <Lazy><CredentialsPage /></Lazy> },
         { path: 'validation', element: <Lazy><ValidationPage /></Lazy> },
-        { path: 'external-pools', element: <Lazy><ExternalPoolsPage /></Lazy> },
+        { path: 'accounts', element: <Lazy><ExternalPoolsPage /></Lazy> },
+        { path: 'external-pools', element: <Navigate to="/accounts" replace /> },
         { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },
         // 分析域
         { path: 'usage', element: <Lazy><UsagePage /></Lazy> },
