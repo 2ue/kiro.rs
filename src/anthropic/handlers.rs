@@ -742,7 +742,7 @@ fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
 
 #[derive(Clone)]
 struct ExternalFallbackContext {
-    provider: Arc<KiroProvider>,
+    provider: Option<Arc<KiroProvider>>,
     manager: Arc<ExternalPoolManager>,
     config: ExternalPoolsConfig,
     effective_raw_body: Bytes,
@@ -1269,9 +1269,12 @@ async fn maybe_raw_external_direct_response(
     request_api_key_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<Response> {
-    let provider = state.kiro_provider.as_ref()?.clone();
     let manager = state.external_pool_manager.clone()?;
-    let runtime_config = request_runtime_config(state, &provider);
+    let runtime_config = state
+        .kiro_provider
+        .as_ref()
+        .map(|provider| request_runtime_config(state, provider))
+        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(state));
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.external_pools.clone();
     if !external_pool_enabled_for_endpoint(&config, endpoint) {
@@ -1283,9 +1286,13 @@ async fn maybe_raw_external_direct_response(
         return None;
     }
 
-    let reason = manager
-        .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
-        .await?;
+    let reason = if state.kiro_provider.is_none() {
+        "account_route".to_string()
+    } else {
+        manager
+            .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
+            .await?
+    };
     let request_id = envelope::request_id();
     let direct_model_resolution = raw_probe
         .model
@@ -1447,10 +1454,19 @@ async fn raw_external_pool_has_eligible_pool(
     let Some(model) = model else {
         return false;
     };
-    manager.has_cached_eligible_pool_for_route_and_model(config, endpoint, model)
-        || manager
-            .has_eligible_pool_for_route_and_model(config, endpoint, model)
-            .await
+    manager.has_cached_eligible_pool_for_route_body_mode_and_model(
+        config,
+        endpoint,
+        ExternalPoolRequestBodyMode::RawPassthrough,
+        model,
+    ) || manager
+        .has_eligible_pool_for_route_body_mode_and_model(
+            config,
+            endpoint,
+            ExternalPoolRequestBodyMode::RawPassthrough,
+            model,
+        )
+        .await
 }
 
 async fn raw_external_pool_ready_for_route_reason(
@@ -1464,15 +1480,20 @@ async fn raw_external_pool_ready_for_route_reason(
         let Some(model) = model else {
             return false;
         };
-        manager.has_cached_immediately_available_pool_for_route_and_model(config, endpoint, model)
-            || manager
-                .has_immediately_available_pool_for_route_and_model(
-                    config,
-                    endpoint,
-                    model,
-                    EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
-                )
-                .await
+        manager.has_cached_immediately_available_pool_for_route_body_mode_and_model(
+            config,
+            endpoint,
+            ExternalPoolRequestBodyMode::RawPassthrough,
+            model,
+        ) || manager
+            .has_immediately_available_pool_for_route_body_mode_and_model(
+                config,
+                endpoint,
+                ExternalPoolRequestBodyMode::RawPassthrough,
+                model,
+                EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+            )
+            .await
     } else {
         raw_external_pool_has_eligible_pool(manager, config, endpoint, model).await
     }
@@ -1604,7 +1625,6 @@ fn build_external_fallback_context(
     requires_normalized_body: bool,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Option<ExternalFallbackContext> {
-    let provider = state.kiro_provider.clone()?;
     let manager = state.external_pool_manager.clone()?;
     let config = runtime_config.external_pools.clone();
     if !external_pool_enabled_for_endpoint(&config, endpoint) {
@@ -1613,7 +1633,7 @@ fn build_external_fallback_context(
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
     let policy = &effective_cache_route.policy;
     Some(ExternalFallbackContext {
-        provider,
+        provider: state.kiro_provider.clone(),
         manager,
         config,
         effective_raw_body,
@@ -1658,8 +1678,9 @@ fn build_external_fallback_context(
 
 impl ExternalFallbackContext {
     fn current_local_dispatchable(&self, model: Option<&str>) -> Option<usize> {
+        let provider = self.provider.as_ref()?;
         let model = model.or(Some(self.payload.model.as_str()));
-        let state = self.provider.local_pool_route_state_fresh(model);
+        let state = provider.local_pool_route_state_fresh(model);
         Some(if matches!(state.kind, LocalPoolRouteStateKind::Ready) {
             state.dispatchable
         } else {
@@ -1699,6 +1720,9 @@ impl ExternalFallbackContext {
     }
 
     async fn local_attempt_policy(&self) -> (AcquireMode, bool) {
+        if self.provider.is_none() {
+            return (AcquireMode::FailFastOnCapacity, false);
+        }
         if self.has_cached_immediately_available_external_pool_for_model(&self.payload.model) {
             let acquire_mode = local_pool_acquire_mode(&self.config);
             if acquire_mode != AcquireMode::WaitForCapacity {
@@ -1782,10 +1806,13 @@ impl ExternalFallbackContext {
         request_id: &str,
         model_resolution: Option<ModelResolution>,
     ) -> Option<Response> {
-        let reason = self
-            .manager
-            .direct_policy_reason(&self.config, &self.endpoint, &self.payload.model)
-            .await?;
+        let reason = if self.provider.is_none() {
+            "account_route".to_string()
+        } else {
+            self.manager
+                .direct_policy_reason(&self.config, &self.endpoint, &self.payload.model)
+                .await?
+        };
         let mut external = self.clone();
         external.model_resolution = model_resolution;
         let route = match external.route_request(
@@ -1812,11 +1839,12 @@ impl ExternalFallbackContext {
         request_id: &str,
         model: Option<&str>,
     ) -> Option<LocalPoolPreflightExternalOutcome> {
+        let provider = self.provider.as_ref()?;
         if !self.config.local_pool_preflight_enabled {
             return None;
         }
         let (reason, state) = local_pool_preflight_reason_after_capacity_grace(
-            self.provider.as_ref(),
+            provider.as_ref(),
             &self.config,
             model,
             bounded_preflight_capacity_wait(&self.config, self.inference_attempt_budget.as_ref()),
@@ -1929,6 +1957,7 @@ impl ExternalFallbackContext {
         };
         let local_state = self
             .provider
+            .as_ref()?
             .local_pool_route_state_fresh(Some(&self.payload.model));
         let typed_auxiliary_route_reason = match call_failure_kind {
             Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted) => {
@@ -5952,25 +5981,11 @@ async fn post_messages_inner(
         "Received POST messages request"
     );
     log_anthropic_request_summary(&endpoint, &payload);
-    // 检查 KiroProvider 是否可用
-    let provider = match &state.kiro_provider {
-        Some(p) => p.clone(),
-        None => {
-            let response = envelope::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
-            );
-            record_pre_usage_rejection(
-                attribution.as_ref(),
-                RequestRejectionReason::ProviderNotReady,
-                &endpoint,
-                &response,
-            );
-            return response;
-        }
-    };
-    let runtime_config = request_runtime_config(&state, &provider);
+    let provider = state.kiro_provider.clone();
+    let runtime_config = provider
+        .as_ref()
+        .map(|provider| request_runtime_config(&state, provider))
+        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let mut external_fallback = build_external_fallback_context(
         &state,
@@ -6053,6 +6068,21 @@ async fn post_messages_inner(
             return response;
         }
     }
+
+    let Some(provider) = provider else {
+        let response = envelope::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
+        );
+        record_pre_usage_rejection(
+            attribution.as_ref(),
+            RequestRejectionReason::ProviderNotReady,
+            &endpoint,
+            &response,
+        );
+        return response;
+    };
 
     let model_resolution = match resolve_request_model(&state, &runtime_config, &endpoint, &payload)
     {

@@ -1042,6 +1042,42 @@ fn websearch_handler_test_router_with_external_options(
     (router, usage_recorder)
 }
 
+fn account_only_handler_test_router(
+    external_pool_manager: Arc<ExternalPoolManager>,
+) -> (Router, Arc<UsageRecorder>) {
+    let mut config = Config::default();
+    config.external_pools.external_pools_enabled = true;
+    config
+        .external_pools
+        .external_pool_global_max_concurrent_requests = 20;
+    config.external_pools.external_pool_max_queued_requests = 0;
+    config.external_pools.external_pool_retry_max_attempts = 0;
+    config.external_pools.external_pool_request_timeout_secs = 10;
+    config
+        .external_pools
+        .external_pool_stream_request_timeout_secs = 10;
+    config.external_pools.external_pool_stream_idle_timeout_secs = 10;
+
+    let usage_recorder = Arc::new(UsageRecorder::new(1_000));
+    let router = create_router_with_provider(
+        AnthropicRouterDependencies {
+            request_api_keys: Arc::new(RequestApiKeyStore::new(["b07-handler-key"])),
+            request_admission: Arc::new(RequestAdmissionController::new(
+                RequestAdmissionConfig::disabled(),
+            )),
+            kiro_provider: None,
+            usage_recorder: usage_recorder.clone(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            external_pool_manager: Some(external_pool_manager),
+        },
+        AnthropicRouterConfig::from_runtime_config(&config),
+    );
+    (router, usage_recorder)
+}
+
 fn websearch_messages_body(
     messages: Vec<Value>,
     stream: bool,
@@ -1619,6 +1655,85 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
 fn normalized_external_direct_policy_skips_raw_preparse_without_raw_pool() {
     run_handler_fixture_on_four_mib_thread("normalized-external-direct-raw-guard", || async {
         run_normalized_external_direct_policy_skips_raw_preparse_without_raw_pool().await;
+    });
+}
+
+async fn run_account_only_routes_normalized_requests_without_kiro_provider() {
+    let external_upstream = ExternalMessagesUpstream::start().await;
+    let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
+        &external_upstream.base_url,
+        ExternalPoolRequestBodyMode::Normalized,
+    )
+    .await
+    else {
+        return;
+    };
+    let (router, usage_recorder) = account_only_handler_test_router(external_pool_manager);
+
+    for stream in [false, true] {
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/cc/v1/messages",
+                json!({
+                    "model": "claude-opus-4-6-thinking",
+                    "max_tokens": 32,
+                    "stream": stream,
+                    "messages": [{"role": "user", "content": format!("account only stream={stream}")}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("account-only upstream account response");
+        let request_id = response_request_id(&response);
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("account-only response body");
+        let body = String::from_utf8(body.to_vec()).expect("account-only response UTF-8");
+        assert!(
+            body.contains("fake-normalized-external-ok"),
+            "stream={stream} body={body}"
+        );
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success, "stream={stream}");
+        assert_eq!(
+            record.route_kind,
+            Some(UsageRouteKind::ExternalPool),
+            "stream={stream}"
+        );
+        assert_eq!(
+            record.route_subtype,
+            Some(UsageRouteSubtype::ExternalDirectPolicy),
+            "stream={stream}"
+        );
+        assert_eq!(
+            record.direct_policy_reason.as_deref(),
+            Some("account_route"),
+            "stream={stream}"
+        );
+        assert_eq!(record.local_attempted, Some(false), "stream={stream}");
+        let attempts = record
+            .latency_trace
+            .as_ref()
+            .and_then(|trace| trace.inference_attempts)
+            .expect("account-only attempt trace");
+        assert_eq!(attempts.external_attempts, 1, "stream={stream}");
+        assert_eq!(attempts.local_attempts, 0, "stream={stream}");
+    }
+
+    assert_eq!(
+        external_upstream.state.hits(),
+        2,
+        "account-only stream and non-stream requests must reach upstream accounts"
+    );
+}
+
+#[test]
+fn account_only_routes_normalized_requests_without_kiro_provider() {
+    run_handler_fixture_on_four_mib_thread("account-only-normalized", || async {
+        run_account_only_routes_normalized_requests_without_kiro_provider().await;
     });
 }
 

@@ -6,7 +6,7 @@ Status: In Progress; implementation branch created
 
 Authority: Defines the target boundary for the current-repository refactor requested after `feature/usage-correction-cost-floor`
 
-As of: 2026-08-13
+As of: 2026-08-14
 
 Related: [Plan Tree](../../README.md), [current module map](../../baseline/module-map.md), [protocol contracts](../../baseline/protocol-and-api-contracts.md), [runtime flows](../../baseline/runtime-flows.md), [target architecture](topics/final-target-plan.md)
 
@@ -61,10 +61,16 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `/api/admin/accounts` aliases for the existing external-pool Admin handlers and matching frontend account API aliases, giving new callers an account-named boundary while the old UI is migrated.
 - the Admin UI resource navigation now exposes the upstream account page at `/accounts`, with the old `/external-pools` route redirecting to it.
 - the upstream account page now calls the account-named Admin API aliases for list, status, create, update, enable, cooldown, supported-model discovery, delete and test actions.
+- `/cc/v1/messages` can now run through configured upstream accounts when no `KiroProvider` is installed, for both stream and non-stream normalized requests.
+- account selection now honors the configured request body mode during eligibility and immediate-availability checks, so raw-preparse routing does not steal normalized-only accounts and normalized routing does not select raw-only accounts.
 
-Last verified on 2026-08-13:
+Last verified on 2026-08-14:
 
 - `feature/tests/run-cargo-scoped.sh account-runtime-initial-test2 -- cargo test account_runtime`
 - `feature/tests/run-cargo-scoped.sh account-runtime-initial-check -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-bridge-test2 -- cargo test external_pool_projects_to_upstream_account_boundary`
 - `feature/tests/run-cargo-scoped.sh account-bridge-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-only-normalized-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-body-mode-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-only-slice-fmt2 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-only-slice-check2 -- cargo check`

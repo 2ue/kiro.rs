@@ -17,8 +17,6 @@ pub(crate) const PUBLIC_PROCESSING_FAILED_MESSAGE: &str =
     "The request could not be completed. Please retry shortly.";
 pub(crate) const PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE: &str =
     "No account is ready for this request right now. Please retry shortly.";
-pub(crate) const PUBLIC_PROVIDER_NOT_READY_MESSAGE: &str =
-    "The request could not be started right now. Please retry shortly.";
 pub(crate) const PUBLIC_MODEL_UNAVAILABLE_MESSAGE: &str =
     "The requested model is not available for this endpoint.";
 pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "The request body is invalid. Simplify the message, tools, tool results, files, or images and retry.";
@@ -302,7 +300,6 @@ mod tests {
             PUBLIC_TEMPORARY_FAILURE_MESSAGE,
             PUBLIC_PROCESSING_FAILED_MESSAGE,
             PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
-            PUBLIC_PROVIDER_NOT_READY_MESSAGE,
             PUBLIC_MODEL_UNAVAILABLE_MESSAGE,
             PUBLIC_INVALID_REQUEST_MESSAGE,
             PUBLIC_RATE_LIMIT_MESSAGE,

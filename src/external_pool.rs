@@ -507,6 +507,7 @@ pub(crate) struct ExternalPoolEligibility {
     pub(crate) enabled: bool,
     pub(crate) auto_disabled: bool,
     pub(crate) auto_disabled_until: Option<DateTime<Utc>>,
+    pub(crate) request_body_mode: ExternalPoolRequestBodyMode,
     pub(crate) supported_models: Arc<HashSet<String>>,
     pub(crate) route_mode: ExternalPoolRouteMode,
     pub(crate) route_rules: Arc<Vec<String>>,
@@ -528,6 +529,7 @@ fn external_pool_eligibility_from_pool(pool: &ExternalPool) -> ExternalPoolEligi
         enabled: pool.enabled,
         auto_disabled: pool.auto_disabled,
         auto_disabled_until: pool.auto_disabled_until,
+        request_body_mode: pool.request_body_mode,
         supported_models: Arc::new(
             normalize_supported_models(pool.supported_models.clone())
                 .into_iter()
@@ -4972,6 +4974,23 @@ impl ExternalPoolManager {
             .await
     }
 
+    pub async fn has_eligible_pool_for_route_body_mode_and_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        endpoint: &str,
+        body_mode: ExternalPoolRequestBodyMode,
+        model: &str,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_eligible_pool_matching(
+            config,
+            Some(body_mode),
+            Some(&model_candidates),
+            Some(endpoint),
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub async fn has_eligible_pool_for_body_mode_and_model(
         &self,
@@ -4999,6 +5018,22 @@ impl ExternalPoolManager {
         )
     }
 
+    pub fn has_cached_eligible_pool_for_route_body_mode_and_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        endpoint: &str,
+        body_mode: ExternalPoolRequestBodyMode,
+        model: &str,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_cached_eligible_pool_matching(
+            config,
+            Some(body_mode),
+            Some(&model_candidates),
+            Some(endpoint),
+        )
+    }
+
     fn has_cached_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
@@ -5006,7 +5041,6 @@ impl ExternalPoolManager {
         model_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> bool {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return false;
         }
@@ -5017,6 +5051,7 @@ impl ExternalPoolManager {
         pools.iter().any(|pool| {
             pool.enabled
                 && !pool.is_auto_disabled_at(now)
+                && external_pool_eligibility_matches_body_mode(pool, body_mode_filter)
                 && external_pool_eligibility_route_allowed(pool, endpoint)
                 && external_pool_eligibility_matches_supported_models(pool, model_candidates)
         })
@@ -5058,6 +5093,25 @@ impl ExternalPoolManager {
         .await
     }
 
+    pub async fn has_immediately_available_pool_for_route_body_mode_and_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        endpoint: &str,
+        body_mode: ExternalPoolRequestBodyMode,
+        model: &str,
+        max_wait: Duration,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_immediately_available_pool_matching(
+            config,
+            Some(body_mode),
+            Some(&model_candidates),
+            Some(endpoint),
+            max_wait,
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub fn has_cached_immediately_available_pool_for_model(
         &self,
@@ -5088,6 +5142,22 @@ impl ExternalPoolManager {
         )
     }
 
+    pub fn has_cached_immediately_available_pool_for_route_body_mode_and_model(
+        &self,
+        config: &ExternalPoolsConfig,
+        endpoint: &str,
+        body_mode: ExternalPoolRequestBodyMode,
+        model: &str,
+    ) -> bool {
+        let model_candidates = normalize_external_pool_support_candidates([model]);
+        self.has_cached_immediately_available_pool_matching(
+            config,
+            Some(body_mode),
+            Some(&model_candidates),
+            Some(endpoint),
+        )
+    }
+
     async fn has_eligible_pool_matching(
         &self,
         config: &ExternalPoolsConfig,
@@ -5095,7 +5165,6 @@ impl ExternalPoolManager {
         model_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> bool {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return false;
         }
@@ -5104,6 +5173,7 @@ impl ExternalPoolManager {
         pools.iter().any(|pool| {
             pool.enabled
                 && !pool.is_auto_disabled_at(now)
+                && external_pool_eligibility_matches_body_mode(pool, body_mode_filter)
                 && external_pool_eligibility_route_allowed(pool, endpoint)
                 && external_pool_eligibility_matches_supported_models(pool, model_candidates)
         })
@@ -5116,7 +5186,6 @@ impl ExternalPoolManager {
         model_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> bool {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return false;
         }
@@ -5129,6 +5198,7 @@ impl ExternalPoolManager {
             .filter(|pool| {
                 pool.enabled
                     && !pool.is_auto_disabled_now()
+                    && external_pool_matches_body_mode_filter(pool, body_mode_filter)
                     && external_pool_route_allowed(pool, endpoint)
                     && external_pool_matches_supported_models_normalized(pool, model_candidates)
             })
@@ -6623,7 +6693,7 @@ impl ExternalPoolManager {
             excluded,
             config,
             true,
-            None,
+            route.body_mode_filter,
             Some(&support_candidates),
             Some(&cooldown_candidates),
             Some(&route.endpoint),
@@ -6647,6 +6717,7 @@ impl ExternalPoolManager {
                 !excluded.contains(&pool.id)
                     && pool.enabled
                     && !pool.is_auto_disabled_now()
+                    && external_pool_matches_body_mode_filter(pool, route.body_mode_filter)
                     && external_pool_route_allowed(pool, Some(&route.endpoint))
                     && external_pool_matches_supported_models_normalized(
                         pool,
@@ -6734,7 +6805,6 @@ impl ExternalPoolManager {
         model_cooldown_candidates: Option<&[String]>,
         endpoint: Option<&str>,
     ) -> PoolSelectionSnapshot {
-        let _ = body_mode_filter;
         if !config.external_pools_enabled {
             return PoolSelectionSnapshot::default();
         }
@@ -6744,6 +6814,7 @@ impl ExternalPoolManager {
                 !excluded.contains(&pool.id)
                     && pool.enabled
                     && !pool.is_auto_disabled_now()
+                    && external_pool_matches_body_mode_filter(pool, body_mode_filter)
                     && external_pool_route_allowed(pool, endpoint)
                     && external_pool_matches_supported_models_normalized(pool, model_candidates)
             })
@@ -9496,7 +9567,6 @@ fn external_pool_outbound_body(
     external_pool_prepare_request(route, pool).map(|prepared| prepared.body)
 }
 
-#[cfg(test)]
 fn external_pool_matches_body_mode_filter(
     pool: &ExternalPool,
     filter: Option<ExternalPoolRequestBodyMode>,
@@ -9561,6 +9631,13 @@ fn external_pool_eligibility_route_allowed(
     endpoint: Option<&str>,
 ) -> bool {
     external_pool_route_policy_allows(pool.route_mode, &pool.route_rules, endpoint)
+}
+
+fn external_pool_eligibility_matches_body_mode(
+    pool: &ExternalPoolEligibility,
+    filter: Option<ExternalPoolRequestBodyMode>,
+) -> bool {
+    filter.is_none_or(|mode| pool.request_body_mode == mode)
 }
 
 fn external_pool_eligibility_matches_supported_models(

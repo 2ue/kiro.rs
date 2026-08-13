@@ -6,7 +6,7 @@ Status: Planning
 
 Authority: Tracks readiness and execution order for the current-repository target only
 
-As of: 2026-08-13
+As of: 2026-08-14
 
 Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md)
 
@@ -22,13 +22,16 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account-named Admin/API aliases were added for the existing upstream account management surface while the old UI and DTO names are migrated.
 - Admin UI navigation now points to `/accounts` as "上游账号"; legacy `/external-pools` redirects to the account page.
 - The upstream account page now uses account-named API calls, while component/type filenames remain to be migrated.
+- Account-only `/cc/v1/messages` routing now works through configured upstream accounts when no `KiroProvider` is installed, covering normalized stream and non-stream requests.
+- Account eligibility and availability checks now honor request body mode, so raw passthrough and normalized account routes are scheduled against compatible accounts only.
 
 ## In Progress
 
-- Convert external-pool UI, DTO and configuration names toward account terminology.
+- Convert remaining backend Admin/API/DTO and usage-dashboard names from external-pool/local-credential terminology toward account terminology while preserving temporary compatibility aliases.
 
 ## Next
 
+- Introduce startup/runtime dependency paths that can boot with upstream accounts and no `KiroProvider`.
 - Split scheduler primitives from Kiro credential types before deleting Kiro modules.
 - Convert body and protocol paths to canonical/upstream-account logic with no Kiro envelope or Kiro event dependency.
 
