@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AccessKeysResponse, AccountsListResponse, AccountsStatusResponse, AddCredentialRequest,
-    AddCredentialResponse, AuxiliaryUpstreamRuntimeResponse, BalanceResponse,
+    AccessKeysResponse, Account, AccountTestResponse, AccountsListResponse, AccountsStatusResponse,
+    AddCredentialRequest, AddCredentialResponse, AuxiliaryUpstreamRuntimeResponse, BalanceResponse,
     BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
     BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
     BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, BulkCredentialActionError,
@@ -964,7 +964,11 @@ impl AdminService {
 
     pub fn list_accounts(&self) -> Result<AccountsListResponse, AdminServiceError> {
         Ok(AccountsListResponse {
-            accounts: self.list_external_pools()?,
+            accounts: self
+                .list_external_pools()?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         })
     }
 
@@ -991,7 +995,7 @@ impl AdminService {
     pub fn create_account(
         &self,
         request: CreateExternalPoolRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+    ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool =
             block_on_admin_store(async move { store.create_external_pool_unmasked(request).await })
@@ -1005,7 +1009,7 @@ impl AdminService {
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
         self.invalidate_external_pool_admin_cache_with_pool("create_account", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(pool.masked_for_admin_response().into())
     }
 
     pub fn update_external_pool(
@@ -1036,7 +1040,7 @@ impl AdminService {
         &self,
         id: u64,
         request: UpdateExternalPoolRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+    ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool =
             block_on_admin_store(
@@ -1053,7 +1057,7 @@ impl AdminService {
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
         self.invalidate_external_pool_admin_cache_with_pool("update_account", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(pool.masked_for_admin_response().into())
     }
 
     pub fn set_external_pool_supported_models(
@@ -1369,7 +1373,7 @@ impl AdminService {
         &self,
         id: u64,
         request: SetExternalPoolEnabledRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+    ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
@@ -1387,7 +1391,7 @@ impl AdminService {
             json!({ "enabled": request.enabled }),
         );
         self.invalidate_external_pool_admin_cache_with_pool("account_enabled", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(pool.masked_for_admin_response().into())
     }
 
     pub fn clear_external_pool_auto_disabled(
@@ -1412,7 +1416,7 @@ impl AdminService {
         Ok(pool.masked_for_admin_response())
     }
 
-    pub fn clear_account_auto_disabled(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
+    pub fn clear_account_auto_disabled(&self, id: u64) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store.clear_external_pool_auto_disabled_unmasked(id).await
@@ -1428,7 +1432,7 @@ impl AdminService {
             json!({}),
         );
         self.invalidate_external_pool_admin_cache_with_pool("clear_account_auto_disabled", &pool);
-        Ok(pool.masked_for_admin_response())
+        Ok(pool.masked_for_admin_response().into())
     }
 
     pub fn clear_external_pool_cooldown(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
@@ -1451,7 +1455,7 @@ impl AdminService {
         Ok(pool.masked_for_admin_response())
     }
 
-    pub fn clear_account_cooldown(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
+    pub fn clear_account_cooldown(&self, id: u64) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
@@ -1468,7 +1472,7 @@ impl AdminService {
             json!({ "deletedKeys": deleted }),
         );
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
-        Ok(pool.masked_for_admin_response())
+        Ok(pool.masked_for_admin_response().into())
     }
 
     pub fn get_external_pool_status(
@@ -1615,8 +1619,8 @@ impl AdminService {
         &self,
         id: u64,
         req: Option<ExternalPoolTestRequest>,
-    ) -> Result<ExternalPoolTestResponse, AdminServiceError> {
-        self.test_external_pool(id, req)
+    ) -> Result<AccountTestResponse, AdminServiceError> {
+        self.test_external_pool(id, req).map(Into::into)
     }
 
     pub fn update_admin_api_key(

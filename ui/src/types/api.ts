@@ -1640,8 +1640,42 @@ export interface ExternalPoolsListResponse {
   pools: ExternalPool[]
 }
 
+export interface Account {
+  id: number
+  name: string
+  baseUrl: string
+  apiKey?: string
+  maskedApiKey?: string
+  authType: ExternalPoolAuthType
+  enabled: boolean
+  priority: number
+  maxConcurrentRequests: number
+  usageProjectionMode: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode
+  requestBodyMode: ExternalPoolRequestBodyMode
+  rawModelMode: ExternalPoolRawModelMode
+  autoDisablePolicy: ExternalPoolAutoDisablePolicy
+  preOutputStreamRetryMode: ExternalPoolStreamRetryMode
+  autoDisabled: boolean
+  autoDisabledReason?: string
+  autoDisabledAt?: string
+  autoDisabledUntil?: string
+  autoDisabledLastError?: string
+  preservePath: boolean
+  normalizeModelVersionDots: boolean
+  modelMappingMode: ExternalPoolModelMappingMode
+  modelMappingRequireMatch: boolean
+  modelMappingRules: ExternalPoolModelMappingRule[]
+  supportedModels: string[]
+  routeMode: ExternalPoolRouteMode
+  routeRules: string[]
+  notes?: string
+  createdAt: string
+  updatedAt: string
+}
+
 export interface AccountsListResponse {
-  accounts: ExternalPool[]
+  accounts: Account[]
 }
 
 export interface ExternalPoolStatus {
@@ -1660,7 +1694,7 @@ export interface ExternalPoolsStatusResponse {
 }
 
 export interface AccountStatus {
-  account: ExternalPool
+  account: Account
   inFlight: number
   cooldownRemainingSecs: number
   cooldownReason?: string
@@ -1751,6 +1785,14 @@ export interface ExternalPoolTestRequest {
   model: string
   prompt?: string
 }
+
+export type CreateAccountRequest = CreateExternalPoolRequest
+
+export type UpdateAccountRequest = UpdateExternalPoolRequest
+
+export type AccountTestRequest = ExternalPoolTestRequest
+
+export type AccountTestResponse = ExternalPoolTestResponse
 
 export interface WeightedCapacityTier {
   minTokens: number

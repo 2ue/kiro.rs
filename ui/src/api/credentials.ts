@@ -52,6 +52,11 @@ import type {
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
   LoadBalancingMode,
+  Account,
+  AccountTestRequest,
+  AccountTestResponse,
+  CreateAccountRequest,
+  UpdateAccountRequest,
   CreateExternalPoolRequest,
   ExternalPool,
   AccountsListResponse,
@@ -62,12 +67,6 @@ import type {
   ExternalPoolTestResponse,
   UpdateExternalPoolRequest,
 } from '@/types/api'
-
-export type Account = ExternalPool
-export type CreateAccountRequest = CreateExternalPoolRequest
-export type UpdateAccountRequest = UpdateExternalPoolRequest
-export type AccountTestRequest = ExternalPoolTestRequest
-export type AccountTestResponse = ExternalPoolTestResponse
 
 const CREDENTIALS_LIST_PAGE_LIMIT = 500
 

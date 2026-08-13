@@ -3,13 +3,19 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
-use crate::external_pool::{ExternalPool, ExternalPoolStatus};
+use crate::external_pool::{
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
+    ExternalPoolModelMappingMode, ExternalPoolRawModelMode, ExternalPoolRequestBodyMode,
+    ExternalPoolStatus, ExternalPoolStreamRetryMode, ExternalPoolTestResponse,
+    ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest,
+};
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
+    ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ExternalPoolsConfig,
     ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
-    PromptCacheCreationControlConfig, PromptSteeringConfig, ReportedUsageConfig,
-    RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
+    ModelMappingRule, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PayloadShapingConfigPatch, PromptCacheCreationControlConfig, PromptSteeringConfig,
+    ReportedUsageConfig, RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -1138,6 +1144,128 @@ pub struct ExternalPoolTestRequest {
     pub prompt: Option<String>,
 }
 
+pub type AccountTestRequest = ExternalPoolTestRequest;
+
+pub type CreateAccountRequest = CreateExternalPoolRequest;
+
+pub type UpdateAccountRequest = UpdateExternalPoolRequest;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Account {
+    pub id: u64,
+    pub name: String,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub masked_api_key: Option<String>,
+    pub auth_type: ExternalPoolAuthType,
+    pub enabled: bool,
+    pub priority: i32,
+    pub max_concurrent_requests: u32,
+    pub usage_projection_mode: ExternalPoolUsageProjectionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+    #[serde(default)]
+    pub request_body_mode: ExternalPoolRequestBodyMode,
+    #[serde(default)]
+    pub raw_model_mode: ExternalPoolRawModelMode,
+    pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
+    #[serde(default)]
+    pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
+    pub auto_disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_disabled_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_disabled_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_disabled_last_error: Option<String>,
+    pub preserve_path: bool,
+    #[serde(default)]
+    pub normalize_model_version_dots: bool,
+    #[serde(default)]
+    pub model_mapping_mode: ExternalPoolModelMappingMode,
+    #[serde(default)]
+    pub model_mapping_require_match: bool,
+    #[serde(default)]
+    pub model_mapping_rules: Vec<ModelMappingRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub route_mode: ExternalPoolRouteMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<ExternalPool> for Account {
+    fn from(pool: ExternalPool) -> Self {
+        Self {
+            id: pool.id,
+            name: pool.name,
+            base_url: pool.base_url,
+            api_key: pool.api_key,
+            masked_api_key: pool.masked_api_key,
+            auth_type: pool.auth_type,
+            enabled: pool.enabled,
+            priority: pool.priority,
+            max_concurrent_requests: pool.max_concurrent_requests,
+            usage_projection_mode: pool.usage_projection_mode,
+            stream_response_mode: pool.stream_response_mode,
+            request_body_mode: pool.request_body_mode,
+            raw_model_mode: pool.raw_model_mode,
+            auto_disable_policy: pool.auto_disable_policy,
+            pre_output_stream_retry_mode: pool.pre_output_stream_retry_mode,
+            auto_disabled: pool.auto_disabled,
+            auto_disabled_reason: pool.auto_disabled_reason,
+            auto_disabled_at: pool.auto_disabled_at,
+            auto_disabled_until: pool.auto_disabled_until,
+            auto_disabled_last_error: pool.auto_disabled_last_error,
+            preserve_path: pool.preserve_path,
+            normalize_model_version_dots: pool.normalize_model_version_dots,
+            model_mapping_mode: pool.model_mapping_mode,
+            model_mapping_require_match: pool.model_mapping_require_match,
+            model_mapping_rules: pool.model_mapping_rules,
+            supported_models: pool.supported_models,
+            route_mode: pool.route_mode,
+            route_rules: pool.route_rules,
+            notes: pool.notes,
+            created_at: pool.created_at,
+            updated_at: pool.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountTestResponse {
+    pub ok: bool,
+    pub status: Option<u16>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+}
+
+impl From<ExternalPoolTestResponse> for AccountTestResponse {
+    fn from(response: ExternalPoolTestResponse) -> Self {
+        Self {
+            ok: response.ok,
+            status: response.status,
+            message: response.message,
+            model: response.model,
+            response: response.response,
+        }
+    }
+}
+
 fn default_proxy_resource_enabled() -> bool {
     true
 }
@@ -1764,13 +1892,13 @@ pub struct UpdateRuntimeConfigRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountsListResponse {
-    pub accounts: Vec<ExternalPool>,
+    pub accounts: Vec<Account>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {
-    pub account: ExternalPool,
+    pub account: Account,
     pub in_flight: u32,
     pub cooldown_remaining_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1784,7 +1912,7 @@ pub struct AccountStatus {
 impl From<ExternalPoolStatus> for AccountStatus {
     fn from(status: ExternalPoolStatus) -> Self {
         Self {
-            account: status.pool,
+            account: status.pool.into(),
             in_flight: status.in_flight,
             cooldown_remaining_secs: status.cooldown_remaining_secs,
             cooldown_reason: status.cooldown_reason,
@@ -2085,6 +2213,71 @@ mod tests {
             }))
             .unwrap();
         assert!(batch_override.auto_discover_supported_models);
+    }
+
+    #[test]
+    fn account_status_response_serializes_account_boundary_names() {
+        let account = Account {
+            id: 42,
+            name: "primary".to_string(),
+            base_url: "https://upstream.example.test".to_string(),
+            api_key: None,
+            masked_api_key: Some("sk_...tail".to_string()),
+            auth_type: ExternalPoolAuthType::Bearer,
+            enabled: true,
+            priority: 10,
+            max_concurrent_requests: 2,
+            usage_projection_mode: ExternalPoolUsageProjectionMode::default(),
+            stream_response_mode: None,
+            request_body_mode: ExternalPoolRequestBodyMode::default(),
+            raw_model_mode: ExternalPoolRawModelMode::default(),
+            auto_disable_policy: ExternalPoolAutoDisablePolicy::default(),
+            pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::default(),
+            auto_disabled: false,
+            auto_disabled_reason: None,
+            auto_disabled_at: None,
+            auto_disabled_until: None,
+            auto_disabled_last_error: None,
+            preserve_path: true,
+            normalize_model_version_dots: false,
+            model_mapping_mode: ExternalPoolModelMappingMode::default(),
+            model_mapping_require_match: false,
+            model_mapping_rules: Vec::new(),
+            supported_models: vec!["claude-sonnet-*".to_string()],
+            route_mode: ExternalPoolRouteMode::default(),
+            route_rules: Vec::new(),
+            notes: None,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-08-14T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2026-08-14T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let response = AccountsStatusResponse {
+            accounts: vec![AccountStatus {
+                account,
+                in_flight: 1,
+                cooldown_remaining_secs: 0,
+                cooldown_reason: None,
+                transient_failure_streak: 0,
+                transient_failure_ttl_secs: 0,
+                dispatchable: true,
+                skipped_reason: None,
+            }],
+        };
+
+        let json = serde_json::to_value(response).unwrap();
+
+        assert!(json.get("accounts").is_some());
+        assert!(json.get("pools").is_none());
+        assert!(json["accounts"][0].get("account").is_some());
+        assert!(json["accounts"][0].get("pool").is_none());
+        assert_eq!(
+            json["accounts"][0]["account"]["baseUrl"],
+            "https://upstream.example.test"
+        );
+        assert!(json["accounts"][0]["account"].get("apiKey").is_none());
     }
 
     #[test]

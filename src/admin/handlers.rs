@@ -13,15 +13,16 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
-        BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
-        CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
-        ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
-        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
-        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
-        SetCredentialRegionsRequest, SetCredentialRpmRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
-        SetWarmupRequest, SuccessResponse, SystemVersionResponse, TestCredentialRequest,
+        AccountTestRequest, AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
+        BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateAccountRequest,
+        CreateProxyResourceRequest, CreateRequestApiKeyRequest,
+        DiscoverExternalPoolSupportedModelsRequest, ExportCredentialsQuery,
+        ExternalPoolTestRequest, ProxyResourceTestRequest, RefreshCredentialInfoRequest,
+        SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
+        SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
+        SetCredentialRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
+        SystemVersionResponse, TestCredentialRequest, UpdateAccountRequest,
         UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
         UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
         UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
@@ -1173,7 +1174,7 @@ pub async fn create_external_pool(
 
 pub async fn create_account(
     State(state): State<AdminState>,
-    Json(payload): Json<CreateExternalPoolRequest>,
+    Json(payload): Json<CreateAccountRequest>,
 ) -> impl IntoResponse {
     match state.service.create_account(payload) {
         Ok(account) => Json(account).into_response(),
@@ -1195,7 +1196,7 @@ pub async fn update_external_pool(
 pub async fn update_account(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<UpdateExternalPoolRequest>,
+    Json(payload): Json<UpdateAccountRequest>,
 ) -> impl IntoResponse {
     match state.service.update_account(id, payload) {
         Ok(account) => Json(account).into_response(),
@@ -1316,7 +1317,7 @@ pub async fn test_external_pool(
 pub async fn test_account(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    payload: Option<Json<ExternalPoolTestRequest>>,
+    payload: Option<Json<AccountTestRequest>>,
 ) -> impl IntoResponse {
     match state
         .service
