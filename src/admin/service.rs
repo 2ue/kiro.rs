@@ -15,12 +15,13 @@ use sha2::{Digest, Sha256};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AccessKeysResponse, Account, AccountTestResponse, AccountsListResponse, AccountsStatusResponse,
-    AddCredentialRequest, AddCredentialResponse, AuxiliaryUpstreamRuntimeResponse, BalanceResponse,
-    BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
-    BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
-    BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, BulkCredentialActionError,
-    BulkCredentialActionResponse, ClearInFlightRequest, CreateProxyResourceRequest,
+    AccessKeysResponse, Account, AccountTestRequest, AccountTestResponse, AccountsListResponse,
+    AccountsStatusResponse, AddCredentialRequest, AddCredentialResponse,
+    AuxiliaryUpstreamRuntimeResponse, BalanceResponse, BatchCredentialImportDefaults,
+    BatchCredentialImportDuplicateMode, BatchCredentialImportItem, BatchCredentialImportRequest,
+    BatchCredentialImportResponse, BatchUpdateCredentialItem, BatchUpdateCredentialsRequest,
+    BatchUpdateCredentialsResponse, BulkCredentialActionError, BulkCredentialActionResponse,
+    ClearInFlightRequest, CreateAccountRequest, CreateProxyResourceRequest,
     CreateRequestApiKeyRequest, CredentialAccountInfo, CredentialAccountInfoItem,
     CredentialAccountInfoListResponse, CredentialCooldown, CredentialCreditSummaryResponse,
     CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialListItem,
@@ -28,19 +29,20 @@ use super::types::{
     CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
     CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
     CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
-    DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest, LoadBalancingModeResponse,
-    ManualModelResponse, ProxyResourceResponse, ProxyResourceTestRequest,
-    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
-    RequestApiKeyItem, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
-    SetCredentialOverageRequest, SetCredentialProxyRequest,
-    SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
-    SetLoadBalancingModeRequest, SetSupportedModelsRequest, SetWarmupRequest,
-    SupportedModelsResponse, TestCredentialRequest, TestCredentialResponse,
-    TokenRefreshAdmissionRuntimeResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
-    UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
-    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+    DiscoverAccountSupportedModelsRequest, DiscoverExternalPoolSupportedModelsRequest,
+    ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
+    ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
+    RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
+    SetAccountEnabledRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
+    SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+    SetCredentialRegionsRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
+    SetSupportedModelsRequest, SetWarmupRequest, SupportedModelsResponse, TestCredentialRequest,
+    TestCredentialResponse, TokenRefreshAdmissionRuntimeResponse, UpdateAccountRequest,
+    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupResumeRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::anthropic::{
@@ -994,12 +996,13 @@ impl AdminService {
 
     pub fn create_account(
         &self,
-        request: CreateExternalPoolRequest,
+        request: CreateAccountRequest,
     ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool =
-            block_on_admin_store(async move { store.create_external_pool_unmasked(request).await })
-                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        let pool = block_on_admin_store(async move {
+            store.create_external_pool_unmasked(request.into()).await
+        })
+        .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
         self.audit(
             "create_account",
             "account",
@@ -1039,15 +1042,16 @@ impl AdminService {
     pub fn update_account(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
+        request: UpdateAccountRequest,
     ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool =
-            block_on_admin_store(
-                async move { store.update_external_pool_unmasked(id, request).await },
-            )
-            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
-            .ok_or(AdminServiceError::NotFound { id })?;
+        let pool = block_on_admin_store(async move {
+            store
+                .update_external_pool_unmasked(id, request.into())
+                .await
+        })
+        .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
         self.audit(
             "update_account",
             "account",
@@ -1122,7 +1126,7 @@ impl AdminService {
         request: DiscoverExternalPoolSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(Some(id), request)
+            .discover_external_pool_supported_model_ids(Some(id), request.into())
             .await?;
         let store = self.postgres_store.clone();
         let supported_models_for_store = supported_models.clone();
@@ -1153,10 +1157,10 @@ impl AdminService {
     pub async fn sync_account_supported_models(
         &self,
         id: u64,
-        request: DiscoverExternalPoolSupportedModelsRequest,
+        request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(Some(id), request)
+            .discover_external_pool_supported_model_ids(Some(id), request.into())
             .await?;
         let store = self.postgres_store.clone();
         let supported_models_for_store = supported_models.clone();
@@ -1191,7 +1195,7 @@ impl AdminService {
         request: DiscoverExternalPoolSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(id, request)
+            .discover_external_pool_supported_model_ids(id, request.into())
             .await?;
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
@@ -1202,10 +1206,10 @@ impl AdminService {
     pub async fn discover_account_supported_models(
         &self,
         id: Option<u64>,
-        request: DiscoverExternalPoolSupportedModelsRequest,
+        request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(id, request)
+            .discover_external_pool_supported_model_ids(id, request.into())
             .await?;
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
@@ -1372,7 +1376,7 @@ impl AdminService {
     pub fn set_account_enabled(
         &self,
         id: u64,
-        request: SetExternalPoolEnabledRequest,
+        request: SetAccountEnabledRequest,
     ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
@@ -1618,9 +1622,10 @@ impl AdminService {
     pub fn test_account(
         &self,
         id: u64,
-        req: Option<ExternalPoolTestRequest>,
+        req: Option<AccountTestRequest>,
     ) -> Result<AccountTestResponse, AdminServiceError> {
-        self.test_external_pool(id, req).map(Into::into)
+        self.test_external_pool(id, req.map(Into::into))
+            .map(Into::into)
     }
 
     pub fn update_admin_api_key(

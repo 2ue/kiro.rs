@@ -37,6 +37,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - The Admin account feature directory has moved from `features/external-pools` to `features/accounts`; account page, form modal, test modal, components and utilities now use account component/file names, with `/external-pools` kept as a redirect.
 - Frontend account runtime config and supported-model discovery now have account-named type/default aliases, so the account page and new account API helpers no longer depend directly on `ExternalPoolsConfig` or external-pool discovery request names.
 - Legacy `ExternalPool` to `UpstreamAccount` projection now lives in `account_runtime::migration`; the old `ExternalPool::to_upstream_account` method and old-module bridge test were removed.
+- Admin `/accounts` request handlers and service methods now use account-owned Rust DTOs for create/update/enabled/supported-model discovery/test, converting to legacy storage DTOs only at the current compatibility boundary.
 
 ## In Progress
 

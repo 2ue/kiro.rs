@@ -16,9 +16,10 @@ use super::{
         AccountTestRequest, AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateAccountRequest,
         CreateProxyResourceRequest, CreateRequestApiKeyRequest,
-        DiscoverExternalPoolSupportedModelsRequest, ExportCredentialsQuery,
-        ExternalPoolTestRequest, ProxyResourceTestRequest, RefreshCredentialInfoRequest,
-        SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
+        DiscoverAccountSupportedModelsRequest, DiscoverExternalPoolSupportedModelsRequest,
+        ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
+        RefreshCredentialInfoRequest, SetAccountEnabledRequest, SetCredentialConcurrencyRequest,
+        SetCredentialOverageRequest, SetCredentialProxyRequest,
         SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
         SetCredentialRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
         SetPriorityRequest, SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
@@ -690,7 +691,7 @@ pub async fn sync_external_pool_supported_models(
 pub async fn sync_account_supported_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+    Json(payload): Json<DiscoverAccountSupportedModelsRequest>,
 ) -> impl IntoResponse {
     match state
         .service
@@ -722,7 +723,7 @@ pub async fn discover_external_pool_supported_models_from_request(
 /// 使用未保存的上游账号配置发现支持模型，不写回。
 pub async fn discover_account_supported_models_from_request(
     State(state): State<AdminState>,
-    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+    Json(payload): Json<DiscoverAccountSupportedModelsRequest>,
 ) -> impl IntoResponse {
     match state
         .service
@@ -756,7 +757,7 @@ pub async fn discover_external_pool_supported_models(
 pub async fn discover_account_supported_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+    Json(payload): Json<DiscoverAccountSupportedModelsRequest>,
 ) -> impl IntoResponse {
     match state
         .service
@@ -1238,7 +1239,7 @@ pub async fn set_external_pool_enabled(
 pub async fn set_account_enabled(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<SetExternalPoolEnabledRequest>,
+    Json(payload): Json<SetAccountEnabledRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_enabled(id, payload) {
         Ok(account) => Json(account).into_response(),

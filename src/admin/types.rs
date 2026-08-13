@@ -583,6 +583,29 @@ pub struct DiscoverExternalPoolSupportedModelsRequest {
     pub auth_type: Option<crate::external_pool::ExternalPoolAuthType>,
 }
 
+/// 使用上游账号兼容 /v1/models 接口发现支持模型。创建态需要传 baseUrl/apiKey；
+/// 编辑态可只传覆盖项，空 key 表示使用已保存 key。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverAccountSupportedModelsRequest {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub auth_type: Option<crate::external_pool::ExternalPoolAuthType>,
+}
+
+impl From<DiscoverAccountSupportedModelsRequest> for DiscoverExternalPoolSupportedModelsRequest {
+    fn from(request: DiscoverAccountSupportedModelsRequest) -> Self {
+        Self {
+            base_url: request.base_url,
+            api_key: request.api_key,
+            auth_type: request.auth_type,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupportedModelsResponse {
@@ -1145,11 +1168,201 @@ pub struct ExternalPoolTestRequest {
     pub prompt: Option<String>,
 }
 
-pub type AccountTestRequest = ExternalPoolTestRequest;
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountTestRequest {
+    pub model: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
 
-pub type CreateAccountRequest = CreateExternalPoolRequest;
+impl From<AccountTestRequest> for ExternalPoolTestRequest {
+    fn from(request: AccountTestRequest) -> Self {
+        Self {
+            model: request.model,
+            prompt: request.prompt,
+        }
+    }
+}
 
-pub type UpdateAccountRequest = UpdateExternalPoolRequest;
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateAccountRequest {
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    #[serde(default)]
+    pub auth_type: ExternalPoolAuthType,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_account_priority")]
+    pub priority: i32,
+    #[serde(default = "default_account_concurrency")]
+    pub max_concurrent_requests: u32,
+    #[serde(default)]
+    pub usage_projection_mode: ExternalPoolUsageProjectionMode,
+    #[serde(default)]
+    pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+    #[serde(default)]
+    pub request_body_mode: ExternalPoolRequestBodyMode,
+    #[serde(default)]
+    pub raw_model_mode: ExternalPoolRawModelMode,
+    #[serde(default)]
+    pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
+    #[serde(default)]
+    pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
+    #[serde(default = "default_true")]
+    pub preserve_path: bool,
+    #[serde(default)]
+    pub normalize_model_version_dots: bool,
+    #[serde(default)]
+    pub model_mapping_mode: ExternalPoolModelMappingMode,
+    #[serde(default)]
+    pub model_mapping_require_match: bool,
+    #[serde(default)]
+    pub model_mapping_rules: Vec<ModelMappingRule>,
+    #[serde(default)]
+    pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub route_mode: ExternalPoolRouteMode,
+    #[serde(default)]
+    pub route_rules: Vec<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+impl From<CreateAccountRequest> for CreateExternalPoolRequest {
+    fn from(request: CreateAccountRequest) -> Self {
+        Self {
+            name: request.name,
+            base_url: request.base_url,
+            api_key: request.api_key,
+            auth_type: request.auth_type,
+            enabled: request.enabled,
+            priority: request.priority,
+            max_concurrent_requests: request.max_concurrent_requests,
+            usage_projection_mode: request.usage_projection_mode,
+            stream_response_mode: request.stream_response_mode,
+            request_body_mode: request.request_body_mode,
+            raw_model_mode: request.raw_model_mode,
+            auto_disable_policy: request.auto_disable_policy,
+            pre_output_stream_retry_mode: request.pre_output_stream_retry_mode,
+            preserve_path: request.preserve_path,
+            normalize_model_version_dots: request.normalize_model_version_dots,
+            model_mapping_mode: request.model_mapping_mode,
+            model_mapping_require_match: request.model_mapping_require_match,
+            model_mapping_rules: request.model_mapping_rules,
+            supported_models: request.supported_models,
+            route_mode: request.route_mode,
+            route_rules: request.route_rules,
+            notes: request.notes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAccountRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub auth_type: Option<ExternalPoolAuthType>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
+    #[serde(default)]
+    pub usage_projection_mode: Option<ExternalPoolUsageProjectionMode>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_account_stream_response_mode_update"
+    )]
+    pub stream_response_mode: Option<Option<ExternalPoolStreamResponseMode>>,
+    #[serde(default)]
+    pub request_body_mode: Option<ExternalPoolRequestBodyMode>,
+    #[serde(default)]
+    pub raw_model_mode: Option<ExternalPoolRawModelMode>,
+    #[serde(default)]
+    pub auto_disable_policy: Option<ExternalPoolAutoDisablePolicy>,
+    #[serde(default)]
+    pub pre_output_stream_retry_mode: Option<ExternalPoolStreamRetryMode>,
+    #[serde(default)]
+    pub preserve_path: Option<bool>,
+    #[serde(default)]
+    pub normalize_model_version_dots: Option<bool>,
+    #[serde(default)]
+    pub model_mapping_mode: Option<ExternalPoolModelMappingMode>,
+    #[serde(default)]
+    pub model_mapping_require_match: Option<bool>,
+    #[serde(default)]
+    pub model_mapping_rules: Option<Vec<ModelMappingRule>>,
+    #[serde(default)]
+    pub supported_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub route_mode: Option<ExternalPoolRouteMode>,
+    #[serde(default)]
+    pub route_rules: Option<Vec<String>>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+impl From<UpdateAccountRequest> for UpdateExternalPoolRequest {
+    fn from(request: UpdateAccountRequest) -> Self {
+        Self {
+            name: request.name,
+            base_url: request.base_url,
+            api_key: request.api_key,
+            auth_type: request.auth_type,
+            enabled: request.enabled,
+            priority: request.priority,
+            max_concurrent_requests: request.max_concurrent_requests,
+            usage_projection_mode: request.usage_projection_mode,
+            stream_response_mode: request.stream_response_mode,
+            request_body_mode: request.request_body_mode,
+            raw_model_mode: request.raw_model_mode,
+            auto_disable_policy: request.auto_disable_policy,
+            pre_output_stream_retry_mode: request.pre_output_stream_retry_mode,
+            preserve_path: request.preserve_path,
+            normalize_model_version_dots: request.normalize_model_version_dots,
+            model_mapping_mode: request.model_mapping_mode,
+            model_mapping_require_match: request.model_mapping_require_match,
+            model_mapping_rules: request.model_mapping_rules,
+            supported_models: request.supported_models,
+            route_mode: request.route_mode,
+            route_rules: request.route_rules,
+            notes: request.notes,
+        }
+    }
+}
+
+fn deserialize_optional_account_stream_response_mode_update<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<ExternalPoolStreamResponseMode>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ExternalPoolStreamResponseMode>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountEnabledRequest {
+    pub enabled: bool,
+}
+
+impl From<SetAccountEnabledRequest> for crate::external_pool::SetExternalPoolEnabledRequest {
+    fn from(request: SetAccountEnabledRequest) -> Self {
+        Self {
+            enabled: request.enabled,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1944,6 +2157,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_account_priority() -> i32 {
+    100
+}
+
+fn default_account_concurrency() -> u32 {
+    10
+}
+
 // ============ 手动模型补充 ============
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2279,6 +2500,63 @@ mod tests {
             "https://upstream.example.test"
         );
         assert!(json["accounts"][0]["account"].get("apiKey").is_none());
+    }
+
+    #[test]
+    fn account_request_dtos_deserialize_and_convert_to_storage_compat_requests() {
+        let create: CreateAccountRequest = serde_json::from_value(serde_json::json!({
+            "name": "primary",
+            "baseUrl": "https://upstream.example.test",
+            "apiKey": "sk-test",
+            "authType": "x_api_key",
+            "enabled": true,
+            "priority": 12,
+            "maxConcurrentRequests": 4,
+            "supportedModels": ["claude-sonnet-*"],
+            "routeMode": "allow_list",
+            "routeRules": ["/cc"]
+        }))
+        .unwrap();
+        let storage_create: CreateExternalPoolRequest = create.into();
+        assert_eq!(storage_create.name, "primary");
+        assert_eq!(storage_create.base_url, "https://upstream.example.test");
+        assert_eq!(storage_create.api_key, "sk-test");
+        assert_eq!(storage_create.auth_type, ExternalPoolAuthType::XApiKey);
+        assert_eq!(storage_create.priority, 12);
+        assert_eq!(storage_create.max_concurrent_requests, 4);
+        assert_eq!(
+            storage_create.supported_models,
+            vec!["claude-sonnet-*".to_string()]
+        );
+        assert_eq!(storage_create.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(storage_create.route_rules, vec!["/cc".to_string()]);
+
+        let update: UpdateAccountRequest = serde_json::from_value(serde_json::json!({
+            "streamResponseMode": null,
+            "enabled": false
+        }))
+        .unwrap();
+        let storage_update: UpdateExternalPoolRequest = update.into();
+        assert_eq!(storage_update.stream_response_mode, Some(None));
+        assert_eq!(storage_update.enabled, Some(false));
+
+        let discover: DiscoverAccountSupportedModelsRequest =
+            serde_json::from_value(serde_json::json!({
+                "baseUrl": "https://upstream.example.test",
+                "apiKey": "",
+                "authType": "bearer"
+            }))
+            .unwrap();
+        let storage_discover: DiscoverExternalPoolSupportedModelsRequest = discover.into();
+        assert_eq!(
+            storage_discover.base_url.as_deref(),
+            Some("https://upstream.example.test")
+        );
+        assert_eq!(storage_discover.api_key.as_deref(), Some(""));
+        assert_eq!(
+            storage_discover.auth_type,
+            Some(ExternalPoolAuthType::Bearer)
+        );
     }
 
     #[test]
