@@ -58,10 +58,11 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - raw usage facts with explicit confidence;
 - a minimal dispatch candidate/selection primitive for later scheduler extraction.
 - a migration bridge from the old `ExternalPool` record into the new `UpstreamAccount` boundary, proving the former external pool can be treated as an upstream account without exposing Kiro concepts.
+- `/api/admin/accounts` aliases for the existing external-pool Admin handlers and matching frontend account API aliases, giving new callers an account-named boundary while the old UI is migrated.
 
 Last verified on 2026-08-13:
 
 - `feature/tests/run-cargo-scoped.sh account-runtime-initial-test2 -- cargo test account_runtime`
 - `feature/tests/run-cargo-scoped.sh account-runtime-initial-check -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-bridge-test2 -- cargo test external_pool_projects_to_upstream_account_boundary`
-- `feature/tests/run-cargo-scoped.sh account-bridge-check -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-bridge-check2 -- cargo check`

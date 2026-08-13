@@ -19,10 +19,11 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Implementation branch `feature/account-runtime-upstream-accounts` was created from updated `master`.
 - Initial provider-neutral `account_runtime` domain module was added and verified with scoped `cargo test account_runtime` and `cargo check`.
 - Old `ExternalPool` records can now project into the new `UpstreamAccount` boundary for migration staging, with a focused bridge test.
+- Account-named Admin/API aliases were added for the existing upstream account management surface while the old UI and DTO names are migrated.
 
 ## In Progress
 
-- Convert external-pool terminology and configuration/API/UI boundaries toward account terminology.
+- Convert external-pool UI, DTO and configuration names toward account terminology.
 
 ## Next
 

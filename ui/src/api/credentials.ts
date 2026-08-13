@@ -60,6 +60,14 @@ import type {
   UpdateExternalPoolRequest,
 } from '@/types/api'
 
+export type Account = ExternalPool
+export type AccountsListResponse = ExternalPoolsListResponse
+export type AccountsStatusResponse = ExternalPoolsStatusResponse
+export type CreateAccountRequest = CreateExternalPoolRequest
+export type UpdateAccountRequest = UpdateExternalPoolRequest
+export type AccountTestRequest = ExternalPoolTestRequest
+export type AccountTestResponse = ExternalPoolTestResponse
+
 const CREDENTIALS_LIST_PAGE_LIMIT = 500
 
 function credentialListItemToStatus(item: CredentialListItem): CredentialStatusItem {
@@ -373,8 +381,18 @@ export async function getExternalPools(): Promise<ExternalPoolsListResponse> {
   return data
 }
 
+export async function getAccounts(): Promise<AccountsListResponse> {
+  const { data } = await api.get<AccountsListResponse>('/accounts')
+  return data
+}
+
 export async function getExternalPoolsStatus(): Promise<ExternalPoolsStatusResponse> {
   const { data } = await api.get<ExternalPoolsStatusResponse>('/external-pools/status')
+  return data
+}
+
+export async function getAccountsStatus(): Promise<AccountsStatusResponse> {
+  const { data } = await api.get<AccountsStatusResponse>('/accounts/status')
   return data
 }
 
@@ -383,8 +401,18 @@ export async function createExternalPool(req: CreateExternalPoolRequest): Promis
   return data
 }
 
+export async function createAccount(req: CreateAccountRequest): Promise<Account> {
+  const { data } = await api.post<Account>('/accounts', req)
+  return data
+}
+
 export async function updateExternalPool(id: number, req: UpdateExternalPoolRequest): Promise<ExternalPool> {
   const { data } = await api.put<ExternalPool>(`/external-pools/${id}`, req)
+  return data
+}
+
+export async function updateAccount(id: number, req: UpdateAccountRequest): Promise<Account> {
+  const { data } = await api.put<Account>(`/accounts/${id}`, req)
   return data
 }
 
@@ -393,8 +421,18 @@ export async function deleteExternalPool(id: number): Promise<SuccessResponse> {
   return data
 }
 
+export async function deleteAccount(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/accounts/${id}`)
+  return data
+}
+
 export async function setExternalPoolEnabled(id: number, enabled: boolean): Promise<ExternalPool> {
   const { data } = await api.post<ExternalPool>(`/external-pools/${id}/enabled`, { enabled })
+  return data
+}
+
+export async function setAccountEnabled(id: number, enabled: boolean): Promise<Account> {
+  const { data } = await api.post<Account>(`/accounts/${id}/enabled`, { enabled })
   return data
 }
 
@@ -403,13 +441,28 @@ export async function clearExternalPoolAutoDisabled(id: number): Promise<Externa
   return data
 }
 
+export async function clearAccountAutoDisabled(id: number): Promise<Account> {
+  const { data } = await api.post<Account>(`/accounts/${id}/auto-disabled/clear`)
+  return data
+}
+
 export async function clearExternalPoolCooldown(id: number): Promise<ExternalPool> {
   const { data } = await api.post<ExternalPool>(`/external-pools/${id}/cooldown/clear`)
   return data
 }
 
+export async function clearAccountCooldown(id: number): Promise<Account> {
+  const { data } = await api.post<Account>(`/accounts/${id}/cooldown/clear`)
+  return data
+}
+
 export async function setExternalPoolSupportedModels(id: number, req: SetSupportedModelsRequest): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models`, req)
+  return data
+}
+
+export async function setAccountSupportedModels(id: number, req: SetSupportedModelsRequest): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models`, req)
   return data
 }
 
@@ -421,10 +474,25 @@ export async function syncExternalPoolSupportedModels(
   return data
 }
 
+export async function syncAccountSupportedModels(
+  id: number,
+  req: DiscoverExternalPoolSupportedModelsRequest = {}
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models/sync`, req)
+  return data
+}
+
 export async function discoverExternalPoolSupportedModels(
   req: DiscoverExternalPoolSupportedModelsRequest
 ): Promise<SupportedModelsResponse> {
   const { data } = await api.post<SupportedModelsResponse>('/external-pools/supported-models/discover', req)
+  return data
+}
+
+export async function discoverAccountSupportedModels(
+  req: DiscoverExternalPoolSupportedModelsRequest
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>('/accounts/supported-models/discover', req)
   return data
 }
 
@@ -436,8 +504,21 @@ export async function discoverStoredExternalPoolSupportedModels(
   return data
 }
 
+export async function discoverStoredAccountSupportedModels(
+  id: number,
+  req: DiscoverExternalPoolSupportedModelsRequest = {}
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/accounts/${id}/supported-models/discover`, req)
+  return data
+}
+
 export async function testExternalPool(id: number, req?: ExternalPoolTestRequest): Promise<ExternalPoolTestResponse> {
   const { data } = await api.post<ExternalPoolTestResponse>(`/external-pools/${id}/test`, req)
+  return data
+}
+
+export async function testAccount(id: number, req?: AccountTestRequest): Promise<AccountTestResponse> {
+  const { data } = await api.post<AccountTestResponse>(`/accounts/${id}/test`, req)
   return data
 }
 

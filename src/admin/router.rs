@@ -150,9 +150,15 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/external-pools",
             get(get_external_pools).post(create_external_pool),
         )
+        .route("/accounts", get(get_external_pools).post(create_external_pool))
         .route("/external-pools/status", get(get_external_pool_status))
+        .route("/accounts/status", get(get_external_pool_status))
         .route(
             "/external-pools/supported-models/discover",
+            post(discover_external_pool_supported_models_from_request),
+        )
+        .route(
+            "/accounts/supported-models/discover",
             post(discover_external_pool_supported_models_from_request),
         )
         .route(
@@ -160,11 +166,20 @@ pub fn create_admin_router(state: AdminState) -> Router {
             put(update_external_pool).delete(delete_external_pool),
         )
         .route(
+            "/accounts/{id}",
+            put(update_external_pool).delete(delete_external_pool),
+        )
+        .route(
             "/external-pools/{id}/enabled",
             post(set_external_pool_enabled),
         )
+        .route("/accounts/{id}/enabled", post(set_external_pool_enabled))
         .route(
             "/external-pools/{id}/supported-models",
+            post(set_external_pool_supported_models),
+        )
+        .route(
+            "/accounts/{id}/supported-models",
             post(set_external_pool_supported_models),
         )
         .route(
@@ -172,7 +187,15 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(sync_external_pool_supported_models),
         )
         .route(
+            "/accounts/{id}/supported-models/sync",
+            post(sync_external_pool_supported_models),
+        )
+        .route(
             "/external-pools/{id}/supported-models/discover",
+            post(discover_external_pool_supported_models),
+        )
+        .route(
+            "/accounts/{id}/supported-models/discover",
             post(discover_external_pool_supported_models),
         )
         .route(
@@ -180,10 +203,19 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(clear_external_pool_auto_disabled),
         )
         .route(
+            "/accounts/{id}/auto-disabled/clear",
+            post(clear_external_pool_auto_disabled),
+        )
+        .route(
             "/external-pools/{id}/cooldown/clear",
             post(clear_external_pool_cooldown),
         )
+        .route(
+            "/accounts/{id}/cooldown/clear",
+            post(clear_external_pool_cooldown),
+        )
         .route("/external-pools/{id}/test", post(test_external_pool))
+        .route("/accounts/{id}/test", post(test_external_pool))
         .route("/usage-records", get(get_usage_records))
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))
