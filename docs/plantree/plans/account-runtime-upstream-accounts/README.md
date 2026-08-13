@@ -2,7 +2,7 @@
 
 Role: Current Rust refactor plan for removing Kiro concepts and making upstream accounts the scheduling unit
 
-Status: Planning; implementation branch not yet created
+Status: In Progress; implementation branch created
 
 Authority: Defines the target boundary for the current-repository refactor requested after `feature/usage-correction-cost-floor`
 
@@ -49,6 +49,16 @@ Implementation must not start on the current feature branch.
 
 ## Current State
 
-The plan is documented. No implementation work for this refactor has started.
+The implementation branch `feature/account-runtime-upstream-accounts` has been created from the updated `master`.
 
-The current active branch at plan creation was `feature/usage-correction-cost-floor`, with uncommitted cost-floor/default-cooldown changes and this planning request. Those changes must be committed and merged before creating the implementation branch.
+Initial neutral `account_runtime` domain types have landed as the first code boundary:
+
+- upstream account identity, auth policy, proxy and limits;
+- account attempt trace, delivery evidence and normalized upstream error classes;
+- raw usage facts with explicit confidence;
+- a minimal dispatch candidate/selection primitive for later scheduler extraction.
+
+Last verified on 2026-08-13:
+
+- `feature/tests/run-cargo-scoped.sh account-runtime-initial-test2 -- cargo test account_runtime`
+- `feature/tests/run-cargo-scoped.sh account-runtime-initial-check -- cargo check`

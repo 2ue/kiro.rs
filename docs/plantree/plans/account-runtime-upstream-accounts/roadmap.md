@@ -15,15 +15,16 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - User intent clarified: the target system must have no Kiro business concept, not even as a first target provider.
 - Mainline workflow decided: commit current work, merge to `master`, then branch for implementation.
 - Target plan created under `docs/plantree/plans/account-runtime-upstream-accounts/`.
+- Current `feature/usage-correction-cost-floor` work was committed and merged into `master`.
+- Implementation branch `feature/account-runtime-upstream-accounts` was created from updated `master`.
+- Initial provider-neutral `account_runtime` domain module was added and verified with scoped `cargo test account_runtime` and `cargo check`.
 
 ## In Progress
 
-- Commit current `feature/usage-correction-cost-floor` work and merge it into `master`.
+- Convert external-pool terminology and configuration boundaries toward account terminology.
 
 ## Next
 
-- Create `feature/account-runtime-upstream-accounts` from updated `master`.
-- Start by introducing provider-neutral account runtime types and replacing external-pool terminology with account terminology at the domain boundary.
 - Split scheduler primitives from Kiro credential types before deleting Kiro modules.
 - Convert body and protocol paths to canonical/upstream-account logic with no Kiro envelope or Kiro event dependency.
 
