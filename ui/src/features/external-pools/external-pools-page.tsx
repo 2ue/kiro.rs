@@ -12,16 +12,16 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
-  clearExternalPoolAutoDisabled,
-  clearExternalPoolCooldown,
-  createExternalPool,
-  deleteExternalPool,
-  discoverExternalPoolSupportedModels,
-  discoverStoredExternalPoolSupportedModels,
-  getExternalPools,
-  getExternalPoolsStatus,
-  setExternalPoolEnabled,
-  updateExternalPool,
+  clearAccountAutoDisabled,
+  clearAccountCooldown,
+  createAccount,
+  deleteAccount,
+  discoverAccountSupportedModels,
+  discoverStoredAccountSupportedModels,
+  getAccounts,
+  getAccountsStatus,
+  setAccountEnabled,
+  updateAccount,
   updateRuntimeConfig,
 } from '@/api/credentials'
 import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
@@ -104,8 +104,8 @@ export function ExternalPoolsPage() {
   const queryClient = useQueryClient()
   const confirmDialog = useConfirm()
   const runtimeConfig = useRuntimeConfig()
-  const pools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools })
-  const status = useQuery({ queryKey: ['external-pools-status'], queryFn: getExternalPoolsStatus, refetchInterval: 5000 })
+  const pools = useQuery({ queryKey: ['accounts'], queryFn: getAccounts })
+  const status = useQuery({ queryKey: ['accounts-status'], queryFn: getAccountsStatus, refetchInterval: 5000 })
 
   const [savingConfig, setSavingConfig] = useState(false)
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
@@ -136,8 +136,8 @@ export function ExternalPoolsPage() {
   }, [status.data])
 
   const invalidate = () => {
-    queryClient.invalidateQueries({ queryKey: ['external-pools'] })
-    queryClient.invalidateQueries({ queryKey: ['external-pools-status'] })
+    queryClient.invalidateQueries({ queryKey: ['accounts'] })
+    queryClient.invalidateQueries({ queryKey: ['accounts-status'] })
     queryClient.invalidateQueries({ queryKey: ['runtime-config'] })
     queryClient.invalidateQueries({ queryKey: ['usage-records'] })
   }
@@ -207,7 +207,7 @@ export function ExternalPoolsPage() {
     setSavingPool(true)
     try {
       const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = createForm
-      await createExternalPool({
+      await createAccount({
         ...form,
         name: createForm.name.trim(),
         baseUrl: createForm.baseUrl.trim(),
@@ -253,7 +253,7 @@ export function ExternalPoolsPage() {
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
       }
-      await updateExternalPool(editingPool.id, payload)
+      await updateAccount(editingPool.id, payload)
       toast.success('外部账号已更新')
       setEditingPool(null)
       setEditForm(defaultPoolForm())
@@ -571,13 +571,13 @@ export function ExternalPoolsPage() {
                     <div className="flex flex-wrap gap-1.5 lg:shrink-0">
                       <Button variant="ghost" size="xs" onClick={() => startEdit(pool)}><Pencil className="h-3.5 w-3.5" />编辑</Button>
                       <Button variant="ghost" size="xs" onClick={() => setTestingPool(pool)}><FlaskConical className="h-3.5 w-3.5" />测试</Button>
-                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => setExternalPoolEnabled(pool.id, !pool.enabled), pool.enabled ? '已停用' : '已启用')}>
+                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => setAccountEnabled(pool.id, !pool.enabled), pool.enabled ? '已停用' : '已启用')}>
                         <Power className="h-3.5 w-3.5" />{pool.enabled ? '停用' : '启用'}
                       </Button>
-                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearExternalPoolAutoDisabled(pool.id), '自动禁用状态已清除')}>
+                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearAccountAutoDisabled(pool.id), '自动禁用状态已清除')}>
                         <RotateCcw className="h-3.5 w-3.5" />清除禁用
                       </Button>
-                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearExternalPoolCooldown(pool.id), '冷却状态已清除')}>
+                      <Button variant="ghost" size="xs" onClick={() => mutatePool(() => clearAccountCooldown(pool.id), '冷却状态已清除')}>
                         <RotateCcw className="h-3.5 w-3.5" />清除冷却
                       </Button>
                       <Button variant="ghost" size="xs" onClick={() => status.refetch()}><RefreshCw className="h-3.5 w-3.5" />刷新</Button>
@@ -586,7 +586,7 @@ export function ExternalPoolsPage() {
                         className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                         onClick={async () => {
                           const confirmed = await confirmDialog({ title: '删除外部账号', message: `删除外部账号「${pool.name}」？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
-                          if (confirmed) mutatePool(() => deleteExternalPool(pool.id), '外部账号已删除')
+                          if (confirmed) mutatePool(() => deleteAccount(pool.id), '外部账号已删除')
                         }}
                       >
                         <Trash2 className="h-3.5 w-3.5" />删除
@@ -610,7 +610,7 @@ export function ExternalPoolsPage() {
           if (!createForm.baseUrl.trim() || !createForm.apiKey.trim()) {
             throw new Error('请先填写外部账号 Base URL 和 Key')
           }
-          const response = await discoverExternalPoolSupportedModels({
+          const response = await discoverAccountSupportedModels({
             baseUrl: createForm.baseUrl.trim(),
             apiKey: createForm.apiKey.trim(),
             authType: createForm.authType,
@@ -629,7 +629,7 @@ export function ExternalPoolsPage() {
         onDraftChange={setEditForm}
         onDiscoverSupportedModels={async () => {
           if (!editingPool) return []
-          const response = await discoverStoredExternalPoolSupportedModels(editingPool.id, {
+          const response = await discoverStoredAccountSupportedModels(editingPool.id, {
             baseUrl: editForm.baseUrl.trim() || null,
             apiKey: editForm.apiKey.trim() || null,
             authType: editForm.authType,

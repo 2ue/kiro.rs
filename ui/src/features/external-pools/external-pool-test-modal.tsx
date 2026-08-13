@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckCircle2, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
-import { testExternalPool } from '@/api/credentials'
+import { testAccount } from '@/api/credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import { buildTestModelOptions, defaultTestModelForOptions, DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT } from '@/lib/test-models'
@@ -72,7 +72,7 @@ export function ExternalPoolTestModal({
     if (!trimmedModel) { toast.error('请选择或输入测试模型'); return }
     setRunning(true); setResult(null); setError('')
     try {
-      const response = await testExternalPool(pool.id, { model: trimmedModel, prompt: trimmedPrompt })
+      const response = await testAccount(pool.id, { model: trimmedModel, prompt: trimmedPrompt })
       setResult(response)
       if (response.ok) toast.success(response.message || '外部账号模型调用测试通过')
       else toast.error(response.message || '外部账号模型调用测试失败')
