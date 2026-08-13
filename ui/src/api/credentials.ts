@@ -53,6 +53,8 @@ import type {
   LoadBalancingMode,
   CreateExternalPoolRequest,
   ExternalPool,
+  AccountsListResponse,
+  AccountsStatusResponse,
   ExternalPoolsListResponse,
   ExternalPoolsStatusResponse,
   ExternalPoolTestRequest,
@@ -61,8 +63,6 @@ import type {
 } from '@/types/api'
 
 export type Account = ExternalPool
-export type AccountsListResponse = ExternalPoolsListResponse
-export type AccountsStatusResponse = ExternalPoolsStatusResponse
 export type CreateAccountRequest = CreateExternalPoolRequest
 export type UpdateAccountRequest = UpdateExternalPoolRequest
 export type AccountTestRequest = ExternalPoolTestRequest
@@ -382,8 +382,8 @@ export async function getExternalPools(): Promise<ExternalPoolsListResponse> {
 }
 
 export async function getAccounts(): Promise<AccountsListResponse> {
-  const { data } = await api.get<AccountsListResponse>('/accounts')
-  return data
+  const { data } = await api.get<AccountsListResponse & Partial<ExternalPoolsListResponse>>('/accounts')
+  return { accounts: data.accounts ?? data.pools ?? [] }
 }
 
 export async function getExternalPoolsStatus(): Promise<ExternalPoolsStatusResponse> {
@@ -392,8 +392,21 @@ export async function getExternalPoolsStatus(): Promise<ExternalPoolsStatusRespo
 }
 
 export async function getAccountsStatus(): Promise<AccountsStatusResponse> {
-  const { data } = await api.get<AccountsStatusResponse>('/accounts/status')
-  return data
+  const { data } = await api.get<
+    AccountsStatusResponse & Partial<ExternalPoolsStatusResponse>
+  >('/accounts/status')
+  return {
+    accounts: data.accounts ?? data.pools?.map((item) => ({
+      account: item.pool,
+      inFlight: item.inFlight,
+      cooldownRemainingSecs: item.cooldownRemainingSecs,
+      cooldownReason: item.cooldownReason,
+      transientFailureStreak: item.transientFailureStreak,
+      transientFailureTtlSecs: item.transientFailureTtlSecs,
+      dispatchable: item.dispatchable,
+      skippedReason: item.skippedReason,
+    })) ?? [],
+  }
 }
 
 export async function createExternalPool(req: CreateExternalPoolRequest): Promise<ExternalPool> {

@@ -15,16 +15,16 @@ use sha2::{Digest, Sha256};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AccessKeysResponse, AddCredentialRequest, AddCredentialResponse,
-    AuxiliaryUpstreamRuntimeResponse, BalanceResponse, BatchCredentialImportDefaults,
-    BatchCredentialImportDuplicateMode, BatchCredentialImportItem, BatchCredentialImportRequest,
-    BatchCredentialImportResponse, BatchUpdateCredentialItem, BatchUpdateCredentialsRequest,
-    BatchUpdateCredentialsResponse, BulkCredentialActionError, BulkCredentialActionResponse,
-    ClearInFlightRequest, CreateProxyResourceRequest, CreateRequestApiKeyRequest,
-    CredentialAccountInfo, CredentialAccountInfoItem, CredentialAccountInfoListResponse,
-    CredentialCooldown, CredentialCreditSummaryResponse, CredentialInfoRefreshItem,
-    CredentialInfoRefreshResponse, CredentialListItem, CredentialListResponse,
-    CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
+    AccessKeysResponse, AccountsListResponse, AccountsStatusResponse, AddCredentialRequest,
+    AddCredentialResponse, AuxiliaryUpstreamRuntimeResponse, BalanceResponse,
+    BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
+    BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
+    BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, BulkCredentialActionError,
+    BulkCredentialActionResponse, ClearInFlightRequest, CreateProxyResourceRequest,
+    CreateRequestApiKeyRequest, CredentialAccountInfo, CredentialAccountInfoItem,
+    CredentialAccountInfoListResponse, CredentialCooldown, CredentialCreditSummaryResponse,
+    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialListItem,
+    CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
     CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
     CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
     CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
@@ -961,6 +961,12 @@ impl AdminService {
         Ok(pools)
     }
 
+    pub fn list_accounts(&self) -> Result<AccountsListResponse, AdminServiceError> {
+        Ok(AccountsListResponse {
+            accounts: self.list_external_pools()?,
+        })
+    }
+
     pub fn create_external_pool(
         &self,
         request: CreateExternalPoolRequest,
@@ -978,6 +984,26 @@ impl AdminService {
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
         self.invalidate_external_pool_admin_cache_with_pool("create", &pool);
+        Ok(pool.masked_for_admin_response())
+    }
+
+    pub fn create_account(
+        &self,
+        request: CreateExternalPoolRequest,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool =
+            block_on_admin_store(async move { store.create_external_pool_unmasked(request).await })
+                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        self.audit(
+            "create_account",
+            "account",
+            Some(pool.id.to_string()),
+            true,
+            None,
+            json!({ "name": pool.name, "baseUrl": pool.base_url }),
+        );
+        self.invalidate_external_pool_admin_cache_with_pool("create_account", &pool);
         Ok(pool.masked_for_admin_response())
     }
 
@@ -1005,6 +1031,30 @@ impl AdminService {
         Ok(pool.masked_for_admin_response())
     }
 
+    pub fn update_account(
+        &self,
+        id: u64,
+        request: UpdateExternalPoolRequest,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool =
+            block_on_admin_store(
+                async move { store.update_external_pool_unmasked(id, request).await },
+            )
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "update_account",
+            "account",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "name": pool.name, "baseUrl": pool.base_url }),
+        );
+        self.invalidate_external_pool_admin_cache_with_pool("update_account", &pool);
+        Ok(pool.masked_for_admin_response())
+    }
+
     pub fn set_external_pool_supported_models(
         &self,
         id: u64,
@@ -1027,6 +1077,34 @@ impl AdminService {
             json!({ "supportedModels": pool.supported_models.clone() }),
         );
         self.invalidate_external_pool_admin_cache_with_pool("supported_models", &pool);
+        Ok(SupportedModelsResponse {
+            count: pool.supported_models.len(),
+            supported_models: pool.supported_models,
+        })
+    }
+
+    pub fn set_account_supported_models(
+        &self,
+        id: u64,
+        request: SetSupportedModelsRequest,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move {
+            store
+                .set_external_pool_supported_models_unmasked(id, request.supported_models)
+                .await
+        })
+        .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "set_account_supported_models",
+            "account",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "supportedModels": pool.supported_models.clone() }),
+        );
+        self.invalidate_external_pool_admin_cache_with_pool("account_supported_models", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
@@ -1067,8 +1145,56 @@ impl AdminService {
         })
     }
 
+    pub async fn sync_account_supported_models(
+        &self,
+        id: u64,
+        request: DiscoverExternalPoolSupportedModelsRequest,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let supported_models = self
+            .discover_external_pool_supported_model_ids(Some(id), request)
+            .await?;
+        let store = self.postgres_store.clone();
+        let supported_models_for_store = supported_models.clone();
+        let pool = block_on_admin_store(async move {
+            store
+                .set_external_pool_supported_models_unmasked(id, supported_models_for_store)
+                .await
+        })
+        .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "sync_account_supported_models",
+            "account",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({
+                "supportedModels": pool.supported_models.clone(),
+            }),
+        );
+        self.invalidate_external_pool_admin_cache_with_pool("account_supported_models_sync", &pool);
+        Ok(SupportedModelsResponse {
+            count: pool.supported_models.len(),
+            supported_models: pool.supported_models,
+        })
+    }
+
     /// 使用外部池自身的兼容 /v1/models 接口发现模型，只返回可编辑建议，不写回。
     pub async fn discover_external_pool_supported_models(
+        &self,
+        id: Option<u64>,
+        request: DiscoverExternalPoolSupportedModelsRequest,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let supported_models = self
+            .discover_external_pool_supported_model_ids(id, request)
+            .await?;
+        Ok(SupportedModelsResponse {
+            count: supported_models.len(),
+            supported_models,
+        })
+    }
+
+    pub async fn discover_account_supported_models(
         &self,
         id: Option<u64>,
         request: DiscoverExternalPoolSupportedModelsRequest,
@@ -1193,6 +1319,26 @@ impl AdminService {
         Ok(())
     }
 
+    pub fn delete_account(&self, id: u64) -> Result<(), AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let deleted =
+            block_on_admin_store(async move { store.soft_delete_external_pool(id).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        if !deleted {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        self.audit(
+            "delete_account",
+            "account",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
+        self.invalidate_external_pool_admin_cache_for_delete("delete_account", id);
+        Ok(())
+    }
+
     pub fn set_external_pool_enabled(
         &self,
         id: u64,
@@ -1218,6 +1364,31 @@ impl AdminService {
         Ok(pool.masked_for_admin_response())
     }
 
+    pub fn set_account_enabled(
+        &self,
+        id: u64,
+        request: SetExternalPoolEnabledRequest,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move {
+            store
+                .set_external_pool_enabled_unmasked(id, request.enabled)
+                .await
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "set_account_enabled",
+            "account",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "enabled": request.enabled }),
+        );
+        self.invalidate_external_pool_admin_cache_with_pool("account_enabled", &pool);
+        Ok(pool.masked_for_admin_response())
+    }
+
     pub fn clear_external_pool_auto_disabled(
         &self,
         id: u64,
@@ -1240,6 +1411,25 @@ impl AdminService {
         Ok(pool.masked_for_admin_response())
     }
 
+    pub fn clear_account_auto_disabled(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move {
+            store.clear_external_pool_auto_disabled_unmasked(id).await
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "clear_account_auto_disabled",
+            "account",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
+        self.invalidate_external_pool_admin_cache_with_pool("clear_account_auto_disabled", &pool);
+        Ok(pool.masked_for_admin_response())
+    }
+
     pub fn clear_external_pool_cooldown(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
@@ -1251,6 +1441,26 @@ impl AdminService {
         self.audit(
             "clear_external_pool_cooldown",
             "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "deletedKeys": deleted }),
+        );
+        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        Ok(pool.masked_for_admin_response())
+    }
+
+    pub fn clear_account_cooldown(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+        let manager = self.external_pool_manager.clone();
+        let deleted = block_on_admin_store(async move { manager.clear_pool_cooldowns(id).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.audit(
+            "clear_account_cooldown",
+            "account",
             Some(id.to_string()),
             true,
             None,
@@ -1279,6 +1489,17 @@ impl AdminService {
             ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
         );
         Ok(response)
+    }
+
+    pub fn get_account_status(&self) -> Result<AccountsStatusResponse, AdminServiceError> {
+        Ok(AccountsStatusResponse {
+            accounts: self
+                .get_external_pool_status()?
+                .pools
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        })
     }
 
     pub fn test_external_pool(
@@ -1387,6 +1608,14 @@ impl AdminService {
             })
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    pub fn test_account(
+        &self,
+        id: u64,
+        req: Option<ExternalPoolTestRequest>,
+    ) -> Result<ExternalPoolTestResponse, AdminServiceError> {
+        self.test_external_pool(id, req)
     }
 
     pub fn update_admin_api_key(

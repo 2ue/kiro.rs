@@ -3,6 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
+use crate::external_pool::{ExternalPool, ExternalPoolStatus};
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
     ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
@@ -1755,6 +1756,47 @@ pub struct UpdateRuntimeConfigRequest {
     pub thinking_trigger_mode: Option<ThinkingTriggerMode>,
     #[serde(default)]
     pub expose_proxy_warnings: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsListResponse {
+    pub accounts: Vec<ExternalPool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStatus {
+    pub account: ExternalPool,
+    pub in_flight: u32,
+    pub cooldown_remaining_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
+    pub transient_failure_streak: u32,
+    pub transient_failure_ttl_secs: u64,
+    pub dispatchable: bool,
+    pub skipped_reason: Option<String>,
+}
+
+impl From<ExternalPoolStatus> for AccountStatus {
+    fn from(status: ExternalPoolStatus) -> Self {
+        Self {
+            account: status.pool,
+            in_flight: status.in_flight,
+            cooldown_remaining_secs: status.cooldown_remaining_secs,
+            cooldown_reason: status.cooldown_reason,
+            transient_failure_streak: status.transient_failure_streak,
+            transient_failure_ttl_secs: status.transient_failure_ttl_secs,
+            dispatchable: status.dispatchable,
+            skipped_reason: status.skipped_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsStatusResponse {
+    pub accounts: Vec<AccountStatus>,
 }
 
 impl UpdateRuntimeConfigRequest {

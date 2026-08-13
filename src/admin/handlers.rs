@@ -647,6 +647,19 @@ pub async fn set_external_pool_supported_models(
     }
 }
 
+/// POST /api/admin/accounts/:id/supported-models
+/// 设置上游账号支持模型列表
+pub async fn set_account_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_account_supported_models(id, payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/external-pools/:id/supported-models/sync
 /// 使用外部池自身的兼容 /v1/models 接口同步并写回支持模型列表
 pub async fn sync_external_pool_supported_models(
@@ -657,6 +670,23 @@ pub async fn sync_external_pool_supported_models(
     match state
         .service
         .sync_external_pool_supported_models(id, payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/accounts/:id/supported-models/sync
+/// 使用上游账号自身的兼容 /v1/models 接口同步并写回支持模型列表
+pub async fn sync_account_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .sync_account_supported_models(id, payload)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -680,6 +710,22 @@ pub async fn discover_external_pool_supported_models_from_request(
     }
 }
 
+/// POST /api/admin/accounts/supported-models/discover
+/// 使用未保存的上游账号配置发现支持模型，不写回。
+pub async fn discover_account_supported_models_from_request(
+    State(state): State<AdminState>,
+    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .discover_account_supported_models(None, payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/external-pools/:id/supported-models/discover
 /// 使用已保存外部池配置发现支持模型，不写回。
 pub async fn discover_external_pool_supported_models(
@@ -690,6 +736,23 @@ pub async fn discover_external_pool_supported_models(
     match state
         .service
         .discover_external_pool_supported_models(Some(id), payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/accounts/:id/supported-models/discover
+/// 使用已保存上游账号配置发现支持模型，不写回。
+pub async fn discover_account_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<DiscoverExternalPoolSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .discover_account_supported_models(Some(id), payload)
         .await
     {
         Ok(response) => Json(response).into_response(),
@@ -1084,12 +1147,29 @@ pub async fn get_external_pools(State(state): State<AdminState>) -> impl IntoRes
     }
 }
 
+pub async fn get_accounts(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.list_accounts() {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
 pub async fn create_external_pool(
     State(state): State<AdminState>,
     Json(payload): Json<CreateExternalPoolRequest>,
 ) -> impl IntoResponse {
     match state.service.create_external_pool(payload) {
         Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn create_account(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateExternalPoolRequest>,
+) -> impl IntoResponse {
+    match state.service.create_account(payload) {
+        Ok(account) => Json(account).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
@@ -1105,12 +1185,33 @@ pub async fn update_external_pool(
     }
 }
 
+pub async fn update_account(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateExternalPoolRequest>,
+) -> impl IntoResponse {
+    match state.service.update_account(id, payload) {
+        Ok(account) => Json(account).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
 pub async fn delete_external_pool(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.delete_external_pool(id) {
         Ok(()) => Json(SuccessResponse::new("外部池已删除")).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn delete_account(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_account(id) {
+        Ok(()) => Json(SuccessResponse::new("账号已删除")).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
@@ -1126,12 +1227,33 @@ pub async fn set_external_pool_enabled(
     }
 }
 
+pub async fn set_account_enabled(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetExternalPoolEnabledRequest>,
+) -> impl IntoResponse {
+    match state.service.set_account_enabled(id, payload) {
+        Ok(account) => Json(account).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
 pub async fn clear_external_pool_auto_disabled(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.clear_external_pool_auto_disabled(id) {
         Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn clear_account_auto_disabled(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.clear_account_auto_disabled(id) {
+        Ok(account) => Json(account).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
 }
@@ -1146,8 +1268,25 @@ pub async fn clear_external_pool_cooldown(
     }
 }
 
+pub async fn clear_account_cooldown(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.clear_account_cooldown(id) {
+        Ok(account) => Json(account).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
 pub async fn get_external_pool_status(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.get_external_pool_status() {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn get_account_status(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_account_status() {
         Ok(status) => Json(status).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
@@ -1161,6 +1300,20 @@ pub async fn test_external_pool(
     match state
         .service
         .test_external_pool(id, payload.map(|Json(payload)| payload))
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn test_account(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    payload: Option<Json<ExternalPoolTestRequest>>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .test_account(id, payload.map(|Json(payload)| payload))
     {
         Ok(result) => Json(result).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),

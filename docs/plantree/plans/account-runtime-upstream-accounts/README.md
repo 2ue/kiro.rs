@@ -65,6 +65,8 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - account selection now honors the configured request body mode during eligibility and immediate-availability checks, so raw-preparse routing does not steal normalized-only accounts and normalized routing does not select raw-only accounts.
 - startup can now run without installing a legacy `KiroProvider` when the upstream account runtime is enabled, so missing legacy credential files do not block account-only deployments.
 - Admin service dependencies now treat the legacy provider as optional; old credential/model-test endpoints return explicit compatibility errors when the provider is absent while account management remains available.
+- `/api/admin/accounts` now has account-named handlers, service methods and response DTOs. List and status responses expose `accounts`, while legacy `/api/admin/external-pools` remains as a compatibility surface with `pools`.
+- the upstream account page now consumes the account-shaped `accounts` responses, with frontend compatibility normalization retained for older server responses during migration.
 
 Last verified on 2026-08-14:
 
@@ -80,3 +82,6 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-startup-account-only-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-startup-fmt3 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-startup-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-admin-boundary-fmt2 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-admin-boundary-check1 -- cargo check`
+- `pnpm --dir ui check`

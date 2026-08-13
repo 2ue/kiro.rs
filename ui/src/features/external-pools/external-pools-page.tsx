@@ -130,8 +130,8 @@ export function ExternalPoolsPage() {
   }, [runtimeConfig.data?.externalPools])
 
   const statusMap = useMemo(() => {
-    const map = new Map<number, NonNullable<typeof status.data>['pools'][number]>()
-    status.data?.pools.forEach((item) => map.set(item.pool.id, item))
+    const map = new Map<number, NonNullable<typeof status.data>['accounts'][number]>()
+    status.data?.accounts.forEach((item) => map.set(item.account.id, item))
     return map
   }, [status.data])
 
@@ -291,12 +291,12 @@ export function ExternalPoolsPage() {
     || configDraft.externalPoolUsageProjectionCostFloorEnabled
   const usageDebugActive = externalEnabled && configDraft.externalPoolUsageDebugEnabled
 
-  const poolStatuses = status.data?.pools ?? []
-  const totalPools = pools.data?.pools.length ?? poolStatuses.length
+  const poolStatuses = status.data?.accounts ?? []
+  const totalPools = pools.data?.accounts.length ?? poolStatuses.length
   const dispatchablePools = poolStatuses.filter((item) => item.dispatchable).length
   const totalInFlight = poolStatuses.reduce((sum, item) => sum + item.inFlight, 0)
-  const totalCapacity = poolStatuses.reduce((sum, item) => sum + item.pool.maxConcurrentRequests, 0)
-  const currentPathPoolCount = pools.data?.pools.filter((pool) => pool.usageProjectionMode === 'current_path_policy').length ?? 0
+  const totalCapacity = poolStatuses.reduce((sum, item) => sum + item.account.maxConcurrentRequests, 0)
+  const currentPathPoolCount = pools.data?.accounts.filter((pool) => pool.usageProjectionMode === 'current_path_policy').length ?? 0
   const concurrencyPct = totalCapacity > 0 ? Math.round((totalInFlight / totalCapacity) * 100) : 0
 
   const setCacheUpliftEnabled = (enabled: boolean) =>
@@ -535,11 +535,11 @@ export function ExternalPoolsPage() {
       >
         {pools.isLoading ? (
           <LoadingState />
-        ) : !pools.data?.pools.length ? (
+        ) : !pools.data?.accounts.length ? (
           <EmptyState title="暂无外部账号" description="点击右上角按钮添加第一个外部账号。" />
         ) : (
           <div className="space-y-3">
-            {pools.data.pools.map((pool) => {
+            {pools.data.accounts.map((pool) => {
               const runtime = statusMap.get(pool.id)
               const inFlight = runtime?.inFlight ?? 0
               const capacity = pool.maxConcurrentRequests

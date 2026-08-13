@@ -1636,6 +1636,10 @@ export interface ExternalPoolsListResponse {
   pools: ExternalPool[]
 }
 
+export interface AccountsListResponse {
+  accounts: ExternalPool[]
+}
+
 export interface ExternalPoolStatus {
   pool: ExternalPool
   inFlight: number
@@ -1649,6 +1653,21 @@ export interface ExternalPoolStatus {
 
 export interface ExternalPoolsStatusResponse {
   pools: ExternalPoolStatus[]
+}
+
+export interface AccountStatus {
+  account: ExternalPool
+  inFlight: number
+  cooldownRemainingSecs: number
+  cooldownReason?: string
+  transientFailureStreak: number
+  transientFailureTtlSecs: number
+  dispatchable: boolean
+  skippedReason?: string
+}
+
+export interface AccountsStatusResponse {
+  accounts: AccountStatus[]
 }
 
 export interface CreateExternalPoolRequest {
