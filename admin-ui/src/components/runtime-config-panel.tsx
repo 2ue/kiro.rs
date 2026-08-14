@@ -4306,7 +4306,7 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="暴露代理改写告警"
-              description="控制是否通过 x-kiro-rs-warnings 响应头展示代理侧的消息合并、tool 清理、thinking 覆写等动作，方便排查兼容问题。"
+              description="控制是否通过 x-account-runtime-warnings 响应头展示代理侧的消息合并、tool 清理、thinking 覆写等动作，方便排查兼容问题。"
               checked={draft.exposeProxyWarnings}
               onCheckedChange={(exposeProxyWarnings) =>
                 setDraft((prev) => ({ ...prev, exposeProxyWarnings }))

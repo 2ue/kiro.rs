@@ -207,7 +207,7 @@ pub struct ProxyWarnings {
 }
 
 impl ProxyWarnings {
-    /// 编码为 `x-kiro-rs-warnings` 头值（仅包含计数 > 0 的项）。
+    /// 编码为 `x-account-runtime-warnings` 头值（仅包含计数 > 0 的项）。
     pub fn encode_header(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         if self.prefill_dropped > 0 {

@@ -7825,7 +7825,9 @@ async fn handle_stream_request(
     // 返回 SSE 响应
     let mut builder = envelope::sse_builder_with_id(&response_request_id);
     if let Some(warnings) = warnings_header {
-        builder = builder.header("x-kiro-rs-warnings", warnings);
+        builder = builder
+            .header(envelope::ACCOUNT_RUNTIME_WARNINGS_HEADER, warnings.clone())
+            .header(envelope::LEGACY_KIRO_RS_WARNINGS_HEADER, warnings);
     }
     builder.body(Body::from_stream(stream)).unwrap()
 }

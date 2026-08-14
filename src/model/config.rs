@@ -3909,7 +3909,7 @@ pub struct Config {
     /// 是否在响应头中暴露代理改写动作（默认 false）。
     ///
     /// 启用后，凡涉及消息合并 / 孤立 tool_use|tool_result 清理 / thinking 覆写等
-    /// 代理侧的隐式改写都会通过 `x-kiro-rs-warnings` 响应头汇总反馈，便于排查。
+    /// 代理侧的隐式改写都会通过 `x-account-runtime-warnings` 响应头汇总反馈，便于排查。
     /// 仅写头，不会修改响应体，对客户端无副作用。
     #[serde(default = "default_expose_proxy_warnings")]
     pub expose_proxy_warnings: bool,

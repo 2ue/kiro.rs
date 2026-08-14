@@ -22,6 +22,8 @@ pub(crate) const PUBLIC_MODEL_UNAVAILABLE_MESSAGE: &str =
 pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "The request body is invalid. Simplify the message, tools, tool results, files, or images and retry.";
 pub(crate) const PUBLIC_RATE_LIMIT_MESSAGE: &str =
     "No account is ready for this request right now. Please retry shortly.";
+pub(crate) const ACCOUNT_RUNTIME_WARNINGS_HEADER: &str = "x-account-runtime-warnings";
+pub(crate) const LEGACY_KIRO_RS_WARNINGS_HEADER: &str = "x-kiro-rs-warnings";
 
 pub(crate) fn public_message_with_error_id(message: &str, error_id: &str) -> String {
     format!("{message} If this continues, contact the administrator with error ID: {error_id}")
@@ -189,7 +191,8 @@ pub(crate) fn insert_optional_warnings_header(headers: &mut HeaderMap, warnings:
         return;
     };
     if let Ok(value) = HeaderValue::from_str(&warnings) {
-        headers.insert("x-kiro-rs-warnings", value);
+        headers.insert(ACCOUNT_RUNTIME_WARNINGS_HEADER, value.clone());
+        headers.insert(LEGACY_KIRO_RS_WARNINGS_HEADER, value);
     }
 }
 
@@ -282,6 +285,19 @@ mod tests {
 
         assert_eq!(headers["request-id"], "req_existing");
         assert_eq!(headers["anthropic-request-id"], "req_01abc");
+    }
+
+    #[test]
+    fn warnings_header_writes_account_header_with_legacy_copy() {
+        let mut headers = HeaderMap::new();
+
+        insert_optional_warnings_header(&mut headers, Some("prefill-dropped=1".to_string()));
+
+        assert_eq!(
+            headers[ACCOUNT_RUNTIME_WARNINGS_HEADER],
+            "prefill-dropped=1"
+        );
+        assert_eq!(headers[LEGACY_KIRO_RS_WARNINGS_HEADER], "prefill-dropped=1");
     }
 
     #[test]
