@@ -139,15 +139,15 @@ fn runtime_cooldown_validation_rejects_zero_values() {
 }
 
 #[test]
-fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
+fn account_runtime_transient_failure_priority_penalty_validation_is_bounded() {
     let mut config = ExternalPoolsConfig {
         external_pool_transient_failure_priority_penalty: 10_000,
         ..ExternalPoolsConfig::default()
     };
-    validate_external_pools_config(&config).expect("upper bound should be accepted");
+    validate_account_runtime_config(&config).expect("upper bound should be accepted");
 
     config.external_pool_transient_failure_priority_penalty = 10_001;
-    let err = validate_external_pools_config(&config).unwrap_err();
+    let err = validate_account_runtime_config(&config).unwrap_err();
     assert!(
         err.contains("externalPoolTransientFailurePriorityPenalty"),
         "unexpected validation error: {err}"
@@ -155,15 +155,15 @@ fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
 }
 
 #[test]
-fn external_pool_transient_failure_cooldown_threshold_validation_is_bounded() {
+fn account_runtime_transient_failure_cooldown_threshold_validation_is_bounded() {
     let mut config = ExternalPoolsConfig {
         external_pool_transient_failure_cooldown_threshold: 1_000,
         ..ExternalPoolsConfig::default()
     };
-    validate_external_pools_config(&config).expect("upper bound should be accepted");
+    validate_account_runtime_config(&config).expect("upper bound should be accepted");
 
     config.external_pool_transient_failure_cooldown_threshold = 1_001;
-    let err = validate_external_pools_config(&config).unwrap_err();
+    let err = validate_account_runtime_config(&config).unwrap_err();
     assert!(
         err.contains("externalPoolTransientFailureCooldownThreshold"),
         "unexpected validation error: {err}"
@@ -171,15 +171,15 @@ fn external_pool_transient_failure_cooldown_threshold_validation_is_bounded() {
 }
 
 #[test]
-fn external_pool_cost_floor_margin_validation_is_bounded() {
+fn account_runtime_cost_floor_margin_validation_is_bounded() {
     let mut config = ExternalPoolsConfig {
         external_pool_usage_projection_cost_floor_margin_percent: 200,
         ..ExternalPoolsConfig::default()
     };
-    validate_external_pools_config(&config).expect("upper bound should be accepted");
+    validate_account_runtime_config(&config).expect("upper bound should be accepted");
 
     config.external_pool_usage_projection_cost_floor_margin_percent = 201;
-    let err = validate_external_pools_config(&config).unwrap_err();
+    let err = validate_account_runtime_config(&config).unwrap_err();
     assert!(
         err.contains("externalPoolUsageProjectionCostFloorMarginPercent"),
         "unexpected validation error: {err}"

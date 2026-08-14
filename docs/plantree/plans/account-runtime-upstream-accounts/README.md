@@ -81,6 +81,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Request-state Anthropic wiring now names the injected account policy as `account_runtime` in `AppState` and `RequestRuntimeConfig`; raw direct, preflight and normalized fallback entrypoints read the account-named field while still delegating to the legacy implementation internals.
 - Admin account service methods now route list/status/discovery/test/cache-invalidation through account-named bridge methods. The bridge still uses the current external-pool storage/cache keys as compatibility details, but `/accounts` service methods no longer call the legacy public external-pool service methods directly.
 - `AccountRuntimeConfigExt` now provides account-named semantic accessors for enabled route checks, dispatch wait, legacy local-rescue wait, account request timeout and usage cost-floor settings. New Admin/request-entry/route-gate call sites use those methods instead of reading legacy field names directly.
+- Runtime config validation now enters through `validate_account_runtime_config`, and the old private `validate_external_pools_config` helper was removed. Tests use account-runtime names while still asserting the current compatibility JSON field names.
 
 Last verified on 2026-08-14:
 
@@ -144,3 +145,6 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-test1 -- cargo test account_runtime_config_ext_applies_enablement_and_route_policy -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-test3 -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-validation-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-validation-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-validation-test1 -- cargo test account_runtime_ -- --nocapture`

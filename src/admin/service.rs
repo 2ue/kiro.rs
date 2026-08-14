@@ -5369,7 +5369,7 @@ impl AdminService {
         cache_policy_raw
             .validate(cache_validation_config.legacy_cache_route_policy_default())
             .map_err(AdminServiceError::InvalidCredential)?;
-        validate_external_pools_config(&account_runtime)
+        validate_account_runtime_config(&account_runtime)
             .map_err(AdminServiceError::InvalidCredential)?;
         if high_cache_threshold < 0 {
             return Err(AdminServiceError::InvalidCredential(
@@ -5972,7 +5972,7 @@ fn normalize_admin_request_admission(
     Ok(config.normalized())
 }
 
-fn validate_external_pools_config(config: &AccountRuntimeConfig) -> Result<(), String> {
+fn validate_account_runtime_config(config: &AccountRuntimeConfig) -> Result<(), String> {
     if config.external_pool_global_max_concurrent_requests > 100_000 {
         return Err("externalPoolGlobalMaxConcurrentRequests 不能大于 100000".to_string());
     }
