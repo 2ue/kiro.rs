@@ -66,9 +66,9 @@ use crate::anthropic::{
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
 use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolTestResponse,
-    ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
-    external_pool_messages_url, external_pool_models_url,
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolStatus,
+    ExternalPoolTestResponse, ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest,
+    UpdateExternalPoolRequest, external_pool_messages_url, external_pool_models_url,
 };
 use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
@@ -814,6 +814,22 @@ impl AdminService {
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
     }
 
+    fn invalidate_account_admin_cache_with_account(
+        &self,
+        reason: &'static str,
+        account: &ExternalPool,
+    ) {
+        self.account_runtime_manager
+            .notify_account_runtime_data_changed_with_local_account(reason, account);
+        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+    }
+
+    fn invalidate_account_admin_cache_for_delete(&self, reason: &'static str, account_id: u64) {
+        self.account_runtime_manager
+            .notify_account_runtime_account_deleted(reason, account_id);
+        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+    }
+
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
         access_keys_response(
             &self.token_manager.runtime_config().request_api_keys(),
@@ -964,10 +980,27 @@ impl AdminService {
         Ok(pools)
     }
 
+    fn list_account_records(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
+        let cache_key = admin_external_pool_list_cache_key();
+        if let Some(cached) = self.read_admin_cache::<Vec<ExternalPool>>(cache_key) {
+            return Ok(cached);
+        }
+
+        let store = self.postgres_store.clone();
+        let accounts = block_on_admin_store(async move { store.list_external_pools(true).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(
+            cache_key.to_string(),
+            accounts.clone(),
+            ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+        );
+        Ok(accounts)
+    }
+
     pub fn list_accounts(&self) -> Result<AccountsListResponse, AdminServiceError> {
         Ok(AccountsListResponse {
             accounts: self
-                .list_external_pools()?
+                .list_account_records()?
                 .into_iter()
                 .map(Into::into)
                 .collect(),
@@ -1011,7 +1044,7 @@ impl AdminService {
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("create_account", &pool);
+        self.invalidate_account_admin_cache_with_account("create_account", &pool);
         Ok(pool.masked_for_admin_response().into())
     }
 
@@ -1060,7 +1093,7 @@ impl AdminService {
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("update_account", &pool);
+        self.invalidate_account_admin_cache_with_account("update_account", &pool);
         Ok(pool.masked_for_admin_response().into())
     }
 
@@ -1113,7 +1146,7 @@ impl AdminService {
             None,
             json!({ "supportedModels": pool.supported_models.clone() }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("account_supported_models", &pool);
+        self.invalidate_account_admin_cache_with_account("account_supported_models", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
@@ -1160,7 +1193,7 @@ impl AdminService {
         request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(Some(id), request.into())
+            .discover_account_supported_model_ids(Some(id), request)
             .await?;
         let store = self.postgres_store.clone();
         let supported_models_for_store = supported_models.clone();
@@ -1181,7 +1214,7 @@ impl AdminService {
                 "supportedModels": pool.supported_models.clone(),
             }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("account_supported_models_sync", &pool);
+        self.invalidate_account_admin_cache_with_account("account_supported_models_sync", &pool);
         Ok(SupportedModelsResponse {
             count: pool.supported_models.len(),
             supported_models: pool.supported_models,
@@ -1209,7 +1242,7 @@ impl AdminService {
         request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
         let supported_models = self
-            .discover_external_pool_supported_model_ids(id, request.into())
+            .discover_account_supported_model_ids(id, request)
             .await?;
         Ok(SupportedModelsResponse {
             count: supported_models.len(),
@@ -1262,7 +1295,7 @@ impl AdminService {
         })?;
         let config = self.token_manager.runtime_config();
         let timeout_secs = config
-            .external_pools
+            .account_runtime_config()
             .external_pool_request_timeout_secs
             .clamp(1, 60);
         let client = build_client(None, timeout_secs, config.tls_backend)
@@ -1308,6 +1341,15 @@ impl AdminService {
         Ok(supported_models)
     }
 
+    async fn discover_account_supported_model_ids(
+        &self,
+        id: Option<u64>,
+        request: DiscoverAccountSupportedModelsRequest,
+    ) -> Result<Vec<String>, AdminServiceError> {
+        self.discover_external_pool_supported_model_ids(id, request.into())
+            .await
+    }
+
     pub fn delete_external_pool(&self, id: u64) -> Result<(), AdminServiceError> {
         let store = self.postgres_store.clone();
         let deleted =
@@ -1344,7 +1386,7 @@ impl AdminService {
             None,
             json!({}),
         );
-        self.invalidate_external_pool_admin_cache_for_delete("delete_account", id);
+        self.invalidate_account_admin_cache_for_delete("delete_account", id);
         Ok(())
     }
 
@@ -1394,7 +1436,7 @@ impl AdminService {
             None,
             json!({ "enabled": request.enabled }),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("account_enabled", &pool);
+        self.invalidate_account_admin_cache_with_account("account_enabled", &pool);
         Ok(pool.masked_for_admin_response().into())
     }
 
@@ -1435,7 +1477,7 @@ impl AdminService {
             None,
             json!({}),
         );
-        self.invalidate_external_pool_admin_cache_with_pool("clear_account_auto_disabled", &pool);
+        self.invalidate_account_admin_cache_with_account("clear_account_auto_disabled", &pool);
         Ok(pool.masked_for_admin_response().into())
     }
 
@@ -1475,7 +1517,7 @@ impl AdminService {
             None,
             json!({ "deletedKeys": deleted }),
         );
-        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        self.invalidate_account_admin_cache_with_account("clear_account_cooldown", &pool);
         Ok(pool.masked_for_admin_response().into())
     }
 
@@ -1504,11 +1546,34 @@ impl AdminService {
         Ok(response)
     }
 
+    fn account_runtime_status_records(&self) -> Result<Vec<ExternalPoolStatus>, AdminServiceError> {
+        let cache_key = admin_external_pool_status_cache_key();
+        if let Some(cached) = self.read_admin_cache::<ExternalPoolsStatusResponse>(cache_key) {
+            return Ok(cached.pools);
+        }
+
+        let manager = self.account_runtime_manager.clone();
+        let config = self
+            .token_manager
+            .runtime_config()
+            .account_runtime_config()
+            .clone();
+        let accounts = block_on_admin_store(async move { manager.status(&config).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(
+            cache_key.to_string(),
+            ExternalPoolsStatusResponse {
+                pools: accounts.clone(),
+            },
+            ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+        );
+        Ok(accounts)
+    }
+
     pub fn get_account_status(&self) -> Result<AccountsStatusResponse, AdminServiceError> {
         Ok(AccountsStatusResponse {
             accounts: self
-                .get_external_pool_status()?
-                .pools
+                .account_runtime_status_records()?
                 .into_iter()
                 .map(Into::into)
                 .collect(),
@@ -1624,6 +1689,14 @@ impl AdminService {
     }
 
     pub fn test_account(
+        &self,
+        id: u64,
+        req: Option<AccountTestRequest>,
+    ) -> Result<AccountTestResponse, AdminServiceError> {
+        self.test_upstream_account_compat(id, req)
+    }
+
+    fn test_upstream_account_compat(
         &self,
         id: u64,
         req: Option<AccountTestRequest>,
@@ -4097,12 +4170,10 @@ impl AdminService {
         query: UsageExternalPoolRiskQuery,
     ) -> Result<UsageExternalPoolRiskResponse, AdminServiceError> {
         let config = self.token_manager.runtime_config();
+        let account_runtime = config.account_runtime_config();
         let cost_config = UsageExternalPoolRiskCostConfig {
-            cost_floor_enabled: config
-                .external_pools
-                .external_pool_usage_projection_cost_floor_enabled,
-            cost_floor_margin_percent: config
-                .external_pools
+            cost_floor_enabled: account_runtime.external_pool_usage_projection_cost_floor_enabled,
+            cost_floor_margin_percent: account_runtime
                 .external_pool_usage_projection_cost_floor_margin_percent,
         };
         self.usage_recorder

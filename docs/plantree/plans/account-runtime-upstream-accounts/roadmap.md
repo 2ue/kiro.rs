@@ -41,11 +41,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account runtime manager callers now use account-named wrappers for runtime-policy invalidation, local account mutation notifications and cross-instance data event observation; old external-pool method names are confined to the delegated implementation.
 - Top-level runtime configuration now exposes account-runtime accessors, and new startup, router, Admin runtime-config and reload-invalidation call sites use those accessors instead of direct `Config.external_pools` access while compatibility storage remains mirrored.
 - Anthropic request-state wiring now uses `account_runtime` fields in `AppState` and `RequestRuntimeConfig`, so raw direct, preflight and normalized fallback entrypoints no longer receive the account policy through an external-pool-named request field.
+- Admin account service methods now use account-named bridge methods for list, status, supported-model discovery, test and cache/data invalidation instead of directly calling legacy external-pool service methods. Storage and cache keys remain compatibility details for now.
 
 ## In Progress
 
 - Migrate account runtime internals away from legacy external-pool names behind the `account_runtime` facade while preserving current scheduler, proxy, body-mode, retry, usage projection and compatibility behavior.
-- Convert remaining backend config DTO/type names from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
+- Convert remaining backend config DTO/type names and storage compatibility bridges from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
 
 ## Next
 

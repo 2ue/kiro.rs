@@ -79,6 +79,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account runtime manager callers now use account-named cache/data invalidation wrappers for runtime config reloads, local account mutations and cross-instance data events. Legacy external-pool method names remain only inside the delegated implementation while Redis channel and storage compatibility keys are still unchanged.
 - Top-level runtime configuration now has account-runtime accessors. New startup, router, Admin runtime-config and reload-invalidation call sites use `account_runtime_config()` / `set_account_runtime_config()` while the persisted `external_pools` field remains the compatibility storage mirror.
 - Request-state Anthropic wiring now names the injected account policy as `account_runtime` in `AppState` and `RequestRuntimeConfig`; raw direct, preflight and normalized fallback entrypoints read the account-named field while still delegating to the legacy implementation internals.
+- Admin account service methods now route list/status/discovery/test/cache-invalidation through account-named bridge methods. The bridge still uses the current external-pool storage/cache keys as compatibility details, but `/accounts` service methods no longer call the legacy public external-pool service methods directly.
 
 Last verified on 2026-08-14:
 
@@ -133,3 +134,7 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh request-runtime-account-field-test4 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh request-runtime-account-field-test3a -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh request-runtime-account-field-test5 -- cargo test account_runtime_endpoint_gate_applies_global_enable_and_route_policy -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh admin-account-bridge-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh admin-account-bridge-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh admin-account-bridge-test1 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh admin-account-bridge-test2 -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
