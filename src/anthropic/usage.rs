@@ -897,6 +897,7 @@ pub struct UsageSummary {
     pub local_prompt_cache_creation_input_tokens: i64,
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
+    pub account_billing: UsageAccountBillingSummary,
     pub external_pool_billing: UsageExternalPoolBillingSummary,
     pub realtime: UsageRealtimeStats,
     pub top_credentials: Vec<UsageAggregate>,
@@ -918,6 +919,8 @@ pub struct UsageExternalPoolBillingSummary {
     pub billable_cost_usd: f64,
     pub cost_floor_delta_usd: f64,
 }
+
+pub type UsageAccountBillingSummary = UsageExternalPoolBillingSummary;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1479,7 +1482,10 @@ pub struct UsageDashboardSummary {
     pub fallback_from_sticky_requests: usize,
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
+    pub account_billing: UsageAccountBillingSummary,
     pub external_pool_billing: UsageExternalPoolBillingSummary,
+    #[serde(default)]
+    pub account_billing_by_account: Vec<UsageAccountBillingByAccount>,
     #[serde(default)]
     pub external_pool_billing_by_pool: Vec<UsageExternalPoolBillingByPool>,
     pub status_breakdown: Vec<UsageBreakdownItem>,
@@ -3215,6 +3221,7 @@ impl UsageRecorder {
             local_prompt_cache_creation_input_tokens: 0,
             simulated_requests: 0,
             upstream_metadata_requests: 0,
+            account_billing: UsageExternalPoolBillingSummary::default(),
             external_pool_billing: UsageExternalPoolBillingSummary::default(),
             realtime: UsageRealtimeStats::empty(REALTIME_USAGE_WINDOW_SECS),
             top_credentials: Vec::new(),
@@ -3353,6 +3360,7 @@ impl UsageRecorder {
 
         summary.top_credentials = top_aggregates(credentials);
         summary.top_conversations = top_aggregates(conversations);
+        summary.account_billing = summary.external_pool_billing;
         summary.realtime = UsageRealtimeStats::from_totals_with_status(
             REALTIME_USAGE_WINDOW_SECS,
             realtime_requests,
@@ -4271,6 +4279,118 @@ mod tests {
                 .billable_cost_usd,
             0.30
         );
+    }
+
+    #[test]
+    fn usage_summaries_serialize_account_billing_with_external_compatibility() {
+        let billing = UsageExternalPoolBillingSummary {
+            requests: 3,
+            priced_requests: 2,
+            unpriced_requests: 1,
+            cost_floor_applied_requests: 1,
+            raw_cost_usd: 0.10,
+            shaped_cost_usd: 0.20,
+            uplifted_cost_usd: 0.30,
+            profit_usd: 0.20,
+            reported_cost_usd: 0.25,
+            billable_cost_usd: 0.30,
+            cost_floor_delta_usd: 0.0,
+        };
+        let summary = UsageSummary {
+            total_requests: 3,
+            success_requests: 2,
+            error_requests: 1,
+            high_cache_requests: 0,
+            total_input_tokens: 100,
+            total_output_tokens: 20,
+            total_cache_read_input_tokens: 10,
+            total_cache_creation_input_tokens: 5,
+            total_estimated_cost_usd: 0.30,
+            total_original_cost_usd: 0.10,
+            total_kiro_metering_usage: 0.0,
+            priced_requests: 2,
+            unpriced_requests: 1,
+            local_prompt_cache_requests: 0,
+            local_prompt_cache_input_tokens: 0,
+            local_prompt_cache_read_input_tokens: 0,
+            local_prompt_cache_creation_input_tokens: 0,
+            simulated_requests: 0,
+            upstream_metadata_requests: 3,
+            account_billing: billing,
+            external_pool_billing: billing,
+            realtime: UsageRealtimeStats::empty(REALTIME_USAGE_WINDOW_SECS),
+            top_credentials: Vec::new(),
+            top_conversations: Vec::new(),
+        };
+        let json = serde_json::to_value(summary).expect("summary serializes");
+        assert_eq!(json["accountBilling"]["requests"], 3);
+        assert_eq!(json["externalPoolBilling"]["requests"], 3);
+
+        let dashboard = UsageDashboardSummary {
+            total_requests: 3,
+            success_requests: 2,
+            error_requests: 1,
+            error_rate: 1.0 / 3.0,
+            stream_requests: 1,
+            non_stream_requests: 2,
+            high_cache_requests: 0,
+            total_input_tokens: 100,
+            billable_input_tokens: 95,
+            total_output_tokens: 20,
+            total_cache_read_input_tokens: 10,
+            total_cache_creation_input_tokens: 5,
+            cache_read_ratio: 0.10,
+            total_estimated_cost_usd: 0.30,
+            total_original_cost_usd: 0.10,
+            total_kiro_metering_usage: 0.0,
+            priced_requests: 2,
+            unpriced_requests: 1,
+            average_duration_ms: 10.0,
+            p95_duration_ms: 20,
+            sticky_bound_requests: 0,
+            fallback_from_sticky_requests: 0,
+            simulated_requests: 0,
+            upstream_metadata_requests: 3,
+            account_billing: billing,
+            external_pool_billing: billing,
+            account_billing_by_account: vec![UsageAccountBillingByAccount {
+                account_id: 42,
+                account_name: "primary".to_string(),
+                requests: 3,
+                priced_requests: 2,
+                unpriced_requests: 1,
+                cost_floor_applied_requests: 1,
+                raw_cost_usd: 0.10,
+                shaped_cost_usd: 0.20,
+                uplifted_cost_usd: 0.30,
+                profit_usd: 0.20,
+                reported_cost_usd: 0.25,
+                billable_cost_usd: 0.30,
+                cost_floor_delta_usd: 0.0,
+            }],
+            external_pool_billing_by_pool: vec![UsageExternalPoolBillingByPool {
+                pool_id: 42,
+                pool_name: "primary".to_string(),
+                requests: 3,
+                priced_requests: 2,
+                unpriced_requests: 1,
+                cost_floor_applied_requests: 1,
+                raw_cost_usd: 0.10,
+                shaped_cost_usd: 0.20,
+                uplifted_cost_usd: 0.30,
+                profit_usd: 0.20,
+                reported_cost_usd: 0.25,
+                billable_cost_usd: 0.30,
+                cost_floor_delta_usd: 0.0,
+            }],
+            status_breakdown: Vec::new(),
+            usage_source_breakdown: Vec::new(),
+        };
+        let json = serde_json::to_value(dashboard).expect("dashboard summary serializes");
+        assert_eq!(json["accountBilling"]["billableCostUsd"], 0.30);
+        assert_eq!(json["externalPoolBilling"]["billableCostUsd"], 0.30);
+        assert_eq!(json["accountBillingByAccount"][0]["accountId"], 42);
+        assert_eq!(json["externalPoolBillingByPool"][0]["poolId"], 42);
     }
 
     #[test]

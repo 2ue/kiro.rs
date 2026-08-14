@@ -2708,6 +2708,7 @@ impl RedisStore {
         let top_conversations = self
             .usage_top_aggregates(USAGE_SUMMARY_TOP_CONVERSATIONS_KEY, "conversation")
             .await?;
+        let account_billing = account_billing_summary_from_hash(&totals);
 
         Ok(Some(UsageSummary {
             total_requests: usage_usize(&totals, "total_requests"),
@@ -2738,22 +2739,8 @@ impl RedisStore {
             ),
             simulated_requests: usage_usize(&totals, "simulated_requests"),
             upstream_metadata_requests: usage_usize(&totals, "upstream_metadata_requests"),
-            external_pool_billing: UsageExternalPoolBillingSummary {
-                requests: usage_usize(&totals, "external_pool_requests"),
-                priced_requests: usage_usize(&totals, "external_pool_priced_requests"),
-                unpriced_requests: usage_usize(&totals, "external_pool_unpriced_requests"),
-                cost_floor_applied_requests: usage_usize(
-                    &totals,
-                    "external_pool_cost_floor_applied_requests",
-                ),
-                raw_cost_usd: usage_f64(&totals, "external_pool_raw_cost_usd"),
-                shaped_cost_usd: usage_f64(&totals, "external_pool_shaped_cost_usd"),
-                uplifted_cost_usd: usage_f64(&totals, "external_pool_uplifted_cost_usd"),
-                profit_usd: usage_f64(&totals, "external_pool_profit_usd"),
-                reported_cost_usd: usage_f64(&totals, "external_pool_reported_cost_usd"),
-                billable_cost_usd: usage_f64(&totals, "external_pool_billable_cost_usd"),
-                cost_floor_delta_usd: usage_f64(&totals, "external_pool_cost_floor_delta_usd"),
-            },
+            account_billing,
+            external_pool_billing: account_billing,
             realtime,
             top_credentials,
             top_conversations,
@@ -3139,6 +3126,12 @@ impl RedisStore {
         );
         summary.external_pool_billing_by_pool = self
             .dashboard_external_pool_billing_by_pool_from_cache(spec, external_pool_index, cache);
+        summary.account_billing_by_account = summary
+            .external_pool_billing_by_pool
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
 
         UsageDashboardWindow {
             key: spec.key.clone(),
@@ -6497,6 +6490,27 @@ fn append_usage_top_aggregate(
     }
 }
 
+fn account_billing_summary_from_hash(
+    values: &HashMap<String, String>,
+) -> UsageExternalPoolBillingSummary {
+    UsageExternalPoolBillingSummary {
+        requests: usage_usize(values, "external_pool_requests"),
+        priced_requests: usage_usize(values, "external_pool_priced_requests"),
+        unpriced_requests: usage_usize(values, "external_pool_unpriced_requests"),
+        cost_floor_applied_requests: usage_usize(
+            values,
+            "external_pool_cost_floor_applied_requests",
+        ),
+        raw_cost_usd: usage_f64(values, "external_pool_raw_cost_usd"),
+        shaped_cost_usd: usage_f64(values, "external_pool_shaped_cost_usd"),
+        uplifted_cost_usd: usage_f64(values, "external_pool_uplifted_cost_usd"),
+        profit_usd: usage_f64(values, "external_pool_profit_usd"),
+        reported_cost_usd: usage_f64(values, "external_pool_reported_cost_usd"),
+        billable_cost_usd: usage_f64(values, "external_pool_billable_cost_usd"),
+        cost_floor_delta_usd: usage_f64(values, "external_pool_cost_floor_delta_usd"),
+    }
+}
+
 fn dashboard_summary_from_values(
     values: &HashMap<String, String>,
     high_cache_requests: usize,
@@ -6511,6 +6525,7 @@ fn dashboard_summary_from_values(
     } else {
         0.0
     };
+    let account_billing = account_billing_summary_from_hash(values);
 
     UsageDashboardSummary {
         total_requests,
@@ -6537,22 +6552,9 @@ fn dashboard_summary_from_values(
         fallback_from_sticky_requests: usage_usize(values, "fallback_from_sticky_requests"),
         simulated_requests: usage_usize(values, "simulated_requests"),
         upstream_metadata_requests: usage_usize(values, "upstream_metadata_requests"),
-        external_pool_billing: UsageExternalPoolBillingSummary {
-            requests: usage_usize(values, "external_pool_requests"),
-            priced_requests: usage_usize(values, "external_pool_priced_requests"),
-            unpriced_requests: usage_usize(values, "external_pool_unpriced_requests"),
-            cost_floor_applied_requests: usage_usize(
-                values,
-                "external_pool_cost_floor_applied_requests",
-            ),
-            raw_cost_usd: usage_f64(values, "external_pool_raw_cost_usd"),
-            shaped_cost_usd: usage_f64(values, "external_pool_shaped_cost_usd"),
-            uplifted_cost_usd: usage_f64(values, "external_pool_uplifted_cost_usd"),
-            profit_usd: usage_f64(values, "external_pool_profit_usd"),
-            reported_cost_usd: usage_f64(values, "external_pool_reported_cost_usd"),
-            billable_cost_usd: usage_f64(values, "external_pool_billable_cost_usd"),
-            cost_floor_delta_usd: usage_f64(values, "external_pool_cost_floor_delta_usd"),
-        },
+        account_billing,
+        external_pool_billing: account_billing,
+        account_billing_by_account: Vec::new(),
         external_pool_billing_by_pool: Vec::new(),
         status_breakdown: Vec::new(),
         usage_source_breakdown: Vec::new(),

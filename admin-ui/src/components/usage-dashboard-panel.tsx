@@ -714,7 +714,7 @@ export function UsageDashboardPanel() {
   const summary = selectedWindow.summary
   const top = topQuery.data?.top || EMPTY_TOP
   const series = seriesQuery.data?.series || { hourly24h: [], daily7d: [] }
-  const externalPoolBilling = summary.externalPoolBilling || EMPTY_EXTERNAL_POOL_BILLING
+  const externalPoolBilling = summary.accountBilling || summary.externalPoolBilling || EMPTY_EXTERNAL_POOL_BILLING
   const externalPoolBillingByPool =
     externalPoolBillingQuery.data?.externalPoolBillingByPool || summary.externalPoolBillingByPool || []
   const statusBreakdown = breakdownQuery.data?.statusBreakdown || summary.statusBreakdown || []

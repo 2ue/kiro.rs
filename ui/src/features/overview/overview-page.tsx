@@ -495,7 +495,7 @@ function CostRelationshipPanel({
 }: {
   summary: UsageDashboardWindow['summary']
 }) {
-  const external = summary.externalPoolBilling ?? EMPTY_ACCOUNT_BILLING
+  const external = summary.accountBilling ?? summary.externalPoolBilling ?? EMPTY_ACCOUNT_BILLING
   const delta = summary.totalEstimatedCostUsd - summary.totalOriginalCostUsd
 
   return (
@@ -1081,7 +1081,9 @@ export function OverviewPage() {
   const usageSourceBreakdown = breakdownQuery.data?.usageSourceBreakdown ?? summary.usageSourceBreakdown ?? []
   const accountBillingByAccount =
     accountBillingQuery.data?.accountBillingByAccount ??
+    summary.accountBillingByAccount ??
     accountBillingRowsFromDashboard(summary.externalPoolBillingByPool)
+  const accountBilling = summary.accountBilling ?? summary.externalPoolBilling ?? EMPTY_ACCOUNT_BILLING
 
   const pricedRatio = summary.totalRequests > 0 ? summary.pricedRequests / summary.totalRequests : 0
   const streamRatio = summary.totalRequests > 0 ? summary.streamRequests / summary.totalRequests : 0
@@ -1251,7 +1253,7 @@ export function OverviewPage() {
             <StatCard title="原始计费" value={formatUsdFixed2(summary.totalOriginalCostUsd)} desc="按原始 usage 估算" icon={<DollarSign />} tone="warning" />
             <StatCard title="Kiro 积分" value={formatCompact(summary.totalKiroMeteringUsage ?? 0)} valueTitle={formatNumber(summary.totalKiroMeteringUsage ?? 0)} desc="当前窗口积分消耗" icon={<DollarSign />} tone="info" />
             <StatCard title="未计价请求" value={formatCompact(summary.unpricedRequests)} valueTitle={formatNumber(summary.unpricedRequests)} desc={`已计价 ${formatCompact(summary.pricedRequests)}`} icon={<DollarSign />} tone={summary.unpricedRequests > 0 ? 'warning' : 'success'} />
-            <StatCard title="上游账号请求" value={formatCompact(summary.externalPoolBilling?.requests ?? 0)} valueTitle={formatNumber(summary.externalPoolBilling?.requests ?? 0)} desc={`billable ${formatUsdFixed2(summary.externalPoolBilling?.billableCostUsd ?? 0)}`} icon={<DollarSign />} tone="info" />
+            <StatCard title="上游账号请求" value={formatCompact(accountBilling.requests)} valueTitle={formatNumber(accountBilling.requests)} desc={`billable ${formatUsdFixed2(accountBilling.billableCostUsd)}`} icon={<DollarSign />} tone="info" />
           </div>
           <CostRelationshipPanel summary={summary} />
           {accountBillingQuery.isLoading ? (
@@ -1260,7 +1262,7 @@ export function OverviewPage() {
             </SectionCard>
           ) : (
             <AccountBillingPanel
-              billing={summary.externalPoolBilling ?? EMPTY_ACCOUNT_BILLING}
+              billing={accountBilling}
               billingByAccount={accountBillingByAccount}
             />
           )}

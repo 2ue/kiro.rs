@@ -6152,6 +6152,7 @@ impl PostgresUsageStore {
         .bind(high_cache_threshold)
         .fetch_one(self.store.pool())
         .await?;
+        let account_billing = account_billing_summary_from_row(&row)?;
 
         Ok(UsageSummary {
             total_requests: row_i64_to_usize(&row, "total_requests")?,
@@ -6175,22 +6176,8 @@ impl PostgresUsageStore {
                 .try_get("local_prompt_cache_creation_input_tokens")?,
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
-            external_pool_billing: UsageExternalPoolBillingSummary {
-                requests: row_i64_to_usize(&row, "external_pool_requests")?,
-                priced_requests: row_i64_to_usize(&row, "external_pool_priced_requests")?,
-                unpriced_requests: row_i64_to_usize(&row, "external_pool_unpriced_requests")?,
-                cost_floor_applied_requests: row_i64_to_usize(
-                    &row,
-                    "external_pool_cost_floor_applied_requests",
-                )?,
-                raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
-                shaped_cost_usd: row.try_get("external_pool_shaped_cost_usd")?,
-                uplifted_cost_usd: row.try_get("external_pool_uplifted_cost_usd")?,
-                profit_usd: row.try_get("external_pool_profit_usd")?,
-                reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
-                billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
-                cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
-            },
+            account_billing,
+            external_pool_billing: account_billing,
             realtime: UsageRealtimeStats::from_totals_with_status(
                 REALTIME_USAGE_WINDOW_SECS,
                 row_i64_to_usize(&row, "realtime_requests")?,
@@ -6745,6 +6732,13 @@ impl PostgresUsageStore {
             window.summary.external_pool_billing_by_pool = external_pool_billing
                 .remove(&window.key)
                 .unwrap_or_default();
+            window.summary.account_billing_by_account = window
+                .summary
+                .external_pool_billing_by_pool
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect();
         }
         Ok(())
     }
@@ -10111,6 +10105,27 @@ fn row_i64_to_u64(row: &PgRow, column: &str) -> anyhow::Result<u64> {
     Ok(value.max(0) as u64)
 }
 
+fn account_billing_summary_from_row(
+    row: &PgRow,
+) -> anyhow::Result<UsageExternalPoolBillingSummary> {
+    Ok(UsageExternalPoolBillingSummary {
+        requests: row_i64_to_usize(row, "external_pool_requests")?,
+        priced_requests: row_i64_to_usize(row, "external_pool_priced_requests")?,
+        unpriced_requests: row_i64_to_usize(row, "external_pool_unpriced_requests")?,
+        cost_floor_applied_requests: row_i64_to_usize(
+            row,
+            "external_pool_cost_floor_applied_requests",
+        )?,
+        raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
+        shaped_cost_usd: row.try_get("external_pool_shaped_cost_usd")?,
+        uplifted_cost_usd: row.try_get("external_pool_uplifted_cost_usd")?,
+        profit_usd: row.try_get("external_pool_profit_usd")?,
+        reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
+        billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
+        cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
+    })
+}
+
 fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow> {
     let from: DateTime<Utc> = row.try_get("from_at")?;
     let to: DateTime<Utc> = row.try_get("to_at")?;
@@ -10119,6 +10134,7 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
     let total_input_tokens: i64 = row.try_get("total_input_tokens")?;
     let total_cache_read_input_tokens: i64 = row.try_get("total_cache_read_input_tokens")?;
     let p95_duration_ms: i64 = row.try_get("p95_duration_ms")?;
+    let account_billing = account_billing_summary_from_row(&row)?;
 
     Ok(UsageDashboardWindow {
         key: row.try_get("key")?,
@@ -10150,22 +10166,9 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
             fallback_from_sticky_requests: row_i64_to_usize(&row, "fallback_from_sticky_requests")?,
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
-            external_pool_billing: UsageExternalPoolBillingSummary {
-                requests: row_i64_to_usize(&row, "external_pool_requests")?,
-                priced_requests: row_i64_to_usize(&row, "external_pool_priced_requests")?,
-                unpriced_requests: row_i64_to_usize(&row, "external_pool_unpriced_requests")?,
-                cost_floor_applied_requests: row_i64_to_usize(
-                    &row,
-                    "external_pool_cost_floor_applied_requests",
-                )?,
-                raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
-                shaped_cost_usd: row.try_get("external_pool_shaped_cost_usd")?,
-                uplifted_cost_usd: row.try_get("external_pool_uplifted_cost_usd")?,
-                profit_usd: row.try_get("external_pool_profit_usd")?,
-                reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
-                billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
-                cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
-            },
+            account_billing,
+            external_pool_billing: account_billing,
+            account_billing_by_account: Vec::new(),
             external_pool_billing_by_pool: Vec::new(),
             status_breakdown: Vec::new(),
             usage_source_breakdown: Vec::new(),
@@ -10206,7 +10209,9 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
             fallback_from_sticky_requests: 0,
             simulated_requests: 0,
             upstream_metadata_requests: 0,
+            account_billing: UsageExternalPoolBillingSummary::default(),
             external_pool_billing: UsageExternalPoolBillingSummary::default(),
+            account_billing_by_account: Vec::new(),
             external_pool_billing_by_pool: Vec::new(),
             status_breakdown: Vec::new(),
             usage_source_breakdown: Vec::new(),

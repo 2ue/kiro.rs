@@ -980,6 +980,7 @@ export interface UsageSummary {
   localPromptCacheCreationInputTokens: number
   simulatedRequests: number
   upstreamMetadataRequests: number
+  accountBilling?: UsageAccountBillingSummary
   externalPoolBilling?: UsageExternalPoolBillingSummary
   realtime: UsageRealtimeStats
   topCredentials: UsageAggregate[]
@@ -1003,6 +1004,13 @@ export interface UsageExternalPoolBillingSummary {
 export interface UsageExternalPoolBillingByPool extends UsageExternalPoolBillingSummary {
   poolId: number
   poolName: string
+}
+
+export type UsageAccountBillingSummary = UsageExternalPoolBillingSummary
+
+export interface UsageAccountBillingByAccount extends UsageAccountBillingSummary {
+  accountId: number
+  accountName: string
 }
 
 export interface UsageDashboardResponse {
@@ -1078,7 +1086,9 @@ export interface UsageDashboardSummary {
   fallbackFromStickyRequests: number
   simulatedRequests: number
   upstreamMetadataRequests: number
+  accountBilling?: UsageAccountBillingSummary
   externalPoolBilling?: UsageExternalPoolBillingSummary
+  accountBillingByAccount?: UsageAccountBillingByAccount[]
   externalPoolBillingByPool?: UsageExternalPoolBillingByPool[]
   statusBreakdown: UsageBreakdownItem[]
   usageSourceBreakdown: UsageBreakdownItem[]
