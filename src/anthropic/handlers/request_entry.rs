@@ -34,7 +34,7 @@ pub(super) async fn handle_messages_endpoint(
         .max(
             runtime_config
                 .account_runtime
-                .legacy_local_rescue_max_wait_secs(),
+                .account_local_rescue_max_wait_secs(),
         );
     inference_attempt_budget.set_dispatch_deadline_after(std::time::Duration::from_secs(
         shared_dispatch_max_wait_secs.max(1),
@@ -60,7 +60,7 @@ pub(super) async fn handle_messages_endpoint(
         record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
         return error.to_response(&request_id);
     }
-    // Raw external routes preserve the effective client request after the
+    // Raw account routes preserve the effective client request after the
     // configured missing-max-tokens policy, before any compatibility cleanup.
     let effective_raw_body = raw_body.clone();
 
@@ -279,7 +279,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
         local_dispatchable = local_state.dispatchable,
         local_usable = local_state.usable,
         retry_after_secs = ?retry_after_secs,
-        "local credential pool is unavailable and no external pool takeover is available; rejecting before full body processing"
+        "local credential pool is unavailable and no upstream account takeover is available; rejecting before full body processing"
     );
     let response = match retry_after_secs {
         Some(retry_after_secs) => envelope::error_response_with_id_and_headers(

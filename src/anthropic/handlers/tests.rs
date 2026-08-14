@@ -10194,7 +10194,7 @@ fn account_fallback_classifier_gates_unsupported_model() {
 }
 
 #[test]
-fn external_local_rescue_classifier_respects_error_type_and_toggles() {
+fn account_local_rescue_classifier_respects_error_type_and_toggles() {
     let config = AccountRuntimeConfig::default();
     let rate_limit = AccountFinalError {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -10216,7 +10216,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_full"),
             Some(1),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_account_error(
@@ -10234,7 +10234,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_account_error(
@@ -10243,7 +10243,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_attempt_reserved_for_fallback"),
             Some(1),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
 
     let timeout = AccountFinalError {
@@ -10264,7 +10264,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_full"),
             Some(1),
         ),
-        Some("external_timeout")
+        Some("account_timeout")
     );
 
     let capacity = AccountFinalError {
@@ -10285,7 +10285,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_full"),
             Some(1),
         ),
-        Some("external_capacity")
+        Some("account_capacity")
     );
 
     let bad_request = AccountFinalError {
@@ -10306,7 +10306,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_full"),
             Some(1),
         ),
-        Some("external_bad_request")
+        Some("account_bad_request")
     );
 
     let mut disabled = config.clone();
@@ -10379,12 +10379,12 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        Some("external_error")
+        Some("account_error")
     );
 }
 
 #[test]
-fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
+fn account_local_rescue_is_blocked_after_terminal_local_route_reasons() {
     let config = AccountRuntimeConfig::default();
     let capacity = AccountFinalError {
         status: StatusCode::SERVICE_UNAVAILABLE,
@@ -10419,7 +10419,7 @@ fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
 }
 
 #[test]
-fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
+fn account_local_rescue_waits_for_capacity_based_local_fallbacks() {
     let config = AccountRuntimeConfig::default();
     let rate_limit = AccountFinalError {
         status: StatusCode::TOO_MANY_REQUESTS,
@@ -10440,7 +10440,7 @@ fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
             Some("local_capacity_full"),
             Some(1),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_account_error(
@@ -10449,7 +10449,7 @@ fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
             Some("local_capacity_exhausted"),
             Some(1),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_account_error(
@@ -10458,7 +10458,7 @@ fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
             Some("local_attempt_reserved_for_fallback"),
             Some(1),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_account_error(
@@ -10467,7 +10467,7 @@ fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
             Some("local_capacity_full"),
             Some(0),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_account_error(
@@ -10476,7 +10476,7 @@ fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_account_error(
@@ -10485,7 +10485,7 @@ fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
             Some("local_attempt_reserved_for_fallback"),
             Some(0),
         ),
-        Some("external_rate_limit")
+        Some("account_rate_limit")
     );
 }
 
@@ -10520,7 +10520,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
                 Some(1),
                 &remaining,
             ),
-            Some("external_rate_limit"),
+            Some("account_rate_limit"),
             "round {round}: two attempts remain for a one-send rescue"
         );
 
@@ -10546,7 +10546,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
 }
 
 #[test]
-fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_rounds() {
+fn direct_account_policy_disables_local_rescue_for_all_error_classes_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = AccountRuntimeConfig {
@@ -10644,7 +10644,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
 }
 
 #[test]
-fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_flag() {
+fn direct_account_route_subtype_blocks_local_rescue_even_without_global_direct_flag() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = AccountRuntimeConfig {
@@ -10666,50 +10666,60 @@ fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_
     };
 
     for round in 1..=10 {
-        assert_eq!(
-            local_rescue_reason_after_account_route_error(
-                UsageRouteSubtype::ExternalDirectPolicy,
-                &config,
-                &server_error,
-                Some("local_capacity_full"),
-                Some(4),
-            ),
-            None,
-            "round {round}: route subtype external_direct_policy is an absolute local-rescue boundary"
-        );
+        for route_subtype in [
+            UsageRouteSubtype::AccountDirectPolicy,
+            UsageRouteSubtype::ExternalDirectPolicy,
+        ] {
+            assert_eq!(
+                local_rescue_reason_after_account_route_error(
+                    route_subtype,
+                    &config,
+                    &server_error,
+                    Some("local_capacity_full"),
+                    Some(4),
+                ),
+                None,
+                "round {round}: direct route subtype {route_subtype:?} is an absolute local-rescue boundary"
+            );
+        }
 
         let budget = InferenceAttemptBudget::new(8);
         budget.reserve(InferenceAttemptKind::Account, 0).unwrap();
-        assert_eq!(
-            budgeted_local_rescue_reason_after_account_route_error(
-                UsageRouteSubtype::ExternalDirectPolicy,
-                &config,
-                &server_error,
-                Some("local_capacity_full"),
-                Some(4),
-                &budget,
-            ),
-            None,
-            "round {round}: direct route subtype must ignore remaining local rescue budget"
-        );
+        for route_subtype in [
+            UsageRouteSubtype::AccountDirectPolicy,
+            UsageRouteSubtype::ExternalDirectPolicy,
+        ] {
+            assert_eq!(
+                budgeted_local_rescue_reason_after_account_route_error(
+                    route_subtype,
+                    &config,
+                    &server_error,
+                    Some("local_capacity_full"),
+                    Some(4),
+                    &budget,
+                ),
+                None,
+                "round {round}: direct route subtype {route_subtype:?} must ignore remaining local rescue budget"
+            );
+        }
 
         assert_eq!(
             budgeted_local_rescue_reason_after_account_route_error(
-                UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+                UsageRouteSubtype::AccountFallbackAfterLocalAttempts,
                 &config,
                 &server_error,
                 Some("local_capacity_full"),
                 Some(4),
                 &budget,
             ),
-            Some("external_error"),
+            Some("account_error"),
             "round {round}: local-first fallback route still allows bounded rescue when the fresh local pool is dispatchable"
         );
     }
 }
 
 #[test]
-fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds() {
+fn preflight_account_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = AccountRuntimeConfig::default();
@@ -10736,7 +10746,7 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
                 Some(1),
                 &budget,
             ),
-            Some("external_capacity"),
+            Some("account_capacity"),
             "round {round}: preflight upstream account capacity failure may wait for one local rescue"
         );
 

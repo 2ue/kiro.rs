@@ -1444,7 +1444,7 @@ async fn maybe_raw_account_preflight_response(
                     request_id,
                     reason = rescue_reason,
                     local_fallback_reason = %reason,
-                    max_wait_secs = config.legacy_local_rescue_max_wait_secs(),
+                    max_wait_secs = config.account_local_rescue_max_wait_secs(),
                     account_status = err.status.as_u16(),
                     account_error_type = %err.route_error_type,
                     account_attempt_count = err.attempts.len(),
@@ -6729,10 +6729,10 @@ fn local_rescue_reason_after_account_route_error(
     if !account_route_subtype_allows_local_rescue(route_subtype) {
         return None;
     }
-    if config.external_direct_policy_enabled {
+    if config.account_direct_policy_enabled() {
         return None;
     }
-    if !config.external_pool_local_rescue_enabled {
+    if !config.account_local_rescue_enabled() {
         return None;
     }
     if local_fallback_reason_blocks_local_rescue(local_fallback_reason, current_local_dispatchable)
@@ -6741,23 +6741,23 @@ fn local_rescue_reason_after_account_route_error(
     }
     if err.is_rate_limit() {
         return config
-            .external_pool_local_rescue_on_rate_limit
-            .then_some("external_rate_limit");
+            .account_local_rescue_on_rate_limit()
+            .then_some("account_rate_limit");
     }
     if err.is_timeout_like() {
         return config
-            .external_pool_local_rescue_on_timeout
-            .then_some("external_timeout");
+            .account_local_rescue_on_timeout()
+            .then_some("account_timeout");
     }
     if err.is_capacity_like() {
         return config
-            .external_pool_local_rescue_on_capacity
-            .then_some("external_capacity");
+            .account_local_rescue_on_capacity()
+            .then_some("account_capacity");
     }
     if err.is_public_invalid_request() {
-        return Some("external_bad_request");
+        return Some("account_bad_request");
     }
-    Some("external_error")
+    Some("account_error")
 }
 
 #[cfg(test)]
@@ -6879,7 +6879,7 @@ async fn call_stream_local_rescue_after_account_error(
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
     let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
         AcquireMode::WaitForCapacityMax(Duration::from_secs(
-            external.config.external_pool_local_rescue_max_wait_secs,
+            external.config.account_local_rescue_max_wait_secs(),
         )),
         external.inference_attempt_budget.as_ref(),
     );
@@ -6930,7 +6930,7 @@ async fn call_non_stream_local_rescue_after_account_error(
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
     let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
         AcquireMode::WaitForCapacityMax(Duration::from_secs(
-            external.config.external_pool_local_rescue_max_wait_secs,
+            external.config.account_local_rescue_max_wait_secs(),
         )),
         external.inference_attempt_budget.as_ref(),
     );
@@ -7189,8 +7189,7 @@ async fn handle_stream_request(
                         tracing::warn!(
                             request_id,
                             reason,
-                            max_wait_secs =
-                                external.config.external_pool_local_rescue_max_wait_secs,
+                            max_wait_secs = external.config.account_local_rescue_max_wait_secs(),
                             "account preflight fallback failed with a rescuable error; retrying local credentials once"
                         );
                         usage_context.mark_local_rescue_after_account(
@@ -7498,8 +7497,7 @@ async fn handle_stream_request(
                                                     request_id,
                                                     reason,
                                                     max_wait_secs = external
-                                                        .config
-                                                        .external_pool_local_rescue_max_wait_secs,
+                                                        .config.account_local_rescue_max_wait_secs(),
                                                     "account route failed with a rescuable error; retrying local credentials once"
                                                 );
                                                 usage_context.mark_local_rescue_after_account(
@@ -7635,7 +7633,7 @@ async fn handle_stream_request(
                                             reason,
                                             max_wait_secs = external
                                                 .config
-                                                .external_pool_local_rescue_max_wait_secs,
+                                                .account_local_rescue_max_wait_secs(),
                                             "account route failed with a rescuable error; retrying local credentials once"
                                         );
                                         usage_context.mark_local_rescue_after_account(
@@ -9434,8 +9432,7 @@ async fn handle_non_stream_request(
                         tracing::warn!(
                             request_id,
                             reason,
-                            max_wait_secs =
-                                external.config.external_pool_local_rescue_max_wait_secs,
+                            max_wait_secs = external.config.account_local_rescue_max_wait_secs(),
                             "account preflight fallback failed with a rescuable error; retrying local credentials once"
                         );
                         usage_context.mark_local_rescue_after_account(
@@ -9737,8 +9734,7 @@ async fn handle_non_stream_request(
                                                     request_id,
                                                     reason,
                                                     max_wait_secs = external
-                                                        .config
-                                                        .external_pool_local_rescue_max_wait_secs,
+                                                        .config.account_local_rescue_max_wait_secs(),
                                                     "account route failed with a rescuable error; retrying local credentials once"
                                                 );
                                                 usage_context.mark_local_rescue_after_account(
@@ -9865,7 +9861,7 @@ async fn handle_non_stream_request(
                                             reason,
                                             max_wait_secs = external
                                                 .config
-                                                .external_pool_local_rescue_max_wait_secs,
+                                                .account_local_rescue_max_wait_secs(),
                                             "account route failed with a rescuable error; retrying local credentials once"
                                         );
                                         usage_context.mark_local_rescue_after_account(

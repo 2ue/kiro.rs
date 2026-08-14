@@ -63,6 +63,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Stream and handler internals now carry upstream metering values as `upstream_metering_units`; the old Kiro-named usage field remains only as the serialized/storage compatibility copy, and stream tests assert metering stays internal rather than leaking into downstream SSE.
 - New upstream account usage route subtypes now serialize with account terminology: `account_fallback_preflight`, `account_fallback_after_local_attempts`, `account_direct_policy`, `account_error` and `local_rescue_after_account`. Historical `external_*` and `local_rescue_after_external` values remain accepted and displayed as compatibility values in maintained UIs.
 - Anthropic parsed/raw fallback routing now uses `AccountFallbackContext` and account-named fallback/preflight helper methods. Local rescue preflight metadata now writes account fields while retaining old `external*` copies, and focused handler/account-only tests passed.
+- Local rescue fallback reasons now use account terminology (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`), and request-entry/local-rescue handler code reads account-named config accessors instead of external-pool fields.
 
 ## In Progress
 

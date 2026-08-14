@@ -192,7 +192,12 @@ pub trait AccountRuntimeConfigExt {
     }
 
     fn effective_account_dispatch_max_wait_secs(&self) -> u64;
-    fn legacy_local_rescue_max_wait_secs(&self) -> u64;
+    fn account_direct_policy_enabled(&self) -> bool;
+    fn account_local_rescue_enabled(&self) -> bool;
+    fn account_local_rescue_on_rate_limit(&self) -> bool;
+    fn account_local_rescue_on_timeout(&self) -> bool;
+    fn account_local_rescue_on_capacity(&self) -> bool;
+    fn account_local_rescue_max_wait_secs(&self) -> u64;
     fn clamped_account_request_timeout_secs(&self) -> u64;
     fn usage_projection_cost_floor_enabled(&self) -> bool;
     fn usage_projection_cost_floor_margin_percent(&self) -> u32;
@@ -211,7 +216,27 @@ impl AccountRuntimeConfigExt for AccountRuntimeConfig {
         self.effective_dispatch_max_wait_secs()
     }
 
-    fn legacy_local_rescue_max_wait_secs(&self) -> u64 {
+    fn account_direct_policy_enabled(&self) -> bool {
+        self.external_direct_policy_enabled
+    }
+
+    fn account_local_rescue_enabled(&self) -> bool {
+        self.external_pool_local_rescue_enabled
+    }
+
+    fn account_local_rescue_on_rate_limit(&self) -> bool {
+        self.external_pool_local_rescue_on_rate_limit
+    }
+
+    fn account_local_rescue_on_timeout(&self) -> bool {
+        self.external_pool_local_rescue_on_timeout
+    }
+
+    fn account_local_rescue_on_capacity(&self) -> bool {
+        self.external_pool_local_rescue_on_capacity
+    }
+
+    fn account_local_rescue_max_wait_secs(&self) -> u64 {
         self.external_pool_local_rescue_max_wait_secs
     }
 
