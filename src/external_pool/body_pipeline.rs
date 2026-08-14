@@ -1,6 +1,6 @@
 use super::{model_pipeline, *};
 use crate::anthropic::body_capabilities::{
-    ExternalBodyBytesPlan, ExternalBodyPlan, PayloadGuardStagePlan, RawModelStagePlan,
+    AccountBodyBytesPlan, AccountBodyPlan, PayloadGuardStagePlan, RawModelStagePlan,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -32,10 +32,10 @@ pub(super) fn prepare_request(
     );
 
     let (payload_guard, model, thinking_normalization) = match plan.bytes {
-        ExternalBodyBytesPlan::RawPassthrough { model } => {
+        AccountBodyBytesPlan::RawPassthrough { model } => {
             return prepare_raw_request(route, pool, model);
         }
-        ExternalBodyBytesPlan::Normalized {
+        AccountBodyBytesPlan::Normalized {
             payload_guard,
             model,
             thinking_normalization,
@@ -365,15 +365,15 @@ fn overlay_object_fields(
     serde_json::Value::Object(merged)
 }
 
-fn plan_for_pool(route: &ExternalRouteRequest, pool: &ExternalPool) -> ExternalBodyPlan {
+fn plan_for_pool(route: &ExternalRouteRequest, pool: &ExternalPool) -> AccountBodyPlan {
     match pool.request_body_mode {
         ExternalPoolRequestBodyMode::RawPassthrough => {
-            ExternalBodyPlan::raw(raw_model_stage_plan(pool.raw_model_mode))
+            AccountBodyPlan::raw(raw_model_stage_plan(pool.raw_model_mode))
         }
         ExternalPoolRequestBodyMode::Normalized => {
             let mut guard_config = route.payload_guard_initial_config;
             guard_config.enabled = route.payload_guard_external_enabled && guard_config.enabled;
-            ExternalBodyPlan::normalized(guard_config)
+            AccountBodyPlan::normalized(guard_config)
         }
     }
 }

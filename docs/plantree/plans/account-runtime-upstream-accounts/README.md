@@ -105,6 +105,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic router/AppState/request runtime now names the account-route payload guard switch as `payload_guard_account_enabled`; it still reads and writes the persisted `payloadGuardExternalEnabled` compatibility field when crossing existing config and legacy route boundaries. Maintained runtime UIs now describe the control as upstream-account payload shaping rather than Kiro/external-pool payload handling.
 - Maintained runtime configuration UIs now label the old external-pool runtime section as upstream-account routing, including routing mode/rules, retry/failover/cooldown, local rescue, usage diagnostics, prompt steering and payload/body shaping text. Compatibility state keys such as `externalPools` and `payloadGuardExternalEnabled` remain unchanged internally.
 - Local parsed body planning now uses local-upstream type names (`LocalUpstreamConverterPlan`, `LocalUpstreamBodyPlan`, `PreparedLocalUpstreamBody`) and local-upstream conversion logs. The concrete legacy `KiroRequest` payload type remains at the current local-provider boundary until the provider/body implementation is replaced.
+- Account-route body capability planning now uses account body plan names (`AccountBodyPlan`, `AccountBodyBytesPlan`, `AccountRaw`, `AccountNormalized`). The delegated legacy route executor still lives in `external_pool`, but body processing decisions no longer expose external-pool names at the capability-plan boundary.
 
 Last verified on 2026-08-14:
 
@@ -227,6 +228,10 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-test1 -- cargo test body_capabilities -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-body-plan-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-body-plan-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-body-plan-test1 -- cargo test body_capabilities -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-body-plan-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

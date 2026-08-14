@@ -6,8 +6,8 @@ use super::payload_guard::PayloadGuardConfig;
 pub(crate) enum BodyProcessingProfile {
     SharedParsedAnthropic,
     LocalCredential,
-    ExternalNormalized,
-    ExternalRaw,
+    AccountNormalized,
+    AccountRaw,
 }
 
 impl BodyProcessingProfile {
@@ -15,8 +15,8 @@ impl BodyProcessingProfile {
         match self {
             Self::SharedParsedAnthropic => "shared_parsed_anthropic",
             Self::LocalCredential => "local_credential",
-            Self::ExternalNormalized => "external_normalized",
-            Self::ExternalRaw => "external_raw",
+            Self::AccountNormalized => "account_normalized",
+            Self::AccountRaw => "account_raw",
         }
     }
 }
@@ -87,7 +87,7 @@ impl ParsedAnthropicBodyPlan {
     #[allow(dead_code)]
     pub(crate) fn raw_probe_only() -> Self {
         Self {
-            profile: BodyProcessingProfile::ExternalRaw,
+            profile: BodyProcessingProfile::AccountRaw,
             thinking: ThinkingStagePlan {
                 model_name_override: BodyStageState::Disabled,
                 trigger_mode: BodyStageState::Disabled,
@@ -191,7 +191,7 @@ pub(crate) enum RawModelStagePlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExternalBodyBytesPlan {
+pub(crate) enum AccountBodyBytesPlan {
     RawPassthrough {
         model: RawModelStagePlan,
     },
@@ -203,25 +203,25 @@ pub(crate) enum ExternalBodyBytesPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExternalBodyPlan {
+pub(crate) struct AccountBodyPlan {
     pub(crate) profile: BodyProcessingProfile,
-    pub(crate) bytes: ExternalBodyBytesPlan,
+    pub(crate) bytes: AccountBodyBytesPlan,
     pub(crate) usage_projection: BodyStageState,
 }
 
-impl ExternalBodyPlan {
+impl AccountBodyPlan {
     pub(crate) fn raw(model: RawModelStagePlan) -> Self {
         Self {
-            profile: BodyProcessingProfile::ExternalRaw,
-            bytes: ExternalBodyBytesPlan::RawPassthrough { model },
+            profile: BodyProcessingProfile::AccountRaw,
+            bytes: AccountBodyBytesPlan::RawPassthrough { model },
             usage_projection: BodyStageState::Enabled,
         }
     }
 
     pub(crate) fn normalized(payload_guard_config: PayloadGuardConfig) -> Self {
         Self {
-            profile: BodyProcessingProfile::ExternalNormalized,
-            bytes: ExternalBodyBytesPlan::Normalized {
+            profile: BodyProcessingProfile::AccountNormalized,
+            bytes: AccountBodyBytesPlan::Normalized {
                 payload_guard: PayloadGuardStagePlan::from_config(payload_guard_config),
                 model: BodyStageState::Enabled,
                 thinking_normalization: BodyStageState::Enabled,
@@ -261,7 +261,7 @@ mod tests {
     fn raw_probe_only_disables_parsed_body_work() {
         let plan = ParsedAnthropicBodyPlan::raw_probe_only();
 
-        assert_eq!(plan.profile, BodyProcessingProfile::ExternalRaw);
+        assert_eq!(plan.profile, BodyProcessingProfile::AccountRaw);
         assert!(!plan.thinking.model_name_override.is_enabled());
         assert!(!plan.thinking.trigger_mode.is_enabled());
         assert!(!plan.thinking.trace.is_enabled());
@@ -281,26 +281,26 @@ mod tests {
     }
 
     #[test]
-    fn external_raw_keeps_usage_separate_from_body_processing() {
-        let plan = ExternalBodyPlan::raw(RawModelStagePlan::ProbeOnly);
+    fn account_raw_keeps_usage_separate_from_body_processing() {
+        let plan = AccountBodyPlan::raw(RawModelStagePlan::ProbeOnly);
 
-        assert_eq!(plan.profile, BodyProcessingProfile::ExternalRaw);
+        assert_eq!(plan.profile, BodyProcessingProfile::AccountRaw);
         assert!(plan.usage_projection.is_enabled());
         assert_eq!(
             plan.bytes,
-            ExternalBodyBytesPlan::RawPassthrough {
+            AccountBodyBytesPlan::RawPassthrough {
                 model: RawModelStagePlan::ProbeOnly
             }
         );
     }
 
     #[test]
-    fn external_normalized_mounts_payload_guard_and_model_stages() {
-        let plan = ExternalBodyPlan::normalized(payload_guard_config(false));
+    fn account_normalized_mounts_payload_guard_and_model_stages() {
+        let plan = AccountBodyPlan::normalized(payload_guard_config(false));
 
-        assert_eq!(plan.profile, BodyProcessingProfile::ExternalNormalized);
+        assert_eq!(plan.profile, BodyProcessingProfile::AccountNormalized);
         assert!(plan.usage_projection.is_enabled());
-        let ExternalBodyBytesPlan::Normalized {
+        let AccountBodyBytesPlan::Normalized {
             payload_guard,
             model,
             thinking_normalization,
