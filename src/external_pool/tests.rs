@@ -6642,7 +6642,7 @@ async fn external_pool_atomic_acquire_honors_pool_cooldown_and_fails_closed_on_b
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_same_pool_retry_runs_even_when_pool_attempt_budget_is_one_for_five_rounds() {
+async fn account_same_account_retry_runs_even_when_account_attempt_budget_is_one_for_five_rounds() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -6651,7 +6651,13 @@ async fn external_pool_same_pool_retry_runs_even_when_pool_attempt_budget_is_one
         fake_external_error_body("temporary upstream failure"),
     )
     .await;
-    create_messages_pool(&postgres, "same-pool-budget-primary", 1, &failing.base_url).await;
+    create_messages_pool(
+        &postgres,
+        "same-account-budget-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
 
     let config = ExternalPoolsConfig {
         external_pools_enabled: true,
@@ -6663,8 +6669,8 @@ async fn external_pool_same_pool_retry_runs_even_when_pool_attempt_budget_is_one
         ..ExternalPoolsConfig::default()
     };
     let mut route = test_route("claude-sonnet-4-6");
-    route.request_id = "req_same_pool_retry_budget".to_string();
-    route.error_id = "err_same_pool_retry_budget".to_string();
+    route.request_id = "req_same_account_retry_budget".to_string();
+    route.error_id = "err_same_account_retry_budget".to_string();
     route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
 
     let outcome = timeout(
@@ -6672,7 +6678,7 @@ async fn external_pool_same_pool_retry_runs_even_when_pool_attempt_budget_is_one
         manager.forward_with_failover_result(config, route),
     )
     .await
-    .expect("same-pool retry should finish");
+    .expect("same-account retry should finish");
     assert!(
         matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
         "single permanently failing pool should still end with a final error"
@@ -6680,14 +6686,14 @@ async fn external_pool_same_pool_retry_runs_even_when_pool_attempt_budget_is_one
     assert_eq!(
         failing.snapshot(),
         2,
-        "same-pool retry must not be blocked by the one-pool cross-pool attempt budget"
+        "same-account retry must not be blocked by the one-account cross-account attempt budget"
     );
 
     postgres.drop_test_schema().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configured_status() {
+async fn account_same_account_retry_precedes_cross_account_failover_for_configured_status() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -6701,14 +6707,14 @@ async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configur
             .await;
     create_messages_pool(
         &postgres,
-        "same-pool-before-failover-primary",
+        "same-account-before-failover-primary",
         1,
         &failing.base_url,
     )
     .await;
     create_messages_pool(
         &postgres,
-        "same-pool-before-failover-secondary",
+        "same-account-before-failover-secondary",
         2,
         &succeeding.base_url,
     )
@@ -6724,8 +6730,8 @@ async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configur
         ..ExternalPoolsConfig::default()
     };
     let mut route = test_route("claude-sonnet-4-6");
-    route.request_id = "req_same_pool_before_failover".to_string();
-    route.error_id = "err_same_pool_before_failover".to_string();
+    route.request_id = "req_same_account_before_failover".to_string();
+    route.error_id = "err_same_account_before_failover".to_string();
     route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
 
     let response = match timeout(
@@ -6733,7 +6739,7 @@ async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configur
         manager.forward_with_failover_result(config, route),
     )
     .await
-    .expect("same-pool retry failover should finish")
+    .expect("same-account retry failover should finish")
     {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(error) => {
@@ -6751,19 +6757,19 @@ async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configur
     assert_eq!(
         failing.snapshot(),
         2,
-        "configured status should retry the selected pool before switching"
+        "configured status should retry the selected account before switching"
     );
     assert_eq!(
         succeeding.snapshot(),
         1,
-        "secondary pool should be tried after same-pool retry is exhausted"
+        "secondary account should be tried after same-account retry is exhausted"
     );
 
     postgres.drop_test_schema().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_same_pool_retry_is_capped_to_one_before_cross_pool_failover() {
+async fn account_same_account_retry_is_capped_to_one_before_cross_account_failover() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -6775,10 +6781,16 @@ async fn external_pool_same_pool_retry_is_capped_to_one_before_cross_pool_failov
     let succeeding =
         ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("capped-ok"))
             .await;
-    create_messages_pool(&postgres, "same-pool-capped-primary", 1, &failing.base_url).await;
     create_messages_pool(
         &postgres,
-        "same-pool-capped-secondary",
+        "same-account-capped-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "same-account-capped-secondary",
         2,
         &succeeding.base_url,
     )
@@ -6794,8 +6806,8 @@ async fn external_pool_same_pool_retry_is_capped_to_one_before_cross_pool_failov
         ..ExternalPoolsConfig::default()
     };
     let mut route = test_route("claude-sonnet-4-6");
-    route.request_id = "req_same_pool_retry_capped".to_string();
-    route.error_id = "err_same_pool_retry_capped".to_string();
+    route.request_id = "req_same_account_retry_capped".to_string();
+    route.error_id = "err_same_account_retry_capped".to_string();
     route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
 
     let response = match timeout(
@@ -6803,18 +6815,18 @@ async fn external_pool_same_pool_retry_is_capped_to_one_before_cross_pool_failov
         manager.forward_with_failover_result(config, route),
     )
     .await
-    .expect("capped same-pool failover should finish")
+    .expect("capped same-account failover should finish")
     {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(error) => {
-            panic!("capped same-pool retry should still fail over: {error:?}")
+            panic!("capped same-account retry should still fail over: {error:?}")
         }
     };
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         failing.snapshot(),
         2,
-        "same-pool retry must be capped to one even when config allows more"
+        "same-account retry must be capped to one even when config allows more"
     );
     assert_eq!(succeeding.snapshot(), 1);
 
@@ -6822,7 +6834,7 @@ async fn external_pool_same_pool_retry_is_capped_to_one_before_cross_pool_failov
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
+async fn account_same_account_retry_skips_statuses_not_in_config() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -6833,19 +6845,19 @@ async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
     .await;
     let succeeding = ExternalMessagesFakeServer::start(
         StatusCode::OK,
-        fake_external_success_body("no-same-pool-retry-ok"),
+        fake_external_success_body("no-same-account-retry-ok"),
     )
     .await;
     create_messages_pool(
         &postgres,
-        "same-pool-status-filter-primary",
+        "same-account-status-filter-primary",
         1,
         &failing.base_url,
     )
     .await;
     create_messages_pool(
         &postgres,
-        "same-pool-status-filter-secondary",
+        "same-account-status-filter-secondary",
         2,
         &succeeding.base_url,
     )
@@ -6861,8 +6873,8 @@ async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
         ..ExternalPoolsConfig::default()
     };
     let mut route = test_route("claude-sonnet-4-6");
-    route.request_id = "req_same_pool_status_filter".to_string();
-    route.error_id = "err_same_pool_status_filter".to_string();
+    route.request_id = "req_same_account_status_filter".to_string();
+    route.error_id = "err_same_account_status_filter".to_string();
     route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
 
     let response = match timeout(
@@ -6874,14 +6886,16 @@ async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
     {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(error) => {
-            panic!("unconfigured status should switch pools without same-pool retry: {error:?}")
+            panic!(
+                "unconfigured status should switch accounts without same-account retry: {error:?}"
+            )
         }
     };
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         failing.snapshot(),
         1,
-        "status not listed in 同池重试状态码 must not retry the same pool"
+        "status not listed in same-account retry status codes must not retry the same account"
     );
     assert_eq!(succeeding.snapshot(), 1);
 
@@ -6889,7 +6903,7 @@ async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_cross_pool_retry_status_codes_can_stop_failover() {
+async fn account_cross_account_retry_status_codes_can_stop_failover() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -6903,14 +6917,14 @@ async fn external_pool_cross_pool_retry_status_codes_can_stop_failover() {
             .await;
     create_messages_pool(
         &postgres,
-        "cross-pool-status-filter-primary",
+        "cross-account-status-filter-primary",
         1,
         &failing.base_url,
     )
     .await;
     create_messages_pool(
         &postgres,
-        "cross-pool-status-filter-secondary",
+        "cross-account-status-filter-secondary",
         2,
         &succeeding.base_url,
     )
@@ -6925,8 +6939,8 @@ async fn external_pool_cross_pool_retry_status_codes_can_stop_failover() {
         ..ExternalPoolsConfig::default()
     };
     let mut route = test_route("claude-sonnet-4-6");
-    route.request_id = "req_cross_pool_status_filter".to_string();
-    route.error_id = "err_cross_pool_status_filter".to_string();
+    route.request_id = "req_cross_account_status_filter".to_string();
+    route.error_id = "err_cross_account_status_filter".to_string();
     route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
 
     let outcome = timeout(
@@ -6934,10 +6948,10 @@ async fn external_pool_cross_pool_retry_status_codes_can_stop_failover() {
         manager.forward_with_failover_result(config, route),
     )
     .await
-    .expect("cross-pool status filtering should finish");
+    .expect("cross-account status filtering should finish");
     assert!(
         matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
-        "a status excluded from cross-pool retry must fail without switching pools"
+        "a status excluded from cross-account retry must fail without switching accounts"
     );
     assert_eq!(failing.snapshot(), 1);
     assert_eq!(succeeding.snapshot(), 0);
@@ -6946,7 +6960,7 @@ async fn external_pool_cross_pool_retry_status_codes_can_stop_failover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_terminal_account_error_skips_same_pool_retry_and_fails_over() {
+async fn account_terminal_error_skips_same_account_retry_and_fails_over() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -6996,7 +7010,7 @@ async fn external_pool_terminal_account_error_skips_same_pool_retry_and_fails_ov
     {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(error) => {
-            panic!("terminal account error should fail over to the next pool: {error:?}")
+            panic!("terminal account error should fail over to the next account: {error:?}")
         }
     };
     assert_eq!(response.status(), StatusCode::OK);
@@ -7974,7 +7988,7 @@ async fn external_pool_mock_error_matrix_limits_repeated_failures_and_preserves_
     let bad_wave2_hits = sustained_wave2_hits.saturating_add(intermittent_wave2_hits);
     assert!(
         sustained_wave2_hits <= 4,
-        "soft penalty plus one same-pool cap should stop repeated hits on sustained bad pool; got {sustained_wave2_hits}"
+        "soft penalty plus one same-account cap should stop repeated hits on sustained bad account; got {sustained_wave2_hits}"
     );
     assert!(
         intermittent_wave2_hits <= 32,

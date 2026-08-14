@@ -111,6 +111,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account-route body/model/retry pipeline diagnostics now use account wording for normalized/raw payload guard, model rewrite, model mapping and model cooldown errors while the delegated executor types remain under the legacy `external_pool` module.
 - Account-route model processing helpers now use account names (`account_outbound_model_for_raw`, `process_account_model`, `account_model_processing_error`) inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while compatibility config fields such as `external_pool_same_pool_*` remain unchanged.
+- Retry behavior tests now use same-account/cross-account names for the core retry/failover cases while keeping compatibility config field names in fixtures.
 
 Last verified on 2026-08-14:
 
@@ -259,6 +260,10 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-retry-helper-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-retry-helper-test1 -- cargo test same_account_retry -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-retry-helper-test2 -- cargo test external_pool_same_pool_retry -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-retry-tests-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-retry-tests-test1 -- cargo test account_same_account_retry -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-retry-tests-test2 -- cargo test account_cross_account -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-retry-tests-test3 -- cargo test account_terminal_error -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
