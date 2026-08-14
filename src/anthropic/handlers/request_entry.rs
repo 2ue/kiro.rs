@@ -27,12 +27,12 @@ pub(super) async fn handle_messages_endpoint(
     let shared_dispatch_max_wait_secs = local_dispatch_max_wait_secs
         .max(
             runtime_config
-                .external_pools
+                .account_runtime
                 .effective_dispatch_max_wait_secs(),
         )
         .max(
             runtime_config
-                .external_pools
+                .account_runtime
                 .external_pool_local_rescue_max_wait_secs,
         );
     inference_attempt_budget.set_dispatch_deadline_after(std::time::Duration::from_secs(
@@ -251,9 +251,9 @@ fn maybe_local_pool_unavailable_fast_fail_response(
         .map(str::trim)
         .filter(|model| !model.is_empty())?;
 
-    // If external pools are globally enabled and wired, the normalized external fallback path may
-    // still be eligible after typed parsing. Do not preempt it with a local-only response.
-    if runtime_config.external_pools.external_pools_enabled
+    // If the account runtime is enabled and wired, the normalized account route may still be
+    // eligible after typed parsing. Do not preempt it with a local-only response.
+    if runtime_config.account_runtime.external_pools_enabled
         && state.account_runtime_manager.is_some()
     {
         return None;

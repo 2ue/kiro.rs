@@ -859,7 +859,7 @@ struct RequestRuntimeConfig {
     prompt_steering: PromptSteeringConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
-    external_pools: AccountRuntimeConfig,
+    account_runtime: AccountRuntimeConfig,
 }
 
 impl RequestRuntimeConfig {
@@ -905,7 +905,7 @@ impl RequestRuntimeConfig {
             prompt_steering: state.prompt_steering.clone().normalized(),
             missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
-            external_pools: state.external_pools.clone(),
+            account_runtime: state.account_runtime.clone(),
         }
     }
 
@@ -976,7 +976,7 @@ impl RequestRuntimeConfig {
             prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
-            external_pools: config.account_runtime_config().clone(),
+            account_runtime: config.account_runtime_config().clone(),
         }
     }
 
@@ -1250,7 +1250,7 @@ fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
         .unwrap_or_else(|| state.image_processing.normalized())
 }
 
-fn external_pool_enabled_for_endpoint(config: &AccountRuntimeConfig, endpoint: &str) -> bool {
+fn account_runtime_enabled_for_endpoint(config: &AccountRuntimeConfig, endpoint: &str) -> bool {
     config.external_pools_enabled && config.external_pool_route_allowed(endpoint)
 }
 
@@ -1277,8 +1277,8 @@ async fn maybe_raw_external_direct_response(
         .map(|provider| request_runtime_config(state, provider))
         .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(state));
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
-    let config = runtime_config.external_pools.clone();
-    if !external_pool_enabled_for_endpoint(&config, endpoint) {
+    let config = runtime_config.account_runtime.clone();
+    if !account_runtime_enabled_for_endpoint(&config, endpoint) {
         return None;
     }
     if !raw_external_pool_has_eligible_pool(&manager, &config, endpoint, raw_probe.model.as_deref())
@@ -1345,9 +1345,9 @@ async fn maybe_raw_external_preflight_response(
     let manager = state.account_runtime_manager.clone()?;
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
-    let config = runtime_config.external_pools.clone();
+    let config = runtime_config.account_runtime.clone();
     if !config.local_pool_preflight_enabled
-        || !external_pool_enabled_for_endpoint(&config, endpoint)
+        || !account_runtime_enabled_for_endpoint(&config, endpoint)
     {
         return None;
     }
@@ -1627,8 +1627,8 @@ fn build_external_fallback_context(
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Option<ExternalFallbackContext> {
     let manager = state.account_runtime_manager.clone()?;
-    let config = runtime_config.external_pools.clone();
-    if !external_pool_enabled_for_endpoint(&config, endpoint) {
+    let config = runtime_config.account_runtime.clone();
+    if !account_runtime_enabled_for_endpoint(&config, endpoint) {
         return None;
     }
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);

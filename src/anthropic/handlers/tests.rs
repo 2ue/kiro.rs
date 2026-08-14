@@ -992,23 +992,22 @@ fn websearch_handler_test_router_with_external_options(
     config.kiro_upstream_base_url = Some(kiro_base_url.to_string());
     config.kiro_upstream_response_timeout_secs = 1;
     config.credential_retry_max_attempts = 0;
-    config.external_pools.external_pools_enabled = true;
-    config.external_pools.external_direct_policy_enabled = external_direct_policy_enabled;
-    config.external_pools.local_pool_preflight_enabled = local_pool_preflight_enabled;
-    config.external_pools.fallback_on_no_available_credentials = true;
-    config.external_pools.fallback_on_local_capacity_exhausted = true;
-    config.external_pools.fallback_on_scheduler_redis_degraded = true;
-    config.external_pools.fallback_on_local_transient_exhausted = true;
-    config
-        .external_pools
-        .external_pool_global_max_concurrent_requests = 20;
-    config.external_pools.external_pool_max_queued_requests = 0;
-    config.external_pools.external_pool_retry_max_attempts = 0;
-    config.external_pools.external_pool_request_timeout_secs = 10;
-    config
-        .external_pools
-        .external_pool_stream_request_timeout_secs = 10;
-    config.external_pools.external_pool_stream_idle_timeout_secs = 10;
+    {
+        let account_runtime = config.account_runtime_config_mut();
+        account_runtime.external_pools_enabled = true;
+        account_runtime.external_direct_policy_enabled = external_direct_policy_enabled;
+        account_runtime.local_pool_preflight_enabled = local_pool_preflight_enabled;
+        account_runtime.fallback_on_no_available_credentials = true;
+        account_runtime.fallback_on_local_capacity_exhausted = true;
+        account_runtime.fallback_on_scheduler_redis_degraded = true;
+        account_runtime.fallback_on_local_transient_exhausted = true;
+        account_runtime.external_pool_global_max_concurrent_requests = 20;
+        account_runtime.external_pool_max_queued_requests = 0;
+        account_runtime.external_pool_retry_max_attempts = 0;
+        account_runtime.external_pool_request_timeout_secs = 10;
+        account_runtime.external_pool_stream_request_timeout_secs = 10;
+        account_runtime.external_pool_stream_idle_timeout_secs = 10;
+    }
 
     let manager = Arc::new(
         MultiTokenManager::new(config.clone(), credentials, None, None, false)
@@ -1046,17 +1045,16 @@ fn account_only_handler_test_router(
     external_pool_manager: Arc<ExternalPoolManager>,
 ) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
-    config.external_pools.external_pools_enabled = true;
-    config
-        .external_pools
-        .external_pool_global_max_concurrent_requests = 20;
-    config.external_pools.external_pool_max_queued_requests = 0;
-    config.external_pools.external_pool_retry_max_attempts = 0;
-    config.external_pools.external_pool_request_timeout_secs = 10;
-    config
-        .external_pools
-        .external_pool_stream_request_timeout_secs = 10;
-    config.external_pools.external_pool_stream_idle_timeout_secs = 10;
+    {
+        let account_runtime = config.account_runtime_config_mut();
+        account_runtime.external_pools_enabled = true;
+        account_runtime.external_pool_global_max_concurrent_requests = 20;
+        account_runtime.external_pool_max_queued_requests = 0;
+        account_runtime.external_pool_retry_max_attempts = 0;
+        account_runtime.external_pool_request_timeout_secs = 10;
+        account_runtime.external_pool_stream_request_timeout_secs = 10;
+        account_runtime.external_pool_stream_idle_timeout_secs = 10;
+    }
 
     let usage_recorder = Arc::new(UsageRecorder::new(1_000));
     let router = create_router_with_provider(
@@ -5540,7 +5538,7 @@ fn runtime_config_for_payload_guard(
         prompt_steering: PromptSteeringConfig::default(),
         missing_max_tokens: MissingMaxTokensConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
-        external_pools: AccountRuntimeConfig::default(),
+        account_runtime: AccountRuntimeConfig::default(),
     }
 }
 
@@ -10769,32 +10767,38 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
 }
 
 #[test]
-fn external_pool_endpoint_gate_applies_global_enable_and_route_policy() {
+fn account_runtime_endpoint_gate_applies_global_enable_and_route_policy() {
     let mut config = AccountRuntimeConfig::default();
 
-    assert!(!external_pool_enabled_for_endpoint(
+    assert!(!account_runtime_enabled_for_endpoint(
         &config,
         "/cc/v1/messages"
     ));
 
     config.external_pools_enabled = true;
-    assert!(external_pool_enabled_for_endpoint(
+    assert!(account_runtime_enabled_for_endpoint(
         &config,
         "/cc/v1/messages"
     ));
 
     config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::DenyList;
     config.external_pool_route_rules = vec!["/cc".to_string()];
-    assert!(!external_pool_enabled_for_endpoint(
+    assert!(!account_runtime_enabled_for_endpoint(
         &config,
         "/cc/v1/messages"
     ));
-    assert!(external_pool_enabled_for_endpoint(&config, "/v1/messages"));
+    assert!(account_runtime_enabled_for_endpoint(
+        &config,
+        "/v1/messages"
+    ));
 
     config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::AllowList;
     config.external_pool_route_rules = vec!["/dfcache/team-a".to_string()];
-    assert!(!external_pool_enabled_for_endpoint(&config, "/v1/messages"));
-    assert!(external_pool_enabled_for_endpoint(
+    assert!(!account_runtime_enabled_for_endpoint(
+        &config,
+        "/v1/messages"
+    ));
+    assert!(account_runtime_enabled_for_endpoint(
         &config,
         "/dfcache/team-a/v1/messages"
     ));

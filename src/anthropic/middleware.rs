@@ -120,8 +120,8 @@ pub struct AppState {
     pub missing_max_tokens: MissingMaxTokensConfig,
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
-    /// 外部备用号池和直连策略配置。
-    pub external_pools: AccountRuntimeConfig,
+    /// 上游账号运行时策略配置。
+    pub account_runtime: AccountRuntimeConfig,
     /// 上游账号运行时管理器。
     pub account_runtime_manager: Option<Arc<AccountRuntimeManager>>,
 }
@@ -182,7 +182,7 @@ impl AppState {
             prompt_steering: PromptSteeringConfig::default(),
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
-            external_pools: AccountRuntimeConfig::default(),
+            account_runtime: AccountRuntimeConfig::default(),
             account_runtime_manager: None,
         }
     }
@@ -321,7 +321,7 @@ impl AppState {
     }
 
     pub fn with_account_runtime_config(mut self, account_runtime: AccountRuntimeConfig) -> Self {
-        self.external_pools = account_runtime;
+        self.account_runtime = account_runtime;
         self
     }
 }
