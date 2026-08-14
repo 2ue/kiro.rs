@@ -106,6 +106,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained runtime configuration UIs now label the old external-pool runtime section as upstream-account routing, including routing mode/rules, retry/failover/cooldown, local rescue, usage diagnostics, prompt steering and payload/body shaping text. Compatibility state keys such as `externalPools` and `payloadGuardExternalEnabled` remain unchanged internally.
 - Local parsed body planning now uses local-upstream type names (`LocalUpstreamConverterPlan`, `LocalUpstreamBodyPlan`, `PreparedLocalUpstreamBody`) and local-upstream conversion logs. The concrete legacy `KiroRequest` payload type remains at the current local-provider boundary until the provider/body implementation is replaced.
 - Account-route body capability planning now uses account body plan names (`AccountBodyPlan`, `AccountBodyBytesPlan`, `AccountRaw`, `AccountNormalized`). The delegated legacy route executor still lives in `external_pool`, but body processing decisions no longer expose external-pool names at the capability-plan boundary.
+- Anthropic upstream error-envelope helpers now use account-neutral official-upstream naming (`official_upstream_public_message` / `official_upstream_public_error`) while retaining the existing sensitive/internal-term filtering behavior.
 
 Last verified on 2026-08-14:
 
@@ -232,6 +233,9 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-body-plan-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-body-plan-test1 -- cargo test body_capabilities -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-body-plan-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh upstream-public-envelope-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-public-envelope-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh upstream-public-envelope-test1 -- cargo test official_upstream_public_message -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

@@ -4953,7 +4953,7 @@ fn provider_public_error_for_message(
         );
     }
 
-    if let Some(public_error) = official_kiro_upstream_public_error(err_str, error_id) {
+    if let Some(public_error) = official_upstream_public_error(err_str, error_id) {
         return public_error;
     }
 
@@ -5026,11 +5026,11 @@ fn provider_public_error_for_message(
     )
 }
 
-fn official_kiro_upstream_public_error(
+fn official_upstream_public_error(
     err_str: &str,
     error_id: Option<&str>,
 ) -> Option<UsagePublicError> {
-    let message = envelope::kiro_official_upstream_message(err_str)?;
+    let message = envelope::official_upstream_public_message(err_str)?;
     let lower = err_str.to_ascii_lowercase();
     let (status, error_type) = if lower.contains("400 bad request") || lower.contains("bad_request")
     {
@@ -5210,10 +5210,10 @@ fn map_provider_error(
         );
     }
 
-    if let Some(public_error) = official_kiro_upstream_public_error(&err_str, error_id) {
+    if let Some(public_error) = official_upstream_public_error(&err_str, error_id) {
         log_provider_warning_with_hint(
             &err_str,
-            "请求被 Kiro 官方上游拒绝，返回上游结构化错误信息",
+            "请求被上游账号拒绝，返回上游结构化错误信息",
             error_id,
         );
         let status =

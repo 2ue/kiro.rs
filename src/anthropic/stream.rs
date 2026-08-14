@@ -2590,7 +2590,7 @@ impl StreamContext {
     }
 
     fn public_stream_error_message(&self, error_type: &str, raw_message: String) -> String {
-        if let Some(message) = envelope::kiro_official_upstream_message(&raw_message) {
+        if let Some(message) = envelope::official_upstream_public_message(&raw_message) {
             return if let Some(error_id) = self.stream_error_id.as_deref() {
                 envelope::public_message_with_error_id(&message, error_id)
             } else {

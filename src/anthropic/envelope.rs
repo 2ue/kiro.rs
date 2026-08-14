@@ -37,7 +37,7 @@ pub(crate) fn public_rate_limit_message(retry_after_secs: Option<u64>) -> String
     }
 }
 
-pub(crate) fn kiro_official_upstream_message(raw: &str) -> Option<String> {
+pub(crate) fn official_upstream_public_message(raw: &str) -> Option<String> {
     let value = extract_json_value(raw)?;
     let message = json_string_at(
         &value,
@@ -355,8 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn kiro_official_upstream_message_extracts_json_body_without_internal_prefix() {
-        let message = kiro_official_upstream_message(
+    fn official_upstream_public_message_extracts_json_body_without_internal_prefix() {
+        let message = official_upstream_public_message(
             r#"流式 API 请求失败（账号 #170 test）: 400 Bad Request {"message":"Bedrock error message: Could not process image","reason":"IMAGE_FORMAT_UNSUPPORTED"}"#,
         )
         .expect("official message");
@@ -370,9 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_official_upstream_message_rejects_sensitive_json_message() {
+    fn official_upstream_public_message_rejects_sensitive_json_message() {
         assert!(
-            kiro_official_upstream_message(
+            official_upstream_public_message(
                 r#"{"message":"The bearer token included in the request is invalid"}"#
             )
             .is_none()
@@ -380,9 +380,9 @@ mod tests {
     }
 
     #[test]
-    fn kiro_official_upstream_message_rejects_kiro_branded_json_message() {
+    fn official_upstream_public_message_rejects_internal_branded_json_message() {
         assert!(
-            kiro_official_upstream_message(
+            official_upstream_public_message(
                 r#"{"message":"Kiro service rejected this model request"}"#
             )
             .is_none()
@@ -390,8 +390,8 @@ mod tests {
     }
 
     #[test]
-    fn kiro_official_upstream_message_drops_forbidden_reason_without_leaking_it() {
-        let message = kiro_official_upstream_message(
+    fn official_upstream_public_message_drops_forbidden_reason_without_leaking_it() {
+        let message = official_upstream_public_message(
             r#"{"message":"The requested model is temporarily unavailable.","reason":"KIRO_MODEL_GATEWAY"}"#,
         )
         .expect("safe message remains available");
