@@ -130,7 +130,7 @@ function toneForRisk(criticalCount: number, warningCount: number): 'default' | '
   return 'success'
 }
 
-export function ExternalPoolRiskPage() {
+export function AccountRiskPage() {
   const [windowKey, setWindowKey] = useState('last24h')
   const [warningInput, setWarningInput] = useState(String(DEFAULT_WARNING_TOKENS))
   const [criticalInput, setCriticalInput] = useState(String(DEFAULT_CRITICAL_TOKENS))
