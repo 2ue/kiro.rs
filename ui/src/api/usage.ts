@@ -7,6 +7,8 @@ import type {
   ModelPricingStatus,
   UpsertManualModelRequest,
   UsageAccountBillingByAccount,
+  UsageAccountRiskQuery,
+  UsageAccountRiskResponse,
   UsageDashboardAccountBillingResponse,
   UsageDashboardResponse,
   UsageDashboardBreakdownResponse,
@@ -40,6 +42,85 @@ function usageRiskQueryParams(query: UsageExternalPoolRiskQuery): Record<string,
   return {
     ...query,
     ...(accountId ? { accountId, externalPoolId: accountId } : {}),
+  }
+}
+
+function accountUsageRiskQueryParams(query: UsageAccountRiskQuery): Record<string, unknown> {
+  return {
+    ...query,
+    ...(query.accountId ? { accountId: query.accountId } : {}),
+  }
+}
+
+function accountRiskReason(reason: string): string {
+  return reason === 'missing_external_pool_billing' ? 'missing_account_billing' : reason
+}
+
+function normalizeAccountRiskResponse(
+  data: UsageAccountRiskResponse & Partial<UsageExternalPoolRiskResponse>
+): UsageAccountRiskResponse {
+  const samples = data.samples as Array<
+    UsageAccountRiskResponse['samples'][number] | UsageExternalPoolRiskResponse['samples'][number]
+  >
+
+  return {
+    generatedAt: data.generatedAt,
+    timezone: data.timezone,
+    window: data.window,
+    thresholds: data.thresholds,
+    filters: data.filters.accountId !== undefined
+      ? data.filters
+      : {
+          accountId: data.filters.poolId,
+          endpoint: data.filters.endpoint,
+          model: data.filters.model,
+          stream: data.filters.stream,
+        },
+    totals: data.totals.missingAccountBillingRecords !== undefined
+      ? data.totals
+      : {
+          ...data.totals,
+          missingAccountBillingRecords: data.totals.missingExternalPoolBillingRecords ?? 0,
+        },
+    rawCache: data.rawCache,
+    reportedCache: data.reportedCache,
+    cost: data.cost,
+    buckets: data.buckets,
+    byAccount: data.byAccount ?? data.byPool ?? [],
+    byPath: data.byPath,
+    byModel: data.byModel,
+    samples: samples.map((sample): UsageAccountRiskResponse['samples'][number] => {
+      if ('accountBillingPresent' in sample) return sample
+      return {
+        id: sample.id,
+        createdAt: sample.createdAt,
+        endpoint: sample.endpoint,
+        stream: sample.stream,
+        model: sample.model,
+        status: sample.status,
+        accountId: sample.externalPoolId,
+        accountName: sample.externalPoolName,
+        pricingModel: sample.pricingModel,
+        usageProjectionMode: sample.usageProjectionMode,
+        accountBillingPresent: sample.externalPoolBillingPresent,
+        costFloorApplied: sample.costFloorApplied,
+        rawInputTokens: sample.rawInputTokens,
+        rawOutputTokens: sample.rawOutputTokens,
+        rawCacheReadInputTokens: sample.rawCacheReadInputTokens,
+        rawCacheCreationInputTokens: sample.rawCacheCreationInputTokens,
+        reportedInputTokens: sample.reportedInputTokens,
+        reportedOutputTokens: sample.reportedOutputTokens,
+        reportedCacheReadInputTokens: sample.reportedCacheReadInputTokens,
+        reportedCacheCreationInputTokens: sample.reportedCacheCreationInputTokens,
+        rawCostUsd: sample.rawCostUsd,
+        reportedCostUsd: sample.reportedCostUsd,
+        targetCostUsd: sample.targetCostUsd,
+        lossUsd: sample.lossUsd,
+        targetGapUsd: sample.targetGapUsd,
+        costRatio: sample.costRatio,
+        riskReasons: sample.riskReasons.map(accountRiskReason),
+      }
+    }),
   }
 }
 
@@ -156,12 +237,12 @@ export async function getUsageDashboardExternalPoolRisk(
 }
 
 export async function getUsageDashboardAccountRisk(
-  query: UsageExternalPoolRiskQuery = {}
-): Promise<UsageExternalPoolRiskResponse> {
-  const { data } = await api.get<UsageExternalPoolRiskResponse>('/usage-dashboard/account-risk', {
-    params: usageRiskQueryParams(query),
+  query: UsageAccountRiskQuery = {}
+): Promise<UsageAccountRiskResponse> {
+  const { data } = await api.get<UsageAccountRiskResponse & Partial<UsageExternalPoolRiskResponse>>('/usage-dashboard/account-risk', {
+    params: accountUsageRiskQueryParams(query),
   })
-  return data
+  return normalizeAccountRiskResponse(data)
 }
 
 export async function clearUsageRecords(): Promise<UsageCleanupStatusResponse> {

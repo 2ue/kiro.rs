@@ -999,6 +999,46 @@ pub struct UsageExternalPoolRiskResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageAccountRiskResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub window: UsageExternalPoolRiskWindow,
+    pub thresholds: UsageExternalPoolRiskThresholds,
+    pub filters: UsageAccountRiskFilters,
+    pub totals: UsageAccountRiskTotals,
+    pub raw_cache: UsageExternalPoolRiskCacheStats,
+    pub reported_cache: UsageExternalPoolRiskCacheStats,
+    pub cost: UsageExternalPoolRiskCostStats,
+    pub buckets: Vec<UsageExternalPoolRiskBucket>,
+    pub by_account: Vec<UsageExternalPoolRiskGroup>,
+    pub by_path: Vec<UsageExternalPoolRiskGroup>,
+    pub by_model: Vec<UsageExternalPoolRiskGroup>,
+    pub samples: Vec<UsageAccountRiskSample>,
+}
+
+impl From<UsageExternalPoolRiskResponse> for UsageAccountRiskResponse {
+    fn from(response: UsageExternalPoolRiskResponse) -> Self {
+        Self {
+            generated_at: response.generated_at,
+            timezone: response.timezone,
+            window: response.window,
+            thresholds: response.thresholds,
+            filters: response.filters.into(),
+            totals: response.totals.into(),
+            raw_cache: response.raw_cache,
+            reported_cache: response.reported_cache,
+            cost: response.cost,
+            buckets: response.buckets,
+            by_account: response.by_pool,
+            by_path: response.by_path,
+            by_model: response.by_model,
+            samples: response.samples.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageExternalPoolRiskWindow {
     pub key: String,
     pub label: String,
@@ -1031,6 +1071,30 @@ pub struct UsageExternalPoolRiskFilters {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageAccountRiskFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+impl From<UsageExternalPoolRiskFilters> for UsageAccountRiskFilters {
+    fn from(filters: UsageExternalPoolRiskFilters) -> Self {
+        Self {
+            account_id: filters.pool_id,
+            endpoint: filters.endpoint,
+            model: filters.model,
+            stream: filters.stream,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageExternalPoolRiskTotals {
     pub records: usize,
     pub success_records: usize,
@@ -1043,6 +1107,40 @@ pub struct UsageExternalPoolRiskTotals {
     pub reported_usage_records: usize,
     pub missing_external_pool_billing_records: usize,
     pub output_zero_records: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAccountRiskTotals {
+    pub records: usize,
+    pub success_records: usize,
+    pub error_records: usize,
+    pub stream_records: usize,
+    pub non_stream_records: usize,
+    pub priced_records: usize,
+    pub unpriced_records: usize,
+    pub raw_usage_records: usize,
+    pub reported_usage_records: usize,
+    pub missing_account_billing_records: usize,
+    pub output_zero_records: usize,
+}
+
+impl From<UsageExternalPoolRiskTotals> for UsageAccountRiskTotals {
+    fn from(totals: UsageExternalPoolRiskTotals) -> Self {
+        Self {
+            records: totals.records,
+            success_records: totals.success_records,
+            error_records: totals.error_records,
+            stream_records: totals.stream_records,
+            non_stream_records: totals.non_stream_records,
+            priced_records: totals.priced_records,
+            unpriced_records: totals.unpriced_records,
+            raw_usage_records: totals.raw_usage_records,
+            reported_usage_records: totals.reported_usage_records,
+            missing_account_billing_records: totals.missing_external_pool_billing_records,
+            output_zero_records: totals.output_zero_records,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1162,6 +1260,89 @@ pub struct UsageExternalPoolRiskSample {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_ratio: Option<f64>,
     pub risk_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAccountRiskSample {
+    pub id: String,
+    pub created_at: String,
+    pub endpoint: String,
+    pub stream: bool,
+    pub model: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_projection_mode: Option<String>,
+    pub account_billing_present: bool,
+    pub cost_floor_applied: bool,
+    pub raw_input_tokens: i64,
+    pub raw_output_tokens: i64,
+    pub raw_cache_read_input_tokens: i64,
+    pub raw_cache_creation_input_tokens: i64,
+    pub reported_input_tokens: i64,
+    pub reported_output_tokens: i64,
+    pub reported_cache_read_input_tokens: i64,
+    pub reported_cache_creation_input_tokens: i64,
+    pub raw_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub target_cost_usd: f64,
+    pub loss_usd: f64,
+    pub target_gap_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_ratio: Option<f64>,
+    pub risk_reasons: Vec<String>,
+}
+
+impl From<UsageExternalPoolRiskSample> for UsageAccountRiskSample {
+    fn from(sample: UsageExternalPoolRiskSample) -> Self {
+        Self {
+            id: sample.id,
+            created_at: sample.created_at,
+            endpoint: sample.endpoint,
+            stream: sample.stream,
+            model: sample.model,
+            status: sample.status,
+            account_id: sample.external_pool_id,
+            account_name: sample.external_pool_name,
+            pricing_model: sample.pricing_model,
+            usage_projection_mode: sample.usage_projection_mode,
+            account_billing_present: sample.external_pool_billing_present,
+            cost_floor_applied: sample.cost_floor_applied,
+            raw_input_tokens: sample.raw_input_tokens,
+            raw_output_tokens: sample.raw_output_tokens,
+            raw_cache_read_input_tokens: sample.raw_cache_read_input_tokens,
+            raw_cache_creation_input_tokens: sample.raw_cache_creation_input_tokens,
+            reported_input_tokens: sample.reported_input_tokens,
+            reported_output_tokens: sample.reported_output_tokens,
+            reported_cache_read_input_tokens: sample.reported_cache_read_input_tokens,
+            reported_cache_creation_input_tokens: sample.reported_cache_creation_input_tokens,
+            raw_cost_usd: sample.raw_cost_usd,
+            reported_cost_usd: sample.reported_cost_usd,
+            target_cost_usd: sample.target_cost_usd,
+            loss_usd: sample.loss_usd,
+            target_gap_usd: sample.target_gap_usd,
+            cost_ratio: sample.cost_ratio,
+            risk_reasons: sample
+                .risk_reasons
+                .into_iter()
+                .map(account_risk_reason)
+                .collect(),
+        }
+    }
+}
+
+fn account_risk_reason(reason: String) -> String {
+    if reason == "missing_external_pool_billing" {
+        "missing_account_billing".to_string()
+    } else {
+        reason
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3876,6 +4057,132 @@ mod tests {
         assert_eq!(json["accountBillingByAccount"][0]["accountName"], "primary");
         assert!(json["accountBillingByAccount"][0].get("poolId").is_none());
         assert!(json["accountBillingByAccount"][0].get("poolName").is_none());
+    }
+
+    #[test]
+    fn account_risk_response_serializes_account_boundary_fields() {
+        let legacy = UsageExternalPoolRiskResponse {
+            generated_at: "2026-08-14T00:00:00Z".to_string(),
+            timezone: "Asia/Shanghai".to_string(),
+            window: UsageExternalPoolRiskWindow {
+                key: "last24h".to_string(),
+                label: "最近24小时".to_string(),
+                from: "2026-08-13T00:00:00Z".to_string(),
+                to: "2026-08-14T00:00:00Z".to_string(),
+            },
+            thresholds: UsageExternalPoolRiskThresholds {
+                warning_tokens: 800_000,
+                critical_tokens: 1_000_000,
+                cost_floor_enabled: true,
+                cost_floor_margin_percent: 15,
+                cost_target_multiplier: 1.15,
+            },
+            filters: UsageExternalPoolRiskFilters {
+                pool_id: Some(42),
+                endpoint: Some("/cc/v1/messages".to_string()),
+                model: Some("claude-sonnet-*".to_string()),
+                stream: Some(true),
+            },
+            totals: UsageExternalPoolRiskTotals {
+                records: 3,
+                success_records: 2,
+                error_records: 1,
+                stream_records: 2,
+                non_stream_records: 1,
+                priced_records: 2,
+                unpriced_records: 1,
+                raw_usage_records: 2,
+                reported_usage_records: 3,
+                missing_external_pool_billing_records: 1,
+                output_zero_records: 1,
+            },
+            raw_cache: UsageExternalPoolRiskCacheStats::default(),
+            reported_cache: UsageExternalPoolRiskCacheStats::default(),
+            cost: UsageExternalPoolRiskCostStats::default(),
+            buckets: Vec::new(),
+            by_pool: vec![UsageExternalPoolRiskGroup {
+                key: "42".to_string(),
+                label: "primary".to_string(),
+                records: 3,
+                success_records: 2,
+                warning_records: 1,
+                critical_records: 1,
+                output_zero_records: 1,
+                raw_read_max: 10,
+                raw_write_max: 20,
+                reported_read_max: 30,
+                reported_write_max: 40,
+                raw_cost_usd: 0.1,
+                reported_cost_usd: 0.2,
+                target_cost_usd: 0.12,
+                profit_usd: 0.1,
+                total_loss_usd: 0.0,
+                total_target_gap_usd: 0.0,
+                below_raw_count: 0,
+                below_target_count: 0,
+            }],
+            by_path: Vec::new(),
+            by_model: Vec::new(),
+            samples: vec![UsageExternalPoolRiskSample {
+                id: "req_1".to_string(),
+                created_at: "2026-08-14T00:00:00Z".to_string(),
+                endpoint: "/cc/v1/messages".to_string(),
+                stream: true,
+                model: "claude-sonnet-4-5".to_string(),
+                status: "success".to_string(),
+                external_pool_id: Some(42),
+                external_pool_name: Some("primary".to_string()),
+                pricing_model: Some("claude-sonnet-4-5".to_string()),
+                usage_projection_mode: Some("current_path_policy".to_string()),
+                external_pool_billing_present: false,
+                cost_floor_applied: true,
+                raw_input_tokens: 10,
+                raw_output_tokens: 20,
+                raw_cache_read_input_tokens: 30,
+                raw_cache_creation_input_tokens: 40,
+                reported_input_tokens: 50,
+                reported_output_tokens: 60,
+                reported_cache_read_input_tokens: 70,
+                reported_cache_creation_input_tokens: 80,
+                raw_cost_usd: 0.1,
+                reported_cost_usd: 0.2,
+                target_cost_usd: 0.12,
+                loss_usd: 0.0,
+                target_gap_usd: 0.0,
+                cost_ratio: Some(2.0),
+                risk_reasons: vec![
+                    "missing_external_pool_billing".to_string(),
+                    "output_zero".to_string(),
+                ],
+            }],
+        };
+
+        let json = serde_json::to_value(UsageAccountRiskResponse::from(legacy))
+            .expect("account risk response serializes");
+
+        assert!(json.get("byAccount").is_some());
+        assert!(json.get("byPool").is_none());
+        assert_eq!(json["filters"]["accountId"], 42);
+        assert!(json["filters"].get("poolId").is_none());
+        assert_eq!(json["totals"]["missingAccountBillingRecords"], 1);
+        assert!(
+            json["totals"]
+                .get("missingExternalPoolBillingRecords")
+                .is_none()
+        );
+        assert_eq!(json["samples"][0]["accountId"], 42);
+        assert_eq!(json["samples"][0]["accountName"], "primary");
+        assert_eq!(json["samples"][0]["accountBillingPresent"], false);
+        assert!(json["samples"][0].get("externalPoolId").is_none());
+        assert!(
+            json["samples"][0]
+                .get("externalPoolBillingPresent")
+                .is_none()
+        );
+        assert_eq!(
+            json["samples"][0]["riskReasons"][0],
+            "missing_account_billing"
+        );
     }
 
     #[test]

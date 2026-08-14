@@ -13,11 +13,11 @@ import { useUsageDashboardAccountRisk } from '@/hooks/use-usage'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
+  UsageAccountRiskQuery,
+  UsageAccountRiskSample,
   UsageExternalPoolRiskBucket,
   UsageExternalPoolRiskCacheStats,
   UsageExternalPoolRiskGroup,
-  UsageExternalPoolRiskQuery,
-  UsageExternalPoolRiskSample,
 } from '@/types/api'
 import {
   PageContainer,
@@ -111,6 +111,7 @@ function accountLabel(id?: number, name?: string): string {
 
 function riskReasonLabel(reason: string): string {
   const labels: Record<string, string> = {
+    missing_account_billing: '缺少计费记录',
     missing_external_pool_billing: '缺少计费记录',
     output_zero: '输出为 0',
     raw_cache_critical: '上游缓存超高',
@@ -139,7 +140,7 @@ export function ExternalPoolRiskPage() {
   const [sinceInput, setSinceInput] = useState(() => recentDatetimeLocal(24))
   const [untilInput, setUntilInput] = useState(() => toDatetimeLocalValue(new Date()))
   const [streamFilter, setStreamFilter] = useState<StreamFilter>('all')
-  const [submitted, setSubmitted] = useState<UsageExternalPoolRiskQuery>({
+  const [submitted, setSubmitted] = useState<UsageAccountRiskQuery>({
     timezone: TIMEZONE,
     windowKey: 'last24h',
     warningThresholdTokens: DEFAULT_WARNING_TOKENS,
@@ -287,7 +288,7 @@ export function ExternalPoolRiskPage() {
             <StatCard title="最终缓存最大" value={`${formatCompact(Math.max(data.reportedCache.maxReadTokens, data.reportedCache.maxWriteTokens))}`} valueTitle={tokenTitle(Math.max(data.reportedCache.maxReadTokens, data.reportedCache.maxWriteTokens))} desc={`读 ${formatCompact(data.reportedCache.maxReadTokens)} / 写 ${formatCompact(data.reportedCache.maxWriteTokens)}`} icon={<BarChart3 />} tone={toneForRisk(data.reportedCache.eitherCriticalCount, data.reportedCache.eitherWarningCount)} />
             <StatCard title="低于目标成本" value={formatCompact(data.cost.belowTargetCount)} valueTitle={formatNumber(data.cost.belowTargetCount)} desc={`差额 ${formatUsd(data.cost.totalTargetGapUsd)}`} icon={<DollarSign />} tone={data.cost.belowTargetCount > 0 ? 'error' : 'success'} />
             <StatCard title="成本利润" value={signedUsd(data.cost.profitUsd)} desc={`上游 ${formatUsd(data.cost.rawCostUsd)} / 最终 ${formatUsd(data.cost.reportedCostUsd)}`} icon={<DollarSign />} tone={data.cost.profitUsd < 0 ? 'error' : 'success'} />
-            <StatCard title="输出为 0" value={formatCompact(data.totals.outputZeroRecords)} valueTitle={formatNumber(data.totals.outputZeroRecords)} desc={`缺计费 ${formatNumber(data.totals.missingExternalPoolBillingRecords)}`} icon={<AlertTriangle />} tone={data.totals.outputZeroRecords > 0 ? 'warning' : 'success'} />
+            <StatCard title="输出为 0" value={formatCompact(data.totals.outputZeroRecords)} valueTitle={formatNumber(data.totals.outputZeroRecords)} desc={`缺计费 ${formatNumber(data.totals.missingAccountBillingRecords)}`} icon={<AlertTriangle />} tone={data.totals.outputZeroRecords > 0 ? 'warning' : 'success'} />
           </StatGrid>
 
           <div className="grid gap-5 xl:grid-cols-2">
@@ -317,7 +318,7 @@ export function ExternalPoolRiskPage() {
           </SectionCard>
 
           <div className="grid gap-5 xl:grid-cols-3">
-            <GroupTable title="按上游账号" groups={data.byPool} />
+            <GroupTable title="按上游账号" groups={data.byAccount} />
             <GroupTable title="按路径" groups={data.byPath} />
             <GroupTable title="按模型" groups={data.byModel} />
           </div>
@@ -330,9 +331,9 @@ export function ExternalPoolRiskPage() {
             <SamplesTable samples={data.samples} />
           </SectionCard>
 
-          {data.totals.missingExternalPoolBillingRecords > 0 && (
+          {data.totals.missingAccountBillingRecords > 0 && (
             <Callout tone="warning">
-              当前窗口存在 {formatNumber(data.totals.missingExternalPoolBillingRecords)} 条上游账号记录缺少账号计费明细。raw/reported 成本和缓存统计会因此不完整，需要优先查这些请求的记录链路。
+              当前窗口存在 {formatNumber(data.totals.missingAccountBillingRecords)} 条上游账号记录缺少账号计费明细。raw/reported 成本和缓存统计会因此不完整，需要优先查这些请求的记录链路。
             </Callout>
           )}
         </>
@@ -463,7 +464,7 @@ function GroupTable({ title, groups }: { title: string; groups: UsageExternalPoo
   )
 }
 
-function SamplesTable({ samples }: { samples: UsageExternalPoolRiskSample[] }) {
+function SamplesTable({ samples }: { samples: UsageAccountRiskSample[] }) {
   if (!samples.length) return <EmptyState title="暂无风险样本" description="当前查询窗口没有命中缓存或成本风险样本。" />
   return (
     <div className="overflow-x-auto">
@@ -489,8 +490,8 @@ function SamplesTable({ samples }: { samples: UsageExternalPoolRiskSample[] }) {
                 <div className="max-w-[12rem] truncate font-mono text-xs" title={sample.id}>{sample.id}</div>
               </TableCell>
               <TableCell>
-                <div className="max-w-[11rem] truncate" title={accountLabel(sample.externalPoolId, sample.externalPoolName)}>
-                  {accountLabel(sample.externalPoolId, sample.externalPoolName)}
+                <div className="max-w-[11rem] truncate" title={accountLabel(sample.accountId, sample.accountName)}>
+                  {accountLabel(sample.accountId, sample.accountName)}
                 </div>
                 <div className="text-xs text-muted-foreground">{sample.stream ? 'stream' : 'non-stream'}</div>
               </TableCell>

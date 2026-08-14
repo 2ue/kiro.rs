@@ -4392,6 +4392,14 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
+    pub fn get_usage_dashboard_account_risk(
+        &self,
+        query: UsageExternalPoolRiskQuery,
+    ) -> Result<crate::anthropic::usage::UsageAccountRiskResponse, AdminServiceError> {
+        self.get_usage_dashboard_external_pool_risk(query)
+            .map(Into::into)
+    }
+
     /// 获取 usage 持久化 writer 状态。该状态只用于观测，不参与调度。
     pub fn get_usage_writer_stats(&self) -> UsageRecorderStats {
         self.usage_recorder.writer_stats()

@@ -26,7 +26,7 @@ import {
   syncModelPricing,
   upsertManualModel,
 } from '@/api/usage'
-import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageExternalPoolRiskQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageAccountRiskQuery, UsageCleanupRequest, UsageCleanupStatusResponse, UsageExternalPoolRiskQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 type RefetchInterval = number | false
 
@@ -148,11 +148,19 @@ export function useUsageDashboardExternalPoolRisk(
   refetchInterval: RefetchInterval = false,
   enabled = true
 ) {
-  return useUsageDashboardAccountRisk(query, refetchInterval, enabled)
+  const { externalPoolId, ...rest } = query
+  return useUsageDashboardAccountRisk(
+    {
+      ...rest,
+      accountId: query.accountId ?? externalPoolId,
+    },
+    refetchInterval,
+    enabled
+  )
 }
 
 export function useUsageDashboardAccountRisk(
-  query: UsageExternalPoolRiskQuery,
+  query: UsageAccountRiskQuery,
   refetchInterval: RefetchInterval = false,
   enabled = true
 ) {

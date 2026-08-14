@@ -1033,6 +1033,20 @@ export interface UsageExternalPoolRiskQuery {
   limit?: number
 }
 
+export interface UsageAccountRiskQuery {
+  timezone?: string
+  windowKey?: string
+  since?: string
+  until?: string
+  warningThresholdTokens?: number
+  criticalThresholdTokens?: number
+  accountId?: number
+  endpoint?: string
+  model?: string
+  stream?: boolean
+  limit?: number
+}
+
 export interface UsageExternalPoolRiskWindow {
   key: string
   label: string
@@ -1055,6 +1069,13 @@ export interface UsageExternalPoolRiskFilters {
   stream?: boolean
 }
 
+export interface UsageAccountRiskFilters {
+  accountId?: number
+  endpoint?: string
+  model?: string
+  stream?: boolean
+}
+
 export interface UsageExternalPoolRiskTotals {
   records: number
   successRecords: number
@@ -1066,6 +1087,20 @@ export interface UsageExternalPoolRiskTotals {
   rawUsageRecords: number
   reportedUsageRecords: number
   missingExternalPoolBillingRecords: number
+  outputZeroRecords: number
+}
+
+export interface UsageAccountRiskTotals {
+  records: number
+  successRecords: number
+  errorRecords: number
+  streamRecords: number
+  nonStreamRecords: number
+  pricedRecords: number
+  unpricedRecords: number
+  rawUsageRecords: number
+  reportedUsageRecords: number
+  missingAccountBillingRecords: number
   outputZeroRecords: number
 }
 
@@ -1168,6 +1203,36 @@ export interface UsageExternalPoolRiskSample {
   riskReasons: string[]
 }
 
+export interface UsageAccountRiskSample {
+  id: string
+  createdAt: string
+  endpoint: string
+  stream: boolean
+  model: string
+  status: string
+  accountId?: number
+  accountName?: string
+  pricingModel?: string
+  usageProjectionMode?: string
+  accountBillingPresent: boolean
+  costFloorApplied: boolean
+  rawInputTokens: number
+  rawOutputTokens: number
+  rawCacheReadInputTokens: number
+  rawCacheCreationInputTokens: number
+  reportedInputTokens: number
+  reportedOutputTokens: number
+  reportedCacheReadInputTokens: number
+  reportedCacheCreationInputTokens: number
+  rawCostUsd: number
+  reportedCostUsd: number
+  targetCostUsd: number
+  lossUsd: number
+  targetGapUsd: number
+  costRatio?: number | null
+  riskReasons: string[]
+}
+
 export interface UsageExternalPoolRiskResponse {
   generatedAt: string
   timezone: string
@@ -1183,6 +1248,23 @@ export interface UsageExternalPoolRiskResponse {
   byPath: UsageExternalPoolRiskGroup[]
   byModel: UsageExternalPoolRiskGroup[]
   samples: UsageExternalPoolRiskSample[]
+}
+
+export interface UsageAccountRiskResponse {
+  generatedAt: string
+  timezone: string
+  window: UsageExternalPoolRiskWindow
+  thresholds: UsageExternalPoolRiskThresholds
+  filters: UsageAccountRiskFilters
+  totals: UsageAccountRiskTotals
+  rawCache: UsageExternalPoolRiskCacheStats
+  reportedCache: UsageExternalPoolRiskCacheStats
+  cost: UsageExternalPoolRiskCostStats
+  buckets: UsageExternalPoolRiskBucket[]
+  byAccount: UsageExternalPoolRiskGroup[]
+  byPath: UsageExternalPoolRiskGroup[]
+  byModel: UsageExternalPoolRiskGroup[]
+  samples: UsageAccountRiskSample[]
 }
 
 export interface UsageDashboardWindow {

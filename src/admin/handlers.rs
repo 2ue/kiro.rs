@@ -180,6 +180,23 @@ pub struct UsageExternalPoolRiskQueryParams {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAccountRiskQueryParams {
+    pub timezone: Option<String>,
+    pub window_key: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub warning_threshold_tokens: Option<i64>,
+    pub critical_threshold_tokens: Option<i64>,
+    #[serde(alias = "account_id")]
+    pub account_id: Option<u64>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub stream: Option<bool>,
+    pub limit: Option<usize>,
+}
+
 /// GET /api/admin/system/version
 pub async fn get_system_version() -> Json<SystemVersionResponse> {
     Json(SystemVersionResponse {
@@ -319,6 +336,31 @@ impl UsageExternalPoolRiskQueryParams {
             stream: self.stream,
             limit,
         })
+    }
+}
+
+impl UsageAccountRiskQueryParams {
+    fn into_query(self) -> Result<UsageExternalPoolRiskQuery, String> {
+        UsageExternalPoolRiskQueryParams::from(self).into_query()
+    }
+}
+
+impl From<UsageAccountRiskQueryParams> for UsageExternalPoolRiskQueryParams {
+    fn from(params: UsageAccountRiskQueryParams) -> Self {
+        Self {
+            timezone: params.timezone,
+            window_key: params.window_key,
+            since: params.since,
+            until: params.until,
+            warning_threshold_tokens: params.warning_threshold_tokens,
+            critical_threshold_tokens: params.critical_threshold_tokens,
+            account_id: params.account_id,
+            external_pool_id: None,
+            endpoint: params.endpoint,
+            model: params.model,
+            stream: params.stream,
+            limit: params.limit,
+        }
     }
 }
 
@@ -1642,9 +1684,19 @@ pub async fn get_usage_dashboard_external_pool_risk(
 /// 获取上游账号 usage 风控统计。
 pub async fn get_usage_dashboard_account_risk(
     State(state): State<AdminState>,
-    Query(params): Query<UsageExternalPoolRiskQueryParams>,
+    Query(params): Query<UsageAccountRiskQueryParams>,
 ) -> impl IntoResponse {
-    get_usage_dashboard_external_pool_risk(State(state), Query(params)).await
+    match params.into_query() {
+        Ok(query) => match state.service.get_usage_dashboard_account_risk(query) {
+            Ok(data) => Json(data).into_response(),
+            Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        },
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(message)),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/admin/usage-writer-stats
