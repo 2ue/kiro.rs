@@ -22,7 +22,15 @@ pub(crate) use runtime::AccountRouteRequestPreparationCache;
 pub use runtime::{
     AccountFinalError, AccountForwardOutcome, AccountLatencyTraceState, AccountRequestBodyMode,
     AccountRouteRequest, AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
-    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord, clear_upstream_account_cooldowns,
+    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord, account_direct_policy_reason,
+    cached_eligible_account_for_route_and_model,
+    cached_eligible_account_for_route_body_mode_and_model,
+    cached_immediately_available_account_for_route_and_model,
+    cached_immediately_available_account_for_route_body_mode_and_model,
+    clear_upstream_account_cooldowns, eligible_account_for_route_and_model,
+    eligible_account_for_route_body_mode_and_model, forward_account_with_failover,
+    forward_account_with_failover_result, immediately_available_account_for_route_and_model,
+    immediately_available_account_for_route_body_mode_and_model,
     load_upstream_account_status_records, upstream_account_messages_url,
     upstream_account_models_url,
 };

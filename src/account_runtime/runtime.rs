@@ -4,6 +4,10 @@
 //! is being migrated. New integration points should depend on this account
 //! runtime boundary instead of importing the legacy scheduler manager directly.
 
+use std::time::Duration;
+
+use axum::response::Response;
+
 pub type AccountRuntimeManager = crate::external_pool::ExternalPoolManager;
 
 pub type AccountRuntimeConfig = crate::model::config::ExternalPoolsConfig;
@@ -37,6 +41,122 @@ pub async fn clear_upstream_account_cooldowns(
     account_id: u64,
 ) -> anyhow::Result<usize> {
     manager.clear_pool_cooldowns(account_id).await
+}
+
+pub fn cached_eligible_account_for_route_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    model: &str,
+) -> bool {
+    manager.has_cached_eligible_pool_for_route_and_model(config, endpoint, model)
+}
+
+pub async fn eligible_account_for_route_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    model: &str,
+) -> bool {
+    manager
+        .has_eligible_pool_for_route_and_model(config, endpoint, model)
+        .await
+}
+
+pub fn cached_eligible_account_for_route_body_mode_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    body_mode: AccountRequestBodyMode,
+    model: &str,
+) -> bool {
+    manager
+        .has_cached_eligible_pool_for_route_body_mode_and_model(config, endpoint, body_mode, model)
+}
+
+pub async fn eligible_account_for_route_body_mode_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    body_mode: AccountRequestBodyMode,
+    model: &str,
+) -> bool {
+    manager
+        .has_eligible_pool_for_route_body_mode_and_model(config, endpoint, body_mode, model)
+        .await
+}
+
+pub fn cached_immediately_available_account_for_route_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    model: &str,
+) -> bool {
+    manager.has_cached_immediately_available_pool_for_route_and_model(config, endpoint, model)
+}
+
+pub async fn immediately_available_account_for_route_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    model: &str,
+    max_wait: Duration,
+) -> bool {
+    manager
+        .has_immediately_available_pool_for_route_and_model(config, endpoint, model, max_wait)
+        .await
+}
+
+pub fn cached_immediately_available_account_for_route_body_mode_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    body_mode: AccountRequestBodyMode,
+    model: &str,
+) -> bool {
+    manager.has_cached_immediately_available_pool_for_route_body_mode_and_model(
+        config, endpoint, body_mode, model,
+    )
+}
+
+pub async fn immediately_available_account_for_route_body_mode_and_model(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    body_mode: AccountRequestBodyMode,
+    model: &str,
+    max_wait: Duration,
+) -> bool {
+    manager
+        .has_immediately_available_pool_for_route_body_mode_and_model(
+            config, endpoint, body_mode, model, max_wait,
+        )
+        .await
+}
+
+pub async fn account_direct_policy_reason(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+    endpoint: &str,
+    model: &str,
+) -> Option<String> {
+    manager.direct_policy_reason(config, endpoint, model).await
+}
+
+pub async fn forward_account_with_failover(
+    manager: &AccountRuntimeManager,
+    config: AccountRuntimeConfig,
+    route: AccountRouteRequest,
+) -> Response {
+    manager.forward_with_failover(config, route).await
+}
+
+pub async fn forward_account_with_failover_result(
+    manager: &AccountRuntimeManager,
+    config: AccountRuntimeConfig,
+    route: AccountRouteRequest,
+) -> AccountForwardOutcome {
+    manager.forward_with_failover_result(config, route).await
 }
 
 pub fn upstream_account_models_url(base_url: &str) -> Result<reqwest::Url, url::ParseError> {

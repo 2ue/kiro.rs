@@ -95,7 +95,15 @@ use super::websearch;
 use crate::account_runtime::{
     AccountFinalError, AccountForwardOutcome, AccountLatencyTraceState, AccountRequestBodyMode,
     AccountRouteRequest, AccountRouteRequestPreparationCache, AccountRuntimeConfig,
-    AccountRuntimeConfigExt, AccountRuntimeManager,
+    AccountRuntimeConfigExt, AccountRuntimeManager, account_direct_policy_reason,
+    cached_eligible_account_for_route_and_model,
+    cached_eligible_account_for_route_body_mode_and_model,
+    cached_immediately_available_account_for_route_and_model,
+    cached_immediately_available_account_for_route_body_mode_and_model,
+    eligible_account_for_route_and_model, eligible_account_for_route_body_mode_and_model,
+    forward_account_with_failover, forward_account_with_failover_result,
+    immediately_available_account_for_route_and_model,
+    immediately_available_account_for_route_body_mode_and_model,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
 use crate::kiro::call_trace::{
@@ -1295,9 +1303,13 @@ async fn maybe_raw_account_direct_response(
     let reason = if state.kiro_provider.is_none() {
         "account_route".to_string()
     } else {
-        manager
-            .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
-            .await?
+        account_direct_policy_reason(
+            &manager,
+            &config,
+            endpoint,
+            raw_probe.model.as_deref().unwrap_or(""),
+        )
+        .await?
     };
     let request_id = envelope::request_id();
     let direct_model_resolution = raw_probe
@@ -1334,7 +1346,7 @@ async fn maybe_raw_account_direct_response(
         route.model_resolution_note = resolution.note;
     }
 
-    Some(manager.forward_with_failover(config, route).await)
+    Some(forward_account_with_failover(&manager, config, route).await)
 }
 
 async fn maybe_raw_account_preflight_response(
@@ -1411,9 +1423,7 @@ async fn maybe_raw_account_preflight_response(
         raw_probe.clone(),
     );
 
-    let outcome = manager
-        .forward_with_failover_result(config.clone(), route)
-        .await;
+    let outcome = forward_account_with_failover_result(&manager, config.clone(), route).await;
     Some(match outcome {
         AccountForwardOutcome::Response(response) => {
             RawAccountPreflightDecision::Response(response)
@@ -1460,19 +1470,20 @@ async fn raw_upstream_account_has_eligible_account(
     let Some(model) = model else {
         return false;
     };
-    manager.has_cached_eligible_pool_for_route_body_mode_and_model(
+    cached_eligible_account_for_route_body_mode_and_model(
+        manager,
         config,
         endpoint,
         AccountRequestBodyMode::RawPassthrough,
         model,
-    ) || manager
-        .has_eligible_pool_for_route_body_mode_and_model(
-            config,
-            endpoint,
-            AccountRequestBodyMode::RawPassthrough,
-            model,
-        )
-        .await
+    ) || eligible_account_for_route_body_mode_and_model(
+        manager,
+        config,
+        endpoint,
+        AccountRequestBodyMode::RawPassthrough,
+        model,
+    )
+    .await
 }
 
 async fn raw_upstream_account_ready_for_route_reason(
@@ -1486,20 +1497,21 @@ async fn raw_upstream_account_ready_for_route_reason(
         let Some(model) = model else {
             return false;
         };
-        manager.has_cached_immediately_available_pool_for_route_body_mode_and_model(
+        cached_immediately_available_account_for_route_body_mode_and_model(
+            manager,
             config,
             endpoint,
             AccountRequestBodyMode::RawPassthrough,
             model,
-        ) || manager
-            .has_immediately_available_pool_for_route_body_mode_and_model(
-                config,
-                endpoint,
-                AccountRequestBodyMode::RawPassthrough,
-                model,
-                EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
-            )
-            .await
+        ) || immediately_available_account_for_route_body_mode_and_model(
+            manager,
+            config,
+            endpoint,
+            AccountRequestBodyMode::RawPassthrough,
+            model,
+            EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+        )
+        .await
     } else {
         raw_upstream_account_has_eligible_account(manager, config, endpoint, model).await
     }
@@ -1761,7 +1773,8 @@ impl ExternalFallbackContext {
     }
 
     fn has_cached_eligible_external_pool_for_model(&self, model: &str) -> bool {
-        self.manager.has_cached_eligible_pool_for_route_and_model(
+        cached_eligible_account_for_route_and_model(
+            &self.manager,
             &self.config,
             &self.endpoint,
             model,
@@ -1770,32 +1783,34 @@ impl ExternalFallbackContext {
 
     async fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
         self.has_cached_eligible_external_pool_for_model(model)
-            || self
-                .manager
-                .has_eligible_pool_for_route_and_model(&self.config, &self.endpoint, model)
-                .await
-    }
-
-    fn has_cached_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
-        self.manager
-            .has_cached_immediately_available_pool_for_route_and_model(
+            || eligible_account_for_route_and_model(
+                &self.manager,
                 &self.config,
                 &self.endpoint,
                 model,
             )
+            .await
+    }
+
+    fn has_cached_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
+        cached_immediately_available_account_for_route_and_model(
+            &self.manager,
+            &self.config,
+            &self.endpoint,
+            model,
+        )
     }
 
     async fn has_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
         self.has_cached_immediately_available_external_pool_for_model(model)
-            || self
-                .manager
-                .has_immediately_available_pool_for_route_and_model(
-                    &self.config,
-                    &self.endpoint,
-                    model,
-                    EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
-                )
-                .await
+            || immediately_available_account_for_route_and_model(
+                &self.manager,
+                &self.config,
+                &self.endpoint,
+                model,
+                EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+            )
+            .await
     }
 
     async fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
@@ -1815,9 +1830,13 @@ impl ExternalFallbackContext {
         let reason = if self.provider.is_none() {
             "account_route".to_string()
         } else {
-            self.manager
-                .direct_policy_reason(&self.config, &self.endpoint, &self.payload.model)
-                .await?
+            account_direct_policy_reason(
+                &self.manager,
+                &self.config,
+                &self.endpoint,
+                &self.payload.model,
+            )
+            .await?
         };
         let mut external = self.clone();
         external.model_resolution = model_resolution;
@@ -1833,11 +1852,7 @@ impl ExternalFallbackContext {
             Ok(route) => route,
             Err(err) => return Some(payload_guard_error_response(err)),
         };
-        Some(
-            self.manager
-                .forward_with_failover(self.config.clone(), route)
-                .await,
-        )
+        Some(forward_account_with_failover(&self.manager, self.config.clone(), route).await)
     }
 
     async fn local_pool_preflight_outcome(
@@ -1897,10 +1912,12 @@ impl ExternalFallbackContext {
             }
         };
         Some(LocalPoolPreflightAccountOutcome {
-            outcome: self
-                .manager
-                .forward_with_failover_result(self.config.clone(), route)
-                .await,
+            outcome: forward_account_with_failover_result(
+                &self.manager,
+                self.config.clone(),
+                route,
+            )
+            .await,
             local_reason: reason,
         })
     }
@@ -2073,11 +2090,7 @@ impl ExternalFallbackContext {
                 ));
             }
         };
-        Some(
-            self.manager
-                .forward_with_failover_result(self.config.clone(), route)
-                .await,
-        )
+        Some(forward_account_with_failover_result(&self.manager, self.config.clone(), route).await)
     }
 
     fn route_request(
