@@ -76,6 +76,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The frontend account runtime boundary now has `AccountRuntimeConfig`, `defaultAccountRuntimeConfig` and `DiscoverAccountSupportedModelsRequest` aliases. New account UI/API code uses those account-named types while legacy `ExternalPoolsConfig` and discovery request names remain only for compatibility functions and mirrored wire fields.
 - `account_runtime::migration` now owns the temporary projection from legacy `ExternalPool` records into `UpstreamAccount`. The old `ExternalPool::to_upstream_account` method was removed so the account runtime boundary, not the legacy record, owns the migration bridge.
 - Admin `/accounts` request surfaces now have account-owned Rust DTOs for create, update, enabled toggles, supported-model discovery and test calls. They preserve the same camelCase JSON shape and explicitly convert into the legacy external-pool storage DTOs only at the compatibility boundary.
+- Account runtime manager callers now use account-named cache/data invalidation wrappers for runtime config reloads, local account mutations and cross-instance data events. Legacy external-pool method names remain only inside the delegated implementation while Redis channel and storage compatibility keys are still unchanged.
 
 Last verified on 2026-08-14:
 
@@ -117,3 +118,6 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-admin-dto-split-check3 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-admin-dto-split-test1 -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-admin-dto-split-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`

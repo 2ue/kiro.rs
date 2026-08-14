@@ -4106,10 +4106,26 @@ impl ExternalPoolManager {
         self.publish_external_pool_data_changed_async(reason, Some(pool_id));
     }
 
+    pub fn notify_account_runtime_data_changed_with_local_account(
+        &self,
+        reason: &'static str,
+        account: &ExternalPool,
+    ) {
+        self.notify_external_pool_data_changed_with_local_pool(reason, account);
+    }
+
+    pub fn notify_account_runtime_account_deleted(&self, reason: &'static str, account_id: u64) {
+        self.notify_external_pool_deleted(reason, account_id);
+    }
+
     pub fn invalidate_external_pool_policy_state(&self) {
         self.selection_runtime_snapshot.lock().take();
         #[cfg(test)]
         self.availability_cache.lock().take();
+    }
+
+    pub fn invalidate_account_runtime_policy_state(&self) {
+        self.invalidate_external_pool_policy_state();
     }
 
     fn invalidate_external_pool_runtime_capacity_state(&self) {
@@ -4154,6 +4170,10 @@ impl ExternalPoolManager {
             return false;
         }
         generation.is_some_and(|generation| self.observe_pool_data_generation(generation))
+    }
+
+    pub fn observe_account_runtime_data_event(&self, payload: &str) -> bool {
+        self.observe_external_pool_data_event(payload)
     }
 
     pub async fn publish_external_pool_data_changed(

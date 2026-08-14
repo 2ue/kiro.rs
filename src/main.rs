@@ -1353,7 +1353,7 @@ fn spawn_redis_runtime_event_listener(
                                     let config = token_manager.runtime_config();
                                     if config.external_pools != previous_account_runtime {
                                         account_runtime_manager
-                                            .invalidate_external_pool_policy_state();
+                                            .invalidate_account_runtime_policy_state();
                                     }
                                     request_api_key_store.replace_keys(config.request_api_keys());
                                     request_admission.update_config(config.request_admission);
@@ -1374,10 +1374,10 @@ fn spawn_redis_runtime_event_listener(
                                 tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");
                             }
                         } else if channel == external_pool_data_channel {
-                            if account_runtime_manager.observe_external_pool_data_event(&payload) {
-                                tracing::debug!(payload, "已失效跨实例外部池数据快照");
+                            if account_runtime_manager.observe_account_runtime_data_event(&payload) {
+                                tracing::debug!(payload, "已失效跨实例账号运行时数据快照");
                             } else {
-                                tracing::debug!(payload, "忽略已观察或无效的外部池数据通知");
+                                tracing::debug!(payload, "忽略已观察或无效的账号运行时数据通知");
                             }
                         }
                     }
@@ -1389,7 +1389,7 @@ fn spawn_redis_runtime_event_listener(
                                 let config = token_manager.runtime_config();
                                 if config.external_pools != previous_account_runtime {
                                     account_runtime_manager
-                                        .invalidate_external_pool_policy_state();
+                                        .invalidate_account_runtime_policy_state();
                                 }
                                 request_api_key_store.replace_keys(config.request_api_keys());
                                 request_admission.update_config(config.request_admission);

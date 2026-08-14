@@ -804,13 +804,13 @@ impl AdminService {
         pool: &ExternalPool,
     ) {
         self.account_runtime_manager
-            .notify_external_pool_data_changed_with_local_pool(reason, pool);
+            .notify_account_runtime_data_changed_with_local_account(reason, pool);
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
     }
 
     fn invalidate_external_pool_admin_cache_for_delete(&self, reason: &'static str, pool_id: u64) {
         self.account_runtime_manager
-            .notify_external_pool_deleted(reason, pool_id);
+            .notify_account_runtime_account_deleted(reason, pool_id);
         self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
     }
 
@@ -5420,7 +5420,7 @@ impl AdminService {
         );
         if account_runtime_policy_changed {
             self.account_runtime_manager
-                .invalidate_external_pool_policy_state();
+                .invalidate_account_runtime_policy_state();
             self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
         }
 
