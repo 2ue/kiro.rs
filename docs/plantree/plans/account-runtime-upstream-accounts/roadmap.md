@@ -55,6 +55,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin UI navigation now points to `/account-risk`, and the account risk page module lives under `features/account-risk`; the old `/external-pool-risk` UI route is only a redirect compatibility path.
 - Inference attempt budgeting now has an `Account` attempt kind, and real upstream account sends reserve it. The old `ExternalPool` kind remains only as a compatibility alias into the same counter until old snapshot fields and legacy route paths are removed.
 - Inference attempt snapshots now expose `accountAttempts` as the primary account send counter. `externalAttempts` remains serialized as a compatibility copy, legacy snapshot JSON maps into the account field on deserialization, and both maintained UIs show local/account/MCP breakdowns.
+- Usage records now expose `accountId`, `accountName` and `accountAttempts` as account-facing JSON fields while retaining `externalPoolId`, `externalPoolName` and `externalAttempts` compatibility fields. Usage record/detail/billing UI surfaces prefer account fields and show upstream-account wording with fallback for old records.
 
 ## In Progress
 

@@ -816,12 +816,15 @@ export interface UsageRecord {
   stickyBound: boolean
   fallbackFromSticky: boolean
   credentialAttempts?: KiroCredentialAttempt[]
-  routeKind?: 'local_credential' | 'external_pool'
+  routeKind?: 'local_credential' | 'account' | 'external_pool'
   routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_external' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
   fallbackReason?: string
   directPolicyReason?: string
   localAttempted?: boolean
   localPreflight?: unknown
+  accountId?: number
+  accountName?: string
+  accountAttempts?: AccountAttempt[]
   externalPoolId?: number
   externalPoolName?: string
   externalAttempts?: ExternalPoolAttempt[]
@@ -896,6 +899,19 @@ export interface ExternalPoolAttempt {
   attempt: number
   poolId: number
   poolName: string
+  outboundModel?: string
+  status?: number
+  action: string
+  durationMs: number
+  errorType?: string
+  errorMessage?: string
+  rawUpstreamError?: RawUpstreamError
+}
+
+export interface AccountAttempt {
+  attempt: number
+  accountId: number
+  accountName: string
   outboundModel?: string
   status?: number
   action: string

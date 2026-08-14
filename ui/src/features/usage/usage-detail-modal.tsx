@@ -24,6 +24,9 @@ import {
   sourceLabel,
   statusLabel,
   statusTone,
+  usageAccountAttemptId,
+  usageAccountAttemptName,
+  usageAccountAttempts,
   upstreamModelLabel,
 } from './usage-helpers'
 import { UsageCostBreakdown, UsageCostTiles, usageRecordCostModel } from './usage-billing'
@@ -269,18 +272,19 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     )
   })
 
-  record.externalAttempts?.forEach((attempt) => {
+  usageAccountAttempts(record).forEach((attempt) => {
+    const accountId = usageAccountAttemptId(attempt)
     appendDiagnostic(
       items,
       seen,
-      `外部池上游错误片段 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
+      `上游账号错误片段 #${attempt.attempt} · 账号 #${accountId} · ${attempt.status ?? attempt.action ?? '-'}`,
       formatRawUpstreamError(attempt.rawUpstreamError),
       'warning'
     )
     appendDiagnostic(
       items,
       seen,
-      `外部池上游尝试 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
+      `上游账号尝试 #${attempt.attempt} · 账号 #${accountId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
       attempt.errorMessage || attempt.errorType,
       'error'
     )
@@ -329,10 +333,13 @@ export function UsageDetailModal({
   if (!record) return null
 
   const hasLocalAttempts = (record.credentialAttempts?.length ?? 0) > 0
-  const hasExternalAttempts = (record.externalAttempts?.length ?? 0) > 0
+  const accountAttempts = usageAccountAttempts(record)
+  const hasExternalAttempts = accountAttempts.length > 0
+  const upstreamAccountId = record.accountId ?? record.externalPoolId
+  const upstreamAccountName = record.accountName ?? record.externalPoolName
   const costModel = usageRecordCostModel(record)
   const showExternalResolvedModel =
-    record.routeKind === 'external_pool'
+    (record.routeKind === 'external_pool' || record.routeKind === 'account')
     && !!record.upstreamModel
     && record.upstreamModel !== (record.externalOutboundModel || record.upstreamModel)
   const errorDiagnostics = buildErrorDiagnostics(record)
@@ -363,8 +370,8 @@ export function UsageDetailModal({
               </div>
             )}
             <DetailField label="账号" value={record.credentialId != null ? `#${record.credentialId}${record.credentialLabel ? ' ' + record.credentialLabel : ''}` : '-'} />
-            {record.routeKind === 'external_pool' && (
-              <DetailField label="外部账号" value={`#${record.externalPoolId ?? '-'}${record.externalPoolName ? ' ' + record.externalPoolName : ''}`} />
+            {(record.routeKind === 'external_pool' || record.routeKind === 'account') && (
+              <DetailField label="上游账号" value={`#${upstreamAccountId ?? '-'}${upstreamAccountName ? ' ' + upstreamAccountName : ''}`} />
             )}
             <DetailField
               label="路由"
@@ -638,10 +645,10 @@ export function UsageDetailModal({
           </div>
         )}
 
-        {/* 外部池链路 Table */}
+        {/* 上游账号链路 Table */}
         {hasExternalAttempts && (
           <div>
-            <SectionTitle>外部池链路</SectionTitle>
+            <SectionTitle>上游账号链路</SectionTitle>
             <div className="mb-2 rounded-lg bg-muted/30 px-3 py-2 font-mono text-xs break-all">
               {formatExternalAttemptChain(record) || '-'}
             </div>
@@ -650,7 +657,7 @@ export function UsageDetailModal({
                 <TableHeader>
                   <TableRow>
                     <TableHead>顺序</TableHead>
-                    <TableHead>外部账号</TableHead>
+                    <TableHead>上游账号</TableHead>
                     <TableHead>请求模型</TableHead>
                     <TableHead>状态</TableHead>
                     <TableHead>动作</TableHead>
@@ -659,12 +666,12 @@ export function UsageDetailModal({
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {record.externalAttempts?.map((a) => (
-                    <TableRow key={`${a.attempt}-${a.poolId}-${a.durationMs}`}>
+                  {accountAttempts.map((a) => (
+                    <TableRow key={`${a.attempt}-${usageAccountAttemptId(a)}-${a.durationMs}`}>
                       <TableCell>{a.attempt}</TableCell>
                       <TableCell>
-                        <div className="font-medium">#{a.poolId}</div>
-                        <div className="max-w-[180px] truncate text-[0.68rem] text-muted-foreground/70">{a.poolName}</div>
+                        <div className="font-medium">#{usageAccountAttemptId(a)}</div>
+                        <div className="max-w-[180px] truncate text-[0.68rem] text-muted-foreground/70">{usageAccountAttemptName(a)}</div>
                       </TableCell>
                       <TableCell>
                         <div className="max-w-[220px] truncate font-mono text-xs" title={a.outboundModel || ''}>

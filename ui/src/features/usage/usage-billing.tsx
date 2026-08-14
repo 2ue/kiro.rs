@@ -239,8 +239,8 @@ export function AccountBillingPanel({
 
   return (
     <SectionCard
-      title="外部账号计费拆分"
-      description="展示外部账号的上游原始成本、展示计费和计费差额"
+      title="上游账号计费拆分"
+      description="展示上游账号的上游原始成本、展示计费和计费差额"
       icon={<DollarSign />}
       actions={
         <Badge tone={billingDeltaBadgeTone(deltaTone)}>
@@ -251,7 +251,7 @@ export function AccountBillingPanel({
       <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <CostMetric
-            label="外部账号请求"
+            label="上游账号请求"
             value={<span title={formatNumber(billing.requests)}>{formatCompact(billing.requests)}</span>}
             detail={<>可计价 <span title={formatNumber(billing.pricedRequests)}>{formatCompact(billing.pricedRequests)}</span> / 未计价 <span title={formatNumber(billing.unpricedRequests)}>{formatCompact(billing.unpricedRequests)}</span></>}
           />
@@ -289,19 +289,19 @@ export function AccountBillingPanel({
 
         <div className="pt-1">
           <div className="mb-2 flex items-center justify-between gap-2">
-            <div className="text-xs font-semibold text-foreground/70">外部账号成本与差额</div>
+            <div className="text-xs font-semibold text-foreground/70">上游账号成本与差额</div>
             <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
           </div>
           {visibleAccounts.length === 0 ? (
             <div className="rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground/60">
-              当前窗口没有外部账号计费样本。
+              当前窗口没有上游账号计费样本。
             </div>
           ) : (
             <div className="scrollbar-thin overflow-x-auto rounded-lg bg-card">
               <table className="w-full min-w-[640px] text-xs">
                 <thead>
                   <tr className="bg-muted/40 text-muted-foreground">
-                    <th className="px-3 py-2 text-left font-medium">外部账号</th>
+                    <th className="px-3 py-2 text-left font-medium">上游账号</th>
                     <th className="px-3 py-2 text-right font-medium">请求</th>
                     <th className="px-3 py-2 text-right font-medium">上游原始成本</th>
                     <th className="px-3 py-2 text-right font-medium">展示计费</th>

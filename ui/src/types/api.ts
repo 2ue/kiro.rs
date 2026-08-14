@@ -801,6 +801,9 @@ export interface UsageRecord {
   directPolicyReason?: string
   localAttempted?: boolean
   localPreflight?: unknown
+  accountId?: number
+  accountName?: string
+  accountAttempts?: AccountAttempt[]
   externalPoolId?: number
   externalPoolName?: string
   externalAttempts?: ExternalPoolAttempt[]
@@ -875,6 +878,19 @@ export interface ExternalPoolAttempt {
   attempt: number
   poolId: number
   poolName: string
+  outboundModel?: string
+  status?: number
+  action: string
+  durationMs: number
+  errorType?: string
+  errorMessage?: string
+  rawUpstreamError?: RawUpstreamError
+}
+
+export interface AccountAttempt {
+  attempt: number
+  accountId: number
+  accountName: string
   outboundModel?: string
   status?: number
   action: string

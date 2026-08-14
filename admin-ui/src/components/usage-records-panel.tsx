@@ -27,7 +27,7 @@ import { getUsageRecords } from '@/api/usage'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatUsd, formatUsdCsv, formatUsdDetailed } from '@/lib/format'
 import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
-import type { ExternalPoolUsageSnapshot, InferenceAttemptSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
+import type { AccountAttempt, ExternalPoolAttempt, ExternalPoolUsageSnapshot, InferenceAttemptSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 import { RequestApiKeyIdDisplay } from '@/components/request-api-key-id'
 
 const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
@@ -39,6 +39,22 @@ type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
 function accountAttemptCount(attempts: InferenceAttemptSnapshot): number {
   return attempts.accountAttempts ?? attempts.externalAttempts ?? 0
+}
+
+type UsageAccountAttempt = AccountAttempt | ExternalPoolAttempt
+
+function usageAccountAttempts(record: UsageRecord): UsageAccountAttempt[] {
+  const accountAttempts = record.accountAttempts ?? []
+  if (accountAttempts.length > 0) return accountAttempts
+  return record.externalAttempts ?? []
+}
+
+function usageAccountAttemptId(attempt: UsageAccountAttempt): number {
+  return 'accountId' in attempt ? attempt.accountId : attempt.poolId
+}
+
+function usageAccountAttemptName(attempt: UsageAccountAttempt): string {
+  return 'accountName' in attempt ? attempt.accountName : attempt.poolName
 }
 
 function billingDeltaTone(delta: number): BillingDeltaTone {
@@ -124,8 +140,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'route_subtype',
     'credential_id',
     'credential_label',
-    'external_pool_id',
-    'external_pool_name',
+    'account_id',
+    'account_name',
     'usage_source',
     'total_input_tokens',
     'compat_input_tokens',
@@ -156,8 +172,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.routeSubtype,
     record.credentialId,
     record.credentialLabel,
-    record.externalPoolId,
-    record.externalPoolName,
+    record.accountId ?? record.externalPoolId,
+    record.accountName ?? record.externalPoolName,
     record.usageSource,
     record.totalInputTokens,
     record.compatInputTokens,
@@ -259,21 +275,21 @@ function statusLabel(status: string): string {
 function routeLabel(record: UsageRecord): string {
   switch (record.routeSubtype) {
     case 'external_direct_policy':
-      return '外部直连'
+      return '账号直连'
     case 'external_fallback_preflight':
-      return '预检 fallback'
+      return '账号预检'
     case 'external_fallback_after_local_attempts':
-      return '失败后 fallback'
+      return '本地后账号'
     case 'local_rescue_after_external':
-      return '备用池后回本地'
+      return '上游账号后回本地'
     case 'external_error':
-      return '外部错误'
+      return '账号错误'
     case 'local_error_no_fallback':
       return '本地错误'
     case 'local_success':
       return '本地成功'
     default:
-      return record.routeKind === 'external_pool' ? '外部池' : '本地'
+      return record.routeKind === 'external_pool' || record.routeKind === 'account' ? '上游账号' : '本地'
   }
 }
 
@@ -359,10 +375,10 @@ function formatAttemptSummary(record: UsageRecord): string {
 }
 
 function formatExternalAttemptChain(record: UsageRecord): string {
-  return (record.externalAttempts || [])
+  return usageAccountAttempts(record)
     .map((attempt) => {
       const model = attempt.outboundModel ? ` ${attempt.outboundModel}` : ''
-      return `外部池 #${attempt.poolId}${model}(${attempt.status ?? attempt.errorType ?? attempt.action})`
+      return `上游账号 #${usageAccountAttemptId(attempt)}${model}(${attempt.status ?? attempt.errorType ?? attempt.action})`
     })
     .join(' > ')
 }
@@ -544,18 +560,19 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     )
   })
 
-  record.externalAttempts?.forEach((attempt) => {
+  usageAccountAttempts(record).forEach((attempt) => {
+    const accountId = usageAccountAttemptId(attempt)
     appendErrorDiagnostic(
       items,
       seen,
-      `外部池上游错误片段 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
+      `上游账号错误片段 #${attempt.attempt} · 账号 #${accountId} · ${attempt.status ?? attempt.action ?? '-'}`,
       formatRawUpstreamError(attempt.rawUpstreamError),
       'warning'
     )
     appendErrorDiagnostic(
       items,
       seen,
-      `外部池上游尝试 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
+      `上游账号尝试 #${attempt.attempt} · 账号 #${accountId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
       attempt.errorMessage || attempt.errorType,
       'error'
     )
@@ -1039,7 +1056,7 @@ export function UsageRecordsPanel() {
             onChange={(event) => setRouteTarget(event.target.value)}
             className="h-10 rounded-md border border-input bg-background px-3 py-2 text-sm"
           >
-            <option value="">全部账号/外部池</option>
+            <option value="">全部账号</option>
             {(credentials.data?.credentials || []).length > 0 && (
               <optgroup label="账号凭证">
                 {(credentials.data?.credentials || []).map((credential) => (
@@ -1050,7 +1067,7 @@ export function UsageRecordsPanel() {
               </optgroup>
             )}
             {(externalPools.data?.pools || []).length > 0 && (
-              <optgroup label="外部池">
+              <optgroup label="上游账号">
                 {(externalPools.data?.pools || []).map((pool) => (
                   <option key={`external:${pool.id}`} value={`external:${pool.id}`}>
                     #{pool.id} {pool.name}
@@ -1215,23 +1232,25 @@ export function UsageRecordsPanel() {
                     const attemptChain = formatAttemptChain(record)
                     const attemptSummary = formatAttemptSummary(record)
                     const externalAttemptChain = formatExternalAttemptChain(record)
-                    const isExternal = record.routeKind === 'external_pool'
+                    const isExternal = record.routeKind === 'external_pool' || record.routeKind === 'account'
+                    const upstreamAccountId = record.accountId ?? record.externalPoolId
+                    const upstreamAccountName = record.accountName ?? record.externalPoolName
 
                     return (
                     <tr key={record.id} className="border-b last:border-0">
                       <td className="px-3 py-2 whitespace-nowrap">{formatDate(record.createdAt)}</td>
                       <td className="px-3 py-2">
                         <div className="font-medium">
-                          {isExternal ? `外部池 #${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}
+                          {isExternal ? `上游账号 #${upstreamAccountId ?? '-'}` : `#${record.credentialId ?? '-'}`}
                         </div>
                         {credentialLabel && (
                           <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={credentialLabel}>
                             {credentialLabel}
                           </div>
                         )}
-                        {isExternal && record.externalPoolName && (
-                          <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={record.externalPoolName}>
-                            {record.externalPoolName}
+                        {isExternal && upstreamAccountName && (
+                          <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={upstreamAccountName}>
+                            {upstreamAccountName}
                           </div>
                         )}
                         {attemptChain && (
@@ -1441,11 +1460,11 @@ export function UsageRecordsPanel() {
                     {selectedRecord.routeKind || '-'} {selectedRecord.routeSubtype ? `· ${selectedRecord.routeSubtype}` : ''}
                   </div>
                 </div>
-                {selectedRecord.routeKind === 'external_pool' && (
+                {(selectedRecord.routeKind === 'external_pool' || selectedRecord.routeKind === 'account') && (
                   <div>
-                    <div className="text-xs text-muted-foreground">外部池</div>
+                    <div className="text-xs text-muted-foreground">上游账号</div>
                     <div>
-                      #{selectedRecord.externalPoolId ?? '-'} {selectedRecord.externalPoolName || ''}
+                      #{selectedRecord.accountId ?? selectedRecord.externalPoolId ?? '-'} {selectedRecord.accountName ?? selectedRecord.externalPoolName ?? ''}
                     </div>
                   </div>
                 )}
@@ -1560,7 +1579,7 @@ export function UsageRecordsPanel() {
                   return (
                     <div className="rounded-md border bg-muted/30 p-3 text-sm">
                       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                        <div className="font-medium">外部池计费拆分</div>
+                        <div className="font-medium">上游账号计费拆分</div>
                         <Badge variant={hasLoss ? 'destructive' : hasProfit ? 'warning' : 'success'}>
                           {hasLoss ? `亏损 ${formatUsdDetailed(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsdDetailed(profit)}` : '持平'}
                         </Badge>
@@ -1655,9 +1674,9 @@ export function UsageRecordsPanel() {
                   </div>
                 </div>
               )}
-              {(selectedRecord.externalAttempts || []).length > 0 && (
+              {usageAccountAttempts(selectedRecord).length > 0 && (
                 <div>
-                  <div className="mb-2 text-sm font-medium">外部池链路</div>
+                  <div className="mb-2 text-sm font-medium">上游账号链路</div>
                   <div className="mb-2 rounded-md border bg-muted px-3 py-2 font-mono text-xs">
                     {formatExternalAttemptChain(selectedRecord)}
                   </div>
@@ -1666,7 +1685,7 @@ export function UsageRecordsPanel() {
                       <thead className="bg-muted text-muted-foreground">
                         <tr className="text-left">
                           <th className="px-3 py-2 font-medium">顺序</th>
-                          <th className="px-3 py-2 font-medium">外部池</th>
+                          <th className="px-3 py-2 font-medium">上游账号</th>
                           <th className="px-3 py-2 font-medium">状态</th>
                           <th className="px-3 py-2 font-medium">动作</th>
                           <th className="px-3 py-2 font-medium text-right">耗时</th>
@@ -1674,13 +1693,13 @@ export function UsageRecordsPanel() {
                         </tr>
                       </thead>
                       <tbody>
-                        {(selectedRecord.externalAttempts || []).map((attempt) => (
-                          <tr key={`${attempt.attempt}-${attempt.poolId}-${attempt.durationMs}`} className="border-t">
+                        {usageAccountAttempts(selectedRecord).map((attempt) => (
+                          <tr key={`${attempt.attempt}-${usageAccountAttemptId(attempt)}-${attempt.durationMs}`} className="border-t">
                             <td className="px-3 py-2">{attempt.attempt}</td>
                             <td className="px-3 py-2">
-                              <div className="font-medium">#{attempt.poolId}</div>
-                              <div className="max-w-[220px] truncate text-muted-foreground" title={attempt.poolName}>
-                                {attempt.poolName}
+                              <div className="font-medium">#{usageAccountAttemptId(attempt)}</div>
+                              <div className="max-w-[220px] truncate text-muted-foreground" title={usageAccountAttemptName(attempt)}>
+                                {usageAccountAttemptName(attempt)}
                               </div>
                             </td>
                             <td className="px-3 py-2">{attempt.status || '-'}</td>

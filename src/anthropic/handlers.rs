@@ -89,7 +89,7 @@ use super::types::{
 use super::usage::{
     ExternalPoolAttempt, ExternalPoolUsageSnapshot, StreamTerminalReason, UsageLatencyTrace,
     UsagePublicError, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
-    UsageSource,
+    UsageSource, account_attempts_from_external,
 };
 use super::websearch;
 use crate::account_runtime::{
@@ -4266,6 +4266,8 @@ impl CredentialUsageContext {
             self.error_metadata.clone(),
             self.request.error_metadata.lock().clone(),
         );
+        let external_attempts = self.request.external_attempts.clone();
+        let account_attempts = account_attempts_from_external(&external_attempts);
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -4326,7 +4328,10 @@ impl CredentialUsageContext {
             local_preflight: self.request.local_preflight.clone(),
             external_pool_id: None,
             external_pool_name: None,
-            external_attempts: self.request.external_attempts.clone(),
+            account_id: None,
+            account_name: None,
+            account_attempts,
+            external_attempts,
             usage_projection_applied: None,
             external_pool_billing: None,
             error_type,

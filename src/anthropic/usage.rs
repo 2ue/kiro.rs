@@ -94,6 +94,49 @@ pub struct ExternalPoolAttempt {
     pub raw_upstream_error: Option<RawUpstreamError>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountAttempt {
+    pub attempt: u32,
+    pub account_id: u64,
+    pub account_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub action: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_upstream_error: Option<RawUpstreamError>,
+}
+
+impl From<&ExternalPoolAttempt> for AccountAttempt {
+    fn from(attempt: &ExternalPoolAttempt) -> Self {
+        Self {
+            attempt: attempt.attempt,
+            account_id: attempt.pool_id,
+            account_name: attempt.pool_name.clone(),
+            outbound_model: attempt.outbound_model.clone(),
+            status: attempt.status,
+            action: attempt.action.clone(),
+            duration_ms: attempt.duration_ms,
+            error_type: attempt.error_type.clone(),
+            error_message: attempt.error_message.clone(),
+            raw_upstream_error: attempt.raw_upstream_error.clone(),
+        }
+    }
+}
+
+pub(crate) fn account_attempts_from_external(
+    attempts: &[ExternalPoolAttempt],
+) -> Vec<AccountAttempt> {
+    attempts.iter().map(AccountAttempt::from).collect()
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolUsageSnapshot {
@@ -473,6 +516,12 @@ pub struct UsageRecord {
     pub external_pool_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_pool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_attempts: Vec<AccountAttempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_attempts: Vec<ExternalPoolAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -604,6 +653,9 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
         local_preflight: None,
         external_pool_id: None,
         external_pool_name: None,
+        account_id: None,
+        account_name: None,
+        account_attempts: Vec::new(),
         external_attempts: Vec::new(),
         usage_projection_applied: None,
         external_pool_billing: None,
@@ -1888,6 +1940,12 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         .take()
         .map(RawUpstreamError::normalize);
     for attempt in &mut record.credential_attempts {
+        attempt.raw_upstream_error = attempt
+            .raw_upstream_error
+            .take()
+            .map(RawUpstreamError::normalize);
+    }
+    for attempt in &mut record.account_attempts {
         attempt.raw_upstream_error = attempt
             .raw_upstream_error
             .take()
@@ -4002,6 +4060,9 @@ mod tests {
             local_preflight: None,
             external_pool_id: None,
             external_pool_name: None,
+            account_id: None,
+            account_name: None,
+            account_attempts: Vec::new(),
             external_attempts: Vec::new(),
             usage_projection_applied: None,
             external_pool_billing: None,
@@ -4023,6 +4084,40 @@ mod tests {
 
     fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
         record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
+    }
+
+    #[test]
+    fn usage_record_serializes_account_attempts_with_external_compatibility() {
+        let external_attempts = vec![ExternalPoolAttempt {
+            attempt: 1,
+            pool_id: 42,
+            pool_name: "primary".to_string(),
+            outbound_model: Some("claude-sonnet-4-5".to_string()),
+            status: Some(200),
+            action: "success".to_string(),
+            duration_ms: 123,
+            error_type: None,
+            error_message: None,
+            raw_upstream_error: None,
+        }];
+        let mut record = record("req_account_attempts", 0, UsageSource::UpstreamMetadata);
+        record.route_kind = Some(UsageRouteKind::ExternalPool);
+        record.external_pool_id = Some(42);
+        record.external_pool_name = Some("primary".to_string());
+        record.account_id = Some(42);
+        record.account_name = Some("primary".to_string());
+        record.account_attempts = account_attempts_from_external(&external_attempts);
+        record.external_attempts = external_attempts;
+
+        let json = serde_json::to_value(record).expect("usage record serializes");
+        assert_eq!(json["accountId"], 42);
+        assert_eq!(json["accountName"], "primary");
+        assert_eq!(json["accountAttempts"][0]["accountId"], 42);
+        assert_eq!(json["accountAttempts"][0]["accountName"], "primary");
+        assert_eq!(json["externalPoolId"], 42);
+        assert_eq!(json["externalPoolName"], "primary");
+        assert_eq!(json["externalAttempts"][0]["poolId"], 42);
+        assert_eq!(json["externalAttempts"][0]["poolName"], "primary");
     }
 
     #[test]

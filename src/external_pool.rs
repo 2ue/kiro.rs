@@ -62,7 +62,7 @@ use crate::{
         usage::{
             ExternalPoolAttempt, ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageLatencyTrace,
             UsagePublicError, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
-            UsageSource,
+            UsageSource, account_attempts_from_external,
         },
     },
     common::{
@@ -8445,6 +8445,9 @@ impl ExternalPoolManager {
             .rev()
             .find_map(|attempt| attempt.outbound_model.clone());
         let latency_trace = external_usage_latency_trace(route);
+        let account_id = pool.map(|pool| pool.id);
+        let account_name = pool.map(|pool| pool.name.clone());
+        let account_attempts = account_attempts_from_external(&attempts);
         route.recorder.record(UsageRecord {
             id: route.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -8510,8 +8513,11 @@ impl ExternalPoolManager {
             direct_policy_reason: route.direct_policy_reason.clone(),
             local_attempted: Some(route.local_attempted),
             local_preflight: route.local_preflight.clone(),
-            external_pool_id: pool.map(|pool| pool.id),
-            external_pool_name: pool.map(|pool| pool.name.clone()),
+            external_pool_id: account_id,
+            external_pool_name: account_name.clone(),
+            account_id,
+            account_name,
+            account_attempts,
             external_attempts: attempts,
             usage_projection_applied: billing
                 .as_ref()

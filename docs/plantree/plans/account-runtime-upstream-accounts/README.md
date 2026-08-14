@@ -93,6 +93,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The Admin UI risk page now lives under `features/account-risk`, navigation points to `/account-risk`, and the old `/external-pool-risk` UI path redirects to the account risk page as a compatibility route.
 - Inference attempt budgeting now has an `Account` attempt kind. Real upstream account sends reserve that kind, while the old `ExternalPool` kind is retained only as a compatibility alias into the same counter until snapshot fields and legacy paths are migrated.
 - Inference attempt snapshots now expose `accountAttempts` as the primary account send counter while still serializing `externalAttempts` as a compatibility copy. Rust deserialization maps old snapshots that only contain `externalAttempts` into the account counter, and both maintained UIs display local/account/MCP breakdowns.
+- Usage records now double-write account-facing upstream account fields: `accountId`, `accountName` and `accountAttempts` are primary JSON fields, while `externalPoolId`, `externalPoolName` and `externalAttempts` remain compatibility copies. The maintained usage UIs prefer account fields, fall back to old records, and no longer display external-pool wording in usage record/detail/billing views.
 
 Last verified on 2026-08-14:
 
@@ -209,6 +210,15 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test2 -- cargo test counts_channels_without_exceeding_limit_for_five_rounds -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test4 -- cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `node feature/tests/mcp-attempt-channel-contract.mjs`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-usage-record-fields-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-usage-record-fields-test1b -- cargo test usage_record_serializes_account_attempts_with_external_compatibility -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-usage-record-fields-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-usage-record-fields-test3 -- cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`

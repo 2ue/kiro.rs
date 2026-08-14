@@ -7404,6 +7404,9 @@ mod tests {
             local_preflight: None,
             external_pool_id: None,
             external_pool_name: None,
+            account_id: None,
+            account_name: None,
+            account_attempts: Vec::new(),
             external_attempts: Vec::new(),
             usage_projection_applied: None,
             external_pool_billing: None,
@@ -8085,6 +8088,8 @@ mod tests {
         external.credential_label = None;
         external.external_pool_id = Some(42);
         external.external_pool_name = Some("backup-a".to_string());
+        external.account_id = Some(42);
+        external.account_name = Some("backup-a".to_string());
         external.external_pool_billing = Some(ExternalPoolBilling {
             request_input_tokens: None,
             raw_usage: ExternalPoolUsageSnapshot::default(),

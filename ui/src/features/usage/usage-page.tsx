@@ -120,9 +120,11 @@ function usageInputTotal(record: UsageRecord): number {
 }
 
 function routeAccountLabel(record: UsageRecord, credentialLabel?: string): string {
-  if (record.routeKind === 'external_pool') {
-    const name = record.externalPoolName ? ` ${record.externalPoolName}` : ''
-    return `上游账号 #${record.externalPoolId ?? '-'}${name}`
+  if (record.routeKind === 'external_pool' || record.routeKind === 'account') {
+    const accountId = record.accountId ?? record.externalPoolId
+    const accountName = record.accountName ?? record.externalPoolName
+    const name = accountName ? ` ${accountName}` : ''
+    return `上游账号 #${accountId ?? '-'}${name}`
   }
   const label = credentialLabel ? ` ${credentialLabel}` : ''
   return `账号 #${record.credentialId ?? '-'}${label}`
@@ -230,8 +232,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'route_subtype',
     'credential_id',
     'credential_label',
-    'external_pool_id',
-    'external_pool_name',
+    'account_id',
+    'account_name',
     'usage_source',
     'total_input_tokens',
     'compat_input_tokens',
@@ -262,8 +264,8 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.routeSubtype,
     record.credentialId,
     record.credentialLabel,
-    record.externalPoolId,
-    record.externalPoolName,
+    record.accountId ?? record.externalPoolId,
+    record.accountName ?? record.externalPoolName,
     record.usageSource,
     record.totalInputTokens,
     record.compatInputTokens,
