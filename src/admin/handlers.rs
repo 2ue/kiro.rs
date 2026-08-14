@@ -1609,7 +1609,14 @@ pub async fn get_usage_dashboard_account_billing(
     State(state): State<AdminState>,
     Query(params): Query<UsageDashboardWindowQueryParams>,
 ) -> impl IntoResponse {
-    get_usage_dashboard_external_pool_billing(State(state), Query(params)).await
+    let window_key = params.window_key.unwrap_or_else(|| "today".to_string());
+    match state
+        .service
+        .get_usage_dashboard_account_billing(params.timezone, window_key)
+    {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/usage-dashboard/external-pool-risk

@@ -88,6 +88,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic request entry and handler code now uses account-runtime aliases for account route requests, route preparation cache, request body mode, forward outcome, final route error and latency trace. Raw direct/preflight helper names now use account-route terminology while the underlying legacy implementation remains behind the facade.
 - `account_runtime` now exposes account-named manager wrappers for eligibility, immediate availability, direct route reason and failover execution. Anthropic handler code enters through those wrappers instead of directly calling legacy pool-named manager methods.
 - `account_runtime` now exports account-named Admin/runtime enum aliases for account auth, usage projection, stream response, raw model, auto-disable, retry, model mapping and route mode. New Account DTOs and account discovery/test service paths use these aliases, while legacy `/external-pools` DTOs keep their compatibility type names.
+- `/api/admin/usage-dashboard/account-billing` now returns an account-shaped billing response with `accountBillingByAccount` rows containing `accountId` and `accountName`. The old `/external-pool-billing` response remains unchanged, and the Admin UI consumes the account-shaped field with a temporary fallback for older responses.
 
 Last verified on 2026-08-14:
 
@@ -179,4 +180,9 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-dto-alias-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-dto-alias-test1 -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-dto-alias-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-billing-response-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-billing-response-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-billing-response-test1 -- cargo test account_billing_response_serializes_account_boundary_fields -- --nocapture`
+- `pnpm --dir ui check`
 - `git diff --check`

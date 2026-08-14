@@ -50,6 +50,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Anthropic raw request entry and handler route construction now use account-runtime route/body/outcome/error/latency aliases and account-route helper names. Legacy external-pool route types remain behind the facade until the implementation moves out of `external_pool`.
 - Anthropic handler scheduling checks and failover execution now call account-named runtime manager wrappers for eligibility, immediate availability, direct route reason and forwarding instead of calling legacy pool-named manager methods directly.
 - Account Admin DTOs now use account-named aliases for auth, usage projection, stream response, request body, raw model, auto-disable, retry, model mapping and route-mode types. Account supported-model discovery and account test service paths also match on `AccountAuthType`, while legacy external-pool DTOs and service paths retain old compatibility type names.
+- Account usage billing now has an account-shaped Admin response for `/usage-dashboard/account-billing`: rows expose `accountId/accountName` under `accountBillingByAccount`. The frontend overview and usage API client consume that account field, while legacy external-pool billing endpoints and fallback parsing remain for compatibility.
 
 ## In Progress
 

@@ -6,6 +6,7 @@ import type {
   ManualModelResponse,
   ModelPricingStatus,
   UpsertManualModelRequest,
+  UsageAccountBillingByAccount,
   UsageDashboardAccountBillingResponse,
   UsageDashboardResponse,
   UsageDashboardBreakdownResponse,
@@ -39,6 +40,28 @@ function usageRiskQueryParams(query: UsageExternalPoolRiskQuery): Record<string,
   return {
     ...query,
     ...(accountId ? { accountId, externalPoolId: accountId } : {}),
+  }
+}
+
+function accountBillingRowsFromExternal(
+  rows: UsageDashboardExternalPoolBillingResponse['externalPoolBillingByPool'] = []
+): UsageAccountBillingByAccount[] {
+  return rows.map(({ poolId, poolName, ...billing }) => ({
+    ...billing,
+    accountId: poolId,
+    accountName: poolName,
+  }))
+}
+
+function normalizeAccountBillingResponse(
+  data: UsageDashboardAccountBillingResponse & Partial<UsageDashboardExternalPoolBillingResponse>
+): UsageDashboardAccountBillingResponse {
+  return {
+    generatedAt: data.generatedAt,
+    timezone: data.timezone,
+    windowKey: data.windowKey,
+    accountBillingByAccount:
+      data.accountBillingByAccount ?? accountBillingRowsFromExternal(data.externalPoolBillingByPool),
   }
 }
 
@@ -117,10 +140,10 @@ export async function getUsageDashboardAccountBilling(
   timezone = 'Asia/Shanghai',
   windowKey = 'today'
 ): Promise<UsageDashboardAccountBillingResponse> {
-  const { data } = await api.get<UsageDashboardAccountBillingResponse>('/usage-dashboard/account-billing', {
+  const { data } = await api.get<UsageDashboardAccountBillingResponse & Partial<UsageDashboardExternalPoolBillingResponse>>('/usage-dashboard/account-billing', {
     params: { timezone, windowKey },
   })
-  return data
+  return normalizeAccountBillingResponse(data)
 }
 
 export async function getUsageDashboardExternalPoolRisk(

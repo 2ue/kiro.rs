@@ -842,6 +842,44 @@ pub struct UsageExternalPoolBillingByPool {
     pub cost_floor_delta_usd: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAccountBillingByAccount {
+    pub account_id: u64,
+    pub account_name: String,
+    pub requests: usize,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
+    pub cost_floor_applied_requests: usize,
+    pub raw_cost_usd: f64,
+    pub shaped_cost_usd: f64,
+    pub uplifted_cost_usd: f64,
+    pub profit_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub cost_floor_delta_usd: f64,
+}
+
+impl From<UsageExternalPoolBillingByPool> for UsageAccountBillingByAccount {
+    fn from(row: UsageExternalPoolBillingByPool) -> Self {
+        Self {
+            account_id: row.pool_id,
+            account_name: row.pool_name,
+            requests: row.requests,
+            priced_requests: row.priced_requests,
+            unpriced_requests: row.unpriced_requests,
+            cost_floor_applied_requests: row.cost_floor_applied_requests,
+            raw_cost_usd: row.raw_cost_usd,
+            shaped_cost_usd: row.shaped_cost_usd,
+            uplifted_cost_usd: row.uplifted_cost_usd,
+            profit_usd: row.profit_usd,
+            reported_cost_usd: row.reported_cost_usd,
+            billable_cost_usd: row.billable_cost_usd,
+            cost_floor_delta_usd: row.cost_floor_delta_usd,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardResponse {
@@ -892,6 +930,30 @@ pub struct UsageDashboardExternalPoolBillingResponse {
     pub timezone: String,
     pub window_key: String,
     pub external_pool_billing_by_pool: Vec<UsageExternalPoolBillingByPool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardAccountBillingResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub window_key: String,
+    pub account_billing_by_account: Vec<UsageAccountBillingByAccount>,
+}
+
+impl From<UsageDashboardExternalPoolBillingResponse> for UsageDashboardAccountBillingResponse {
+    fn from(response: UsageDashboardExternalPoolBillingResponse) -> Self {
+        Self {
+            generated_at: response.generated_at,
+            timezone: response.timezone,
+            window_key: response.window_key,
+            account_billing_by_account: response
+                .external_pool_billing_by_pool
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3780,6 +3842,40 @@ mod tests {
 
     fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
         record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
+    }
+
+    #[test]
+    fn account_billing_response_serializes_account_boundary_fields() {
+        let legacy = UsageDashboardExternalPoolBillingResponse {
+            generated_at: "2026-08-14T00:00:00Z".to_string(),
+            timezone: "Asia/Shanghai".to_string(),
+            window_key: "today".to_string(),
+            external_pool_billing_by_pool: vec![UsageExternalPoolBillingByPool {
+                pool_id: 42,
+                pool_name: "primary".to_string(),
+                requests: 7,
+                priced_requests: 6,
+                unpriced_requests: 1,
+                cost_floor_applied_requests: 2,
+                raw_cost_usd: 0.1,
+                shaped_cost_usd: 0.2,
+                uplifted_cost_usd: 0.3,
+                profit_usd: 0.2,
+                reported_cost_usd: 0.25,
+                billable_cost_usd: 0.32,
+                cost_floor_delta_usd: 0.02,
+            }],
+        };
+
+        let json = serde_json::to_value(UsageDashboardAccountBillingResponse::from(legacy))
+            .expect("account billing response serializes");
+
+        assert!(json.get("accountBillingByAccount").is_some());
+        assert!(json.get("externalPoolBillingByPool").is_none());
+        assert_eq!(json["accountBillingByAccount"][0]["accountId"], 42);
+        assert_eq!(json["accountBillingByAccount"][0]["accountName"], "primary");
+        assert!(json["accountBillingByAccount"][0].get("poolId").is_none());
+        assert!(json["accountBillingByAccount"][0].get("poolName").is_none());
     }
 
     #[test]

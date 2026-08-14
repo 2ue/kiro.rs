@@ -4365,6 +4365,18 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
+    pub fn get_usage_dashboard_account_billing(
+        &self,
+        timezone: Option<String>,
+        window_key: String,
+    ) -> Result<crate::anthropic::usage::UsageDashboardAccountBillingResponse, AdminServiceError>
+    {
+        self.usage_recorder
+            .dashboard_external_pool_billing(timezone.as_deref(), &window_key)
+            .map(Into::into)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
     pub fn get_usage_dashboard_external_pool_risk(
         &self,
         query: UsageExternalPoolRiskQuery,

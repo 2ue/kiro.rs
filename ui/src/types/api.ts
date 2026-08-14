@@ -964,6 +964,13 @@ export interface UsageExternalPoolBillingByPool extends UsageExternalPoolBilling
   poolName: string
 }
 
+export type UsageAccountBillingSummary = UsageExternalPoolBillingSummary
+
+export interface UsageAccountBillingByAccount extends UsageAccountBillingSummary {
+  accountId: number
+  accountName: string
+}
+
 export interface UsageDashboardResponse {
   generatedAt: string
   timezone: string
@@ -1004,7 +1011,12 @@ export interface UsageDashboardExternalPoolBillingResponse {
   externalPoolBillingByPool: UsageExternalPoolBillingByPool[]
 }
 
-export type UsageDashboardAccountBillingResponse = UsageDashboardExternalPoolBillingResponse
+export interface UsageDashboardAccountBillingResponse {
+  generatedAt: string
+  timezone: string
+  windowKey: string
+  accountBillingByAccount: UsageAccountBillingByAccount[]
+}
 
 export interface UsageExternalPoolRiskQuery {
   timezone?: string

@@ -7,7 +7,7 @@ import { cn } from '@/lib/utils'
 import type {
   ExternalPoolBilling,
   ExternalPoolUsageSnapshot,
-  UsageExternalPoolBillingByPool,
+  UsageAccountBillingByAccount,
   UsageExternalPoolBillingSummary,
   UsageRecord,
 } from '@/types/api'
@@ -221,12 +221,12 @@ export function UsageCostBreakdown({
   )
 }
 
-export function ExternalPoolBillingPanel({
+export function AccountBillingPanel({
   billing,
-  billingByPool,
+  billingByAccount,
 }: {
   billing: UsageExternalPoolBillingSummary
-  billingByPool: UsageExternalPoolBillingByPool[]
+  billingByAccount: UsageAccountBillingByAccount[]
 }) {
   const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
   const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
@@ -235,7 +235,7 @@ export function ExternalPoolBillingPanel({
   const deltaTone = billingDeltaTone(delta)
   const hasNegativeDelta = deltaTone === 'loss'
   const hasPositiveDelta = deltaTone === 'profit'
-  const visiblePools = billingByPool.filter((pool) => pool.requests > 0).slice(0, 20)
+  const visibleAccounts = billingByAccount.filter((account) => account.requests > 0).slice(0, 20)
 
   return (
     <SectionCard
@@ -292,7 +292,7 @@ export function ExternalPoolBillingPanel({
             <div className="text-xs font-semibold text-foreground/70">外部账号成本与差额</div>
             <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
           </div>
-          {visiblePools.length === 0 ? (
+          {visibleAccounts.length === 0 ? (
             <div className="rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground/60">
               当前窗口没有外部账号计费样本。
             </div>
@@ -312,24 +312,24 @@ export function ExternalPoolBillingPanel({
                   </tr>
                 </thead>
                 <tbody>
-                  {visiblePools.map((pool) => {
-                    const poolDelta = pool.profitUsd ?? ((pool.upliftedCostUsd ?? pool.reportedCostUsd ?? 0) - pool.rawCostUsd)
-                    const poolTone = billingDeltaTone(poolDelta)
+                  {visibleAccounts.map((account) => {
+                    const accountDelta = account.profitUsd ?? ((account.upliftedCostUsd ?? account.reportedCostUsd ?? 0) - account.rawCostUsd)
+                    const accountTone = billingDeltaTone(accountDelta)
                     return (
-                      <tr key={pool.poolId} className="bg-card transition-colors hover:bg-muted/30">
+                      <tr key={account.accountId} className="bg-card transition-colors hover:bg-muted/30">
                         <td className="px-3 py-2">
-                          <div className="max-w-[200px] truncate font-medium" title={pool.poolName}>{pool.poolName}</div>
-                          <div className="font-mono text-[0.62rem] text-muted-foreground/45">#{pool.poolId}</div>
+                          <div className="max-w-[200px] truncate font-medium" title={account.accountName}>{account.accountName}</div>
+                          <div className="font-mono text-[0.62rem] text-muted-foreground/45">#{account.accountId}</div>
                         </td>
-                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.requests)}>{formatCompact(pool.requests)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(pool.rawCostUsd)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(pool.shapedCostUsd ?? pool.reportedCostUsd)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(pool.upliftedCostUsd ?? pool.reportedCostUsd)}</td>
-                        <td className={cn('px-3 py-2 text-right font-mono', billingDeltaTextClass(poolTone))}>
-                          {poolDelta >= 0 ? '+' : ''}{formatUsdFixed2(poolDelta)}
+                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(account.requests)}>{formatCompact(account.requests)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(account.rawCostUsd)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(account.shapedCostUsd ?? account.reportedCostUsd)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(account.upliftedCostUsd ?? account.reportedCostUsd)}</td>
+                        <td className={cn('px-3 py-2 text-right font-mono', billingDeltaTextClass(accountTone))}>
+                          {accountDelta >= 0 ? '+' : ''}{formatUsdFixed2(accountDelta)}
                         </td>
-                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.unpricedRequests)}>{formatCompact(pool.unpricedRequests)}</td>
-                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.costFloorAppliedRequests)}>{formatCompact(pool.costFloorAppliedRequests)}</td>
+                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(account.unpricedRequests)}>{formatCompact(account.unpricedRequests)}</td>
+                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(account.costFloorAppliedRequests)}>{formatCompact(account.costFloorAppliedRequests)}</td>
                       </tr>
                     )
                   })}

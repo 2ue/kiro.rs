@@ -14,8 +14,8 @@ import {
 } from 'lucide-react'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import {
+  useUsageDashboardAccountBilling,
   useUsageDashboardBreakdown,
-  useUsageDashboardExternalPoolBilling,
   useUsageDashboardSeries,
   useUsageDashboardTop,
   useUsageDashboardWindows,
@@ -25,11 +25,12 @@ import {
 import { useCredentialSummary, useCredentialUsageSummary } from '@/hooks/use-credentials'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import { ExternalPoolBillingPanel } from '../usage/usage-billing'
+import { AccountBillingPanel } from '../usage/usage-billing'
 import type {
   UsageBreakdownItem,
+  UsageAccountBillingByAccount,
   UsageDashboardWindow,
-  UsageExternalPoolBillingSummary,
+  UsageAccountBillingSummary,
   UsageSeriesPoint,
   UsageTopAggregate,
   CredentialUsageSummaryItem,
@@ -74,7 +75,7 @@ import {
 const OVERVIEW_TIMEZONE = 'Asia/Shanghai'
 const OVERVIEW_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:overview'
 
-const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
+const EMPTY_ACCOUNT_BILLING: UsageAccountBillingSummary = {
   requests: 0,
   pricedRequests: 0,
   unpricedRequests: 0,
@@ -86,6 +87,16 @@ const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
   reportedCostUsd: 0,
   billableCostUsd: 0,
   costFloorDeltaUsd: 0,
+}
+
+function accountBillingRowsFromDashboard(
+  rows: NonNullable<UsageDashboardWindow['summary']['externalPoolBillingByPool']> = []
+): UsageAccountBillingByAccount[] {
+  return rows.map(({ poolId, poolName, ...billing }) => ({
+    ...billing,
+    accountId: poolId,
+    accountName: poolName,
+  }))
 }
 
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'
@@ -484,7 +495,7 @@ function CostRelationshipPanel({
 }: {
   summary: UsageDashboardWindow['summary']
 }) {
-  const external = summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING
+  const external = summary.externalPoolBilling ?? EMPTY_ACCOUNT_BILLING
   const delta = summary.totalEstimatedCostUsd - summary.totalOriginalCostUsd
 
   return (
@@ -1016,7 +1027,7 @@ export function OverviewPage() {
     autoRefresh.refetchInterval,
     activeSection === 'errors'
   )
-  const externalPoolBillingQuery = useUsageDashboardExternalPoolBilling(
+  const accountBillingQuery = useUsageDashboardAccountBilling(
     OVERVIEW_TIMEZONE,
     effectiveWindowKey,
     autoRefresh.refetchInterval,
@@ -1068,10 +1079,9 @@ export function OverviewPage() {
   const series = seriesQuery.data?.series ?? { hourly24h: [], daily7d: [] }
   const statusBreakdown = breakdownQuery.data?.statusBreakdown ?? summary.statusBreakdown ?? []
   const usageSourceBreakdown = breakdownQuery.data?.usageSourceBreakdown ?? summary.usageSourceBreakdown ?? []
-  const externalPoolBillingByPool =
-    externalPoolBillingQuery.data?.externalPoolBillingByPool ??
-    summary.externalPoolBillingByPool ??
-    []
+  const accountBillingByAccount =
+    accountBillingQuery.data?.accountBillingByAccount ??
+    accountBillingRowsFromDashboard(summary.externalPoolBillingByPool)
 
   const pricedRatio = summary.totalRequests > 0 ? summary.pricedRequests / summary.totalRequests : 0
   const streamRatio = summary.totalRequests > 0 ? summary.streamRequests / summary.totalRequests : 0
@@ -1084,7 +1094,7 @@ export function OverviewPage() {
     topQuery.error ? `排行：${extractErrorMessage(topQuery.error)}` : '',
     credentialUsageSummaryQuery.error ? `账号质量：${extractErrorMessage(credentialUsageSummaryQuery.error)}` : '',
     breakdownQuery.error ? `分布：${extractErrorMessage(breakdownQuery.error)}` : '',
-    externalPoolBillingQuery.error ? `外部池计费：${extractErrorMessage(externalPoolBillingQuery.error)}` : '',
+    accountBillingQuery.error ? `上游账号计费：${extractErrorMessage(accountBillingQuery.error)}` : '',
   ].filter(Boolean)
 
   // 为 StatCard 准备 Sparkline 数据（用 hourly24h 序列）
@@ -1132,7 +1142,7 @@ export function OverviewPage() {
         seriesQuery.isFetching ||
         topQuery.isFetching ||
         breakdownQuery.isFetching ||
-        externalPoolBillingQuery.isFetching) && (
+        accountBillingQuery.isFetching) && (
         <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />
       )}
     </div>
@@ -1241,17 +1251,17 @@ export function OverviewPage() {
             <StatCard title="原始计费" value={formatUsdFixed2(summary.totalOriginalCostUsd)} desc="按原始 usage 估算" icon={<DollarSign />} tone="warning" />
             <StatCard title="Kiro 积分" value={formatCompact(summary.totalKiroMeteringUsage ?? 0)} valueTitle={formatNumber(summary.totalKiroMeteringUsage ?? 0)} desc="当前窗口积分消耗" icon={<DollarSign />} tone="info" />
             <StatCard title="未计价请求" value={formatCompact(summary.unpricedRequests)} valueTitle={formatNumber(summary.unpricedRequests)} desc={`已计价 ${formatCompact(summary.pricedRequests)}`} icon={<DollarSign />} tone={summary.unpricedRequests > 0 ? 'warning' : 'success'} />
-            <StatCard title="外部池请求" value={formatCompact(summary.externalPoolBilling?.requests ?? 0)} valueTitle={formatNumber(summary.externalPoolBilling?.requests ?? 0)} desc={`billable ${formatUsdFixed2(summary.externalPoolBilling?.billableCostUsd ?? 0)}`} icon={<DollarSign />} tone="info" />
+            <StatCard title="上游账号请求" value={formatCompact(summary.externalPoolBilling?.requests ?? 0)} valueTitle={formatNumber(summary.externalPoolBilling?.requests ?? 0)} desc={`billable ${formatUsdFixed2(summary.externalPoolBilling?.billableCostUsd ?? 0)}`} icon={<DollarSign />} tone="info" />
           </div>
           <CostRelationshipPanel summary={summary} />
-          {externalPoolBillingQuery.isLoading ? (
-            <SectionCard title="外部池计费" description="按当前窗口拆分">
-              <LoadingState text="加载外部池计费..." className="py-8" />
+          {accountBillingQuery.isLoading ? (
+            <SectionCard title="上游账号计费" description="按当前窗口拆分">
+              <LoadingState text="加载上游账号计费..." className="py-8" />
             </SectionCard>
           ) : (
-            <ExternalPoolBillingPanel
-              billing={summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING}
-              billingByPool={externalPoolBillingByPool}
+            <AccountBillingPanel
+              billing={summary.externalPoolBilling ?? EMPTY_ACCOUNT_BILLING}
+              billingByAccount={accountBillingByAccount}
             />
           )}
         </TabsContent>
