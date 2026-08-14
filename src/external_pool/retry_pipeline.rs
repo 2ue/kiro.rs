@@ -28,7 +28,7 @@ pub(super) fn payload_guard_retry_route(
             tracing::warn!(
                 request_id = %route.request_id,
                 error = %err,
-                "external pool payload guard retry failed to build trimmed request"
+                "account payload guard retry failed to build trimmed request"
             );
             return None;
         }

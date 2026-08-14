@@ -90,7 +90,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
     match err {
         ModelProcessingError::MissingModel => ExternalPoolError {
             status: Some(StatusCode::BAD_REQUEST),
-            message: format!("external pool #{} model is missing", pool.id),
+            message: format!("account #{} model is missing", pool.id),
             retryable: false,
             auto_disable_reason: None,
             cooldown: None,
@@ -100,7 +100,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
         ModelProcessingError::MappingMiss { model } => ExternalPoolError {
             status: Some(StatusCode::BAD_GATEWAY),
             message: format!(
-                "external pool #{} requires model mapping match, but no rule matched model {}",
+                "account #{} requires model mapping match, but no rule matched model {}",
                 pool.id, model
             ),
             retryable: true,

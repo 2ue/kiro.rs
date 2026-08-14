@@ -70,6 +70,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account-route raw/normalized body capability planning now has account body plan names, with the legacy executor still delegated through `external_pool` until that module is migrated.
 - Official upstream error-message extraction now uses account-neutral envelope/helper names while preserving the public-message filtering that blocks sensitive or internal scheduler/account/provider wording from downstream protocol errors.
 - Payload guard runtime wrappers and account-forwarding sanitizer now use local-upstream/account names, while the concrete legacy local payload type remains isolated until the provider/body implementation is replaced.
+- Account-route body/model/retry pipeline diagnostics now use account wording for payload guard, model rewrite, model mapping and cooldown failures inside the delegated legacy executor.
 
 ## In Progress
 

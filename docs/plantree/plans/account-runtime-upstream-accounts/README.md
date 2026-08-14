@@ -108,6 +108,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account-route body capability planning now uses account body plan names (`AccountBodyPlan`, `AccountBodyBytesPlan`, `AccountRaw`, `AccountNormalized`). The delegated legacy route executor still lives in `external_pool`, but body processing decisions no longer expose external-pool names at the capability-plan boundary.
 - Anthropic upstream error-envelope helpers now use account-neutral official-upstream naming (`official_upstream_public_message` / `official_upstream_public_error`) while retaining the existing sensitive/internal-term filtering behavior.
 - Payload guard runtime wrappers now use local-upstream/account names (`PreparedLocalUpstreamRequestBody`, `prepare_local_upstream_request_body`, `PreparedAccountMessagesPayload`, `prepare_account_messages_payload`, `sanitize_anthropic_messages_for_account_forwarding`). The underlying legacy local payload still uses `KiroRequest` until the provider/body implementation is replaced.
+- Account-route body/model/retry pipeline diagnostics now use account wording for normalized/raw payload guard, model rewrite, model mapping and model cooldown errors while the delegated executor types remain under the legacy `external_pool` module.
 
 Last verified on 2026-08-14:
 
@@ -245,6 +246,10 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test3 -- cargo test disabled_local_guard_serializes_without_report -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test4 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-pipeline-errors-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-pipeline-errors-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-pipeline-errors-test1 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-pipeline-errors-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

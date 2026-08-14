@@ -46,7 +46,7 @@ pub(super) fn prepare_request(
         Some(external_route_raw_projection_payload(route).ok_or_else(|| ExternalPoolError {
             status: Some(StatusCode::BAD_REQUEST),
             message: format!(
-                "external pool #{} requires normalized request body but raw route could not be parsed",
+                "account #{} requires normalized request body but raw route could not be parsed",
                 pool.id
             ),
             retryable: false,
@@ -86,7 +86,7 @@ pub(super) fn prepare_request(
             modified = report.was_modified(),
             original_bytes = report.original_bytes,
             final_bytes = report.final_bytes,
-            "external pool normalized body payload guard applied"
+            "account normalized body payload guard applied"
         );
     }
     if let Some(error) = normalized_base.guard_fallback_error.as_ref() {
@@ -96,7 +96,7 @@ pub(super) fn prepare_request(
             error = %error,
             endpoint = route.endpoint,
             model = %payload.model,
-            "external pool normalized payload guard failed; using the request-scoped safety-sanitized body"
+            "account normalized payload guard failed; using the request-scoped safety-sanitized body"
         );
     }
 
@@ -114,7 +114,7 @@ pub(super) fn prepare_request(
         .map_err(|message| ExternalPoolError {
             status: Some(StatusCode::INTERNAL_SERVER_ERROR),
             message: format!(
-                "external pool #{} normalized model rewrite failed: {}",
+                "account #{} normalized model rewrite failed: {}",
                 pool.id, message
             ),
             retryable: false,
@@ -423,10 +423,7 @@ fn prepare_raw_request(
             )
             .map_err(|message| ExternalPoolError {
                 status: None,
-                message: format!(
-                    "external pool #{} raw model rewrite failed: {}",
-                    pool.id, message
-                ),
+                message: format!("account #{} raw model rewrite failed: {}", pool.id, message),
                 retryable: false,
                 auto_disable_reason: None,
                 cooldown: Some((Duration::ZERO, "model_rewrite_failed".to_string())),
@@ -453,7 +450,7 @@ fn effective_raw_probe<'a>(
         .ok_or_else(|| ExternalPoolError {
             status: Some(StatusCode::INTERNAL_SERVER_ERROR),
             message: format!(
-                "external pool #{} raw request probe is missing or does not match the body snapshot",
+                "account #{} raw request probe is missing or does not match the body snapshot",
                 pool.id
             ),
             retryable: false,
@@ -515,7 +512,7 @@ fn payload_guard_error(pool: &ExternalPool, err: PayloadGuardError) -> ExternalP
     let (status, message) = match err {
         PayloadGuardError::Serialize(message) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("external pool #{} payload guard serialize failed: {}", pool.id, message),
+            format!("account #{} payload guard serialize failed: {}", pool.id, message),
         ),
         PayloadGuardError::OversizedImage { .. } => (
             StatusCode::BAD_REQUEST,

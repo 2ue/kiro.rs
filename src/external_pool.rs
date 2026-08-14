@@ -9799,13 +9799,13 @@ fn decode_pool_runtime_snapshot(
             };
             let cooldown =
                 serde_json::from_str::<ExternalPoolCooldownState>(raw).map_err(|err| {
-                anyhow::anyhow!(
-                    "invalid external pool model cooldown for pool {pool_id}, model {model}: {err}"
-                )
+                    anyhow::anyhow!(
+                        "invalid account model cooldown for account {pool_id}, model {model}: {err}"
+                    )
                 })?;
             let remaining = remaining.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "external pool model cooldown for pool {pool_id}, model {model} is missing a Redis TTL"
+                    "account model cooldown for account {pool_id}, model {model} is missing a Redis TTL"
                 )
             })?;
             let remaining_secs = (remaining.as_millis().saturating_add(999) / 1_000).max(1) as u64;
