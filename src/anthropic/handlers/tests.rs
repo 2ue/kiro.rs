@@ -8253,7 +8253,7 @@ fn local_scheduler_error_enables_admission_backoff_classification() {
 fn upstream_rate_limit_does_not_enable_local_admission_backoff() {
     let err = anyhow::anyhow!(
         "{}",
-        r#"Kiro API 请求失败: 429 Too Many Requests {"error":"rate_limit"}"#
+        r#"上游 API 请求失败: 429 Too Many Requests {"error":"rate_limit"}"#
     );
 
     assert_eq!(local_temporary_admission_backoff_secs(&err, None), None);
@@ -8314,7 +8314,7 @@ async fn prompt_too_long_error_maps_to_input_length_message() {
 }
 
 #[tokio::test]
-async fn official_kiro_upstream_400_message_is_exposed_without_internal_prefix() {
+async fn official_upstream_400_message_is_exposed_without_internal_prefix() {
     let response = map_provider_error(
         anyhow::anyhow!(
             "{}",
@@ -8383,7 +8383,7 @@ async fn malformed_upstream_error_exposes_safe_official_message() {
 }
 
 #[tokio::test]
-async fn official_kiro_bad_request_message_is_exposed_when_safe() {
+async fn official_upstream_bad_request_message_is_exposed_when_safe() {
     let response = map_provider_error(
         anyhow::anyhow!(
             "{}",
@@ -8416,7 +8416,7 @@ async fn official_kiro_bad_request_message_is_exposed_when_safe() {
 }
 
 #[tokio::test]
-async fn official_kiro_high_load_message_is_exposed_when_safe() {
+async fn official_upstream_high_load_message_is_exposed_when_safe() {
     let response = map_provider_error(
         anyhow::anyhow!(
             "{}",
@@ -8449,13 +8449,13 @@ async fn official_kiro_high_load_message_is_exposed_when_safe() {
 }
 
 #[tokio::test]
-async fn official_kiro_upstream_message_with_kiro_term_is_masked() {
+async fn official_upstream_message_with_internal_brand_term_is_masked() {
     let response = map_provider_error(
         anyhow::anyhow!(
             "{}",
             r#"流式 API 请求失败（账号 #7 secret-user）: 500 Internal Server Error {"message":"Kiro service rejected the request","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
         ),
-        Some("req_test_official_kiro_term"),
+        Some("req_test_official_internal_term"),
         Some("req_01official_term"),
         None,
     );

@@ -236,6 +236,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh upstream-public-envelope-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh upstream-public-envelope-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh upstream-public-envelope-test1 -- cargo test official_upstream_public_message -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh upstream-handler-tests-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-handler-tests-test1 -- cargo test official_upstream -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
