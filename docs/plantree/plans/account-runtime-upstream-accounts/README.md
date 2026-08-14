@@ -82,6 +82,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin account service methods now route list/status/discovery/test/cache-invalidation through account-named bridge methods. The bridge still uses the current external-pool storage/cache keys as compatibility details, but `/accounts` service methods no longer call the legacy public external-pool service methods directly.
 - `AccountRuntimeConfigExt` now provides account-named semantic accessors for enabled route checks, dispatch wait, legacy local-rescue wait, account request timeout and usage cost-floor settings. New Admin/request-entry/route-gate call sites use those methods instead of reading legacy field names directly.
 - Runtime config validation now enters through `validate_account_runtime_config`, and the old private `validate_external_pools_config` helper was removed. Tests use account-runtime names while still asserting the current compatibility JSON field names.
+- `account_runtime` now exports `UpstreamAccountStorageRecord` and `UpstreamAccountStatusRecord` aliases. Admin account bridge methods use those account-named record types while legacy storage/cache keys remain an internal compatibility detail.
 
 Last verified on 2026-08-14:
 
@@ -148,3 +149,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-runtime-validation-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-validation-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-validation-test1 -- cargo test account_runtime_ -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-record-alias-fmt1 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-record-alias-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-record-alias-test1 -- cargo test account_runtime_ -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-record-alias-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
+- `git diff --check`

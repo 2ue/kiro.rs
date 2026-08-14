@@ -46,6 +46,7 @@ use super::types::{
 };
 use crate::account_runtime::{
     AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
+    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord,
 };
 use crate::anthropic::{
     inference_attempt_budget::{
@@ -68,9 +69,9 @@ use crate::anthropic::{
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
 use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolStatus,
-    ExternalPoolTestResponse, ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest,
-    UpdateExternalPoolRequest, external_pool_messages_url, external_pool_models_url,
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolTestResponse,
+    ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
+    external_pool_messages_url, external_pool_models_url,
 };
 use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
@@ -819,7 +820,7 @@ impl AdminService {
     fn invalidate_account_admin_cache_with_account(
         &self,
         reason: &'static str,
-        account: &ExternalPool,
+        account: &UpstreamAccountStorageRecord,
     ) {
         self.account_runtime_manager
             .notify_account_runtime_data_changed_with_local_account(reason, account);
@@ -982,9 +983,10 @@ impl AdminService {
         Ok(pools)
     }
 
-    fn list_account_records(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
+    fn list_account_records(&self) -> Result<Vec<UpstreamAccountStorageRecord>, AdminServiceError> {
         let cache_key = admin_external_pool_list_cache_key();
-        if let Some(cached) = self.read_admin_cache::<Vec<ExternalPool>>(cache_key) {
+        if let Some(cached) = self.read_admin_cache::<Vec<UpstreamAccountStorageRecord>>(cache_key)
+        {
             return Ok(cached);
         }
 
@@ -1547,7 +1549,9 @@ impl AdminService {
         Ok(response)
     }
 
-    fn account_runtime_status_records(&self) -> Result<Vec<ExternalPoolStatus>, AdminServiceError> {
+    fn account_runtime_status_records(
+        &self,
+    ) -> Result<Vec<UpstreamAccountStatusRecord>, AdminServiceError> {
         let cache_key = admin_external_pool_status_cache_key();
         if let Some(cached) = self.read_admin_cache::<ExternalPoolsStatusResponse>(cache_key) {
             return Ok(cached.pools);

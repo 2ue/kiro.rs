@@ -17,6 +17,9 @@ pub use attempt::{
     AccountAttemptAction, AccountAttemptTrace, DeliveryEvidence, UpstreamErrorClass,
 };
 pub use migration::upstream_account_from_external_pool;
-pub use runtime::{AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager};
+pub use runtime::{
+    AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
+    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord,
+};
 pub use scheduler::{AccountDispatchCandidate, AccountDispatchDecision, select_account_candidate};
 pub use usage::{RawUsageFacts, TokenUsage, UsageConfidence};

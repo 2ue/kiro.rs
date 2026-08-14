@@ -8,6 +8,10 @@ pub type AccountRuntimeManager = crate::external_pool::ExternalPoolManager;
 
 pub type AccountRuntimeConfig = crate::model::config::ExternalPoolsConfig;
 
+pub type UpstreamAccountStorageRecord = crate::external_pool::ExternalPool;
+
+pub type UpstreamAccountStatusRecord = crate::external_pool::ExternalPoolStatus;
+
 pub trait AccountRuntimeConfigExt {
     fn account_runtime_enabled(&self) -> bool;
     fn account_route_allowed(&self, endpoint: &str) -> bool;

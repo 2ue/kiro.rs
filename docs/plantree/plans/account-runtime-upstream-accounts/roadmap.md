@@ -44,6 +44,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin account service methods now use account-named bridge methods for list, status, supported-model discovery, test and cache/data invalidation instead of directly calling legacy external-pool service methods. Storage and cache keys remain compatibility details for now.
 - `AccountRuntimeConfigExt` now gives new Admin/request-entry/route-gate code account-named accessors for enablement, route policy, dispatch wait, request timeout and usage cost-floor settings while the legacy config structure remains the temporary storage mirror.
 - Runtime config validation now uses `validate_account_runtime_config`; the old private external-pool validation helper was removed, and validation tests use account-runtime names while compatibility JSON field assertions remain explicit.
+- `account_runtime` now exports account-named storage/status record aliases, and Admin account bridge signatures use them so new `/accounts` service code does not expose legacy record names at its boundary.
 
 ## In Progress
 
