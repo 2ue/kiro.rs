@@ -113,6 +113,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while compatibility config fields such as `external_pool_same_pool_*` remain unchanged.
 - Retry behavior tests now use same-account/cross-account names for the core retry/failover cases while keeping compatibility config field names in fixtures.
 - Runtime config now exposes account-named retry status accessors (`same_account_retry_status_codes`, `cross_account_retry_status_codes`) and the retry pipeline uses them. Old accessor names remain as compatibility delegates.
+- Account runtime facade comments and upstream-account integration-test skip messages no longer present the migrated runtime as an external-pool feature.
 
 Last verified on 2026-08-14:
 
@@ -268,6 +269,7 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-retry-config-accessor-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-retry-config-accessor-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-retry-config-accessor-test1 -- cargo test account_same_account_retry_limit_caps_to_one_and_rejects_terminal_errors -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-text-fmt1 -- cargo fmt --check`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

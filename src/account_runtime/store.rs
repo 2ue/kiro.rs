@@ -1,8 +1,8 @@
 //! Account-named storage bridge for the migration period.
 //!
-//! The current persisted table and storage implementation still use the old
-//! external-pool names. New account-runtime callers should use this bridge so
-//! those names stay confined to the compatibility layer until the schema moves.
+//! The current persisted table and storage implementation still use legacy
+//! names. New account-runtime callers should use this bridge so those names
+//! stay confined to the compatibility layer until the schema moves.
 
 use crate::{
     account_runtime::UpstreamAccountStorageRecord,

@@ -191,11 +191,11 @@ fn test_redis_config() -> Option<Config> {
 
 async fn test_external_pool_manager() -> Option<(ExternalPoolManager, Arc<PostgresStore>)> {
     let Some(postgres_config) = test_postgres_config() else {
-        eprintln!("跳过外部备用池集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过上游账号集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
         return None;
     };
     let Some(redis_config) = test_redis_config() else {
-        eprintln!("跳过外部备用池集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过上游账号集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
         return None;
     };
     let postgres = Arc::new(PostgresStore::connect_test(&postgres_config).await.unwrap());

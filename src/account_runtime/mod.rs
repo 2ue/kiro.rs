@@ -1,7 +1,7 @@
 //! Provider-neutral upstream account runtime types.
 //!
-//! This module is the target boundary for replacing the old local/external pool
-//! split with upstream accounts as the scheduling unit.
+//! This module is the target boundary for replacing the legacy split scheduler
+//! with upstream accounts as the scheduling unit.
 
 pub mod account;
 pub mod attempt;

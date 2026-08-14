@@ -1,8 +1,9 @@
 //! Account runtime facade.
 //!
-//! The old implementation still lives behind the external-pool module while it
-//! is being migrated. New integration points should depend on this account
-//! runtime boundary instead of importing the legacy scheduler manager directly.
+//! The delegated implementation still lives behind a legacy scheduler module
+//! while it is being migrated. New integration points should depend on this
+//! account runtime boundary instead of importing the legacy scheduler manager
+//! directly.
 
 use std::time::Duration;
 
