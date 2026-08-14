@@ -289,8 +289,12 @@ function routeLabel(record: UsageRecord): string {
     case 'local_success':
       return '本地成功'
     default:
-      return record.routeKind === 'external_pool' || record.routeKind === 'account' ? '上游账号' : '本地'
+      return isUpstreamAccountRoute(record) ? '上游账号' : '本地'
   }
+}
+
+function isUpstreamAccountRoute(record: UsageRecord): boolean {
+  return record.routeKind === 'account' || record.routeKind === 'external_pool'
 }
 
 function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
@@ -306,19 +310,19 @@ function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
 function routeVariant(record: UsageRecord): 'success' | 'secondary' | 'outline' | 'warning' | 'destructive' {
   if (record.routeSubtype === 'external_direct_policy') return 'warning'
   if (record.routeSubtype === 'local_rescue_after_external') return 'secondary'
-  if (record.routeKind === 'external_pool') return record.status === 'success' ? 'success' : 'destructive'
+  if (isUpstreamAccountRoute(record)) return record.status === 'success' ? 'success' : 'destructive'
   return 'outline'
 }
 
 function upstreamModel(record: UsageRecord): string {
-  if (record.routeKind === 'external_pool') {
+  if (isUpstreamAccountRoute(record)) {
     return record.externalOutboundModel || record.upstreamModel || record.model || '-'
   }
   return record.upstreamModel || record.model || '-'
 }
 
 function upstreamModelLabel(record: UsageRecord): string {
-  if (record.routeKind === 'external_pool' && record.externalOutboundModel) {
+  if (isUpstreamAccountRoute(record) && record.externalOutboundModel) {
     return upstreamModel(record)
   }
   const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
@@ -1232,7 +1236,7 @@ export function UsageRecordsPanel() {
                     const attemptChain = formatAttemptChain(record)
                     const attemptSummary = formatAttemptSummary(record)
                     const externalAttemptChain = formatExternalAttemptChain(record)
-                    const isExternal = record.routeKind === 'external_pool' || record.routeKind === 'account'
+                    const isExternal = isUpstreamAccountRoute(record)
                     const upstreamAccountId = record.accountId ?? record.externalPoolId
                     const upstreamAccountName = record.accountName ?? record.externalPoolName
 
@@ -1460,7 +1464,7 @@ export function UsageRecordsPanel() {
                     {selectedRecord.routeKind || '-'} {selectedRecord.routeSubtype ? `· ${selectedRecord.routeSubtype}` : ''}
                   </div>
                 </div>
-                {(selectedRecord.routeKind === 'external_pool' || selectedRecord.routeKind === 'account') && (
+                {isUpstreamAccountRoute(selectedRecord) && (
                   <div>
                     <div className="text-xs text-muted-foreground">上游账号</div>
                     <div>

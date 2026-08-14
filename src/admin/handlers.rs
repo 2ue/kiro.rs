@@ -422,8 +422,8 @@ fn parse_usage_source(value: &str) -> Result<UsageSource, String> {
 fn parse_usage_route_kind(value: &str) -> Result<UsageRouteKind, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "local_credential" | "local-credential" | "local" => Ok(UsageRouteKind::LocalCredential),
-        "account" | "upstream_account" | "upstream-account" | "external_pool" | "external-pool"
-        | "external" => Ok(UsageRouteKind::ExternalPool),
+        "account" | "upstream_account" | "upstream-account" => Ok(UsageRouteKind::Account),
+        "external_pool" | "external-pool" | "external" => Ok(UsageRouteKind::ExternalPool),
         _ => Err(format!("无效 routeKind: {}", value)),
     }
 }
@@ -1885,7 +1885,7 @@ mod tests {
         let (query, _, _) = params.into_query().expect("valid account query");
 
         assert_eq!(query.external_pool_id, Some(42));
-        assert_eq!(query.route_kind, Some(UsageRouteKind::ExternalPool));
+        assert_eq!(query.route_kind, Some(UsageRouteKind::Account));
 
         let query = UsageRecordsQueryParams {
             limit: None,
@@ -1911,7 +1911,7 @@ mod tests {
         .expect("valid query");
 
         assert_eq!(query.external_pool_id, Some(12));
-        assert_eq!(query.route_kind, Some(UsageRouteKind::ExternalPool));
+        assert_eq!(query.route_kind, Some(UsageRouteKind::Account));
     }
 
     #[test]

@@ -1492,7 +1492,7 @@ async fn run_native_websearch_normalized_external_preflight_precedes_mcp_for_fiv
             );
             assert_eq!(
                 record.route_kind,
-                Some(UsageRouteKind::ExternalPool),
+                Some(UsageRouteKind::Account),
                 "stream={stream} round={round}"
             );
             assert_eq!(
@@ -1599,7 +1599,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         assert_eq!(record.status, UsageRecordStatus::Success, "stream={stream}");
         assert_eq!(
             record.route_kind,
-            Some(UsageRouteKind::ExternalPool),
+            Some(UsageRouteKind::Account),
             "stream={stream}"
         );
         assert_eq!(
@@ -1698,7 +1698,7 @@ async fn run_account_only_routes_normalized_requests_without_kiro_provider() {
         assert_eq!(record.status, UsageRecordStatus::Success, "stream={stream}");
         assert_eq!(
             record.route_kind,
-            Some(UsageRouteKind::ExternalPool),
+            Some(UsageRouteKind::Account),
             "stream={stream}"
         );
         assert_eq!(
@@ -1789,7 +1789,7 @@ async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp
             );
             assert_eq!(
                 record.route_kind,
-                Some(UsageRouteKind::ExternalPool),
+                Some(UsageRouteKind::Account),
                 "stream={stream} round={round}"
             );
             assert_eq!(

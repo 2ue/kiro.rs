@@ -8507,7 +8507,7 @@ impl ExternalPoolManager {
             sticky_bound: false,
             fallback_from_sticky: false,
             credential_attempts: route.local_attempts.clone(),
-            route_kind: Some(UsageRouteKind::ExternalPool),
+            route_kind: Some(UsageRouteKind::Account),
             route_subtype: Some(route.route_subtype),
             fallback_reason: route.fallback_reason.clone(),
             direct_policy_reason: route.direct_policy_reason.clone(),

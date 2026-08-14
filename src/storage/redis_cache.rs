@@ -19,7 +19,7 @@ use crate::anthropic::usage::{
     UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
     UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
     usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
-    usage_dashboard_windows,
+    usage_dashboard_windows, usage_route_kind_matches,
 };
 use crate::model::config::{
     Config, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
@@ -2375,8 +2375,14 @@ impl RedisStore {
             &mut pipe,
             &self.key(USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY),
             "external_pool",
-            record.external_pool_id.map(|id| id.to_string()),
-            record.external_pool_name.clone(),
+            record
+                .account_id
+                .or(record.external_pool_id)
+                .map(|id| id.to_string()),
+            record
+                .account_name
+                .clone()
+                .or_else(|| record.external_pool_name.clone()),
             record,
             |key| self.key(usage_dashboard_top_metrics_key("external_pool", key)),
         );
@@ -6170,12 +6176,12 @@ fn append_usage_dashboard_rollups(
         )),
         record,
     );
-    if let Some(external_pool_id) = record.external_pool_id {
+    if let Some(account_id) = record.account_id.or(record.external_pool_id) {
         append_usage_dashboard_bucket_aggregate(
             pipe,
             &store.key(usage_dashboard_bucket_key(
                 "external_pool",
-                &external_pool_id.to_string(),
+                &account_id.to_string(),
                 hour_epoch,
             )),
             record,
@@ -6304,7 +6310,10 @@ fn append_external_pool_usage_summary(
     totals_key: &str,
     record: &UsageRecord,
 ) {
-    if record.route_kind != Some(UsageRouteKind::ExternalPool) {
+    if !record
+        .route_kind
+        .is_some_and(UsageRouteKind::is_upstream_account)
+    {
         return;
     }
 
@@ -6753,12 +6762,12 @@ fn usage_record_matches_query(record: &UsageRecord, query: &UsageRecordQuery) ->
         }
     }
     if let Some(external_pool_id) = query.external_pool_id {
-        if record.external_pool_id != Some(external_pool_id) {
+        if record.account_id.or(record.external_pool_id) != Some(external_pool_id) {
             return false;
         }
     }
     if let Some(route_kind) = query.route_kind {
-        if record.route_kind != Some(route_kind) {
+        if !usage_route_kind_matches(route_kind, record.route_kind) {
             return false;
         }
     }
@@ -6826,6 +6835,7 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let status = usage_status_value(record.status);
     let source = usage_source_value(record.usage_source);
     let credential_id = record.credential_id.map(|id| id.to_string());
+    let account_id = record.account_id.map(|id| id.to_string());
     let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
     let kiro_metering_usage = record.kiro_metering_usage.to_string();
@@ -6841,6 +6851,8 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.model_resolution_note.as_deref(),
         record.conversation_id.as_deref(),
         record.request_api_key_id.as_deref(),
+        account_id.as_deref(),
+        record.account_name.as_deref(),
         external_pool_id.as_deref(),
         record.external_pool_name.as_deref(),
         record.credential_label.as_deref(),
@@ -7425,6 +7437,50 @@ mod tests {
             payload_breakdown: None,
             payload_guard_report: None,
         }
+    }
+
+    #[test]
+    fn redis_usage_record_query_treats_account_and_external_pool_as_upstream_account() {
+        let mut account = usage_record(
+            "redis-account-route",
+            UsageRecordStatus::Success,
+            UsageSource::UpstreamMetadata,
+            0,
+            0.10,
+            10,
+        );
+        account.route_kind = Some(UsageRouteKind::Account);
+        account.account_id = Some(42);
+        account.account_name = Some("primary".to_string());
+
+        let mut legacy = account.clone();
+        legacy.id = "redis-legacy-route".to_string();
+        legacy.route_kind = Some(UsageRouteKind::ExternalPool);
+        legacy.account_id = None;
+        legacy.account_name = None;
+        legacy.external_pool_id = Some(42);
+        legacy.external_pool_name = Some("primary".to_string());
+
+        let account_query = UsageRecordQuery {
+            route_kind: Some(UsageRouteKind::Account),
+            external_pool_id: Some(42),
+            ..Default::default()
+        };
+        let legacy_query = UsageRecordQuery {
+            route_kind: Some(UsageRouteKind::ExternalPool),
+            external_pool_id: Some(42),
+            ..Default::default()
+        };
+        let local_query = UsageRecordQuery {
+            route_kind: Some(UsageRouteKind::LocalCredential),
+            ..Default::default()
+        };
+
+        assert!(usage_record_matches_query(&account, &account_query));
+        assert!(usage_record_matches_query(&legacy, &account_query));
+        assert!(usage_record_matches_query(&account, &legacy_query));
+        assert!(usage_record_matches_query(&legacy, &legacy_query));
+        assert!(!usage_record_matches_query(&account, &local_query));
     }
 
     fn assert_f64_close(actual: f64, expected: f64) {
@@ -8082,7 +8138,7 @@ mod tests {
             30,
         );
         external.kiro_metering_usage = 2.50;
-        external.route_kind = Some(UsageRouteKind::ExternalPool);
+        external.route_kind = Some(UsageRouteKind::Account);
         external.route_subtype = Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts);
         external.credential_id = None;
         external.credential_label = None;

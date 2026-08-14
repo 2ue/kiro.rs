@@ -142,11 +142,15 @@ export function formatAccountAttemptChain(record: UsageRecord): string {
 
 export const formatExternalAttemptChain = formatAccountAttemptChain
 
+function isUpstreamAccountRoute(record: UsageRecord): boolean {
+  return record.routeKind === 'account' || record.routeKind === 'external_pool'
+}
+
 export function upstreamModelLabel(record: UsageRecord): string {
-  const model = record.routeKind === 'external_pool'
+  const model = isUpstreamAccountRoute(record)
     ? record.externalOutboundModel || record.upstreamModel || record.model || '-'
     : record.upstreamModel || record.model || '-'
-  if (record.routeKind === 'external_pool' && record.externalOutboundModel) return model
+  if (isUpstreamAccountRoute(record) && record.externalOutboundModel) return model
   const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
   return `${model}${source}`
 }

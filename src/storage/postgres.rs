@@ -7718,8 +7718,14 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
                 records.model,
                 records.status,
                 records.pricing_available,
-                NULLIF(records.data->>'externalPoolId', '') AS external_pool_id_text,
-                NULLIF(BTRIM(records.data->>'externalPoolName'), '') AS external_pool_name,
+                COALESCE(
+                    NULLIF(records.data->>'accountId', ''),
+                    NULLIF(records.data->>'externalPoolId', '')
+                ) AS external_pool_id_text,
+                COALESCE(
+                    NULLIF(BTRIM(records.data->>'accountName'), ''),
+                    NULLIF(BTRIM(records.data->>'externalPoolName'), '')
+                ) AS external_pool_name,
                 COALESCE(
                     NULLIF(BTRIM(records.data #>> '{externalPoolBilling,pricingModel}'), ''),
                     NULLIF(BTRIM(records.pricing_model), '')
@@ -7853,15 +7859,19 @@ fn push_external_pool_usage_risk_scored_cte<'a>(
     builder.push(
         r#"
               AND (
-                  records.data->>'routeKind' = 'external_pool'
+                  records.data->>'routeKind' IN ('account', 'external_pool')
                   OR jsonb_typeof(records.data->'externalPoolBilling') = 'object'
               )
         "#,
     );
 
     if let Some(pool_id) = query.pool_id {
-        builder.push(" AND records.data->>'externalPoolId' = ");
-        builder.push_bind(pool_id.to_string());
+        let pool_id = pool_id.to_string();
+        builder.push(" AND (records.data->>'accountId' = ");
+        builder.push_bind(pool_id.clone());
+        builder.push(" OR records.data->>'externalPoolId' = ");
+        builder.push_bind(pool_id);
+        builder.push(")");
     }
     if let Some(endpoint) = query.endpoint.as_deref() {
         builder.push(" AND records.endpoint = ");
@@ -8460,7 +8470,9 @@ impl UsageRollupMetrics {
         let success = record.status == UsageRecordStatus::Success;
         let local_prompt_cache = record.usage_source == UsageSource::LocalPromptCache;
         let upstream_metadata = record.usage_source == UsageSource::UpstreamMetadata;
-        let external_pool = record.route_kind == Some(UsageRouteKind::ExternalPool);
+        let external_pool = record
+            .route_kind
+            .is_some_and(UsageRouteKind::is_upstream_account);
         let external_billing = record.external_pool_billing.as_ref();
         let external_priced =
             external_pool && external_billing.is_some_and(|billing| billing.pricing_available);
@@ -8827,13 +8839,14 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
         });
     }
 
-    if let Some(external_pool_id) = record.external_pool_id {
+    if let Some(account_id) = record.account_id.or(record.external_pool_id) {
         dimensions.push(UsageRollupDimension {
             dimension: "external_pool",
-            key: external_pool_id.to_string(),
+            key: account_id.to_string(),
             label: record
-                .external_pool_name
+                .account_name
                 .as_deref()
+                .or(record.external_pool_name.as_deref())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
@@ -9489,6 +9502,22 @@ fn normalize_page_limit(limit: usize) -> usize {
     if limit == 0 { 20 } else { limit.min(1000) }
 }
 
+fn push_usage_route_kind_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    route_kind: UsageRouteKind,
+) {
+    if route_kind.is_upstream_account() {
+        builder.push(" AND data->>'routeKind' IN (");
+        builder.push_bind(usage_route_kind_value(UsageRouteKind::Account));
+        builder.push(", ");
+        builder.push_bind(usage_route_kind_value(UsageRouteKind::ExternalPool));
+        builder.push(")");
+    } else {
+        builder.push(" AND data->>'routeKind' = ");
+        builder.push_bind(usage_route_kind_value(route_kind));
+    }
+}
+
 fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRecordQuery) {
     builder.push(" WHERE deleted_at IS NULL");
 
@@ -9522,6 +9551,8 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "credential_id::text",
             "data->>'upstreamModel'",
             "data->>'externalOutboundModel'",
+            "data->>'accountId'",
+            "data->>'accountName'",
             "data->>'externalPoolId'",
             "data->>'externalPoolName'",
             "data->>'routeKind'",
@@ -9566,12 +9597,15 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
         builder.push_bind(credential_id as i64);
     }
     if let Some(external_pool_id) = query.external_pool_id {
-        builder.push(" AND data->>'externalPoolId' = ");
-        builder.push_bind(external_pool_id.to_string());
+        let external_pool_id = external_pool_id.to_string();
+        builder.push(" AND (data->>'accountId' = ");
+        builder.push_bind(external_pool_id.clone());
+        builder.push(" OR data->>'externalPoolId' = ");
+        builder.push_bind(external_pool_id);
+        builder.push(")");
     }
     if let Some(route_kind) = query.route_kind {
-        builder.push(" AND data->>'routeKind' = ");
-        builder.push_bind(usage_route_kind_value(route_kind));
+        push_usage_route_kind_filter(builder, route_kind);
     }
     if let Some(model) = &query.model {
         builder.push(" AND (model = ");
@@ -9704,9 +9738,14 @@ fn push_dashboard_windows_cte(
             records.simulated,
             records.sticky_bound,
             records.fallback_from_sticky,
-            records.data->>'externalPoolId' AS dashboard_external_pool_id,
-            NULLIF(BTRIM(records.data->>'externalPoolName'), '')
-                AS dashboard_external_pool_name,
+            COALESCE(
+                NULLIF(records.data->>'accountId', ''),
+                NULLIF(records.data->>'externalPoolId', '')
+            ) AS dashboard_external_pool_id,
+            COALESCE(
+                NULLIF(BTRIM(records.data->>'accountName'), ''),
+                NULLIF(BTRIM(records.data->>'externalPoolName'), '')
+            ) AS dashboard_external_pool_name,
             CASE
                 WHEN jsonb_typeof(records.data->'durationMs') = 'number'
                  AND records.data->>'durationMs' ~ '^[0-9]+$'
@@ -9716,7 +9755,8 @@ fn push_dashboard_windows_cte(
                 )::bigint
                 ELSE GREATEST(records.duration_ms, 0)
             END AS dashboard_duration_ms,
-            records.data->>'routeKind' = 'external_pool' AS dashboard_external_pool,
+            records.data->>'routeKind' IN ('account', 'external_pool')
+                AS dashboard_external_pool,
             jsonb_typeof(records.data->'externalPoolBilling') = 'object'
                 AS dashboard_external_billing_present,
             COALESCE(
@@ -10962,6 +11002,7 @@ fn usage_source_value(source: crate::anthropic::usage::UsageSource) -> &'static 
 fn usage_route_kind_value(route_kind: UsageRouteKind) -> &'static str {
     match route_kind {
         UsageRouteKind::LocalCredential => "local_credential",
+        UsageRouteKind::Account => "account",
         UsageRouteKind::ExternalPool => "external_pool",
     }
 }
@@ -15068,7 +15109,7 @@ mod tests {
             simulated: false,
             sticky_bound: false,
             fallback_from_sticky: false,
-            route_kind: Some(UsageRouteKind::ExternalPool),
+            route_kind: Some(UsageRouteKind::Account),
             route_subtype: Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts),
             fallback_reason: Some("local_transient_exhausted".to_string()),
             direct_policy_reason: None,
@@ -15119,6 +15160,40 @@ mod tests {
             payload_breakdown: None,
             payload_guard_report: None,
         }
+    }
+
+    #[test]
+    fn postgres_usage_route_kind_value_writes_account_route_kind() {
+        assert_eq!(usage_route_kind_value(UsageRouteKind::Account), "account");
+        assert_eq!(
+            usage_route_kind_value(UsageRouteKind::ExternalPool),
+            "external_pool"
+        );
+    }
+
+    #[test]
+    fn postgres_rollup_treats_account_and_legacy_external_pool_as_upstream_account() {
+        let account = external_usage_record("account-rollup", 0.10, 0.20, 0.42);
+        let account_metrics = UsageRollupMetrics::from_record(&account, 1);
+        assert_eq!(account_metrics.external_pool_requests, 1);
+        assert_eq!(account_metrics.external_pool_priced_requests, 1);
+        assert!((account_metrics.external_pool_raw_cost_usd - 0.10).abs() < 0.000_001);
+        assert!((account_metrics.external_pool_uplifted_cost_usd - 0.42).abs() < 0.000_001);
+
+        let account_dimensions = usage_rollup_dimensions(&account);
+        assert!(account_dimensions.iter().any(|dimension| {
+            dimension.dimension == "external_pool"
+                && dimension.key == "42"
+                && dimension.label.as_deref() == Some("backup-a")
+        }));
+
+        let mut legacy = account.clone();
+        legacy.route_kind = Some(UsageRouteKind::ExternalPool);
+        legacy.account_id = None;
+        legacy.account_name = None;
+        let legacy_metrics = UsageRollupMetrics::from_record(&legacy, 1);
+        assert_eq!(legacy_metrics.external_pool_requests, 1);
+        assert_eq!(legacy_metrics.external_pool_priced_requests, 1);
     }
 
     #[tokio::test]

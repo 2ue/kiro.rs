@@ -59,7 +59,28 @@ pub enum UsageRecordStatus {
 #[serde(rename_all = "snake_case")]
 pub enum UsageRouteKind {
     LocalCredential,
+    Account,
     ExternalPool,
+}
+
+impl UsageRouteKind {
+    pub fn is_upstream_account(self) -> bool {
+        matches!(self, Self::Account | Self::ExternalPool)
+    }
+
+    pub fn matches_record(self, record_kind: Self) -> bool {
+        match self {
+            Self::LocalCredential => record_kind == Self::LocalCredential,
+            Self::Account | Self::ExternalPool => record_kind.is_upstream_account(),
+        }
+    }
+}
+
+pub fn usage_route_kind_matches(
+    query_kind: UsageRouteKind,
+    record_kind: Option<UsageRouteKind>,
+) -> bool {
+    record_kind.is_some_and(|record_kind| query_kind.matches_record(record_kind))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3201,7 +3222,10 @@ impl UsageRecorder {
             if record.usage_source == UsageSource::UpstreamMetadata {
                 summary.upstream_metadata_requests += 1;
             }
-            if record.route_kind == Some(UsageRouteKind::ExternalPool) {
+            if record
+                .route_kind
+                .is_some_and(UsageRouteKind::is_upstream_account)
+            {
                 summary.external_pool_billing.requests += 1;
                 if let Some(billing) = &record.external_pool_billing {
                     if billing.pricing_available {
@@ -3856,7 +3880,7 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
         }
     }
     if let Some(route_kind) = query.route_kind {
-        if record.route_kind != Some(route_kind) {
+        if !usage_route_kind_matches(route_kind, record.route_kind) {
             return false;
         }
     }
@@ -4101,7 +4125,7 @@ mod tests {
             raw_upstream_error: None,
         }];
         let mut record = record("req_account_attempts", 0, UsageSource::UpstreamMetadata);
-        record.route_kind = Some(UsageRouteKind::ExternalPool);
+        record.route_kind = Some(UsageRouteKind::Account);
         record.external_pool_id = Some(42);
         record.external_pool_name = Some("primary".to_string());
         record.account_id = Some(42);
@@ -4110,6 +4134,7 @@ mod tests {
         record.external_attempts = external_attempts;
 
         let json = serde_json::to_value(record).expect("usage record serializes");
+        assert_eq!(json["routeKind"], "account");
         assert_eq!(json["accountId"], 42);
         assert_eq!(json["accountName"], "primary");
         assert_eq!(json["accountAttempts"][0]["accountId"], 42);
@@ -4118,6 +4143,35 @@ mod tests {
         assert_eq!(json["externalPoolName"], "primary");
         assert_eq!(json["externalAttempts"][0]["poolId"], 42);
         assert_eq!(json["externalAttempts"][0]["poolName"], "primary");
+    }
+
+    #[test]
+    fn usage_route_kind_query_treats_account_and_external_pool_as_upstream_account() {
+        assert!(usage_route_kind_matches(
+            UsageRouteKind::Account,
+            Some(UsageRouteKind::Account)
+        ));
+        assert!(usage_route_kind_matches(
+            UsageRouteKind::Account,
+            Some(UsageRouteKind::ExternalPool)
+        ));
+        assert!(usage_route_kind_matches(
+            UsageRouteKind::ExternalPool,
+            Some(UsageRouteKind::Account)
+        ));
+        assert!(usage_route_kind_matches(
+            UsageRouteKind::ExternalPool,
+            Some(UsageRouteKind::ExternalPool)
+        ));
+        assert!(usage_route_kind_matches(
+            UsageRouteKind::LocalCredential,
+            Some(UsageRouteKind::LocalCredential)
+        ));
+        assert!(!usage_route_kind_matches(
+            UsageRouteKind::LocalCredential,
+            Some(UsageRouteKind::Account)
+        ));
+        assert!(!usage_route_kind_matches(UsageRouteKind::Account, None));
     }
 
     #[test]
