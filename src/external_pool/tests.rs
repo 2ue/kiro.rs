@@ -9488,8 +9488,35 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         message,
         &route.error_id,
     );
+    assert!(err.retryable);
     assert!(err.is_capacity_like());
     assert_eq!(err.route_error_type, "external_pool_capacity_full");
+    assert!(should_defer_synthetic_capacity_error_to_last_pool_error(
+        &err
+    ));
+
+    let wait_timeout = external_capacity_final_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "external_pool_wait_timeout",
+        "Request capacity wait timed out after 1 seconds",
+        &route.error_id,
+    );
+    assert!(wait_timeout.retryable);
+    assert!(wait_timeout.is_capacity_like());
+    assert!(should_defer_synthetic_capacity_error_to_last_pool_error(
+        &wait_timeout
+    ));
+
+    let deadline = external_capacity_final_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "external_pool_deadline_exceeded",
+        "Request dispatch deadline exceeded",
+        &route.error_id,
+    );
+    assert!(!deadline.retryable);
+    assert!(!should_defer_synthetic_capacity_error_to_last_pool_error(
+        &deadline
+    ));
     let response = err.into_response(&route.request_id);
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

@@ -1734,11 +1734,36 @@ impl ExternalFallbackContext {
             Ok(route) => route,
             Err(err) => return Some(payload_guard_error_response(err)),
         };
-        Some(
-            self.manager
-                .forward_with_failover(self.config.clone(), route)
-                .await,
-        )
+        match self
+            .manager
+            .forward_with_failover_result(self.config.clone(), route)
+            .await
+        {
+            ExternalPoolForwardOutcome::Response(response) => Some(response),
+            ExternalPoolForwardOutcome::FinalError(err) => {
+                if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
+                    UsageRouteSubtype::ExternalDirectPolicy,
+                    &self.config,
+                    &err,
+                    None,
+                    self.current_local_dispatchable(Some(&self.payload.model)),
+                    self.inference_attempt_budget.as_ref(),
+                ) {
+                    tracing::warn!(
+                        request_id,
+                        reason,
+                        status = err.status.as_u16(),
+                        route_error_type = %err.route_error_type,
+                        pool_id = ?err.pool_id,
+                        pool_name = ?err.pool_name,
+                        "external direct policy failed with a rescuable error; continuing with local credentials"
+                    );
+                    None
+                } else {
+                    Some(err.into_response(request_id))
+                }
+            }
+        }
     }
 
     async fn local_pool_preflight_outcome(
@@ -6481,7 +6506,9 @@ fn local_rescue_reason_after_external_route_error(
     if !external_route_subtype_allows_local_rescue(route_subtype) {
         return None;
     }
-    if config.external_direct_policy_enabled {
+    if route_subtype == UsageRouteSubtype::ExternalDirectPolicy
+        && !external_direct_policy_error_allows_local_rescue(err)
+    {
         return None;
     }
     if !config.external_pool_local_rescue_enabled {
@@ -6533,7 +6560,20 @@ fn external_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) 
         route_subtype,
         UsageRouteSubtype::ExternalFallbackPreflight
             | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
+            | UsageRouteSubtype::ExternalDirectPolicy
     )
+}
+
+fn external_direct_policy_error_allows_local_rescue(err: &ExternalPoolFinalError) -> bool {
+    if err.is_public_invalid_request() || err.is_external_prompt_too_long() {
+        return false;
+    }
+    err.retryable
+        || err.is_rate_limit()
+        || err.is_timeout_like()
+        || err.is_capacity_like()
+        || err.status.is_server_error()
+        || err.status == StatusCode::SERVICE_UNAVAILABLE
 }
 
 fn external_fallback_route_subtype_for_attempts(
@@ -6570,7 +6610,7 @@ fn local_fallback_reason_blocks_local_rescue(
             | "local_capacity_exhausted"
             | "local_attempt_reserved_for_fallback",
         ) => current_local_dispatchable.unwrap_or(0) == 0,
-        None => true,
+        None => current_local_dispatchable.unwrap_or(0) == 0,
         _ => false,
     }
 }

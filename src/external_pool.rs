@@ -4858,6 +4858,17 @@ impl ExternalPoolManager {
                     {
                         ExternalCapacityDecision::Retry => continue,
                         ExternalCapacityDecision::FinalError(err) => {
+                            if last_error.is_some()
+                                && should_defer_synthetic_capacity_error_to_last_pool_error(&err)
+                            {
+                                tracing::warn!(
+                                    request_id = %route.request_id,
+                                    error_id = %route.error_id,
+                                    route_error_type = %err.route_error_type,
+                                    "external dispatch produced a synthetic capacity error after concrete pool attempts; using the last concrete pool error for fallback"
+                                );
+                                break;
+                            }
                             return ExternalPoolForwardOutcome::FinalError(err);
                         }
                     }
@@ -4938,6 +4949,18 @@ impl ExternalPoolManager {
                     {
                         ExternalCapacityDecision::Retry => continue,
                         ExternalCapacityDecision::FinalError(err) => {
+                            if last_error.is_some()
+                                && should_defer_synthetic_capacity_error_to_last_pool_error(&err)
+                            {
+                                tracing::warn!(
+                                    request_id = %route.request_id,
+                                    error_id = %route.error_id,
+                                    route_error_type = %err.route_error_type,
+                                    pool_id,
+                                    "external pool acquire produced a synthetic capacity error after concrete pool attempts; using the last concrete pool error for fallback"
+                                );
+                                break;
+                            }
                             return ExternalPoolForwardOutcome::FinalError(err);
                         }
                     }
@@ -4995,6 +5018,18 @@ impl ExternalPoolManager {
                                 {
                                     ExternalCapacityDecision::Retry => continue,
                                     ExternalCapacityDecision::FinalError(err) => {
+                                        if last_error.is_some()
+                                            && should_defer_synthetic_capacity_error_to_last_pool_error(&err)
+                                        {
+                                            tracing::warn!(
+                                                request_id = %route.request_id,
+                                                error_id = %route.error_id,
+                                                route_error_type = %err.route_error_type,
+                                                pool_id = pool.id,
+                                                "external dispatch fence produced a synthetic capacity error after concrete pool attempts; using the last concrete pool error for fallback"
+                                            );
+                                            break;
+                                        }
                                         return ExternalPoolForwardOutcome::FinalError(err);
                                     }
                                 }
@@ -9154,7 +9189,7 @@ fn external_capacity_final_error(
     message: impl Into<String>,
     error_id: &str,
 ) -> ExternalPoolFinalError {
-    let retryable = code != "external_pool_wait_timeout";
+    let retryable = code != "external_pool_deadline_exceeded";
     ExternalPoolFinalError {
         status,
         response_error_type: code.to_string(),
@@ -9166,6 +9201,19 @@ fn external_capacity_final_error(
         pool_id: None,
         pool_name: None,
     }
+}
+
+fn should_defer_synthetic_capacity_error_to_last_pool_error(err: &ExternalPoolFinalError) -> bool {
+    err.pool_id.is_none()
+        && matches!(
+            err.route_error_type.as_str(),
+            "external_pool_capacity_full"
+                | "external_pool_queue_full"
+                | "external_pool_wait_timeout"
+                | "external_pool_cooldown"
+                | "external_pool_coordinator_unavailable"
+                | "model_unavailable"
+        )
 }
 
 fn compact_usage_error_message(message: &str) -> (String, bool) {

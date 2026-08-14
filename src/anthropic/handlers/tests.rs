@@ -10188,7 +10188,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_full"),
             Some(1),
         ),
-        None
+        Some("external_rate_limit")
     );
 
     let mut no_rate_limit = config;
@@ -10413,7 +10413,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
 }
 
 #[test]
-fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_rounds() {
+fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = ExternalPoolsConfig {
@@ -10422,75 +10422,113 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
         ..Default::default()
     };
 
-    let errors = [
-        ExternalPoolFinalError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            response_error_type: "rate_limit_error".to_string(),
-            route_error_type: "rate_limit".to_string(),
-            message: "external rate limit".to_string(),
-            error_id: "req_direct_rate".to_string(),
-            retryable: true,
-            attempts: Vec::new(),
-            pool_id: Some(1),
-            pool_name: Some("direct".to_string()),
-        },
-        ExternalPoolFinalError {
-            status: StatusCode::BAD_GATEWAY,
-            response_error_type: "api_error".to_string(),
-            route_error_type: "network_error".to_string(),
-            message: "external timeout".to_string(),
-            error_id: "req_direct_timeout".to_string(),
-            retryable: true,
-            attempts: Vec::new(),
-            pool_id: Some(1),
-            pool_name: Some("direct".to_string()),
-        },
-        ExternalPoolFinalError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            response_error_type: "api_error".to_string(),
-            route_error_type: "external_pool_capacity_full".to_string(),
-            message: "external capacity full".to_string(),
-            error_id: "req_direct_capacity".to_string(),
-            retryable: true,
-            attempts: Vec::new(),
-            pool_id: None,
-            pool_name: None,
-        },
-        ExternalPoolFinalError {
-            status: StatusCode::BAD_REQUEST,
-            response_error_type: "invalid_request_error".to_string(),
-            route_error_type: "client_error".to_string(),
-            message: "external bad request".to_string(),
-            error_id: "req_direct_bad_request".to_string(),
-            retryable: false,
-            attempts: Vec::new(),
-            pool_id: Some(1),
-            pool_name: Some("direct".to_string()),
-        },
-        ExternalPoolFinalError {
-            status: StatusCode::BAD_GATEWAY,
-            response_error_type: "api_error".to_string(),
-            route_error_type: "server_error".to_string(),
-            message: "external server error".to_string(),
-            error_id: "req_direct_server".to_string(),
-            retryable: true,
-            attempts: Vec::new(),
-            pool_id: Some(1),
-            pool_name: Some("direct".to_string()),
-        },
+    let cases = [
+        (
+            ExternalPoolFinalError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                response_error_type: "rate_limit_error".to_string(),
+                route_error_type: "rate_limit".to_string(),
+                message: "external rate limit".to_string(),
+                error_id: "req_direct_rate".to_string(),
+                retryable: true,
+                attempts: Vec::new(),
+                pool_id: Some(1),
+                pool_name: Some("direct".to_string()),
+            },
+            Some("external_rate_limit"),
+        ),
+        (
+            ExternalPoolFinalError {
+                status: StatusCode::BAD_GATEWAY,
+                response_error_type: "api_error".to_string(),
+                route_error_type: "network_error".to_string(),
+                message: "external timeout".to_string(),
+                error_id: "req_direct_timeout".to_string(),
+                retryable: true,
+                attempts: Vec::new(),
+                pool_id: Some(1),
+                pool_name: Some("direct".to_string()),
+            },
+            Some("external_timeout"),
+        ),
+        (
+            ExternalPoolFinalError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                response_error_type: "api_error".to_string(),
+                route_error_type: "external_pool_capacity_full".to_string(),
+                message: "external capacity full".to_string(),
+                error_id: "req_direct_capacity".to_string(),
+                retryable: true,
+                attempts: Vec::new(),
+                pool_id: None,
+                pool_name: None,
+            },
+            Some("external_capacity"),
+        ),
+        (
+            ExternalPoolFinalError {
+                status: StatusCode::BAD_REQUEST,
+                response_error_type: "invalid_request_error".to_string(),
+                route_error_type: "client_error".to_string(),
+                message: "external bad request".to_string(),
+                error_id: "req_direct_bad_request".to_string(),
+                retryable: false,
+                attempts: Vec::new(),
+                pool_id: Some(1),
+                pool_name: Some("direct".to_string()),
+            },
+            None,
+        ),
+        (
+            ExternalPoolFinalError {
+                status: StatusCode::BAD_GATEWAY,
+                response_error_type: "api_error".to_string(),
+                route_error_type: "server_error".to_string(),
+                message: "external server error".to_string(),
+                error_id: "req_direct_server".to_string(),
+                retryable: true,
+                attempts: Vec::new(),
+                pool_id: Some(1),
+                pool_name: Some("direct".to_string()),
+            },
+            Some("external_error"),
+        ),
     ];
 
     for round in 1..=5 {
-        for err in &errors {
+        for (err, expected) in &cases {
             assert_eq!(
-                local_rescue_reason_after_external_error(
+                local_rescue_reason_after_external_route_error(
+                    UsageRouteSubtype::ExternalDirectPolicy,
                     &config,
                     err,
                     Some("local_capacity_full"),
                     Some(1),
                 ),
+                *expected,
+                "round {round}: direct external policy should only rescue recoverable external failures"
+            );
+            assert_eq!(
+                local_rescue_reason_after_external_route_error(
+                    UsageRouteSubtype::ExternalDirectPolicy,
+                    &config,
+                    err,
+                    None,
+                    Some(1),
+                ),
+                *expected,
+                "round {round}: direct policy without a prior local fallback reason should rescue only when local credentials are dispatchable"
+            );
+            assert_eq!(
+                local_rescue_reason_after_external_route_error(
+                    UsageRouteSubtype::ExternalDirectPolicy,
+                    &config,
+                    err,
+                    None,
+                    Some(0),
+                ),
                 None,
-                "round {round}: direct external policy must not route external failures back to local"
+                "round {round}: direct policy must not rescue into an unavailable local pool"
             );
 
             let budget = InferenceAttemptBudget::new(4);
@@ -10498,22 +10536,23 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
                 .reserve(InferenceAttemptKind::ExternalPool, 0)
                 .unwrap();
             assert_eq!(
-                budgeted_local_rescue_reason_after_external_error(
+                budgeted_local_rescue_reason_after_external_route_error(
+                    UsageRouteSubtype::ExternalDirectPolicy,
                     &config,
                     err,
                     Some("local_capacity_full"),
                     Some(1),
                     &budget,
                 ),
-                None,
-                "round {round}: direct external policy must ignore remaining attempt budget"
+                *expected,
+                "round {round}: direct external policy should honor remaining rescue budget"
             );
         }
     }
 }
 
 #[test]
-fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_flag() {
+fn direct_external_route_subtype_rescues_recoverable_failures_even_without_global_direct_flag() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = ExternalPoolsConfig {
@@ -10543,8 +10582,8 @@ fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_
                 Some("local_capacity_full"),
                 Some(4),
             ),
-            None,
-            "round {round}: route subtype external_direct_policy is an absolute local-rescue boundary"
+            Some("external_error"),
+            "round {round}: route subtype external_direct_policy may rescue recoverable failures"
         );
 
         let budget = InferenceAttemptBudget::new(8);
@@ -10560,8 +10599,8 @@ fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_
                 Some(4),
                 &budget,
             ),
-            None,
-            "round {round}: direct route subtype must ignore remaining local rescue budget"
+            Some("external_error"),
+            "round {round}: direct route subtype should honor remaining local rescue budget"
         );
 
         assert_eq!(
