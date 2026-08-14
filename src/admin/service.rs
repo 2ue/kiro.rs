@@ -45,7 +45,7 @@ use super::types::{
     ValidateExternalCredentialsRequest,
 };
 use crate::account_runtime::{
-    AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
+    AccountAuthType, AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
     UpstreamAccountStatusRecord, UpstreamAccountStorageRecord, clear_upstream_account_cooldowns,
     load_upstream_account_status_records, upstream_account_messages_url,
     upstream_account_models_url,
@@ -1366,8 +1366,6 @@ impl AdminService {
         } else {
             None
         };
-        let request: DiscoverExternalPoolSupportedModelsRequest = request.into();
-
         let base_url = request
             .base_url
             .as_deref()
@@ -1399,7 +1397,7 @@ impl AdminService {
         let auth_type = request
             .auth_type
             .or_else(|| saved_account.as_ref().map(|account| account.auth_type))
-            .unwrap_or(ExternalPoolAuthType::Bearer);
+            .unwrap_or(AccountAuthType::Bearer);
         let url = upstream_account_models_url(&base_url).map_err(|err| {
             AdminServiceError::InvalidCredential(format!("上游账号模型列表 URL 无效: {err}"))
         })?;
@@ -1414,10 +1412,10 @@ impl AdminService {
             .header("accept", "application/json")
             .header("anthropic-version", "2023-06-01");
         match auth_type {
-            ExternalPoolAuthType::Bearer => {
+            AccountAuthType::Bearer => {
                 request_builder = request_builder.bearer_auth(api_key);
             }
-            ExternalPoolAuthType::XApiKey => {
+            AccountAuthType::XApiKey => {
                 request_builder = request_builder.header("x-api-key", api_key);
             }
         }
@@ -1840,10 +1838,10 @@ impl AdminService {
                 client.get(url)
             };
             match account.auth_type {
-                ExternalPoolAuthType::Bearer => {
+                AccountAuthType::Bearer => {
                     request = request.bearer_auth(account.api_key.unwrap_or_default());
                 }
-                ExternalPoolAuthType::XApiKey => {
+                AccountAuthType::XApiKey => {
                     request = request.header("x-api-key", account.api_key.unwrap_or_default());
                 }
             }

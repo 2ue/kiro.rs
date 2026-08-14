@@ -20,10 +20,12 @@ pub use attempt::{
 pub use migration::upstream_account_from_external_pool;
 pub(crate) use runtime::AccountRouteRequestPreparationCache;
 pub use runtime::{
-    AccountFinalError, AccountForwardOutcome, AccountLatencyTraceState, AccountRequestBodyMode,
-    AccountRouteRequest, AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
-    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord, account_direct_policy_reason,
-    cached_eligible_account_for_route_and_model,
+    AccountAuthType, AccountAutoDisablePolicy, AccountFinalError, AccountForwardOutcome,
+    AccountLatencyTraceState, AccountModelMappingMode, AccountRawModelMode, AccountRequestBodyMode,
+    AccountRouteMode, AccountRouteRequest, AccountRuntimeConfig, AccountRuntimeConfigExt,
+    AccountRuntimeManager, AccountStreamResponseMode, AccountStreamRetryMode,
+    AccountUsageProjectionMode, UpstreamAccountStatusRecord, UpstreamAccountStorageRecord,
+    account_direct_policy_reason, cached_eligible_account_for_route_and_model,
     cached_eligible_account_for_route_body_mode_and_model,
     cached_immediately_available_account_for_route_and_model,
     cached_immediately_available_account_for_route_body_mode_and_model,

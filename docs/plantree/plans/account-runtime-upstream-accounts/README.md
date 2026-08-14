@@ -87,6 +87,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `account_runtime` now exposes account-named status, cooldown and upstream URL helpers. Account status, account cooldown clearing, account supported-model discovery and account tests enter through those helpers and return account-facing Admin messages instead of external-pool wording.
 - Anthropic request entry and handler code now uses account-runtime aliases for account route requests, route preparation cache, request body mode, forward outcome, final route error and latency trace. Raw direct/preflight helper names now use account-route terminology while the underlying legacy implementation remains behind the facade.
 - `account_runtime` now exposes account-named manager wrappers for eligibility, immediate availability, direct route reason and failover execution. Anthropic handler code enters through those wrappers instead of directly calling legacy pool-named manager methods.
+- `account_runtime` now exports account-named Admin/runtime enum aliases for account auth, usage projection, stream response, raw model, auto-disable, retry, model mapping and route mode. New Account DTOs and account discovery/test service paths use these aliases, while legacy `/external-pools` DTOs keep their compatibility type names.
 
 Last verified on 2026-08-14:
 
@@ -173,4 +174,9 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-manager-wrapper-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-manager-wrapper-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-manager-wrapper-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-dto-alias-fmt2 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-dto-alias-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-dto-alias-test1 -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-dto-alias-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
 - `git diff --check`

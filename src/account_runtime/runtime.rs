@@ -12,6 +12,12 @@ pub type AccountRuntimeManager = crate::external_pool::ExternalPoolManager;
 
 pub type AccountRuntimeConfig = crate::model::config::ExternalPoolsConfig;
 
+pub type AccountAuthType = crate::external_pool::ExternalPoolAuthType;
+
+pub type AccountUsageProjectionMode = crate::external_pool::ExternalPoolUsageProjectionMode;
+
+pub type AccountStreamResponseMode = crate::model::config::ExternalPoolStreamResponseMode;
+
 pub type UpstreamAccountStorageRecord = crate::external_pool::ExternalPool;
 
 pub type UpstreamAccountStatusRecord = crate::external_pool::ExternalPoolStatus;
@@ -26,6 +32,16 @@ pub type AccountForwardOutcome = crate::external_pool::ExternalPoolForwardOutcom
 pub type AccountFinalError = crate::external_pool::ExternalPoolFinalError;
 
 pub type AccountRequestBodyMode = crate::external_pool::ExternalPoolRequestBodyMode;
+
+pub type AccountRawModelMode = crate::external_pool::ExternalPoolRawModelMode;
+
+pub type AccountAutoDisablePolicy = crate::external_pool::ExternalPoolAutoDisablePolicy;
+
+pub type AccountStreamRetryMode = crate::external_pool::ExternalPoolStreamRetryMode;
+
+pub type AccountModelMappingMode = crate::external_pool::ExternalPoolModelMappingMode;
+
+pub type AccountRouteMode = crate::model::config::ExternalPoolRouteMode;
 
 pub type AccountLatencyTraceState = crate::external_pool::ExternalLatencyTraceState;
 
@@ -215,7 +231,6 @@ impl AccountRuntimeConfigExt for AccountRuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::config::ExternalPoolRouteMode;
 
     #[test]
     fn account_runtime_config_ext_applies_enablement_and_route_policy() {
@@ -225,7 +240,7 @@ mod tests {
         config.external_pools_enabled = true;
         assert!(config.account_runtime_enabled_for_endpoint("/cc/v1/messages"));
 
-        config.external_pool_route_mode = ExternalPoolRouteMode::AllowList;
+        config.external_pool_route_mode = AccountRouteMode::AllowList;
         config.external_pool_route_rules = vec!["/dfcache/team-a".to_string()];
 
         assert!(!config.account_runtime_enabled_for_endpoint("/cc/v1/messages"));

@@ -2,21 +2,22 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::account_runtime::AccountRuntimeConfig;
+use crate::account_runtime::{
+    AccountAuthType, AccountAutoDisablePolicy, AccountModelMappingMode, AccountRawModelMode,
+    AccountRequestBodyMode, AccountRouteMode, AccountRuntimeConfig, AccountStreamResponseMode,
+    AccountStreamRetryMode, AccountUsageProjectionMode,
+};
 use crate::anthropic::pricing::ModelPricing;
 use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
-    ExternalPoolModelMappingMode, ExternalPoolRawModelMode, ExternalPoolRequestBodyMode,
-    ExternalPoolStatus, ExternalPoolStreamRetryMode, ExternalPoolTestResponse,
-    ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest,
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolStatus, ExternalPoolTestResponse,
+    UpdateExternalPoolRequest,
 };
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
-    ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ImageProcessingConfig,
-    KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig, ModelMappingRule,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
-    PromptCacheCreationControlConfig, PromptSteeringConfig, ReportedUsageConfig,
-    RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
+    ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
+    ModelMappingRule, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PayloadShapingConfigPatch, PromptCacheCreationControlConfig, PromptSteeringConfig,
+    ReportedUsageConfig, RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -593,7 +594,7 @@ pub struct DiscoverAccountSupportedModelsRequest {
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
-    pub auth_type: Option<crate::external_pool::ExternalPoolAuthType>,
+    pub auth_type: Option<AccountAuthType>,
 }
 
 impl From<DiscoverAccountSupportedModelsRequest> for DiscoverExternalPoolSupportedModelsRequest {
@@ -1192,7 +1193,7 @@ pub struct CreateAccountRequest {
     pub base_url: String,
     pub api_key: String,
     #[serde(default)]
-    pub auth_type: ExternalPoolAuthType,
+    pub auth_type: AccountAuthType,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_account_priority")]
@@ -1200,23 +1201,23 @@ pub struct CreateAccountRequest {
     #[serde(default = "default_account_concurrency")]
     pub max_concurrent_requests: u32,
     #[serde(default)]
-    pub usage_projection_mode: ExternalPoolUsageProjectionMode,
+    pub usage_projection_mode: AccountUsageProjectionMode,
     #[serde(default)]
-    pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+    pub stream_response_mode: Option<AccountStreamResponseMode>,
     #[serde(default)]
-    pub request_body_mode: ExternalPoolRequestBodyMode,
+    pub request_body_mode: AccountRequestBodyMode,
     #[serde(default)]
-    pub raw_model_mode: ExternalPoolRawModelMode,
+    pub raw_model_mode: AccountRawModelMode,
     #[serde(default)]
-    pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
+    pub auto_disable_policy: AccountAutoDisablePolicy,
     #[serde(default)]
-    pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
+    pub pre_output_stream_retry_mode: AccountStreamRetryMode,
     #[serde(default = "default_true")]
     pub preserve_path: bool,
     #[serde(default)]
     pub normalize_model_version_dots: bool,
     #[serde(default)]
-    pub model_mapping_mode: ExternalPoolModelMappingMode,
+    pub model_mapping_mode: AccountModelMappingMode,
     #[serde(default)]
     pub model_mapping_require_match: bool,
     #[serde(default)]
@@ -1224,7 +1225,7 @@ pub struct CreateAccountRequest {
     #[serde(default)]
     pub supported_models: Vec<String>,
     #[serde(default)]
-    pub route_mode: ExternalPoolRouteMode,
+    pub route_mode: AccountRouteMode,
     #[serde(default)]
     pub route_rules: Vec<String>,
     #[serde(default)]
@@ -1270,7 +1271,7 @@ pub struct UpdateAccountRequest {
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
-    pub auth_type: Option<ExternalPoolAuthType>,
+    pub auth_type: Option<AccountAuthType>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -1278,26 +1279,26 @@ pub struct UpdateAccountRequest {
     #[serde(default)]
     pub max_concurrent_requests: Option<u32>,
     #[serde(default)]
-    pub usage_projection_mode: Option<ExternalPoolUsageProjectionMode>,
+    pub usage_projection_mode: Option<AccountUsageProjectionMode>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_account_stream_response_mode_update"
     )]
-    pub stream_response_mode: Option<Option<ExternalPoolStreamResponseMode>>,
+    pub stream_response_mode: Option<Option<AccountStreamResponseMode>>,
     #[serde(default)]
-    pub request_body_mode: Option<ExternalPoolRequestBodyMode>,
+    pub request_body_mode: Option<AccountRequestBodyMode>,
     #[serde(default)]
-    pub raw_model_mode: Option<ExternalPoolRawModelMode>,
+    pub raw_model_mode: Option<AccountRawModelMode>,
     #[serde(default)]
-    pub auto_disable_policy: Option<ExternalPoolAutoDisablePolicy>,
+    pub auto_disable_policy: Option<AccountAutoDisablePolicy>,
     #[serde(default)]
-    pub pre_output_stream_retry_mode: Option<ExternalPoolStreamRetryMode>,
+    pub pre_output_stream_retry_mode: Option<AccountStreamRetryMode>,
     #[serde(default)]
     pub preserve_path: Option<bool>,
     #[serde(default)]
     pub normalize_model_version_dots: Option<bool>,
     #[serde(default)]
-    pub model_mapping_mode: Option<ExternalPoolModelMappingMode>,
+    pub model_mapping_mode: Option<AccountModelMappingMode>,
     #[serde(default)]
     pub model_mapping_require_match: Option<bool>,
     #[serde(default)]
@@ -1305,7 +1306,7 @@ pub struct UpdateAccountRequest {
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
     #[serde(default)]
-    pub route_mode: Option<ExternalPoolRouteMode>,
+    pub route_mode: Option<AccountRouteMode>,
     #[serde(default)]
     pub route_rules: Option<Vec<String>>,
     #[serde(default)]
@@ -1343,11 +1344,11 @@ impl From<UpdateAccountRequest> for UpdateExternalPoolRequest {
 
 fn deserialize_optional_account_stream_response_mode_update<'de, D>(
     deserializer: D,
-) -> Result<Option<Option<ExternalPoolStreamResponseMode>>, D::Error>
+) -> Result<Option<Option<AccountStreamResponseMode>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<ExternalPoolStreamResponseMode>::deserialize(deserializer).map(Some)
+    Option::<AccountStreamResponseMode>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1374,20 +1375,20 @@ pub struct Account {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masked_api_key: Option<String>,
-    pub auth_type: ExternalPoolAuthType,
+    pub auth_type: AccountAuthType,
     pub enabled: bool,
     pub priority: i32,
     pub max_concurrent_requests: u32,
-    pub usage_projection_mode: ExternalPoolUsageProjectionMode,
+    pub usage_projection_mode: AccountUsageProjectionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+    pub stream_response_mode: Option<AccountStreamResponseMode>,
     #[serde(default)]
-    pub request_body_mode: ExternalPoolRequestBodyMode,
+    pub request_body_mode: AccountRequestBodyMode,
     #[serde(default)]
-    pub raw_model_mode: ExternalPoolRawModelMode,
-    pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
+    pub raw_model_mode: AccountRawModelMode,
+    pub auto_disable_policy: AccountAutoDisablePolicy,
     #[serde(default)]
-    pub pre_output_stream_retry_mode: ExternalPoolStreamRetryMode,
+    pub pre_output_stream_retry_mode: AccountStreamRetryMode,
     pub auto_disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_disabled_reason: Option<String>,
@@ -1401,7 +1402,7 @@ pub struct Account {
     #[serde(default)]
     pub normalize_model_version_dots: bool,
     #[serde(default)]
-    pub model_mapping_mode: ExternalPoolModelMappingMode,
+    pub model_mapping_mode: AccountModelMappingMode,
     #[serde(default)]
     pub model_mapping_require_match: bool,
     #[serde(default)]
@@ -1409,7 +1410,7 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
     #[serde(default)]
-    pub route_mode: ExternalPoolRouteMode,
+    pub route_mode: AccountRouteMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_rules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2445,16 +2446,16 @@ mod tests {
             base_url: "https://upstream.example.test".to_string(),
             api_key: None,
             masked_api_key: Some("sk_...tail".to_string()),
-            auth_type: ExternalPoolAuthType::Bearer,
+            auth_type: AccountAuthType::Bearer,
             enabled: true,
             priority: 10,
             max_concurrent_requests: 2,
-            usage_projection_mode: ExternalPoolUsageProjectionMode::default(),
+            usage_projection_mode: AccountUsageProjectionMode::default(),
             stream_response_mode: None,
-            request_body_mode: ExternalPoolRequestBodyMode::default(),
-            raw_model_mode: ExternalPoolRawModelMode::default(),
-            auto_disable_policy: ExternalPoolAutoDisablePolicy::default(),
-            pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::default(),
+            request_body_mode: AccountRequestBodyMode::default(),
+            raw_model_mode: AccountRawModelMode::default(),
+            auto_disable_policy: AccountAutoDisablePolicy::default(),
+            pre_output_stream_retry_mode: AccountStreamRetryMode::default(),
             auto_disabled: false,
             auto_disabled_reason: None,
             auto_disabled_at: None,
@@ -2462,11 +2463,11 @@ mod tests {
             auto_disabled_last_error: None,
             preserve_path: true,
             normalize_model_version_dots: false,
-            model_mapping_mode: ExternalPoolModelMappingMode::default(),
+            model_mapping_mode: AccountModelMappingMode::default(),
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
             supported_models: vec!["claude-sonnet-*".to_string()],
-            route_mode: ExternalPoolRouteMode::default(),
+            route_mode: AccountRouteMode::default(),
             route_rules: Vec::new(),
             notes: None,
             created_at: chrono::DateTime::parse_from_rfc3339("2026-08-14T00:00:00Z")
@@ -2521,14 +2522,14 @@ mod tests {
         assert_eq!(storage_create.name, "primary");
         assert_eq!(storage_create.base_url, "https://upstream.example.test");
         assert_eq!(storage_create.api_key, "sk-test");
-        assert_eq!(storage_create.auth_type, ExternalPoolAuthType::XApiKey);
+        assert_eq!(storage_create.auth_type, AccountAuthType::XApiKey);
         assert_eq!(storage_create.priority, 12);
         assert_eq!(storage_create.max_concurrent_requests, 4);
         assert_eq!(
             storage_create.supported_models,
             vec!["claude-sonnet-*".to_string()]
         );
-        assert_eq!(storage_create.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(storage_create.route_mode, AccountRouteMode::AllowList);
         assert_eq!(storage_create.route_rules, vec!["/cc".to_string()]);
 
         let update: UpdateAccountRequest = serde_json::from_value(serde_json::json!({
@@ -2553,10 +2554,7 @@ mod tests {
             Some("https://upstream.example.test")
         );
         assert_eq!(storage_discover.api_key.as_deref(), Some(""));
-        assert_eq!(
-            storage_discover.auth_type,
-            Some(ExternalPoolAuthType::Bearer)
-        );
+        assert_eq!(storage_discover.auth_type, Some(AccountAuthType::Bearer));
     }
 
     #[test]
