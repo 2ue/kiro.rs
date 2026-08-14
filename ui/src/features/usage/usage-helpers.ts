@@ -60,7 +60,12 @@ export function routeLabel(record: UsageRecord): string {
   const labels: Record<string, string> = {
     local_success: '本地成功',
     local_error_no_fallback: '本地错误',
+    local_rescue_after_account: '上游账号后回本地',
     local_rescue_after_external: '上游账号后回本地',
+    account_fallback_preflight: '账号预检',
+    account_fallback_after_local_attempts: '本地后账号',
+    account_direct_policy: '账号直连',
+    account_error: '账号错误',
     external_fallback_preflight: '账号预检',
     external_fallback_after_local_attempts: '本地后账号',
     external_direct_policy: '账号直连',
@@ -70,8 +75,8 @@ export function routeLabel(record: UsageRecord): string {
 }
 
 export function routeTone(record: UsageRecord): NonNullable<BadgeProps['tone']> {
-  if (record.routeSubtype === 'external_direct_policy') return 'warning'
-  if (record.routeSubtype === 'local_rescue_after_external') return 'info'
+  if (record.routeSubtype === 'account_direct_policy' || record.routeSubtype === 'external_direct_policy') return 'warning'
+  if (record.routeSubtype === 'local_rescue_after_account' || record.routeSubtype === 'local_rescue_after_external') return 'info'
   if (record.routeKind === 'external_pool' || record.routeKind === 'account') return record.status === 'success' ? 'info' : 'error'
   return record.status === 'success' ? 'success' : 'neutral'
 }

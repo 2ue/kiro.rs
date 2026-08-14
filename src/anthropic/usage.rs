@@ -88,7 +88,12 @@ pub fn usage_route_kind_matches(
 pub enum UsageRouteSubtype {
     LocalSuccess,
     LocalErrorNoFallback,
+    LocalRescueAfterAccount,
     LocalRescueAfterExternal,
+    AccountFallbackPreflight,
+    AccountFallbackAfterLocalAttempts,
+    AccountDirectPolicy,
+    AccountError,
     ExternalFallbackPreflight,
     ExternalFallbackAfterLocalAttempts,
     ExternalDirectPolicy,
@@ -4507,6 +4512,37 @@ mod tests {
             Some(UsageRouteKind::Account)
         ));
         assert!(!usage_route_kind_matches(UsageRouteKind::Account, None));
+    }
+
+    #[test]
+    fn usage_route_subtype_serializes_account_values_with_external_compatibility() {
+        assert_eq!(
+            serde_json::to_value(UsageRouteSubtype::AccountFallbackPreflight)
+                .expect("account route subtype serializes"),
+            serde_json::json!("account_fallback_preflight")
+        );
+        assert_eq!(
+            serde_json::to_value(UsageRouteSubtype::AccountFallbackAfterLocalAttempts)
+                .expect("account route subtype serializes"),
+            serde_json::json!("account_fallback_after_local_attempts")
+        );
+        assert_eq!(
+            serde_json::to_value(UsageRouteSubtype::AccountDirectPolicy)
+                .expect("account route subtype serializes"),
+            serde_json::json!("account_direct_policy")
+        );
+        assert_eq!(
+            serde_json::to_value(UsageRouteSubtype::LocalRescueAfterAccount)
+                .expect("account route subtype serializes"),
+            serde_json::json!("local_rescue_after_account")
+        );
+        assert_eq!(
+            serde_json::from_value::<UsageRouteSubtype>(serde_json::json!(
+                "external_fallback_preflight"
+            ))
+            .expect("legacy external route subtype deserializes"),
+            UsageRouteSubtype::ExternalFallbackPreflight
+        );
     }
 
     #[test]

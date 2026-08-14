@@ -1332,7 +1332,7 @@ async fn maybe_raw_account_direct_response(
         raw_body,
         endpoint,
         request_id,
-        UsageRouteSubtype::ExternalDirectPolicy,
+        UsageRouteSubtype::AccountDirectPolicy,
         None,
         Some(reason),
         None,
@@ -1399,7 +1399,7 @@ async fn maybe_raw_account_preflight_response(
         local_dispatchable = local_state.dispatchable,
         local_usable = local_state.usable,
         retry_after_secs = ?local_state.retry_after_secs,
-        "local credential pool is not immediately schedulable; routing raw request directly to external pool before parsing body"
+        "local credential pool is not immediately schedulable; routing raw request directly to upstream account before parsing body"
     );
     let route = raw_account_route_request_with_hints(
         state,
@@ -1409,7 +1409,7 @@ async fn maybe_raw_account_preflight_response(
         raw_body,
         endpoint,
         request_id.clone(),
-        UsageRouteSubtype::ExternalFallbackPreflight,
+        UsageRouteSubtype::AccountFallbackPreflight,
         Some(reason.clone()),
         None,
         Some(json!({
@@ -1433,7 +1433,7 @@ async fn maybe_raw_account_preflight_response(
                 .local_pool_route_state_fresh(raw_probe.model.as_deref())
                 .dispatchable;
             if let Some(rescue_reason) = budgeted_local_rescue_reason_after_external_route_error(
-                UsageRouteSubtype::ExternalFallbackPreflight,
+                UsageRouteSubtype::AccountFallbackPreflight,
                 &config,
                 &err,
                 Some(reason.as_str()),
@@ -1842,7 +1842,7 @@ impl ExternalFallbackContext {
         external.model_resolution = model_resolution;
         let route = match external.route_request(
             request_id.to_string(),
-            UsageRouteSubtype::ExternalDirectPolicy,
+            UsageRouteSubtype::AccountDirectPolicy,
             None,
             Some(reason),
             false,
@@ -1889,11 +1889,11 @@ impl ExternalFallbackContext {
             local_dispatchable = state.dispatchable,
             local_usable = state.usable,
             retry_after_secs = ?state.retry_after_secs,
-            "local credential pool is not immediately schedulable; routing request directly to external pool"
+            "local credential pool is not immediately schedulable; routing request directly to upstream account"
         );
         let route = match self.route_request(
             request_id.to_string(),
-            UsageRouteSubtype::ExternalFallbackPreflight,
+            UsageRouteSubtype::AccountFallbackPreflight,
             Some(reason.clone()),
             None,
             false,
@@ -2070,9 +2070,9 @@ impl ExternalFallbackContext {
             "state": local_state,
         }));
         let route_subtype = if diagnostic_attempts.is_empty() {
-            UsageRouteSubtype::ExternalFallbackPreflight
+            UsageRouteSubtype::AccountFallbackPreflight
         } else {
-            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
+            UsageRouteSubtype::AccountFallbackAfterLocalAttempts
         };
         let route = match self.route_request(
             request_id.to_string(),
@@ -3164,7 +3164,7 @@ impl RequestUsageContext {
         local_preflight: Option<serde_json::Value>,
         external_attempts: Vec<ExternalPoolAttempt>,
     ) {
-        self.route_subtype_override = Some(UsageRouteSubtype::LocalRescueAfterExternal);
+        self.route_subtype_override = Some(UsageRouteSubtype::LocalRescueAfterAccount);
         self.fallback_reason = Some(reason.into());
         self.local_preflight = local_preflight;
         self.external_attempts = external_attempts;
@@ -6769,7 +6769,7 @@ fn local_rescue_reason_after_external_error(
     current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
     local_rescue_reason_after_external_route_error(
-        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+        UsageRouteSubtype::AccountFallbackAfterLocalAttempts,
         config,
         err,
         local_fallback_reason,
@@ -6780,7 +6780,9 @@ fn local_rescue_reason_after_external_error(
 fn external_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) -> bool {
     matches!(
         route_subtype,
-        UsageRouteSubtype::ExternalFallbackPreflight
+        UsageRouteSubtype::AccountFallbackPreflight
+            | UsageRouteSubtype::AccountFallbackAfterLocalAttempts
+            | UsageRouteSubtype::ExternalFallbackPreflight
             | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
     )
 }
@@ -6789,9 +6791,9 @@ fn external_fallback_route_subtype_for_attempts(
     attempts: &[KiroCredentialAttempt],
 ) -> UsageRouteSubtype {
     if attempts.is_empty() {
-        UsageRouteSubtype::ExternalFallbackPreflight
+        UsageRouteSubtype::AccountFallbackPreflight
     } else {
-        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
+        UsageRouteSubtype::AccountFallbackAfterLocalAttempts
     }
 }
 
@@ -6853,7 +6855,7 @@ fn budgeted_local_rescue_reason_after_external_error(
     inference_attempt_budget: &InferenceAttemptBudget,
 ) -> Option<&'static str> {
     budgeted_local_rescue_reason_after_external_route_error(
-        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+        UsageRouteSubtype::AccountFallbackAfterLocalAttempts,
         config,
         err,
         local_fallback_reason,
@@ -7170,7 +7172,7 @@ async fn handle_stream_request(
             AccountForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
                     if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
-                        UsageRouteSubtype::ExternalFallbackPreflight,
+                        UsageRouteSubtype::AccountFallbackPreflight,
                         &external.config,
                         &err,
                         Some(local_reason.as_str()),
@@ -9415,7 +9417,7 @@ async fn handle_non_stream_request(
             AccountForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
                     if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
-                        UsageRouteSubtype::ExternalFallbackPreflight,
+                        UsageRouteSubtype::AccountFallbackPreflight,
                         &external.config,
                         &err,
                         Some(local_reason.as_str()),

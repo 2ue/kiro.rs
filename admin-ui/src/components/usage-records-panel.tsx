@@ -278,14 +278,19 @@ function statusLabel(status: string): string {
 
 function routeLabel(record: UsageRecord): string {
   switch (record.routeSubtype) {
+    case 'account_direct_policy':
     case 'external_direct_policy':
       return '账号直连'
+    case 'account_fallback_preflight':
     case 'external_fallback_preflight':
       return '账号预检'
+    case 'account_fallback_after_local_attempts':
     case 'external_fallback_after_local_attempts':
       return '本地后账号'
+    case 'local_rescue_after_account':
     case 'local_rescue_after_external':
       return '上游账号后回本地'
+    case 'account_error':
     case 'external_error':
       return '账号错误'
     case 'local_error_no_fallback':
@@ -312,8 +317,8 @@ function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
 }
 
 function routeVariant(record: UsageRecord): 'success' | 'secondary' | 'outline' | 'warning' | 'destructive' {
-  if (record.routeSubtype === 'external_direct_policy') return 'warning'
-  if (record.routeSubtype === 'local_rescue_after_external') return 'secondary'
+  if (record.routeSubtype === 'account_direct_policy' || record.routeSubtype === 'external_direct_policy') return 'warning'
+  if (record.routeSubtype === 'local_rescue_after_account' || record.routeSubtype === 'local_rescue_after_external') return 'secondary'
   if (isUpstreamAccountRoute(record)) return record.status === 'success' ? 'success' : 'destructive'
   return 'outline'
 }

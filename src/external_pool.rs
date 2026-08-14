@@ -891,7 +891,9 @@ pub struct ExternalRouteRequest {
 fn route_allows_degraded_fallback_local_lease(route: &ExternalRouteRequest) -> bool {
     matches!(
         route.route_subtype,
-        UsageRouteSubtype::ExternalFallbackPreflight
+        UsageRouteSubtype::AccountFallbackPreflight
+            | UsageRouteSubtype::AccountFallbackAfterLocalAttempts
+            | UsageRouteSubtype::ExternalFallbackPreflight
             | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
     ) && route.fallback_reason.as_deref() == Some("local_scheduler_redis_degraded")
 }

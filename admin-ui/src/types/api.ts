@@ -820,7 +820,7 @@ export interface UsageRecord {
   fallbackFromSticky: boolean
   credentialAttempts?: KiroCredentialAttempt[]
   routeKind?: 'local_credential' | 'account' | 'external_pool'
-  routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_external' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
+  routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_account' | 'local_rescue_after_external' | 'account_fallback_preflight' | 'account_fallback_after_local_attempts' | 'account_direct_policy' | 'account_error' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
   fallbackReason?: string
   directPolicyReason?: string
   localAttempted?: boolean

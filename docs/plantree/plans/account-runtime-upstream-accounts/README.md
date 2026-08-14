@@ -99,6 +99,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Usage summary and dashboard window summary now expose `accountBilling` and `accountBillingByAccount` as account-facing aggregate fields while retaining `externalPoolBilling` and `externalPoolBillingByPool` for compatibility. Redis/Postgres dashboard materialization fills both shapes, and the maintained overview UI reads the account fields first.
 - Usage record, summary, dashboard and credential usage APIs now expose account-neutral `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` fields while retaining old `kiroMeteringUsage` / `totalKiroMeteringUsage` compatibility copies. Recorder, Redis and Postgres read/write boundaries normalize old-only and new-only metering records into both fields, and maintained usage UI surfaces now show "上游计量" instead of Kiro metering wording.
 - Stream and handler code now pass upstream metering values through `upstream_metering_units` naming. The old Kiro-named field remains only where a usage record writes the legacy compatibility copy, and downstream SSE still excludes both upstream and compatibility metering fields.
+- New upstream account usage records now write account-named route subtypes (`account_fallback_preflight`, `account_fallback_after_local_attempts`, `account_direct_policy`, `account_error`, `local_rescue_after_account`). Legacy `external_*` subtype values remain deserializable and accepted by compatibility route checks, and maintained UIs label both old and new values as upstream-account routes.
 
 Last verified on 2026-08-14:
 
@@ -278,3 +279,13 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh upstream-metering-internal-test1 -- cargo test test_metering_event_is_recorded_but_not_emitted_downstream -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh upstream-metering-internal-test3 -- cargo test handler_legacy_metadata_metering_and_complete_tool_are_trusted_terminals_for_five_rounds -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh upstream-metering-internal-fmt2 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-test1 -- cargo test usage_route_subtype_serializes_account_values_with_external_compatibility -- --nocapture`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-test3 -- cargo test normalized_external_direct_policy_skips_raw_preparse_without_raw_pool -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-test4 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-test5 -- cargo test preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-fmt2 -- cargo fmt --check`

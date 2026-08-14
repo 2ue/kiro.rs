@@ -639,7 +639,7 @@ mod tests {
                 effective,
                 "/cc/v1/messages",
                 "req_missing_max_raw_route".to_string(),
-                UsageRouteSubtype::ExternalFallbackPreflight,
+                UsageRouteSubtype::AccountFallbackPreflight,
                 Some("local_capacity_full".to_string()),
                 None,
                 Some(json!({"preflightStage": "before_parse"})),
