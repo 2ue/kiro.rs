@@ -2033,7 +2033,7 @@ fn apply_anthropic_current_payload_safety_shaping(
     stats
 }
 
-pub fn sanitize_anthropic_messages_for_external_forwarding(
+pub fn sanitize_anthropic_messages_for_account_forwarding(
     request: &mut MessagesRequest,
     config: PayloadShapingConfig,
 ) -> bool {

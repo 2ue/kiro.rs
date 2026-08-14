@@ -14,18 +14,18 @@ use crate::{
     kiro::model::requests::kiro::KiroRequest,
 };
 
-pub(crate) struct PreparedKiroRequestBody {
+pub(crate) struct PreparedLocalUpstreamRequestBody {
     pub body: String,
     pub report: Option<PayloadGuardReport>,
     pub guard_elapsed: Option<Duration>,
 }
 
-pub(crate) fn prepare_kiro_request_body(
+pub(crate) fn prepare_local_upstream_request_body(
     request: &mut KiroRequest,
     config: PayloadGuardConfig,
-) -> Result<PreparedKiroRequestBody, PayloadGuardError> {
+) -> Result<PreparedLocalUpstreamRequestBody, PayloadGuardError> {
     if !config.enabled {
-        return Ok(PreparedKiroRequestBody {
+        return Ok(PreparedLocalUpstreamRequestBody {
             body: serialize_kiro_request(request)?,
             report: None,
             guard_elapsed: None,
@@ -34,27 +34,27 @@ pub(crate) fn prepare_kiro_request_body(
 
     let started_at = Instant::now();
     let (body, report) = guard_kiro_request(request, config)?;
-    Ok(PreparedKiroRequestBody {
+    Ok(PreparedLocalUpstreamRequestBody {
         body,
         report: Some(report),
         guard_elapsed: Some(started_at.elapsed()),
     })
 }
 
-pub(crate) struct PreparedExternalMessagesPayload {
+pub(crate) struct PreparedAccountMessagesPayload {
     pub payload: MessagesRequest,
     pub report: Option<PayloadGuardReport>,
     pub guard_applied: bool,
 }
 
-pub(crate) fn prepare_external_messages_payload(
+pub(crate) fn prepare_account_messages_payload(
     payload: &MessagesRequest,
     raw_body: &Bytes,
-    external_guard_enabled: bool,
+    account_guard_enabled: bool,
     config: PayloadGuardConfig,
-) -> Result<PreparedExternalMessagesPayload, PayloadGuardError> {
-    if !external_guard_enabled || !config.enabled {
-        return Ok(PreparedExternalMessagesPayload {
+) -> Result<PreparedAccountMessagesPayload, PayloadGuardError> {
+    if !account_guard_enabled || !config.enabled {
+        return Ok(PreparedAccountMessagesPayload {
             payload: payload.clone(),
             report: None,
             guard_applied: false,
@@ -65,7 +65,7 @@ pub(crate) fn prepare_external_messages_payload(
     let (_, report) =
         guard_anthropic_messages_request_reusing_body(&mut prepared_payload, config, raw_body)?;
 
-    Ok(PreparedExternalMessagesPayload {
+    Ok(PreparedAccountMessagesPayload {
         payload: prepared_payload,
         report: Some(report),
         guard_applied: true,
@@ -134,8 +134,8 @@ mod tests {
     fn disabled_local_guard_serializes_without_report() {
         let mut request = kiro_request();
 
-        let prepared =
-            prepare_kiro_request_body(&mut request, guard_config(false, 1024)).expect("prepare");
+        let prepared = prepare_local_upstream_request_body(&mut request, guard_config(false, 1024))
+            .expect("prepare");
 
         assert!(prepared.body.contains("current"));
         assert!(prepared.report.is_none());
@@ -143,12 +143,12 @@ mod tests {
     }
 
     #[test]
-    fn disabled_external_guard_reuses_raw_body_without_report() {
+    fn disabled_account_guard_reuses_raw_body_without_report() {
         let request = anthropic_request();
         let raw_body = Bytes::from(serde_json::to_vec(&request).expect("serialize"));
 
         let prepared =
-            prepare_external_messages_payload(&request, &raw_body, true, guard_config(false, 1024))
+            prepare_account_messages_payload(&request, &raw_body, true, guard_config(false, 1024))
                 .expect("prepare");
 
         assert_eq!(prepared.payload.messages.len(), 1);
@@ -157,12 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn external_guard_flag_off_reuses_raw_body_without_report() {
+    fn account_guard_flag_off_reuses_raw_body_without_report() {
         let request = anthropic_request();
         let raw_body = Bytes::from(serde_json::to_vec(&request).expect("serialize"));
 
         let prepared =
-            prepare_external_messages_payload(&request, &raw_body, false, guard_config(true, 1024))
+            prepare_account_messages_payload(&request, &raw_body, false, guard_config(true, 1024))
                 .expect("prepare");
 
         assert_eq!(prepared.payload.messages.len(), 1);

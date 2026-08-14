@@ -105,7 +105,7 @@ pub(super) fn prepare_with_plan(
         None
     };
     let prepared_payload =
-        match prepare_kiro_request_body(&mut kiro_request, plan.payload_guard.config) {
+        match prepare_local_upstream_request_body(&mut kiro_request, plan.payload_guard.config) {
             Ok(result) => result,
             Err(err) => return Err(payload_guard_error_response(err)),
         };

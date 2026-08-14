@@ -39,11 +39,9 @@ use crate::{
         payload_guard::{
             PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
             breakdown_anthropic_messages_request, guard_anthropic_messages_request_reusing_body,
-            sanitize_anthropic_messages_for_external_forwarding,
+            sanitize_anthropic_messages_for_account_forwarding,
         },
-        payload_guard_runtime::{
-            PreparedExternalMessagesPayload, prepare_external_messages_payload,
-        },
+        payload_guard_runtime::{PreparedAccountMessagesPayload, prepare_account_messages_payload},
         pricing::PricingCatalog,
         prompt_cache::{
             KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
@@ -9828,7 +9826,7 @@ fn decode_pool_runtime_snapshot(
 fn external_pool_prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
-) -> Result<body_pipeline::PreparedExternalRequest, ExternalPoolError> {
+) -> Result<body_pipeline::PreparedAccountRequest, ExternalPoolError> {
     body_pipeline::prepare_request(route, pool)
 }
 

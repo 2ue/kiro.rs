@@ -63,7 +63,7 @@ use super::payload_guard::{
     ToolUseFormatDiagnostics, breakdown_kiro_request, diagnose_kiro_tool_use_format,
     guard_kiro_request, serialize_kiro_request,
 };
-use super::payload_guard_runtime::prepare_kiro_request_body;
+use super::payload_guard_runtime::prepare_local_upstream_request_body;
 use super::prompt_cache::{
     KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
 };

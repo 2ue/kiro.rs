@@ -4,7 +4,7 @@ use crate::anthropic::body_capabilities::{
 };
 use std::collections::{HashMap, VecDeque};
 
-pub(super) struct PreparedExternalRequest {
+pub(super) struct PreparedAccountRequest {
     pub(super) body: Bytes,
     pub(super) outbound_model: Option<String>,
 }
@@ -21,14 +21,14 @@ pub(super) struct NormalizedRequestBase {
 pub(super) fn prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
-) -> Result<PreparedExternalRequest, ExternalPoolError> {
+) -> Result<PreparedAccountRequest, ExternalPoolError> {
     let plan = plan_for_pool(route, pool);
     tracing::trace!(
         request_id = %route.request_id,
         pool_id = pool.id,
         profile = plan.profile.as_str(),
         usage_projection_enabled = plan.usage_projection.is_enabled(),
-        "preparing external request body with capability plan"
+        "preparing account request body with capability plan"
     );
 
     let (payload_guard, model, thinking_normalization) = match plan.bytes {
@@ -125,7 +125,7 @@ pub(super) fn prepare_request(
         })?,
         None => normalized_base.body.clone(),
     };
-    Ok(PreparedExternalRequest {
+    Ok(PreparedAccountRequest {
         body,
         outbound_model,
     })
@@ -391,9 +391,9 @@ fn prepare_raw_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     model_stage: RawModelStagePlan,
-) -> Result<PreparedExternalRequest, ExternalPoolError> {
+) -> Result<PreparedAccountRequest, ExternalPoolError> {
     match model_stage {
-        RawModelStagePlan::None => Ok(PreparedExternalRequest {
+        RawModelStagePlan::None => Ok(PreparedAccountRequest {
             body: route.effective_raw_body.clone(),
             outbound_model: None,
         }),
@@ -401,7 +401,7 @@ fn prepare_raw_request(
             let probe = effective_raw_probe(route, pool)?;
             let outbound_model =
                 model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
-            Ok(PreparedExternalRequest {
+            Ok(PreparedAccountRequest {
                 body: route.effective_raw_body.clone(),
                 outbound_model,
             })
@@ -411,7 +411,7 @@ fn prepare_raw_request(
             let outbound_model =
                 model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
             let Some(outbound_model_value) = outbound_model.as_deref() else {
-                return Ok(PreparedExternalRequest {
+                return Ok(PreparedAccountRequest {
                     body: route.effective_raw_body.clone(),
                     outbound_model,
                 });
@@ -433,7 +433,7 @@ fn prepare_raw_request(
                 protocol_error: None,
                 raw_upstream_error: None,
             })?;
-            Ok(PreparedExternalRequest {
+            Ok(PreparedAccountRequest {
                 body,
                 outbound_model,
             })
@@ -480,8 +480,8 @@ fn prepare_normalized_payload(
     route: &ExternalRouteRequest,
     payload: &MessagesRequest,
     payload_guard: PayloadGuardStagePlan,
-) -> Result<(PreparedExternalMessagesPayload, Option<PayloadGuardError>), PayloadGuardError> {
-    match prepare_external_messages_payload(
+) -> Result<(PreparedAccountMessagesPayload, Option<PayloadGuardError>), PayloadGuardError> {
+    match prepare_account_messages_payload(
         payload,
         &route.raw_body,
         payload_guard.state.is_enabled(),
@@ -494,13 +494,13 @@ fn prepare_normalized_payload(
             }
             let mut payload = payload.clone();
             if payload_guard.config.shaping.enabled {
-                let _ = sanitize_anthropic_messages_for_external_forwarding(
+                let _ = sanitize_anthropic_messages_for_account_forwarding(
                     &mut payload,
                     payload_guard.config.shaping,
                 );
             }
             Ok((
-                PreparedExternalMessagesPayload {
+                PreparedAccountMessagesPayload {
                     payload,
                     report: None,
                     guard_applied: false,
