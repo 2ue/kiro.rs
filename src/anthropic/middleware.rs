@@ -100,8 +100,8 @@ pub struct AppState {
     pub payload_guard_safety_margin_bytes: usize,
     /// payload 超限时是否裁剪旧历史
     pub payload_guard_trim_history: bool,
-    /// 外部备用池是否复用同一套 payload guard / shaping 配置
-    pub payload_guard_external_enabled: bool,
+    /// 上游账号路由是否复用同一套 payload guard / shaping 配置
+    pub payload_guard_account_enabled: bool,
     /// 是否把工具 cache_control 转成 Kiro cachePoint
     pub kiro_cache_point_enabled: bool,
     /// cachePoint 是否仅按工具 cache_control 插入
@@ -172,7 +172,7 @@ impl AppState {
             payload_guard_max_bytes: 450 * 1024,
             payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,
-            payload_guard_external_enabled: true,
+            payload_guard_account_enabled: true,
             kiro_cache_point_enabled: false,
             kiro_cache_point_tools_only: true,
             kiro_cache_point_record_plan: true,
@@ -274,7 +274,7 @@ impl AppState {
         max_bytes: usize,
         safety_margin_bytes: usize,
         trim_history: bool,
-        external_enabled: bool,
+        account_enabled: bool,
         kiro_cache_point_enabled: bool,
         kiro_cache_point_tools_only: bool,
         kiro_cache_point_record_plan: bool,
@@ -289,7 +289,7 @@ impl AppState {
         self.payload_guard_max_bytes = max_bytes;
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
         self.payload_guard_trim_history = trim_history;
-        self.payload_guard_external_enabled = external_enabled;
+        self.payload_guard_account_enabled = account_enabled;
         self.kiro_cache_point_enabled = kiro_cache_point_enabled;
         self.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
         self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;

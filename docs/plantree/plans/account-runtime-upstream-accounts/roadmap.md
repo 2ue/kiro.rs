@@ -64,6 +64,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - New upstream account usage route subtypes now serialize with account terminology: `account_fallback_preflight`, `account_fallback_after_local_attempts`, `account_direct_policy`, `account_error` and `local_rescue_after_account`. Historical `external_*` and `local_rescue_after_external` values remain accepted and displayed as compatibility values in maintained UIs.
 - Anthropic parsed/raw fallback routing now uses `AccountFallbackContext` and account-named fallback/preflight helper methods. Local rescue preflight metadata now writes account fields while retaining old `external*` copies, and focused handler/account-only tests passed.
 - Local rescue fallback reasons now use account terminology (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`), and request-entry/local-rescue handler code reads account-named config accessors instead of external-pool fields.
+- Anthropic router, AppState and request runtime now use `payload_guard_account_enabled` for the account-route payload guard switch, while the existing persisted/runtime-config JSON field remains a compatibility boundary. Maintained runtime UI text describes upstream-account payload shaping instead of Kiro/external-pool payload handling.
 
 ## In Progress
 

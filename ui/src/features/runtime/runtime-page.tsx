@@ -732,7 +732,7 @@ export function RuntimePage() {
                 />
                 <NumField
                   label="单请求最大容量单位"
-                  desc="限制超长上下文最多占用多少本地并发/RPM 单位；只影响本地账号，不影响外部账号。"
+                  desc="限制超长上下文最多占用多少本地并发/RPM 单位；只影响本地账号，不影响上游账号。"
                   value={draft.weightedCapacity.maxUnitsPerRequest}
                   min={1}
                   max={64}
@@ -1122,7 +1122,7 @@ export function RuntimePage() {
                     <TogField label="启用请求压缩" desc="发送前尽量去掉冗余内容，减少请求体积。" checked={draft.compressionEnabled} onChange={set('compressionEnabled')} />
                     <TogField label="仅压缩空白字符" desc="只处理多余空格和换行，改动最小，风险较低。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={set('whitespaceCompression')} />
                     <TogField label="启用大小保护" desc="发送前检查请求大小，超过限制时按规则清理内容。" checked={draft.payloadGuardEnabled} onChange={set('payloadGuardEnabled')} />
-                    <TogField label="外部账号也应用大小保护" desc="请求转发到外部账号前，也执行同样的大小保护。" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={set('payloadGuardExternalEnabled')} />
+                    <TogField label="上游账号也应用大小保护" desc="请求转发到上游账号前，也执行同样的大小保护。" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={set('payloadGuardExternalEnabled')} />
                     <TogField label="优先裁剪旧历史" desc="内容太长时，优先缩短较早的对话历史，尽量保留当前请求" checked={draft.payloadGuardTrimHistory} disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardTrimHistory')} />
                   </TwoCol>
                   <div className="space-y-1.5">
@@ -1568,7 +1568,7 @@ export function RuntimePage() {
                       </SelectContent>
                     </Select>
                     <p className="text-xs leading-5 text-muted-foreground">
-                      作为外部池默认值；单个外部账号可以覆盖。只决定 stream=true 的 SSE 事件转发方式；usage 是透传上游还是按入口路径整理，由外部账号的“下游 usage 口径”决定。
+                      作为账号运行时默认值；单个上游账号可以覆盖。只决定 stream=true 的 SSE 事件转发方式；usage 是透传上游还是按入口路径整理，由上游账号的“下游 usage 口径”决定。
                     </p>
                   </div>
                 </div>

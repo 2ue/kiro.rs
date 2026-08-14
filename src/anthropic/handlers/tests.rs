@@ -5523,7 +5523,7 @@ fn runtime_config_for_payload_guard(
         payload_guard_max_bytes: max_bytes,
         payload_guard_safety_margin_bytes: 0,
         payload_guard_trim_history: true,
-        payload_guard_external_enabled: true,
+        payload_guard_account_enabled: true,
         kiro_cache_point_enabled: false,
         kiro_cache_point_tools_only: true,
         kiro_cache_point_record_plan: true,

@@ -102,6 +102,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - New upstream account usage records now write account-named route subtypes (`account_fallback_preflight`, `account_fallback_after_local_attempts`, `account_direct_policy`, `account_error`, `local_rescue_after_account`). Legacy `external_*` subtype values remain deserializable and accepted by compatibility route checks, and maintained UIs label both old and new values as upstream-account routes.
 - Anthropic handler fallback routing now uses `AccountFallbackContext` and account-named local-preflight/fallback helper methods. The old external-pool terminology remains only in compatibility subtype values, legacy usage fields and delegated storage/runtime internals, and local rescue preflight metadata now double-writes account fields with old `external*` copies.
 - Account local-rescue decisions now enter account-named runtime config accessors and write account-named fallback reasons (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`). Request-entry dispatch deadlines and pre-body rejection logs also use account runtime terminology while persisted config fields remain compatibility storage details.
+- Anthropic router/AppState/request runtime now names the account-route payload guard switch as `payload_guard_account_enabled`; it still reads and writes the persisted `payloadGuardExternalEnabled` compatibility field when crossing existing config and legacy route boundaries. Maintained runtime UIs now describe the control as upstream-account payload shaping rather than Kiro/external-pool payload handling.
 
 Last verified on 2026-08-14:
 
@@ -303,3 +304,9 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test2 -- cargo test preflight_account_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test3 -- cargo test account_runtime_config_ext_applies_enablement_and_route_policy -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test4 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-test1 -- cargo test payload_guard -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`

@@ -3006,7 +3006,7 @@ export function RuntimeConfigPanel() {
       return
     }
     if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536) {
-      toast.error('Kiro Payload 最大字节数必须为 0 或不小于 65536')
+      toast.error('上游 Payload 最大字节数必须为 0 或不小于 65536')
       return
     }
     if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes - next.payloadGuardSafetyMarginBytes < 65536) {
@@ -3860,16 +3860,16 @@ export function RuntimeConfigPanel() {
               />
             </label>
             <ToggleField
-              title="启用 Kiro Payload 防护"
-              description="按真实 Kiro JSON 字节数统计请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。"
+              title="启用 Payload 防护"
+              description="按上游请求 JSON 字节数统计请求，并修复空 toolUse、孤立 tool_result 等上游协议容易拒绝的形态。"
               checked={draft.payloadGuardEnabled}
               onCheckedChange={(payloadGuardEnabled) =>
                 setDraft((prev) => ({ ...prev, payloadGuardEnabled }))
               }
             />
             <ToggleField
-              title="备用池也应用 Payload 整形"
-              description="开启后，备用池请求会复用本页同一套阈值、模式和内容整形规则；关闭时备用池保持原始 Anthropic 请求体透传。"
+              title="上游账号也应用 Payload 整形"
+              description="开启后，上游账号请求会复用本页同一套阈值、模式和内容整形规则；关闭时上游账号保持原始 Anthropic 请求体透传。"
               checked={draft.payloadGuardExternalEnabled}
               disabled={!draft.payloadGuardEnabled}
               onCheckedChange={(payloadGuardExternalEnabled) =>
@@ -3904,7 +3904,7 @@ export function RuntimeConfigPanel() {
               description="payloadGuardMaxBytes 是本地裁剪目标阈值，不是模型上下文窗口。填 0 表示关闭所有按大小触发的内容整形、历史裁剪、当前内容兜底裁剪和错误后裁剪重试，但仍保留上面的协议修复。"
             />
             <NumberField
-              title="Kiro Payload 裁剪目标阈值"
+              title="上游 Payload 裁剪目标阈值"
               description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。"
               value={draft.payloadGuardMaxBytes}
               min={0}
@@ -4053,7 +4053,7 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="自动适配当前内容预算"
-              description="开启后，历史裁剪后仍超出 Kiro Payload 最大字节数时，会按下方预算裁剪当前 tool_result、当前文本、当前 document，并按体积丢弃当前图片；默认关闭。"
+              description="开启后，历史裁剪后仍超出上游 Payload 最大字节数时，会按下方预算裁剪当前 tool_result、当前文本、当前 document，并按体积丢弃当前图片；默认关闭。"
               checked={draft.payloadShaping.fitCurrentPayloadToBudget}
               disabled={!payloadShapingBranchEnabled}
               onCheckedChange={(fitCurrentPayloadToBudget) =>
