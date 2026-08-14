@@ -4333,6 +4333,7 @@ impl CredentialUsageContext {
             account_attempts,
             external_attempts,
             usage_projection_applied: None,
+            account_billing: None,
             external_pool_billing: None,
             error_type,
             error_message,

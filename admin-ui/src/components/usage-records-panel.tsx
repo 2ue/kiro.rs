@@ -1571,9 +1571,10 @@ export function UsageRecordsPanel() {
                   内部成本输入 = 上报输入 + 上报缓存写入，仅用于本系统费用估算和历史兼容，不是 Anthropic/Kiro 响应里的独立字段。
                 </div>
               </div>
-              {selectedRecord.externalPoolBilling && (
+              {(selectedRecord.accountBilling ?? selectedRecord.externalPoolBilling) && (
                 (() => {
-                  const billing = selectedRecord.externalPoolBilling
+                  const billing = selectedRecord.accountBilling ?? selectedRecord.externalPoolBilling
+                  if (!billing) return null
                   const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
                   const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
                   const profit = billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))

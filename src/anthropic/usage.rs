@@ -213,6 +213,8 @@ pub struct ExternalPoolBilling {
     pub body_usage_projection_applied: bool,
 }
 
+pub type AccountBilling = ExternalPoolBilling;
+
 impl ExternalPoolBilling {
     pub fn effective_shaped_cost_usd(&self) -> f64 {
         if self.pricing_available && self.shaped_cost_usd == 0.0 && self.reported_cost_usd > 0.0 {
@@ -548,6 +550,8 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_projection_applied: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_billing: Option<AccountBilling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_pool_billing: Option<ExternalPoolBilling>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
@@ -576,6 +580,23 @@ pub struct UsageRecord {
     pub payload_breakdown: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_guard_report: Option<serde_json::Value>,
+}
+
+impl UsageRecord {
+    pub fn account_billing_ref(&self) -> Option<&AccountBilling> {
+        self.account_billing
+            .as_ref()
+            .or(self.external_pool_billing.as_ref())
+    }
+
+    pub fn ensure_account_billing_compatibility(&mut self) {
+        if self.account_billing.is_none() {
+            self.account_billing = self.external_pool_billing.clone();
+        }
+        if self.external_pool_billing.is_none() {
+            self.external_pool_billing = self.account_billing.clone();
+        }
+    }
 }
 
 /// Builds a bounded diagnostic record for a sampled gateway rejection.
@@ -679,6 +700,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
         account_attempts: Vec::new(),
         external_attempts: Vec::new(),
         usage_projection_applied: None,
+        account_billing: None,
         external_pool_billing: None,
         error_type: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
         error_message: Some(REQUEST_REJECTION_ERROR_MESSAGE.to_string()),
@@ -2332,6 +2354,8 @@ impl UsageRecorder {
             }
             return UsageRecordOutcome::RejectedShuttingDown;
         }
+        let mut record = record;
+        record.ensure_account_billing_compatibility();
         let record = normalize_error_diagnostics(record);
         let record_micros = parse_record_time(&record.created_at)
             .unwrap_or_else(Utc::now)
@@ -3227,7 +3251,7 @@ impl UsageRecorder {
                 .is_some_and(UsageRouteKind::is_upstream_account)
             {
                 summary.external_pool_billing.requests += 1;
-                if let Some(billing) = &record.external_pool_billing {
+                if let Some(billing) = record.account_billing_ref() {
                     if billing.pricing_available {
                         summary.external_pool_billing.priced_requests += 1;
                     } else {
@@ -4089,6 +4113,7 @@ mod tests {
             account_attempts: Vec::new(),
             external_attempts: Vec::new(),
             usage_projection_applied: None,
+            account_billing: None,
             external_pool_billing: None,
             error_type: None,
             error_message: None,
@@ -4108,6 +4133,59 @@ mod tests {
 
     fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
         record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
+    }
+
+    fn account_billing_fixture() -> AccountBilling {
+        AccountBilling {
+            request_input_tokens: Some(100),
+            raw_usage: ExternalPoolUsageSnapshot {
+                total_input_tokens: 100,
+                input_tokens: 90,
+                billable_input_tokens: 95,
+                output_tokens: 20,
+                cache_read_input_tokens: 5,
+                cache_creation_input_tokens: 5,
+                cache_creation_5m_input_tokens: 5,
+                cache_creation_1h_input_tokens: 0,
+            },
+            shaped_usage: ExternalPoolUsageSnapshot {
+                total_input_tokens: 120,
+                input_tokens: 100,
+                billable_input_tokens: 110,
+                output_tokens: 20,
+                cache_read_input_tokens: 10,
+                cache_creation_input_tokens: 10,
+                cache_creation_5m_input_tokens: 10,
+                cache_creation_1h_input_tokens: 0,
+            },
+            reported_usage: ExternalPoolUsageSnapshot {
+                total_input_tokens: 130,
+                input_tokens: 110,
+                billable_input_tokens: 120,
+                output_tokens: 25,
+                cache_read_input_tokens: 10,
+                cache_creation_input_tokens: 10,
+                cache_creation_5m_input_tokens: 10,
+                cache_creation_1h_input_tokens: 0,
+            },
+            usage_projection_applied: true,
+            raw_cost_usd: 0.10,
+            shaped_cost_usd: 0.20,
+            uplifted_cost_usd: 0.30,
+            profit_usd: 0.20,
+            reported_cost_usd: 0.25,
+            billable_cost_usd: 0.30,
+            cost_floor_delta_usd: 0.0,
+            cost_floor_applied: false,
+            pricing_available: true,
+            pricing_model: Some("claude-sonnet-4-5".to_string()),
+            usage_projection_mode: "current_path_policy".to_string(),
+            stream_response_mode: None,
+            usage_estimated: false,
+            usage_estimate_reason: None,
+            usage_candidate_path: None,
+            body_usage_projection_applied: true,
+        }
     }
 
     #[test]
@@ -4143,6 +4221,56 @@ mod tests {
         assert_eq!(json["externalPoolName"], "primary");
         assert_eq!(json["externalAttempts"][0]["poolId"], 42);
         assert_eq!(json["externalAttempts"][0]["poolName"], "primary");
+    }
+
+    #[test]
+    fn usage_record_serializes_account_billing_with_external_compatibility() {
+        let mut record = record("req_account_billing", 0, UsageSource::UpstreamMetadata);
+        record.account_billing = Some(account_billing_fixture());
+        record.ensure_account_billing_compatibility();
+
+        let json = serde_json::to_value(&record).expect("usage record serializes");
+        assert_eq!(json["accountBilling"]["rawCostUsd"], 0.10);
+        assert_eq!(json["accountBilling"]["billableCostUsd"], 0.30);
+        assert_eq!(json["externalPoolBilling"]["rawCostUsd"], 0.10);
+        assert_eq!(json["externalPoolBilling"]["billableCostUsd"], 0.30);
+
+        let mut historical: UsageRecord = serde_json::from_value(serde_json::json!({
+            "id": "legacy_billing",
+            "createdAt": "2026-08-14T00:00:00Z",
+            "endpoint": "/cc/v1/messages",
+            "stream": false,
+            "model": "claude-sonnet-4-5",
+            "status": "success",
+            "usageSource": "upstream_metadata",
+            "totalInputTokens": 1,
+            "compatInputTokens": 1,
+            "billableInputTokens": 1,
+            "outputTokens": 1,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "cacheCreation5mInputTokens": 0,
+            "cacheCreation1hInputTokens": 0,
+            "estimatedCostUsd": 0.30,
+            "originalCostUsd": 0.10,
+            "kiroMeteringUsage": 0.0,
+            "pricingAvailable": true,
+            "durationMs": 1,
+            "simulated": false,
+            "stickyBound": false,
+            "fallbackFromSticky": false,
+            "externalPoolBilling": json["externalPoolBilling"].clone()
+        }))
+        .expect("historical external billing record deserializes");
+        assert!(historical.account_billing.is_none());
+        historical.ensure_account_billing_compatibility();
+        assert_eq!(
+            historical
+                .account_billing_ref()
+                .expect("account billing fallback")
+                .billable_cost_usd,
+            0.30
+        );
     }
 
     #[test]

@@ -5653,6 +5653,9 @@ impl PostgresUsageStore {
         }
         let mut records: Vec<UsageRecord> = records_by_id.into_values().collect();
         records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        for record in &mut records {
+            record.ensure_account_billing_compatibility();
+        }
         let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
         let mut tx = self.store.pool().begin().await?;
         acquire_usage_writer_commit_guard(&mut tx).await?;
@@ -8114,16 +8117,16 @@ fn external_pool_usage_risk_sample_from_row(
 }
 
 fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
+    record.ensure_account_billing_compatibility();
     if record.original_cost_usd != 0.0 {
         return;
     }
 
-    if let Some(external_pool_billing) = record
-        .external_pool_billing
-        .as_ref()
+    if let Some(account_billing) = record
+        .account_billing_ref()
         .filter(|billing| billing.raw_cost_usd != 0.0)
     {
-        record.original_cost_usd = external_pool_billing.raw_cost_usd;
+        record.original_cost_usd = account_billing.raw_cost_usd;
         return;
     }
 
@@ -8473,7 +8476,7 @@ impl UsageRollupMetrics {
         let external_pool = record
             .route_kind
             .is_some_and(UsageRouteKind::is_upstream_account);
-        let external_billing = record.external_pool_billing.as_ref();
+        let external_billing = record.account_billing_ref();
         let external_priced =
             external_pool && external_billing.is_some_and(|billing| billing.pricing_available);
         Self {
@@ -12362,6 +12365,7 @@ mod tests {
             account_attempts: Vec::new(),
             external_attempts: Vec::new(),
             usage_projection_applied: None,
+            account_billing: None,
             external_pool_billing: None,
             credential_attempts: Vec::new(),
             error_type: None,
@@ -15122,6 +15126,29 @@ mod tests {
             account_attempts: Vec::new(),
             external_attempts: Vec::new(),
             usage_projection_applied: Some(true),
+            account_billing: Some(ExternalPoolBilling {
+                request_input_tokens: None,
+                raw_usage,
+                shaped_usage,
+                reported_usage,
+                usage_projection_applied: true,
+                raw_cost_usd,
+                shaped_cost_usd,
+                uplifted_cost_usd,
+                profit_usd,
+                reported_cost_usd: uplifted_cost_usd,
+                billable_cost_usd: uplifted_cost_usd,
+                cost_floor_delta_usd: (raw_cost_usd - uplifted_cost_usd).max(0.0),
+                cost_floor_applied: uplifted_cost_usd < raw_cost_usd,
+                pricing_available: true,
+                pricing_model: Some("claude-sonnet-4-5".to_string()),
+                usage_projection_mode: "current_path_policy".to_string(),
+                stream_response_mode: None,
+                usage_estimated: false,
+                usage_estimate_reason: None,
+                usage_candidate_path: None,
+                body_usage_projection_applied: true,
+            }),
             external_pool_billing: Some(ExternalPoolBilling {
                 request_input_tokens: None,
                 raw_usage,

@@ -829,6 +829,7 @@ export interface UsageRecord {
   externalPoolName?: string
   externalAttempts?: ExternalPoolAttempt[]
   usageProjectionApplied?: boolean
+  accountBilling?: ExternalPoolBilling
   externalPoolBilling?: ExternalPoolBilling
   errorType?: string
   errorMessage?: string
@@ -894,6 +895,8 @@ export interface ExternalPoolBilling {
   usageCandidatePath?: string
   bodyUsageProjectionApplied?: boolean
 }
+
+export type AccountBilling = ExternalPoolBilling
 
 export interface ExternalPoolAttempt {
   attempt: number

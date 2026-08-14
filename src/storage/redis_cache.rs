@@ -2587,7 +2587,8 @@ impl RedisStore {
             let value: Option<String> = manager.get(self.key(usage_record_key(request_id))).await?;
             let mut records = Vec::new();
             if let Some(value) = value {
-                if let Ok(record) = serde_json::from_str::<UsageRecord>(&value) {
+                if let Ok(mut record) = serde_json::from_str::<UsageRecord>(&value) {
+                    record.ensure_account_billing_compatibility();
                     if usage_record_matches_query(&record, &query) {
                         records.push(record);
                     }
@@ -2642,9 +2643,10 @@ impl RedisStore {
             }
             let values: Vec<Option<String>> = pipe.query_async(&mut manager).await?;
             for value in values.into_iter().flatten() {
-                let Ok(record) = serde_json::from_str::<UsageRecord>(&value) else {
+                let Ok(mut record) = serde_json::from_str::<UsageRecord>(&value) else {
                     continue;
                 };
+                record.ensure_account_billing_compatibility();
                 if usage_record_matches_query(&record, &query) {
                     matched.push(record);
                     if matched.len() >= target_matches {
@@ -6321,7 +6323,7 @@ fn append_external_pool_usage_summary(
         .arg(totals_key)
         .arg("external_pool_requests")
         .arg(1i64);
-    if let Some(billing) = &record.external_pool_billing {
+    if let Some(billing) = record.account_billing_ref() {
         pipe.cmd("HINCRBY")
             .arg(totals_key)
             .arg(if billing.pricing_available {
@@ -7421,6 +7423,7 @@ mod tests {
             account_attempts: Vec::new(),
             external_attempts: Vec::new(),
             usage_projection_applied: None,
+            account_billing: None,
             external_pool_billing: None,
             error_type: (status != UsageRecordStatus::Success).then(|| "rate_limit".to_string()),
             error_message: (status != UsageRecordStatus::Success).then(|| "429".to_string()),
@@ -8146,7 +8149,7 @@ mod tests {
         external.external_pool_name = Some("backup-a".to_string());
         external.account_id = Some(42);
         external.account_name = Some("backup-a".to_string());
-        external.external_pool_billing = Some(ExternalPoolBilling {
+        let billing = ExternalPoolBilling {
             request_input_tokens: None,
             raw_usage: ExternalPoolUsageSnapshot::default(),
             shaped_usage: ExternalPoolUsageSnapshot::default(),
@@ -8168,7 +8171,9 @@ mod tests {
             usage_estimate_reason: None,
             usage_candidate_path: None,
             body_usage_projection_applied: true,
-        });
+        };
+        external.account_billing = Some(billing.clone());
+        external.external_pool_billing = Some(billing);
         let mut error = usage_record(
             "redis-usage-error",
             UsageRecordStatus::Error,

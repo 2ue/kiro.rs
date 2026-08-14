@@ -8522,6 +8522,7 @@ impl ExternalPoolManager {
             usage_projection_applied: billing
                 .as_ref()
                 .map(|billing| billing.usage_projection_applied),
+            account_billing: billing.clone(),
             external_pool_billing: billing,
             error_type,
             error_message,

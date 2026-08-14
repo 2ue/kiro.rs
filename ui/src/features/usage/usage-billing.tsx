@@ -19,6 +19,7 @@ export interface UsageCostModel {
   kiroMeteringUsage?: number
   pricingAvailable?: boolean
   pricingModel?: string
+  accountBilling?: ExternalPoolBilling
   externalPoolBilling?: ExternalPoolBilling
 }
 
@@ -29,6 +30,7 @@ export function usageRecordCostModel(record: UsageRecord): UsageCostModel {
     kiroMeteringUsage: record.kiroMeteringUsage,
     pricingAvailable: record.pricingAvailable,
     pricingModel: record.pricingModel,
+    accountBilling: record.accountBilling ?? record.externalPoolBilling,
     externalPoolBilling: record.externalPoolBilling,
   }
 }
@@ -149,7 +151,7 @@ export function UsageCostBreakdown({
 }: {
   model: UsageCostModel
 }) {
-  const billing = model.externalPoolBilling
+  const billing = model.accountBilling ?? model.externalPoolBilling
   const shapedCost = billing?.shapedCostUsd ?? billing?.reportedCostUsd ?? model.estimatedCostUsd
   const upliftedCost = billing?.upliftedCostUsd ?? billing?.reportedCostUsd ?? billing?.billableCostUsd ?? model.estimatedCostUsd
   const delta = billing
