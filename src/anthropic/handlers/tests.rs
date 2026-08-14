@@ -5221,7 +5221,7 @@ fn defined_cache_route_requires_explicit_configuration() {
 }
 
 #[test]
-fn raw_external_route_request_is_preparse_raw_only() {
+fn raw_account_route_request_is_preparse_raw_only() {
     let state = AppState::new(
         Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
         true,
@@ -5239,7 +5239,7 @@ fn raw_external_route_request_is_preparse_raw_only() {
         br#"{"model":"client-model","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
     );
 
-    let route = raw_external_route_request(
+    let route = raw_account_route_request(
         &state,
         &runtime_config,
         &cache_route,
@@ -5279,9 +5279,9 @@ fn raw_external_route_request_is_preparse_raw_only() {
 #[test]
 fn contaminated_fallback_requires_normalized_pool_for_five_rounds() {
     for _round in 0..5 {
-        assert_eq!(external_fallback_body_mode_filter(false), None);
+        assert_eq!(account_route_body_mode_filter(false), None);
         assert_eq!(
-            external_fallback_body_mode_filter(true),
+            account_route_body_mode_filter(true),
             Some(ExternalPoolRequestBodyMode::Normalized)
         );
     }
@@ -5315,7 +5315,7 @@ fn all_parsed_external_fallback_entrypoints_share_route_and_model_eligibility() 
     );
     assert!(
         source.contains(
-            "body_mode_filter: external_fallback_body_mode_filter(self.requires_normalized_body)"
+            "body_mode_filter: account_route_body_mode_filter(self.requires_normalized_body)"
         ),
         "body mode remains a route body-processing hint, not an external-pool candidate filter"
     );
@@ -5348,14 +5348,14 @@ fn direct_external_policy_resolves_model_before_route_request() {
         "external direct route must retain 模型（本地解析） for external 模型处理"
     );
     assert!(
-        source.contains("external_route_model_resolution(direct_model_resolution)"),
+        source.contains("account_route_model_resolution(direct_model_resolution)"),
         "direct external policy must use the same processed 模型（上游） that local Kiro dispatch would use"
     );
 }
 
 #[test]
-fn external_route_model_resolution_prefers_local_processed_model_for_cc_aliases() {
-    let resolved = external_route_model_resolution(ModelResolution::exact(
+fn account_route_model_resolution_prefers_local_processed_model_for_cc_aliases() {
+    let resolved = account_route_model_resolution(ModelResolution::exact(
         "claude-opus-4-6-thinking".to_string(),
     ));
 
@@ -5387,7 +5387,7 @@ fn native_websearch_runs_local_pool_preflight_before_mcp_intercept() {
 }
 
 #[test]
-fn raw_external_route_request_applies_non_stream_skip_cache_route() {
+fn raw_account_route_request_applies_non_stream_skip_cache_route() {
     let mut cache_policy = CachePolicyConfig::default();
     cache_policy.path_overrides.insert(
         "/cc".to_string(),
@@ -5426,7 +5426,7 @@ fn raw_external_route_request_applies_non_stream_skip_cache_route() {
             .skip_non_stream_usage_projection
     );
 
-    let non_stream_route = raw_external_route_request(
+    let non_stream_route = raw_account_route_request(
             &state,
             &runtime_config,
             &cache_route,
@@ -5461,7 +5461,7 @@ fn raw_external_route_request_applies_non_stream_skip_cache_route() {
             .skip_non_stream_usage_projection
     );
 
-    let stream_route = raw_external_route_request(
+    let stream_route = raw_account_route_request(
             &state,
             &runtime_config,
             &cache_route,
@@ -10195,7 +10195,7 @@ fn external_fallback_classifier_gates_unsupported_model() {
 #[test]
 fn external_local_rescue_classifier_respects_error_type_and_toggles() {
     let config = AccountRuntimeConfig::default();
-    let rate_limit = ExternalPoolFinalError {
+    let rate_limit = AccountFinalError {
             status: StatusCode::TOO_MANY_REQUESTS,
             response_error_type: "rate_limit_error".to_string(),
             route_error_type: "rate_limit".to_string(),
@@ -10245,7 +10245,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         Some("external_rate_limit")
     );
 
-    let timeout = ExternalPoolFinalError {
+    let timeout = AccountFinalError {
         status: StatusCode::BAD_GATEWAY,
         response_error_type: "api_error".to_string(),
         route_error_type: "network_error".to_string(),
@@ -10266,7 +10266,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         Some("external_timeout")
     );
 
-    let capacity = ExternalPoolFinalError {
+    let capacity = AccountFinalError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         response_error_type: "api_error".to_string(),
         route_error_type: "external_pool_capacity_full".to_string(),
@@ -10287,7 +10287,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         Some("external_capacity")
     );
 
-    let bad_request = ExternalPoolFinalError {
+    let bad_request = AccountFinalError {
         status: StatusCode::BAD_REQUEST,
         response_error_type: "invalid_request_error".to_string(),
         route_error_type: "client_error".to_string(),
@@ -10351,7 +10351,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
         None
     );
 
-    let server_error = ExternalPoolFinalError {
+    let server_error = AccountFinalError {
         status: StatusCode::BAD_GATEWAY,
         response_error_type: "api_error".to_string(),
         route_error_type: "server_error".to_string(),
@@ -10385,7 +10385,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
 #[test]
 fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
     let config = AccountRuntimeConfig::default();
-    let capacity = ExternalPoolFinalError {
+    let capacity = AccountFinalError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         response_error_type: "api_error".to_string(),
         route_error_type: "external_pool_capacity_full".to_string(),
@@ -10420,7 +10420,7 @@ fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
 #[test]
 fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
     let config = AccountRuntimeConfig::default();
-    let rate_limit = ExternalPoolFinalError {
+    let rate_limit = AccountFinalError {
         status: StatusCode::TOO_MANY_REQUESTS,
         response_error_type: "rate_limit_error".to_string(),
         route_error_type: "rate_limit".to_string(),
@@ -10493,7 +10493,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = AccountRuntimeConfig::default();
-    let rate_limit = ExternalPoolFinalError {
+    let rate_limit = AccountFinalError {
         status: StatusCode::TOO_MANY_REQUESTS,
         response_error_type: "rate_limit_error".to_string(),
         route_error_type: "rate_limit".to_string(),
@@ -10559,7 +10559,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
     };
 
     let errors = [
-        ExternalPoolFinalError {
+        AccountFinalError {
             status: StatusCode::TOO_MANY_REQUESTS,
             response_error_type: "rate_limit_error".to_string(),
             route_error_type: "rate_limit".to_string(),
@@ -10570,7 +10570,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
             pool_id: Some(1),
             pool_name: Some("direct".to_string()),
         },
-        ExternalPoolFinalError {
+        AccountFinalError {
             status: StatusCode::BAD_GATEWAY,
             response_error_type: "api_error".to_string(),
             route_error_type: "network_error".to_string(),
@@ -10581,7 +10581,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
             pool_id: Some(1),
             pool_name: Some("direct".to_string()),
         },
-        ExternalPoolFinalError {
+        AccountFinalError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             response_error_type: "api_error".to_string(),
             route_error_type: "external_pool_capacity_full".to_string(),
@@ -10592,7 +10592,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
             pool_id: None,
             pool_name: None,
         },
-        ExternalPoolFinalError {
+        AccountFinalError {
             status: StatusCode::BAD_REQUEST,
             response_error_type: "invalid_request_error".to_string(),
             route_error_type: "client_error".to_string(),
@@ -10603,7 +10603,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
             pool_id: Some(1),
             pool_name: Some("direct".to_string()),
         },
-        ExternalPoolFinalError {
+        AccountFinalError {
             status: StatusCode::BAD_GATEWAY,
             response_error_type: "api_error".to_string(),
             route_error_type: "server_error".to_string(),
@@ -10658,7 +10658,7 @@ fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_
         external_pool_local_rescue_enabled: true,
         ..Default::default()
     };
-    let server_error = ExternalPoolFinalError {
+    let server_error = AccountFinalError {
         status: StatusCode::BAD_GATEWAY,
         response_error_type: "api_error".to_string(),
         route_error_type: "server_error".to_string(),
@@ -10720,7 +10720,7 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = AccountRuntimeConfig::default();
-    let capacity = ExternalPoolFinalError {
+    let capacity = AccountFinalError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         response_error_type: "api_error".to_string(),
         route_error_type: "external_pool_capacity_full".to_string(),

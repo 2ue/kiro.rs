@@ -18,8 +18,10 @@ pub use attempt::{
     AccountAttemptAction, AccountAttemptTrace, DeliveryEvidence, UpstreamErrorClass,
 };
 pub use migration::upstream_account_from_external_pool;
+pub(crate) use runtime::AccountRouteRequestPreparationCache;
 pub use runtime::{
-    AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
+    AccountFinalError, AccountForwardOutcome, AccountLatencyTraceState, AccountRequestBodyMode,
+    AccountRouteRequest, AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
     UpstreamAccountStatusRecord, UpstreamAccountStorageRecord, clear_upstream_account_cooldowns,
     load_upstream_account_status_records, upstream_account_messages_url,
     upstream_account_models_url,

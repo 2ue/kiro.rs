@@ -85,6 +85,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `account_runtime` now exports `UpstreamAccountStorageRecord` and `UpstreamAccountStatusRecord` aliases. Admin account bridge methods use those account-named record types while legacy storage/cache keys remain an internal compatibility detail.
 - `account_runtime::store` now provides account-named storage bridge methods for listing, loading, creating, updating, deleting, enabling, supported-model updates and auto-disable clearing. `/api/admin/accounts` service methods use those bridge methods while legacy `/external-pools` methods keep their old compatibility calls.
 - `account_runtime` now exposes account-named status, cooldown and upstream URL helpers. Account status, account cooldown clearing, account supported-model discovery and account tests enter through those helpers and return account-facing Admin messages instead of external-pool wording.
+- Anthropic request entry and handler code now uses account-runtime aliases for account route requests, route preparation cache, request body mode, forward outcome, final route error and latency trace. Raw direct/preflight helper names now use account-route terminology while the underlying legacy implementation remains behind the facade.
 
 Last verified on 2026-08-14:
 
@@ -161,4 +162,9 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-store-bridge-test1b -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-store-bridge-test2b -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-store-bridge-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-route-alias-fmt5 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-route-alias-check3 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-route-alias-test1b -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-alias-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `git diff --check`

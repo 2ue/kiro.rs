@@ -93,11 +93,9 @@ use super::usage::{
 };
 use super::websearch;
 use crate::account_runtime::{
-    AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
-};
-use crate::external_pool::{
-    ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolRequestBodyMode,
-    ExternalRouteRequest, ExternalRouteRequestPreparationCache,
+    AccountFinalError, AccountForwardOutcome, AccountLatencyTraceState, AccountRequestBodyMode,
+    AccountRouteRequest, AccountRouteRequestPreparationCache, AccountRuntimeConfig,
+    AccountRuntimeConfigExt, AccountRuntimeManager,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
 use crate::kiro::call_trace::{
@@ -783,23 +781,23 @@ struct ExternalFallbackContext {
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     requires_normalized_body: bool,
-    raw_preflight_failure: Option<RawExternalPreflightFailure>,
+    raw_preflight_failure: Option<RawAccountPreflightFailure>,
 }
 
-struct LocalPoolPreflightExternalOutcome {
-    outcome: ExternalPoolForwardOutcome,
+struct LocalPoolPreflightAccountOutcome {
+    outcome: AccountForwardOutcome,
     local_reason: String,
 }
 
 #[derive(Clone)]
-struct RawExternalPreflightFailure {
+struct RawAccountPreflightFailure {
     local_reason: String,
-    error: ExternalPoolFinalError,
+    error: AccountFinalError,
 }
 
-enum RawExternalPreflightDecision {
+enum RawAccountPreflightDecision {
     Response(Response),
-    ContinueWithLocalRescue(RawExternalPreflightFailure),
+    ContinueWithLocalRescue(RawAccountPreflightFailure),
 }
 
 #[derive(Clone)]
@@ -1263,7 +1261,7 @@ fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response>
         .map_err(|error| error.to_response(&request_id))
 }
 
-async fn maybe_raw_external_direct_response(
+async fn maybe_raw_account_direct_response(
     state: &AppState,
     headers: HeaderMap,
     raw_body: Bytes,
@@ -1283,8 +1281,13 @@ async fn maybe_raw_external_direct_response(
     if !account_runtime_enabled_for_endpoint(&config, endpoint) {
         return None;
     }
-    if !raw_external_pool_has_eligible_pool(&manager, &config, endpoint, raw_probe.model.as_deref())
-        .await
+    if !raw_upstream_account_has_eligible_account(
+        &manager,
+        &config,
+        endpoint,
+        raw_probe.model.as_deref(),
+    )
+    .await
     {
         return None;
     }
@@ -1308,8 +1311,8 @@ async fn maybe_raw_external_direct_response(
             )
         })
         .filter(|resolution| resolution.source != ModelResolutionSource::Unsupported)
-        .map(external_route_model_resolution);
-    let mut route = raw_external_route_request_with_hints(
+        .map(account_route_model_resolution);
+    let mut route = raw_account_route_request_with_hints(
         state,
         &runtime_config,
         &cache_route,
@@ -1334,7 +1337,7 @@ async fn maybe_raw_external_direct_response(
     Some(manager.forward_with_failover(config, route).await)
 }
 
-async fn maybe_raw_external_preflight_response(
+async fn maybe_raw_account_preflight_response(
     state: &AppState,
     headers: HeaderMap,
     raw_body: Bytes,
@@ -1342,7 +1345,7 @@ async fn maybe_raw_external_preflight_response(
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
-) -> Option<RawExternalPreflightDecision> {
+) -> Option<RawAccountPreflightDecision> {
     let provider = state.kiro_provider.as_ref()?.clone();
     let manager = state.account_runtime_manager.clone()?;
     let runtime_config = request_runtime_config(state, &provider);
@@ -1363,7 +1366,7 @@ async fn maybe_raw_external_preflight_response(
         None,
     )
     .await?;
-    if !raw_external_pool_ready_for_route_reason(
+    if !raw_upstream_account_ready_for_route_reason(
         &manager,
         &config,
         reason.as_str(),
@@ -1386,7 +1389,7 @@ async fn maybe_raw_external_preflight_response(
         retry_after_secs = ?local_state.retry_after_secs,
         "local credential pool is not immediately schedulable; routing raw request directly to external pool before parsing body"
     );
-    let route = raw_external_route_request_with_hints(
+    let route = raw_account_route_request_with_hints(
         state,
         &runtime_config,
         &cache_route,
@@ -1401,7 +1404,7 @@ async fn maybe_raw_external_preflight_response(
             "reason": reason,
             "state": local_state,
             "preflightStage": "before_parse",
-            "requiredBodyMode": ExternalPoolRequestBodyMode::RawPassthrough.as_str(),
+            "requiredBodyMode": AccountRequestBodyMode::RawPassthrough.as_str(),
         })),
         inference_attempt_budget.clone(),
         request_api_key_id,
@@ -1412,10 +1415,10 @@ async fn maybe_raw_external_preflight_response(
         .forward_with_failover_result(config.clone(), route)
         .await;
     Some(match outcome {
-        ExternalPoolForwardOutcome::Response(response) => {
-            RawExternalPreflightDecision::Response(response)
+        AccountForwardOutcome::Response(response) => {
+            RawAccountPreflightDecision::Response(response)
         }
-        ExternalPoolForwardOutcome::FinalError(err) => {
+        AccountForwardOutcome::FinalError(err) => {
             let current_local_dispatchable = provider
                 .local_pool_route_state_fresh(raw_probe.model.as_deref())
                 .dispatchable;
@@ -1437,18 +1440,18 @@ async fn maybe_raw_external_preflight_response(
                     external_attempt_count = err.attempts.len(),
                     "raw external preflight failed with a rescuable error; continuing into parsed local rescue path"
                 );
-                RawExternalPreflightDecision::ContinueWithLocalRescue(RawExternalPreflightFailure {
+                RawAccountPreflightDecision::ContinueWithLocalRescue(RawAccountPreflightFailure {
                     local_reason: reason,
                     error: err,
                 })
             } else {
-                RawExternalPreflightDecision::Response(err.into_response(&request_id))
+                RawAccountPreflightDecision::Response(err.into_response(&request_id))
             }
         }
     })
 }
 
-async fn raw_external_pool_has_eligible_pool(
+async fn raw_upstream_account_has_eligible_account(
     manager: &AccountRuntimeManager,
     config: &AccountRuntimeConfig,
     endpoint: &str,
@@ -1460,19 +1463,19 @@ async fn raw_external_pool_has_eligible_pool(
     manager.has_cached_eligible_pool_for_route_body_mode_and_model(
         config,
         endpoint,
-        ExternalPoolRequestBodyMode::RawPassthrough,
+        AccountRequestBodyMode::RawPassthrough,
         model,
     ) || manager
         .has_eligible_pool_for_route_body_mode_and_model(
             config,
             endpoint,
-            ExternalPoolRequestBodyMode::RawPassthrough,
+            AccountRequestBodyMode::RawPassthrough,
             model,
         )
         .await
 }
 
-async fn raw_external_pool_ready_for_route_reason(
+async fn raw_upstream_account_ready_for_route_reason(
     manager: &AccountRuntimeManager,
     config: &AccountRuntimeConfig,
     route_reason: &str,
@@ -1486,24 +1489,24 @@ async fn raw_external_pool_ready_for_route_reason(
         manager.has_cached_immediately_available_pool_for_route_body_mode_and_model(
             config,
             endpoint,
-            ExternalPoolRequestBodyMode::RawPassthrough,
+            AccountRequestBodyMode::RawPassthrough,
             model,
         ) || manager
             .has_immediately_available_pool_for_route_body_mode_and_model(
                 config,
                 endpoint,
-                ExternalPoolRequestBodyMode::RawPassthrough,
+                AccountRequestBodyMode::RawPassthrough,
                 model,
                 EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
             )
             .await
     } else {
-        raw_external_pool_has_eligible_pool(manager, config, endpoint, model).await
+        raw_upstream_account_has_eligible_account(manager, config, endpoint, model).await
     }
 }
 
 #[cfg(test)]
-fn raw_external_route_request(
+fn raw_account_route_request(
     state: &AppState,
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
@@ -1517,9 +1520,9 @@ fn raw_external_route_request(
     local_preflight: Option<serde_json::Value>,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
-) -> ExternalRouteRequest {
+) -> AccountRouteRequest {
     let raw_probe = Arc::new(probe_raw_messages_body(&raw_body));
-    raw_external_route_request_with_hints(
+    raw_account_route_request_with_hints(
         state,
         runtime_config,
         cache_route,
@@ -1538,7 +1541,7 @@ fn raw_external_route_request(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn raw_external_route_request_with_hints(
+fn raw_account_route_request_with_hints(
     state: &AppState,
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
@@ -1553,21 +1556,21 @@ fn raw_external_route_request_with_hints(
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
-) -> ExternalRouteRequest {
+) -> AccountRouteRequest {
     let model_hint = raw_probe.model.clone();
     let stream_hint = raw_probe.stream;
     let effective_cache_route =
         cache_route_for_request_stream(cache_route.clone(), stream_hint.unwrap_or(false));
     let policy = &effective_cache_route.policy;
-    ExternalRouteRequest {
+    AccountRouteRequest {
         effective_raw_body: raw_body.clone(),
         effective_raw_probe: Some(raw_probe),
-        preparation_cache: Arc::new(ExternalRouteRequestPreparationCache::default()),
+        preparation_cache: Arc::new(AccountRouteRequestPreparationCache::default()),
         raw_body,
         headers,
         endpoint: endpoint.to_string(),
         payload: None,
-        body_mode_filter: Some(ExternalPoolRequestBodyMode::RawPassthrough),
+        body_mode_filter: Some(AccountRequestBodyMode::RawPassthrough),
         model_hint,
         stream_hint,
         request_input_tokens: 0,
@@ -1602,7 +1605,7 @@ fn raw_external_route_request_with_hints(
         recorder: state.usage_recorder.clone(),
         started_at: inference_attempt_budget.started_at().into(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
-        latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
+        latency_trace: Arc::new(AccountLatencyTraceState::default()),
         payload_breakdown: None,
         payload_guard_report: None,
         payload_guard_external_enabled: false,
@@ -1626,7 +1629,7 @@ fn build_external_fallback_context(
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
     requires_normalized_body: bool,
-    raw_preflight_failure: Option<RawExternalPreflightFailure>,
+    raw_preflight_failure: Option<RawAccountPreflightFailure>,
 ) -> Option<ExternalFallbackContext> {
     let manager = state.account_runtime_manager.clone()?;
     let config = runtime_config.account_runtime.clone();
@@ -1841,7 +1844,7 @@ impl ExternalFallbackContext {
         &self,
         request_id: &str,
         model: Option<&str>,
-    ) -> Option<LocalPoolPreflightExternalOutcome> {
+    ) -> Option<LocalPoolPreflightAccountOutcome> {
         let provider = self.provider.as_ref()?;
         if !self.config.local_pool_preflight_enabled {
             return None;
@@ -1887,15 +1890,13 @@ impl ExternalFallbackContext {
         ) {
             Ok(route) => route,
             Err(err) => {
-                return Some(LocalPoolPreflightExternalOutcome {
-                    outcome: ExternalPoolForwardOutcome::Response(payload_guard_error_response(
-                        err,
-                    )),
+                return Some(LocalPoolPreflightAccountOutcome {
+                    outcome: AccountForwardOutcome::Response(payload_guard_error_response(err)),
                     local_reason: reason,
                 });
             }
         };
-        Some(LocalPoolPreflightExternalOutcome {
+        Some(LocalPoolPreflightAccountOutcome {
             outcome: self
                 .manager
                 .forward_with_failover_result(self.config.clone(), route)
@@ -1914,8 +1915,8 @@ impl ExternalFallbackContext {
             .fallback_after_local_error_outcome(request_id, error_message, None, local_attempts)
             .await?
         {
-            ExternalPoolForwardOutcome::Response(response) => Some(response),
-            ExternalPoolForwardOutcome::FinalError(err) => Some(err.into_response(request_id)),
+            AccountForwardOutcome::Response(response) => Some(response),
+            AccountForwardOutcome::FinalError(err) => Some(err.into_response(request_id)),
         }
     }
 
@@ -1925,7 +1926,7 @@ impl ExternalFallbackContext {
         error_message: &str,
         call_failure_kind: Option<KiroCallFailureKind>,
         local_attempts: Vec<KiroCredentialAttempt>,
-    ) -> Option<ExternalPoolForwardOutcome> {
+    ) -> Option<AccountForwardOutcome> {
         let classification_attempts = local_attempts.clone();
         self.fallback_after_local_error_outcome_with_diagnostics(
             request_id,
@@ -1944,7 +1945,7 @@ impl ExternalFallbackContext {
         call_failure_kind: Option<KiroCallFailureKind>,
         classification_attempts: Vec<KiroCredentialAttempt>,
         diagnostic_attempts: Vec<KiroCredentialAttempt>,
-    ) -> Option<ExternalPoolForwardOutcome> {
+    ) -> Option<AccountForwardOutcome> {
         let Some(classified_reason) = classify_local_error_for_external_fallback_with_kind(
             error_message,
             &classification_attempts,
@@ -2067,7 +2068,7 @@ impl ExternalFallbackContext {
         ) {
             Ok(route) => route,
             Err(err) => {
-                return Some(ExternalPoolForwardOutcome::Response(
+                return Some(AccountForwardOutcome::Response(
                     payload_guard_error_response(err),
                 ));
             }
@@ -2088,16 +2089,16 @@ impl ExternalFallbackContext {
         local_attempted: bool,
         local_preflight: Option<serde_json::Value>,
         local_attempts: Vec<KiroCredentialAttempt>,
-    ) -> Result<ExternalRouteRequest, PayloadGuardError> {
-        Ok(ExternalRouteRequest {
+    ) -> Result<AccountRouteRequest, PayloadGuardError> {
+        Ok(AccountRouteRequest {
             effective_raw_body: self.effective_raw_body.clone(),
             effective_raw_probe: Some(self.effective_raw_probe.clone()),
-            preparation_cache: Arc::new(ExternalRouteRequestPreparationCache::default()),
+            preparation_cache: Arc::new(AccountRouteRequestPreparationCache::default()),
             raw_body: self.raw_body.clone(),
             headers: self.headers.clone(),
             endpoint: self.endpoint.clone(),
             payload: Some(self.payload.clone()),
-            body_mode_filter: external_fallback_body_mode_filter(self.requires_normalized_body),
+            body_mode_filter: account_route_body_mode_filter(self.requires_normalized_body),
             model_hint: None,
             stream_hint: None,
             request_input_tokens: self.request_input_tokens.max(0),
@@ -2141,7 +2142,7 @@ impl ExternalFallbackContext {
             recorder: self.recorder.clone(),
             started_at: self.inference_attempt_budget.started_at().into(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
-            latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
+            latency_trace: Arc::new(AccountLatencyTraceState::default()),
             payload_breakdown: None,
             payload_guard_report: None,
             payload_guard_external_enabled: self.payload_guard_external_enabled,
@@ -2153,10 +2154,10 @@ impl ExternalFallbackContext {
     }
 }
 
-fn external_fallback_body_mode_filter(
+fn account_route_body_mode_filter(
     requires_normalized_body: bool,
-) -> Option<ExternalPoolRequestBodyMode> {
-    requires_normalized_body.then_some(ExternalPoolRequestBodyMode::Normalized)
+) -> Option<AccountRequestBodyMode> {
+    requires_normalized_body.then_some(AccountRequestBodyMode::Normalized)
 }
 
 fn local_pool_capacity_fail_fast_enabled(config: &AccountRuntimeConfig) -> bool {
@@ -5552,7 +5553,7 @@ fn resolve_request_model(
     Ok(resolution)
 }
 
-fn external_route_model_resolution(mut resolution: ModelResolution) -> ModelResolution {
+fn account_route_model_resolution(mut resolution: ModelResolution) -> ModelResolution {
     if !matches!(
         resolution.source,
         ModelResolutionSource::ExactUpstream | ModelResolutionSource::PassThrough
@@ -5973,7 +5974,7 @@ async fn post_messages_inner(
     request_api_key_id: Option<String>,
     request_history_contaminated: bool,
     attribution: Option<RequestRejectionAttribution>,
-    raw_preflight_failure: Option<RawExternalPreflightFailure>,
+    raw_preflight_failure: Option<RawAccountPreflightFailure>,
 ) -> Response {
     tracing::debug!(
         endpoint = endpoint,
@@ -6063,7 +6064,7 @@ async fn post_messages_inner(
         );
         let direct_model_resolution = (direct_model_resolution.source
             != ModelResolutionSource::Unsupported)
-            .then(|| external_route_model_resolution(direct_model_resolution));
+            .then(|| account_route_model_resolution(direct_model_resolution));
         if let Some(response) = external
             .direct_policy_response(&request_id, direct_model_resolution)
             .await
@@ -6111,7 +6112,7 @@ async fn post_messages_inner(
         }
     };
     if let Some(external) = external_fallback.as_mut() {
-        external.model_resolution = Some(external_route_model_resolution(model_resolution.clone()));
+        external.model_resolution = Some(account_route_model_resolution(model_resolution.clone()));
     }
 
     if websearch::has_misnamed_native_web_search_tool(&payload) {
@@ -6547,7 +6548,7 @@ async fn maybe_external_fallback_after_local_error_outcome(
     message: &str,
     call_failure_kind: Option<KiroCallFailureKind>,
     attempts: Vec<KiroCredentialAttempt>,
-) -> Option<ExternalPoolForwardOutcome> {
+) -> Option<AccountForwardOutcome> {
     external_fallback?
         .fallback_after_local_error_outcome(request_id, message, call_failure_kind, attempts)
         .await
@@ -6560,7 +6561,7 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
     call_failure_kind: Option<KiroCallFailureKind>,
     classification_attempts: Vec<KiroCredentialAttempt>,
     diagnostic_attempts: Vec<KiroCredentialAttempt>,
-) -> Option<ExternalPoolForwardOutcome> {
+) -> Option<AccountForwardOutcome> {
     external_fallback?
         .fallback_after_local_error_outcome_with_diagnostics(
             request_id,
@@ -6580,8 +6581,8 @@ async fn maybe_local_pool_preflight_external_response(
     let preflight =
         maybe_local_pool_preflight_external_outcome(external_fallback, request_id, model).await?;
     Some(match preflight.outcome {
-        ExternalPoolForwardOutcome::Response(response) => response,
-        ExternalPoolForwardOutcome::FinalError(err) => err.into_response(request_id),
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(err) => err.into_response(request_id),
     })
 }
 
@@ -6589,7 +6590,7 @@ async fn maybe_local_pool_preflight_external_outcome(
     external_fallback: Option<&ExternalFallbackContext>,
     request_id: &str,
     model: Option<&str>,
-) -> Option<LocalPoolPreflightExternalOutcome> {
+) -> Option<LocalPoolPreflightAccountOutcome> {
     external_fallback?
         .local_pool_preflight_outcome(request_id, model)
         .await
@@ -6599,7 +6600,7 @@ async fn maybe_local_pool_preflight_external_outcome_for_local_request(
     external_fallback: Option<&ExternalFallbackContext>,
     request_id: &str,
     model: Option<&str>,
-) -> Option<LocalPoolPreflightExternalOutcome> {
+) -> Option<LocalPoolPreflightAccountOutcome> {
     if let Some(failure) =
         external_fallback.and_then(|external| external.raw_preflight_failure.as_ref())
     {
@@ -6611,8 +6612,8 @@ async fn maybe_local_pool_preflight_external_outcome_for_local_request(
             external_attempt_count = failure.error.attempts.len(),
             "using raw external preflight final error to drive parsed local rescue"
         );
-        return Some(LocalPoolPreflightExternalOutcome {
-            outcome: ExternalPoolForwardOutcome::FinalError(failure.error.clone()),
+        return Some(LocalPoolPreflightAccountOutcome {
+            outcome: AccountForwardOutcome::FinalError(failure.error.clone()),
             local_reason: failure.local_reason.clone(),
         });
     }
@@ -6693,15 +6694,15 @@ async fn maybe_external_fallback_after_websearch_mcp_failure(
     )
     .await?;
     Some(match outcome {
-        ExternalPoolForwardOutcome::Response(response) => response,
-        ExternalPoolForwardOutcome::FinalError(err) => err.into_response(request_id),
+        AccountForwardOutcome::Response(response) => response,
+        AccountForwardOutcome::FinalError(err) => err.into_response(request_id),
     })
 }
 
 fn local_rescue_reason_after_external_route_error(
     route_subtype: UsageRouteSubtype,
     config: &AccountRuntimeConfig,
-    err: &ExternalPoolFinalError,
+    err: &AccountFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
@@ -6742,7 +6743,7 @@ fn local_rescue_reason_after_external_route_error(
 #[cfg(test)]
 fn local_rescue_reason_after_external_error(
     config: &AccountRuntimeConfig,
-    err: &ExternalPoolFinalError,
+    err: &AccountFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
@@ -6805,7 +6806,7 @@ fn local_fallback_reason_blocks_local_rescue(
 fn budgeted_local_rescue_reason_after_external_route_error(
     route_subtype: UsageRouteSubtype,
     config: &AccountRuntimeConfig,
-    err: &ExternalPoolFinalError,
+    err: &AccountFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
     inference_attempt_budget: &InferenceAttemptBudget,
@@ -6825,7 +6826,7 @@ fn budgeted_local_rescue_reason_after_external_route_error(
 #[cfg(test)]
 fn budgeted_local_rescue_reason_after_external_error(
     config: &AccountRuntimeConfig,
-    err: &ExternalPoolFinalError,
+    err: &AccountFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
     inference_attempt_budget: &InferenceAttemptBudget,
@@ -7088,7 +7089,7 @@ impl SseStreamState {
     }
 }
 
-fn external_rescue_preflight(reason: &str, err: &ExternalPoolFinalError) -> serde_json::Value {
+fn external_rescue_preflight(reason: &str, err: &AccountFinalError) -> serde_json::Value {
     json!({
         "reason": reason,
         "externalStatus": err.status.as_u16(),
@@ -7144,8 +7145,8 @@ async fn handle_stream_request(
     {
         let local_reason = outcome.local_reason;
         match outcome.outcome {
-            ExternalPoolForwardOutcome::Response(response) => return response,
-            ExternalPoolForwardOutcome::FinalError(err) => {
+            AccountForwardOutcome::Response(response) => return response,
+            AccountForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
                     if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
                         UsageRouteSubtype::ExternalFallbackPreflight,
@@ -7325,10 +7326,10 @@ async fn handle_stream_request(
                                 .await
                             {
                                 match outcome {
-                                    ExternalPoolForwardOutcome::Response(response) => {
+                                    AccountForwardOutcome::Response(response) => {
                                         return response;
                                     }
-                                    ExternalPoolForwardOutcome::FinalError(err) => {
+                                    AccountForwardOutcome::FinalError(err) => {
                                         return err.into_response(&request_id);
                                     }
                                 }
@@ -7436,10 +7437,10 @@ async fn handle_stream_request(
                                 .await
                             {
                                 match outcome {
-                                    ExternalPoolForwardOutcome::Response(response) => {
+                                    AccountForwardOutcome::Response(response) => {
                                         return response;
                                     }
-                                    ExternalPoolForwardOutcome::FinalError(err) => {
+                                    AccountForwardOutcome::FinalError(err) => {
                                         if let Some(external) = external_fallback.as_ref() {
                                             let local_fallback_reason =
                                             classify_local_error_for_external_fallback_with_kind(
@@ -7579,8 +7580,8 @@ async fn handle_stream_request(
                     .await
                     {
                         match outcome {
-                            ExternalPoolForwardOutcome::Response(response) => return response,
-                            ExternalPoolForwardOutcome::FinalError(err) => {
+                            AccountForwardOutcome::Response(response) => return response,
+                            AccountForwardOutcome::FinalError(err) => {
                                 if let Some(external) = external_fallback.as_ref() {
                                     let local_fallback_reason =
                                         classify_local_error_for_external_fallback_with_kind(
@@ -9389,8 +9390,8 @@ async fn handle_non_stream_request(
     {
         let local_reason = outcome.local_reason;
         match outcome.outcome {
-            ExternalPoolForwardOutcome::Response(response) => return response,
-            ExternalPoolForwardOutcome::FinalError(err) => {
+            AccountForwardOutcome::Response(response) => return response,
+            AccountForwardOutcome::FinalError(err) => {
                 if let Some(external) = external_fallback.as_ref() {
                     if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
                         UsageRouteSubtype::ExternalFallbackPreflight,
@@ -9567,10 +9568,10 @@ async fn handle_non_stream_request(
                                 .await
                             {
                                 match outcome {
-                                    ExternalPoolForwardOutcome::Response(response) => {
+                                    AccountForwardOutcome::Response(response) => {
                                         return response;
                                     }
-                                    ExternalPoolForwardOutcome::FinalError(err) => {
+                                    AccountForwardOutcome::FinalError(err) => {
                                         return err.into_response(&request_id);
                                     }
                                 }
@@ -9675,10 +9676,10 @@ async fn handle_non_stream_request(
                                 .await
                             {
                                 match outcome {
-                                    ExternalPoolForwardOutcome::Response(response) => {
+                                    AccountForwardOutcome::Response(response) => {
                                         return response;
                                     }
-                                    ExternalPoolForwardOutcome::FinalError(err) => {
+                                    AccountForwardOutcome::FinalError(err) => {
                                         if let Some(external) = external_fallback.as_ref() {
                                             let local_fallback_reason =
                                             classify_local_error_for_external_fallback_with_kind(
@@ -9809,8 +9810,8 @@ async fn handle_non_stream_request(
                     .await
                     {
                         match outcome {
-                            ExternalPoolForwardOutcome::Response(response) => return response,
-                            ExternalPoolForwardOutcome::FinalError(err) => {
+                            AccountForwardOutcome::Response(response) => return response,
+                            AccountForwardOutcome::FinalError(err) => {
                                 if let Some(external) = external_fallback.as_ref() {
                                     let local_fallback_reason =
                                         classify_local_error_for_external_fallback_with_kind(

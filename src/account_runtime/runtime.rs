@@ -12,6 +12,19 @@ pub type UpstreamAccountStorageRecord = crate::external_pool::ExternalPool;
 
 pub type UpstreamAccountStatusRecord = crate::external_pool::ExternalPoolStatus;
 
+pub type AccountRouteRequest = crate::external_pool::ExternalRouteRequest;
+
+pub(crate) type AccountRouteRequestPreparationCache =
+    crate::external_pool::ExternalRouteRequestPreparationCache;
+
+pub type AccountForwardOutcome = crate::external_pool::ExternalPoolForwardOutcome;
+
+pub type AccountFinalError = crate::external_pool::ExternalPoolFinalError;
+
+pub type AccountRequestBodyMode = crate::external_pool::ExternalPoolRequestBodyMode;
+
+pub type AccountLatencyTraceState = crate::external_pool::ExternalLatencyTraceState;
+
 pub async fn load_upstream_account_status_records(
     manager: &AccountRuntimeManager,
     config: &AccountRuntimeConfig,

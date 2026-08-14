@@ -113,8 +113,8 @@ pub(super) async fn handle_messages_endpoint(
         request_history_contaminated = true;
     }
 
-    if should_try_raw_external_routes(request_history_contaminated) {
-        if let Some(response) = maybe_raw_external_direct_response(
+    if should_try_raw_account_routes(request_history_contaminated) {
+        if let Some(response) = maybe_raw_account_direct_response(
             &state,
             headers.clone(),
             effective_raw_body.clone(),
@@ -128,7 +128,7 @@ pub(super) async fn handle_messages_endpoint(
             return response;
         }
         let mut raw_preflight_failure = None;
-        if let Some(decision) = maybe_raw_external_preflight_response(
+        if let Some(decision) = maybe_raw_account_preflight_response(
             &state,
             headers.clone(),
             effective_raw_body.clone(),
@@ -140,13 +140,13 @@ pub(super) async fn handle_messages_endpoint(
         .await
         {
             match decision {
-                RawExternalPreflightDecision::Response(response) => return response,
-                RawExternalPreflightDecision::ContinueWithLocalRescue(failure) => {
+                RawAccountPreflightDecision::Response(response) => return response,
+                RawAccountPreflightDecision::ContinueWithLocalRescue(failure) => {
                     raw_preflight_failure = Some(failure);
                 }
             }
         }
-        return continue_messages_endpoint_after_raw_external_routes(
+        return continue_messages_endpoint_after_raw_account_routes(
             state,
             headers,
             effective_raw_body,
@@ -162,7 +162,7 @@ pub(super) async fn handle_messages_endpoint(
         )
         .await;
     }
-    continue_messages_endpoint_after_raw_external_routes(
+    continue_messages_endpoint_after_raw_account_routes(
         state,
         headers,
         effective_raw_body,
@@ -180,7 +180,7 @@ pub(super) async fn handle_messages_endpoint(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn continue_messages_endpoint_after_raw_external_routes(
+async fn continue_messages_endpoint_after_raw_account_routes(
     state: AppState,
     headers: HeaderMap,
     effective_raw_body: Bytes,
@@ -192,7 +192,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     request_api_key_id: Option<String>,
     request_history_contaminated: bool,
     attribution: Option<RequestRejectionAttribution>,
-    raw_preflight_failure: Option<RawExternalPreflightFailure>,
+    raw_preflight_failure: Option<RawAccountPreflightFailure>,
 ) -> Response {
     let runtime_config = state
         .kiro_provider
@@ -234,7 +234,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     .await
 }
 
-fn should_try_raw_external_routes(request_history_contaminated: bool) -> bool {
+fn should_try_raw_account_routes(request_history_contaminated: bool) -> bool {
     !request_history_contaminated
 }
 
@@ -631,7 +631,7 @@ mod tests {
             assert_eq!(parsed.max_tokens, DEFAULT_MISSING_MAX_TOKENS_VALUE);
             assert_eq!(parsed.model, "claude-sonnet-4-5");
 
-            let route = raw_external_route_request(
+            let route = raw_account_route_request(
                 &state,
                 &runtime_config,
                 &cache_route,
@@ -660,7 +660,7 @@ mod tests {
         ];
 
         for _round in 0..5 {
-            assert!(should_try_raw_external_routes(false));
+            assert!(should_try_raw_account_routes(false));
             for fixture in fixtures {
                 assert!(
                     super::super::super::transcript_sanitizer::sanitize_raw_request_assistant_history(
@@ -669,7 +669,7 @@ mod tests {
                     .expect("assistant history inspection succeeds")
                     .is_some()
                 );
-                assert!(!should_try_raw_external_routes(true));
+                assert!(!should_try_raw_account_routes(true));
             }
         }
     }

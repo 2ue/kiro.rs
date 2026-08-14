@@ -47,6 +47,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - `account_runtime` now exports account-named storage/status record aliases, and Admin account bridge signatures use them so new `/accounts` service code does not expose legacy record names at its boundary.
 - `account_runtime::store` now owns account-named storage compatibility methods, and `/api/admin/accounts` service code uses those methods for list, create, update, delete, enable, supported models and auto-disable operations.
 - Account status, cooldown clearing, supported-model discovery and account test helpers now enter through account-named runtime/URL helpers and return account-facing Admin messages while legacy `/external-pools` keeps its old wording.
+- Anthropic raw request entry and handler route construction now use account-runtime route/body/outcome/error/latency aliases and account-route helper names. Legacy external-pool route types remain behind the facade until the implementation moves out of `external_pool`.
 
 ## In Progress
 
