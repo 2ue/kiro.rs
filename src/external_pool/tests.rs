@@ -11004,7 +11004,7 @@ fn external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds() {
         let trace = external_usage_latency_trace(&route);
         let inference = trace.inference_attempts.expect("inference snapshot");
         assert_eq!(inference.consumed, 1, "round {round}");
-        assert_eq!(inference.external_attempts, 1, "round {round}");
+        assert_eq!(inference.account_attempts, 1, "round {round}");
         let auxiliary = trace.auxiliary_attempts.expect("auxiliary snapshot");
         assert_eq!(auxiliary.consumed, 2, "round {round}");
         assert_eq!(auxiliary.token_refresh_attempts, 1, "round {round}");
@@ -11151,7 +11151,7 @@ async fn external_fallback_usage_matches_real_refresh_profile_and_inference_hits
                     .saturating_add(hits_after_external.3.saturating_sub(hits_before.3)),
                 "case={case} round={round}"
             );
-            assert_eq!(inference.external_attempts, 1, "case={case} round={round}");
+            assert_eq!(inference.account_attempts, 1, "case={case} round={round}");
             assert_eq!(
                 auxiliary.token_refresh_attempts as u64,
                 hits_after_external.0 - hits_before.0,

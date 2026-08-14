@@ -692,6 +692,7 @@ export interface InferenceAttemptSnapshot {
   maxAttempts: number
   consumed: number
   localAttempts: number
+  accountAttempts: number
   externalAttempts: number
   mcpAttempts: number
   exhausted: boolean

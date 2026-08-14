@@ -30,16 +30,55 @@ pub(crate) enum InferenceAttemptRejection {
     DownstreamCommitted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceAttemptSnapshot {
     pub max_attempts: u32,
     pub consumed: u32,
     pub local_attempts: u32,
+    pub account_attempts: u32,
     pub external_attempts: u32,
     pub mcp_attempts: u32,
     pub exhausted: bool,
     pub downstream_committed: bool,
+}
+
+impl<'de> Deserialize<'de> for InferenceAttemptSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireSnapshot {
+            max_attempts: u32,
+            consumed: u32,
+            local_attempts: u32,
+            #[serde(default)]
+            account_attempts: Option<u32>,
+            #[serde(default)]
+            external_attempts: Option<u32>,
+            mcp_attempts: u32,
+            exhausted: bool,
+            downstream_committed: bool,
+        }
+
+        let wire = WireSnapshot::deserialize(deserializer)?;
+        let account_attempts = wire
+            .account_attempts
+            .or(wire.external_attempts)
+            .unwrap_or_default();
+        Ok(Self {
+            max_attempts: wire.max_attempts,
+            consumed: wire.consumed,
+            local_attempts: wire.local_attempts,
+            account_attempts,
+            external_attempts: account_attempts,
+            mcp_attempts: wire.mcp_attempts,
+            exhausted: wire.exhausted,
+            downstream_committed: wire.downstream_committed,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +218,7 @@ pub(crate) struct InferenceAttemptBudget {
     max_attempts: u32,
     state: AtomicU32,
     local_attempts: AtomicU32,
-    external_attempts: AtomicU32,
+    account_attempts: AtomicU32,
     mcp_attempts: AtomicU32,
     exhausted: AtomicBool,
     auxiliary: Arc<AuxiliaryAttemptBudget>,
@@ -207,7 +246,7 @@ impl InferenceAttemptBudget {
             ),
             state: AtomicU32::new(0),
             local_attempts: AtomicU32::new(0),
-            external_attempts: AtomicU32::new(0),
+            account_attempts: AtomicU32::new(0),
             mcp_attempts: AtomicU32::new(0),
             exhausted: AtomicBool::new(false),
             auxiliary: Arc::new(AuxiliaryAttemptBudget::new(auxiliary_max_attempts)),
@@ -286,7 +325,7 @@ impl InferenceAttemptBudget {
                 self.local_attempts.fetch_add(1, Ordering::Relaxed);
             }
             InferenceAttemptKind::Account | InferenceAttemptKind::ExternalPool => {
-                self.external_attempts.fetch_add(1, Ordering::Relaxed);
+                self.account_attempts.fetch_add(1, Ordering::Relaxed);
             }
             InferenceAttemptKind::Mcp => {
                 self.mcp_attempts.fetch_add(1, Ordering::Relaxed);
@@ -314,11 +353,13 @@ impl InferenceAttemptBudget {
     pub(crate) fn snapshot(&self) -> InferenceAttemptSnapshot {
         let state = self.state.load(Ordering::Acquire);
         let consumed = state & CONSUMED_MASK;
+        let account_attempts = self.account_attempts.load(Ordering::Acquire);
         InferenceAttemptSnapshot {
             max_attempts: self.max_attempts,
             consumed,
             local_attempts: self.local_attempts.load(Ordering::Acquire),
-            external_attempts: self.external_attempts.load(Ordering::Acquire),
+            account_attempts,
+            external_attempts: account_attempts,
             mcp_attempts: self.mcp_attempts.load(Ordering::Acquire),
             exhausted: consumed >= self.max_attempts || self.exhausted.load(Ordering::Acquire),
             downstream_committed: state & DOWNSTREAM_COMMITTED_BIT != 0,
@@ -352,8 +393,9 @@ mod tests {
                     max_attempts: 4,
                     consumed: 4,
                     local_attempts: 1,
-                    mcp_attempts: 1,
+                    account_attempts: 2,
                     external_attempts: 2,
+                    mcp_attempts: 1,
                     exhausted: true,
                     downstream_committed: false,
                 }
@@ -369,10 +411,10 @@ mod tests {
             let snapshot = budget.snapshot();
             assert_eq!(snapshot.consumed, 1);
             assert_eq!(snapshot.local_attempts, 0);
-            assert_eq!(snapshot.external_attempts, 0);
+            assert_eq!(snapshot.account_attempts, 0);
             assert_eq!(snapshot.mcp_attempts, 1);
             assert_eq!(
-                snapshot.local_attempts + snapshot.external_attempts + snapshot.mcp_attempts,
+                snapshot.local_attempts + snapshot.account_attempts + snapshot.mcp_attempts,
                 snapshot.consumed
             );
         }
@@ -386,9 +428,33 @@ mod tests {
 
         let snapshot = budget.snapshot();
         assert_eq!(snapshot.consumed, 1);
+        assert_eq!(snapshot.account_attempts, 1);
         assert_eq!(snapshot.external_attempts, 1);
         assert_eq!(snapshot.local_attempts, 0);
         assert_eq!(snapshot.mcp_attempts, 0);
+    }
+
+    #[test]
+    fn account_snapshot_serializes_account_attempts_with_external_compatibility() {
+        let budget = InferenceAttemptBudget::new(4);
+        assert_eq!(budget.reserve(InferenceAttemptKind::Account, 0), Ok(1));
+
+        let value = serde_json::to_value(budget.snapshot()).expect("serialize snapshot");
+        assert_eq!(value["accountAttempts"], 1);
+        assert_eq!(value["externalAttempts"], 1);
+
+        let old_snapshot: InferenceAttemptSnapshot = serde_json::from_value(serde_json::json!({
+            "maxAttempts": 4,
+            "consumed": 1,
+            "localAttempts": 0,
+            "externalAttempts": 1,
+            "mcpAttempts": 0,
+            "exhausted": false,
+            "downstreamCommitted": false
+        }))
+        .expect("deserialize legacy snapshot");
+        assert_eq!(old_snapshot.account_attempts, 1);
+        assert_eq!(old_snapshot.external_attempts, 1);
     }
 
     #[test]
@@ -467,7 +533,7 @@ mod tests {
                 assert_eq!(snapshot.consumed, max_attempts);
                 assert!(snapshot.exhausted);
                 assert_eq!(
-                    snapshot.local_attempts + snapshot.external_attempts + snapshot.mcp_attempts,
+                    snapshot.local_attempts + snapshot.account_attempts + snapshot.mcp_attempts,
                     max_attempts
                 );
             }
@@ -492,7 +558,7 @@ mod tests {
                 let snapshot = budget.snapshot();
                 assert_eq!(snapshot.consumed, max_attempts);
                 assert_eq!(
-                    snapshot.local_attempts + snapshot.external_attempts + snapshot.mcp_attempts,
+                    snapshot.local_attempts + snapshot.account_attempts + snapshot.mcp_attempts,
                     max_attempts
                 );
                 assert!(snapshot.exhausted);
@@ -529,7 +595,7 @@ mod tests {
                 let snapshot = budget.snapshot();
                 assert_eq!(snapshot.consumed, max_attempts);
                 assert_eq!(
-                    snapshot.local_attempts + snapshot.external_attempts + snapshot.mcp_attempts,
+                    snapshot.local_attempts + snapshot.account_attempts + snapshot.mcp_attempts,
                     max_attempts
                 );
                 assert!(snapshot.exhausted);
@@ -603,6 +669,7 @@ mod tests {
             );
             let snapshot = budget.snapshot();
             assert_eq!(snapshot.local_attempts, 1);
+            assert_eq!(snapshot.account_attempts, 0);
             assert_eq!(snapshot.external_attempts, 0);
             assert!(snapshot.exhausted);
         }
@@ -636,6 +703,7 @@ mod tests {
                 max_attempts: 4,
                 consumed: 1,
                 local_attempts: 1,
+                account_attempts: 0,
                 external_attempts: 0,
                 mcp_attempts: 0,
                 exhausted: false,

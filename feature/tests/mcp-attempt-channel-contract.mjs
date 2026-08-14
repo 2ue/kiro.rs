@@ -9,6 +9,7 @@ const requiredFields = [
   'maxAttempts',
   'consumed',
   'localAttempts',
+  'accountAttempts',
   'externalAttempts',
   'mcpAttempts',
   'exhausted',
@@ -24,4 +25,4 @@ for (const target of targets) {
   }
 }
 
-console.log('PASS: both UI contracts expose the explicit MCP attempt channel')
+console.log('PASS: both UI contracts expose account, external-compat, and MCP attempt channels')

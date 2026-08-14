@@ -1222,7 +1222,7 @@ fn assert_websearch_usage_attribution(
     assert!(attempts.consumed <= attempts.max_attempts, "{context}");
     assert!(attempts.consumed <= 4, "{context}");
     assert_eq!(attempts.local_attempts, 0, "{context}");
-    assert_eq!(attempts.external_attempts, 0, "{context}");
+    assert_eq!(attempts.account_attempts, 0, "{context}");
     assert_eq!(
         attempts.mcp_attempts, attempts.consumed,
         "{context}: every real MCP send must use the explicit MCP channel"
@@ -1517,7 +1517,7 @@ async fn run_native_websearch_normalized_external_preflight_precedes_mcp_for_fiv
                 .expect("normalized external attempt trace");
             assert_eq!(attempts.mcp_attempts, 0, "stream={stream} round={round}");
             assert_eq!(
-                attempts.external_attempts, 1,
+                attempts.account_attempts, 1,
                 "stream={stream} round={round}"
             );
         }
@@ -1629,7 +1629,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
             .as_ref()
             .and_then(|trace| trace.inference_attempts)
             .expect("normalized direct external attempt trace");
-        assert_eq!(attempts.external_attempts, 1, "stream={stream}");
+        assert_eq!(attempts.account_attempts, 1, "stream={stream}");
     }
     assert_eq!(
         external_upstream.state.hits(),
@@ -1717,7 +1717,7 @@ async fn run_account_only_routes_normalized_requests_without_kiro_provider() {
             .as_ref()
             .and_then(|trace| trace.inference_attempts)
             .expect("account-only attempt trace");
-        assert_eq!(attempts.external_attempts, 1, "stream={stream}");
+        assert_eq!(attempts.account_attempts, 1, "stream={stream}");
         assert_eq!(attempts.local_attempts, 0, "stream={stream}");
     }
 
@@ -1809,7 +1809,7 @@ async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp
                 .expect("post-MCP fallback attempt trace");
             assert_eq!(attempts.mcp_attempts, 0, "stream={stream} round={round}");
             assert_eq!(
-                attempts.external_attempts, 1,
+                attempts.account_attempts, 1,
                 "stream={stream} round={round}"
             );
         }
@@ -1904,7 +1904,7 @@ async fn run_websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_fo
                 .expect("invalid current-turn attempt snapshot");
             assert_eq!(attempts.consumed, 0);
             assert_eq!(attempts.local_attempts, 0);
-            assert_eq!(attempts.external_attempts, 0);
+            assert_eq!(attempts.account_attempts, 0);
             assert_eq!(attempts.mcp_attempts, 0);
             assert!(!attempts.downstream_committed);
             let serialized = serde_json::to_string(&record).expect("serialize invalid usage");
@@ -2176,10 +2176,7 @@ async fn run_websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_f
                 .expect("cancelled WebSearch attempt snapshot");
             assert_eq!(attempts.consumed, 1, "{cancel_phase} round {round}");
             assert_eq!(attempts.local_attempts, 0, "{cancel_phase} round {round}");
-            assert_eq!(
-                attempts.external_attempts, 0,
-                "{cancel_phase} round {round}"
-            );
+            assert_eq!(attempts.account_attempts, 0, "{cancel_phase} round {round}");
             assert_eq!(attempts.mcp_attempts, 1, "{cancel_phase} round {round}");
             assert!(
                 !attempts.downstream_committed,
@@ -4206,7 +4203,7 @@ async fn run_single_credential_precommit_retry_matrix() {
             .inference_attempts
             .expect("single-credential inference attempt snapshot");
         assert_eq!(attempts.local_attempts, 1, "round={round}");
-        assert_eq!(attempts.external_attempts, 0, "round={round}");
+        assert_eq!(attempts.account_attempts, 0, "round={round}");
         assert!(attempts.consumed <= attempts.max_attempts, "round={round}");
         assert_eq!(trace.stream_retry_attempts, None, "round={round}");
         assert_eq!(

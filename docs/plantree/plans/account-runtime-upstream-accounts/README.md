@@ -92,6 +92,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `/api/admin/usage-dashboard/account-risk` now returns an account-shaped risk response with `byAccount`, `accountId`, `accountName`, `accountBillingPresent` and `missingAccountBillingRecords`. The old `/external-pool-risk` response remains unchanged, and the Admin UI consumes the account-shaped response while retaining fallback normalization for older responses.
 - The Admin UI risk page now lives under `features/account-risk`, navigation points to `/account-risk`, and the old `/external-pool-risk` UI path redirects to the account risk page as a compatibility route.
 - Inference attempt budgeting now has an `Account` attempt kind. Real upstream account sends reserve that kind, while the old `ExternalPool` kind is retained only as a compatibility alias into the same counter until snapshot fields and legacy paths are migrated.
+- Inference attempt snapshots now expose `accountAttempts` as the primary account send counter while still serializing `externalAttempts` as a compatibility copy. Rust deserialization maps old snapshots that only contain `externalAttempts` into the account counter, and both maintained UIs display local/account/MCP breakdowns.
 
 Last verified on 2026-08-14:
 
@@ -201,4 +202,14 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-attempt-kind-test1 -- cargo test legacy_external_pool_kind_counts_as_account_attempt -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-attempt-kind-test2 -- cargo test counts_channels_without_exceeding_limit_for_five_rounds -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-attempt-kind-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-fmt2 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test1 -- cargo test account_snapshot_serializes_account_attempts_with_external_compatibility -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test2 -- cargo test counts_channels_without_exceeding_limit_for_five_rounds -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test4 -- cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`

@@ -3335,7 +3335,7 @@ mod tests {
             let inference = budget.snapshot();
             assert_eq!(inference.consumed, 1, "round {round}");
             assert_eq!(inference.local_attempts, 1, "round {round}");
-            assert_eq!(inference.external_attempts, 0, "round {round}");
+            assert_eq!(inference.account_attempts, 0, "round {round}");
             let request_auxiliary = budget.auxiliary_snapshot();
             assert_eq!(request_auxiliary.consumed, 1, "round {round}");
             assert_eq!(
@@ -3783,7 +3783,7 @@ mod tests {
         let snapshot = budget.snapshot();
         assert_eq!(snapshot.consumed as usize, hits);
         assert_eq!(snapshot.local_attempts as usize, hits);
-        assert_eq!(snapshot.external_attempts, 0);
+        assert_eq!(snapshot.account_attempts, 0);
         (hits, KiroProvider::attempts_from_error(&error))
     }
 
@@ -4457,7 +4457,7 @@ mod tests {
                     let budget = budget.snapshot();
                     assert_eq!(budget.consumed, 2);
                     assert_eq!(budget.local_attempts, 2);
-                    assert_eq!(budget.external_attempts, 0);
+                    assert_eq!(budget.account_attempts, 0);
                     assert_eq!(budget.mcp_attempts, 0);
 
                     let captures = server.state.signature_requests(scenario);
@@ -4538,7 +4538,7 @@ mod tests {
                 assert_eq!(snapshot.max_attempts, 2);
                 assert_eq!(snapshot.consumed, 2);
                 assert_eq!(snapshot.local_attempts, 2);
-                assert_eq!(snapshot.external_attempts, 0);
+                assert_eq!(snapshot.account_attempts, 0);
                 assert_eq!(snapshot.mcp_attempts, 0);
                 assert_signature_retry_did_not_cool_down(
                     &manager,
@@ -4715,7 +4715,7 @@ mod tests {
                     let snapshot = budget.snapshot();
                     assert_eq!(snapshot.consumed, 2);
                     assert_eq!(snapshot.local_attempts, 2);
-                    assert_eq!(snapshot.external_attempts, 0);
+                    assert_eq!(snapshot.account_attempts, 0);
                     assert!(error.to_string().len() < 1024);
                     assert!(!error.to_string().contains("PRIVATE_SIGNATURE_RESPONSE"));
                     assert_signature_retry_did_not_cool_down(
@@ -4802,7 +4802,7 @@ mod tests {
                     let snapshot = budget.snapshot();
                     assert_eq!(snapshot.consumed, 2);
                     assert_eq!(snapshot.local_attempts, 2);
-                    assert_eq!(snapshot.external_attempts, 0);
+                    assert_eq!(snapshot.account_attempts, 0);
                     let manager_snapshot = manager.snapshot();
                     assert!(
                         manager_snapshot
@@ -4940,7 +4940,7 @@ mod tests {
                 let snapshot = budget.snapshot();
                 assert_eq!(snapshot.consumed, 2);
                 assert_eq!(snapshot.local_attempts, 2);
-                assert_eq!(snapshot.external_attempts, 0);
+                assert_eq!(snapshot.account_attempts, 0);
                 assert_signature_retry_did_not_cool_down(
                     &manager,
                     &format!("transport stream={is_stream} round {round}"),
@@ -6340,10 +6340,10 @@ mod tests {
                 let snapshot = budget.snapshot();
                 assert_eq!(snapshot.consumed, expected_sends as u32);
                 assert_eq!(snapshot.local_attempts, 0);
-                assert_eq!(snapshot.external_attempts, 0);
+                assert_eq!(snapshot.account_attempts, 0);
                 assert_eq!(snapshot.mcp_attempts, expected_sends as u32);
                 assert_eq!(
-                    snapshot.local_attempts + snapshot.external_attempts + snapshot.mcp_attempts,
+                    snapshot.local_attempts + snapshot.account_attempts + snapshot.mcp_attempts,
                     snapshot.consumed
                 );
                 let attribution = KiroProvider::mcp_attribution_from_error(&error);

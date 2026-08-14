@@ -27,7 +27,7 @@ import { getUsageRecords } from '@/api/usage'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatUsd, formatUsdCsv, formatUsdDetailed } from '@/lib/format'
 import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
-import type { ExternalPoolUsageSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
+import type { ExternalPoolUsageSnapshot, InferenceAttemptSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 import { RequestApiKeyIdDisplay } from '@/components/request-api-key-id'
 
 const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
@@ -36,6 +36,10 @@ const EXPORT_LIMIT = 10_000
 const SLOW_FIRST_TOKEN_MS = 10_000
 
 type BillingDeltaTone = 'loss' | 'profit' | 'even'
+
+function accountAttemptCount(attempts: InferenceAttemptSnapshot): number {
+  return attempts.accountAttempts ?? attempts.externalAttempts ?? 0
+}
 
 function billingDeltaTone(delta: number): BillingDeltaTone {
   if (delta < 0) return 'loss'
@@ -660,7 +664,7 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="首次可见文本" value={formatLatency(trace.firstVisibleTextDeltaMs)} tone="success" />
         <UsageMetric label="分片到输出" value={formatLatency(trace.streamGapToFirstOutputMs)} />
         <UsageMetric label="推理发送" value={trace.inferenceAttempts ? `${formatNumber(trace.inferenceAttempts.consumed)} / ${formatNumber(trace.inferenceAttempts.maxAttempts)}` : '-'} tone={trace.inferenceAttempts?.exhausted ? 'warning' : 'info'} />
-        <UsageMetric label="推理发送分项" value={trace.inferenceAttempts ? `本地 ${formatNumber(trace.inferenceAttempts.localAttempts)} / 外部 ${formatNumber(trace.inferenceAttempts.externalAttempts)} / MCP ${formatNumber(trace.inferenceAttempts.mcpAttempts)}` : '-'} />
+        <UsageMetric label="推理发送分项" value={trace.inferenceAttempts ? `本地 ${formatNumber(trace.inferenceAttempts.localAttempts)} / 账号 ${formatNumber(accountAttemptCount(trace.inferenceAttempts))} / MCP ${formatNumber(trace.inferenceAttempts.mcpAttempts)}` : '-'} />
         <UsageMetric label="辅助发送" value={trace.auxiliaryAttempts ? `${formatNumber(trace.auxiliaryAttempts.consumed)} / ${formatNumber(trace.auxiliaryAttempts.maxAttempts)}` : '-'} tone={trace.auxiliaryAttempts?.exhausted ? 'warning' : 'info'} />
         <UsageMetric label="辅助发送分项" value={trace.auxiliaryAttempts ? `刷新 ${formatNumber(trace.auxiliaryAttempts.tokenRefreshAttempts)} / Profile ${formatNumber(trace.auxiliaryAttempts.profileDiscoveryAttempts)}` : '-'} />
         <UsageMetric label="本地容量权重" value={typeof trace.capacityWeightUnits === 'number' ? `${formatNumber(trace.capacityWeightUnits)} 单位` : '-'} tone="info" />

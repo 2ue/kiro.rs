@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { cn } from '@/lib/utils'
 import { formatDate, formatNumber } from '@/lib/format'
-import type { UsageRecord } from '@/types/api'
+import type { InferenceAttemptSnapshot, UsageRecord } from '@/types/api'
 import { Badge } from '@/components/ui'
 import {
   Table,
@@ -64,6 +64,10 @@ function DetailField({ label, value, mono }: { label: string; value: string; mon
 
 function SectionTitle({ children }: { children: ReactNode }) {
   return <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{children}</div>
+}
+
+function accountAttemptCount(attempts: InferenceAttemptSnapshot): number {
+  return attempts.accountAttempts ?? attempts.externalAttempts ?? 0
 }
 
 function formatJsonBlock(value: unknown): string {
@@ -463,7 +467,7 @@ export function UsageDetailModal({
                   <MetricTile label="推理发送" value={`${formatNumber(record.latencyTrace.inferenceAttempts.consumed)} / ${formatNumber(record.latencyTrace.inferenceAttempts.maxAttempts)}`} tone={record.latencyTrace.inferenceAttempts.exhausted ? 'warning' : 'info'} />
                 )}
                 {record.latencyTrace.inferenceAttempts && (
-                  <MetricTile label="推理发送分项" value={`本地 ${formatNumber(record.latencyTrace.inferenceAttempts.localAttempts)} / 外部 ${formatNumber(record.latencyTrace.inferenceAttempts.externalAttempts)} / MCP ${formatNumber(record.latencyTrace.inferenceAttempts.mcpAttempts)}`} />
+                  <MetricTile label="推理发送分项" value={`本地 ${formatNumber(record.latencyTrace.inferenceAttempts.localAttempts)} / 账号 ${formatNumber(accountAttemptCount(record.latencyTrace.inferenceAttempts))} / MCP ${formatNumber(record.latencyTrace.inferenceAttempts.mcpAttempts)}`} />
                 )}
                 {record.latencyTrace.auxiliaryAttempts && (
                   <MetricTile label="辅助发送" value={`${formatNumber(record.latencyTrace.auxiliaryAttempts.consumed)} / ${formatNumber(record.latencyTrace.auxiliaryAttempts.maxAttempts)}`} tone={record.latencyTrace.auxiliaryAttempts.exhausted ? 'warning' : 'info'} />
