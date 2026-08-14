@@ -3088,6 +3088,10 @@ impl ExternalPoolsConfig {
     }
 
     pub fn same_pool_retry_status_codes(&self) -> BTreeSet<u16> {
+        self.same_account_retry_status_codes()
+    }
+
+    pub fn same_account_retry_status_codes(&self) -> BTreeSet<u16> {
         self.external_pool_same_pool_retry_status_codes
             .iter()
             .copied()
@@ -3096,6 +3100,10 @@ impl ExternalPoolsConfig {
     }
 
     pub fn retry_status_codes(&self) -> BTreeSet<u16> {
+        self.cross_account_retry_status_codes()
+    }
+
+    pub fn cross_account_retry_status_codes(&self) -> BTreeSet<u16> {
         self.external_pool_retry_status_codes
             .iter()
             .copied()

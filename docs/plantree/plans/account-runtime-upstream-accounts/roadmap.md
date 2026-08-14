@@ -74,6 +74,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account-route model processing helpers now use account names for outbound raw model selection and model processing errors inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while old config field names remain compatibility storage.
 - Core retry/failover tests now use same-account/cross-account terminology for behavior names and assertions while compatibility config fixture fields remain unchanged.
+- Runtime config now provides account-named retry status accessors used by the retry pipeline, with old accessor names retained as compatibility delegates.
 
 ## In Progress
 

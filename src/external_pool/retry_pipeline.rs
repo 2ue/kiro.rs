@@ -68,7 +68,7 @@ pub(super) fn should_retry_same_account(
     let Some(status) = err.status else {
         return false;
     };
-    retry_status_matches(status, &config.same_pool_retry_status_codes())
+    retry_status_matches(status, &config.same_account_retry_status_codes())
 }
 
 pub(super) fn same_account_retry_limit(
@@ -101,7 +101,7 @@ pub(super) fn should_retry_cross_account(
     let Some(status) = err.status else {
         return config.external_pool_retry_on_network_error;
     };
-    retry_status_matches(status, &config.retry_status_codes())
+    retry_status_matches(status, &config.cross_account_retry_status_codes())
 }
 
 pub(super) fn same_account_retry_delay(config: &ExternalPoolsConfig) -> Option<Duration> {
