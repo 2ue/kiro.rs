@@ -66,6 +66,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local rescue fallback reasons now use account terminology (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`), and request-entry/local-rescue handler code reads account-named config accessors instead of external-pool fields.
 - Anthropic router, AppState and request runtime now use `payload_guard_account_enabled` for the account-route payload guard switch, while the existing persisted/runtime-config JSON field remains a compatibility boundary. Maintained runtime UI text describes upstream-account payload shaping instead of Kiro/external-pool payload handling.
 - Runtime configuration UI wording now presents the legacy external-pool runtime section as upstream-account routing, covering route policy, retry/failover, local rescue, usage diagnostics, prompt steering and body/payload shaping while retaining compatibility state keys internally.
+- Local parsed body capability planning now has local-upstream type names and logs. The concrete `KiroRequest` payload type is still isolated to the current legacy local-provider boundary pending provider/body replacement.
 
 ## In Progress
 

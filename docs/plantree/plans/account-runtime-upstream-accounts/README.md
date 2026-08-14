@@ -104,6 +104,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account local-rescue decisions now enter account-named runtime config accessors and write account-named fallback reasons (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`). Request-entry dispatch deadlines and pre-body rejection logs also use account runtime terminology while persisted config fields remain compatibility storage details.
 - Anthropic router/AppState/request runtime now names the account-route payload guard switch as `payload_guard_account_enabled`; it still reads and writes the persisted `payloadGuardExternalEnabled` compatibility field when crossing existing config and legacy route boundaries. Maintained runtime UIs now describe the control as upstream-account payload shaping rather than Kiro/external-pool payload handling.
 - Maintained runtime configuration UIs now label the old external-pool runtime section as upstream-account routing, including routing mode/rules, retry/failover/cooldown, local rescue, usage diagnostics, prompt steering and payload/body shaping text. Compatibility state keys such as `externalPools` and `payloadGuardExternalEnabled` remain unchanged internally.
+- Local parsed body planning now uses local-upstream type names (`LocalUpstreamConverterPlan`, `LocalUpstreamBodyPlan`, `PreparedLocalUpstreamBody`) and local-upstream conversion logs. The concrete legacy `KiroRequest` payload type remains at the current local-provider boundary until the provider/body implementation is replaced.
 
 Last verified on 2026-08-14:
 
@@ -222,6 +223,10 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test4 -- cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-test1 -- cargo test body_capabilities -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

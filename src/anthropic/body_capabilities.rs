@@ -114,7 +114,7 @@ impl PayloadGuardStagePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KiroConverterPlan {
+pub(crate) struct LocalUpstreamConverterPlan {
     pub(crate) tool_schema_normalization: BodyStageState,
     pub(crate) tool_name_mapping: BodyStageState,
     pub(crate) tool_schema_key_mapping: ToolSchemaKeyMappingMode,
@@ -127,7 +127,7 @@ pub(crate) struct KiroConverterPlan {
     pub(crate) history_placeholder_tools: BodyStageState,
 }
 
-impl KiroConverterPlan {
+impl LocalUpstreamConverterPlan {
     pub(crate) fn from_config(config: BodyConversionConfig) -> Self {
         Self {
             tool_schema_normalization: BodyStageState::from(config.tool_schema_normalization),
@@ -144,24 +144,24 @@ impl KiroConverterPlan {
     }
 }
 
-impl Default for KiroConverterPlan {
+impl Default for LocalUpstreamConverterPlan {
     fn default() -> Self {
         Self::from_config(BodyConversionConfig::default())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LocalKiroBodyPlan {
+pub(crate) struct LocalUpstreamBodyPlan {
     pub(crate) profile: BodyProcessingProfile,
     pub(crate) conversion: BodyStageState,
-    pub(crate) converter: KiroConverterPlan,
+    pub(crate) converter: LocalUpstreamConverterPlan,
     pub(crate) payload_guard: PayloadGuardStagePlan,
     pub(crate) token_counting: BodyStageState,
     pub(crate) diagnostics: BodyStageState,
     pub(crate) retry_payloads: BodyStageState,
 }
 
-impl LocalKiroBodyPlan {
+impl LocalUpstreamBodyPlan {
     #[cfg(test)]
     pub(crate) fn compatible_default(payload_guard_config: PayloadGuardConfig) -> Self {
         Self::compatible_with_config(payload_guard_config, BodyConversionConfig::default())
@@ -174,7 +174,7 @@ impl LocalKiroBodyPlan {
         Self {
             profile: BodyProcessingProfile::LocalCredential,
             conversion: BodyStageState::Enabled,
-            converter: KiroConverterPlan::from_config(body_conversion),
+            converter: LocalUpstreamConverterPlan::from_config(body_conversion),
             payload_guard: PayloadGuardStagePlan::from_config(payload_guard_config),
             token_counting: BodyStageState::Enabled,
             diagnostics: BodyStageState::Enabled,
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn local_default_mounts_current_local_capabilities() {
-        let plan = LocalKiroBodyPlan::compatible_default(payload_guard_config(true));
+        let plan = LocalUpstreamBodyPlan::compatible_default(payload_guard_config(true));
 
         assert_eq!(plan.profile, BodyProcessingProfile::LocalCredential);
         assert!(plan.conversion.is_enabled());

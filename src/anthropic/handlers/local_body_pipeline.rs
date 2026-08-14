@@ -1,8 +1,8 @@
 use super::*;
-use crate::anthropic::body_capabilities::{BodyStageState, LocalKiroBodyPlan};
+use crate::anthropic::body_capabilities::{BodyStageState, LocalUpstreamBodyPlan};
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 
-pub(super) struct PreparedLocalKiroBody {
+pub(super) struct PreparedLocalUpstreamBody {
     pub(super) request_body: String,
     pub(super) kiro_request: KiroRequest,
     pub(super) conversation_id: String,
@@ -27,8 +27,8 @@ pub(super) fn prepare(
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
     native_reasoning_capability: KiroReasoningCapabilityState,
-) -> Result<PreparedLocalKiroBody, Response> {
-    let plan = LocalKiroBodyPlan::compatible_with_config(
+) -> Result<PreparedLocalUpstreamBody, Response> {
+    let plan = LocalUpstreamBodyPlan::compatible_with_config(
         runtime_config.initial_payload_guard_config(),
         runtime_config.body_conversion.clone(),
     );
@@ -50,8 +50,8 @@ pub(super) fn prepare_with_plan(
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
     native_reasoning_capability: KiroReasoningCapabilityState,
-    plan: LocalKiroBodyPlan,
-) -> Result<PreparedLocalKiroBody, Response> {
+    plan: LocalUpstreamBodyPlan,
+) -> Result<PreparedLocalUpstreamBody, Response> {
     debug_assert_eq!(plan.profile.as_str(), "local_credential");
     debug_assert_eq!(plan.conversion, BodyStageState::Enabled);
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
@@ -138,7 +138,7 @@ pub(super) fn prepare_with_plan(
             Some(&conversation_id),
         );
     }
-    log_kiro_conversion_summary(
+    log_local_upstream_conversion_summary(
         endpoint,
         payload,
         model_resolution,
@@ -156,7 +156,7 @@ pub(super) fn prepare_with_plan(
             resolution = %model_resolution.source.as_str(),
             note = ?model_resolution.note,
             conversation_id = %conversation_id,
-            "Kiro upstream model mapping applied to request payload"
+            "Local upstream model mapping applied to request payload"
         );
     };
 
@@ -173,7 +173,7 @@ pub(super) fn prepare_with_plan(
         current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
         current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
         current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
-        "Kiro request prepared"
+        "Local upstream request prepared"
     );
     let input_tokens = if plan.token_counting.is_enabled() {
         token::count_all_tokens(
@@ -207,7 +207,7 @@ pub(super) fn prepare_with_plan(
         None
     };
 
-    Ok(PreparedLocalKiroBody {
+    Ok(PreparedLocalUpstreamBody {
         request_body,
         kiro_request,
         conversation_id,

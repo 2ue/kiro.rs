@@ -635,7 +635,7 @@ fn log_thinking_request_trace(
     );
 }
 
-fn log_kiro_conversion_summary(
+fn log_local_upstream_conversion_summary(
     endpoint: &str,
     payload: &MessagesRequest,
     model_resolution: &ModelResolution,
@@ -695,7 +695,7 @@ fn log_kiro_conversion_summary(
         .unwrap_or((None, None));
     let reasoning_source = reasoning_path.map(|_| {
         if discovered_reasoning_capability {
-            "kiro_model_schema"
+            "upstream_model_schema"
         } else {
             "legacy_model_fallback"
         }
@@ -733,7 +733,7 @@ fn log_kiro_conversion_summary(
         warning_sanitized_assistant_history_leaks = warnings.sanitized_assistant_history_leaks,
         warning_sanitized_assistant_history_leak_chars = warnings
             .sanitized_assistant_history_leak_chars,
-        "Kiro conversion summary"
+        "Local upstream conversion summary"
     );
 }
 
@@ -6342,7 +6342,7 @@ async fn post_messages_inner(
             return response;
         }
     };
-    let local_body_pipeline::PreparedLocalKiroBody {
+    let local_body_pipeline::PreparedLocalUpstreamBody {
         request_body,
         kiro_request,
         conversation_id,

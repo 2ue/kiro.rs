@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::anthropic::body_capabilities::KiroConverterPlan;
+use crate::anthropic::body_capabilities::LocalUpstreamConverterPlan;
 use crate::anthropic::model_capabilities::{KiroReasoningCapabilityState, ModelResolution};
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
@@ -102,16 +102,16 @@ pub struct ConversionResult {
     /// 仅用于下游响应容错：当上游把工具调用泄漏为字面 `<invoke>` 文本时，只有工具名命中
     /// 这个集合才允许恢复成结构化 `tool_use`，避免误执行正文中展示的 XML。
     pub known_tool_names: std::collections::HashSet<String>,
-    /// 代理对入参的隐式改写汇总（兜底动作的统计），用于可选的 `x-kiro-rs-warnings` 响应头。
+    /// 代理对入参的隐式改写汇总（兜底动作的统计），用于可选的 warnings 响应头。
     pub warnings: ProxyWarnings,
-    /// Kiro 原生模型扩展字段，例如 reasoning effort。
+    /// 本地上游模型扩展字段，例如 reasoning effort。
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConverterOptions {
     pub compat_profile: CompatProfile,
-    pub conversion: KiroConverterPlan,
+    pub conversion: LocalUpstreamConverterPlan,
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
     pub kiro_cache_point_enabled: bool,
     pub kiro_cache_point_tools_only: bool,
@@ -125,7 +125,7 @@ impl Default for ConverterOptions {
     fn default() -> Self {
         Self {
             compat_profile: CompatProfile::ClaudeCode,
-            conversion: KiroConverterPlan::default(),
+            conversion: LocalUpstreamConverterPlan::default(),
             prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
             kiro_cache_point_enabled: false,
             kiro_cache_point_tools_only: true,
@@ -2728,7 +2728,7 @@ mod tests {
 
     #[test]
     fn explicit_reasoning_effort_falls_back_to_compat_prompt_without_native_schema_five_rounds() {
-        use crate::anthropic::body_capabilities::{BodyStageState, KiroConverterPlan};
+        use crate::anthropic::body_capabilities::{BodyStageState, LocalUpstreamConverterPlan};
 
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -2791,7 +2791,7 @@ mod tests {
                 );
             }
 
-            let mut conversion = KiroConverterPlan::default();
+            let mut conversion = LocalUpstreamConverterPlan::default();
             conversion.thinking_prompt_controls = BodyStageState::Disabled;
             let error = convert_request_with_options(
                 &req,
