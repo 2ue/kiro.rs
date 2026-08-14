@@ -17,6 +17,8 @@ pub(crate) const MAX_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS: u32 = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InferenceAttemptKind {
     LocalCredential,
+    Account,
+    #[allow(dead_code)]
     ExternalPool,
     Mcp,
 }
@@ -283,7 +285,7 @@ impl InferenceAttemptBudget {
             InferenceAttemptKind::LocalCredential => {
                 self.local_attempts.fetch_add(1, Ordering::Relaxed);
             }
-            InferenceAttemptKind::ExternalPool => {
+            InferenceAttemptKind::Account | InferenceAttemptKind::ExternalPool => {
                 self.external_attempts.fetch_add(1, Ordering::Relaxed);
             }
             InferenceAttemptKind::Mcp => {
@@ -338,8 +340,8 @@ mod tests {
                 Ok(1)
             );
             assert_eq!(budget.reserve(InferenceAttemptKind::Mcp, 0), Ok(2));
-            assert_eq!(budget.reserve(InferenceAttemptKind::ExternalPool, 0), Ok(3));
-            assert_eq!(budget.reserve(InferenceAttemptKind::ExternalPool, 0), Ok(4));
+            assert_eq!(budget.reserve(InferenceAttemptKind::Account, 0), Ok(3));
+            assert_eq!(budget.reserve(InferenceAttemptKind::Account, 0), Ok(4));
             assert_eq!(
                 budget.reserve(InferenceAttemptKind::LocalCredential, 0),
                 Err(InferenceAttemptRejection::Exhausted)
@@ -377,6 +379,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_external_pool_kind_counts_as_account_attempt() {
+        let budget = InferenceAttemptBudget::new(4);
+
+        assert_eq!(budget.reserve(InferenceAttemptKind::ExternalPool, 0), Ok(1));
+
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.consumed, 1);
+        assert_eq!(snapshot.external_attempts, 1);
+        assert_eq!(snapshot.local_attempts, 0);
+        assert_eq!(snapshot.mcp_attempts, 0);
+    }
+
+    #[test]
     fn policy_reservation_does_not_consume_a_synthetic_attempt() {
         let budget = InferenceAttemptBudget::new(4);
         assert_eq!(
@@ -397,7 +412,7 @@ mod tests {
         );
         assert_eq!(budget.snapshot().consumed, 3);
         assert!(!budget.snapshot().exhausted);
-        assert_eq!(budget.reserve(InferenceAttemptKind::ExternalPool, 0), Ok(4));
+        assert_eq!(budget.reserve(InferenceAttemptKind::Account, 0), Ok(4));
         assert!(budget.snapshot().exhausted);
     }
 
@@ -415,7 +430,7 @@ mod tests {
                 Err(InferenceAttemptRejection::DownstreamCommitted)
             );
             assert_eq!(
-                budget.reserve(InferenceAttemptKind::ExternalPool, 0),
+                budget.reserve(InferenceAttemptKind::Account, 0),
                 Err(InferenceAttemptRejection::DownstreamCommitted)
             );
             let snapshot = budget.snapshot();
@@ -436,7 +451,7 @@ mod tests {
                     threads.push(std::thread::spawn(move || {
                         let kind = match index % 3 {
                             0 => InferenceAttemptKind::LocalCredential,
-                            1 => InferenceAttemptKind::ExternalPool,
+                            1 => InferenceAttemptKind::Account,
                             _ => InferenceAttemptKind::Mcp,
                         };
                         budget.reserve(kind, 0).is_ok()
@@ -468,7 +483,7 @@ mod tests {
                     let kind = match expected % 3 {
                         0 => InferenceAttemptKind::Mcp,
                         1 => InferenceAttemptKind::LocalCredential,
-                        _ => InferenceAttemptKind::ExternalPool,
+                        _ => InferenceAttemptKind::Account,
                     };
                     assert_eq!(budget.reserve(kind, 0), Ok(expected));
                 }
@@ -500,7 +515,7 @@ mod tests {
                             barrier.wait();
                             let kind = match index % 3 {
                                 0 => InferenceAttemptKind::LocalCredential,
-                                1 => InferenceAttemptKind::ExternalPool,
+                                1 => InferenceAttemptKind::Account,
                                 _ => InferenceAttemptKind::Mcp,
                             };
                             budget.reserve(kind, 0)
@@ -583,7 +598,7 @@ mod tests {
                 Ok(1)
             );
             assert_eq!(
-                budget.reserve(InferenceAttemptKind::ExternalPool, 0),
+                budget.reserve(InferenceAttemptKind::Account, 0),
                 Err(InferenceAttemptRejection::Exhausted)
             );
             let snapshot = budget.snapshot();

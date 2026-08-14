@@ -10510,9 +10510,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
         remaining
             .reserve(InferenceAttemptKind::LocalCredential, 0)
             .unwrap();
-        remaining
-            .reserve(InferenceAttemptKind::ExternalPool, 0)
-            .unwrap();
+        remaining.reserve(InferenceAttemptKind::Account, 0).unwrap();
         assert_eq!(
             budgeted_local_rescue_reason_after_external_error(
                 &config,
@@ -10531,9 +10529,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
                 .reserve(InferenceAttemptKind::LocalCredential, 0)
                 .unwrap();
         }
-        exhausted
-            .reserve(InferenceAttemptKind::ExternalPool, 0)
-            .unwrap();
+        exhausted.reserve(InferenceAttemptKind::Account, 0).unwrap();
         assert_eq!(
             budgeted_local_rescue_reason_after_external_error(
                 &config,
@@ -10630,9 +10626,7 @@ fn direct_external_policy_disables_local_rescue_for_all_error_classes_five_round
             );
 
             let budget = InferenceAttemptBudget::new(4);
-            budget
-                .reserve(InferenceAttemptKind::ExternalPool, 0)
-                .unwrap();
+            budget.reserve(InferenceAttemptKind::Account, 0).unwrap();
             assert_eq!(
                 budgeted_local_rescue_reason_after_external_error(
                     &config,
@@ -10684,9 +10678,7 @@ fn direct_external_route_subtype_blocks_local_rescue_even_without_global_direct_
         );
 
         let budget = InferenceAttemptBudget::new(8);
-        budget
-            .reserve(InferenceAttemptKind::ExternalPool, 0)
-            .unwrap();
+        budget.reserve(InferenceAttemptKind::Account, 0).unwrap();
         assert_eq!(
             budgeted_local_rescue_reason_after_external_route_error(
                 UsageRouteSubtype::ExternalDirectPolicy,
@@ -10734,9 +10726,7 @@ fn preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_fiv
 
     for round in 1..=5 {
         let budget = InferenceAttemptBudget::new(2);
-        budget
-            .reserve(InferenceAttemptKind::ExternalPool, 0)
-            .unwrap();
+        budget.reserve(InferenceAttemptKind::Account, 0).unwrap();
         assert_eq!(
             budgeted_local_rescue_reason_after_external_error(
                 &config,

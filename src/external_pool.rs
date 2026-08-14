@@ -6080,14 +6080,14 @@ impl ExternalPoolManager {
         } = prepared;
         if let Err(rejection) = route
             .inference_attempt_budget
-            .reserve(InferenceAttemptKind::ExternalPool, 0)
+            .reserve(InferenceAttemptKind::Account, 0)
         {
             tracing::warn!(
                 request_id = %route.request_id,
                 error_id = %route.error_id,
                 pool_id = pool.id,
                 rejection = ?rejection,
-                "shared inference attempt policy rejected external upstream send"
+                "shared inference attempt policy rejected account upstream send"
             );
             return Err(ExternalForwardError::dispatch_rejected(
                 ExternalPoolError {

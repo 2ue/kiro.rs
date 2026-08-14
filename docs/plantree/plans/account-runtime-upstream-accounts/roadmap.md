@@ -53,6 +53,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account usage billing now has an account-shaped Admin response for `/usage-dashboard/account-billing`: rows expose `accountId/accountName` under `accountBillingByAccount`. The frontend overview and usage API client consume that account field, while legacy external-pool billing endpoints and fallback parsing remain for compatibility.
 - Account usage risk now has an account-shaped Admin response for `/usage-dashboard/account-risk`: filters, totals, samples and grouping expose account terminology (`accountId`, `accountName`, `accountBillingPresent`, `missingAccountBillingRecords`, `byAccount`). The frontend risk page and usage API client consume the account shape while legacy external-pool risk endpoints remain compatibility-only.
 - Admin UI navigation now points to `/account-risk`, and the account risk page module lives under `features/account-risk`; the old `/external-pool-risk` UI route is only a redirect compatibility path.
+- Inference attempt budgeting now has an `Account` attempt kind, and real upstream account sends reserve it. The old `ExternalPool` kind remains only as a compatibility alias into the same counter until old snapshot fields and legacy route paths are removed.
 
 ## In Progress
 

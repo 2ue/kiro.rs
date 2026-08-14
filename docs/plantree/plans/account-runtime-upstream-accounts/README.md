@@ -91,6 +91,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `/api/admin/usage-dashboard/account-billing` now returns an account-shaped billing response with `accountBillingByAccount` rows containing `accountId` and `accountName`. The old `/external-pool-billing` response remains unchanged, and the Admin UI consumes the account-shaped field with a temporary fallback for older responses.
 - `/api/admin/usage-dashboard/account-risk` now returns an account-shaped risk response with `byAccount`, `accountId`, `accountName`, `accountBillingPresent` and `missingAccountBillingRecords`. The old `/external-pool-risk` response remains unchanged, and the Admin UI consumes the account-shaped response while retaining fallback normalization for older responses.
 - The Admin UI risk page now lives under `features/account-risk`, navigation points to `/account-risk`, and the old `/external-pool-risk` UI path redirects to the account risk page as a compatibility route.
+- Inference attempt budgeting now has an `Account` attempt kind. Real upstream account sends reserve that kind, while the old `ExternalPool` kind is retained only as a compatibility alias into the same counter until snapshot fields and legacy paths are migrated.
 
 Last verified on 2026-08-14:
 
@@ -194,4 +195,10 @@ Last verified on 2026-08-14:
 - `pnpm --dir ui check`
 - `git diff --check`
 - `pnpm --dir ui check`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-attempt-kind-fmt2 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-attempt-kind-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-attempt-kind-test1 -- cargo test legacy_external_pool_kind_counts_as_account_attempt -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-attempt-kind-test2 -- cargo test counts_channels_without_exceeding_limit_for_five_rounds -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-attempt-kind-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `git diff --check`

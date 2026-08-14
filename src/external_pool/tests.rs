@@ -10998,7 +10998,7 @@ fn external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds() {
             .expect("profile discovery auxiliary attempt");
         route
             .inference_attempt_budget
-            .reserve(InferenceAttemptKind::ExternalPool, 0)
+            .reserve(InferenceAttemptKind::Account, 0)
             .expect("external inference attempt");
 
         let trace = external_usage_latency_trace(&route);
