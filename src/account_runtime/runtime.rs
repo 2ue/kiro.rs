@@ -12,6 +12,28 @@ pub type UpstreamAccountStorageRecord = crate::external_pool::ExternalPool;
 
 pub type UpstreamAccountStatusRecord = crate::external_pool::ExternalPoolStatus;
 
+pub async fn load_upstream_account_status_records(
+    manager: &AccountRuntimeManager,
+    config: &AccountRuntimeConfig,
+) -> anyhow::Result<Vec<UpstreamAccountStatusRecord>> {
+    manager.status(config).await
+}
+
+pub async fn clear_upstream_account_cooldowns(
+    manager: &AccountRuntimeManager,
+    account_id: u64,
+) -> anyhow::Result<usize> {
+    manager.clear_pool_cooldowns(account_id).await
+}
+
+pub fn upstream_account_models_url(base_url: &str) -> Result<reqwest::Url, url::ParseError> {
+    crate::external_pool::external_pool_models_url(base_url)
+}
+
+pub fn upstream_account_messages_url(base_url: &str) -> Result<reqwest::Url, url::ParseError> {
+    crate::external_pool::external_pool_messages_url(base_url)
+}
+
 pub trait AccountRuntimeConfigExt {
     fn account_runtime_enabled(&self) -> bool;
     fn account_route_allowed(&self, endpoint: &str) -> bool;

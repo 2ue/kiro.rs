@@ -83,6 +83,8 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `AccountRuntimeConfigExt` now provides account-named semantic accessors for enabled route checks, dispatch wait, legacy local-rescue wait, account request timeout and usage cost-floor settings. New Admin/request-entry/route-gate call sites use those methods instead of reading legacy field names directly.
 - Runtime config validation now enters through `validate_account_runtime_config`, and the old private `validate_external_pools_config` helper was removed. Tests use account-runtime names while still asserting the current compatibility JSON field names.
 - `account_runtime` now exports `UpstreamAccountStorageRecord` and `UpstreamAccountStatusRecord` aliases. Admin account bridge methods use those account-named record types while legacy storage/cache keys remain an internal compatibility detail.
+- `account_runtime::store` now provides account-named storage bridge methods for listing, loading, creating, updating, deleting, enabling, supported-model updates and auto-disable clearing. `/api/admin/accounts` service methods use those bridge methods while legacy `/external-pools` methods keep their old compatibility calls.
+- `account_runtime` now exposes account-named status, cooldown and upstream URL helpers. Account status, account cooldown clearing, account supported-model discovery and account tests enter through those helpers and return account-facing Admin messages instead of external-pool wording.
 
 Last verified on 2026-08-14:
 
@@ -153,4 +155,10 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-record-alias-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-record-alias-test1 -- cargo test account_runtime_ -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-record-alias-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh account-store-bridge-fmt4 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-store-bridge-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-store-bridge-test1b -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-store-bridge-test2b -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-store-bridge-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `git diff --check`

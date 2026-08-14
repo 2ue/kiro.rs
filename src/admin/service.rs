@@ -46,7 +46,9 @@ use super::types::{
 };
 use crate::account_runtime::{
     AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
-    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord,
+    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord, clear_upstream_account_cooldowns,
+    load_upstream_account_status_records, upstream_account_messages_url,
+    upstream_account_models_url,
 };
 use crate::anthropic::{
     inference_attempt_budget::{
@@ -991,8 +993,9 @@ impl AdminService {
         }
 
         let store = self.postgres_store.clone();
-        let accounts = block_on_admin_store(async move { store.list_external_pools(true).await })
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let accounts =
+            block_on_admin_store(async move { store.list_upstream_account_records(true).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.write_admin_cache(
             cache_key.to_string(),
             accounts.clone(),
@@ -1037,7 +1040,9 @@ impl AdminService {
     ) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
-            store.create_external_pool_unmasked(request.into()).await
+            store
+                .create_upstream_account_record_unmasked(request.into())
+                .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
         self.audit(
@@ -1084,7 +1089,7 @@ impl AdminService {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .update_external_pool_unmasked(id, request.into())
+                .update_upstream_account_record_unmasked(id, request.into())
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1137,7 +1142,7 @@ impl AdminService {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models_unmasked(id, request.supported_models)
+                .set_upstream_account_supported_models_unmasked(id, request.supported_models)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1203,7 +1208,7 @@ impl AdminService {
         let supported_models_for_store = supported_models.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models_unmasked(id, supported_models_for_store)
+                .set_upstream_account_supported_models_unmasked(id, supported_models_for_store)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1349,8 +1354,100 @@ impl AdminService {
         id: Option<u64>,
         request: DiscoverAccountSupportedModelsRequest,
     ) -> Result<Vec<String>, AdminServiceError> {
-        self.discover_external_pool_supported_model_ids(id, request.into())
+        let saved_account = if let Some(id) = id {
+            let store = self.postgres_store.clone();
+            Some(
+                block_on_admin_store(
+                    async move { store.get_upstream_account_record(id, false).await },
+                )
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+                .ok_or(AdminServiceError::NotFound { id })?,
+            )
+        } else {
+            None
+        };
+        let request: DiscoverExternalPoolSupportedModelsRequest = request.into();
+
+        let base_url = request
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                saved_account
+                    .as_ref()
+                    .map(|account| account.base_url.clone())
+            })
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("上游账号 Base URL 不能为空".to_string())
+            })?;
+        let api_key = request
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                saved_account
+                    .as_ref()
+                    .and_then(|account| account.api_key.clone())
+            })
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("上游账号 Key 不能为空".to_string())
+            })?;
+        let auth_type = request
+            .auth_type
+            .or_else(|| saved_account.as_ref().map(|account| account.auth_type))
+            .unwrap_or(ExternalPoolAuthType::Bearer);
+        let url = upstream_account_models_url(&base_url).map_err(|err| {
+            AdminServiceError::InvalidCredential(format!("上游账号模型列表 URL 无效: {err}"))
+        })?;
+        let config = self.token_manager.runtime_config();
+        let timeout_secs = config
+            .account_runtime_config()
+            .clamped_account_request_timeout_secs();
+        let client = build_client(None, timeout_secs, config.tls_backend)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let mut request_builder = client
+            .get(url)
+            .header("accept", "application/json")
+            .header("anthropic-version", "2023-06-01");
+        match auth_type {
+            ExternalPoolAuthType::Bearer => {
+                request_builder = request_builder.bearer_auth(api_key);
+            }
+            ExternalPoolAuthType::XApiKey => {
+                request_builder = request_builder.header("x-api-key", api_key);
+            }
+        }
+        let response = send_with_response_header_timeout(request_builder, timeout_secs)
             .await
+            .map_err(|err| {
+                AdminServiceError::InvalidCredential(format!("上游账号模型列表请求失败: {err}"))
+            })?;
+        let status = response.status();
+        let body =
+            response_text_with_limit_and_body_timeout(response, timeout_secs, 4 * 1024 * 1024)
+                .await
+                .map_err(|err| {
+                    AdminServiceError::InvalidCredential(format!("读取上游账号模型列表失败: {err}"))
+                })?;
+        if !status.is_success() {
+            let suffix = body.chars().take(500).collect::<String>();
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "上游账号模型列表请求失败: {} {}",
+                status, suffix
+            )));
+        }
+        let supported_models =
+            normalize_supported_models(extract_model_ids_from_models_response(&body));
+        if supported_models.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "上游账号模型列表响应中没有可识别的模型 ID".to_string(),
+            ));
+        }
+        Ok(supported_models)
     }
 
     pub fn delete_external_pool(&self, id: u64) -> Result<(), AdminServiceError> {
@@ -1376,7 +1473,7 @@ impl AdminService {
     pub fn delete_account(&self, id: u64) -> Result<(), AdminServiceError> {
         let store = self.postgres_store.clone();
         let deleted =
-            block_on_admin_store(async move { store.soft_delete_external_pool(id).await })
+            block_on_admin_store(async move { store.delete_upstream_account_record(id).await })
                 .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         if !deleted {
             return Err(AdminServiceError::NotFound { id });
@@ -1426,7 +1523,7 @@ impl AdminService {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_enabled_unmasked(id, request.enabled)
+                .set_upstream_account_enabled_unmasked(id, request.enabled)
                 .await
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
@@ -1468,7 +1565,9 @@ impl AdminService {
     pub fn clear_account_auto_disabled(&self, id: u64) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
-            store.clear_external_pool_auto_disabled_unmasked(id).await
+            store
+                .clear_upstream_account_auto_disabled_unmasked(id)
+                .await
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
         .ok_or(AdminServiceError::NotFound { id })?;
@@ -1506,11 +1605,15 @@ impl AdminService {
 
     pub fn clear_account_cooldown(&self, id: u64) -> Result<Account, AdminServiceError> {
         let store = self.postgres_store.clone();
-        let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
-            .ok_or(AdminServiceError::NotFound { id })?;
+        let pool =
+            block_on_admin_store(async move { store.get_upstream_account_record(id, true).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+                .ok_or(AdminServiceError::NotFound { id })?;
         let manager = self.account_runtime_manager.clone();
-        let deleted = block_on_admin_store(async move { manager.clear_pool_cooldowns(id).await })
+        let deleted =
+            block_on_admin_store(
+                async move { clear_upstream_account_cooldowns(&manager, id).await },
+            )
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.audit(
             "clear_account_cooldown",
@@ -1563,8 +1666,10 @@ impl AdminService {
             .runtime_config()
             .account_runtime_config()
             .clone();
-        let accounts = block_on_admin_store(async move { manager.status(&config).await })
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let accounts = block_on_admin_store(async move {
+            load_upstream_account_status_records(&manager, &config).await
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.write_admin_cache(
             cache_key.to_string(),
             ExternalPoolsStatusResponse {
@@ -1656,7 +1761,7 @@ impl AdminService {
                         }
                     };
                     let response_text = if status.is_success() {
-                        extract_external_pool_test_response_text(&body)
+                        extract_upstream_account_test_response_text(&body)
                     } else {
                         None
                     };
@@ -1698,16 +1803,108 @@ impl AdminService {
         id: u64,
         req: Option<AccountTestRequest>,
     ) -> Result<AccountTestResponse, AdminServiceError> {
-        self.test_upstream_account_compat(id, req)
-    }
-
-    fn test_upstream_account_compat(
-        &self,
-        id: u64,
-        req: Option<AccountTestRequest>,
-    ) -> Result<AccountTestResponse, AdminServiceError> {
-        self.test_external_pool(id, req.map(Into::into))
-            .map(Into::into)
+        let store = self.postgres_store.clone();
+        let account =
+            block_on_admin_store(async move { store.get_upstream_account_record(id, false).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+                .ok_or(AdminServiceError::NotFound { id })?;
+        block_on_admin_store(async move {
+            let model = req
+                .as_ref()
+                .map(|req| req.model.trim().to_string())
+                .filter(|model| !model.is_empty());
+            let url = if model.is_some() {
+                upstream_account_messages_url(&account.base_url)?
+            } else {
+                upstream_account_models_url(&account.base_url)?
+            };
+            let client = reqwest::Client::builder()
+                .timeout(StdDuration::from_secs(15))
+                .build()?;
+            let mut request = if let Some(model) = model.as_deref() {
+                let prompt = req
+                    .as_ref()
+                    .and_then(|req| req.prompt.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("hi");
+                client.post(url).json(&json!({
+                    "model": model,
+                    "max_tokens": 32,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": false
+                }))
+            } else {
+                client.get(url)
+            };
+            match account.auth_type {
+                ExternalPoolAuthType::Bearer => {
+                    request = request.bearer_auth(account.api_key.unwrap_or_default());
+                }
+                ExternalPoolAuthType::XApiKey => {
+                    request = request.header("x-api-key", account.api_key.unwrap_or_default());
+                }
+            }
+            let result = request.send().await;
+            Ok::<AccountTestResponse, anyhow::Error>(match result {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = match response_text_with_limit_and_body_timeout(
+                        response,
+                        15,
+                        ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(body) => body,
+                        Err(error) => {
+                            return Ok(AccountTestResponse {
+                                ok: false,
+                                status: Some(status.as_u16()),
+                                message: format!("读取上游账号测试响应失败: {error}"),
+                                model,
+                                response: None,
+                            });
+                        }
+                    };
+                    let response_text = if status.is_success() {
+                        extract_upstream_account_test_response_text(&body)
+                    } else {
+                        None
+                    };
+                    AccountTestResponse {
+                        ok: status.is_success(),
+                        status: Some(status.as_u16()),
+                        message: if status.is_success() {
+                            if model.is_some() {
+                                "上游账号模型调用测试通过".to_string()
+                            } else {
+                                "上游账号模型列表测试通过".to_string()
+                            }
+                        } else {
+                            let suffix = body.chars().take(300).collect::<String>();
+                            if suffix.is_empty() {
+                                format!("上游账号测试失败: {}", status)
+                            } else {
+                                format!("上游账号测试失败: {}; {}", status, suffix)
+                            }
+                        },
+                        model,
+                        response: response_text,
+                    }
+                }
+                Err(err) => AccountTestResponse {
+                    ok: false,
+                    status: None,
+                    message: err.to_string(),
+                    model,
+                    response: None,
+                },
+            })
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
     pub fn update_admin_api_key(
@@ -6266,7 +6463,7 @@ fn is_duplicate_credential_error(err: &AdminServiceError) -> bool {
         || message.contains("refreshToken 重复")
 }
 
-fn extract_external_pool_test_response_text(body: &str) -> Option<String> {
+fn extract_upstream_account_test_response_text(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     value
         .get("content")
