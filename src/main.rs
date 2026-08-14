@@ -113,7 +113,7 @@ fn model_capability_retry_delay(consecutive_failures: u32) -> StdDuration {
 }
 
 fn legacy_credential_provider_required(config: &Config) -> bool {
-    !config.external_pools.external_pools_enabled
+    !config.account_runtime_config().external_pools_enabled
 }
 
 #[tokio::main]
@@ -1347,11 +1347,11 @@ fn spawn_redis_runtime_event_listener(
                         health.mark_event();
                         if channel == config_channel {
                             let previous_account_runtime =
-                                token_manager.runtime_config().external_pools;
+                                token_manager.runtime_config().account_runtime_config().clone();
                             match token_manager.reload_runtime_config_from_postgres() {
                                 Ok(true) => {
                                     let config = token_manager.runtime_config();
-                                    if config.external_pools != previous_account_runtime {
+                                    if config.account_runtime_config() != &previous_account_runtime {
                                         account_runtime_manager
                                             .invalidate_account_runtime_policy_state();
                                     }
@@ -1383,11 +1383,11 @@ fn spawn_redis_runtime_event_listener(
                     }
                     _ = periodic_reload.tick() => {
                         let previous_account_runtime =
-                            token_manager.runtime_config().external_pools;
+                            token_manager.runtime_config().account_runtime_config().clone();
                         match token_manager.reload_runtime_config_from_postgres() {
                             Ok(true) => {
                                 let config = token_manager.runtime_config();
-                                if config.external_pools != previous_account_runtime {
+                                if config.account_runtime_config() != &previous_account_runtime {
                                     account_runtime_manager
                                         .invalidate_account_runtime_policy_state();
                                 }

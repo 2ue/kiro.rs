@@ -39,11 +39,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Legacy `ExternalPool` to `UpstreamAccount` projection now lives in `account_runtime::migration`; the old `ExternalPool::to_upstream_account` method and old-module bridge test were removed.
 - Admin `/accounts` request handlers and service methods now use account-owned Rust DTOs for create/update/enabled/supported-model discovery/test, converting to legacy storage DTOs only at the current compatibility boundary.
 - Account runtime manager callers now use account-named wrappers for runtime-policy invalidation, local account mutation notifications and cross-instance data event observation; old external-pool method names are confined to the delegated implementation.
+- Top-level runtime configuration now exposes account-runtime accessors, and new startup, router, Admin runtime-config and reload-invalidation call sites use those accessors instead of direct `Config.external_pools` access while compatibility storage remains mirrored.
 
 ## In Progress
 
 - Migrate account runtime internals away from legacy external-pool names behind the `account_runtime` facade while preserving current scheduler, proxy, body-mode, retry, usage projection and compatibility behavior.
-- Convert remaining runtime-config field names and backend config DTO names from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
+- Convert remaining request-runtime/AppState config field names and backend config DTO names from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
 
 ## Next
 

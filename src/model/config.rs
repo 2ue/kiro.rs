@@ -4889,6 +4889,18 @@ impl Config {
         self.api_region.as_deref().unwrap_or(&self.region)
     }
 
+    pub fn account_runtime_config(&self) -> &ExternalPoolsConfig {
+        &self.external_pools
+    }
+
+    pub fn account_runtime_config_mut(&mut self) -> &mut ExternalPoolsConfig {
+        &mut self.external_pools
+    }
+
+    pub fn set_account_runtime_config(&mut self, account_runtime: ExternalPoolsConfig) {
+        self.external_pools = account_runtime;
+    }
+
     pub fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
         CacheRoutePolicy {
             cache_type: PromptCacheStrategyType::CurrentHighCache,

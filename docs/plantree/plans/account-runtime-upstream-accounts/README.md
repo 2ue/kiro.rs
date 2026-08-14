@@ -77,6 +77,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `account_runtime::migration` now owns the temporary projection from legacy `ExternalPool` records into `UpstreamAccount`. The old `ExternalPool::to_upstream_account` method was removed so the account runtime boundary, not the legacy record, owns the migration bridge.
 - Admin `/accounts` request surfaces now have account-owned Rust DTOs for create, update, enabled toggles, supported-model discovery and test calls. They preserve the same camelCase JSON shape and explicitly convert into the legacy external-pool storage DTOs only at the compatibility boundary.
 - Account runtime manager callers now use account-named cache/data invalidation wrappers for runtime config reloads, local account mutations and cross-instance data events. Legacy external-pool method names remain only inside the delegated implementation while Redis channel and storage compatibility keys are still unchanged.
+- Top-level runtime configuration now has account-runtime accessors. New startup, router, Admin runtime-config and reload-invalidation call sites use `account_runtime_config()` / `set_account_runtime_config()` while the persisted `external_pools` field remains the compatibility storage mirror.
 
 Last verified on 2026-08-14:
 
@@ -121,3 +122,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-fmt3 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
+- `git diff --check`

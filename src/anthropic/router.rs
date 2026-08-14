@@ -131,7 +131,7 @@ impl AnthropicRouterConfig {
             prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
-            account_runtime: config.external_pools.clone(),
+            account_runtime: config.account_runtime_config().clone(),
             tool_format_debug: config.tool_format_debug.clone(),
         }
     }

@@ -976,7 +976,7 @@ impl RequestRuntimeConfig {
             prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
-            external_pools: config.external_pools.clone(),
+            external_pools: config.account_runtime_config().clone(),
         }
     }
 

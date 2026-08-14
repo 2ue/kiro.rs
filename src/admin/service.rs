@@ -1488,7 +1488,11 @@ impl AdminService {
         }
 
         let manager = self.account_runtime_manager.clone();
-        let config = self.token_manager.runtime_config().external_pools;
+        let config = self
+            .token_manager
+            .runtime_config()
+            .account_runtime_config()
+            .clone();
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let response = ExternalPoolsStatusResponse { pools };
@@ -4764,8 +4768,8 @@ impl AdminService {
                 .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
                 .normalized(),
             defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
-            account_runtime: config.external_pools.clone(),
-            external_pools: config.external_pools.clone(),
+            account_runtime: config.account_runtime_config().clone(),
+            external_pools: config.account_runtime_config().clone(),
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
             kiro_agent_mode_strategy: config.kiro_agent_mode_strategy,
@@ -5034,8 +5038,9 @@ impl AdminService {
             .account_runtime
             .clone()
             .or_else(|| req.external_pools.clone())
-            .unwrap_or_else(|| current_config.external_pools.clone());
-        let account_runtime_policy_changed = account_runtime != current_config.external_pools;
+            .unwrap_or_else(|| current_config.account_runtime_config().clone());
+        let account_runtime_policy_changed =
+            &account_runtime != current_config.account_runtime_config();
         let high_cache_threshold = req
             .high_cache_threshold
             .unwrap_or(current_config.high_cache_threshold);
@@ -5398,7 +5403,7 @@ impl AdminService {
                 config.reported_usage = reported_usage;
                 config.cache_policy = cache_policy;
                 config.defined_cache_routes = defined_cache_routes;
-                config.external_pools = account_runtime;
+                config.set_account_runtime_config(account_runtime);
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
                 config.kiro_agent_mode_strategy = kiro_agent_mode_strategy;
