@@ -130,7 +130,7 @@ const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
 const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_CAPACITY_PREFLIGHT_GRACE_MAX_MS: u64 = 250;
 const LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS: u64 = 250;
-const EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT: Duration = Duration::from_millis(250);
+const ACCOUNT_FALLBACK_READINESS_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy)]
 struct LocalStreamRetryConfig {
@@ -750,7 +750,7 @@ fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
 }
 
 #[derive(Clone)]
-struct ExternalFallbackContext {
+struct AccountFallbackContext {
     provider: Option<Arc<KiroProvider>>,
     manager: Arc<AccountRuntimeManager>,
     config: AccountRuntimeConfig,
@@ -1432,7 +1432,7 @@ async fn maybe_raw_account_preflight_response(
             let current_local_dispatchable = provider
                 .local_pool_route_state_fresh(raw_probe.model.as_deref())
                 .dispatchable;
-            if let Some(rescue_reason) = budgeted_local_rescue_reason_after_external_route_error(
+            if let Some(rescue_reason) = budgeted_local_rescue_reason_after_account_route_error(
                 UsageRouteSubtype::AccountFallbackPreflight,
                 &config,
                 &err,
@@ -1445,10 +1445,10 @@ async fn maybe_raw_account_preflight_response(
                     reason = rescue_reason,
                     local_fallback_reason = %reason,
                     max_wait_secs = config.legacy_local_rescue_max_wait_secs(),
-                    external_status = err.status.as_u16(),
-                    external_error_type = %err.route_error_type,
-                    external_attempt_count = err.attempts.len(),
-                    "raw external preflight failed with a rescuable error; continuing into parsed local rescue path"
+                    account_status = err.status.as_u16(),
+                    account_error_type = %err.route_error_type,
+                    account_attempt_count = err.attempts.len(),
+                    "raw account preflight failed with a rescuable error; continuing into parsed local rescue path"
                 );
                 RawAccountPreflightDecision::ContinueWithLocalRescue(RawAccountPreflightFailure {
                     local_reason: reason,
@@ -1493,7 +1493,7 @@ async fn raw_upstream_account_ready_for_route_reason(
     endpoint: &str,
     model: Option<&str>,
 ) -> bool {
-    if local_route_reason_requires_immediate_external_capacity(route_reason) {
+    if local_route_reason_requires_immediate_account_capacity(route_reason) {
         let Some(model) = model else {
             return false;
         };
@@ -1509,7 +1509,7 @@ async fn raw_upstream_account_ready_for_route_reason(
             endpoint,
             AccountRequestBodyMode::RawPassthrough,
             model,
-            EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+            ACCOUNT_FALLBACK_READINESS_TIMEOUT,
         )
         .await
     } else {
@@ -1628,7 +1628,7 @@ fn raw_account_route_request_with_hints(
     }
 }
 
-fn build_external_fallback_context(
+fn build_account_fallback_context(
     state: &AppState,
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
@@ -1642,7 +1642,7 @@ fn build_external_fallback_context(
     request_api_key_id: Option<String>,
     requires_normalized_body: bool,
     raw_preflight_failure: Option<RawAccountPreflightFailure>,
-) -> Option<ExternalFallbackContext> {
+) -> Option<AccountFallbackContext> {
     let manager = state.account_runtime_manager.clone()?;
     let config = runtime_config.account_runtime.clone();
     if !account_runtime_enabled_for_endpoint(&config, endpoint) {
@@ -1650,7 +1650,7 @@ fn build_external_fallback_context(
     }
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
     let policy = &effective_cache_route.policy;
-    Some(ExternalFallbackContext {
+    Some(AccountFallbackContext {
         provider: state.kiro_provider.clone(),
         manager,
         config,
@@ -1694,7 +1694,7 @@ fn build_external_fallback_context(
     })
 }
 
-impl ExternalFallbackContext {
+impl AccountFallbackContext {
     fn current_local_dispatchable(&self, model: Option<&str>) -> Option<usize> {
         let provider = self.provider.as_ref()?;
         let model = model.or(Some(self.payload.model.as_str()));
@@ -1724,7 +1724,7 @@ impl ExternalFallbackContext {
                     sanitized_assistant_history_blocks = report.blocks,
                     sanitized_assistant_history_chars = report.chars,
                     sanitized_assistant_history_kinds = ?report.kinds,
-                    "sanitized internal tool transcript from normalized external fallback payload"
+                    "sanitized internal tool transcript from normalized account fallback payload"
                 );
             }
         }
@@ -1741,7 +1741,7 @@ impl ExternalFallbackContext {
         if self.provider.is_none() {
             return (AcquireMode::FailFastOnCapacity, false);
         }
-        if self.has_cached_immediately_available_external_pool_for_model(&self.payload.model) {
+        if self.has_cached_immediately_available_account_for_model(&self.payload.model) {
             let acquire_mode = local_pool_acquire_mode(&self.config);
             if acquire_mode != AcquireMode::WaitForCapacity {
                 return (
@@ -1756,7 +1756,7 @@ impl ExternalFallbackContext {
         if self.config.local_pool_preflight_enabled
             && self.config.fallback_on_scheduler_redis_degraded
             && self
-                .has_eligible_external_pool_for_model(&self.payload.model)
+                .has_eligible_account_for_model(&self.payload.model)
                 .await
         {
             return (
@@ -1772,7 +1772,7 @@ impl ExternalFallbackContext {
         (AcquireMode::WaitForCapacity, false)
     }
 
-    fn has_cached_eligible_external_pool_for_model(&self, model: &str) -> bool {
+    fn has_cached_eligible_account_for_model(&self, model: &str) -> bool {
         cached_eligible_account_for_route_and_model(
             &self.manager,
             &self.config,
@@ -1781,8 +1781,8 @@ impl ExternalFallbackContext {
         )
     }
 
-    async fn has_eligible_external_pool_for_model(&self, model: &str) -> bool {
-        self.has_cached_eligible_external_pool_for_model(model)
+    async fn has_eligible_account_for_model(&self, model: &str) -> bool {
+        self.has_cached_eligible_account_for_model(model)
             || eligible_account_for_route_and_model(
                 &self.manager,
                 &self.config,
@@ -1792,7 +1792,7 @@ impl ExternalFallbackContext {
             .await
     }
 
-    fn has_cached_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
+    fn has_cached_immediately_available_account_for_model(&self, model: &str) -> bool {
         cached_immediately_available_account_for_route_and_model(
             &self.manager,
             &self.config,
@@ -1801,24 +1801,24 @@ impl ExternalFallbackContext {
         )
     }
 
-    async fn has_immediately_available_external_pool_for_model(&self, model: &str) -> bool {
-        self.has_cached_immediately_available_external_pool_for_model(model)
+    async fn has_immediately_available_account_for_model(&self, model: &str) -> bool {
+        self.has_cached_immediately_available_account_for_model(model)
             || immediately_available_account_for_route_and_model(
                 &self.manager,
                 &self.config,
                 &self.endpoint,
                 model,
-                EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT,
+                ACCOUNT_FALLBACK_READINESS_TIMEOUT,
             )
             .await
     }
 
-    async fn external_pool_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
-        if local_route_reason_requires_immediate_external_capacity(route_reason) {
-            self.has_immediately_available_external_pool_for_model(model)
+    async fn account_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
+        if local_route_reason_requires_immediate_account_capacity(route_reason) {
+            self.has_immediately_available_account_for_model(model)
                 .await
         } else {
-            self.has_eligible_external_pool_for_model(model).await
+            self.has_eligible_account_for_model(model).await
         }
     }
 
@@ -1838,9 +1838,9 @@ impl ExternalFallbackContext {
             )
             .await?
         };
-        let mut external = self.clone();
-        external.model_resolution = model_resolution;
-        let route = match external.route_request(
+        let mut account = self.clone();
+        account.model_resolution = model_resolution;
+        let route = match account.route_request(
             request_id.to_string(),
             UsageRouteSubtype::AccountDirectPolicy,
             None,
@@ -1875,7 +1875,7 @@ impl ExternalFallbackContext {
         .await?;
         let route_model = model.unwrap_or(&self.payload.model);
         if !self
-            .external_pool_ready_for_route_reason(reason.as_str(), route_model)
+            .account_ready_for_route_reason(reason.as_str(), route_model)
             .await
         {
             return None;
@@ -1963,7 +1963,7 @@ impl ExternalFallbackContext {
         classification_attempts: Vec<KiroCredentialAttempt>,
         diagnostic_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<AccountForwardOutcome> {
-        let Some(classified_reason) = classify_local_error_for_external_fallback_with_kind(
+        let Some(classified_reason) = classify_local_error_for_account_fallback_with_kind(
             error_message,
             &classification_attempts,
             &self.config,
@@ -1972,7 +1972,7 @@ impl ExternalFallbackContext {
             tracing::debug!(
                 request_id,
                 classification_attempt_count = classification_attempts.len(),
-                "local error is not eligible for external fallback"
+                "local error is not eligible for account fallback"
             );
             return None;
         };
@@ -2009,13 +2009,13 @@ impl ExternalFallbackContext {
                 local_available = local_state.available,
                 local_dispatchable = local_state.dispatchable,
                 local_usable = local_state.usable,
-                "external fallback suppressed because the fresh local pool remains dispatchable or its fallback policy is disabled"
+                "account fallback suppressed because the fresh local pool remains dispatchable or its fallback policy is disabled"
             );
             return None;
         };
         let route_reason = route_reason.to_string();
         if !self
-            .external_pool_ready_for_route_reason(&route_reason, &self.payload.model)
+            .account_ready_for_route_reason(&route_reason, &self.payload.model)
             .await
         {
             tracing::warn!(
@@ -2024,7 +2024,7 @@ impl ExternalFallbackContext {
                 route_reason,
                 local_state = ?local_state.kind,
                 local_dispatchable = local_state.dispatchable,
-                "fresh local state permits fallback but no external pool is ready for this route reason"
+                "fresh local state permits fallback but no upstream account is ready for this route reason"
             );
             return None;
         }
@@ -2059,7 +2059,7 @@ impl ExternalFallbackContext {
             local_total = local_state.total,
             local_available = local_state.available,
             local_dispatchable = local_state.dispatchable,
-            "fresh local state permits external fallback after local error"
+            "fresh local state permits account fallback after local error"
         );
         let local_preflight = Some(json!({
             "reason": route_reason.clone(),
@@ -2333,7 +2333,7 @@ async fn local_pool_preflight_reason_after_capacity_grace(
                 local_queued = state.queued_requests,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 max_wait_ms = max_wait.as_millis() as u64,
-                "local capacity preflight wait expired; external fallback remains eligible"
+                "local capacity preflight wait expired; account fallback remains eligible"
             );
             return Some((reason.to_string(), state));
         }
@@ -2364,7 +2364,7 @@ async fn local_pool_preflight_reason_after_capacity_grace(
     }
 }
 
-fn local_route_reason_requires_immediate_external_capacity(reason: &str) -> bool {
+fn local_route_reason_requires_immediate_account_capacity(reason: &str) -> bool {
     matches!(
         reason,
         "local_capacity_full"
@@ -2397,15 +2397,15 @@ fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-fn classify_local_error_for_external_fallback(
+fn classify_local_error_for_account_fallback(
     message: &str,
     attempts: &[KiroCredentialAttempt],
     config: &AccountRuntimeConfig,
 ) -> Option<String> {
-    classify_local_error_for_external_fallback_with_kind(message, attempts, config, None)
+    classify_local_error_for_account_fallback_with_kind(message, attempts, config, None)
 }
 
-fn classify_local_error_for_external_fallback_with_kind(
+fn classify_local_error_for_account_fallback_with_kind(
     message: &str,
     attempts: &[KiroCredentialAttempt],
     config: &AccountRuntimeConfig,
@@ -3158,7 +3158,7 @@ impl RequestUsageContext {
         }
     }
 
-    fn mark_local_rescue_after_external(
+    fn mark_local_rescue_after_account(
         &mut self,
         reason: impl Into<String>,
         local_preflight: Option<serde_json::Value>,
@@ -6012,7 +6012,7 @@ async fn post_messages_inner(
         .map(|provider| request_runtime_config(&state, provider))
         .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
-    let mut external_fallback = build_external_fallback_context(
+    let mut account_fallback = build_account_fallback_context(
         &state,
         &runtime_config,
         &cache_route,
@@ -6064,7 +6064,7 @@ async fn post_messages_inner(
             &mut payload,
         );
     }
-    if let Some(external) = external_fallback.as_mut() {
+    if let Some(external) = account_fallback.as_mut() {
         external.refresh_payload(&payload);
     }
     if !prompt_steering_for_external {
@@ -6076,7 +6076,7 @@ async fn post_messages_inner(
         );
     }
 
-    if let Some(external) = external_fallback.as_ref() {
+    if let Some(external) = account_fallback.as_ref() {
         let request_id = envelope::request_id();
         let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping(
             &payload.model,
@@ -6113,8 +6113,8 @@ async fn post_messages_inner(
     {
         Ok(resolution) => resolution,
         Err(response) => {
-            if let Some(external_response) = maybe_forward_external_after_local_error(
-                external_fallback.as_ref(),
+            if let Some(external_response) = maybe_forward_account_after_local_error(
+                account_fallback.as_ref(),
                 &envelope::request_id(),
                 &format!("模型不支持: {}", payload.model),
                 Vec::new(),
@@ -6132,7 +6132,7 @@ async fn post_messages_inner(
             return response;
         }
     };
-    if let Some(external) = external_fallback.as_mut() {
+    if let Some(external) = account_fallback.as_mut() {
         external.model_resolution = Some(account_route_model_resolution(model_resolution.clone()));
     }
 
@@ -6175,13 +6175,13 @@ async fn post_messages_inner(
             "detected native WebSearch tool request"
         );
 
-        if let Some(external) = external_fallback.as_ref() {
+        if let Some(external) = account_fallback.as_ref() {
             let request_id = envelope::request_id();
             let preflight_model = model_resolution
                 .upstream_model
                 .as_deref()
                 .unwrap_or(payload.model.as_str());
-            if let Some(response) = maybe_local_pool_preflight_external_response(
+            if let Some(response) = maybe_local_pool_preflight_account_response(
                 Some(external),
                 &request_id,
                 Some(preflight_model),
@@ -6192,7 +6192,7 @@ async fn post_messages_inner(
                     request_id,
                     model = %payload.model,
                     upstream_model = %preflight_model,
-                    "native WebSearch MCP skipped because local pool preflight routed request to external pool"
+                    "native WebSearch MCP skipped because local pool preflight routed request to upstream account"
                 );
                 return response;
             }
@@ -6283,14 +6283,13 @@ async fn post_messages_inner(
                 internal_reason,
                 attribution,
             } => {
-                if let Some(external_response) =
-                    maybe_external_fallback_after_websearch_mcp_failure(
-                        external_fallback.as_ref(),
-                        &request_id,
-                        internal_reason,
-                        &attribution,
-                    )
-                    .await
+                if let Some(external_response) = maybe_account_fallback_after_websearch_mcp_failure(
+                    account_fallback.as_ref(),
+                    &request_id,
+                    internal_reason,
+                    &attribution,
+                )
+                .await
                 {
                     return external_response;
                 }
@@ -6410,7 +6409,7 @@ async fn post_messages_inner(
             warnings_header,
             too_long_retry,
             cache_point_retry,
-            external_fallback,
+            account_fallback,
             runtime_config.kiro_upstream_stream_idle_timeout_secs,
             LocalStreamRetryConfig::from_runtime_config(&runtime_config),
             capacity_weight_units,
@@ -6440,7 +6439,7 @@ async fn post_messages_inner(
             warnings_header,
             too_long_retry,
             cache_point_retry,
-            external_fallback,
+            account_fallback,
             capacity_weight_units,
         )
         .await
@@ -6452,12 +6451,12 @@ async fn call_api_stream_maybe_fail_fast(
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: Option<&str>,
-    external_fallback: Option<&ExternalFallbackContext>,
+    account_fallback: Option<&AccountFallbackContext>,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
-    let (acquire_mode, preserve_external_attempt) = if let Some(external) = external_fallback {
+    let (acquire_mode, preserve_external_attempt) = if let Some(external) = account_fallback {
         external.local_attempt_policy().await
     } else {
         (AcquireMode::WaitForCapacity, false)
@@ -6499,12 +6498,12 @@ async fn call_api_maybe_fail_fast(
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: Option<&str>,
-    external_fallback: Option<&ExternalFallbackContext>,
+    account_fallback: Option<&AccountFallbackContext>,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
-    let (acquire_mode, preserve_external_attempt) = if let Some(external) = external_fallback {
+    let (acquire_mode, preserve_external_attempt) = if let Some(external) = account_fallback {
         external.local_attempt_policy().await
     } else {
         (AcquireMode::WaitForCapacity, false)
@@ -6552,38 +6551,38 @@ fn build_thinking_signature_retry_body(request: &KiroRequest) -> anyhow::Result<
     serialize_kiro_request(&retry_request).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-async fn maybe_forward_external_after_local_error(
-    external_fallback: Option<&ExternalFallbackContext>,
+async fn maybe_forward_account_after_local_error(
+    account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     message: &str,
     attempts: Vec<KiroCredentialAttempt>,
 ) -> Option<Response> {
-    external_fallback?
+    account_fallback?
         .fallback_after_local_error(request_id, message, attempts)
         .await
 }
 
-async fn maybe_external_fallback_after_local_error_outcome(
-    external_fallback: Option<&ExternalFallbackContext>,
+async fn maybe_account_fallback_after_local_error_outcome(
+    account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     message: &str,
     call_failure_kind: Option<KiroCallFailureKind>,
     attempts: Vec<KiroCredentialAttempt>,
 ) -> Option<AccountForwardOutcome> {
-    external_fallback?
+    account_fallback?
         .fallback_after_local_error_outcome(request_id, message, call_failure_kind, attempts)
         .await
 }
 
-async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-    external_fallback: Option<&ExternalFallbackContext>,
+async fn maybe_account_fallback_after_local_error_outcome_with_diagnostics(
+    account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     message: &str,
     call_failure_kind: Option<KiroCallFailureKind>,
     classification_attempts: Vec<KiroCredentialAttempt>,
     diagnostic_attempts: Vec<KiroCredentialAttempt>,
 ) -> Option<AccountForwardOutcome> {
-    external_fallback?
+    account_fallback?
         .fallback_after_local_error_outcome_with_diagnostics(
             request_id,
             message,
@@ -6594,54 +6593,54 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
         .await
 }
 
-async fn maybe_local_pool_preflight_external_response(
-    external_fallback: Option<&ExternalFallbackContext>,
+async fn maybe_local_pool_preflight_account_response(
+    account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     model: Option<&str>,
 ) -> Option<Response> {
     let preflight =
-        maybe_local_pool_preflight_external_outcome(external_fallback, request_id, model).await?;
+        maybe_local_pool_preflight_account_outcome(account_fallback, request_id, model).await?;
     Some(match preflight.outcome {
         AccountForwardOutcome::Response(response) => response,
         AccountForwardOutcome::FinalError(err) => err.into_response(request_id),
     })
 }
 
-async fn maybe_local_pool_preflight_external_outcome(
-    external_fallback: Option<&ExternalFallbackContext>,
+async fn maybe_local_pool_preflight_account_outcome(
+    account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     model: Option<&str>,
 ) -> Option<LocalPoolPreflightAccountOutcome> {
-    external_fallback?
+    account_fallback?
         .local_pool_preflight_outcome(request_id, model)
         .await
 }
 
-async fn maybe_local_pool_preflight_external_outcome_for_local_request(
-    external_fallback: Option<&ExternalFallbackContext>,
+async fn maybe_local_pool_preflight_account_outcome_for_local_request(
+    account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     model: Option<&str>,
 ) -> Option<LocalPoolPreflightAccountOutcome> {
     if let Some(failure) =
-        external_fallback.and_then(|external| external.raw_preflight_failure.as_ref())
+        account_fallback.and_then(|account| account.raw_preflight_failure.as_ref())
     {
         tracing::warn!(
             request_id,
             local_fallback_reason = %failure.local_reason,
-            external_status = failure.error.status.as_u16(),
-            external_error_type = %failure.error.route_error_type,
-            external_attempt_count = failure.error.attempts.len(),
-            "using raw external preflight final error to drive parsed local rescue"
+            account_status = failure.error.status.as_u16(),
+            account_error_type = %failure.error.route_error_type,
+            account_attempt_count = failure.error.attempts.len(),
+            "using raw account preflight final error to drive parsed local rescue"
         );
         return Some(LocalPoolPreflightAccountOutcome {
             outcome: AccountForwardOutcome::FinalError(failure.error.clone()),
             local_reason: failure.local_reason.clone(),
         });
     }
-    maybe_local_pool_preflight_external_outcome(external_fallback, request_id, model).await
+    maybe_local_pool_preflight_account_outcome(account_fallback, request_id, model).await
 }
 
-fn websearch_mcp_external_fallback_signal(
+fn websearch_mcp_account_fallback_signal(
     internal_reason: &str,
     attribution: &McpCallAttribution,
 ) -> Option<(&'static str, Option<KiroCallFailureKind>)> {
@@ -6696,17 +6695,17 @@ fn websearch_mcp_external_fallback_signal(
     }
 }
 
-async fn maybe_external_fallback_after_websearch_mcp_failure(
-    external_fallback: Option<&ExternalFallbackContext>,
+async fn maybe_account_fallback_after_websearch_mcp_failure(
+    account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     internal_reason: &str,
     attribution: &McpCallAttribution,
 ) -> Option<Response> {
     let (message, call_failure_kind) =
-        websearch_mcp_external_fallback_signal(internal_reason, attribution)?;
+        websearch_mcp_account_fallback_signal(internal_reason, attribution)?;
     let attempts = attribution.attempts.clone();
-    let outcome = maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-        external_fallback,
+    let outcome = maybe_account_fallback_after_local_error_outcome_with_diagnostics(
+        account_fallback,
         request_id,
         message,
         call_failure_kind,
@@ -6720,14 +6719,14 @@ async fn maybe_external_fallback_after_websearch_mcp_failure(
     })
 }
 
-fn local_rescue_reason_after_external_route_error(
+fn local_rescue_reason_after_account_route_error(
     route_subtype: UsageRouteSubtype,
     config: &AccountRuntimeConfig,
     err: &AccountFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
-    if !external_route_subtype_allows_local_rescue(route_subtype) {
+    if !account_route_subtype_allows_local_rescue(route_subtype) {
         return None;
     }
     if config.external_direct_policy_enabled {
@@ -6762,13 +6761,13 @@ fn local_rescue_reason_after_external_route_error(
 }
 
 #[cfg(test)]
-fn local_rescue_reason_after_external_error(
+fn local_rescue_reason_after_account_error(
     config: &AccountRuntimeConfig,
     err: &AccountFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
-    local_rescue_reason_after_external_route_error(
+    local_rescue_reason_after_account_route_error(
         UsageRouteSubtype::AccountFallbackAfterLocalAttempts,
         config,
         err,
@@ -6777,7 +6776,7 @@ fn local_rescue_reason_after_external_error(
     )
 }
 
-fn external_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) -> bool {
+fn account_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) -> bool {
     matches!(
         route_subtype,
         UsageRouteSubtype::AccountFallbackPreflight
@@ -6787,7 +6786,7 @@ fn external_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) 
     )
 }
 
-fn external_fallback_route_subtype_for_attempts(
+fn account_fallback_route_subtype_for_attempts(
     attempts: &[KiroCredentialAttempt],
 ) -> UsageRouteSubtype {
     if attempts.is_empty() {
@@ -6826,7 +6825,7 @@ fn local_fallback_reason_blocks_local_rescue(
     }
 }
 
-fn budgeted_local_rescue_reason_after_external_route_error(
+fn budgeted_local_rescue_reason_after_account_route_error(
     route_subtype: UsageRouteSubtype,
     config: &AccountRuntimeConfig,
     err: &AccountFinalError,
@@ -6837,7 +6836,7 @@ fn budgeted_local_rescue_reason_after_external_route_error(
     if inference_attempt_budget.available_attempts(0) == 0 {
         return None;
     }
-    local_rescue_reason_after_external_route_error(
+    local_rescue_reason_after_account_route_error(
         route_subtype,
         config,
         err,
@@ -6847,14 +6846,14 @@ fn budgeted_local_rescue_reason_after_external_route_error(
 }
 
 #[cfg(test)]
-fn budgeted_local_rescue_reason_after_external_error(
+fn budgeted_local_rescue_reason_after_account_error(
     config: &AccountRuntimeConfig,
     err: &AccountFinalError,
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
     inference_attempt_budget: &InferenceAttemptBudget,
 ) -> Option<&'static str> {
-    budgeted_local_rescue_reason_after_external_route_error(
+    budgeted_local_rescue_reason_after_account_route_error(
         UsageRouteSubtype::AccountFallbackAfterLocalAttempts,
         config,
         err,
@@ -6864,17 +6863,17 @@ fn budgeted_local_rescue_reason_after_external_error(
     )
 }
 
-/// Last-chance local retry after an external-pool final error.
+/// Last-chance local retry after an upstream-account final error.
 ///
 /// This deliberately calls the provider-local `*_max_wait` entrypoint directly. Do not route this
 /// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
-/// `ExternalFallbackContext::*fallback*`; those paths can choose the external pool again.
-async fn call_stream_local_rescue_after_external_error(
+/// `AccountFallbackContext::*fallback*`; those paths can choose an upstream account again.
+async fn call_stream_local_rescue_after_account_error(
     provider: &Arc<KiroProvider>,
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: &str,
-    external: &ExternalFallbackContext,
+    external: &AccountFallbackContext,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
@@ -6915,17 +6914,17 @@ async fn call_stream_local_rescue_after_external_error(
         .await
 }
 
-/// Last-chance local retry after an external-pool final error.
+/// Last-chance local retry after an upstream-account final error.
 ///
 /// This deliberately calls the provider-local `*_max_wait` entrypoint directly. Do not route this
 /// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
-/// `ExternalFallbackContext::*fallback*`; those paths can choose the external pool again.
-async fn call_non_stream_local_rescue_after_external_error(
+/// `AccountFallbackContext::*fallback*`; those paths can choose an upstream account again.
+async fn call_non_stream_local_rescue_after_account_error(
     provider: &Arc<KiroProvider>,
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: &str,
-    external: &ExternalFallbackContext,
+    external: &AccountFallbackContext,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
@@ -7018,7 +7017,7 @@ struct StreamRetryPlan {
     request_body: Arc<str>,
     kiro_request: Option<Arc<KiroRequest>>,
     request_id: String,
-    external_fallback: Option<ExternalFallbackContext>,
+    account_fallback: Option<AccountFallbackContext>,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<String>,
     base_usage_context: RequestUsageContext,
@@ -7112,9 +7111,17 @@ impl SseStreamState {
     }
 }
 
-fn external_rescue_preflight(reason: &str, err: &AccountFinalError) -> serde_json::Value {
+fn account_rescue_preflight(reason: &str, err: &AccountFinalError) -> serde_json::Value {
     json!({
         "reason": reason,
+        "accountStatus": err.status.as_u16(),
+        "accountErrorType": err.route_error_type,
+        "accountResponseErrorType": err.response_error_type,
+        "accountRetryable": err.retryable,
+        "accountId": err.pool_id,
+        "accountName": err.pool_name,
+        "accountAttemptCount": err.attempts.len(),
+        "accountError": err.message,
         "externalStatus": err.status.as_u16(),
         "externalErrorType": err.route_error_type,
         "externalResponseErrorType": err.response_error_type,
@@ -7146,7 +7153,7 @@ async fn handle_stream_request(
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
     cache_point_retry: Option<CachePointRetryRequest>,
-    external_fallback: Option<ExternalFallbackContext>,
+    account_fallback: Option<AccountFallbackContext>,
     stream_idle_timeout_secs: u64,
     stream_retry_config: LocalStreamRetryConfig,
     capacity_weight_units: u32,
@@ -7159,8 +7166,8 @@ async fn handle_stream_request(
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
     let mut successful_derived_request: Option<(String, KiroRequest)> = None;
     let response = if let Some(outcome) =
-        maybe_local_pool_preflight_external_outcome_for_local_request(
-            external_fallback.as_ref(),
+        maybe_local_pool_preflight_account_outcome_for_local_request(
+            account_fallback.as_ref(),
             &request_id,
             Some(model),
         )
@@ -7170,8 +7177,8 @@ async fn handle_stream_request(
         match outcome.outcome {
             AccountForwardOutcome::Response(response) => return response,
             AccountForwardOutcome::FinalError(err) => {
-                if let Some(external) = external_fallback.as_ref() {
-                    if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
+                if let Some(external) = account_fallback.as_ref() {
+                    if let Some(reason) = budgeted_local_rescue_reason_after_account_route_error(
                         UsageRouteSubtype::AccountFallbackPreflight,
                         &external.config,
                         &err,
@@ -7184,14 +7191,14 @@ async fn handle_stream_request(
                             reason,
                             max_wait_secs =
                                 external.config.external_pool_local_rescue_max_wait_secs,
-                            "external preflight fallback failed with a rescuable error; retrying local credentials once"
+                            "account preflight fallback failed with a rescuable error; retrying local credentials once"
                         );
-                        usage_context.mark_local_rescue_after_external(
+                        usage_context.mark_local_rescue_after_account(
                             reason,
-                            Some(external_rescue_preflight(reason, &err)),
+                            Some(account_rescue_preflight(reason, &err)),
                             err.attempts.clone(),
                         );
-                        match call_stream_local_rescue_after_external_error(
+                        match call_stream_local_rescue_after_account_error(
                             &provider,
                             request_body,
                             Some(&kiro_request),
@@ -7247,7 +7254,7 @@ async fn handle_stream_request(
             request_body,
             Some(&kiro_request),
             Some(&request_id),
-            external_fallback.as_ref(),
+            account_fallback.as_ref(),
             capacity_weight_units,
             Some(model),
             usage_context.latency.inference_attempt_budget.clone(),
@@ -7304,7 +7311,7 @@ async fn handle_stream_request(
                         &retry_body,
                         Some(&retry_kiro_request),
                         Some(&request_id),
-                        external_fallback.as_ref(),
+                        account_fallback.as_ref(),
                         capacity_weight_units,
                         Some(model),
                         usage_context.latency.inference_attempt_budget.clone(),
@@ -7338,8 +7345,8 @@ async fn handle_stream_request(
                                 preflight_model,
                             );
                             if let Some(outcome) =
-                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                    external_fallback.as_ref(),
+                                maybe_account_fallback_after_local_error_outcome_with_diagnostics(
+                                    account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
@@ -7415,7 +7422,7 @@ async fn handle_stream_request(
                         &retry_body,
                         Some(&retry_kiro_request),
                         Some(&request_id),
-                        external_fallback.as_ref(),
+                        account_fallback.as_ref(),
                         capacity_weight_units,
                         Some(model),
                         usage_context.latency.inference_attempt_budget.clone(),
@@ -7449,8 +7456,8 @@ async fn handle_stream_request(
                                 preflight_model,
                             );
                             if let Some(outcome) =
-                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                    external_fallback.as_ref(),
+                                maybe_account_fallback_after_local_error_outcome_with_diagnostics(
+                                    account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
@@ -7464,19 +7471,19 @@ async fn handle_stream_request(
                                         return response;
                                     }
                                     AccountForwardOutcome::FinalError(err) => {
-                                        if let Some(external) = external_fallback.as_ref() {
+                                        if let Some(external) = account_fallback.as_ref() {
                                             let local_fallback_reason =
-                                            classify_local_error_for_external_fallback_with_kind(
-                                                &retry_message,
-                                                &classification_attempts,
-                                                &external.config,
-                                                KiroProvider::call_failure_kind_from_error(
-                                                    &retry_error,
-                                                ),
-                                            );
+                                                classify_local_error_for_account_fallback_with_kind(
+                                                    &retry_message,
+                                                    &classification_attempts,
+                                                    &external.config,
+                                                    KiroProvider::call_failure_kind_from_error(
+                                                        &retry_error,
+                                                    ),
+                                                );
                                             if let Some(reason) =
-                                                budgeted_local_rescue_reason_after_external_route_error(
-                                                    external_fallback_route_subtype_for_attempts(
+                                                budgeted_local_rescue_reason_after_account_route_error(
+                                                    account_fallback_route_subtype_for_attempts(
                                                         &all_attempts,
                                                     ),
                                                     &external.config,
@@ -7493,15 +7500,15 @@ async fn handle_stream_request(
                                                     max_wait_secs = external
                                                         .config
                                                         .external_pool_local_rescue_max_wait_secs,
-                                                    "external fallback failed with a rescuable error; retrying local credentials once"
+                                                    "account route failed with a rescuable error; retrying local credentials once"
                                                 );
-                                                usage_context.mark_local_rescue_after_external(
+                                                usage_context.mark_local_rescue_after_account(
                                                     reason,
-                                                    Some(external_rescue_preflight(reason, &err)),
+                                                    Some(account_rescue_preflight(reason, &err)),
                                                     err.attempts.clone(),
                                                 );
                                                 retry_attempt_prefix = all_attempts.clone();
-                                                match call_stream_local_rescue_after_external_error(
+                                                match call_stream_local_rescue_after_account_error(
                                                     &provider,
                                                     &retry_body,
                                                     Some(&retry_kiro_request),
@@ -7593,8 +7600,8 @@ async fn handle_stream_request(
                         }
                     }
                 } else {
-                    if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                        external_fallback.as_ref(),
+                    if let Some(outcome) = maybe_account_fallback_after_local_error_outcome(
+                        account_fallback.as_ref(),
                         &request_id,
                         &message,
                         KiroProvider::call_failure_kind_from_error(&e),
@@ -7605,17 +7612,17 @@ async fn handle_stream_request(
                         match outcome {
                             AccountForwardOutcome::Response(response) => return response,
                             AccountForwardOutcome::FinalError(err) => {
-                                if let Some(external) = external_fallback.as_ref() {
+                                if let Some(external) = account_fallback.as_ref() {
                                     let local_fallback_reason =
-                                        classify_local_error_for_external_fallback_with_kind(
+                                        classify_local_error_for_account_fallback_with_kind(
                                             &message,
                                             &attempts,
                                             &external.config,
                                             KiroProvider::call_failure_kind_from_error(&e),
                                         );
                                     if let Some(reason) =
-                                        budgeted_local_rescue_reason_after_external_route_error(
-                                            external_fallback_route_subtype_for_attempts(&attempts),
+                                        budgeted_local_rescue_reason_after_account_route_error(
+                                            account_fallback_route_subtype_for_attempts(&attempts),
                                             &external.config,
                                             &err,
                                             local_fallback_reason.as_deref(),
@@ -7629,15 +7636,15 @@ async fn handle_stream_request(
                                             max_wait_secs = external
                                                 .config
                                                 .external_pool_local_rescue_max_wait_secs,
-                                            "external fallback failed with a rescuable error; retrying local credentials once"
+                                            "account route failed with a rescuable error; retrying local credentials once"
                                         );
-                                        usage_context.mark_local_rescue_after_external(
+                                        usage_context.mark_local_rescue_after_account(
                                             reason,
-                                            Some(external_rescue_preflight(reason, &err)),
+                                            Some(account_rescue_preflight(reason, &err)),
                                             err.attempts.clone(),
                                         );
                                         retry_attempt_prefix = attempts.clone();
-                                        match call_stream_local_rescue_after_external_error(
+                                        match call_stream_local_rescue_after_account_error(
                                             &provider,
                                             request_body,
                                             Some(&kiro_request),
@@ -7766,7 +7773,7 @@ async fn handle_stream_request(
                             request_body: Arc::<str>::from(effective_body),
                             kiro_request: None,
                             request_id: request_id.clone(),
-                            external_fallback: external_fallback.clone(),
+                            account_fallback: account_fallback.clone(),
                             capacity_weight_units,
                             dispatch_model_filter: Some(model.to_string()),
                             base_usage_context,
@@ -7793,7 +7800,7 @@ async fn handle_stream_request(
                 request_body: Arc::<str>::from(effective_body),
                 kiro_request: retry_kiro_request,
                 request_id: request_id.clone(),
-                external_fallback: external_fallback.clone(),
+                account_fallback: account_fallback.clone(),
                 capacity_weight_units,
                 dispatch_model_filter: Some(model.to_string()),
                 base_usage_context,
@@ -8477,7 +8484,7 @@ async fn retry_stream_before_downstream_commit(
         plan.request_body.as_ref(),
         plan.kiro_request.as_deref(),
         Some(&plan.request_id),
-        plan.external_fallback.as_ref(),
+        plan.account_fallback.as_ref(),
         plan.capacity_weight_units,
         plan.dispatch_model_filter.as_deref(),
         attempt_budget.clone(),
@@ -9395,7 +9402,7 @@ async fn handle_non_stream_request(
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
     cache_point_retry: Option<CachePointRetryRequest>,
-    external_fallback: Option<ExternalFallbackContext>,
+    account_fallback: Option<AccountFallbackContext>,
     capacity_weight_units: u32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -9404,8 +9411,8 @@ async fn handle_non_stream_request(
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
     let api_response = if let Some(outcome) =
-        maybe_local_pool_preflight_external_outcome_for_local_request(
-            external_fallback.as_ref(),
+        maybe_local_pool_preflight_account_outcome_for_local_request(
+            account_fallback.as_ref(),
             &request_id,
             Some(model),
         )
@@ -9415,8 +9422,8 @@ async fn handle_non_stream_request(
         match outcome.outcome {
             AccountForwardOutcome::Response(response) => return response,
             AccountForwardOutcome::FinalError(err) => {
-                if let Some(external) = external_fallback.as_ref() {
-                    if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
+                if let Some(external) = account_fallback.as_ref() {
+                    if let Some(reason) = budgeted_local_rescue_reason_after_account_route_error(
                         UsageRouteSubtype::AccountFallbackPreflight,
                         &external.config,
                         &err,
@@ -9429,14 +9436,14 @@ async fn handle_non_stream_request(
                             reason,
                             max_wait_secs =
                                 external.config.external_pool_local_rescue_max_wait_secs,
-                            "external preflight fallback failed with a rescuable error; retrying local credentials once"
+                            "account preflight fallback failed with a rescuable error; retrying local credentials once"
                         );
-                        usage_context.mark_local_rescue_after_external(
+                        usage_context.mark_local_rescue_after_account(
                             reason,
-                            Some(external_rescue_preflight(reason, &err)),
+                            Some(account_rescue_preflight(reason, &err)),
                             err.attempts.clone(),
                         );
-                        match call_non_stream_local_rescue_after_external_error(
+                        match call_non_stream_local_rescue_after_account_error(
                             &provider,
                             request_body,
                             Some(kiro_request),
@@ -9492,7 +9499,7 @@ async fn handle_non_stream_request(
             request_body,
             Some(kiro_request),
             Some(&request_id),
-            external_fallback.as_ref(),
+            account_fallback.as_ref(),
             capacity_weight_units,
             Some(model),
             usage_context.latency.inference_attempt_budget.clone(),
@@ -9549,7 +9556,7 @@ async fn handle_non_stream_request(
                         &retry_body,
                         Some(&retry_kiro_request),
                         Some(&request_id),
-                        external_fallback.as_ref(),
+                        account_fallback.as_ref(),
                         capacity_weight_units,
                         Some(model),
                         usage_context.latency.inference_attempt_budget.clone(),
@@ -9580,8 +9587,8 @@ async fn handle_non_stream_request(
                                 preflight_model,
                             );
                             if let Some(outcome) =
-                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                    external_fallback.as_ref(),
+                                maybe_account_fallback_after_local_error_outcome_with_diagnostics(
+                                    account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
@@ -9657,7 +9664,7 @@ async fn handle_non_stream_request(
                         &retry_body,
                         Some(&retry_kiro_request),
                         Some(&request_id),
-                        external_fallback.as_ref(),
+                        account_fallback.as_ref(),
                         capacity_weight_units,
                         Some(model),
                         usage_context.latency.inference_attempt_budget.clone(),
@@ -9688,8 +9695,8 @@ async fn handle_non_stream_request(
                                 preflight_model,
                             );
                             if let Some(outcome) =
-                                maybe_external_fallback_after_local_error_outcome_with_diagnostics(
-                                    external_fallback.as_ref(),
+                                maybe_account_fallback_after_local_error_outcome_with_diagnostics(
+                                    account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
@@ -9703,19 +9710,19 @@ async fn handle_non_stream_request(
                                         return response;
                                     }
                                     AccountForwardOutcome::FinalError(err) => {
-                                        if let Some(external) = external_fallback.as_ref() {
+                                        if let Some(external) = account_fallback.as_ref() {
                                             let local_fallback_reason =
-                                            classify_local_error_for_external_fallback_with_kind(
-                                                &retry_message,
-                                                &classification_attempts,
-                                                &external.config,
-                                                KiroProvider::call_failure_kind_from_error(
-                                                    &retry_error,
-                                                ),
-                                            );
+                                                classify_local_error_for_account_fallback_with_kind(
+                                                    &retry_message,
+                                                    &classification_attempts,
+                                                    &external.config,
+                                                    KiroProvider::call_failure_kind_from_error(
+                                                        &retry_error,
+                                                    ),
+                                                );
                                             if let Some(reason) =
-                                                budgeted_local_rescue_reason_after_external_route_error(
-                                                    external_fallback_route_subtype_for_attempts(
+                                                budgeted_local_rescue_reason_after_account_route_error(
+                                                    account_fallback_route_subtype_for_attempts(
                                                         &all_attempts,
                                                     ),
                                                     &external.config,
@@ -9732,15 +9739,15 @@ async fn handle_non_stream_request(
                                                     max_wait_secs = external
                                                         .config
                                                         .external_pool_local_rescue_max_wait_secs,
-                                                    "external fallback failed with a rescuable error; retrying local credentials once"
+                                                    "account route failed with a rescuable error; retrying local credentials once"
                                                 );
-                                                usage_context.mark_local_rescue_after_external(
+                                                usage_context.mark_local_rescue_after_account(
                                                     reason,
-                                                    Some(external_rescue_preflight(reason, &err)),
+                                                    Some(account_rescue_preflight(reason, &err)),
                                                     err.attempts.clone(),
                                                 );
                                                 retry_attempt_prefix = all_attempts.clone();
-                                                match call_non_stream_local_rescue_after_external_error(
+                                                match call_non_stream_local_rescue_after_account_error(
                                                 &provider,
                                                 &retry_body,
                                                 Some(&retry_kiro_request),
@@ -9823,8 +9830,8 @@ async fn handle_non_stream_request(
                         }
                     }
                 } else {
-                    if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                        external_fallback.as_ref(),
+                    if let Some(outcome) = maybe_account_fallback_after_local_error_outcome(
+                        account_fallback.as_ref(),
                         &request_id,
                         &message,
                         KiroProvider::call_failure_kind_from_error(&e),
@@ -9835,17 +9842,17 @@ async fn handle_non_stream_request(
                         match outcome {
                             AccountForwardOutcome::Response(response) => return response,
                             AccountForwardOutcome::FinalError(err) => {
-                                if let Some(external) = external_fallback.as_ref() {
+                                if let Some(external) = account_fallback.as_ref() {
                                     let local_fallback_reason =
-                                        classify_local_error_for_external_fallback_with_kind(
+                                        classify_local_error_for_account_fallback_with_kind(
                                             &message,
                                             &attempts,
                                             &external.config,
                                             KiroProvider::call_failure_kind_from_error(&e),
                                         );
                                     if let Some(reason) =
-                                        budgeted_local_rescue_reason_after_external_route_error(
-                                            external_fallback_route_subtype_for_attempts(&attempts),
+                                        budgeted_local_rescue_reason_after_account_route_error(
+                                            account_fallback_route_subtype_for_attempts(&attempts),
                                             &external.config,
                                             &err,
                                             local_fallback_reason.as_deref(),
@@ -9859,15 +9866,15 @@ async fn handle_non_stream_request(
                                             max_wait_secs = external
                                                 .config
                                                 .external_pool_local_rescue_max_wait_secs,
-                                            "external fallback failed with a rescuable error; retrying local credentials once"
+                                            "account route failed with a rescuable error; retrying local credentials once"
                                         );
-                                        usage_context.mark_local_rescue_after_external(
+                                        usage_context.mark_local_rescue_after_account(
                                             reason,
-                                            Some(external_rescue_preflight(reason, &err)),
+                                            Some(account_rescue_preflight(reason, &err)),
                                             err.attempts.clone(),
                                         );
                                         retry_attempt_prefix = attempts.clone();
-                                        match call_non_stream_local_rescue_after_external_error(
+                                        match call_non_stream_local_rescue_after_account_error(
                                             &provider,
                                             request_body,
                                             Some(kiro_request),

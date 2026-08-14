@@ -62,6 +62,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Usage records, usage summaries, dashboard windows/series/top aggregates and credential usage summaries now expose `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` as the account-neutral metering fields. Old `kiroMeteringUsage` / `totalKiroMeteringUsage` JSON fields and current DB/Redis compatibility keys remain mirrored, historical old-only records are normalized on read, and maintained usage UI surfaces show "上游计量" instead of Kiro metering wording.
 - Stream and handler internals now carry upstream metering values as `upstream_metering_units`; the old Kiro-named usage field remains only as the serialized/storage compatibility copy, and stream tests assert metering stays internal rather than leaking into downstream SSE.
 - New upstream account usage route subtypes now serialize with account terminology: `account_fallback_preflight`, `account_fallback_after_local_attempts`, `account_direct_policy`, `account_error` and `local_rescue_after_account`. Historical `external_*` and `local_rescue_after_external` values remain accepted and displayed as compatibility values in maintained UIs.
+- Anthropic parsed/raw fallback routing now uses `AccountFallbackContext` and account-named fallback/preflight helper methods. Local rescue preflight metadata now writes account fields while retaining old `external*` copies, and focused handler/account-only tests passed.
 
 ## In Progress
 
