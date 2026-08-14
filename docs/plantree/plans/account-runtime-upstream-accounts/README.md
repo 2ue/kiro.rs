@@ -110,6 +110,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Payload guard runtime wrappers now use local-upstream/account names (`PreparedLocalUpstreamRequestBody`, `prepare_local_upstream_request_body`, `PreparedAccountMessagesPayload`, `prepare_account_messages_payload`, `sanitize_anthropic_messages_for_account_forwarding`). The underlying legacy local payload still uses `KiroRequest` until the provider/body implementation is replaced.
 - Account-route body/model/retry pipeline diagnostics now use account wording for normalized/raw payload guard, model rewrite, model mapping and model cooldown errors while the delegated executor types remain under the legacy `external_pool` module.
 - Account-route model processing helpers now use account names (`account_outbound_model_for_raw`, `process_account_model`, `account_model_processing_error`) inside the delegated legacy executor.
+- Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while compatibility config fields such as `external_pool_same_pool_*` remain unchanged.
 
 Last verified on 2026-08-14:
 
@@ -254,6 +255,10 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-model-helper-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-model-helper-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-model-helper-test1 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-retry-helper-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-retry-helper-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-retry-helper-test1 -- cargo test same_account_retry -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-retry-helper-test2 -- cargo test external_pool_same_pool_retry -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

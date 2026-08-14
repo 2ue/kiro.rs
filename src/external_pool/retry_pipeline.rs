@@ -47,7 +47,7 @@ pub(super) fn payload_guard_retry_route(
     Some(next)
 }
 
-pub(super) fn should_retry_same_pool(
+pub(super) fn should_retry_same_account(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolError,
 ) -> bool {
@@ -55,8 +55,8 @@ pub(super) fn should_retry_same_pool(
         return false;
     }
     // These errors should leave the current candidate for this request instead
-    // of repeatedly sending to the same pool. They are still treated as
-    // recoverable health signals by the pool scheduler.
+    // of repeatedly sending to the same account. They are still treated as
+    // recoverable health signals by the account scheduler.
     if err.auto_disable_reason.is_some()
         || err
             .cooldown
@@ -71,18 +71,21 @@ pub(super) fn should_retry_same_pool(
     retry_status_matches(status, &config.same_pool_retry_status_codes())
 }
 
-pub(super) fn same_pool_retry_limit(config: &ExternalPoolsConfig, err: &ExternalPoolError) -> u32 {
-    if !should_retry_same_pool(config, err) {
+pub(super) fn same_account_retry_limit(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolError,
+) -> u32 {
+    if !should_retry_same_account(config, err) {
         return 0;
     }
-    // Keep same-pool replay bounded to a single retry. More than one retry on the
-    // same pool tends to amplify one upstream fault into repeated failures for
-    // the same request, while the scheduler-level transient penalty already
-    // handles future requests.
+    // Keep same-account replay bounded to a single retry. More than one retry on
+    // the same account tends to amplify one upstream fault into repeated
+    // failures for the same request, while the scheduler-level transient
+    // penalty already handles future requests.
     config.external_pool_same_pool_retry_count.min(1)
 }
 
-pub(super) fn should_retry_cross_pool(
+pub(super) fn should_retry_cross_account(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolError,
 ) -> bool {
@@ -101,7 +104,7 @@ pub(super) fn should_retry_cross_pool(
     retry_status_matches(status, &config.retry_status_codes())
 }
 
-pub(super) fn same_pool_retry_delay(config: &ExternalPoolsConfig) -> Option<Duration> {
+pub(super) fn same_account_retry_delay(config: &ExternalPoolsConfig) -> Option<Duration> {
     let delay_ms = config.external_pool_same_pool_retry_delay_ms;
     (delay_ms > 0).then(|| Duration::from_millis(delay_ms))
 }

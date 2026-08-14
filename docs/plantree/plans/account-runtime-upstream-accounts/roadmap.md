@@ -72,6 +72,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Payload guard runtime wrappers and account-forwarding sanitizer now use local-upstream/account names, while the concrete legacy local payload type remains isolated until the provider/body implementation is replaced.
 - Account-route body/model/retry pipeline diagnostics now use account wording for payload guard, model rewrite, model mapping and cooldown failures inside the delegated legacy executor.
 - Account-route model processing helpers now use account names for outbound raw model selection and model processing errors inside the delegated legacy executor.
+- Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while old config field names remain compatibility storage.
 
 ## In Progress
 

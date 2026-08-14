@@ -10522,7 +10522,7 @@ fn external_pool_error_classifies_model_unavailable_without_cooldown_when_disabl
 }
 
 #[test]
-fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors() {
+fn account_same_account_retry_limit_caps_to_one_and_rejects_terminal_errors() {
     let mut config = ExternalPoolsConfig {
         external_pool_same_pool_retry_count: 3,
         external_pool_same_pool_retry_status_codes: vec![401, 403, 429, 500, 502, 503, 504],
@@ -10558,19 +10558,19 @@ fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors()
     };
 
     assert_eq!(
-        retry_pipeline::same_pool_retry_limit(&config, &retryable_server_error),
+        retry_pipeline::same_account_retry_limit(&config, &retryable_server_error),
         1,
-        "server errors must be capped to one same-pool retry"
+        "server errors must be capped to one same-account retry"
     );
     assert_eq!(
-        retry_pipeline::same_pool_retry_limit(&config, &terminal_auth_error),
+        retry_pipeline::same_account_retry_limit(&config, &terminal_auth_error),
         0,
-        "security lock should not retry the same pool"
+        "security lock should not retry the same account"
     );
     assert_eq!(
-        retry_pipeline::same_pool_retry_limit(&config, &terminal_quota_error),
+        retry_pipeline::same_account_retry_limit(&config, &terminal_quota_error),
         0,
-        "quota exhaustion should not retry the same pool"
+        "quota exhaustion should not retry the same account"
     );
 
     config.external_pool_same_pool_retry_status_codes =
@@ -10585,9 +10585,9 @@ fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors()
         raw_upstream_error: None,
     };
     assert_eq!(
-        retry_pipeline::same_pool_retry_limit(&config, &rate_limit_error),
+        retry_pipeline::same_account_retry_limit(&config, &rate_limit_error),
         1,
-        "rate limit may retry once on the same pool, not more"
+        "rate limit may retry once on the same account, not more"
     );
 }
 

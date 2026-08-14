@@ -5421,7 +5421,7 @@ impl ExternalPoolManager {
         let mut wait_started_at: Option<Instant> = None;
         let mut send_attempt_index = 0usize;
         let mut pool_attempt_index = 0usize;
-        let mut same_pool_retry_counts: HashMap<u64, u32> = HashMap::new();
+        let mut same_account_retry_counts: HashMap<u64, u32> = HashMap::new();
         let mut attempt_rejection = None;
         let mut preselected_pool: Option<ExternalPool> = None;
         let dispatch_deadline = external_dispatch_deadline(&route, &config);
@@ -5739,8 +5739,8 @@ impl ExternalPoolManager {
                     send_attempt_index = send_attempt_index.saturating_add(1);
                     let outbound_model = forward_err.outbound_model;
                     let err = forward_err.err;
-                    let cross_pool_retry = should_retry_external_cross_pool(&config, &err);
-                    let action = if cross_pool_retry {
+                    let cross_account_retry = should_retry_external_cross_account(&config, &err);
+                    let action = if cross_account_retry {
                         "retry_next"
                     } else {
                         "fail"
@@ -5768,7 +5768,7 @@ impl ExternalPoolManager {
                         }
                         route = retry_route;
                         excluded.clear();
-                        same_pool_retry_counts.clear();
+                        same_account_retry_counts.clear();
                         last_error = None;
                         continue;
                     }
@@ -5788,16 +5788,17 @@ impl ExternalPoolManager {
                             }
                         }
                     }
-                    let same_pool_retry_count = same_pool_retry_counts.entry(pool_id).or_insert(0);
-                    let same_pool_retry_limit =
-                        retry_pipeline::same_pool_retry_limit(&config, &err);
+                    let same_account_retry_count =
+                        same_account_retry_counts.entry(pool_id).or_insert(0);
+                    let same_account_retry_limit =
+                        retry_pipeline::same_account_retry_limit(&config, &err);
                     if !soft_failure_cooldown
-                        && *same_pool_retry_count < same_pool_retry_limit
+                        && *same_account_retry_count < same_account_retry_limit
                         && route.inference_attempt_budget.available_attempts(0) > 0
                     {
-                        *same_pool_retry_count = (*same_pool_retry_count).saturating_add(1);
+                        *same_account_retry_count = (*same_account_retry_count).saturating_add(1);
                         if let Some(last) = attempts.last_mut() {
-                            last.action = "retry_same_pool".to_string();
+                            last.action = "retry_same_account".to_string();
                         }
                         tracing::warn!(
                             request_id = %route.request_id,
@@ -5805,12 +5806,12 @@ impl ExternalPoolManager {
                             pool_id,
                             pool_name = %pool.name,
                             status = err.status.map(|status| status.as_u16()),
-                            same_pool_retry_count = *same_pool_retry_count,
-                            same_pool_retry_max = same_pool_retry_limit,
-                            "external pool retryable status will be retried on the same pool before cross-pool failover"
+                            same_account_retry_count = *same_account_retry_count,
+                            same_account_retry_max = same_account_retry_limit,
+                            "account retryable status will be retried on the same account before account failover"
                         );
                         last_error = Some((pool.clone(), err));
-                        if let Some(delay) = external_same_pool_retry_delay(&config) {
+                        if let Some(delay) = external_same_account_retry_delay(&config) {
                             let delay = dispatch_deadline
                                 .map(|deadline| {
                                     delay.min(deadline.saturating_duration_since(Instant::now()))
@@ -5877,7 +5878,7 @@ impl ExternalPoolManager {
                         self.auto_disable_pool_if_configured(&pool, &config, reason, &err.message)
                             .await;
                     }
-                    if cross_pool_retry {
+                    if cross_account_retry {
                         excluded.insert(pool_id);
                         last_error = Some((pool, err));
                         pool_attempt_index = pool_attempt_index.saturating_add(1);
@@ -10616,12 +10617,15 @@ fn external_payload_guard_retry_route(
     retry_pipeline::payload_guard_retry_route(route)
 }
 
-fn should_retry_external_cross_pool(config: &ExternalPoolsConfig, err: &ExternalPoolError) -> bool {
-    retry_pipeline::should_retry_cross_pool(config, err)
+fn should_retry_external_cross_account(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolError,
+) -> bool {
+    retry_pipeline::should_retry_cross_account(config, err)
 }
 
-fn external_same_pool_retry_delay(config: &ExternalPoolsConfig) -> Option<Duration> {
-    retry_pipeline::same_pool_retry_delay(config)
+fn external_same_account_retry_delay(config: &ExternalPoolsConfig) -> Option<Duration> {
+    retry_pipeline::same_account_retry_delay(config)
 }
 
 fn auto_disable_reason_enabled(config: &ExternalPoolsConfig, reason: &str) -> bool {
