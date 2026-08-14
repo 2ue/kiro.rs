@@ -103,6 +103,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic handler fallback routing now uses `AccountFallbackContext` and account-named local-preflight/fallback helper methods. The old external-pool terminology remains only in compatibility subtype values, legacy usage fields and delegated storage/runtime internals, and local rescue preflight metadata now double-writes account fields with old `external*` copies.
 - Account local-rescue decisions now enter account-named runtime config accessors and write account-named fallback reasons (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`). Request-entry dispatch deadlines and pre-body rejection logs also use account runtime terminology while persisted config fields remain compatibility storage details.
 - Anthropic router/AppState/request runtime now names the account-route payload guard switch as `payload_guard_account_enabled`; it still reads and writes the persisted `payloadGuardExternalEnabled` compatibility field when crossing existing config and legacy route boundaries. Maintained runtime UIs now describe the control as upstream-account payload shaping rather than Kiro/external-pool payload handling.
+- Maintained runtime configuration UIs now label the old external-pool runtime section as upstream-account routing, including routing mode/rules, retry/failover/cooldown, local rescue, usage diagnostics, prompt steering and payload/body shaping text. Compatibility state keys such as `externalPools` and `payloadGuardExternalEnabled` remain unchanged internally.
 
 Last verified on 2026-08-14:
 
@@ -308,5 +309,7 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-test1 -- cargo test payload_guard -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`

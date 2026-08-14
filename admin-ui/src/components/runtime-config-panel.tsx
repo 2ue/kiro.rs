@@ -1254,7 +1254,7 @@ function KiroAgentModeSelectField({ value, onChange }: KiroAgentModeSelectFieldP
       <div className="mb-3">
         <div className="text-sm font-medium">Kiro Agent Mode</div>
         <div className="mt-1 text-xs leading-5 text-muted-foreground">
-          控制发往 Kiro IDE 上游的 x-amzn-kiro-agent-mode。vibe 保持当前 Claude Code 成功链路；spec 强制规格模式；auto 会按账号协议自动选择。
+          控制发往旧 IDE 上游的 x-amzn-kiro-agent-mode。vibe 保持当前 Claude Code 成功链路；spec 强制规格模式；auto 会按账号协议自动选择。
         </div>
       </div>
       <select
@@ -1603,7 +1603,7 @@ function ReportedUsagePathEditor({
         <>
           <ToggleField
             title="禁用非流式整形"
-            description="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
+            description="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续上游账号等配置不能重新开启本次整形。"
             checked={Boolean(value.skipNonStreamUsageProjection)}
             onCheckedChange={(skipNonStreamUsageProjection) =>
               onChange({ ...value, skipNonStreamUsageProjection })
@@ -3236,7 +3236,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="单请求推理发送硬上限"
-              description="本地换号、首输出前重试、请求体重试、外部池故障转移和本地救援共享此上限；默认 4，与账号和外部池数量无关。"
+              description="本地换号、首输出前重试、请求体重试、上游账号故障转移和本地救援共享此上限；默认 4，与本地账号和上游账号数量无关。"
               value={draft.inferenceUpstreamMaxAttempts}
               min={1}
               max={10}
@@ -3374,7 +3374,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="单请求最大容量单位"
-              description="限制超长上下文最多占用多少本地并发/RPM 单位，只影响本地凭据，不影响外部池。"
+              description="限制超长上下文最多占用多少本地并发/RPM 单位，只影响本地凭据，不影响上游账号。"
               value={draft.weightedCapacity.maxUnitsPerRequest}
               min={1}
               max={64}
@@ -3675,8 +3675,8 @@ export function RuntimeConfigPanel() {
               />
             </label>
             <ToggleField
-              title="应用到外部池"
-              description="开启后，请求进入外部池 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
+              title="应用到上游账号"
+              description="开启后，请求进入上游账号 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
               checked={draft.promptSteering.applyToExternalPool}
               onCheckedChange={(applyToExternalPool) => updatePromptSteering('applyToExternalPool', applyToExternalPool)}
             />
@@ -3782,7 +3782,7 @@ export function RuntimeConfigPanel() {
             <ImpactGroupHeader
               label="本地转换"
               title="本地凭据路径的 Anthropic -> Kiro 转换能力"
-              description="这些开关只影响本地凭据请求。外部池 raw body 透传不会进入这些阶段，外部池 normalized 仍按外部池自己的配置处理。"
+              description="这些开关只影响本地凭据请求。上游账号 raw body 透传不会进入这些阶段，上游账号 normalized 仍按上游账号自己的配置处理。"
             />
             {[
               ['toolSchemaNormalization', '工具 schema 规范化', '清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。'],

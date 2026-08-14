@@ -93,7 +93,7 @@ const runtimeSections: Array<{
 }> = [
   { key: 'loadBalancing', title: '负载均衡模式', desc: '请求分配给账号的策略', icon: <Gauge className="h-4 w-4" /> },
   { key: 'capacity', title: '请求容量', desc: '并发、排队、重试、超时', icon: <Gauge className="h-4 w-4" /> },
-  { key: 'externalPools', title: '外部池路由', desc: '控制哪些入口可以进入外部池', icon: <Router className="h-4 w-4" /> },
+  { key: 'externalPools', title: '上游账号路由', desc: '控制哪些入口可以进入上游账号', icon: <Router className="h-4 w-4" /> },
   { key: 'cooldown', title: '错误恢复 / 冷却', desc: '不同错误类型的暂停策略与退避', icon: <Shield className="h-4 w-4" /> },
   { key: 'scheduler', title: '账号选择权重', desc: '优先使用哪些账号的调度参数', icon: <Gauge className="h-4 w-4" /> },
   { key: 'warmup', title: '新账号预热', desc: '新账号逐步参与请求，稳定后恢复正常', icon: <Sparkles className="h-4 w-4" /> },
@@ -810,7 +810,7 @@ export function RuntimePage() {
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
                 <TogField label="首输出前流式换号" desc="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试。" checked={draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryEnabled')} />
                 <NumField label="首输出前最多尝试" desc="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。" value={draft.kiroUpstreamStreamRetryMaxAttempts} min={1} max={100} suffix="次" disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryMaxAttempts')} />
-                <NumField label="单请求推理发送硬上限" desc="本地换号、首输出前重试、请求体重试、外部池故障转移和本地救援共享；默认 4，与账号数量无关。" value={draft.inferenceUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('inferenceUpstreamMaxAttempts')} />
+                <NumField label="单请求推理发送硬上限" desc="本地换号、首输出前重试、请求体重试、上游账号故障转移和本地救援共享；默认 4，与账号数量无关。" value={draft.inferenceUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('inferenceUpstreamMaxAttempts')} />
                 <NumField label="单请求辅助发送硬上限" desc="Token 刷新与企业 Profile 探测共享；默认 2，与账号数量无关，不计入推理发送次数。" value={draft.auxiliaryUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('auxiliaryUpstreamMaxAttempts')} />
                 <NumField label="单实例辅助并发上限" desc="限制同时进行的 Token 刷新、Profile 探测和模型目录请求；饱和时立即拒绝，不进入无界等待队列。" value={draft.auxiliaryUpstreamMaxConcurrentRequests} min={1} max={256} suffix="路" onChange={set('auxiliaryUpstreamMaxConcurrentRequests')} />
                 <NumField label="Token 刷新 RPM 上限" desc="Redis 可用时为跨实例共享上限；未配置 Redis 时为单进程上限。" value={draft.tokenRefreshMaxRpm} min={1} max={6000} suffix="RPM" onChange={set('tokenRefreshMaxRpm')} />
@@ -833,26 +833,26 @@ export function RuntimePage() {
               <div className="space-y-4">
                 <TwoCol>
                   <TogField
-                    label="启用外部池"
-                    desc="允许请求在本地凭据不可调度或策略命中时进入外部池；下方路由规则会继续限制入口。"
+                    label="启用上游账号"
+                    desc="允许请求在本地凭据不可调度或策略命中时进入上游账号；下方路由规则会继续限制入口。"
                     checked={draft.externalPools.externalPoolsEnabled}
                     onChange={setExternalPools('externalPoolsEnabled')}
                   />
                   <TogField
                     label="外部直连策略"
-                    desc="开启后命中直连模型或路径规则的请求直接走外部池；关闭时外部池只作为本地不可用后的兜底。"
+                    desc="开启后命中直连模型或路径规则的请求直接走上游账号；关闭时上游账号只作为本地不可用后的兜底。"
                     checked={draft.externalPools.externalDirectPolicyEnabled}
                     onChange={setExternalPools('externalDirectPolicyEnabled')}
                   />
                   <TogField
-                    label="本地不可调度时预检外部池"
-                    desc="本地账号容量不足、无可用账号或调度 Redis 退化时，允许请求在解析后优先尝试外部池。"
+                    label="本地不可调度时预检上游账号"
+                    desc="本地账号容量不足、无可用账号或调度 Redis 退化时，允许请求在解析后优先尝试上游账号。"
                     checked={draft.externalPools.localPoolPreflightEnabled}
                     onChange={setExternalPools('localPoolPreflightEnabled')}
                   />
                   <TogField
-                    label="外部池失败后本地救援"
-                    desc="外部池作为兜底路径失败后，允许最后再尝试一次本地凭据；外部直连策略命中时不会启用该救援。"
+                    label="上游账号失败后本地救援"
+                    desc="上游账号作为兜底路径失败后，允许最后再尝试一次本地凭据；外部直连策略命中时不会启用该救援。"
                     checked={draft.externalPools.externalPoolLocalRescueEnabled}
                     onChange={setExternalPools('externalPoolLocalRescueEnabled')}
                   />
@@ -861,8 +861,8 @@ export function RuntimePage() {
                 <div className="rounded-lg border border-warning/30 bg-warning/5 p-4">
                   <div className="grid gap-4 md:grid-cols-2">
                     <TogField
-                      label="外部池 usage 原始数据诊断"
-                      desc="临时记录外部池上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；默认关闭。"
+                      label="上游账号 usage 原始数据诊断"
+                      desc="临时记录上游账号上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；默认关闭。"
                       checked={draft.externalPools.externalPoolUsageDebugEnabled}
                       onChange={setExternalPools('externalPoolUsageDebugEnabled')}
                     />
@@ -903,7 +903,7 @@ export function RuntimePage() {
 
                 <div className="grid gap-4 md:grid-cols-[minmax(16rem,22rem)_1fr]">
                   <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">外部池路由模式</div>
+                    <div className="text-sm font-semibold">上游账号路由模式</div>
                     <Select
                       value={draft.externalPools.externalPoolRouteMode}
                       onValueChange={(v) =>
@@ -914,9 +914,9 @@ export function RuntimePage() {
                     >
                       <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="allow_all">全部入口允许进入外部池</SelectItem>
-                        <SelectItem value="allow_list">只允许下列入口进入外部池</SelectItem>
-                        <SelectItem value="deny_list">禁止下列入口进入外部池</SelectItem>
+                        <SelectItem value="allow_all">全部入口允许进入上游账号</SelectItem>
+                        <SelectItem value="allow_list">只允许下列入口进入上游账号</SelectItem>
+                        <SelectItem value="deny_list">禁止下列入口进入上游账号</SelectItem>
                       </SelectContent>
                     </Select>
                     <p className="text-xs leading-5 text-muted-foreground">
@@ -925,7 +925,7 @@ export function RuntimePage() {
                   </div>
 
                   <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">外部池路由规则</div>
+                    <div className="text-sm font-semibold">上游账号路由规则</div>
                     <Textarea
                       className="min-h-40 font-mono text-xs"
                       value={externalRouteRulesText}
@@ -944,8 +944,8 @@ export function RuntimePage() {
 
                 <TwoCol>
                   <NumField
-                    label="外部池全局最大并发"
-                    desc="所有外部池合计同时处理的请求上限；0 表示不限制。"
+                    label="上游账号全局最大并发"
+                    desc="所有上游账号合计同时处理的请求上限；0 表示不限制。"
                     value={draft.externalPools.externalPoolGlobalMaxConcurrentRequests}
                     min={0}
                     max={100_000}
@@ -953,8 +953,8 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolGlobalMaxConcurrentRequests')}
                   />
                   <NumField
-                    label="外部池最大排队请求数"
-                    desc="外部池并发占满时最多允许排队的请求数；0 表示不排队。"
+                    label="上游账号最大排队请求数"
+                    desc="上游账号并发占满时最多允许排队的请求数；0 表示不排队。"
                     value={draft.externalPools.externalPoolMaxQueuedRequests}
                     min={0}
                     max={100_000}
@@ -962,8 +962,8 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolMaxQueuedRequests')}
                   />
                   <NumField
-                    label="外部池最长排队等待"
-                    desc="外部池等待并发名额的最长时间；0 会按后端安全默认值处理。"
+                    label="上游账号最长排队等待"
+                    desc="上游账号等待并发名额的最长时间；0 会按后端安全默认值处理。"
                     value={draft.externalPools.externalPoolDispatchMaxWaitSecs}
                     min={0}
                     max={86_400}
@@ -971,8 +971,8 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolDispatchMaxWaitSecs')}
                   />
                   <NumField
-                    label="外部池最多故障转移"
-                    desc="同一请求在多个外部池之间最多尝试多少次；0 表示不重试其它外部池。"
+                    label="上游账号最多故障转移"
+                    desc="同一请求在多个上游账号之间最多尝试多少次；0 表示不重试其它上游账号。"
                     value={draft.externalPools.externalPoolRetryMaxAttempts}
                     min={0}
                     max={10_000}
@@ -981,13 +981,13 @@ export function RuntimePage() {
                   />
                   <TogField
                     label="网络错误跨池重试"
-                    desc="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他外部池。"
+                    desc="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他上游账号。"
                     checked={draft.externalPools.externalPoolRetryOnNetworkError}
                     onChange={setExternalPools('externalPoolRetryOnNetworkError')}
                   />
                   <TogField
                     label="协议错误跨池重试"
-                    desc="上游返回成功状态码但内容是错误信封或协议污染时，是否允许切换其他外部池。"
+                    desc="上游返回成功状态码但内容是错误信封或协议污染时，是否允许切换其他上游账号。"
                     checked={draft.externalPools.externalPoolRetryOnProtocolError}
                     onChange={setExternalPools('externalPoolRetryOnProtocolError')}
                   />
@@ -999,12 +999,12 @@ export function RuntimePage() {
                       onChange={(event) => setExternalPools('externalPoolRetryStatusCodes')(parseStatusCodeList(event.target.value))}
                     />
                     <span className="block text-xs leading-4 text-muted-foreground">
-                      控制普通 HTTP 错误是否继续尝试其他外部池；认证、配额、渠道禁用等已分类错误仍按错误分类切换。
+                      控制普通 HTTP 错误是否继续尝试其他上游账号；认证、配额、渠道禁用等已分类错误仍按错误分类切换。
                     </span>
                   </label>
                   <NumField
                     label="同池重试次数"
-                    desc="命中下面状态码时，先在同一个外部池上重试；重试耗尽后才冷却并尝试其他外部池。"
+                    desc="命中下面状态码时，先在同一个上游账号上重试；重试耗尽后才冷却并尝试其他上游账号。"
                     value={draft.externalPools.externalPoolSamePoolRetryCount}
                     min={0}
                     max={10}
@@ -1013,7 +1013,7 @@ export function RuntimePage() {
                   />
                   <NumField
                     label="同池重试间隔"
-                    desc="同一个外部池重试之间的等待时间。"
+                    desc="同一个上游账号重试之间的等待时间。"
                     value={draft.externalPools.externalPoolSamePoolRetryDelayMs}
                     min={0}
                     max={60_000}
@@ -1022,7 +1022,7 @@ export function RuntimePage() {
                   />
                   <NumField
                     label="失败池临时降权"
-                    desc="外部池出现可重试瞬态失败后，在失败窗口内临时增加有效优先级；默认 20 可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。"
+                    desc="上游账号出现可重试瞬态失败后，在失败窗口内临时增加有效优先级；默认 20 可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。"
                     value={draft.externalPools.externalPoolTransientFailurePriorityPenalty}
                     min={0}
                     max={10_000}
@@ -1031,7 +1031,7 @@ export function RuntimePage() {
                   />
                   <NumField
                     label="连续失败冷却阈值"
-                    desc="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；默认 0，仅降权不池级冷却。"
+                    desc="同一上游账号同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；默认 0，仅降权不做账号级冷却。"
                     value={draft.externalPools.externalPoolTransientFailureCooldownThreshold}
                     min={0}
                     max={1000}
@@ -1048,7 +1048,7 @@ export function RuntimePage() {
                     <span className="block text-xs leading-4 text-muted-foreground">支持用逗号、空格或换行分隔；默认值用于 401、403、429、500、502、503、504。</span>
                   </label>
                   <NumField
-                    label="外部池失败后本地等待"
+                    label="上游账号失败后本地等待"
                     desc="触发本地救援时，最多等待本地账号空闲多久。"
                     value={draft.externalPools.externalPoolLocalRescueMaxWaitSecs}
                     min={0}
@@ -1058,7 +1058,7 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolLocalRescueMaxWaitSecs')}
                   />
                   <NumField
-                    label="外部池估算输入上限（兼容）"
+                    label="上游账号估算输入上限（兼容）"
                     desc="保留历史配置；当前不再用它做本地发送前拒绝，真实上下文超限以上游响应和请求大小保护为准。"
                     value={draft.externalPools.externalPoolMaxInputTokens}
                     min={0}
@@ -1255,8 +1255,8 @@ export function RuntimePage() {
                       </div>
                     </div>
                     <TogField
-                      label="应用到外部池"
-                      desc="开启后，请求进入外部池 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
+                      label="应用到上游账号"
+                      desc="开启后，请求进入上游账号 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
                       checked={draft.promptSteering.applyToExternalPool}
                       onChange={setPromptSteering('applyToExternalPool')}
                     />
@@ -1367,7 +1367,7 @@ export function RuntimePage() {
                   <div>
                     <div className="text-sm font-semibold">本地协议转换</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      这些开关会改变本地凭据路径最终发往 Kiro 的请求体；外部池 raw body 透传不会进入这些阶段。
+                      这些开关会改变本地凭据路径最终发往本地上游的请求体；上游账号 raw body 透传不会进入这些阶段。
                     </div>
                   </div>
                   <TwoCol>
@@ -1553,7 +1553,7 @@ export function RuntimePage() {
                     onChange={setMissingMaxTokens('defaultValue')}
                   />
                   <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">外部池默认流式 SSE 转发</div>
+                    <div className="text-sm font-semibold">上游账号默认流式 SSE 转发</div>
                     <Select
                       value={draft.externalPools.externalPoolStreamResponseMode}
                       onValueChange={(v) =>
