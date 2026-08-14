@@ -1618,8 +1618,8 @@ pub struct StreamContext {
     final_usage: Option<super::cache::CacheUsage>,
     /// 最近一次最终下游上报 usage，用于请求级记录。
     final_reported_usage: Option<super::cache::CacheUsage>,
-    /// Kiro 上游 meteringEvent 返回的本次请求积分用量。
-    kiro_metering_usage: Option<f64>,
+    /// 上游 meteringEvent 返回的本次请求计量单位。
+    upstream_metering_units: Option<f64>,
     /// 上游 assistantResponseEvent 最近一次 messageStatus。
     upstream_message_status: Option<String>,
     /// 是否见过上游显式 `messageStatus: COMPLETED`。
@@ -1815,7 +1815,7 @@ impl StreamContext {
             reported_cache_usage_policy: None,
             final_usage: None,
             final_reported_usage: None,
-            kiro_metering_usage: None,
+            upstream_metering_units: None,
             upstream_message_status: None,
             saw_upstream_completed: false,
             upstream_event_tail: VecDeque::with_capacity(Self::UPSTREAM_EVENT_TAIL_LIMIT),
@@ -2484,7 +2484,7 @@ impl StreamContext {
             }
             Event::Metering(metering) => {
                 if metering.usage.is_finite() {
-                    self.kiro_metering_usage = Some(metering.usage);
+                    self.upstream_metering_units = Some(metering.usage);
                 }
                 if self
                     .metadata_usage
@@ -2571,8 +2571,8 @@ impl StreamContext {
         self.metadata_usage.as_ref()
     }
 
-    pub fn kiro_metering_usage(&self) -> Option<f64> {
-        self.kiro_metering_usage
+    pub fn upstream_metering_units(&self) -> Option<f64> {
+        self.upstream_metering_units
     }
 
     pub fn context_input_tokens_seen(&self) -> bool {
@@ -5095,17 +5095,16 @@ mod tests {
             ..Default::default()
         }));
         assert!(sse_events.is_empty());
-        assert_eq!(ctx.kiro_metering_usage(), Some(1.25));
+        assert_eq!(ctx.upstream_metering_units(), Some(1.25));
 
         let final_events = ctx.generate_final_events();
-        assert!(
-            final_events
-                .iter()
-                .all(|event| !serde_json::to_string(&event.data)
-                    .expect("event data serializes")
-                    .contains("kiroMeteringUsage")),
-            "Kiro metering is a system usage field and must not be emitted downstream"
-        );
+        for event in final_events {
+            let data = serde_json::to_string(&event.data).expect("event data serializes");
+            assert!(
+                !data.contains("upstreamMeteringUnits") && !data.contains("kiroMeteringUsage"),
+                "upstream metering is a system usage field and must not be emitted downstream"
+            );
+        }
     }
 
     #[test]

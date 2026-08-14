@@ -98,6 +98,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Usage records now expose `accountBilling` as the primary upstream-account billing detail while retaining `externalPoolBilling` as a compatibility copy. Recorder/storage write paths fill both fields, historical records are normalized on read, and maintained usage detail/cost UI reads account billing first with fallback to old records.
 - Usage summary and dashboard window summary now expose `accountBilling` and `accountBillingByAccount` as account-facing aggregate fields while retaining `externalPoolBilling` and `externalPoolBillingByPool` for compatibility. Redis/Postgres dashboard materialization fills both shapes, and the maintained overview UI reads the account fields first.
 - Usage record, summary, dashboard and credential usage APIs now expose account-neutral `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` fields while retaining old `kiroMeteringUsage` / `totalKiroMeteringUsage` compatibility copies. Recorder, Redis and Postgres read/write boundaries normalize old-only and new-only metering records into both fields, and maintained usage UI surfaces now show "上游计量" instead of Kiro metering wording.
+- Stream and handler code now pass upstream metering values through `upstream_metering_units` naming. The old Kiro-named field remains only where a usage record writes the legacy compatibility copy, and downstream SSE still excludes both upstream and compatibility metering fields.
 
 Last verified on 2026-08-14:
 
@@ -272,3 +273,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh upstream-metering-field-test4 -- cargo test dashboard_window_basic_fallback_preserves_core_series_metrics -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh --reap-stale`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-internal-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-internal-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-internal-test1 -- cargo test test_metering_event_is_recorded_but_not_emitted_downstream -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-internal-test3 -- cargo test handler_legacy_metadata_metering_and_complete_tool_are_trusted_terminals_for_five_rounds -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-internal-fmt2 -- cargo fmt --check`

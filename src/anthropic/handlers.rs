@@ -3874,7 +3874,7 @@ impl CredentialUsageContext {
             reported_usage,
             usage_source,
             Some(raw_usage),
-            ctx.kiro_metering_usage(),
+            ctx.upstream_metering_units(),
         );
     }
 
@@ -3901,7 +3901,7 @@ impl CredentialUsageContext {
         error_detail: Option<(String, String)>,
         metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
         context_input_tokens: Option<i32>,
-        kiro_metering_usage: Option<f64>,
+        upstream_metering_units: Option<f64>,
     ) {
         let usage = usage.unwrap_or(super::cache::CacheUsage {
             total_input_tokens: self.request.input_tokens,
@@ -3950,7 +3950,7 @@ impl CredentialUsageContext {
             Some(error_message),
             Some(error_detail),
             public_error,
-            kiro_metering_usage,
+            upstream_metering_units,
         );
     }
 
@@ -3983,7 +3983,7 @@ impl CredentialUsageContext {
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
         raw_usage: Option<super::cache::CacheUsage>,
-        kiro_metering_usage: Option<f64>,
+        upstream_metering_units: Option<f64>,
     ) {
         self.record(
             UsageRecordStatus::Success,
@@ -3994,7 +3994,7 @@ impl CredentialUsageContext {
             None,
             None,
             None,
-            kiro_metering_usage,
+            upstream_metering_units,
         );
 
         if usage_source != UsageSource::LocalPromptCache {
@@ -4199,7 +4199,7 @@ impl CredentialUsageContext {
         error_message: Option<String>,
         error_detail: Option<String>,
         public_error: Option<UsagePublicError>,
-        kiro_metering_usage: Option<f64>,
+        upstream_metering_units: Option<f64>,
     ) {
         let standard_usage = standard_usage_for_status(status, usage);
         let pricing = self.request.pricing_catalog.estimate(
@@ -4268,8 +4268,8 @@ impl CredentialUsageContext {
         );
         let external_attempts = self.request.external_attempts.clone();
         let account_attempts = account_attempts_from_external(&external_attempts);
-        let upstream_metering_units = kiro_metering_usage
-            .filter(|usage| usage.is_finite())
+        let upstream_metering_units = upstream_metering_units
+            .filter(|units| units.is_finite())
             .unwrap_or(0.0);
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
@@ -8371,7 +8371,7 @@ fn finish_stream_with_recorded_error(
         error_detail,
         ctx.metadata_usage(),
         ctx.context_input_tokens,
-        ctx.kiro_metering_usage(),
+        ctx.upstream_metering_units(),
     );
     usage_guard.complete();
     final_events
@@ -9120,7 +9120,7 @@ fn create_sse_stream(
                                     error_detail,
                                     state.ctx.metadata_usage(),
                                     state.ctx.context_input_tokens,
-                                    state.ctx.kiro_metering_usage(),
+                                    state.ctx.upstream_metering_units(),
                                 );
                             } else {
                                 state.usage_guard.context().record_success_from_stream(&state.ctx);
@@ -10064,7 +10064,7 @@ async fn handle_non_stream_request(
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut metadata_usage: Option<crate::kiro::model::events::MetadataTokenUsage> = None;
-    let mut kiro_metering_usage: Option<f64> = None;
+    let mut upstream_metering_units: Option<f64> = None;
     let mut native_thinking_content = String::new();
     let mut native_thinking_signature: Option<String> = None;
     let mut redacted_thinking: Option<String> = None;
@@ -10260,7 +10260,7 @@ async fn handle_non_stream_request(
             }
             Event::Metering(metering) => {
                 if metering.usage.is_finite() {
-                    kiro_metering_usage = Some(metering.usage);
+                    upstream_metering_units = Some(metering.usage);
                     saw_upstream_metering = true;
                 }
                 if metadata_usage
@@ -10590,7 +10590,7 @@ async fn handle_non_stream_request(
         reported_usage,
         usage_source,
         Some(raw_usage),
-        kiro_metering_usage,
+        upstream_metering_units,
     );
     completion.report_success();
 

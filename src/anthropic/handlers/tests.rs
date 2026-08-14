@@ -4603,7 +4603,7 @@ fn handler_non_stream_untrusted_eof_fails_closed_for_five_rounds() {
 }
 
 async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
-    for (fault, expected_content, expected_stop_reason, expected_kiro_metering_usage) in [
+    for (fault, expected_content, expected_stop_reason, expected_upstream_metering_units) in [
         (
             HandlerEventStreamFault::LegacyTextWithMetadataNoStatus,
             Some("legacy-terminal-ok"),
@@ -4668,8 +4668,15 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
                     Some(expected_stop_reason)
                 );
                 assert!(
-                    (record.kiro_metering_usage - expected_kiro_metering_usage).abs() < 0.000_001,
-                    "fault={fault:?} stream={stream} round={round} kiro_metering_usage={}",
+                    (record.upstream_metering_units - expected_upstream_metering_units).abs()
+                        < 0.000_001,
+                    "fault={fault:?} stream={stream} round={round} upstream_metering_units={}",
+                    record.upstream_metering_units
+                );
+                assert!(
+                    (record.kiro_metering_usage - expected_upstream_metering_units).abs()
+                        < 0.000_001,
+                    "fault={fault:?} stream={stream} round={round} legacy_kiro_metering_usage={}",
                     record.kiro_metering_usage
                 );
                 if matches!(fault, HandlerEventStreamFault::UsageOnlyMeteringNoStatus) {

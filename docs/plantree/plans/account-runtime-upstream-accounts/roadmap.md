@@ -60,6 +60,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Usage records now expose `accountBilling` as the primary upstream-account billing detail while retaining `externalPoolBilling` as a compatibility copy. Recorder/storage paths fill both fields, read paths normalize historical records, and maintained usage UI reads account billing first.
 - Usage summary and dashboard window summary now expose `accountBilling` plus `accountBillingByAccount` aggregate fields while retaining legacy external-pool aggregate fields for compatibility. Redis/Postgres materialization fills both, and the maintained overview UI consumes the account fields first.
 - Usage records, usage summaries, dashboard windows/series/top aggregates and credential usage summaries now expose `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` as the account-neutral metering fields. Old `kiroMeteringUsage` / `totalKiroMeteringUsage` JSON fields and current DB/Redis compatibility keys remain mirrored, historical old-only records are normalized on read, and maintained usage UI surfaces show "上游计量" instead of Kiro metering wording.
+- Stream and handler internals now carry upstream metering values as `upstream_metering_units`; the old Kiro-named usage field remains only as the serialized/storage compatibility copy, and stream tests assert metering stays internal rather than leaking into downstream SSE.
 
 ## In Progress
 
