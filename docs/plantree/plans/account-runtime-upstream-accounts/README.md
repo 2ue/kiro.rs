@@ -97,6 +97,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - New upstream account usage records now write `routeKind: "account"` as the primary route kind. Query, Redis summary, Postgres rollup/dashboard and maintained usage UIs treat `account` and historical `external_pool` route kinds as the same upstream-account class while preserving the old value only for stored-record/filter compatibility.
 - Usage records now expose `accountBilling` as the primary upstream-account billing detail while retaining `externalPoolBilling` as a compatibility copy. Recorder/storage write paths fill both fields, historical records are normalized on read, and maintained usage detail/cost UI reads account billing first with fallback to old records.
 - Usage summary and dashboard window summary now expose `accountBilling` and `accountBillingByAccount` as account-facing aggregate fields while retaining `externalPoolBilling` and `externalPoolBillingByPool` for compatibility. Redis/Postgres dashboard materialization fills both shapes, and the maintained overview UI reads the account fields first.
+- Usage record, summary, dashboard and credential usage APIs now expose account-neutral `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` fields while retaining old `kiroMeteringUsage` / `totalKiroMeteringUsage` compatibility copies. Recorder, Redis and Postgres read/write boundaries normalize old-only and new-only metering records into both fields, and maintained usage UI surfaces now show "上游计量" instead of Kiro metering wording.
 
 Last verified on 2026-08-14:
 
@@ -258,5 +259,16 @@ Last verified on 2026-08-14:
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `feature/tests/run-cargo-scoped.sh account-summary-field-fmt3 -- cargo fmt --check`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
+- `git diff --check`
+- `feature/tests/run-cargo-scoped.sh --reap-stale`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-check2 -- cargo check`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-test2 -- cargo test usage_metering_fields_serialize_upstream_with_kiro_compatibility -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-test3 -- cargo test usage_summaries_serialize_account_billing_with_external_compatibility -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-fmt3 -- cargo fmt --check`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-check3 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-test4 -- cargo test dashboard_window_basic_fallback_preserves_core_series_metrics -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh --reap-stale`

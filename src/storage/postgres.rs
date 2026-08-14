@@ -5654,6 +5654,7 @@ impl PostgresUsageStore {
         let mut records: Vec<UsageRecord> = records_by_id.into_values().collect();
         records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         for record in &mut records {
+            record.ensure_upstream_metering_compatibility();
             record.ensure_account_billing_compatibility();
         }
         let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
@@ -6154,6 +6155,7 @@ impl PostgresUsageStore {
         .await?;
         let account_billing = account_billing_summary_from_row(&row)?;
 
+        let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
         Ok(UsageSummary {
             total_requests: row_i64_to_usize(&row, "total_requests")?,
             success_requests: row_i64_to_usize(&row, "success_requests")?,
@@ -6165,7 +6167,8 @@ impl PostgresUsageStore {
             total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-            total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+            total_upstream_metering_units: total_metering_units,
+            total_kiro_metering_usage: total_metering_units,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             local_prompt_cache_requests: row_i64_to_usize(&row, "local_prompt_cache_requests")?,
@@ -7179,12 +7182,14 @@ impl PostgresUsageStore {
         let mut summaries = HashMap::with_capacity(rows.len());
         for row in rows {
             let credential_id: i64 = row.try_get("credential_id")?;
+            let metering_units: f64 = row.try_get("kiro_metering_usage")?;
             summaries.insert(
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
                     original_cost_usd: row.try_get("original_cost_usd")?,
-                    kiro_metering_usage: row.try_get("kiro_metering_usage")?,
+                    upstream_metering_units: metering_units,
+                    kiro_metering_usage: metering_units,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
                 },
@@ -7225,12 +7230,14 @@ impl PostgresUsageStore {
         let mut summaries = HashMap::with_capacity(rows.len());
         for row in rows {
             let credential_id: i64 = row.try_get("credential_id")?;
+            let metering_units: f64 = row.try_get("kiro_metering_usage")?;
             summaries.insert(
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
                     original_cost_usd: row.try_get("original_cost_usd")?,
-                    kiro_metering_usage: row.try_get("kiro_metering_usage")?,
+                    upstream_metering_units: metering_units,
+                    kiro_metering_usage: metering_units,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
                 },
@@ -8111,6 +8118,7 @@ fn external_pool_usage_risk_sample_from_row(
 }
 
 fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
+    record.ensure_upstream_metering_compatibility();
     record.ensure_account_billing_compatibility();
     if record.original_cost_usd != 0.0 {
         return;
@@ -8217,7 +8225,7 @@ async fn upsert_usage_record_in_tx(
     .bind(record.cache_creation_1h_input_tokens)
     .bind(record.estimated_cost_usd)
     .bind(record.original_cost_usd)
-    .bind(record.kiro_metering_usage)
+    .bind(record.upstream_metering_units())
     .bind(record.pricing_available)
     .bind(&record.pricing_model)
     .bind(u64_to_i64(record.duration_ms))
@@ -8508,7 +8516,7 @@ impl UsageRollupMetrics {
             },
             total_estimated_cost_usd: record.estimated_cost_usd * sign as f64,
             total_original_cost_usd: record.original_cost_usd * sign as f64,
-            total_kiro_metering_usage: record.kiro_metering_usage * sign as f64,
+            total_kiro_metering_usage: record.upstream_metering_units() * sign as f64,
             external_pool_requests: signed_bool(external_pool, sign),
             external_pool_priced_requests: signed_bool(external_priced, sign),
             external_pool_unpriced_requests: signed_bool(external_pool && !external_priced, sign),
@@ -8669,7 +8677,7 @@ impl UsageRollupBatchDelta {
             summary.requests += direction;
             summary.estimated_cost_usd += record.estimated_cost_usd * direction as f64;
             summary.original_cost_usd += record.original_cost_usd * direction as f64;
-            summary.kiro_metering_usage += record.kiro_metering_usage * direction as f64;
+            summary.kiro_metering_usage += record.upstream_metering_units() * direction as f64;
             summary.priced_requests += signed_bool(record.pricing_available, direction);
             summary.unpriced_requests += signed_bool(!record.pricing_available, direction);
         }
@@ -10134,6 +10142,7 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
     let total_input_tokens: i64 = row.try_get("total_input_tokens")?;
     let total_cache_read_input_tokens: i64 = row.try_get("total_cache_read_input_tokens")?;
     let p95_duration_ms: i64 = row.try_get("p95_duration_ms")?;
+    let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
     let account_billing = account_billing_summary_from_row(&row)?;
 
     Ok(UsageDashboardWindow {
@@ -10157,7 +10166,8 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
             cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-            total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+            total_upstream_metering_units: total_metering_units,
+            total_kiro_metering_usage: total_metering_units,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             average_duration_ms: row.try_get("average_duration_ms")?,
@@ -10179,6 +10189,11 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
 fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDashboardWindow {
     let total_requests = point.requests;
     let error_requests = point.error_requests;
+    let total_metering_units = if point.total_upstream_metering_units != 0.0 {
+        point.total_upstream_metering_units
+    } else {
+        point.total_kiro_metering_usage
+    };
     UsageDashboardWindow {
         key: point.key,
         label: point.label,
@@ -10200,7 +10215,8 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
             cache_read_ratio: 0.0,
             total_estimated_cost_usd: point.total_estimated_cost_usd,
             total_original_cost_usd: point.total_original_cost_usd,
-            total_kiro_metering_usage: point.total_kiro_metering_usage,
+            total_upstream_metering_units: total_metering_units,
+            total_kiro_metering_usage: total_metering_units,
             priced_requests: 0,
             unpriced_requests: 0,
             average_duration_ms: 0.0,
@@ -10222,6 +10238,7 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
 fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
     let from: DateTime<Utc> = row.try_get("from_at")?;
     let to: DateTime<Utc> = row.try_get("to_at")?;
+    let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
     Ok(UsageSeriesPoint {
         key: row.try_get("key")?,
         label: row.try_get("label")?,
@@ -10235,7 +10252,8 @@ fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
         total_output_tokens: row.try_get("total_output_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-        total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+        total_upstream_metering_units: total_metering_units,
+        total_kiro_metering_usage: total_metering_units,
     })
 }
 
@@ -10252,6 +10270,7 @@ fn usage_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageAggregate> {
 }
 
 fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate> {
+    let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
     Ok(UsageTopAggregate {
         key: row.try_get("key")?,
         label: row.try_get("label")?,
@@ -10264,7 +10283,8 @@ fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate>
         total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
-        total_kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+        total_upstream_metering_units: total_metering_units,
+        total_kiro_metering_usage: total_metering_units,
     })
 }
 
@@ -12347,6 +12367,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
             original_cost_usd: 0.001,
+            upstream_metering_units: 0.0,
             kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
@@ -12410,6 +12431,7 @@ mod tests {
             total_output_tokens: 678,
             total_estimated_cost_usd: 1.25,
             total_original_cost_usd: 2.5,
+            total_upstream_metering_units: 3.75,
             total_kiro_metering_usage: 3.75,
         });
 
@@ -15108,6 +15130,7 @@ mod tests {
             cache_creation_1h_input_tokens: reported_usage.cache_creation_1h_input_tokens,
             estimated_cost_usd: uplifted_cost_usd,
             original_cost_usd: raw_cost_usd,
+            upstream_metering_units: 0.0,
             kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),

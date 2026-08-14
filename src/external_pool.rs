@@ -8493,6 +8493,7 @@ impl ExternalPoolManager {
             } else {
                 0.0
             },
+            upstream_metering_units: 0.0,
             kiro_metering_usage: 0.0,
             pricing_available,
             pricing_model,

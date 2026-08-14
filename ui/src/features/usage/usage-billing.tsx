@@ -16,6 +16,7 @@ import { billingDeltaBadgeTone, billingDeltaTextClass, billingDeltaTone } from '
 export interface UsageCostModel {
   estimatedCostUsd: number
   originalCostUsd: number
+  upstreamMeteringUnits?: number
   kiroMeteringUsage?: number
   pricingAvailable?: boolean
   pricingModel?: string
@@ -27,6 +28,7 @@ export function usageRecordCostModel(record: UsageRecord): UsageCostModel {
   return {
     estimatedCostUsd: record.estimatedCostUsd,
     originalCostUsd: record.originalCostUsd,
+    upstreamMeteringUnits: record.upstreamMeteringUnits ?? record.kiroMeteringUsage,
     kiroMeteringUsage: record.kiroMeteringUsage,
     pricingAvailable: record.pricingAvailable,
     pricingModel: record.pricingModel,
@@ -38,11 +40,15 @@ export function usageRecordCostModel(record: UsageRecord): UsageCostModel {
 export function simpleUsageCostModel(input: {
   estimatedCostUsd: number
   originalCostUsd: number
+  upstreamMeteringUnits?: number
   kiroMeteringUsage?: number
   pricingAvailable?: boolean
   pricingModel?: string
 }): UsageCostModel {
-  return input
+  return {
+    ...input,
+    upstreamMeteringUnits: input.upstreamMeteringUnits ?? input.kiroMeteringUsage,
+  }
 }
 
 export function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
@@ -92,6 +98,7 @@ export function UsageCostInline({
   const pricingLabel = model.pricingAvailable
     ? model.pricingModel || '已计价'
     : '未计价'
+  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.kiroMeteringUsage
 
   return (
     <div className="text-right font-mono text-xs tabular-nums">
@@ -112,9 +119,9 @@ export function UsageCostInline({
         原始 {formatUsdDetailed(model.originalCostUsd)}
       </div>
       <div className="text-[0.62rem] text-muted-foreground/60">{pricingLabel}</div>
-      {typeof model.kiroMeteringUsage === 'number' && (
+      {typeof upstreamMeteringUnits === 'number' && (
         <div className="text-[0.62rem] text-muted-foreground/60">
-          Kiro {formatMeteringUsage(model.kiroMeteringUsage)}
+          上游 {formatMeteringUsage(upstreamMeteringUnits)}
         </div>
       )}
     </div>
@@ -124,22 +131,23 @@ export function UsageCostInline({
 export function UsageCostTiles({
   model,
   className,
-  showKiro = true,
+  showUpstreamMetering = true,
 }: {
   model: UsageCostModel
   className?: string
-  showKiro?: boolean
+  showUpstreamMetering?: boolean
 }) {
   const pricingLabel = model.pricingAvailable
     ? `是（${model.pricingModel || 'priced'}）`
     : '否'
+  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.kiroMeteringUsage
 
   return (
     <div className={cn('grid grid-cols-2 gap-2 sm:grid-cols-3', className)}>
       <CostMetric label="估算费用" value={formatUsdDetailed(model.estimatedCostUsd)} tone={model.estimatedCostUsd > 0 ? 'warning' : 'default'} />
       <CostMetric label="原始计费" value={formatUsdDetailed(model.originalCostUsd)} tone={model.originalCostUsd > 0 ? 'warning' : 'default'} />
-      {showKiro && typeof model.kiroMeteringUsage === 'number' && (
-        <CostMetric label="Kiro计量" value={formatMeteringUsage(model.kiroMeteringUsage)} />
+      {showUpstreamMetering && typeof upstreamMeteringUnits === 'number' && (
+        <CostMetric label="上游计量" value={formatMeteringUsage(upstreamMeteringUnits)} />
       )}
       <CostMetric label="有定价" value={pricingLabel} />
     </div>
@@ -158,6 +166,7 @@ export function UsageCostBreakdown({
     ? billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
     : model.estimatedCostUsd - model.originalCostUsd
   const deltaTone = billingDeltaTone(delta)
+  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.kiroMeteringUsage
 
   return (
     <div>
@@ -214,8 +223,8 @@ export function UsageCostBreakdown({
             detail="展示计费 - 原始计费"
           />
           <CostMetric
-            label="Kiro计量"
-            value={typeof model.kiroMeteringUsage === 'number' ? formatMeteringUsage(model.kiroMeteringUsage) : '-'}
+            label="上游计量"
+            value={typeof upstreamMeteringUnits === 'number' ? formatMeteringUsage(upstreamMeteringUnits) : '-'}
           />
         </div>
       )}

@@ -81,6 +81,10 @@ function formatMeteringUsage(value: number | undefined | null): string {
   }).format(num)
 }
 
+function upstreamMetering(record: UsageRecord | undefined): number {
+  return record?.upstreamMeteringUnits ?? record?.kiroMeteringUsage ?? 0
+}
+
 function formatLatency(value?: number): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-'
   if (value < 1000) return `${formatNumber(Math.round(value))}ms`
@@ -151,7 +155,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'cache_creation_input_tokens',
     'estimated_cost_usd',
     'original_cost_usd',
-    'kiro_metering_usage',
+    'upstream_metering_units',
     'pricing_model',
     'duration_ms',
     'first_token_latency_ms',
@@ -183,7 +187,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.cacheCreationInputTokens,
     formatUsdCsv(record.estimatedCostUsd),
     formatUsdCsv(record.originalCostUsd),
-    record.kiroMeteringUsage,
+    record.upstreamMeteringUnits ?? record.kiroMeteringUsage,
     record.pricingModel,
     record.durationMs,
     record.firstTokenLatencyMs,
@@ -1352,7 +1356,7 @@ export function UsageRecordsPanel() {
                           原始 {formatUsdDetailed(record.originalCostUsd || 0)}
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          Kiro {formatMeteringUsage(record.kiroMeteringUsage || 0)}
+                          上游 {formatMeteringUsage(upstreamMetering(record))}
                         </div>
                       </td>
                       <td className="px-3 py-2 text-right">
@@ -1500,8 +1504,8 @@ export function UsageRecordsPanel() {
                   <div>{formatUsdDetailed(selectedRecord.originalCostUsd || 0)}</div>
                 </div>
                 <div>
-                  <div className="text-xs text-muted-foreground">Kiro计量</div>
-                  <div>{formatMeteringUsage(selectedRecord.kiroMeteringUsage || 0)}</div>
+                  <div className="text-xs text-muted-foreground">上游计量</div>
+                  <div>{formatMeteringUsage(upstreamMetering(selectedRecord))}</div>
                 </div>
                 <div>
                   <div className="text-xs text-muted-foreground">首字 token</div>

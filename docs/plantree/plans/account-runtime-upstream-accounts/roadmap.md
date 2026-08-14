@@ -59,6 +59,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - New upstream account usage records now write `routeKind: "account"` as the primary route kind. Account/upstream-account usage filters, Redis summaries, Postgres rollups/dashboard queries and maintained usage UI display all treat `account` plus historical `external_pool` as the upstream-account class during compatibility migration.
 - Usage records now expose `accountBilling` as the primary upstream-account billing detail while retaining `externalPoolBilling` as a compatibility copy. Recorder/storage paths fill both fields, read paths normalize historical records, and maintained usage UI reads account billing first.
 - Usage summary and dashboard window summary now expose `accountBilling` plus `accountBillingByAccount` aggregate fields while retaining legacy external-pool aggregate fields for compatibility. Redis/Postgres materialization fills both, and the maintained overview UI consumes the account fields first.
+- Usage records, usage summaries, dashboard windows/series/top aggregates and credential usage summaries now expose `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` as the account-neutral metering fields. Old `kiroMeteringUsage` / `totalKiroMeteringUsage` JSON fields and current DB/Redis compatibility keys remain mirrored, historical old-only records are normalized on read, and maintained usage UI surfaces show "上游计量" instead of Kiro metering wording.
 
 ## In Progress
 

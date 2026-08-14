@@ -187,6 +187,7 @@ export interface CredentialUsageSummaryItem {
   id: number
   estimatedCostUsd: number
   originalCostUsd: number
+  upstreamMeteringUnits: number
   kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
@@ -276,6 +277,7 @@ export interface CredentialStatusItem {
   schedulerScore?: number
   estimatedCostUsd: number
   originalCostUsd: number
+  upstreamMeteringUnits: number
   kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
@@ -805,6 +807,7 @@ export interface UsageRecord {
   cacheCreation1hInputTokens: number
   estimatedCostUsd: number
   originalCostUsd: number
+  upstreamMeteringUnits: number
   kiroMeteringUsage: number
   pricingAvailable: boolean
   pricingModel?: string
@@ -971,6 +974,7 @@ export interface UsageSummary {
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalUpstreamMeteringUnits: number
   totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
@@ -1077,6 +1081,7 @@ export interface UsageDashboardSummary {
   cacheReadRatio: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalUpstreamMeteringUnits: number
   totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
@@ -1119,6 +1124,7 @@ export interface UsageSeriesPoint {
   totalOutputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalUpstreamMeteringUnits: number
   totalKiroMeteringUsage: number
 }
 
@@ -1142,6 +1148,7 @@ export interface UsageTopAggregate {
   totalCacheCreationInputTokens: number
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
+  totalUpstreamMeteringUnits: number
   totalKiroMeteringUsage: number
 }
 

@@ -4268,6 +4268,9 @@ impl CredentialUsageContext {
         );
         let external_attempts = self.request.external_attempts.clone();
         let account_attempts = account_attempts_from_external(&external_attempts);
+        let upstream_metering_units = kiro_metering_usage
+            .filter(|usage| usage.is_finite())
+            .unwrap_or(0.0);
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -4301,9 +4304,8 @@ impl CredentialUsageContext {
                 .filter(|estimate| estimate.available)
                 .map(|estimate| estimate.cost_usd)
                 .unwrap_or(pricing.cost_usd),
-            kiro_metering_usage: kiro_metering_usage
-                .filter(|usage| usage.is_finite())
-                .unwrap_or(0.0),
+            upstream_metering_units,
+            kiro_metering_usage: upstream_metering_units,
             pricing_available: pricing.available,
             pricing_model: Some(pricing.model),
             duration_ms,

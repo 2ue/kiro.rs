@@ -1725,6 +1725,7 @@ impl RedisStore {
                 total_output_tokens: usage_i64(&totals, "total_output_tokens"),
                 total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
                 total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
+                total_upstream_metering_units: usage_f64(&totals, "total_kiro_metering_usage"),
                 total_kiro_metering_usage: usage_f64(&totals, "total_kiro_metering_usage"),
             });
         }
@@ -2160,6 +2161,10 @@ impl RedisStore {
         record: &UsageRecord,
         cache_read_bucket_limit: usize,
     ) -> anyhow::Result<bool> {
+        let mut compat_record = record.clone();
+        compat_record.ensure_upstream_metering_compatibility();
+        compat_record.ensure_account_billing_compatibility();
+        let record = &compat_record;
         let created_at = DateTime::parse_from_rfc3339(&record.created_at)
             .map(|created_at| created_at.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
@@ -2237,7 +2242,7 @@ impl RedisStore {
             .cmd("HINCRBYFLOAT")
             .arg(&totals_key)
             .arg("total_kiro_metering_usage")
-            .arg(record.kiro_metering_usage)
+            .arg(record.upstream_metering_units())
             .cmd("HINCRBY")
             .arg(&totals_key)
             .arg(if record.pricing_available {
@@ -2470,6 +2475,10 @@ impl RedisStore {
         max_cached: usize,
         trim_batch: usize,
     ) -> anyhow::Result<bool> {
+        let mut compat_record = record.clone();
+        compat_record.ensure_upstream_metering_compatibility();
+        compat_record.ensure_account_billing_compatibility();
+        let record = &compat_record;
         let member = usage_dimension_hash(&record.id);
         let record_key = self.key(usage_record_key(&member));
         let index_key = self.key(USAGE_RECORDS_INDEX_KEY);
@@ -2588,6 +2597,7 @@ impl RedisStore {
             let mut records = Vec::new();
             if let Some(value) = value {
                 if let Ok(mut record) = serde_json::from_str::<UsageRecord>(&value) {
+                    record.ensure_upstream_metering_compatibility();
                     record.ensure_account_billing_compatibility();
                     if usage_record_matches_query(&record, &query) {
                         records.push(record);
@@ -2646,6 +2656,7 @@ impl RedisStore {
                 let Ok(mut record) = serde_json::from_str::<UsageRecord>(&value) else {
                     continue;
                 };
+                record.ensure_upstream_metering_compatibility();
                 record.ensure_account_billing_compatibility();
                 if usage_record_matches_query(&record, &query) {
                     matched.push(record);
@@ -2724,6 +2735,7 @@ impl RedisStore {
             ),
             total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
             total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
+            total_upstream_metering_units: usage_f64(&totals, "total_kiro_metering_usage"),
             total_kiro_metering_usage: usage_f64(&totals, "total_kiro_metering_usage"),
             priced_requests: usage_usize(&totals, "priced_requests"),
             unpriced_requests: usage_usize(&totals, "unpriced_requests"),
@@ -3217,6 +3229,7 @@ impl RedisStore {
                 ),
                 total_estimated_cost_usd: usage_f64(&metrics, "total_estimated_cost_usd"),
                 total_original_cost_usd: usage_f64(&metrics, "total_original_cost_usd"),
+                total_upstream_metering_units: usage_f64(&metrics, "total_kiro_metering_usage"),
                 total_kiro_metering_usage: usage_f64(&metrics, "total_kiro_metering_usage"),
             });
         }
@@ -6250,7 +6263,7 @@ fn append_usage_dashboard_bucket_aggregate(
         .cmd("HINCRBYFLOAT")
         .arg(key)
         .arg("total_kiro_metering_usage")
-        .arg(record.kiro_metering_usage)
+        .arg(record.upstream_metering_units())
         .cmd("HINCRBY")
         .arg(key)
         .arg(if record.pricing_available {
@@ -6436,7 +6449,7 @@ fn append_usage_dashboard_top_aggregate(
         .cmd("HINCRBYFLOAT")
         .arg(&metrics_key)
         .arg("total_kiro_metering_usage")
-        .arg(record.kiro_metering_usage);
+        .arg(record.upstream_metering_units());
     if let Some(label) = label.filter(|label| !label.trim().is_empty()) {
         pipe.cmd("HSET").arg(&metrics_key).arg("label").arg(label);
     }
@@ -6543,6 +6556,7 @@ fn dashboard_summary_from_values(
         cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
         total_estimated_cost_usd: usage_f64(values, "total_estimated_cost_usd"),
         total_original_cost_usd: usage_f64(values, "total_original_cost_usd"),
+        total_upstream_metering_units: usage_f64(values, "total_kiro_metering_usage"),
         total_kiro_metering_usage: usage_f64(values, "total_kiro_metering_usage"),
         priced_requests: usage_usize(values, "priced_requests"),
         unpriced_requests: usage_usize(values, "unpriced_requests"),
@@ -6842,7 +6856,7 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let account_id = record.account_id.map(|id| id.to_string());
     let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
-    let kiro_metering_usage = record.kiro_metering_usage.to_string();
+    let upstream_metering_units = record.upstream_metering_units().to_string();
 
     [
         Some(record.id.as_str()),
@@ -6867,7 +6881,7 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.error_detail.as_deref(),
         record.pricing_model.as_deref(),
         Some(estimated_cost.as_str()),
-        Some(kiro_metering_usage.as_str()),
+        Some(upstream_metering_units.as_str()),
         credential_id.as_deref(),
     ]
     .into_iter()
@@ -7401,6 +7415,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd,
             original_cost_usd: estimated_cost_usd,
+            upstream_metering_units: 0.0,
             kiro_metering_usage: 0.0,
             pricing_available: status == UsageRecordStatus::Success,
             pricing_model: Some("claude-sonnet-4-5".to_string()),

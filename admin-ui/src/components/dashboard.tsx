@@ -123,6 +123,7 @@ function credentialFromListItem(item: CredentialListItem): CredentialStatusItem 
     schedulerScore: 0,
     estimatedCostUsd: 0,
     originalCostUsd: 0,
+    upstreamMeteringUnits: 0,
     kiroMeteringUsage: 0,
     pricedRequests: 0,
     unpricedRequests: 0,
@@ -279,7 +280,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
         accountInfo: accountById.get(item.id),
         estimatedCostUsd: usageItem?.estimatedCostUsd ?? 0,
         originalCostUsd: usageItem?.originalCostUsd ?? 0,
-        kiroMeteringUsage: usageItem?.kiroMeteringUsage ?? 0,
+        upstreamMeteringUnits: usageItem?.upstreamMeteringUnits ?? usageItem?.kiroMeteringUsage ?? 0,
+        kiroMeteringUsage: usageItem?.upstreamMeteringUnits ?? usageItem?.kiroMeteringUsage ?? 0,
         pricedRequests: usageItem?.pricedRequests ?? 0,
         unpricedRequests: usageItem?.unpricedRequests ?? 0,
       }

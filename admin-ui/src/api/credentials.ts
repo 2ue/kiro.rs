@@ -128,6 +128,7 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     schedulerScore: 0,
     estimatedCostUsd: 0,
     originalCostUsd: 0,
+    upstreamMeteringUnits: 0,
     kiroMeteringUsage: 0,
     pricedRequests: 0,
     unpricedRequests: 0,

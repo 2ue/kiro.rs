@@ -439,6 +439,7 @@ fn credential_item(
         scheduler_selection_pressure: 0.0,
         scheduler_score: 0.0,
         estimated_cost_usd,
+        upstream_metering_units: 0.0,
         kiro_metering_usage: 0.0,
         priced_requests: 0,
         unpriced_requests: 0,

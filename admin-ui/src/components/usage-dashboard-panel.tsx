@@ -84,6 +84,10 @@ function formatPercent(value: number | undefined | null): string {
   return `${((value as number) * 100).toFixed(1)}%`
 }
 
+function totalUpstreamMetering(value: { totalUpstreamMeteringUnits?: number; totalKiroMeteringUsage?: number }): number {
+  return value.totalUpstreamMeteringUnits ?? value.totalKiroMeteringUsage ?? 0
+}
+
 function formatDate(value?: string): string {
   if (!value) return '-'
   return new Date(value).toLocaleString('zh-CN', {
@@ -264,13 +268,13 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
   const totalRequests = points.reduce((sum, point) => sum + point.requests, 0)
   const totalCost = points.reduce((sum, point) => sum + point.totalEstimatedCostUsd, 0)
   const totalOriginalCost = points.reduce((sum, point) => sum + (point.totalOriginalCostUsd ?? 0), 0)
-  const totalKiroMetering = points.reduce((sum, point) => sum + (point.totalKiroMeteringUsage ?? 0), 0)
+  const totalMetering = points.reduce((sum, point) => sum + totalUpstreamMetering(point), 0)
   const totalErrors = points.reduce((sum, point) => sum + point.errorRequests, 0)
 
   return (
     <Panel
       title={title}
-      subtitle={`${formatNumber(totalRequests)} 请求 · 估算 ${formatUsd(totalCost)} · 原始 ${formatUsd(totalOriginalCost)} · 积分 ${formatNumber(totalKiroMetering)}`}
+      subtitle={`${formatNumber(totalRequests)} 请求 · 估算 ${formatUsd(totalCost)} · 原始 ${formatUsd(totalOriginalCost)} · 上游计量 ${formatNumber(totalMetering)}`}
       actions={<Badge variant={totalErrors > 0 ? 'destructive' : 'success'}>{totalErrors > 0 ? `错误 ${formatNumber(totalErrors)}` : '无错误'}</Badge>}
     >
       <div className="overflow-x-auto">
@@ -288,7 +292,7 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
                   <div
                     className="relative w-full overflow-hidden rounded-t bg-primary/70 transition-colors group-hover:bg-primary"
                     style={{ height }}
-                    title={`${point.label}: ${formatNumber(point.requests)} 请求 / ${formatNumber(point.errorRequests)} 错误 / 估算 ${formatUsd(point.totalEstimatedCostUsd)} / 原始 ${formatUsd(point.totalOriginalCostUsd)} / 积分 ${formatNumber(point.totalKiroMeteringUsage ?? 0)}`}
+                    title={`${point.label}: ${formatNumber(point.requests)} 请求 / ${formatNumber(point.errorRequests)} 错误 / 估算 ${formatUsd(point.totalEstimatedCostUsd)} / 原始 ${formatUsd(point.totalOriginalCostUsd)} / 上游计量 ${formatNumber(totalUpstreamMetering(point))}`}
                   >
                     {errorHeight > 0 && <div className="absolute inset-x-0 bottom-0 bg-kiro-error" style={{ height: errorHeight }} />}
                   </div>
@@ -399,8 +403,8 @@ function ErrorFocusPanel({
               <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-muted-foreground">
                 <span className="truncate">输入 {formatNumber(item.totalInputTokens)}</span>
                 <span className="truncate">输出 {formatNumber(item.totalOutputTokens)}</span>
-                <span className="truncate text-right" title={`估算 ${formatUsd(item.totalEstimatedCostUsd)} / 原始 ${formatUsd(item.totalOriginalCostUsd)} / 积分 ${formatNumber(item.totalKiroMeteringUsage ?? 0)}`}>
-                  积分 {formatNumber(item.totalKiroMeteringUsage ?? 0)}
+                <span className="truncate text-right" title={`估算 ${formatUsd(item.totalEstimatedCostUsd)} / 原始 ${formatUsd(item.totalOriginalCostUsd)} / 上游计量 ${formatNumber(totalUpstreamMetering(item))}`}>
+                  计量 {formatNumber(totalUpstreamMetering(item))}
                 </span>
               </div>
             </div>
@@ -757,7 +761,7 @@ export function UsageDashboardPanel() {
         <MetricCard title="耗时" value={`${Math.round(summary.averageDurationMs)}ms`} desc={`P95 ${formatNumber(summary.p95DurationMs)}ms`} icon={<Clock3 className="h-5 w-5" />} tone={latencyTone} />
         <MetricCard title="估算费用" value={formatUsd(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign className="h-5 w-5" />} tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'warning' : 'info'} />
         <MetricCard title="原始计费" value={formatUsd(summary.totalOriginalCostUsd)} desc="按上游原始 usage 估算" icon={<DollarSign className="h-5 w-5" />} tone="warning" />
-        <MetricCard title="Kiro 积分" value={formatNumber(summary.totalKiroMeteringUsage ?? 0)} desc="当前窗口积分消耗" icon={<DollarSign className="h-5 w-5" />} tone="info" />
+        <MetricCard title="上游计量" value={formatNumber(totalUpstreamMetering(summary))} desc="当前窗口上游计量" icon={<DollarSign className="h-5 w-5" />} tone="info" />
         <MetricCard title="Token" value={formatNumber(totalTokens)} desc={`输入 ${formatNumber(summary.totalInputTokens)} / 输出 ${formatNumber(summary.totalOutputTokens)}`} icon={<BarChart3 className="h-5 w-5" />} />
         <MetricCard title="缓存读取" value={formatPercent(summary.cacheReadRatio)} desc={`读取 ${formatNumber(summary.totalCacheReadInputTokens)}`} icon={<Database className="h-5 w-5" />} tone="success" />
       </div>

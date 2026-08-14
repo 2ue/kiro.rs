@@ -752,7 +752,7 @@ export function CredentialCard({
               </div>
               <MetaItem label="估算成本" value={formatUsdFixed2(credential.estimatedCostUsd)} />
               <MetaItem label="原始计费" value={formatUsdFixed2(credential.originalCostUsd)} />
-              <MetaItem label="Kiro计量" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
+              <MetaItem label="上游计量" value={formatMeteringUsage(credential.upstreamMeteringUnits ?? credential.kiroMeteringUsage)} />
             </div>
           </div>
 

@@ -122,6 +122,14 @@ function activeWindow(windows: UsageDashboardWindow[], key: string): UsageDashbo
   return windows.find((w) => w.key === key) ?? windows[0]
 }
 
+function totalUpstreamMetering(value: { totalUpstreamMeteringUnits?: number; totalKiroMeteringUsage?: number }): number {
+  return value.totalUpstreamMeteringUnits ?? value.totalKiroMeteringUsage ?? 0
+}
+
+function upstreamMetering(value?: { upstreamMeteringUnits?: number; kiroMeteringUsage?: number }): number {
+  return value?.upstreamMeteringUnits ?? value?.kiroMeteringUsage ?? 0
+}
+
 function seriesPointToChartRow(p: UsageSeriesPoint): Record<string, number | string> {
   return {
     label: p.label,
@@ -131,7 +139,7 @@ function seriesPointToChartRow(p: UsageSeriesPoint): Record<string, number | str
     originalCost: p.totalOriginalCostUsd,
     inputTokens: p.totalInputTokens,
     outputTokens: p.totalOutputTokens,
-    kiroMetering: p.totalKiroMeteringUsage ?? 0,
+    upstreamMetering: totalUpstreamMetering(p),
   }
 }
 
@@ -497,11 +505,12 @@ function CostRelationshipPanel({
 }) {
   const external = summary.accountBilling ?? summary.externalPoolBilling ?? EMPTY_ACCOUNT_BILLING
   const delta = summary.totalEstimatedCostUsd - summary.totalOriginalCostUsd
+  const meteringUnits = totalUpstreamMetering(summary)
 
   return (
     <SectionCard
       title="费用关系"
-      description="当前窗口内本地账号、Kiro 积分与外部池成本口径"
+      description="当前窗口内本地账号、上游计量与上游账号成本口径"
       icon={<DollarSign />}
     >
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -526,11 +535,11 @@ function CostRelationshipPanel({
           title="本地估算费用减去原始/实际费用"
         />
         <SignalRow
-          label="Kiro 积分"
-          value={<span title={formatNumber(summary.totalKiroMeteringUsage ?? 0)}>{formatCompact(summary.totalKiroMeteringUsage ?? 0)}</span>}
-          ratio={(summary.totalKiroMeteringUsage ?? 0) > 0 ? 1 : 0}
+          label="上游计量"
+          value={<span title={formatNumber(meteringUnits)}>{formatCompact(meteringUnits)}</span>}
+          ratio={meteringUnits > 0 ? 1 : 0}
           barColor="bg-info/70"
-          title="上游 meteringEvent / 积分消耗统计"
+          title="上游 meteringEvent 计量单位统计"
         />
         <SignalRow
           label="外部池原始成本"
@@ -918,7 +927,7 @@ function AccountQualityPanel({
   return (
     <SectionCard
       title="本地账号质量"
-      description="当前窗口账号贡献、计费与 Kiro 积分；用于发现高成本、低成功率或未计价账号"
+      description="当前窗口账号贡献、计费与上游计量；用于发现高成本、低成功率或未计价账号"
       icon={<Users />}
       noPadding
     >
@@ -969,13 +978,13 @@ function AccountQualityPanel({
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(credential.totalEstimatedCostUsd)}</TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(credential.totalOriginalCostUsd)}</TableCell>
-                    <TableCell className="text-right font-mono text-xs" title={formatNumber(credential.totalKiroMeteringUsage ?? 0)}>
-                      {formatCompact(credential.totalKiroMeteringUsage ?? 0)}
+                    <TableCell className="text-right font-mono text-xs" title={formatNumber(totalUpstreamMetering(credential))}>
+                      {formatCompact(totalUpstreamMetering(credential))}
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulative?.estimatedCostUsd ?? 0)}</TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulative?.originalCostUsd ?? 0)}</TableCell>
-                    <TableCell className="text-right font-mono text-xs" title={formatNumber(cumulative?.kiroMeteringUsage ?? 0)}>
-                      {formatCompact(cumulative?.kiroMeteringUsage ?? 0)}
+                    <TableCell className="text-right font-mono text-xs" title={formatNumber(upstreamMetering(cumulative))}>
+                      {formatCompact(upstreamMetering(cumulative))}
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">
                       <span className={(cumulative?.unpricedRequests ?? 0) > 0 ? 'text-warning' : 'text-muted-foreground'}>
@@ -1190,7 +1199,7 @@ export function OverviewPage() {
                 <SignalRow label="错误率" value={formatPercent(summary.errorRate)} ratio={summary.errorRate} barColor={summary.errorRate > 0 ? 'bg-destructive/75' : 'bg-success/70'} />
                 <SignalRow label="P95 耗时" value={formatDuration(summary.p95DurationMs)} ratio={summary.p95DurationMs > 0 ? Math.min(1, summary.p95DurationMs / 60_000) : 0} barColor={latencyTone === 'warning' ? 'bg-warning/80' : 'bg-info/70'} />
                 <SignalRow label="估算费用" value={formatUsdFixed2(summary.totalEstimatedCostUsd)} ratio={summary.totalEstimatedCostUsd > 0 ? 1 : 0} />
-                <SignalRow label="Kiro 积分" value={formatCompact(summary.totalKiroMeteringUsage ?? 0)} ratio={(summary.totalKiroMeteringUsage ?? 0) > 0 ? 1 : 0} />
+                <SignalRow label="上游计量" value={formatCompact(totalUpstreamMetering(summary))} ratio={totalUpstreamMetering(summary) > 0 ? 1 : 0} />
               </div>
             </SectionCard>
           </div>
@@ -1251,7 +1260,7 @@ export function OverviewPage() {
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
             <StatCard title="估算费用" value={formatUsdFixed2(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign />} tone="primary" />
             <StatCard title="原始计费" value={formatUsdFixed2(summary.totalOriginalCostUsd)} desc="按原始 usage 估算" icon={<DollarSign />} tone="warning" />
-            <StatCard title="Kiro 积分" value={formatCompact(summary.totalKiroMeteringUsage ?? 0)} valueTitle={formatNumber(summary.totalKiroMeteringUsage ?? 0)} desc="当前窗口积分消耗" icon={<DollarSign />} tone="info" />
+            <StatCard title="上游计量" value={formatCompact(totalUpstreamMetering(summary))} valueTitle={formatNumber(totalUpstreamMetering(summary))} desc="当前窗口上游计量" icon={<DollarSign />} tone="info" />
             <StatCard title="未计价请求" value={formatCompact(summary.unpricedRequests)} valueTitle={formatNumber(summary.unpricedRequests)} desc={`已计价 ${formatCompact(summary.pricedRequests)}`} icon={<DollarSign />} tone={summary.unpricedRequests > 0 ? 'warning' : 'success'} />
             <StatCard title="上游账号请求" value={formatCompact(accountBilling.requests)} valueTitle={formatNumber(accountBilling.requests)} desc={`billable ${formatUsdFixed2(accountBilling.billableCostUsd)}`} icon={<DollarSign />} tone="info" />
           </div>

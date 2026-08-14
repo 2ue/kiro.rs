@@ -505,6 +505,8 @@ pub struct UsageRecord {
     #[serde(default)]
     pub original_cost_usd: f64,
     #[serde(default)]
+    pub upstream_metering_units: f64,
+    #[serde(default)]
     pub kiro_metering_usage: f64,
     #[serde(default)]
     pub pricing_available: bool,
@@ -583,6 +585,27 @@ pub struct UsageRecord {
 }
 
 impl UsageRecord {
+    pub fn upstream_metering_units(&self) -> f64 {
+        if metering_units_has_signal(self.upstream_metering_units) {
+            self.upstream_metering_units
+        } else {
+            self.kiro_metering_usage
+        }
+    }
+
+    pub fn ensure_upstream_metering_compatibility(&mut self) {
+        if !metering_units_has_signal(self.upstream_metering_units)
+            && metering_units_has_signal(self.kiro_metering_usage)
+        {
+            self.upstream_metering_units = self.kiro_metering_usage;
+        }
+        if !metering_units_has_signal(self.kiro_metering_usage)
+            && metering_units_has_signal(self.upstream_metering_units)
+        {
+            self.kiro_metering_usage = self.upstream_metering_units;
+        }
+    }
+
     pub fn account_billing_ref(&self) -> Option<&AccountBilling> {
         self.account_billing
             .as_ref()
@@ -597,6 +620,10 @@ impl UsageRecord {
             self.external_pool_billing = self.account_billing.clone();
         }
     }
+}
+
+fn metering_units_has_signal(value: f64) -> bool {
+    value.is_finite() && value != 0.0
 }
 
 /// Builds a bounded diagnostic record for a sampled gateway rejection.
@@ -676,6 +703,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
         cache_creation_1h_input_tokens: 0,
         estimated_cost_usd: 0.0,
         original_cost_usd: 0.0,
+        upstream_metering_units: 0.0,
         kiro_metering_usage: 0.0,
         pricing_available: false,
         pricing_model: None,
@@ -887,6 +915,8 @@ pub struct UsageSummary {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
+    #[serde(default)]
+    pub total_upstream_metering_units: f64,
     #[serde(default)]
     pub total_kiro_metering_usage: f64,
     pub priced_requests: usize,
@@ -1473,6 +1503,8 @@ pub struct UsageDashboardSummary {
     #[serde(default)]
     pub total_original_cost_usd: f64,
     #[serde(default)]
+    pub total_upstream_metering_units: f64,
+    #[serde(default)]
     pub total_kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
@@ -1525,6 +1557,8 @@ pub struct UsageSeriesPoint {
     #[serde(default)]
     pub total_original_cost_usd: f64,
     #[serde(default)]
+    pub total_upstream_metering_units: f64,
+    #[serde(default)]
     pub total_kiro_metering_usage: f64,
 }
 
@@ -1554,6 +1588,8 @@ pub struct UsageTopAggregate {
     pub total_estimated_cost_usd: f64,
     #[serde(default)]
     pub total_original_cost_usd: f64,
+    #[serde(default)]
+    pub total_upstream_metering_units: f64,
     #[serde(default)]
     pub total_kiro_metering_usage: f64,
 }
@@ -2195,6 +2231,7 @@ fn ensure_metadata_object_flags(
 pub struct CredentialCostSummary {
     pub estimated_cost_usd: f64,
     pub original_cost_usd: f64,
+    pub upstream_metering_units: f64,
     pub kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
@@ -2361,6 +2398,7 @@ impl UsageRecorder {
             return UsageRecordOutcome::RejectedShuttingDown;
         }
         let mut record = record;
+        record.ensure_upstream_metering_compatibility();
         record.ensure_account_billing_compatibility();
         let record = normalize_error_diagnostics(record);
         let record_micros = parse_record_time(&record.created_at)
@@ -3212,6 +3250,7 @@ impl UsageRecorder {
             total_cache_creation_input_tokens: 0,
             total_estimated_cost_usd: 0.0,
             total_original_cost_usd: 0.0,
+            total_upstream_metering_units: 0.0,
             total_kiro_metering_usage: 0.0,
             priced_requests: 0,
             unpriced_requests: 0,
@@ -3287,7 +3326,9 @@ impl UsageRecorder {
             summary.total_cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
             summary.total_estimated_cost_usd += record.estimated_cost_usd;
             summary.total_original_cost_usd += record.original_cost_usd;
-            summary.total_kiro_metering_usage += record.kiro_metering_usage;
+            let metering_units = record.upstream_metering_units();
+            summary.total_upstream_metering_units += metering_units;
+            summary.total_kiro_metering_usage += metering_units;
             if record.pricing_available {
                 summary.priced_requests += 1;
             } else {
@@ -3416,7 +3457,9 @@ impl UsageRecorder {
             let entry = summaries.entry(credential_id).or_default();
             entry.estimated_cost_usd += record.estimated_cost_usd;
             entry.original_cost_usd += record.original_cost_usd;
-            entry.kiro_metering_usage += record.kiro_metering_usage;
+            let metering_units = record.upstream_metering_units();
+            entry.upstream_metering_units += metering_units;
+            entry.kiro_metering_usage += metering_units;
             if record.pricing_available {
                 entry.priced_requests += 1;
             } else {
@@ -3442,7 +3485,9 @@ impl UsageRecorder {
             let entry = summaries.entry(credential_id).or_default();
             entry.estimated_cost_usd += record.estimated_cost_usd;
             entry.original_cost_usd += record.original_cost_usd;
-            entry.kiro_metering_usage += record.kiro_metering_usage;
+            let metering_units = record.upstream_metering_units();
+            entry.upstream_metering_units += metering_units;
+            entry.kiro_metering_usage += metering_units;
             if record.pricing_available {
                 entry.priced_requests += 1;
             } else {
@@ -3983,7 +4028,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
     let original_cost = record.original_cost_usd.to_string();
-    let kiro_metering_usage = record.kiro_metering_usage.to_string();
+    let upstream_metering_units = record.upstream_metering_units().to_string();
     let attempt_chain = summarize_attempts(&record.credential_attempts);
 
     [
@@ -4008,7 +4053,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.error_detail.as_deref(),
         record.pricing_model.as_deref(),
         Some(estimated_cost.as_str()),
-        Some(kiro_metering_usage.as_str()),
+        Some(upstream_metering_units.as_str()),
         Some(attempt_chain.as_str()),
         credential_id.as_deref(),
     ]
@@ -4097,6 +4142,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
             original_cost_usd: 0.001,
+            upstream_metering_units: 0.0,
             kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
@@ -4282,6 +4328,41 @@ mod tests {
     }
 
     #[test]
+    fn usage_metering_fields_serialize_upstream_with_kiro_compatibility() {
+        let mut record = record("req_upstream_metering", 0, UsageSource::UpstreamMetadata);
+        record.upstream_metering_units = 1.25;
+        record.ensure_upstream_metering_compatibility();
+
+        let json = serde_json::to_value(&record).expect("usage record serializes");
+        assert_eq!(json["upstreamMeteringUnits"], 1.25);
+        assert_eq!(json["kiroMeteringUsage"], 1.25);
+
+        let mut legacy_json = json.clone();
+        legacy_json
+            .as_object_mut()
+            .expect("object")
+            .remove("upstreamMeteringUnits");
+        legacy_json["kiroMeteringUsage"] = serde_json::json!(2.5);
+        let mut historical: UsageRecord =
+            serde_json::from_value(legacy_json).expect("historical metering record deserializes");
+        historical.ensure_upstream_metering_compatibility();
+        assert_eq!(historical.upstream_metering_units, 2.5);
+        assert_eq!(historical.upstream_metering_units(), 2.5);
+
+        let mut primary_json = json;
+        primary_json
+            .as_object_mut()
+            .expect("object")
+            .remove("kiroMeteringUsage");
+        primary_json["upstreamMeteringUnits"] = serde_json::json!(3.75);
+        let mut primary_only: UsageRecord =
+            serde_json::from_value(primary_json).expect("primary metering record deserializes");
+        primary_only.ensure_upstream_metering_compatibility();
+        assert_eq!(primary_only.kiro_metering_usage, 3.75);
+        assert_eq!(primary_only.upstream_metering_units(), 3.75);
+    }
+
+    #[test]
     fn usage_summaries_serialize_account_billing_with_external_compatibility() {
         let billing = UsageExternalPoolBillingSummary {
             requests: 3,
@@ -4307,7 +4388,8 @@ mod tests {
             total_cache_creation_input_tokens: 5,
             total_estimated_cost_usd: 0.30,
             total_original_cost_usd: 0.10,
-            total_kiro_metering_usage: 0.0,
+            total_upstream_metering_units: 4.25,
+            total_kiro_metering_usage: 4.25,
             priced_requests: 2,
             unpriced_requests: 1,
             local_prompt_cache_requests: 0,
@@ -4323,6 +4405,8 @@ mod tests {
             top_conversations: Vec::new(),
         };
         let json = serde_json::to_value(summary).expect("summary serializes");
+        assert_eq!(json["totalUpstreamMeteringUnits"], 4.25);
+        assert_eq!(json["totalKiroMeteringUsage"], 4.25);
         assert_eq!(json["accountBilling"]["requests"], 3);
         assert_eq!(json["externalPoolBilling"]["requests"], 3);
 
@@ -4342,7 +4426,8 @@ mod tests {
             cache_read_ratio: 0.10,
             total_estimated_cost_usd: 0.30,
             total_original_cost_usd: 0.10,
-            total_kiro_metering_usage: 0.0,
+            total_upstream_metering_units: 4.25,
+            total_kiro_metering_usage: 4.25,
             priced_requests: 2,
             unpriced_requests: 1,
             average_duration_ms: 10.0,
@@ -4387,6 +4472,8 @@ mod tests {
             usage_source_breakdown: Vec::new(),
         };
         let json = serde_json::to_value(dashboard).expect("dashboard summary serializes");
+        assert_eq!(json["totalUpstreamMeteringUnits"], 4.25);
+        assert_eq!(json["totalKiroMeteringUsage"], 4.25);
         assert_eq!(json["accountBilling"]["billableCostUsd"], 0.30);
         assert_eq!(json["externalPoolBilling"]["billableCostUsd"], 0.30);
         assert_eq!(json["accountBillingByAccount"][0]["accountId"], 42);

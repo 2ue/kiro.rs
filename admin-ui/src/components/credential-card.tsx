@@ -947,8 +947,8 @@ export function CredentialCard({
               <span className="font-medium">{formatUsd(credential.originalCostUsd || 0)}</span>
             </div>
             <div>
-              <span className="text-muted-foreground">Kiro计量：</span>
-              <span className="font-medium">{formatMeteringUsage(credential.kiroMeteringUsage || 0)}</span>
+              <span className="text-muted-foreground">上游计量：</span>
+              <span className="font-medium">{formatMeteringUsage(credential.upstreamMeteringUnits ?? credential.kiroMeteringUsage ?? 0)}</span>
             </div>
             {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
               <div>
