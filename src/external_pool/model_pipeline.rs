@@ -1,7 +1,7 @@
 use super::*;
 
 #[allow(clippy::result_large_err)]
-pub(super) fn outbound_model_for_raw(
+pub(super) fn account_outbound_model_for_raw(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     raw_model: Option<&str>,
@@ -16,11 +16,11 @@ pub(super) fn outbound_model_for_raw(
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .or(original_model);
-    process_external_pool_model(pool, original_model, processed_model)
+    process_account_model(pool, original_model, processed_model)
 }
 
 #[allow(clippy::result_large_err)]
-fn process_external_pool_model(
+fn process_account_model(
     pool: &ExternalPool,
     original_model: Option<&str>,
     processed_model: Option<&str>,
@@ -44,7 +44,7 @@ fn process_external_pool_model(
             fallback_transform,
         },
     )
-    .map_err(|err| model_processing_error(pool, err))?;
+    .map_err(|err| account_model_processing_error(pool, err))?;
     Ok(Some(result.model))
 }
 
@@ -86,7 +86,10 @@ pub(super) fn normalize_outbound_model(model: &str) -> String {
     out
 }
 
-fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> ExternalPoolError {
+fn account_model_processing_error(
+    pool: &ExternalPool,
+    err: ModelProcessingError,
+) -> ExternalPoolError {
     match err {
         ModelProcessingError::MissingModel => ExternalPoolError {
             status: Some(StatusCode::BAD_REQUEST),

@@ -101,7 +101,11 @@ pub(super) fn prepare_request(
     }
 
     let outbound_model = if model.is_enabled() {
-        model_pipeline::outbound_model_for_raw(route, pool, normalized_base.probe.model.as_deref())?
+        model_pipeline::account_outbound_model_for_raw(
+            route,
+            pool,
+            normalized_base.probe.model.as_deref(),
+        )?
     } else {
         None
     };
@@ -399,8 +403,11 @@ fn prepare_raw_request(
         }),
         RawModelStagePlan::ProbeOnly => {
             let probe = effective_raw_probe(route, pool)?;
-            let outbound_model =
-                model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
+            let outbound_model = model_pipeline::account_outbound_model_for_raw(
+                route,
+                pool,
+                probe.model.as_deref(),
+            )?;
             Ok(PreparedAccountRequest {
                 body: route.effective_raw_body.clone(),
                 outbound_model,
@@ -408,8 +415,11 @@ fn prepare_raw_request(
         }
         RawModelStagePlan::RewriteTopLevel => {
             let probe = effective_raw_probe(route, pool)?;
-            let outbound_model =
-                model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
+            let outbound_model = model_pipeline::account_outbound_model_for_raw(
+                route,
+                pool,
+                probe.model.as_deref(),
+            )?;
             let Some(outbound_model_value) = outbound_model.as_deref() else {
                 return Ok(PreparedAccountRequest {
                     body: route.effective_raw_body.clone(),
