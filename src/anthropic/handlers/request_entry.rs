@@ -1,4 +1,5 @@
 use super::*;
+use crate::account_runtime::AccountRuntimeConfigExt;
 
 const MAX_ENTRY_ERROR_MESSAGE_CHARS: usize = 512;
 
@@ -28,12 +29,12 @@ pub(super) async fn handle_messages_endpoint(
         .max(
             runtime_config
                 .account_runtime
-                .effective_dispatch_max_wait_secs(),
+                .effective_account_dispatch_max_wait_secs(),
         )
         .max(
             runtime_config
                 .account_runtime
-                .external_pool_local_rescue_max_wait_secs,
+                .legacy_local_rescue_max_wait_secs(),
         );
     inference_attempt_budget.set_dispatch_deadline_after(std::time::Duration::from_secs(
         shared_dispatch_max_wait_secs.max(1),
@@ -253,7 +254,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
 
     // If the account runtime is enabled and wired, the normalized account route may still be
     // eligible after typed parsing. Do not preempt it with a local-only response.
-    if runtime_config.account_runtime.external_pools_enabled
+    if runtime_config.account_runtime.account_runtime_enabled()
         && state.account_runtime_manager.is_some()
     {
         return None;

@@ -42,11 +42,12 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Top-level runtime configuration now exposes account-runtime accessors, and new startup, router, Admin runtime-config and reload-invalidation call sites use those accessors instead of direct `Config.external_pools` access while compatibility storage remains mirrored.
 - Anthropic request-state wiring now uses `account_runtime` fields in `AppState` and `RequestRuntimeConfig`, so raw direct, preflight and normalized fallback entrypoints no longer receive the account policy through an external-pool-named request field.
 - Admin account service methods now use account-named bridge methods for list, status, supported-model discovery, test and cache/data invalidation instead of directly calling legacy external-pool service methods. Storage and cache keys remain compatibility details for now.
+- `AccountRuntimeConfigExt` now gives new Admin/request-entry/route-gate code account-named accessors for enablement, route policy, dispatch wait, request timeout and usage cost-floor settings while the legacy config structure remains the temporary storage mirror.
 
 ## In Progress
 
 - Migrate account runtime internals away from legacy external-pool names behind the `account_runtime` facade while preserving current scheduler, proxy, body-mode, retry, usage projection and compatibility behavior.
-- Convert remaining backend config DTO/type names and storage compatibility bridges from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
+- Convert remaining backend config DTO/type names, validation helpers and storage compatibility bridges from external-pool terminology toward account terminology while preserving temporary compatibility aliases only where existing clients still need them.
 
 ## Next
 

@@ -44,7 +44,9 @@ use super::types::{
     UsageCleanupResumeRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
     ValidateExternalCredentialsRequest,
 };
-use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
+use crate::account_runtime::{
+    AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
+};
 use crate::anthropic::{
     inference_attempt_budget::{
         MAX_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
@@ -1296,8 +1298,7 @@ impl AdminService {
         let config = self.token_manager.runtime_config();
         let timeout_secs = config
             .account_runtime_config()
-            .external_pool_request_timeout_secs
-            .clamp(1, 60);
+            .clamped_account_request_timeout_secs();
         let client = build_client(None, timeout_secs, config.tls_backend)
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let mut request_builder = client
@@ -4172,9 +4173,8 @@ impl AdminService {
         let config = self.token_manager.runtime_config();
         let account_runtime = config.account_runtime_config();
         let cost_config = UsageExternalPoolRiskCostConfig {
-            cost_floor_enabled: account_runtime.external_pool_usage_projection_cost_floor_enabled,
-            cost_floor_margin_percent: account_runtime
-                .external_pool_usage_projection_cost_floor_margin_percent,
+            cost_floor_enabled: account_runtime.usage_projection_cost_floor_enabled(),
+            cost_floor_margin_percent: account_runtime.usage_projection_cost_floor_margin_percent(),
         };
         self.usage_recorder
             .external_pool_usage_risk(query, cost_config)

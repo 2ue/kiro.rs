@@ -92,7 +92,9 @@ use super::usage::{
     UsageSource,
 };
 use super::websearch;
-use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
+use crate::account_runtime::{
+    AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
+};
 use crate::external_pool::{
     ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolRequestBodyMode,
     ExternalRouteRequest, ExternalRouteRequestPreparationCache,
@@ -1251,7 +1253,7 @@ fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
 }
 
 fn account_runtime_enabled_for_endpoint(config: &AccountRuntimeConfig, endpoint: &str) -> bool {
-    config.external_pools_enabled && config.external_pool_route_allowed(endpoint)
+    config.account_runtime_enabled_for_endpoint(endpoint)
 }
 
 #[cfg(test)]
@@ -1429,7 +1431,7 @@ async fn maybe_raw_external_preflight_response(
                     request_id,
                     reason = rescue_reason,
                     local_fallback_reason = %reason,
-                    max_wait_secs = config.external_pool_local_rescue_max_wait_secs,
+                    max_wait_secs = config.legacy_local_rescue_max_wait_secs(),
                     external_status = err.status.as_u16(),
                     external_error_type = %err.route_error_type,
                     external_attempt_count = err.attempts.len(),
@@ -2172,7 +2174,7 @@ fn local_pool_acquire_mode(config: &AccountRuntimeConfig) -> AcquireMode {
 }
 
 fn local_scheduler_redis_degraded_fallback_wait(config: &AccountRuntimeConfig) -> Duration {
-    let configured = Duration::from_secs(config.effective_dispatch_max_wait_secs());
+    let configured = Duration::from_secs(config.effective_account_dispatch_max_wait_secs());
     if config.fallback_on_scheduler_redis_degraded {
         configured.min(Duration::from_millis(
             LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS,
@@ -2277,7 +2279,7 @@ fn bounded_preflight_capacity_wait(
     config: &AccountRuntimeConfig,
     inference_attempt_budget: &InferenceAttemptBudget,
 ) -> Duration {
-    let configured = Duration::from_secs(config.effective_dispatch_max_wait_secs())
+    let configured = Duration::from_secs(config.effective_account_dispatch_max_wait_secs())
         .min(Duration::from_millis(LOCAL_CAPACITY_PREFLIGHT_GRACE_MAX_MS));
     inference_attempt_budget
         .dispatch_remaining()
