@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub(crate) const RAW_UPSTREAM_ERROR_BODY_MAX_BYTES: usize = 2 * 1024;
 const RAW_UPSTREAM_ERROR_JSON_PARSE_MAX_BYTES: usize = 64 * 1024;
@@ -55,6 +56,32 @@ impl RawUpstreamError {
         Self::from_bytes(source, status_code, content_type, body.as_bytes())
     }
 
+    pub fn from_redacted_body_metadata(
+        source: impl Into<String>,
+        status_code: Option<u16>,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Self {
+        let body_bytes = body.len();
+        let content_type = content_type
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let body_kind = upstream_error_body_kind(body, content_type.as_deref());
+        let fingerprint = upstream_error_body_fingerprint(body);
+        let truncated = body_bytes > RAW_UPSTREAM_ERROR_BODY_MAX_BYTES;
+        Self {
+            source: source.into(),
+            status_code,
+            content_type,
+            body: format!(
+                "redacted_upstream_body kind={body_kind} fingerprint_sha256={fingerprint}"
+            ),
+            body_bytes,
+            truncated,
+        }
+    }
+
     pub fn normalize(mut self) -> Self {
         let normalized = Self::from_text(
             self.source.clone(),
@@ -68,6 +95,24 @@ impl RawUpstreamError {
         self.content_type = normalized.content_type;
         self
     }
+}
+
+fn upstream_error_body_kind(body: &[u8], content_type: Option<&str>) -> &'static str {
+    if body.is_empty() {
+        return "empty";
+    }
+    if upstream_error_looks_like_json(body, content_type) {
+        return "json";
+    }
+    if std::str::from_utf8(body).is_ok() {
+        return "text";
+    }
+    "binary"
+}
+
+fn upstream_error_body_fingerprint(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    format!("{digest:x}").chars().take(16).collect()
 }
 
 fn upstream_error_fragment(body: &[u8], content_type: Option<&str>) -> (String, bool) {
@@ -277,5 +322,27 @@ mod tests {
         assert!(!error.body.contains("largePayloadEcho"));
         assert!(!error.body.contains("should not be copied"));
         assert_eq!(error.body_bytes, body.len());
+    }
+
+    #[test]
+    fn raw_upstream_error_redacted_metadata_does_not_copy_json_error_values() {
+        let body = serde_json::json!({
+            "message": "PRIVATE_PROVIDER_MARKER",
+            "private": "PRIVATE_PROVIDER_MARKER"
+        })
+        .to_string();
+        let error = RawUpstreamError::from_redacted_body_metadata(
+            "official_upstream",
+            Some(400),
+            Some("application/json"),
+            body.as_bytes(),
+        );
+
+        assert_eq!(error.source, "official_upstream");
+        assert_eq!(error.body_bytes, body.len());
+        assert!(error.body.contains("redacted_upstream_body kind=json"));
+        assert!(error.body.contains("fingerprint_sha256="));
+        assert!(!error.body.contains("PRIVATE_PROVIDER_MARKER"));
+        assert!(!error.truncated);
     }
 }

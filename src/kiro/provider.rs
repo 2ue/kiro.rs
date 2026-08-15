@@ -10572,11 +10572,11 @@ impl KiroProvider {
             };
             let body_bytes = upstream_body.bytes;
             let body = upstream_body.text;
-            let raw_upstream_error = RawUpstreamError::from_text(
-                "kiro_official",
+            let raw_upstream_error = RawUpstreamError::from_redacted_body_metadata(
+                "official_upstream",
                 Some(status.as_u16()),
                 Some(content_kind.as_str()),
-                &body,
+                body.as_bytes(),
             );
 
             if status.is_success() {
@@ -11278,11 +11278,11 @@ impl KiroProvider {
                         ));
                     }
                 };
-                let retry_raw_upstream_error = RawUpstreamError::from_text(
-                    "kiro_official",
+                let retry_raw_upstream_error = RawUpstreamError::from_redacted_body_metadata(
+                    "official_upstream",
                     Some(retry_status.as_u16()),
                     Some(retry_content_kind.as_str()),
-                    &retry_upstream_body.text,
+                    retry_upstream_body.text.as_bytes(),
                 );
 
                 if Self::is_thinking_signature_invalid_response(
