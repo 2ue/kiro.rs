@@ -55,7 +55,7 @@ pub struct CompressionConfig {
     pub whitespace_compression: bool,
 }
 
-/// Kiro payload shaping 配置。
+/// 本地上游 payload shaping 配置。
 ///
 /// 该配置只处理旧历史和可安全压缩的冗余内容；默认不截断当前用户消息、
 /// 当前合法 tool_result、当前 document/PDF 或当前图片。
@@ -134,7 +134,7 @@ pub enum ToolSchemaKeyMappingMode {
     Disabled,
 }
 
-/// 本地 Anthropic -> Kiro body 转换能力开关。
+/// 本地 Anthropic-compatible body 转换能力开关。
 ///
 /// 这些开关只影响本地凭据路径的 Kiro 协议转换器。外部池 raw body 透传不会进入
 /// 这些转换阶段；外部池 normalized body 仍按外部池自己的 body/model/usage 配置处理。
@@ -146,7 +146,7 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub tool_schema_normalization: bool,
 
-    /// 将不符合 Kiro 工具名约束的名称清洗/缩短，并维护响应反向映射。
+    /// 将不符合本地上游工具名约束的名称清洗/缩短，并维护响应反向映射。
     #[serde(default = "default_true")]
     pub tool_name_mapping: bool,
 
@@ -701,7 +701,7 @@ pub struct PayloadShapingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolFormatDebugConfig {
-    /// 是否在 Kiro 上游返回 tool-use 格式错误时记录内部诊断。
+    /// 是否在本地上游返回 tool-use 格式错误时记录内部诊断。
     #[serde(default = "default_tool_format_debug_enabled")]
     pub enabled: bool,
     /// JSONL 诊断文件目录。仅用于内部排查，不返回给下游。
@@ -731,7 +731,7 @@ pub struct ToolFormatDebugConfig {
     /// 诊断字段中的字符串最大字节数。
     #[serde(default = "default_tool_format_debug_max_string_bytes")]
     pub max_string_bytes: usize,
-    /// 是否在采样命中的 tool-use 格式错误诊断中记录实际发送失败的 Kiro 请求体。
+    /// 是否在采样命中的 tool-use 格式错误诊断中记录实际发送失败的本地上游请求体。
     #[serde(default = "default_tool_format_debug_capture_request_body")]
     pub capture_request_body: bool,
     /// 单条诊断中最多保留多少字节的请求体内容。
@@ -2556,7 +2556,7 @@ impl Default for LocalUpstreamAgentModeStrategy {
 ///
 /// `compatible` 保持当前 Claude Code 兼容行为：允许 `sonnet`、`opus`、
 /// `default` 等短别名，也允许把同 family 的旧版/未来模型名映射到当前
-/// Kiro 上游可用模型。`alias_only` 只允许精确模型和显式别名，不做
+/// 本地上游可用模型。`alias_only` 只允许精确模型和显式别名，不做
 /// 宽松 family 归一化。`exact_only` 只允许模型能力目录里的精确模型 ID。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2669,7 +2669,7 @@ impl ModelMappingConfig {
     }
 }
 
-/// Kiro payload guard 的大小裁剪触发模式。
+/// 本地上游 payload guard 的大小裁剪触发模式。
 ///
 /// `preemptive` 保持原有行为：发送上游前只要超过 `payloadGuardMaxBytes`
 /// 就执行配置的内容整形和裁剪。`on_too_long` 首次请求只做协议修复；
@@ -3689,7 +3689,7 @@ pub struct Config {
     #[serde(default)]
     pub image_processing: ImageProcessingConfig,
 
-    /// 本地 Anthropic -> Kiro 协议转换能力配置。
+    /// 本地 Anthropic-compatible 协议转换能力配置。
     #[serde(default)]
     pub body_conversion: BodyConversionConfig,
 
@@ -3702,13 +3702,13 @@ pub struct Config {
     #[serde(default)]
     pub missing_max_tokens: MissingMaxTokensConfig,
 
-    /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
+    /// 本地上游 payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
     #[serde(default)]
     pub payload_shaping: PayloadShapingConfig,
 
-    /// 发送 Kiro 上游前启用最终 payload 防护。
+    /// 发送本地上游前启用最终 payload 防护。
     ///
-    /// 防护在 Anthropic -> Kiro 转换之后运行，按真实 JSON 字节数裁剪旧历史，
+    /// 防护在本地上游协议转换之后运行，按真实 JSON 字节数裁剪旧历史，
     /// 并修复 Kiro 容易返回 `400 Improperly formed request` 的工具配对边界。
     #[serde(default = "default_payload_guard_enabled")]
     pub payload_guard_enabled: bool,
@@ -3717,7 +3717,7 @@ pub struct Config {
     #[serde(default = "default_payload_guard_mode")]
     pub payload_guard_mode: PayloadGuardMode,
 
-    /// Kiro 上游请求 JSON body 的本地裁剪目标。默认使用保守阈值 450 KiB；
+    /// 本地上游请求 JSON body 的本地裁剪目标。默认使用保守阈值 450 KiB；
     /// `0` 表示不按大小整形或裁剪，但仍执行协议修复。该字段不是入站
     /// hard limit；无法安全裁剪时会记录 `still_oversized` 并由上游裁决。
     #[serde(default = "default_payload_guard_max_bytes")]
@@ -3727,12 +3727,12 @@ pub struct Config {
     ///
     /// 当 `payloadGuardMaxBytes > 0` 时，实际裁剪目标为
     /// `payloadGuardMaxBytes - payloadGuardSafetyMarginBytes`，避免 provider
-    /// 层追加 endpoint/profile 等字段后贴近 Kiro 的真实请求体上限。
+    /// 层追加 endpoint/profile 等字段后贴近本地上游的真实请求体上限。
     #[serde(default = "default_payload_guard_safety_margin_bytes")]
     pub payload_guard_safety_margin_bytes: usize,
 
     /// payload 超限时是否允许裁剪最旧历史。关闭后只执行轻量协议修复；
-    /// 仍超预算的请求会标记 `still_oversized` 并继续透传给 Kiro。
+    /// 仍超预算的请求会标记 `still_oversized` 并继续透传给本地上游。
     #[serde(default = "default_payload_guard_trim_history")]
     pub payload_guard_trim_history: bool,
 

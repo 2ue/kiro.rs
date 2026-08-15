@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-/// Anthropic <-> Kiro API 客户端
+/// Anthropic-compatible API client
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Args {

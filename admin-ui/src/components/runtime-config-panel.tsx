@@ -3098,7 +3098,7 @@ export function RuntimeConfigPanel() {
   const payloadConditionDescription = payloadSizeLimitEnabled
     ? payloadGuardRetryMode
       ? '第一次上游请求只做协议修复和字节统计；只有返回输入过长类错误时，才按 payloadGuardMaxBytes 裁剪并重试一次。'
-      : '这些配置会在发送上游前判断最终 Kiro JSON body 是否大于 payloadGuardMaxBytes；小请求不会被截断或整形。'
+      : '这些配置会在发送上游前判断最终本地上游 JSON body 是否大于 payloadGuardMaxBytes；小请求不会被截断或整形。'
     : '当前 payloadGuardMaxBytes 为 0 或 Payload 防护关闭，因此这些按大小触发的历史整形、历史裁剪和错误后裁剪重试都不会运行。'
 
   if (config.isLoading) {
@@ -3579,7 +3579,7 @@ export function RuntimeConfigPanel() {
             </label>
             <ToggleField
               title="展开本地文件 source"
-              description="把已上传文件引用展开为可发送给 Kiro 的 inline 内容。"
+              description="把已上传文件引用展开为可发送给本地上游的 inline 内容。"
               checked={Boolean(draft.imageProcessing?.safeMaterializeFileSources)}
               disabled={imageProcessingMode !== 'safe'}
               onCheckedChange={(safeMaterializeFileSources) =>
@@ -3719,7 +3719,7 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="tool_choice 引导"
-              description="控制本地 Kiro 的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
+              description="控制本地上游的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
               checked={draft.promptSteering.toolChoice.enabled}
               onCheckedChange={(enabled) => updatePromptToggle('toolChoice', enabled)}
             />
@@ -3800,16 +3800,16 @@ export function RuntimeConfigPanel() {
             </label>
             <ImpactGroupHeader
               label="本地转换"
-              title="本地凭据路径的 Anthropic -> Kiro 转换能力"
+              title="本地上游路径的 Anthropic-compatible 转换能力"
               description="这些开关只影响本地凭据请求。上游账号 raw body 透传不会进入这些阶段，上游账号 normalized 仍按上游账号自己的配置处理。"
             />
             {[
               ['toolSchemaNormalization', '工具 schema 规范化', '清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。'],
-              ['toolNameMapping', '工具名映射', '清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。'],
+              ['toolNameMapping', '工具名映射', '清洗或缩短不符合本地上游工具名约束的名称，并记录响应反向映射。'],
               ['toolChoiceSteering', '结构化 tool_choice', '按请求语义执行 none=0、any=N、named=1 工具过滤；提示词总开关只控制额外提示，不删除结构化语义。'],
-              ['thinkingPromptControls', 'thinking 转换能力', '允许本地 Kiro 生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。'],
+              ['thinkingPromptControls', 'thinking 转换能力', '允许本地上游生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。'],
               ['chunkedToolPolicy', '分块工具策略', '定义 Write/Edit 分块协议能力；额外 system/工具描述提示受上方总开关控制。'],
-              ['nativeReasoningFields', '原生 reasoning 字段', '对支持的 Kiro 模型上报 additionalModelRequestFields。'],
+              ['nativeReasoningFields', '原生 reasoning 字段', '对支持的本地上游模型上报 additionalModelRequestFields。'],
               ['toolPairingRepair', '工具配对修复', '清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
             ].map(([key, title, description]) => (
@@ -3924,7 +3924,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="上游 Payload 裁剪目标阈值"
-              description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。"
+              description="按最终发送到本地上游的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。"
               value={draft.payloadGuardMaxBytes}
               min={0}
               suffix="bytes"
@@ -3934,7 +3934,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="Payload 安全余量"
-              description="实际裁剪目标会从上面的阈值中扣除该余量。默认 32768 bytes；用于避免 provider 层追加字段后贴近 Kiro 请求体上限。"
+              description="实际裁剪目标会从上面的阈值中扣除该余量。默认 32768 bytes；用于避免 provider 层追加字段后贴近本地上游请求体上限。"
               value={draft.payloadGuardSafetyMarginBytes}
               min={0}
               suffix="bytes"
@@ -3951,7 +3951,7 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="超限裁剪旧历史"
-              description="按当前模式触发大小裁剪时，优先裁剪最旧历史；关闭后不会裁 history，仍超限会继续透传给 Kiro。"
+              description="按当前模式触发大小裁剪时，优先裁剪最旧历史；关闭后不会裁 history，仍超限会继续透传给本地上游。"
               checked={draft.payloadGuardTrimHistory}
               disabled={!payloadSizeLimitEnabled}
               onCheckedChange={(payloadGuardTrimHistory) =>

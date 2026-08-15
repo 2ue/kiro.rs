@@ -1175,7 +1175,7 @@ export function RuntimePage() {
                     </div>
                     <TogField
                       label="展开本地文件 source"
-                      desc="把已上传文件引用展开为可发送给 Kiro 的 inline 内容。"
+                      desc="把已上传文件引用展开为可发送给本地上游的 inline 内容。"
                       checked={Boolean(draft.imageProcessing?.safeMaterializeFileSources)}
                       disabled={imageProcessingMode !== 'safe'}
                       onChange={setImageProcessing('safeMaterializeFileSources')}
@@ -1280,7 +1280,7 @@ export function RuntimePage() {
                     />
                     <TogField
                       label="tool_choice 引导"
-                      desc="控制本地 Kiro 的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
+                      desc="控制本地上游的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
                       checked={draft.promptSteering.toolChoice.enabled}
                       onChange={setPromptSteeringToggle('toolChoice')}
                     />
@@ -1372,7 +1372,7 @@ export function RuntimePage() {
                   </div>
                   <TwoCol>
                     <TogField label="工具 schema 规范化" desc="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
-                    <TogField label="工具名映射" desc="清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
+                    <TogField label="工具名映射" desc="清洗或缩短不符合本地上游工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
                     <div className="rounded-md border bg-background p-4">
                       <div className="mb-3">
                         <div className="text-sm font-medium">schema key 映射</div>
@@ -1398,9 +1398,9 @@ export function RuntimePage() {
                         onChange={(event) => setBodyConversion('toolSchemaKeyValidationRegex')(event.target.value)}
                       />
                     </div>
-                    <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
+                    <TogField label="原生 reasoning 字段" desc="对支持的本地上游模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
                     <TogField label="结构化 tool_choice" desc="按请求语义执行 none=0、any=N、named=1 工具过滤；提示词总开关只控制额外提示，不删除结构化语义。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
-                    <TogField label="thinking 转换能力" desc="允许本地 Kiro 生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
+                    <TogField label="thinking 转换能力" desc="允许本地上游生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
                     <TogField label="分块工具策略" desc="定义 Write/Edit 分块协议能力；额外 system/工具描述提示受上方总开关控制。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
                     <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
