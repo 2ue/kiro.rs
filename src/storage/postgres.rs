@@ -14672,7 +14672,7 @@ mod tests {
         assert_eq!(top_credentials[0].key, "7");
         assert!(
             (top_credentials[0].total_kiro_metering_usage - 15.0).abs() < 1e-12,
-            "windowed credential top must preserve Kiro metering from rollup and boundary rows"
+            "windowed credential top must preserve Upstream metering from rollup and boundary rows"
         );
 
         let status = usage_store
@@ -15306,7 +15306,7 @@ mod tests {
             .save_credential_account_info(
                 7,
                 &CredentialAccountInfoRow {
-                    subscription_title: Some("Kiro Pro".to_string()),
+                    subscription_title: Some("Upstream Pro".to_string()),
                     current_usage: 90.0,
                     usage_limit: 1000.0,
                     remaining: 910.0,
@@ -15328,7 +15328,10 @@ mod tests {
             .unwrap();
         let account_info = store.load_credential_account_info().await.unwrap();
         let account_info = account_info.get(&7).unwrap();
-        assert_eq!(account_info.subscription_title.as_deref(), Some("Kiro Pro"));
+        assert_eq!(
+            account_info.subscription_title.as_deref(),
+            Some("Upstream Pro")
+        );
         assert_eq!(account_info.current_usage, 90.0);
         assert_eq!(account_info.usage_limit, 1000.0);
 

@@ -190,9 +190,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
 - Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
 - Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
+- Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving the generic tier parsing behavior.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro Pro|Kiro Power|KIRO FREE|KIRO PRO|Kiro Pro\\+|Kiro Pro Max" src/admin/service_tests.rs src/storage/postgres.rs`
+- `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-test1 -- bash -lc 'cargo test subscription_ -- --nocapture && cargo test credit_snapshot -- --nocapture && cargo test account_info -- --nocapture'`
+- `git diff --check`
 - `rg -n "local Kiro|本地 Kiro|Kiro dispatch|legacy_kiro_metering_usage" src/anthropic/handlers/tests.rs`
 - `feature/tests/run-cargo-scoped.sh handler-local-upstream-test-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh handler-local-upstream-test-text-test1 -- bash -lc 'cargo test direct_account_policy -- --nocapture && cargo test stream_pre_output -- --nocapture && cargo test metering -- --nocapture && cargo test official_upstream_message_with_internal_brand_term_is_masked -- --nocapture'`

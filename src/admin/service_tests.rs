@@ -224,49 +224,49 @@ fn credential_admin_list_options_include_account_info_snapshot() {
 #[test]
 fn credit_snapshot_uses_overage_bonus_for_all_paid_tiers() {
     let free_without_overage =
-        credit_snapshot_for_subscription(Some("KIRO FREE"), 34.52, 50.0, 0.0);
+        credit_snapshot_for_subscription(Some("UPSTREAM FREE"), 34.52, 50.0, 0.0);
     assert_eq!(free_without_overage.limit, 50.0);
     assert!((free_without_overage.remaining - 15.48).abs() < 1e-9);
     assert_eq!(free_without_overage.base, 50.0);
     assert_eq!(free_without_overage.bonus, 0.0);
 
     let pro_without_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 1_000.0, 0.0);
+        credit_snapshot_for_subscription(Some("Upstream Pro"), 125.25, 1_000.0, 0.0);
     assert_eq!(pro_without_overage.limit, 1_000.0);
     assert_eq!(pro_without_overage.remaining, 874.75);
     assert_eq!(pro_without_overage.base, 1_000.0);
     assert_eq!(pro_without_overage.bonus, 0.0);
 
     let pro_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 11_000.0, 10_000.0);
+        credit_snapshot_for_subscription(Some("Upstream Pro"), 125.25, 11_000.0, 10_000.0);
     assert_eq!(pro_with_overage.limit, 11_000.0);
     assert_eq!(pro_with_overage.remaining, 10_874.75);
     assert_eq!(pro_with_overage.base, 1_000.0);
     assert_eq!(pro_with_overage.bonus, 10_000.0);
 
     let pro_plus_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro+"), 125.25, 12_000.0, 10_000.0);
+        credit_snapshot_for_subscription(Some("Upstream Pro+"), 125.25, 12_000.0, 10_000.0);
     assert_eq!(pro_plus_with_overage.limit, 12_000.0);
     assert_eq!(pro_plus_with_overage.remaining, 11_874.75);
     assert_eq!(pro_plus_with_overage.base, 2_000.0);
     assert_eq!(pro_plus_with_overage.bonus, 10_000.0);
 
     let pro_max_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Pro Max"), 125.25, 15_000.0, 10_000.0);
+        credit_snapshot_for_subscription(Some("Upstream Pro Max"), 125.25, 15_000.0, 10_000.0);
     assert_eq!(pro_max_with_overage.limit, 15_000.0);
     assert_eq!(pro_max_with_overage.remaining, 14_874.75);
     assert_eq!(pro_max_with_overage.base, 5_000.0);
     assert_eq!(pro_max_with_overage.bonus, 10_000.0);
 
     let power_without_overage =
-        credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 10_000.0, 0.0);
+        credit_snapshot_for_subscription(Some("Upstream Power"), 125.25, 10_000.0, 0.0);
     assert_eq!(power_without_overage.limit, 10_000.0);
     assert_eq!(power_without_overage.remaining, 9_874.75);
     assert_eq!(power_without_overage.base, 10_000.0);
     assert_eq!(power_without_overage.bonus, 0.0);
 
     let power_with_overage =
-        credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 20_000.0, 10_000.0);
+        credit_snapshot_for_subscription(Some("Upstream Power"), 125.25, 20_000.0, 10_000.0);
     assert_eq!(power_with_overage.limit, 20_000.0);
     assert_eq!(power_with_overage.remaining, 19_874.75);
     assert_eq!(power_with_overage.base, 10_000.0);
@@ -275,22 +275,22 @@ fn credit_snapshot_uses_overage_bonus_for_all_paid_tiers() {
 
 #[test]
 fn subscription_key_and_rank_distinguish_pro_max_from_pro() {
-    for title in ["Kiro Pro Max", "KIRO PRO_MAX", "pro-max", "promax"] {
+    for title in ["Upstream Pro Max", "UPSTREAM PRO_MAX", "pro-max", "promax"] {
         assert_eq!(subscription_key(Some(title)), "pro_max", "title={title}");
         assert_eq!(subscription_rank(Some(title)), 5, "title={title}");
     }
-    assert_eq!(subscription_key(Some("Kiro Pro")), "pro");
-    assert_eq!(subscription_rank(Some("Kiro Pro")), 3);
-    assert_eq!(subscription_key(Some("Kiro Pro+")), "pro_plus");
-    assert_eq!(subscription_rank(Some("Kiro Pro+")), 4);
-    assert_eq!(subscription_key(Some("Kiro Power")), "power");
-    assert_eq!(subscription_rank(Some("Kiro Power")), 6);
+    assert_eq!(subscription_key(Some("Upstream Pro")), "pro");
+    assert_eq!(subscription_rank(Some("Upstream Pro")), 3);
+    assert_eq!(subscription_key(Some("Upstream Pro+")), "pro_plus");
+    assert_eq!(subscription_rank(Some("Upstream Pro+")), 4);
+    assert_eq!(subscription_key(Some("Upstream Power")), "power");
+    assert_eq!(subscription_rank(Some("Upstream Power")), 6);
 }
 
 #[test]
 fn live_credit_snapshot_does_not_infer_bonus_from_usage_limit() {
     let pro_without_active_bonus =
-        credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 11_000.0, 0.0);
+        credit_snapshot_for_subscription(Some("Upstream Pro"), 125.25, 11_000.0, 0.0);
 
     assert_eq!(pro_without_active_bonus.limit, 1_000.0);
     assert_eq!(pro_without_active_bonus.remaining, 874.75);
@@ -301,7 +301,7 @@ fn live_credit_snapshot_does_not_infer_bonus_from_usage_limit() {
 #[test]
 fn persisted_credit_snapshot_recomputes_from_usage_limit() {
     let old_wrong_power = credit_snapshot_from_persisted_fields(
-        Some("Kiro Power"),
+        Some("Upstream Power"),
         250.0,
         20_000.0,
         10_000.0,
@@ -315,7 +315,7 @@ fn persisted_credit_snapshot_recomputes_from_usage_limit() {
     assert_eq!(old_wrong_power.bonus, 10_000.0);
 
     let old_wrong_pro_without_overage = credit_snapshot_from_persisted_fields(
-        Some("Kiro Pro"),
+        Some("Upstream Pro"),
         250.0,
         1_000.0,
         11_000.0,
@@ -332,7 +332,7 @@ fn persisted_credit_snapshot_recomputes_from_usage_limit() {
 #[test]
 fn persisted_credit_snapshot_only_infers_fixed_overage_bonus() {
     let trial_like_extra_limit = credit_snapshot_from_persisted_fields(
-        Some("Kiro Pro"),
+        Some("Upstream Pro"),
         125.0,
         1_500.0,
         11_000.0,
@@ -378,7 +378,7 @@ fn credential_item(
         email: Some(format!("user{}@example.com", id)),
         subscription_title: None,
         account_info: usage_percentage.map(|usage_percentage| CredentialAccountInfo {
-            subscription_title: Some("Kiro Pro".to_string()),
+            subscription_title: Some("Upstream Pro".to_string()),
             current_usage: usage_percentage,
             usage_limit: 100.0,
             remaining: 100.0 - usage_percentage,
