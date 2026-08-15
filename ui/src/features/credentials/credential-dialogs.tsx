@@ -176,7 +176,7 @@ function initialParameterDefaults(): CredentialParameterDefaults {
 }
 
 function initialCredentialForm() {
-  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false }
+  return { authMethod: 'social' as AuthMethod, refreshToken: '', apiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false }
 }
 
 function formFromCredential(c: AddCredentialRequest) {
@@ -184,7 +184,7 @@ function formFromCredential(c: AddCredentialRequest) {
   return {
     ...initialCredentialForm(),
     authMethod: (c.authMethod || (apiKey ? 'api_key' : c.clientId && c.clientSecret ? 'idc' : 'social')) as AuthMethod,
-    refreshToken: c.refreshToken || '', kiroApiKey: apiKey, profileArn: c.profileArn || '',
+    refreshToken: c.refreshToken || '', apiKey, profileArn: c.profileArn || '',
     region: c.region || '', authRegion: c.authRegion || '', apiRegion: c.apiRegion || '',
     clientId: c.clientId || '', clientSecret: c.clientSecret || '', tokenEndpoint: c.tokenEndpoint || '',
     issuerUrl: c.issuerUrl || '', scopes: c.scopes || '', email: c.email || '',
@@ -397,7 +397,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           ...prev,
           authMethod: am,
           refreshToken: am === 'api_key' ? '' : prev.refreshToken,
-          kiroApiKey: am === 'api_key' ? prev.kiroApiKey : '',
+          apiKey: am === 'api_key' ? prev.apiKey : '',
           clientId: am === 'idc' || am === 'external_idp' ? prev.clientId : '',
           clientSecret: am === 'idc' ? prev.clientSecret : '',
           tokenEndpoint: am === 'external_idp' ? prev.tokenEndpoint : '',
@@ -405,12 +405,12 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           scopes: am === 'external_idp' ? prev.scopes : '',
         }
       }
-      if (key === 'kiroApiKey') {
+      if (key === 'apiKey') {
         const parsed = splitApiKeyDraft(value)
         if (parsed.region) {
           return {
             ...prev,
-            kiroApiKey: parsed.key,
+            apiKey: parsed.key,
             region: prev.region.trim() ? prev.region : parsed.region,
             authRegion: prev.authRegion.trim() ? prev.authRegion : parsed.region,
             apiRegion: prev.apiRegion.trim() ? prev.apiRegion : parsed.region,
@@ -437,7 +437,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (isApiKey && !form.kiroApiKey.trim()) return toast.error('请输入上游 API Key')
+    if (isApiKey && !form.apiKey.trim()) return toast.error('请输入上游 API Key')
     if (!isApiKey && !form.refreshToken.trim()) return toast.error('请输入 Refresh Token')
     if (form.authMethod === 'idc' && (!form.clientId.trim() || !form.clientSecret.trim())) return toast.error('IdC 认证需要 Client ID 和 Client Secret')
     if (form.authMethod === 'external_idp' && !form.clientId.trim()) return toast.error('External IdP 认证需要 Client ID')
@@ -448,7 +448,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
     add.mutate({
       authMethod: form.authMethod,
       refreshToken: isApiKey ? undefined : form.refreshToken.trim(),
-      apiKey: isApiKey ? form.kiroApiKey.trim() : undefined,
+      apiKey: isApiKey ? form.apiKey.trim() : undefined,
       profileArn: form.profileArn.trim() || undefined,
       region: form.region.trim() || undefined,
       authRegion: form.authRegion.trim() || undefined,
@@ -520,7 +520,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
         <FieldGrid>
           {isApiKey ? (
             <Field label="上游 API Key" className="col-span-2">
-              <SecretInput value={form.kiroApiKey} onChange={(v) => update('kiroApiKey', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} placeholder="ksk_... 或 ksk_...|eu-central-1" disabled={add.isPending} />
+              <SecretInput value={form.apiKey} onChange={(v) => update('apiKey', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} placeholder="ksk_... 或 ksk_...|eu-central-1" disabled={add.isPending} />
             </Field>
           ) : (
             <Field label="Refresh Token" className="col-span-2">

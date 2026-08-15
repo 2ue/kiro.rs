@@ -63,7 +63,7 @@ function SecretInput({
   )
 }
 
-function splitKiroApiKeyDraft(value: string): { key: string; region?: string } {
+function splitApiKeyDraft(value: string): { key: string; region?: string } {
   const trimmed = value.trim()
   const [rawKey, rawRegion] = trimmed.split('|', 2)
   return {
@@ -74,7 +74,7 @@ function splitKiroApiKeyDraft(value: string): { key: string; region?: string } {
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
-  const [kiroApiKey, setKiroApiKey] = useState('')
+  const [apiKey, setApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [profileArn, setProfileArn] = useState('')
   const [region, setRegion] = useState('')
@@ -106,7 +106,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   const resetForm = () => {
     setRefreshToken('')
-    setKiroApiKey('')
+    setApiKey('')
     setAuthMethod('social')
     setProfileArn('')
     setRegion('')
@@ -138,6 +138,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const fillFromCredential = (credential: {
     authMethod?: AuthMethod
     refreshToken?: string
+    apiKey?: string
     kiroApiKey?: string
     profileArn?: string
     region?: string
@@ -161,9 +162,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     endpoint?: string
     enableOverageAfterImport?: boolean | null
   }) => {
-    setAuthMethod(credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
+    const credentialApiKey = credential.apiKey || credential.kiroApiKey || ''
+    setAuthMethod(credential.authMethod || (credentialApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
     setRefreshToken(credential.refreshToken || '')
-    setKiroApiKey(credential.kiroApiKey || '')
+    setApiKey(credentialApiKey)
     setProfileArn(credential.profileArn || '')
     setRegion(credential.region || '')
     setAuthRegion(credential.authRegion || '')
@@ -207,7 +209,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       setScopes('')
       return
     }
-    setKiroApiKey('')
+    setApiKey('')
     if (nextAuthMethod === 'social') {
       setClientId('')
       setClientSecret('')
@@ -230,9 +232,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     }
   }
 
-  const handleKiroApiKeyChange = (value: string) => {
-    const parsed = splitKiroApiKeyDraft(value)
-    setKiroApiKey(parsed.region ? parsed.key : value)
+  const handleApiKeyChange = (value: string) => {
+    const parsed = splitApiKeyDraft(value)
+    setApiKey(parsed.region ? parsed.key : value)
     if (parsed.region) {
       if (!region.trim()) setRegion(parsed.region)
       if (!authRegion.trim()) setAuthRegion(parsed.region)
@@ -284,7 +286,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
     // 验证必填字段
     if (isApiKey) {
-      if (!kiroApiKey.trim()) {
+      if (!apiKey.trim()) {
         toast.error('请输入上游 API Key')
         return
       }
@@ -339,7 +341,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
-        apiKey: isApiKey ? kiroApiKey.trim() : undefined,
+        apiKey: isApiKey ? apiKey.trim() : undefined,
         profileArn: profileArn.trim() || undefined,
         region: region.trim() || undefined,
         authRegion: authRegion.trim() || undefined,
@@ -437,15 +439,15 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* 上游 API Key (API Key 模式) */}
             {isApiKey && (
               <div className="space-y-2">
-                <label htmlFor="kiroApiKey" className="text-sm font-medium">
+                <label htmlFor="apiKey" className="text-sm font-medium">
                   上游 API Key <span className="text-red-500">*</span>
                 </label>
                 <Input
-                  id="kiroApiKey"
+                  id="apiKey"
                   type="password"
                   placeholder="格式: ksk_xxxxxxxx 或 ksk_xxxxxxxx|eu-central-1"
-                  value={kiroApiKey}
-                  onChange={(e) => handleKiroApiKeyChange(e.target.value)}
+                  value={apiKey}
+                  onChange={(e) => handleApiKeyChange(e.target.value)}
                   disabled={isPending}
                 />
               </div>
