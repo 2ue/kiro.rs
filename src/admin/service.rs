@@ -80,16 +80,18 @@ use crate::http_client::{
     response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
-use crate::kiro::model::events::Event;
-use crate::kiro::model::requests::{
-    ConversationState, CurrentMessage, KiroRequest, UserInputMessage,
-};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
+use crate::local_upstream::event::LocalUpstreamEvent as Event;
+use crate::local_upstream::request::{
+    LocalUpstreamConversationState as ConversationState,
+    LocalUpstreamCurrentMessage as CurrentMessage, LocalUpstreamRequest,
+    LocalUpstreamUserInputMessage as UserInputMessage,
+};
+use crate::local_upstream::stream::LocalUpstreamEventStreamDecoder as EventStreamDecoder;
 use crate::model::config::{
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
     MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
@@ -3334,14 +3336,14 @@ impl AdminService {
             .with_agent_task_type("vibe")
             .with_chat_trigger_type("MANUAL")
             .with_current_message(CurrentMessage::new(user_input));
-        let kiro_request = KiroRequest {
+        let local_upstream_request = LocalUpstreamRequest {
             conversation_state,
             profile_arn: None,
             additional_model_request_fields: None,
             tool_cache_point_insert_after: Vec::new(),
             cache_point_plan_recording_enabled: true,
         };
-        let request_body = serde_json::to_string(&kiro_request)
+        let request_body = serde_json::to_string(&local_upstream_request)
             .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))?;
         Ok((
             model.to_string(),
