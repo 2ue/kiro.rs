@@ -140,6 +140,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording, and the sidebar brand mark no longer presents Kiro as the product name.
 - Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
 - Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Kiro request/body/guard behavior.
+- Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `kiro_*` names.
 
 ## In Progress
 

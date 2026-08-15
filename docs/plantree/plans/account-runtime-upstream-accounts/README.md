@@ -178,9 +178,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording and the sidebar brand mark no longer exposes Kiro as the product name.
 - Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
 - Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Kiro request/body/guard behavior; test function names remain a later cleanup target.
+- Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `kiro_*` names.
 
 Last verified on 2026-08-16:
 
+- `rg -n "\\bkiro_(guard|history)|serialized_kiro_body|clean_kiro" src/anthropic/payload_guard.rs`
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-names-test1 -- cargo test payload_guard -- --nocapture`
+- `git diff --check`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-text-fmt1 -- cargo fmt`
 - `rg -n "Kiro request|Kiro body|Kiro serialization|Kiro guard|Kiro perf|Kiro history|passed through to Kiro|serialized Kiro|Kiro current image|Kiro image" src/anthropic/payload_guard.rs`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-text-test1 -- cargo test payload_guard -- --nocapture`

@@ -5007,7 +5007,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_kiro_guard_serializes_once_and_is_stable_for_one_hundred_rounds() {
+    fn clean_local_upstream_guard_serializes_once_and_is_stable_for_one_hundred_rounds() {
         for content_bytes in [1_024usize, 100 * 1_024, 1_024 * 1_024, 5 * 1_024 * 1_024] {
             let mut template = request_with_history(Vec::new());
             template
@@ -5116,7 +5116,7 @@ mod tests {
         const ROUNDS: usize = 5;
 
         for content_bytes in SIZES {
-            for mode in ["clean_anthropic", "dirty_anthropic", "clean_kiro"] {
+            for mode in ["clean_anthropic", "dirty_anthropic", "clean_local_upstream"] {
                 let (anthropic_template, raw, kiro_template) = match mode {
                     "clean_anthropic" => {
                         let request = anthropic_request(vec![anthropic_message(
@@ -5134,7 +5134,7 @@ mod tests {
                         let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
                         (Some(request), Some(raw), None)
                     }
-                    "clean_kiro" => {
+                    "clean_local_upstream" => {
                         let mut request = request_with_history(Vec::new());
                         request
                             .conversation_state
@@ -5281,7 +5281,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_history_trim_removes_a_complete_logical_tool_turn_atomically() {
+    fn local_upstream_history_trim_removes_a_complete_logical_tool_turn_atomically() {
         let assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("calling")
                 .with_tool_uses(vec![ToolUseEntry::new("tool-old", "Bash")]),
@@ -5316,7 +5316,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_history_trim_preserves_the_active_current_tool_result_pair() {
+    fn local_upstream_history_trim_preserves_the_active_current_tool_result_pair() {
         let active_assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("calling")
                 .with_tool_uses(vec![ToolUseEntry::new("tool-active", "Bash")]),
@@ -5461,7 +5461,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_history_batch_trim_matches_exact_json_reduction() {
+    fn local_upstream_history_batch_trim_matches_exact_json_reduction() {
         let mut history = Vec::new();
         for idx in 0..200 {
             history.push(Message::User(HistoryUserMessage::new(
@@ -5522,7 +5522,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_guard_large_history_uses_one_trim_pass_and_constant_serializations() {
+    fn local_upstream_guard_large_history_uses_one_trim_pass_and_constant_serializations() {
         let mut history = Vec::new();
         for idx in 0..1_000 {
             history.push(Message::User(HistoryUserMessage::new(
@@ -6858,7 +6858,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_point_plan_inserts_markers_in_serialized_kiro_body() {
+    fn cache_point_plan_inserts_markers_in_serialized_local_upstream_body() {
         let mut current = UserInputMessage::new("current", TEST_MODEL);
         current.user_input_message_context = UserInputMessageContext::new().with_tools(vec![
             Tool {
@@ -8380,7 +8380,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_guard_drops_oversized_historical_images_even_when_body_fits() {
+    fn local_upstream_guard_drops_oversized_historical_images_even_when_body_fits() {
         let mut user = HistoryUserMessage::new("image", TEST_MODEL);
         user.user_input_message.images = vec![LocalUpstreamImage::from_base64(
             "png",
@@ -8407,7 +8407,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_guard_drops_oversized_current_images_even_when_body_fits() {
+    fn local_upstream_guard_drops_oversized_current_images_even_when_body_fits() {
         let mut request = request_with_history(Vec::new());
         request
             .conversation_state
@@ -8446,7 +8446,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_guard_rejects_oversized_images_when_configured() {
+    fn local_upstream_guard_rejects_oversized_images_when_configured() {
         let mut request = request_with_history(Vec::new());
         request
             .conversation_state
