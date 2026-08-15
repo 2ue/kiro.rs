@@ -4441,25 +4441,27 @@ impl AdminService {
         status
     }
 
-    /// 获取 Kiro 模型能力同步状态。
+    /// 获取本地上游模型能力同步状态。
     pub fn get_model_capabilities(&self) -> ModelCapabilitiesStatus {
         self.model_capabilities.status()
     }
 
-    /// 手动同步 Kiro 模型能力。失败不影响调度，只体现在返回状态的 last_error。
+    /// 手动同步本地上游模型能力。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_capabilities(&self) -> ModelCapabilitiesStatus {
         let status = match self.kiro_provider.as_ref() {
             Some(provider) => match provider.list_available_models().await {
-                Ok(models) => self.model_capabilities.sync_from_kiro_catalog(models),
+                Ok(models) => self.model_capabilities.sync_from_upstream_catalog(models),
                 Err(err) => {
-                    tracing::warn!("同步 Kiro 模型能力失败，不影响请求调度: {}", err);
+                    tracing::warn!("同步本地上游模型能力失败，不影响请求调度: {}", err);
                     self.model_capabilities.record_sync_error(err.to_string())
                 }
             },
             None => {
-                tracing::warn!("跳过旧模型能力同步：当前运行时未启用 Kiro provider");
+                tracing::warn!(
+                    "跳过本地上游模型能力同步：当前运行时未启用 legacy local-upstream executor"
+                );
                 self.model_capabilities.record_sync_error(
-                    "model capability sync skipped because the runtime has no legacy Kiro provider",
+                    "model capability sync skipped because the runtime has no legacy local-upstream executor",
                 )
             }
         };

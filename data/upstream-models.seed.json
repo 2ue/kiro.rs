@@ -1,6 +1,6 @@
 {
   "version": "2026-05-28",
-  "source": "kiro-upstream-seed",
+  "source": "upstream-model-seed",
   "models": [
     {
       "model": "auto",

@@ -1,4 +1,4 @@
-//! Model mapping and Kiro native reasoning field selection.
+//! Model mapping and local-upstream native reasoning field selection.
 
 use crate::anthropic::model_capabilities::strip_model_1m_suffix;
 use crate::anthropic::model_capabilities::{
@@ -9,7 +9,7 @@ use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
 };
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
+/// 模型映射：将 Anthropic 模型名映射到上游模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
@@ -87,7 +87,7 @@ fn is_native_claude_family_model(model: &str, family: &str) -> bool {
 
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 这是仅在 Kiro `ListAvailableModels` 能力目录缺失时使用的保守兜底。
+/// 这是仅在上游 `ListAvailableModels` 能力目录缺失时使用的保守兜底。
 /// 真实请求应优先使用上游目录中的 `maxInputTokens`；同名/同族模型在不同
 /// 账号池中可能是 200K 或 1M，不能仅凭普通别名把 free Sonnet 误抬成 1M。
 pub fn get_context_window_size(model: &str) -> i32 {

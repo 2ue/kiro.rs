@@ -85,6 +85,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Stream conversion now offers `process_local_upstream_event` as the handler-facing event processor; the legacy concrete event method remains internal to the stream module and existing stream tests until the event model is replaced.
 - Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor, keeping the concrete legacy provider type behind the protocol boundary.
 - Anthropic converter module docs, diagnostics, tool-name collision errors and compatibility comments now describe local-upstream/upstream-safe behavior instead of Kiro protocol behavior.
+- Model capability seed/status source values now use upstream-account terminology for new writes, normalize old `kiro-*` source strings on read, and expose `sync_from_upstream_catalog` as the main/Admin synchronization entrypoint.
 
 ## In Progress
 

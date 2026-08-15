@@ -453,7 +453,9 @@ async fn main() {
             }
         }
     } else {
-        tracing::info!("上游账号运行时已启用；跳过旧凭据端点校验并不安装 Kiro provider");
+        tracing::info!(
+            "上游账号运行时已启用；跳过旧凭据端点校验并不安装 legacy local-upstream executor"
+        );
     }
     let usage_recorder = Arc::new(
         anthropic::usage::UsageRecorder::with_postgres_and_observability_redis(
@@ -488,13 +490,13 @@ async fn main() {
                 tracing::info!(
                     source = %status.source,
                     model_count = status.model_count,
-                    "PgSQL 模型能力目录为旧内置目录，使用本地 Kiro seed 刷新"
+                    "PgSQL 模型能力目录为旧内置目录，使用本地上游模型 seed 刷新"
                 );
                 let status = anthropic::model_capabilities::ModelCapabilitiesCatalog::seed_status();
                 model_capabilities.load_persisted_status(status.clone());
                 if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
                     tracing::warn!(
-                        "刷新 Kiro 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
+                        "刷新本地上游模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
                         err
                     );
                 }
@@ -508,14 +510,14 @@ async fn main() {
             model_capabilities.load_persisted_status(status.clone());
             if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
                 tracing::warn!(
-                    "保存 Kiro 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
+                    "保存本地上游模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
                     err
                 );
             } else {
                 tracing::info!(
                     source = %status.source,
                     model_count = status.model_count,
-                    "已使用本地 Kiro 模型 seed 初始化 PgSQL"
+                    "已使用本地上游模型 seed 初始化 PgSQL"
                 );
             }
         }
@@ -956,7 +958,7 @@ fn spawn_model_capability_recovery_worker(
                         ModelCapabilityDiscoveryOutcome::Incomplete
                     };
                     (
-                        model_capabilities.sync_from_kiro_catalog(catalog),
+                        model_capabilities.sync_from_upstream_catalog(catalog),
                         discovery,
                     )
                 }

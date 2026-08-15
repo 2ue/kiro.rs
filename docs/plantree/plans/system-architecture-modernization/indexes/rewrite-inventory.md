@@ -160,7 +160,7 @@ Both frontends remain in scope unless a separate accepted product decision retir
 | `docs/ai-docker-compose-deployment.md`, absent `docs/claude-code-cli-local-testing.md` entrypoint | Supported target deployment runbook and secret-safe Claude Code local-testing runbook registered from maintained entrypoints and bound to the release manifest | R9 | Replace the obsolete deployment guide; create/restore the maintained CLI guide; remove or update stale links | Not Started |
 | `.cargo/config.toml`, `.dockerignore`, `.gitignore` | Reproducible build inputs plus protected/generated artifact boundaries | R0/R9/R10 | Update with target build and cleanup ownership; preserve user/runtime protection rules | Not Started |
 | `.claude/settings.local.json` | Tracked project-local AI-tool network/permission policy that can affect validation behavior | R0/R9 | Review, minimize, document or delete as project tooling; never treat it as product/runtime configuration or a place for secrets | Not Started |
-| `config.example.json`, `credentials.example.*.json`, `data/kiro-upstream-models.seed.json` | Version-compatible configuration/credential examples and model-catalog seed data | R2/R8/R9 | Regenerate or update from accepted schema/catalog contracts; never copy runtime secrets | Not Started |
+| `config.example.json`, `credentials.example.*.json`, `data/upstream-models.seed.json` | Version-compatible configuration/credential examples and model-catalog seed data | R2/R8/R9 | Regenerate or update from accepted schema/catalog contracts; never copy runtime secrets | Not Started |
 | `Cargo.toml`, `Cargo.lock` | Target Rust module/dependency/build authority | All/R9 | Update as required; third-party code is excluded | Not Started |
 
 ## Excluded Or Preserved Material

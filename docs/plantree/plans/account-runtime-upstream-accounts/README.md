@@ -123,6 +123,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Stream conversion now exposes `process_local_upstream_event` as the handler-facing event processor. The old concrete `process_kiro_event` method remains inside the stream module for the current legacy event type and stream tests, while runtime handler code enters through the local-upstream wrapper.
 - Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor. The underlying concrete type is still the legacy provider until the provider implementation is replaced, but the Claude/Anthropic protocol boundary no longer exposes a Kiro-named provider field.
 - Anthropic converter module docs, diagnostics, collision errors and compatibility comments now use local-upstream/upstream-safe wording instead of presenting the request conversion as a Kiro protocol surface. The concrete legacy request type remains isolated behind the current local-upstream body boundary until the provider/body implementation is replaced.
+- The model capability seed/source boundary now uses upstream-account terminology. New seed/status writes use `upstream-model-seed` and `upstream-account-model-catalog`, old `kiro-*` source values are normalized on read, and main/Admin model capability sync call the account-neutral `sync_from_upstream_catalog` entrypoint while the legacy provider method remains a compatibility delegate.
 
 Last verified on 2026-08-14:
 
@@ -305,6 +306,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-field-test1 -- bash -lc 'cargo check && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh converter-neutral-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh converter-neutral-text-test1 -- bash -lc 'cargo check && cargo test convert_tools_rejects -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh upstream-model-source-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-model-source-test3 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
