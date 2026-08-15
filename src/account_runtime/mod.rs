@@ -8,6 +8,9 @@ pub mod attempt;
 pub mod migration;
 pub mod runtime;
 pub mod scheduler;
+pub(crate) mod storage_task {
+    pub(crate) use crate::kiro::token_manager::storage_task::spawn_critical_storage_task as spawn_account_runtime_critical_storage_task;
+}
 pub mod store;
 pub mod usage;
 

@@ -108,6 +108,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin service dependencies and internal provider state now use local-upstream provider naming, leaving legacy credential behavior behind the local executor boundary.
 - The unmounted `src/test.rs` Kiro-specific manual stream caller was removed.
 - Account-route local auxiliary attempt traces now use local-upstream credential-attempt aliases instead of direct legacy call-trace paths.
+- Account-route Redis lease cleanup now uses an account-runtime critical storage-task alias instead of importing the helper from the legacy token-manager module.
 
 ## In Progress
 

@@ -27,6 +27,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedSemaphorePe
 use tokio::time::{Instant, timeout};
 
 use crate::{
+    account_runtime::storage_task::spawn_account_runtime_critical_storage_task,
     anthropic::{
         cache::{
             CacheAmplification, CacheSimulation, CacheUsage, RawUsage, ReportedCacheUsagePolicy,
@@ -68,7 +69,6 @@ use crate::{
         upstream_error::RawUpstreamError,
     },
     http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout},
-    kiro::token_manager::storage_task::spawn_critical_storage_task,
     local_upstream::call_trace::LocalUpstreamCredentialAttempt,
     model::config::{
         ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode, ExternalPoolRouteMode,
@@ -3202,11 +3202,14 @@ async fn release_external_pool_queue_lease_with_retry(
 fn release_external_pool_queue_lease_reliably(manager: ExternalPoolManager, lease_id: String) {
     let fallback_manager = manager.clone();
     let fallback_lease_id = lease_id.clone();
-    let admitted = spawn_critical_storage_task("释放外部池 Redis 调度排队 lease", async move {
-        release_external_pool_queue_lease_with_retry(manager, lease_id, 2)
-            .await
-            .map(|_| ())
-    });
+    let admitted = spawn_account_runtime_critical_storage_task(
+        "释放外部池 Redis 调度排队 lease",
+        async move {
+            release_external_pool_queue_lease_with_retry(manager, lease_id, 2)
+                .await
+                .map(|_| ())
+        },
+    );
     if admitted {
         return;
     }
