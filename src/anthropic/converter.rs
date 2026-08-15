@@ -200,7 +200,7 @@ pub struct ProxyWarnings {
     pub duplicate_tool_results: u32,
     /// 兼容性保留字段；安全修复不再把重复 tool_result 转为普通文本。
     pub duplicate_tool_results_textified: u32,
-    /// user 消息只有 tool_result 且文本为空时补了 Kiro content 占位
+    /// user 消息只有 tool_result 且文本为空时补了 local-upstream content 占位
     pub tool_result_content_placeholders: u32,
     /// user 消息没有文本也没有 tool_result 时补了无语义非空占位
     pub empty_content_placeholders: u32,
@@ -1396,7 +1396,7 @@ mod tests {
         for name in [
             "Bash",
             "echo_value",
-            "veryLongToolNameThatKeepsGrowingBeyondTheKiroSixtyThreeCharacterLimit",
+            "veryLongToolNameThatKeepsGrowingBeyondTheLocalUpstreamSixtyThreeCharacterLimit",
         ] {
             map_tool_name(name, &mut map, ConverterOptions::default());
         }
@@ -2943,7 +2943,7 @@ mod tests {
                 .additional_model_request_fields
                 .expect("authoritative native fields");
             assert_eq!(
-                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::to_value(fields).expect("serialize upstream native fields"),
                 serde_json::json!({
                     "thinking": {"type": "adaptive"},
                     "output_config": {"effort": "max"}
@@ -2998,7 +2998,7 @@ mod tests {
                 .additional_model_request_fields
                 .expect("authoritative native fields");
             assert_eq!(
-                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::to_value(fields).expect("serialize upstream native fields"),
                 serde_json::json!({
                     "thinking": {"type": "adaptive"},
                     "output_config": {"effort": "high"}
@@ -3053,7 +3053,7 @@ mod tests {
                 .additional_model_request_fields
                 .expect("authoritative native fields");
             assert_eq!(
-                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::to_value(fields).expect("serialize upstream native fields"),
                 serde_json::json!({
                     "thinking": {"type": "adaptive"},
                     "output_config": {"effort": "max"}
@@ -3109,7 +3109,7 @@ mod tests {
                 .additional_model_request_fields
                 .expect("authoritative native fields");
             assert_eq!(
-                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::to_value(fields).expect("serialize upstream native fields"),
                 serde_json::json!({
                     "thinking": {"type": "adaptive", "display": "summarized"},
                     "output_config": {"effort": "max"}
@@ -3314,7 +3314,7 @@ mod tests {
                 .additional_model_request_fields
                 .expect("explicit output_config.effort should remain native");
             assert_eq!(
-                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::to_value(fields).expect("serialize upstream native fields"),
                 serde_json::json!({
                     "output_config": {"effort": "max"}
                 }),
@@ -3366,7 +3366,7 @@ mod tests {
                 .additional_model_request_fields
                 .expect("native reasoning fields");
             assert_eq!(
-                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::to_value(fields).expect("serialize upstream native fields"),
                 serde_json::json!({
                     "thinking": {"type": "adaptive"},
                     "output_config": {"effort": "high"}
@@ -3421,7 +3421,7 @@ mod tests {
                 .additional_model_request_fields
                 .expect("native reasoning fields");
             assert_eq!(
-                serde_json::to_value(fields).expect("serialize Kiro wire fields"),
+                serde_json::to_value(fields).expect("serialize upstream native fields"),
                 serde_json::json!({
                     "thinking": {"type": "adaptive"},
                     "output_config": {"effort": "max"}
@@ -3884,7 +3884,7 @@ mod tests {
                     Message::User(user)
                         if user.user_input_message.content.contains("<tool_choice_name>read_file</tool_choice_name>")
                 )),
-            "compat mode should add a Kiro-facing forced-tool steering prefix"
+            "compat mode should add a local-upstream-facing forced-tool steering prefix"
         );
     }
 

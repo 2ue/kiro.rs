@@ -180,9 +180,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Kiro request/body/guard behavior; test function names remain a later cleanup target.
 - Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `kiro_*` names.
 - Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Kiro protocol/model/cache wording.
+- Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Kiro content/wire-facing behavior.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro|Kiro-facing|Kiro wire|Kiro content|KiroSixty|Kiro 400" src/anthropic/converter.rs`
+- `feature/tests/run-cargo-scoped.sh converter-upstream-text-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh converter-upstream-text-test1 -- cargo test converter -- --nocapture`
+- `git diff --check`
 - `rg -n "Kiro|Kiro/|Kiro 协议|Kiro 原生|Kiro 容易|Kiro 可用|Kiro metadata|Kiro upstream|外部池 raw body|外部池 normalized body" src/model/config.rs`
 - `feature/tests/run-cargo-scoped.sh config-local-upstream-comment-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh config-local-upstream-comment-test1 -- cargo test model::config -- --nocapture`
