@@ -81,6 +81,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - JSON stream error-envelope usage diagnostics now keep provider-message privacy by storing shape/fingerprint metadata for complete JSON error envelopes instead of raw message bodies, and remaining malformed/incomplete raw snippet sources use neutral official-upstream wording.
 - Local-upstream payload diagnostics now use wrapper names for byte breakdown and tool-use format diagnostics at handler/local body pipeline call sites, leaving Kiro-named helpers inside the legacy payload implementation only.
 - Anthropic handler runtime log/comment text for local-upstream cache-point retry, payload guard, tool-format, slow interaction and stream/non-stream retry diagnostics now uses local-upstream/account wording instead of Kiro product wording.
+- The local body pipeline now exposes `PreparedLocalUpstreamBody.local_upstream_request` and local-upstream helper parameter names at the handler boundary, while the concrete legacy request type remains isolated behind that boundary.
 
 ## In Progress
 

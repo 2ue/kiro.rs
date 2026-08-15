@@ -640,7 +640,7 @@ fn log_local_upstream_conversion_summary(
     endpoint: &str,
     payload: &MessagesRequest,
     model_resolution: &ModelResolution,
-    kiro_request: &KiroRequest,
+    local_upstream_request: &KiroRequest,
     request_bytes: usize,
     payload_guard_report: Option<&PayloadGuardReport>,
     warnings: &ProxyWarnings,
@@ -650,40 +650,42 @@ fn log_local_upstream_conversion_summary(
         return;
     }
 
-    let current_user_input = &kiro_request
+    let current_user_input = &local_upstream_request
         .conversation_state
         .current_message
         .user_input_message;
     let current_context = &current_user_input.user_input_message_context;
     let current_content = current_user_input.content.as_str();
     let warnings_header = warnings.encode_header();
-    let history_entries = kiro_request.conversation_state.history.len();
+    let history_entries = local_upstream_request.conversation_state.history.len();
     let original_history_entries = payload_guard_report
         .map(|report| report.original_history_entries)
         .unwrap_or(history_entries);
     let final_history_entries = payload_guard_report
         .map(|report| report.final_history_entries)
         .unwrap_or(history_entries);
-    let (reasoning_path, reasoning_effort) =
-        match kiro_request.additional_model_request_fields.as_ref() {
-            Some(fields) if fields.output_config.is_some() => (
-                Some("output_config"),
-                fields
-                    .output_config
-                    .as_ref()
-                    .map(|config| config.effort.as_str()),
-            ),
-            Some(fields) if fields.reasoning.is_some() => (
-                Some("reasoning"),
-                fields
-                    .reasoning
-                    .as_ref()
-                    .map(|config| config.effort.as_str()),
-            ),
-            Some(fields) if fields.thinking.is_some() => (Some("thinking"), None),
-            _ => (None, None),
-        };
-    let (native_thinking_type, native_thinking_display) = kiro_request
+    let (reasoning_path, reasoning_effort) = match local_upstream_request
+        .additional_model_request_fields
+        .as_ref()
+    {
+        Some(fields) if fields.output_config.is_some() => (
+            Some("output_config"),
+            fields
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+        ),
+        Some(fields) if fields.reasoning.is_some() => (
+            Some("reasoning"),
+            fields
+                .reasoning
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+        ),
+        Some(fields) if fields.thinking.is_some() => (Some("thinking"), None),
+        _ => (None, None),
+    };
+    let (native_thinking_type, native_thinking_display) = local_upstream_request
         .additional_model_request_fields
         .as_ref()
         .and_then(|fields| fields.thinking.as_ref())
@@ -706,7 +708,7 @@ fn log_local_upstream_conversion_summary(
         endpoint,
         requested_model = %payload.model,
         upstream_model = ?model_resolution.upstream_model,
-        conversation_id = %kiro_request.conversation_state.conversation_id,
+        conversation_id = %local_upstream_request.conversation_state.conversation_id,
         request_bytes,
         payload_guard_enabled = payload_guard_report.is_some(),
         original_history_entries,
@@ -6345,7 +6347,7 @@ async fn post_messages_inner(
     };
     let local_body_pipeline::PreparedLocalUpstreamBody {
         request_body,
-        kiro_request,
+        local_upstream_request,
         conversation_id,
         input_tokens,
         payload_breakdown,
@@ -6391,7 +6393,7 @@ async fn post_messages_inner(
         handle_stream_request(
             provider,
             &request_body,
-            kiro_request,
+            local_upstream_request,
             &payload.model,
             model_resolution
                 .upstream_model
@@ -6423,7 +6425,7 @@ async fn post_messages_inner(
         handle_non_stream_request(
             provider,
             &request_body,
-            &kiro_request,
+            &local_upstream_request,
             &payload.model,
             model_resolution
                 .upstream_model

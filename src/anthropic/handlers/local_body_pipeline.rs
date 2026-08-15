@@ -4,7 +4,7 @@ use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 
 pub(super) struct PreparedLocalUpstreamBody {
     pub(super) request_body: String,
-    pub(super) kiro_request: KiroRequest,
+    pub(super) local_upstream_request: KiroRequest,
     pub(super) conversation_id: String,
     pub(super) input_tokens: i32,
     pub(super) payload_breakdown: Option<PayloadByteBreakdown>,
@@ -80,18 +80,21 @@ pub(super) fn prepare_with_plan(
         }
     };
 
-    let mut kiro_request = KiroRequest {
+    let mut local_upstream_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion_result.additional_model_request_fields,
         tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
         cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
     };
-    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
+    let conversation_id = local_upstream_request
+        .conversation_state
+        .conversation_id
+        .clone();
 
     let too_long_retry = if plan.retry_payloads.is_enabled() {
         PayloadTooLongRetryRequest::new(
-            &kiro_request,
+            &local_upstream_request,
             runtime_config,
             endpoint,
             &payload.model,
@@ -104,11 +107,13 @@ pub(super) fn prepare_with_plan(
     } else {
         None
     };
-    let prepared_payload =
-        match prepare_local_upstream_request_body(&mut kiro_request, plan.payload_guard.config) {
-            Ok(result) => result,
-            Err(err) => return Err(payload_guard_error_response(err)),
-        };
+    let prepared_payload = match prepare_local_upstream_request_body(
+        &mut local_upstream_request,
+        plan.payload_guard.config,
+    ) {
+        Ok(result) => result,
+        Err(err) => return Err(payload_guard_error_response(err)),
+    };
     let request_body = prepared_payload.body;
     let payload_guard_report = prepared_payload.report;
     if let Some(report) = payload_guard_report.as_ref() {
@@ -123,7 +128,7 @@ pub(super) fn prepare_with_plan(
     let payload_breakdown = if plan.diagnostics.is_enabled() {
         payload_guard_report.as_ref().and_then(|report| {
             should_log_payload_byte_breakdown(report)
-                .then(|| breakdown_local_upstream_request(&kiro_request, &request_body))
+                .then(|| breakdown_local_upstream_request(&local_upstream_request, &request_body))
         })
     } else {
         None
@@ -142,7 +147,7 @@ pub(super) fn prepare_with_plan(
         endpoint,
         payload,
         model_resolution,
-        &kiro_request,
+        &local_upstream_request,
         request_body.len(),
         payload_guard_report.as_ref(),
         &conversion_result.warnings,
@@ -169,10 +174,10 @@ pub(super) fn prepare_with_plan(
         history_entries = payload_guard_report
             .as_ref()
             .map(|report| report.final_history_entries)
-            .unwrap_or_else(|| kiro_request.conversation_state.history.len()),
-        current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
-        current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
-        current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
+            .unwrap_or_else(|| local_upstream_request.conversation_state.history.len()),
+        current_tool_count = local_upstream_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
+        current_tool_result_count = local_upstream_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
+        current_image_count = local_upstream_request.conversation_state.current_message.user_input_message.images.len(),
         "Local upstream request prepared"
     );
     let input_tokens = if plan.token_counting.is_enabled() {
@@ -185,7 +190,7 @@ pub(super) fn prepare_with_plan(
     } else {
         0
     };
-    let thinking_enabled = should_expose_downstream_thinking(payload, &kiro_request);
+    let thinking_enabled = should_expose_downstream_thinking(payload, &local_upstream_request);
     let warnings_header = if should_expose_proxy_warnings(runtime_config) {
         merge_warning_headers(
             conversion_result.warnings.encode_header(),
@@ -197,7 +202,7 @@ pub(super) fn prepare_with_plan(
     let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
     let cache_point_retry = if plan.retry_payloads.is_enabled() {
         CachePointRetryRequest::new(
-            &kiro_request,
+            &local_upstream_request,
             endpoint,
             &payload.model,
             model_resolution.upstream_model.as_deref(),
@@ -209,7 +214,7 @@ pub(super) fn prepare_with_plan(
 
     Ok(PreparedLocalUpstreamBody {
         request_body,
-        kiro_request,
+        local_upstream_request,
         conversation_id,
         input_tokens,
         payload_breakdown,
@@ -228,7 +233,7 @@ pub(super) fn prepare_with_plan(
 
 fn should_expose_downstream_thinking(
     payload: &MessagesRequest,
-    kiro_request: &KiroRequest,
+    local_upstream_request: &KiroRequest,
 ) -> bool {
     if payload
         .thinking
@@ -243,7 +248,7 @@ fn should_expose_downstream_thinking(
         .map(|t| t.is_enabled())
         .unwrap_or(false)
         || payload.output_config.is_some()
-        || kiro_request
+        || local_upstream_request
             .additional_model_request_fields
             .as_ref()
             .is_some_and(|fields| {
