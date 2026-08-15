@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::model::config::{Config, KiroAgentModeStrategy};
+use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
 
 pub const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
@@ -162,9 +162,9 @@ pub fn resolve_streaming_profile_arn(
 
 pub fn resolve_agent_mode(credentials: &KiroCredentials, config: &Config) -> &'static str {
     match config.kiro_agent_mode_strategy {
-        KiroAgentModeStrategy::Vibe => "vibe",
-        KiroAgentModeStrategy::Spec => "spec",
-        KiroAgentModeStrategy::Auto => {
+        LocalUpstreamAgentModeStrategy::Vibe => "vibe",
+        LocalUpstreamAgentModeStrategy::Spec => "spec",
+        LocalUpstreamAgentModeStrategy::Auto => {
             if credentials.is_api_key_credential()
                 || credentials.is_idc_refresh_credential()
                 || is_external_idp_credentials(credentials)
@@ -390,12 +390,12 @@ mod tests {
 
         assert_eq!(resolve_agent_mode(&social, &config), "vibe");
 
-        config.kiro_agent_mode_strategy = KiroAgentModeStrategy::Auto;
+        config.kiro_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
         assert_eq!(resolve_agent_mode(&social, &config), "spec");
         assert_eq!(resolve_agent_mode(&idc, &config), "vibe");
         assert_eq!(resolve_agent_mode(&api_key, &config), "vibe");
 
-        config.kiro_agent_mode_strategy = KiroAgentModeStrategy::Spec;
+        config.kiro_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Spec;
         assert_eq!(resolve_agent_mode(&idc, &config), "spec");
     }
 }

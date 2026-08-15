@@ -14,10 +14,11 @@ use crate::external_pool::{
 };
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
-    ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
-    ModelMappingRule, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PayloadShapingConfigPatch, PromptCacheCreationControlConfig, PromptSteeringConfig,
-    ReportedUsageConfig, RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
+    ImageProcessingConfig, LocalUpstreamAgentModeStrategy, MissingMaxTokensConfig,
+    ModelMappingConfig, ModelMappingRule, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PayloadShapingConfigPatch, PromptCacheCreationControlConfig,
+    PromptSteeringConfig, ReportedUsageConfig, RequestAdmissionConfig, ThinkingTriggerMode,
+    WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -1923,7 +1924,7 @@ pub struct RuntimeConfigResponse {
     pub external_pools: AccountRuntimeConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
-    pub kiro_agent_mode_strategy: KiroAgentModeStrategy,
+    pub kiro_agent_mode_strategy: LocalUpstreamAgentModeStrategy,
     pub model_resolution_mode: ModelResolutionMode,
     pub model_mapping: ModelMappingConfig,
     pub extract_thinking: bool,
@@ -2094,7 +2095,7 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub compat_profile: Option<CompatProfile>,
     #[serde(default)]
-    pub kiro_agent_mode_strategy: Option<KiroAgentModeStrategy>,
+    pub kiro_agent_mode_strategy: Option<LocalUpstreamAgentModeStrategy>,
     #[serde(default)]
     pub model_resolution_mode: Option<ModelResolutionMode>,
     #[serde(default)]

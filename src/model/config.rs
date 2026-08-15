@@ -2535,13 +2535,13 @@ impl Default for ThinkingTriggerMode {
 /// key credentials stay on `vibe`; social/provider credentials use `spec`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum KiroAgentModeStrategy {
+pub enum LocalUpstreamAgentModeStrategy {
     Vibe,
     Spec,
     Auto,
 }
 
-impl Default for KiroAgentModeStrategy {
+impl Default for LocalUpstreamAgentModeStrategy {
     fn default() -> Self {
         Self::Vibe
     }
@@ -3790,7 +3790,7 @@ pub struct Config {
 
     /// Kiro IDE agent-mode header 策略（默认 vibe，保持现有成功链路）。
     #[serde(default = "default_kiro_agent_mode_strategy")]
-    pub kiro_agent_mode_strategy: KiroAgentModeStrategy,
+    pub kiro_agent_mode_strategy: LocalUpstreamAgentModeStrategy,
 
     /// 请求模型解析策略（默认 compatible）。
     ///
@@ -4246,8 +4246,8 @@ fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
 
-fn default_kiro_agent_mode_strategy() -> KiroAgentModeStrategy {
-    KiroAgentModeStrategy::Vibe
+fn default_kiro_agent_mode_strategy() -> LocalUpstreamAgentModeStrategy {
+    LocalUpstreamAgentModeStrategy::Vibe
 }
 
 fn default_model_resolution_mode() -> ModelResolutionMode {
@@ -5357,7 +5357,7 @@ mod tests {
     fn default_kiro_agent_mode_strategy_preserves_vibe() {
         assert_eq!(
             Config::default().kiro_agent_mode_strategy,
-            KiroAgentModeStrategy::Vibe
+            LocalUpstreamAgentModeStrategy::Vibe
         );
     }
 
@@ -5641,7 +5641,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
-        assert_eq!(config.kiro_agent_mode_strategy, KiroAgentModeStrategy::Auto);
+        assert_eq!(
+            config.kiro_agent_mode_strategy,
+            LocalUpstreamAgentModeStrategy::Auto
+        );
     }
 
     #[test]

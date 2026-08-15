@@ -237,7 +237,7 @@ mod tests {
     use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::protocol::{KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN};
-    use crate::model::config::{Config, KiroAgentModeStrategy};
+    use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
     use reqwest::Client;
     use serde_json::Value;
     use std::time::Instant;
@@ -639,7 +639,7 @@ mod tests {
             ..Default::default()
         };
         let mut config = Config::default();
-        config.kiro_agent_mode_strategy = KiroAgentModeStrategy::Auto;
+        config.kiro_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
         let ctx = RequestContext {
             credentials: &credentials,
             token: "token",
