@@ -4056,7 +4056,7 @@ impl CredentialUsageContext {
                     if let Some(plan) = self.request.kiro_rs_tool_prompt_cache_plan.as_ref() {
                         self.request
                             .prompt_cache
-                            .commit_kiro_rs_tool_success_with_bounds(
+                            .commit_claude_code_tool_success_with_bounds(
                                 Some(scope),
                                 plan,
                                 self.request.prompt_cache_bounds,
@@ -4711,7 +4711,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         },
         PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => (
             None,
-            Some(state.prompt_cache.compute_kiro_rs_tool_with_bounds(
+            Some(state.prompt_cache.compute_claude_code_tool_with_bounds(
                 scope.clone(),
                 payload,
                 input_tokens,

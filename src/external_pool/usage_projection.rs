@@ -241,7 +241,7 @@ fn build_template(
             (profile, None, simulated_usage)
         }
         PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
-            let plan = route.prompt_cache.compute_kiro_rs_tool_with_bounds(
+            let plan = route.prompt_cache.compute_claude_code_tool_with_bounds(
                 scope.clone(),
                 payload,
                 raw_input_tokens,
@@ -360,11 +360,12 @@ impl ExternalUsageProjectionContext {
                 );
         }
         if let Some(plan) = self.kiro_rs_tool_prompt_cache_plan.as_ref() {
-            self.prompt_cache.commit_kiro_rs_tool_success_with_bounds(
-                self.scope.clone(),
-                plan,
-                self.prompt_cache_bounds,
-            );
+            self.prompt_cache
+                .commit_claude_code_tool_success_with_bounds(
+                    self.scope.clone(),
+                    plan,
+                    self.prompt_cache_bounds,
+                );
         } else {
             self.prompt_cache.update_with_bounds(
                 self.scope.clone(),

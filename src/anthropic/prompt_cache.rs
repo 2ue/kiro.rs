@@ -187,7 +187,7 @@ impl PromptCacheTracker {
         self.build_profile_with_policy(req, total_input_tokens, true, cache_model)
     }
 
-    pub fn compute_kiro_rs_tool_with_bounds(
+    pub fn compute_claude_code_tool_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
         req: &MessagesRequest,
@@ -197,10 +197,18 @@ impl PromptCacheTracker {
         policy: ClaudeCodeToolCachePolicy,
     ) -> ClaudeCodeToolPromptCachePlan {
         let policy = policy.normalized();
-        let profile =
-            self.build_kiro_rs_tool_profile_for_model(req, total_input_tokens, cache_model, policy);
-        let usage =
-            self.compute_kiro_rs_tool_profile_with_bounds(scope, profile.as_ref(), bounds, policy);
+        let profile = self.build_claude_code_tool_profile_for_model(
+            req,
+            total_input_tokens,
+            cache_model,
+            policy,
+        );
+        let usage = self.compute_claude_code_tool_profile_with_bounds(
+            scope,
+            profile.as_ref(),
+            bounds,
+            policy,
+        );
         ClaudeCodeToolPromptCachePlan {
             profile,
             usage,
@@ -211,13 +219,13 @@ impl PromptCacheTracker {
         }
     }
 
-    pub fn commit_kiro_rs_tool_success_with_bounds(
+    pub fn commit_claude_code_tool_success_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
         plan: &ClaudeCodeToolPromptCachePlan,
         bounds: PromptCacheBounds,
     ) {
-        self.update_kiro_rs_tool_profile_with_bounds(
+        self.update_claude_code_tool_profile_with_bounds(
             scope,
             plan.profile.as_ref(),
             bounds,
@@ -225,7 +233,7 @@ impl PromptCacheTracker {
         );
     }
 
-    fn build_kiro_rs_tool_profile_for_model(
+    fn build_claude_code_tool_profile_for_model(
         &self,
         req: &MessagesRequest,
         total_input_tokens: i32,
@@ -233,7 +241,7 @@ impl PromptCacheTracker {
         policy: ClaudeCodeToolCachePolicy,
     ) -> Option<PromptCacheProfile> {
         self.build_profile_with_blocks(
-            kiro_rs_tool_cache_blocks(req, policy),
+            claude_code_tool_cache_blocks(req, policy),
             total_input_tokens,
             cache_model,
             false,
@@ -493,7 +501,7 @@ impl PromptCacheTracker {
         enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
     }
 
-    fn compute_kiro_rs_tool_profile_with_bounds(
+    fn compute_claude_code_tool_profile_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
@@ -517,7 +525,7 @@ impl PromptCacheTracker {
         if covered_tokens <= 0 {
             return PromptCacheUsage::default();
         }
-        let covered_tokens = apply_kiro_rs_tool_coverage_policy(covered_tokens, policy);
+        let covered_tokens = apply_claude_code_tool_coverage_policy(covered_tokens, policy);
         if covered_tokens <= 0 {
             return PromptCacheUsage::default();
         }
@@ -566,7 +574,7 @@ impl PromptCacheTracker {
         }
     }
 
-    fn update_kiro_rs_tool_profile_with_bounds(
+    fn update_claude_code_tool_profile_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
@@ -741,7 +749,7 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheBlock> {
     blocks
 }
 
-fn kiro_rs_tool_cache_blocks(
+fn claude_code_tool_cache_blocks(
     req: &MessagesRequest,
     policy: ClaudeCodeToolCachePolicy,
 ) -> Vec<CacheBlock> {
@@ -777,10 +785,10 @@ fn kiro_rs_tool_cache_blocks(
             && msg.role == "user"
             && !message_has_explicit_cache_control(msg)
         {
-            append_kiro_rs_tool_current_user_stable_prefix_block(&mut blocks, msg, policy);
+            append_claude_code_tool_current_user_stable_prefix_block(&mut blocks, msg, policy);
             continue;
         }
-        append_kiro_rs_tool_message_blocks(&mut blocks, msg, idx != last_message_idx);
+        append_claude_code_tool_message_blocks(&mut blocks, msg, idx != last_message_idx);
     }
 
     blocks
@@ -853,7 +861,7 @@ fn append_message_blocks(blocks: &mut Vec<CacheBlock>, msg: &Message) {
     }
 }
 
-fn append_kiro_rs_tool_message_blocks(
+fn append_claude_code_tool_message_blocks(
     blocks: &mut Vec<CacheBlock>,
     msg: &Message,
     auto_breakpoint_at_message_end: bool,
@@ -914,7 +922,7 @@ fn message_has_explicit_cache_control(msg: &Message) -> bool {
     }
 }
 
-fn append_kiro_rs_tool_current_user_stable_prefix_block(
+fn append_claude_code_tool_current_user_stable_prefix_block(
     blocks: &mut Vec<CacheBlock>,
     msg: &Message,
     policy: ClaudeCodeToolCachePolicy,
@@ -1188,7 +1196,7 @@ fn is_valid_uuid(value: &str) -> bool {
     true
 }
 
-fn apply_kiro_rs_tool_coverage_policy(
+fn apply_claude_code_tool_coverage_policy(
     covered_tokens: i32,
     policy: ClaudeCodeToolCachePolicy,
 ) -> i32 {
@@ -1817,7 +1825,7 @@ mod tests {
             },
         ];
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &first_req,
             12_000,
@@ -1828,13 +1836,13 @@ mod tests {
         assert!(first.usage().cache_creation_input_tokens > 0);
         assert_eq!(first.usage().cache_read_input_tokens, 0);
 
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_claude_code_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &first_req,
             12_000,
@@ -1866,7 +1874,7 @@ mod tests {
             },
         ];
 
-        let failed = tracker.compute_kiro_rs_tool_with_bounds(
+        let failed = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &req,
             12_000,
@@ -1877,7 +1885,7 @@ mod tests {
         assert!(failed.usage().cache_creation_input_tokens > 0);
         assert_eq!(failed.usage().cache_read_input_tokens, 0);
 
-        let retry = tracker.compute_kiro_rs_tool_with_bounds(
+        let retry = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &req,
             12_000,
@@ -1929,7 +1937,7 @@ mod tests {
         };
 
         let first_req = make_req("time=1000");
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &first_req,
             12_000,
@@ -1937,14 +1945,14 @@ mod tests {
             PromptCacheBounds::default(),
             ClaudeCodeToolCachePolicy::default(),
         );
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_claude_code_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
         let second_req = make_req("time=2000");
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &second_req,
             12_000,
@@ -1977,7 +1985,7 @@ mod tests {
             metadata: None,
         };
 
-        let plan = tracker.compute_kiro_rs_tool_with_bounds(
+        let plan = tracker.compute_claude_code_tool_with_bounds(
             Some(test_scope("kiro-single-message")),
             &req,
             1_000,
@@ -2011,7 +2019,7 @@ mod tests {
                     content: json!("current question"),
                 },
             ];
-            let plan = tracker.compute_kiro_rs_tool_with_bounds(
+            let plan = tracker.compute_claude_code_tool_with_bounds(
                 Some(scope.clone()),
                 &req,
                 12_000,
@@ -2019,7 +2027,7 @@ mod tests {
                 bounds,
                 ClaudeCodeToolCachePolicy::default(),
             );
-            tracker.commit_kiro_rs_tool_success_with_bounds(Some(scope), &plan, bounds);
+            tracker.commit_claude_code_tool_success_with_bounds(Some(scope), &plan, bounds);
         }
 
         assert!(tracker.entry_count() <= 2);
@@ -2049,7 +2057,7 @@ mod tests {
             ..ClaudeCodeToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &req,
             12_000,
@@ -2060,13 +2068,13 @@ mod tests {
         let first_create = first.usage().cache_creation_input_tokens;
         assert!(first_create > 0);
         assert_eq!(first.usage().cache_read_input_tokens, 0);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_claude_code_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &req,
             12_000,
@@ -2102,7 +2110,7 @@ mod tests {
             ..ClaudeCodeToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &req,
             20_000,
@@ -2112,13 +2120,13 @@ mod tests {
         );
         assert_eq!(first.usage().cache_creation_input_tokens, 2_048);
         assert_eq!(first.usage().cache_read_input_tokens, 0);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_claude_code_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &req,
             20_000,
@@ -2158,7 +2166,7 @@ mod tests {
             ..ClaudeCodeToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &req,
             20_000,
@@ -2166,13 +2174,13 @@ mod tests {
             PromptCacheBounds::default(),
             first_policy,
         );
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_claude_code_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &req,
             20_000,
@@ -2208,7 +2216,7 @@ mod tests {
             ..ClaudeCodeToolCachePolicy::default()
         };
 
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &req,
             20_000,
@@ -2217,13 +2225,13 @@ mod tests {
             policy,
         );
         assert_eq!(first.usage().cache_creation_input_tokens, 3_000);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_claude_code_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &req,
             20_000,
@@ -2254,7 +2262,7 @@ mod tests {
             metadata: None,
         };
 
-        let default_plan = tracker.compute_kiro_rs_tool_with_bounds(
+        let default_plan = tracker.compute_claude_code_tool_with_bounds(
             Some(test_scope("kiro-current-user-default")),
             &req,
             10_000,
@@ -2271,7 +2279,7 @@ mod tests {
             ..ClaudeCodeToolCachePolicy::default()
         };
         let scope = test_scope("kiro-current-user-opt-in");
-        let first = tracker.compute_kiro_rs_tool_with_bounds(
+        let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &req,
             10_000,
@@ -2281,13 +2289,13 @@ mod tests {
         );
         assert!(first.usage().cache_creation_input_tokens > 0);
         assert!(first.usage().cache_creation_input_tokens <= 1_500);
-        tracker.commit_kiro_rs_tool_success_with_bounds(
+        tracker.commit_claude_code_tool_success_with_bounds(
             Some(scope.clone()),
             &first,
             PromptCacheBounds::default(),
         );
 
-        let second = tracker.compute_kiro_rs_tool_with_bounds(
+        let second = tracker.compute_claude_code_tool_with_bounds(
             Some(scope),
             &req,
             10_000,
