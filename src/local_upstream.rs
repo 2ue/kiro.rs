@@ -52,6 +52,18 @@ pub(crate) mod event {
     pub(crate) type LocalUpstreamToolUseEvent = crate::kiro::model::events::ToolUseEvent;
 }
 
+pub(crate) mod model_catalog {
+    pub(crate) type LocalUpstreamAvailableModel =
+        crate::kiro::model::available_models::KiroAvailableModel;
+    pub(crate) type LocalUpstreamAvailableModelCatalog =
+        crate::kiro::model::available_models::KiroAvailableModelCatalog;
+    pub(crate) type LocalUpstreamModelCapabilityCohortKey =
+        crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamModelTokenLimits =
+        crate::kiro::model::available_models::KiroModelTokenLimits;
+}
+
 pub(crate) mod request {
     pub(crate) type LocalUpstreamAdditionalModelRequestFields =
         crate::kiro::model::requests::kiro::AdditionalModelRequestFields;

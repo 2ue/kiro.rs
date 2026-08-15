@@ -6,8 +6,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::types::Model;
-use crate::kiro::model::available_models::{
-    KiroAvailableModel, KiroAvailableModelCatalog, KiroModelCapabilityCohortKey,
+use crate::local_upstream::model_catalog::{
+    LocalUpstreamAvailableModel, LocalUpstreamAvailableModelCatalog,
+    LocalUpstreamModelCapabilityCohortKey,
 };
 use crate::model::config::{ModelMappingConfig, ModelMappingRuleKind, ModelResolutionMode};
 
@@ -86,8 +87,8 @@ impl KiroReasoningCapabilityState {
 }
 
 fn reasoning_cohort_contract_match(
-    verified_cohort_keys: Option<&[KiroModelCapabilityCohortKey]>,
-    current_cohort_keys: &[KiroModelCapabilityCohortKey],
+    verified_cohort_keys: Option<&[LocalUpstreamModelCapabilityCohortKey]>,
+    current_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
 ) -> KiroReasoningCohortContractMatch {
     // An empty local cohort means there is no local dispatch population whose wire contract can be
     // proven. In particular, it must not vacuously match every persisted contract.
@@ -321,7 +322,7 @@ pub struct ModelCapabilitiesStatus {
     pub reasoning_fields: BTreeMap<String, KiroReasoningFieldCapability>,
     /// Persistence-only fence. Admin JSON must not expose account cohort metadata.
     #[serde(skip)]
-    pub reasoning_capability_cohort_keys: Vec<KiroModelCapabilityCohortKey>,
+    pub reasoning_capability_cohort_keys: Vec<LocalUpstreamModelCapabilityCohortKey>,
     #[serde(skip)]
     pub reasoning_capability_cohort_complete: bool,
     #[serde(skip)]
@@ -341,7 +342,7 @@ struct ModelCapabilitiesSnapshot {
     models: BTreeMap<String, ModelCapabilityItem>,
     reasoning_fields: BTreeMap<String, KiroReasoningFieldCapability>,
     reasoning_states: BTreeMap<String, KiroReasoningCapabilityState>,
-    reasoning_capability_cohort_keys: Option<Vec<KiroModelCapabilityCohortKey>>,
+    reasoning_capability_cohort_keys: Option<Vec<LocalUpstreamModelCapabilityCohortKey>>,
     source: String,
     last_synced_at: Option<String>,
     last_error: Option<String>,
@@ -587,7 +588,7 @@ impl ModelCapabilitiesCatalog {
     pub(crate) fn reasoning_capability_state_for(
         &self,
         model: &str,
-        current_capability_cohort_keys: &[KiroModelCapabilityCohortKey],
+        current_capability_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
     ) -> KiroReasoningCapabilityState {
         let model = normalize_model_id(model);
         let inner = self.inner.read();
@@ -607,7 +608,7 @@ impl ModelCapabilitiesCatalog {
 
     pub(crate) fn reasoning_capability_cohort_contract_match(
         &self,
-        current_capability_cohort_keys: &[KiroModelCapabilityCohortKey],
+        current_capability_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
     ) -> KiroReasoningCohortContractMatch {
         let inner = self.inner.read();
         reasoning_cohort_contract_match(
@@ -682,7 +683,7 @@ impl ModelCapabilitiesCatalog {
 
     pub fn sync_from_upstream_catalog(
         &self,
-        mut catalog: KiroAvailableModelCatalog,
+        mut catalog: LocalUpstreamAvailableModelCatalog,
     ) -> ModelCapabilitiesStatus {
         catalog.capability_cohort_keys.sort();
         let cohort_keys_valid = !catalog.capability_cohort_keys.is_empty()
@@ -717,7 +718,7 @@ impl ModelCapabilitiesCatalog {
 
     pub fn sync_from_kiro_catalog(
         &self,
-        catalog: KiroAvailableModelCatalog,
+        catalog: LocalUpstreamAvailableModelCatalog,
     ) -> ModelCapabilitiesStatus {
         self.sync_from_upstream_catalog(catalog)
     }
@@ -725,7 +726,7 @@ impl ModelCapabilitiesCatalog {
     #[cfg(test)]
     pub fn sync_from_upstream_models(
         &self,
-        models: Vec<KiroAvailableModel>,
+        models: Vec<LocalUpstreamAvailableModel>,
     ) -> ModelCapabilitiesStatus {
         self.sync_from_upstream_models_with_cohort(models, None, true, 1, 1)
     }
@@ -733,15 +734,15 @@ impl ModelCapabilitiesCatalog {
     #[cfg(test)]
     pub fn sync_from_kiro_models(
         &self,
-        models: Vec<KiroAvailableModel>,
+        models: Vec<LocalUpstreamAvailableModel>,
     ) -> ModelCapabilitiesStatus {
         self.sync_from_upstream_models(models)
     }
 
     fn sync_from_upstream_models_with_cohort(
         &self,
-        models: Vec<KiroAvailableModel>,
-        reasoning_capability_cohort_keys: Option<Vec<KiroModelCapabilityCohortKey>>,
+        models: Vec<LocalUpstreamAvailableModel>,
+        reasoning_capability_cohort_keys: Option<Vec<LocalUpstreamModelCapabilityCohortKey>>,
         cohort_complete: bool,
         successful_cohort_count: usize,
         cohort_count: usize,
@@ -992,7 +993,7 @@ impl ModelResolution {
 }
 
 fn model_capability_from_upstream_catalog_item(
-    model: KiroAvailableModel,
+    model: LocalUpstreamAvailableModel,
 ) -> Option<ModelCapabilityItem> {
     let model_id = model.model_id.trim().to_string();
     if model_id.is_empty() {
@@ -1893,7 +1894,9 @@ fn model_created_at(model: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiro::model::available_models::{KiroAvailableModel, KiroModelTokenLimits};
+    use crate::local_upstream::model_catalog::{
+        LocalUpstreamAvailableModel, LocalUpstreamModelTokenLimits,
+    };
 
     fn reasoning_schema(
         field: &str,
@@ -1934,8 +1937,8 @@ mod tests {
         }
     }
 
-    fn capability_cohort_key(class: &str) -> KiroModelCapabilityCohortKey {
-        KiroModelCapabilityCohortKey {
+    fn capability_cohort_key(class: &str) -> LocalUpstreamModelCapabilityCohortKey {
+        LocalUpstreamModelCapabilityCohortKey {
             endpoint_family: "ide".to_string(),
             auth_method: "social".to_string(),
             provider: "builderid".to_string(),
@@ -1951,8 +1954,8 @@ mod tests {
         for round in 0..5 {
             let key = capability_cohort_key("pro");
             let catalog = ModelCapabilitiesCatalog::new();
-            catalog.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
+            catalog.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                models: vec![LocalUpstreamAvailableModel {
                     model_id: "claude-cohort-state".to_string(),
                     additional_model_request_fields_schema: Some(reasoning_schema(
                         "output_config",
@@ -1983,8 +1986,8 @@ mod tests {
             );
 
             let absent = ModelCapabilitiesCatalog::new();
-            absent.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
+            absent.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                models: vec![LocalUpstreamAvailableModel {
                     model_id: "claude-cohort-state".to_string(),
                     additional_model_request_fields_schema: None,
                     ..Default::default()
@@ -2003,8 +2006,8 @@ mod tests {
             );
 
             let invalid = ModelCapabilitiesCatalog::new();
-            invalid.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
+            invalid.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                models: vec![LocalUpstreamAvailableModel {
                     model_id: "claude-cohort-state".to_string(),
                     additional_model_request_fields_schema: Some(serde_json::Value::Null),
                     ..Default::default()
@@ -2031,8 +2034,8 @@ mod tests {
                 KiroReasoningCapabilityState::AuthoritativeInvalid,
                 "round {round}: invalid authoritative schema survives restart"
             );
-            invalid_restored.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
+            invalid_restored.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                models: vec![LocalUpstreamAvailableModel {
                     model_id: "claude-cohort-state".to_string(),
                     additional_model_request_fields_schema: Some(reasoning_schema(
                         "output_config",
@@ -2059,21 +2062,22 @@ mod tests {
                 .map(|index| capability_cohort_key(&format!("class-{index}")))
                 .collect::<Vec<_>>();
             let incomplete = ModelCapabilitiesCatalog::new();
-            let status = incomplete.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
-                    model_id: "claude-cohort-state".to_string(),
-                    additional_model_request_fields_schema: Some(reasoning_schema(
-                        "output_config",
-                        serde_json::json!(["high"]),
-                        Some("high"),
-                    )),
-                    ..Default::default()
-                }],
-                capability_cohort_keys: incomplete_keys.clone(),
-                successful_cohort_count: 4,
-                cohort_count: 5,
-                complete: false,
-            });
+            let status =
+                incomplete.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                    models: vec![LocalUpstreamAvailableModel {
+                        model_id: "claude-cohort-state".to_string(),
+                        additional_model_request_fields_schema: Some(reasoning_schema(
+                            "output_config",
+                            serde_json::json!(["high"]),
+                            Some("high"),
+                        )),
+                        ..Default::default()
+                    }],
+                    capability_cohort_keys: incomplete_keys.clone(),
+                    successful_cohort_count: 4,
+                    cohort_count: 5,
+                    complete: false,
+                });
             assert!(!status.reasoning_capability_cohort_complete);
             assert_eq!(
                 incomplete.reasoning_capability_state_for("claude-cohort-state", &incomplete_keys),
@@ -2090,8 +2094,8 @@ mod tests {
                 vec![capability_cohort_key("pro"), capability_cohort_key("free")];
             verified_keys.sort();
             let source = ModelCapabilitiesCatalog::new();
-            source.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
+            source.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                models: vec![LocalUpstreamAvailableModel {
                     model_id: "claude-persisted-subset".to_string(),
                     additional_model_request_fields_schema: Some(reasoning_schema(
                         "output_config",
@@ -2156,7 +2160,7 @@ mod tests {
             );
 
             let incomplete_status =
-                restored.sync_from_upstream_catalog(KiroAvailableModelCatalog {
+                restored.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
                     models: Vec::new(),
                     capability_cohort_keys: current_subset.clone(),
                     successful_cohort_count: 0,
@@ -2182,8 +2186,8 @@ mod tests {
         for round in 0..5 {
             let key = capability_cohort_key("pro");
             let source = ModelCapabilitiesCatalog::new();
-            source.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
+            source.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                models: vec![LocalUpstreamAvailableModel {
                     model_id: "claude-restart-state".to_string(),
                     additional_model_request_fields_schema: Some(reasoning_schema(
                         "output_config",
@@ -2216,8 +2220,8 @@ mod tests {
                 ),
                 KiroReasoningCapabilityState::Supported(_)
             ));
-            restored.sync_from_upstream_catalog(KiroAvailableModelCatalog {
-                models: vec![KiroAvailableModel {
+            restored.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
+                models: vec![LocalUpstreamAvailableModel {
                     model_id: "claude-restart-state".to_string(),
                     ..Default::default()
                 }],
@@ -2321,7 +2325,7 @@ mod tests {
     fn catalog_sync_tracks_and_replaces_reasoning_schema_capability_for_five_rounds() {
         for round in 0..5 {
             let catalog = ModelCapabilitiesCatalog::new();
-            catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+            catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
                 model_id: "claude-test-reasoning".to_string(),
                 additional_model_request_fields_schema: Some(reasoning_schema(
                     "reasoning",
@@ -2336,7 +2340,7 @@ mod tests {
             assert_eq!(capability.path, KiroReasoningFieldPath::Reasoning);
             assert_eq!(capability.default_effort.as_deref(), Some("high"));
 
-            catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+            catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
                 model_id: "claude-test-reasoning".to_string(),
                 additional_model_request_fields_schema: None,
                 ..Default::default()
@@ -2354,7 +2358,7 @@ mod tests {
     fn persisted_catalog_restores_only_valid_reasoning_capabilities_for_five_rounds() {
         for round in 0..5 {
             let source = ModelCapabilitiesCatalog::new();
-            source.sync_from_upstream_models(vec![KiroAvailableModel {
+            source.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
                 model_id: "claude-persisted-reasoning".to_string(),
                 additional_model_request_fields_schema: Some(reasoning_schema(
                     "output_config",
@@ -2416,10 +2420,10 @@ mod tests {
     #[test]
     fn sync_from_upstream_models_uses_upstream_models_without_static_merge() {
         let catalog = ModelCapabilitiesCatalog::new();
-        let status = catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+        let status = catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
             model_id: "claude-sonnet-4-9-20270101".to_string(),
             model_name: Some("Claude Sonnet 4.9".to_string()),
-            token_limits: Some(KiroModelTokenLimits {
+            token_limits: Some(LocalUpstreamModelTokenLimits {
                 max_input_tokens: Some(1_000_000),
                 max_output_tokens: Some(128_000),
             }),
@@ -2470,19 +2474,19 @@ mod tests {
     fn catalog_context_window_for_sonnet_follows_real_upstream_model() {
         let catalog = ModelCapabilitiesCatalog::new();
         catalog.sync_from_upstream_models(vec![
-            KiroAvailableModel {
+            LocalUpstreamAvailableModel {
                 model_id: "claude-sonnet-4.5".to_string(),
                 model_name: Some("Claude Sonnet 4.5".to_string()),
-                token_limits: Some(KiroModelTokenLimits {
+                token_limits: Some(LocalUpstreamModelTokenLimits {
                     max_input_tokens: Some(200_000),
                     max_output_tokens: Some(64_000),
                 }),
                 ..Default::default()
             },
-            KiroAvailableModel {
+            LocalUpstreamAvailableModel {
                 model_id: "claude-sonnet-4.6".to_string(),
                 model_name: Some("Claude Sonnet 4.6".to_string()),
-                token_limits: Some(KiroModelTokenLimits {
+                token_limits: Some(LocalUpstreamModelTokenLimits {
                     max_input_tokens: Some(1_000_000),
                     max_output_tokens: Some(64_000),
                 }),
@@ -2501,10 +2505,10 @@ mod tests {
         );
 
         let free_catalog = ModelCapabilitiesCatalog::new();
-        free_catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+        free_catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
             model_id: "claude-sonnet-4.5".to_string(),
             model_name: Some("Claude Sonnet 4.5".to_string()),
-            token_limits: Some(KiroModelTokenLimits {
+            token_limits: Some(LocalUpstreamModelTokenLimits {
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(64_000),
             }),
@@ -2528,10 +2532,10 @@ mod tests {
     fn sync_from_upstream_models_preserves_claude_alias_targets_when_sync_omits_all_claude_models()
     {
         let catalog = ModelCapabilitiesCatalog::new();
-        let status = catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+        let status = catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
             model_id: "deepseek-3.2".to_string(),
             model_name: Some("Deepseek v3.2".to_string()),
-            token_limits: Some(KiroModelTokenLimits {
+            token_limits: Some(LocalUpstreamModelTokenLimits {
                 max_input_tokens: Some(164_000),
                 max_output_tokens: Some(64_000),
             }),
@@ -2575,10 +2579,10 @@ mod tests {
             source: Some(MANUAL_SOURCE.to_string()),
         });
 
-        let status = catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+        let status = catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
             model_id: "claude-sonnet-4-9-20270101".to_string(),
             model_name: Some("Claude Sonnet 4.9".to_string()),
-            token_limits: Some(KiroModelTokenLimits {
+            token_limits: Some(LocalUpstreamModelTokenLimits {
                 max_input_tokens: Some(1_000_000),
                 max_output_tokens: Some(128_000),
             }),
@@ -2595,10 +2599,10 @@ mod tests {
             ModelResolutionSource::Manual
         );
 
-        let status = catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+        let status = catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
             model_id: "claude-opus-5-20270101".to_string(),
             model_name: Some("Claude Opus 5 Upstream".to_string()),
-            token_limits: Some(KiroModelTokenLimits {
+            token_limits: Some(LocalUpstreamModelTokenLimits {
                 max_input_tokens: Some(200_000),
                 max_output_tokens: Some(64_000),
             }),
@@ -3007,10 +3011,10 @@ mod tests {
     #[test]
     fn anthropic_models_do_not_advertise_unresolvable_static_models() {
         let catalog = ModelCapabilitiesCatalog::new();
-        catalog.sync_from_upstream_models(vec![KiroAvailableModel {
+        catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
             model_id: "claude-sonnet-4-9-20270101".to_string(),
             model_name: Some("Claude Sonnet 4.9".to_string()),
-            token_limits: Some(KiroModelTokenLimits {
+            token_limits: Some(LocalUpstreamModelTokenLimits {
                 max_input_tokens: Some(1_000_000),
                 max_output_tokens: Some(128_000),
             }),
