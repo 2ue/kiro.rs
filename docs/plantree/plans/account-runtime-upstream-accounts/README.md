@@ -124,6 +124,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor. The underlying concrete type is still the legacy provider until the provider implementation is replaced, but the Claude/Anthropic protocol boundary no longer exposes a Kiro-named provider field.
 - Anthropic converter module docs, diagnostics, collision errors and compatibility comments now use local-upstream/upstream-safe wording instead of presenting the request conversion as a Kiro protocol surface. The concrete legacy request type remains isolated behind the current local-upstream body boundary until the provider/body implementation is replaced.
 - The model capability seed/source boundary now uses upstream-account terminology. New seed/status writes use `upstream-model-seed` and `upstream-account-model-catalog`, old `kiro-*` source values are normalized on read, and main/Admin model capability sync call the account-neutral `sync_from_upstream_catalog` entrypoint while the legacy provider method remains a compatibility delegate.
+- Native WebSearch MCP routing now enters through local-auxiliary-upstream names in `websearch.rs`: provider/error helper wrappers, MCP call helper names and runtime comments no longer present WebSearch as a Kiro MCP surface. The concrete legacy provider type and timeout config field remain compatibility details behind the wrapper.
 
 Last verified on 2026-08-14:
 
@@ -308,6 +309,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh converter-neutral-text-test1 -- bash -lc 'cargo check && cargo test convert_tools_rejects -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh upstream-model-source-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh upstream-model-source-test3 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-aux-mcp-websearch-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-aux-mcp-websearch-test1 -- bash -lc 'cargo check && cargo test websearch -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

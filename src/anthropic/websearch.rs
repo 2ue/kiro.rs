@@ -1,6 +1,6 @@
 //! WebSearch 工具处理模块
 //!
-//! 实现 Anthropic WebSearch 请求到 Kiro MCP 的转换和响应生成
+//! 实现 Anthropic WebSearch 请求到本地辅助上游 MCP 的转换和响应生成
 
 use std::{convert::Infallible, sync::Arc};
 
@@ -18,6 +18,8 @@ use super::types::MessagesRequest;
 use crate::http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout};
 use crate::kiro::call_trace::McpCallAttributionSink;
 use crate::kiro::provider::{McpCallAttribution, McpCallFailureKind};
+
+type LocalAuxiliaryMcpProvider = crate::kiro::provider::KiroProvider;
 
 const MAX_MCP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const WEB_SEARCH_QUERY_PREFIX: &str = "Perform a web search for the query:";
@@ -151,8 +153,7 @@ impl WebSearchFailure {
     }
 
     fn from_provider_error(error: &anyhow::Error) -> Self {
-        let failure = match crate::kiro::provider::KiroProvider::mcp_failure_kind_from_error(error)
-        {
+        let failure = match local_auxiliary_mcp_failure_kind_from_error(error) {
             Some(McpCallFailureKind::Scheduler) => Self::new(
                 WebSearchFailureKind::Scheduler,
                 "websearch_mcp_scheduler_unavailable",
@@ -195,9 +196,7 @@ impl WebSearchFailure {
                 "websearch_mcp_upstream_error",
             ),
         };
-        failure.with_attribution(
-            crate::kiro::provider::KiroProvider::mcp_attribution_from_error(error),
-        )
+        failure.with_attribution(local_auxiliary_mcp_attribution_from_error(error))
     }
 
     fn into_outcome(self, request_id: &str, error_id: &str) -> WebSearchOutcome {
@@ -257,6 +256,21 @@ impl WebSearchFailure {
             attribution: *self.attribution,
         }
     }
+}
+
+fn local_auxiliary_mcp_failure_kind_from_error(
+    error: &anyhow::Error,
+) -> Option<McpCallFailureKind> {
+    LocalAuxiliaryMcpProvider::mcp_failure_kind_from_error(error)
+}
+
+fn local_auxiliary_mcp_attribution_from_error(error: &anyhow::Error) -> McpCallAttribution {
+    LocalAuxiliaryMcpProvider::mcp_attribution_from_error(error)
+}
+
+#[cfg(test)]
+fn local_auxiliary_mcp_failure_error(kind: McpCallFailureKind, message: &str) -> anyhow::Error {
+    LocalAuxiliaryMcpProvider::mcp_failure_error(kind, message)
 }
 
 fn is_known_native_web_search_tool_type(tool_type: &str) -> bool {
@@ -801,7 +815,7 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 
 /// 处理 WebSearch 请求
 pub async fn handle_websearch_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<LocalAuxiliaryMcpProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
@@ -830,8 +844,8 @@ pub async fn handle_websearch_request(
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
-    // 3. 调用 Kiro MCP API
-    let (search_results, attribution) = match call_mcp_api(
+    // 3. 调用本地辅助上游 MCP API
+    let (search_results, attribution) = match call_local_auxiliary_mcp_api(
         &provider,
         &mcp_request,
         inference_attempt_budget,
@@ -890,9 +904,9 @@ pub async fn handle_websearch_request(
     }
 }
 
-/// 调用 Kiro MCP API
-async fn call_mcp_api(
-    provider: &crate::kiro::provider::KiroProvider,
+/// 调用本地辅助上游 MCP API
+async fn call_local_auxiliary_mcp_api(
+    provider: &LocalAuxiliaryMcpProvider,
     request: &McpRequest,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     attribution_sink: Arc<McpCallAttributionSink>,
@@ -1468,7 +1482,7 @@ mod tests {
 
         for _ in 0..5 {
             for (kind, message, expected) in cases {
-                let error = crate::kiro::provider::KiroProvider::mcp_failure_error(kind, message);
+                let error = local_auxiliary_mcp_failure_error(kind, message);
                 let failure = WebSearchFailure::from_provider_error(&error);
                 assert_eq!(failure.kind, expected);
                 assert!(!failure.internal_reason.contains("private-response"));
