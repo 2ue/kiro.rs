@@ -20,10 +20,9 @@ use tokio::{
 };
 
 use crate::{
-    kiro::model::requests::{
-        conversation::Message,
-        kiro::KiroRequest,
-        tool::{ToolResult, ToolUseEntry},
+    local_upstream::request::{
+        LocalUpstreamConversationMessage, LocalUpstreamRequest, LocalUpstreamToolResult,
+        LocalUpstreamToolUseEntry,
     },
     model::config::ToolFormatDebugConfig,
 };
@@ -41,7 +40,7 @@ pub struct ToolFormatDebugEvent<'a> {
     pub upstream_model: Option<&'a str>,
     pub error_message: &'a str,
     pub attempted_body: Option<&'a str>,
-    pub request: &'a KiroRequest,
+    pub request: &'a LocalUpstreamRequest,
     pub report: Option<&'a PayloadGuardReport>,
     pub diagnostics: ToolUseFormatDiagnostics,
 }
@@ -831,7 +830,10 @@ struct ToolFormatSamplingSnapshot {
     window_secs: u64,
 }
 
-fn collect_samples(request: &KiroRequest, config: &ToolFormatDebugConfig) -> ToolFormatSamples {
+fn collect_samples(
+    request: &LocalUpstreamRequest,
+    config: &ToolFormatDebugConfig,
+) -> ToolFormatSamples {
     let mut samples = ToolFormatSamples::default();
     let mut tool_names = HashSet::new();
     for tool in &request
@@ -851,7 +853,7 @@ fn collect_samples(request: &KiroRequest, config: &ToolFormatDebugConfig) -> Too
     let mut seen_tool_results = HashSet::new();
     for (idx, message) in request.conversation_state.history.iter().enumerate() {
         match message {
-            Message::Assistant(assistant) => {
+            LocalUpstreamConversationMessage::Assistant(assistant) => {
                 if let Some(tool_uses) = &assistant.assistant_response_message.tool_uses {
                     for tool_use in tool_uses {
                         collect_tool_use_sample(
@@ -866,7 +868,7 @@ fn collect_samples(request: &KiroRequest, config: &ToolFormatDebugConfig) -> Too
                     }
                 }
             }
-            Message::User(user) => {
+            LocalUpstreamConversationMessage::User(user) => {
                 for result in &user
                     .user_input_message
                     .user_input_message_context
@@ -910,7 +912,7 @@ fn collect_tool_use_sample(
     config: &ToolFormatDebugConfig,
     history_index: Option<usize>,
     role: &'static str,
-    tool_use: &ToolUseEntry,
+    tool_use: &LocalUpstreamToolUseEntry,
     known_tool_names: &HashSet<String>,
     seen_tool_uses: &mut HashSet<String>,
 ) {
@@ -964,7 +966,7 @@ fn collect_tool_result_sample(
     config: &ToolFormatDebugConfig,
     history_index: Option<usize>,
     role: &'static str,
-    result: &ToolResult,
+    result: &LocalUpstreamToolResult,
     seen_tool_results: &mut HashSet<String>,
 ) {
     let id = result.tool_use_id.trim();
@@ -1005,7 +1007,7 @@ fn sample(
     reason: &'static str,
     tool_name: &str,
     tool_use_id: &str,
-    tool_use: &ToolUseEntry,
+    tool_use: &LocalUpstreamToolUseEntry,
 ) -> ToolFormatSample {
     ToolFormatSample {
         history_index,
@@ -1192,37 +1194,41 @@ fn truncate_string_to_limit(value: &str, max_bytes: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiro::model::requests::{
-        conversation::{
-            AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-            HistoryUserMessage, UserInputMessage, UserInputMessageContext,
-        },
-        tool::ToolUseEntry,
+    use crate::local_upstream::request::{
+        LocalUpstreamAssistantMessage, LocalUpstreamConversationMessage,
+        LocalUpstreamConversationState, LocalUpstreamCurrentMessage,
+        LocalUpstreamHistoryAssistantMessage, LocalUpstreamHistoryUserMessage,
+        LocalUpstreamRequest, LocalUpstreamToolResult, LocalUpstreamToolUseEntry,
+        LocalUpstreamUserInputMessage, LocalUpstreamUserInputMessageContext,
     };
 
-    fn test_request() -> KiroRequest {
-        let assistant = HistoryAssistantMessage {
-            assistant_response_message: AssistantMessage::new("tool call").with_tool_uses(vec![
-                ToolUseEntry::new("tool-1", "missingTool").with_input(json!("bad-input")),
-                ToolUseEntry::new("tool-1", "missingTool").with_input(json!({})),
-            ]),
+    fn test_request() -> LocalUpstreamRequest {
+        let assistant = LocalUpstreamHistoryAssistantMessage {
+            assistant_response_message: LocalUpstreamAssistantMessage::new("tool call")
+                .with_tool_uses(vec![
+                    LocalUpstreamToolUseEntry::new("tool-1", "missingTool")
+                        .with_input(json!("bad-input")),
+                    LocalUpstreamToolUseEntry::new("tool-1", "missingTool").with_input(json!({})),
+                ]),
         };
-        let mut user = HistoryUserMessage::new("result", "model");
-        user.user_input_message.user_input_message_context = UserInputMessageContext::new()
-            .with_tool_results(vec![
-                ToolResult::success("tool-1", "secret result content"),
-                ToolResult::success("tool-1", "duplicate secret"),
+        let mut user = LocalUpstreamHistoryUserMessage::new("result", "model");
+        user.user_input_message.user_input_message_context =
+            LocalUpstreamUserInputMessageContext::new().with_tool_results(vec![
+                LocalUpstreamToolResult::success("tool-1", "secret result content"),
+                LocalUpstreamToolResult::success("tool-1", "duplicate secret"),
             ]);
 
-        KiroRequest {
-            conversation_state: ConversationState::new("conv")
-                .with_current_message(CurrentMessage::new(UserInputMessage::new(
-                    "current", "model",
-                )))
+        LocalUpstreamRequest {
+            conversation_state: LocalUpstreamConversationState::new("conv")
+                .with_current_message(LocalUpstreamCurrentMessage::new(
+                    LocalUpstreamUserInputMessage::new("current", "model"),
+                ))
                 .with_history(vec![
-                    Message::User(HistoryUserMessage::new("user", "model")),
-                    Message::Assistant(assistant),
-                    Message::User(user),
+                    LocalUpstreamConversationMessage::User(LocalUpstreamHistoryUserMessage::new(
+                        "user", "model",
+                    )),
+                    LocalUpstreamConversationMessage::Assistant(assistant),
+                    LocalUpstreamConversationMessage::User(user),
                 ]),
             profile_arn: None,
             additional_model_request_fields: None,
@@ -1232,7 +1238,7 @@ mod tests {
     }
 
     fn test_event<'a>(
-        request: &'a KiroRequest,
+        request: &'a LocalUpstreamRequest,
         diagnostics: ToolUseFormatDiagnostics,
     ) -> ToolFormatDebugEvent<'a> {
         ToolFormatDebugEvent {

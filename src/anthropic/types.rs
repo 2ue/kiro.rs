@@ -306,8 +306,8 @@ mod tests {
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct OutputConfig {
     /// Client-selected reasoning effort. `None` means the field was omitted and must remain
-    /// distinct from an explicit `high`; native Kiro routing resolves it from the authoritative
-    /// model capability default.
+    /// distinct from an explicit `high`; native upstream routing resolves it from the
+    /// authoritative model capability default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 }
@@ -315,7 +315,7 @@ pub struct OutputConfig {
 /// Compatibility default used only by the legacy synthetic thinking prompt transport.
 ///
 /// It is not an Anthropic request default and must never be serialized as a client-selected
-/// `output_config.effort` or used in place of an authoritative Kiro schema default.
+/// `output_config.effort` or used in place of an authoritative upstream schema default.
 pub const LEGACY_PROMPT_COMPAT_THINKING_EFFORT: &str = "high";
 
 pub fn parse_thinking_effort(effort: &str) -> Option<&'static str> {

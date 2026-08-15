@@ -11,7 +11,7 @@ use crate::{
         },
         types::MessagesRequest,
     },
-    kiro::model::requests::kiro::KiroRequest,
+    local_upstream::request::LocalUpstreamRequest,
 };
 
 pub(crate) struct PreparedLocalUpstreamRequestBody {
@@ -21,7 +21,7 @@ pub(crate) struct PreparedLocalUpstreamRequestBody {
 }
 
 pub(crate) fn prepare_local_upstream_request_body(
-    request: &mut KiroRequest,
+    request: &mut LocalUpstreamRequest,
     config: PayloadGuardConfig,
 ) -> Result<PreparedLocalUpstreamRequestBody, PayloadGuardError> {
     if !config.enabled {
@@ -77,8 +77,10 @@ mod tests {
     use super::*;
     use crate::{
         anthropic::types::Message as AnthropicMessage,
-        kiro::model::requests::conversation::{
-            ConversationState, CurrentMessage, HistoryUserMessage, UserInputMessage,
+        local_upstream::request::{
+            LocalUpstreamConversationMessage, LocalUpstreamConversationState,
+            LocalUpstreamCurrentMessage, LocalUpstreamHistoryUserMessage, LocalUpstreamRequest,
+            LocalUpstreamUserInputMessage,
         },
         model::config::PayloadShapingConfig,
     };
@@ -93,18 +95,15 @@ mod tests {
         }
     }
 
-    fn kiro_request() -> KiroRequest {
-        KiroRequest {
-            conversation_state: ConversationState::new("conv-runtime-test")
-                .with_current_message(CurrentMessage::new(UserInputMessage::new(
-                    "current",
-                    "test-model",
-                )))
-                .with_history(vec![
-                    crate::kiro::model::requests::conversation::Message::User(
-                        HistoryUserMessage::new("old history", "test-model"),
-                    ),
-                ]),
+    fn local_upstream_request() -> LocalUpstreamRequest {
+        LocalUpstreamRequest {
+            conversation_state: LocalUpstreamConversationState::new("conv-runtime-test")
+                .with_current_message(LocalUpstreamCurrentMessage::new(
+                    LocalUpstreamUserInputMessage::new("current", "test-model"),
+                ))
+                .with_history(vec![LocalUpstreamConversationMessage::User(
+                    LocalUpstreamHistoryUserMessage::new("old history", "test-model"),
+                )]),
             profile_arn: None,
             additional_model_request_fields: None,
             tool_cache_point_insert_after: Vec::new(),
@@ -132,7 +131,7 @@ mod tests {
 
     #[test]
     fn disabled_local_guard_serializes_without_report() {
-        let mut request = kiro_request();
+        let mut request = local_upstream_request();
 
         let prepared = prepare_local_upstream_request_body(&mut request, guard_config(false, 1024))
             .expect("prepare");

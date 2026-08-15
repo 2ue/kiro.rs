@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use crate::anthropic::prompt_cache::PromptCacheUsage;
-use crate::kiro::model::events::MetadataTokenUsage;
+use crate::local_upstream::event::LocalUpstreamMetadataTokenUsage;
 use crate::model::config::{
     ReportedUsageFieldMode, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
 };
@@ -10,7 +10,7 @@ use crate::model::config::{
 ///
 /// `input_tokens` here means the billable uncached portion reported in Anthropic
 /// responses, while `total_input_tokens` keeps the full prompt token count used
-/// by Kiro metadata/context accounting.
+/// by local-upstream metadata/context accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheUsage {
     pub total_input_tokens: i32,
@@ -1410,7 +1410,7 @@ impl CacheSimulation {
 
 #[cfg(test)]
 pub fn build_usage_with_simulation(
-    metadata_usage: Option<&MetadataTokenUsage>,
+    metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
     total_input_tokens: i32,
     output_tokens: i32,
     simulation: Option<CacheSimulation>,
@@ -1425,7 +1425,7 @@ pub fn build_usage_with_simulation(
 }
 
 pub fn build_usage_with_simulation_policy(
-    metadata_usage: Option<&MetadataTokenUsage>,
+    metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
     total_input_tokens: i32,
     output_tokens: i32,
     simulation: Option<CacheSimulation>,
@@ -1458,7 +1458,7 @@ pub fn build_usage_with_simulation_policy(
 }
 
 pub fn usage_from_metadata_or_estimate(
-    metadata_usage: Option<&MetadataTokenUsage>,
+    metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
     input_tokens: i32,
     output_tokens: i32,
 ) -> CacheUsage {
@@ -1509,14 +1509,14 @@ pub fn usage_from_metadata_or_estimate(
     }
 }
 
-pub fn metadata_usage_has_signal(usage: &MetadataTokenUsage) -> bool {
+pub fn metadata_usage_has_signal(usage: &LocalUpstreamMetadataTokenUsage) -> bool {
     usage.uncached_input_tokens > 0
         || usage.output_tokens > 0
         || usage.cache_read_input_tokens > 0
         || usage.cache_write_input_tokens > 0
 }
 
-pub fn metadata_cache_is_empty(usage: &MetadataTokenUsage) -> bool {
+pub fn metadata_cache_is_empty(usage: &LocalUpstreamMetadataTokenUsage) -> bool {
     usage.cache_read_input_tokens <= 0 && usage.cache_write_input_tokens <= 0
 }
 
@@ -1529,7 +1529,7 @@ mod tests {
     use super::*;
     #[test]
     fn metadata_usage_takes_precedence_over_simulated_cache() {
-        let metadata = MetadataTokenUsage {
+        let metadata = LocalUpstreamMetadataTokenUsage {
             uncached_input_tokens: 1200,
             output_tokens: 900,
             total_tokens: 207_300,
@@ -1549,7 +1549,7 @@ mod tests {
 
     #[test]
     fn high_cache_policy_fills_zero_metadata_cache_from_larger_local_total() {
-        let metadata = MetadataTokenUsage {
+        let metadata = LocalUpstreamMetadataTokenUsage {
             uncached_input_tokens: 50_000,
             output_tokens: 42,
             total_tokens: 50_042,
@@ -1579,7 +1579,7 @@ mod tests {
 
     #[test]
     fn high_cache_policy_uses_local_totals_when_metadata_is_all_zero() {
-        let metadata = MetadataTokenUsage {
+        let metadata = LocalUpstreamMetadataTokenUsage {
             uncached_input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
@@ -1608,7 +1608,7 @@ mod tests {
 
     #[test]
     fn all_zero_metadata_without_simulation_falls_back_to_local_estimates() {
-        let metadata = MetadataTokenUsage::default();
+        let metadata = LocalUpstreamMetadataTokenUsage::default();
 
         let usage = build_usage_with_simulation_policy(Some(&metadata), 4_096, 17, None, false);
 
@@ -1622,7 +1622,7 @@ mod tests {
 
     #[test]
     fn partial_metadata_preserves_cache_and_falls_back_missing_fields() {
-        let metadata = MetadataTokenUsage {
+        let metadata = LocalUpstreamMetadataTokenUsage {
             uncached_input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
@@ -1642,7 +1642,7 @@ mod tests {
 
     #[test]
     fn partial_metadata_uses_reported_total_to_derive_uncached_input() {
-        let metadata = MetadataTokenUsage {
+        let metadata = LocalUpstreamMetadataTokenUsage {
             uncached_input_tokens: 0,
             output_tokens: 100,
             total_tokens: 2_000,
@@ -1661,7 +1661,7 @@ mod tests {
 
     #[test]
     fn high_cache_policy_preserves_nonzero_metadata_cache() {
-        let metadata = MetadataTokenUsage {
+        let metadata = LocalUpstreamMetadataTokenUsage {
             uncached_input_tokens: 1200,
             output_tokens: 900,
             total_tokens: 207_300,
