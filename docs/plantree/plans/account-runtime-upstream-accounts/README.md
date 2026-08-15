@@ -127,6 +127,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Native WebSearch MCP routing now enters through local-auxiliary-upstream names in `websearch.rs`: provider/error helper wrappers, MCP call helper names and runtime comments no longer present WebSearch as a Kiro MCP surface. The concrete legacy provider type and timeout config field remain compatibility details behind the wrapper.
 - `local_upstream` now provides a compatibility facade for the current legacy local provider/call-trace response types. Anthropic router, middleware, handler and WebSearch boundaries import local-upstream aliases instead of directly depending on legacy provider type names, while the underlying implementation remains unchanged.
 - The `local_upstream` facade now also exposes request/event aliases for local-upstream request bodies, tool-use diagnostics and metadata usage. `payload_guard_runtime`, `tool_format_debug`, `cache` and native reasoning comments use those aliases/neutral wording instead of importing legacy request/event types directly at those small boundaries.
+- Anthropic handler stream/body code now imports local-upstream request, event, metadata usage and EventStream decoder aliases from the `local_upstream` facade. Handler-facing retry plans, payload guard retries, non-stream event decoding, stream latency classification and stream retry state use local-upstream names, while concrete legacy request/event/decoder types remain isolated behind the facade.
 
 Last verified on 2026-08-14:
 
@@ -317,6 +318,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-upstream-facade-test4 -- bash -lc 'cargo check && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture && cargo test websearch -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-alias-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-alias-test2 -- bash -lc 'cargo check && cargo test disabled_local_guard_serializes_without_report -- --nocapture && cargo test tool_format_debug -- --nocapture && cargo test metadata_cache -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-event-alias-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-event-alias-test2 -- bash -lc 'cargo check && cargo test stream_success_records_requested_max_tokens_and_downstream_stop_reason -- --nocapture && cargo test stream_zero_context_and_metadata_record_request_estimate_consistently -- --nocapture && cargo test complete_eventstream_decoder_accepts_only_complete_valid_frames -- --nocapture && cargo test disabled_thinking_suppresses_downstream_thinking_even_with_native_effort_for_five_rounds -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

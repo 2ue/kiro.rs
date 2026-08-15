@@ -20,10 +20,13 @@ use crate::external_pool::{
 };
 use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::model::events::MetadataTokenUsage;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::local_upstream::call_trace::{
     AccountRejectReason, LocalUpstreamCallError, SelectionFailureStage, SelectionFailureSummary,
+};
+use crate::local_upstream::event::{
+    LocalUpstreamAssistantResponseEvent, LocalUpstreamContextUsageEvent,
+    LocalUpstreamMessageMetadataEvent, LocalUpstreamMetadataEvent, LocalUpstreamMetadataTokenUsage,
 };
 use crate::model::config::{
     CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch, CacheSimulationPolicyPatch,
@@ -5106,7 +5109,7 @@ fn complete_eventstream_decoder_accepts_only_complete_valid_frames() {
         let events = decode_complete_eventstream(&frame).expect("valid frame decodes");
         assert_eq!(events.len(), 1);
         match &events[0] {
-            Event::AssistantResponse(response) => {
+            LocalUpstreamEvent::AssistantResponse(response) => {
                 assert_eq!(response.content, "visible answer");
                 assert_eq!(response.message_status.as_deref(), Some("COMPLETED"));
             }
@@ -5544,8 +5547,8 @@ fn runtime_config_for_payload_guard(
     }
 }
 
-fn thinking_signature_retry_kiro_fixture() -> KiroRequest {
-    let mut request = serde_json::from_value::<KiroRequest>(json!({
+fn thinking_signature_retry_local_upstream_fixture() -> LocalUpstreamRequest {
+    let mut request = serde_json::from_value::<LocalUpstreamRequest>(json!({
         "conversationState": {
             "conversationId": "thinking-signature-handler-fixture",
             "history": [
@@ -5628,7 +5631,7 @@ fn count_serialized_cache_points(value: &serde_json::Value) -> usize {
 #[test]
 fn thinking_signature_retry_body_removes_only_native_reasoning_five_rounds() {
     for round in 1..=5 {
-        let request = thinking_signature_retry_kiro_fixture();
+        let request = thinking_signature_retry_local_upstream_fixture();
         let original_body =
             serialize_local_upstream_request(&request).expect("serialize original fixture");
         let original: serde_json::Value =
@@ -5694,7 +5697,7 @@ fn thinking_signature_retry_body_removes_only_native_reasoning_five_rounds() {
 #[test]
 fn cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds() {
     for round in 1..=5 {
-        let mut cache_retry_request = thinking_signature_retry_kiro_fixture();
+        let mut cache_retry_request = thinking_signature_retry_local_upstream_fixture();
         assert_eq!(cache_retry_request.clear_tool_cache_point_plan(), 1);
         let cache_retry_body = serialize_local_upstream_request(&cache_retry_request)
             .expect("serialize cache retry fixture");
@@ -5736,7 +5739,7 @@ fn cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds()
 fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_rounds() {
     for round in 1..=5 {
         let old_marker = format!("OLD_HISTORY_MUST_STAY_TRIMMED_{round}_{}", "x".repeat(4096));
-        let mut request = serde_json::from_value::<KiroRequest>(json!({
+        let mut request = serde_json::from_value::<LocalUpstreamRequest>(json!({
             "conversationState": {
                 "conversationId": format!("guard-signature-{round}"),
                 "history": [
@@ -7494,7 +7497,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
     usage_context.mark_upstream_pending_chunk_before_first_output();
     usage_context.mark_upstream_frame_before_first_output();
     usage_context.mark_upstream_event_before_first_output(
-        &Event::Metadata(crate::kiro::model::events::MetadataEvent::default()),
+        &LocalUpstreamEvent::Metadata(LocalUpstreamMetadataEvent::default()),
         0,
     );
     usage_context.mark_upstream_frame_before_first_output();
@@ -7630,28 +7633,28 @@ fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
     stream_context.set_requested_max_tokens(payload.max_tokens);
     let _initial_events = stream_context.generate_initial_events();
     let mut events = Vec::new();
-    let assistant_response = crate::kiro::model::events::AssistantResponseEvent {
+    let assistant_response = LocalUpstreamAssistantResponseEvent {
         content: "near token limit".to_string(),
         ..Default::default()
     };
     events.extend(
-        stream_context.process_local_upstream_event(&Event::AssistantResponse(assistant_response)),
-    );
-    events.extend(
-        stream_context.process_local_upstream_event(&Event::MessageMetadata(
-            crate::kiro::model::events::MessageMetadataEvent {
-                conversation_id: Some("conv-stop-reason".to_string()),
-                utterance_id: Some("utt-stop-reason".to_string()),
-                token_usage: Some(MetadataTokenUsage {
-                    uncached_input_tokens: 50,
-                    output_tokens: 95,
-                    total_tokens: 145,
-                    cache_read_input_tokens: 0,
-                    cache_write_input_tokens: 0,
-                }),
-            },
+        stream_context.process_local_upstream_event(&LocalUpstreamEvent::AssistantResponse(
+            assistant_response,
         )),
     );
+    events.extend(stream_context.process_local_upstream_event(
+        &LocalUpstreamEvent::MessageMetadata(LocalUpstreamMessageMetadataEvent {
+            conversation_id: Some("conv-stop-reason".to_string()),
+            utterance_id: Some("utt-stop-reason".to_string()),
+            token_usage: Some(LocalUpstreamMetadataTokenUsage {
+                uncached_input_tokens: 50,
+                output_tokens: 95,
+                total_tokens: 145,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+            }),
+        }),
+    ));
     events.extend(stream_context.generate_final_events());
     assert!(events.iter().any(|event| {
         event.event == "message_delta" && event.data["delta"]["stop_reason"] == "max_tokens"
@@ -7668,8 +7671,6 @@ fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
 
 #[test]
 fn stream_zero_context_and_metadata_record_request_estimate_consistently() {
-    use crate::kiro::model::events::{AssistantResponseEvent, ContextUsageEvent, MetadataEvent};
-
     let usage_recorder = Arc::new(UsageRecorder::new(10));
     let state = AppState::new(
         Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
@@ -7708,21 +7709,25 @@ fn stream_zero_context_and_metadata_record_request_estimate_consistently() {
         PromptCacheSimulationMode::Disabled,
     );
     let _initial_events = stream_context.generate_initial_events();
-    let assistant_response = AssistantResponseEvent {
+    let assistant_response = LocalUpstreamAssistantResponseEvent {
         content: "fake response".to_string(),
         ..Default::default()
     };
-    let mut events =
-        stream_context.process_local_upstream_event(&Event::AssistantResponse(assistant_response));
+    let mut events = stream_context
+        .process_local_upstream_event(&LocalUpstreamEvent::AssistantResponse(assistant_response));
     events.extend(
-        stream_context.process_local_upstream_event(&Event::ContextUsage(ContextUsageEvent {
-            context_usage_percentage: 0.0,
-        })),
+        stream_context.process_local_upstream_event(&LocalUpstreamEvent::ContextUsage(
+            LocalUpstreamContextUsageEvent {
+                context_usage_percentage: 0.0,
+            },
+        )),
     );
     events.extend(
-        stream_context.process_local_upstream_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage::default()),
-        })),
+        stream_context.process_local_upstream_event(&LocalUpstreamEvent::Metadata(
+            LocalUpstreamMetadataEvent {
+                token_usage: Some(LocalUpstreamMetadataTokenUsage::default()),
+            },
+        )),
     );
     events.extend(stream_context.generate_final_events());
 
@@ -8841,7 +8846,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         latency: RequestLatencyTraceState::new(),
     }
     .attach_credential(Some(1), None, false, false, Vec::new());
-    let metadata = MetadataTokenUsage {
+    let metadata = LocalUpstreamMetadataTokenUsage {
         uncached_input_tokens: 4096,
         output_tokens: 1,
         total_tokens: 4097,
@@ -8935,7 +8940,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
     );
     assert!(first_usage_body.cache_creation_input_tokens > 0);
     assert_eq!(first_usage_body.cache_read_input_tokens, 0);
-    let first_metadata = MetadataTokenUsage {
+    let first_metadata = LocalUpstreamMetadataTokenUsage {
         uncached_input_tokens: 4096,
         output_tokens: 1,
         total_tokens: 4097,

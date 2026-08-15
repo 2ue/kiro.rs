@@ -26,6 +26,17 @@ pub(crate) mod provider {
 }
 
 pub(crate) mod event {
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamAssistantResponseEvent =
+        crate::kiro::model::events::AssistantResponseEvent;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamContextUsageEvent = crate::kiro::model::events::ContextUsageEvent;
+    pub(crate) type LocalUpstreamEvent = crate::kiro::model::events::Event;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamMessageMetadataEvent =
+        crate::kiro::model::events::MessageMetadataEvent;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamMetadataEvent = crate::kiro::model::events::MetadataEvent;
     pub(crate) type LocalUpstreamMetadataTokenUsage =
         crate::kiro::model::events::MetadataTokenUsage;
 }
@@ -57,4 +68,9 @@ pub(crate) mod request {
     #[cfg(test)]
     pub(crate) type LocalUpstreamUserInputMessage =
         crate::kiro::model::requests::conversation::UserInputMessage;
+}
+
+pub(crate) mod stream {
+    pub(crate) type LocalUpstreamEventStreamDecoder =
+        crate::kiro::parser::decoder::EventStreamDecoder;
 }

@@ -4,7 +4,7 @@ use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 
 pub(super) struct PreparedLocalUpstreamBody {
     pub(super) request_body: String,
-    pub(super) local_upstream_request: KiroRequest,
+    pub(super) local_upstream_request: LocalUpstreamRequest,
     pub(super) conversation_id: String,
     pub(super) input_tokens: i32,
     pub(super) payload_breakdown: Option<PayloadByteBreakdown>,
@@ -80,7 +80,7 @@ pub(super) fn prepare_with_plan(
         }
     };
 
-    let mut local_upstream_request = KiroRequest {
+    let mut local_upstream_request = LocalUpstreamRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion_result.additional_model_request_fields,
@@ -233,7 +233,7 @@ pub(super) fn prepare_with_plan(
 
 fn should_expose_downstream_thinking(
     payload: &MessagesRequest,
-    local_upstream_request: &KiroRequest,
+    local_upstream_request: &LocalUpstreamRequest,
 ) -> bool {
     if payload
         .thinking
@@ -293,8 +293,8 @@ mod tests {
         }
     }
 
-    fn kiro_request_with_native_output_config() -> KiroRequest {
-        KiroRequest {
+    fn local_upstream_request_with_native_output_config() -> LocalUpstreamRequest {
+        LocalUpstreamRequest {
             conversation_state: ConversationState::new("conv").with_current_message(
                 CurrentMessage::new(UserInputMessage::new("hello", "claude-opus-4.8")),
             ),
@@ -316,12 +316,12 @@ mod tests {
 
     #[test]
     fn disabled_thinking_suppresses_downstream_thinking_even_with_native_effort_for_five_rounds() {
-        let kiro_request = kiro_request_with_native_output_config();
+        let local_upstream_request = local_upstream_request_with_native_output_config();
         for round in 0..5 {
             assert!(
                 !should_expose_downstream_thinking(
                     &messages_request(Some("disabled"), Some("max")),
-                    &kiro_request,
+                    &local_upstream_request,
                 ),
                 "round {round}: client disabled thinking must control downstream visibility"
             );
@@ -331,19 +331,19 @@ mod tests {
     #[test]
     fn adaptive_or_omitted_thinking_with_output_effort_exposes_downstream_thinking_for_five_rounds()
     {
-        let kiro_request = kiro_request_with_native_output_config();
+        let local_upstream_request = local_upstream_request_with_native_output_config();
         for round in 0..5 {
             assert!(
                 should_expose_downstream_thinking(
                     &messages_request(Some("adaptive"), Some("max")),
-                    &kiro_request,
+                    &local_upstream_request,
                 ),
                 "round {round}: adaptive thinking remains visible"
             );
             assert!(
                 should_expose_downstream_thinking(
                     &messages_request(None, Some("max")),
-                    &kiro_request
+                    &local_upstream_request
                 ),
                 "round {round}: omitted thinking with explicit effort keeps prior output_config behavior"
             );

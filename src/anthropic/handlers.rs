@@ -11,9 +11,6 @@ use std::{
 };
 
 use crate::common::upstream_error::RawUpstreamError;
-use crate::kiro::model::events::Event;
-use crate::kiro::model::requests::kiro::KiroRequest;
-use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     BodyConversionConfig, CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
     CacheSimulationPolicy, CompatProfile, Config, ImageProcessingConfig, KiroRsToolCachePolicy,
@@ -112,10 +109,13 @@ use crate::local_upstream::call_trace::{
     AccountRejectReason, LocalAuxiliaryMcpAttributionSink, LocalUpstreamCallFailureKind,
     LocalUpstreamCredentialAttempt, SelectionFailureStage,
 };
+use crate::local_upstream::event::{LocalUpstreamEvent, LocalUpstreamMetadataTokenUsage};
 use crate::local_upstream::provider::{
     LocalAuxiliaryMcpAttribution, LocalUpstreamApiResponse, LocalUpstreamProvider,
     LocalUpstreamStreamCompletion, LocalUpstreamStreamResponse,
 };
+use crate::local_upstream::request::LocalUpstreamRequest;
+use crate::local_upstream::stream::LocalUpstreamEventStreamDecoder;
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
@@ -643,7 +643,7 @@ fn log_local_upstream_conversion_summary(
     endpoint: &str,
     payload: &MessagesRequest,
     model_resolution: &ModelResolution,
-    local_upstream_request: &KiroRequest,
+    local_upstream_request: &LocalUpstreamRequest,
     request_bytes: usize,
     payload_guard_report: Option<&PayloadGuardReport>,
     warnings: &ProxyWarnings,
@@ -1143,7 +1143,7 @@ fn reported_usage_config_for_policy(policy: ReportedUsagePathPolicy) -> Reported
 
 #[derive(Clone)]
 struct PayloadTooLongRetryRequest {
-    request: KiroRequest,
+    request: LocalUpstreamRequest,
     config: PayloadGuardConfig,
     endpoint: String,
     requested_model: String,
@@ -1154,7 +1154,7 @@ struct PayloadTooLongRetryRequest {
 
 impl PayloadTooLongRetryRequest {
     fn new(
-        request: &KiroRequest,
+        request: &LocalUpstreamRequest,
         runtime_config: &RequestRuntimeConfig,
         endpoint: &str,
         requested_model: &str,
@@ -1176,7 +1176,7 @@ impl PayloadTooLongRetryRequest {
     fn build_retry_body(
         self,
         usage_context: &mut RequestUsageContext,
-    ) -> Result<(String, Option<String>, KiroRequest), PayloadGuardError> {
+    ) -> Result<(String, Option<String>, LocalUpstreamRequest), PayloadGuardError> {
         let mut request = self.request;
         let (request_body, report) = guard_local_upstream_request(&mut request, self.config)?;
         log_payload_guard_report(
@@ -1203,7 +1203,7 @@ impl PayloadTooLongRetryRequest {
 
 #[derive(Clone)]
 struct CachePointRetryRequest {
-    request: KiroRequest,
+    request: LocalUpstreamRequest,
     endpoint: String,
     requested_model: String,
     upstream_model: Option<String>,
@@ -1212,7 +1212,7 @@ struct CachePointRetryRequest {
 
 impl CachePointRetryRequest {
     fn new(
-        request: &KiroRequest,
+        request: &LocalUpstreamRequest,
         endpoint: &str,
         requested_model: &str,
         upstream_model: Option<&str>,
@@ -1231,7 +1231,7 @@ impl CachePointRetryRequest {
         self,
         reason: &str,
         usage_context: &mut RequestUsageContext,
-    ) -> Result<(String, KiroRequest), PayloadGuardError> {
+    ) -> Result<(String, LocalUpstreamRequest), PayloadGuardError> {
         let mut request = self.request;
         let planned = request.clear_tool_cache_point_plan();
         usage_context.attach_cache_point_retry(planned, reason);
@@ -2700,7 +2700,11 @@ impl RequestUsageContext {
         saturating_fetch_add_u32(&self.latency.upstream_frames_before_first_output, 1);
     }
 
-    fn mark_upstream_event_before_first_output(&self, event: &Event, downstream_events_len: usize) {
+    fn mark_upstream_event_before_first_output(
+        &self,
+        event: &LocalUpstreamEvent,
+        downstream_events_len: usize,
+    ) {
         if self.has_first_output() {
             return;
         }
@@ -2715,7 +2719,7 @@ impl RequestUsageContext {
             );
         }
 
-        let kind = kiro_event_latency_kind(event);
+        let kind = local_upstream_event_latency_kind(event);
         let mut counts = self.latency.upstream_event_types_before_first_output.lock();
         let entry = counts.entry(kind).or_insert(0);
         *entry = entry.saturating_add(1);
@@ -3364,20 +3368,20 @@ fn is_first_token_output_event(event: &SseEvent) -> bool {
     }
 }
 
-fn kiro_event_latency_kind(event: &Event) -> &'static str {
+fn local_upstream_event_latency_kind(event: &LocalUpstreamEvent) -> &'static str {
     match event {
-        Event::AssistantResponse(_) => "assistant_response",
-        Event::ToolUse(_) => "tool_use",
-        Event::ReasoningContent(_) => "reasoning_content",
-        Event::Metadata(_) => "metadata",
-        Event::Metering(_) => "metering",
-        Event::Code(_) => "code",
-        Event::ContextUsage(_) => "context_usage",
-        Event::MessageMetadata(_) => "message_metadata",
-        Event::InvalidState(_) => "invalid_state",
-        Event::Unknown {} => "unknown",
-        Event::Error { .. } => "error",
-        Event::Exception { .. } => "exception",
+        LocalUpstreamEvent::AssistantResponse(_) => "assistant_response",
+        LocalUpstreamEvent::ToolUse(_) => "tool_use",
+        LocalUpstreamEvent::ReasoningContent(_) => "reasoning_content",
+        LocalUpstreamEvent::Metadata(_) => "metadata",
+        LocalUpstreamEvent::Metering(_) => "metering",
+        LocalUpstreamEvent::Code(_) => "code",
+        LocalUpstreamEvent::ContextUsage(_) => "context_usage",
+        LocalUpstreamEvent::MessageMetadata(_) => "message_metadata",
+        LocalUpstreamEvent::InvalidState(_) => "invalid_state",
+        LocalUpstreamEvent::Unknown {} => "unknown",
+        LocalUpstreamEvent::Error { .. } => "error",
+        LocalUpstreamEvent::Exception { .. } => "exception",
     }
 }
 
@@ -3508,7 +3512,7 @@ fn usage_snapshot(usage: super::cache::CacheUsage) -> ExternalPoolUsageSnapshot 
 }
 
 fn raw_usage_from_metadata_or_estimate(
-    metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+    metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
     input_tokens: i32,
     output_tokens: i32,
 ) -> super::cache::CacheUsage {
@@ -3691,7 +3695,7 @@ impl CredentialUsageContext {
     fn usage_source(
         &self,
         usage: &super::cache::CacheUsage,
-        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
         context_estimated: bool,
     ) -> UsageSource {
         if self.uses_local_prompt_cache_fallback(metadata_usage, usage) {
@@ -3819,7 +3823,7 @@ impl CredentialUsageContext {
 
     fn uses_local_prompt_cache_fallback(
         &self,
-        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
         usage: &super::cache::CacheUsage,
     ) -> bool {
         matches!(
@@ -3896,7 +3900,7 @@ impl CredentialUsageContext {
     fn final_reported_usage_for_stream(
         &self,
         final_usage: super::cache::CacheUsage,
-        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
         context_estimated: bool,
         estimated_input_tokens: i32,
     ) -> super::cache::CacheUsage {
@@ -3914,7 +3918,7 @@ impl CredentialUsageContext {
         status: UsageRecordStatus,
         usage: Option<super::cache::CacheUsage>,
         error_detail: Option<(String, String)>,
-        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
         context_input_tokens: Option<i32>,
         upstream_metering_units: Option<f64>,
     ) {
@@ -5428,7 +5432,7 @@ fn should_retry_without_cache_point_after_error(value: &str) -> bool {
 fn attach_and_log_tool_use_format_diagnostics(
     message: &str,
     attempted_body: &str,
-    request: &KiroRequest,
+    request: &LocalUpstreamRequest,
     usage_context: &mut RequestUsageContext,
     endpoint: &str,
     requested_model: &str,
@@ -6463,7 +6467,7 @@ async fn post_messages_inner(
 async fn call_api_stream_maybe_fail_fast(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
-    kiro_request: Option<&KiroRequest>,
+    local_upstream_request: Option<&LocalUpstreamRequest>,
     request_id: Option<&str>,
     account_fallback: Option<&AccountFallbackContext>,
     capacity_weight_units: u32,
@@ -6477,8 +6481,8 @@ async fn call_api_stream_maybe_fail_fast(
     };
     let acquire_mode =
         clamp_acquire_mode_to_dispatch_deadline(acquire_mode, inference_attempt_budget.as_ref());
-    if let Some(kiro_request) =
-        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    if let Some(local_upstream_request) = local_upstream_request
+        .filter(|request| request.conversation_state.has_history_reasoning_content())
     {
         return provider
             .call_api_stream_with_request_id_and_thinking_signature_retry(
@@ -6490,7 +6494,7 @@ async fn call_api_stream_maybe_fail_fast(
                 inference_attempt_budget,
                 preserve_external_attempt,
                 None,
-                move || build_thinking_signature_retry_body(kiro_request),
+                move || build_thinking_signature_retry_body(local_upstream_request),
             )
             .await;
     }
@@ -6510,7 +6514,7 @@ async fn call_api_stream_maybe_fail_fast(
 async fn call_api_maybe_fail_fast(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
-    kiro_request: Option<&KiroRequest>,
+    local_upstream_request: Option<&LocalUpstreamRequest>,
     request_id: Option<&str>,
     account_fallback: Option<&AccountFallbackContext>,
     capacity_weight_units: u32,
@@ -6524,8 +6528,8 @@ async fn call_api_maybe_fail_fast(
     };
     let acquire_mode =
         clamp_acquire_mode_to_dispatch_deadline(acquire_mode, inference_attempt_budget.as_ref());
-    if let Some(kiro_request) =
-        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    if let Some(local_upstream_request) = local_upstream_request
+        .filter(|request| request.conversation_state.has_history_reasoning_content())
     {
         return provider
             .call_api_with_context_with_request_id_and_thinking_signature_retry(
@@ -6537,7 +6541,7 @@ async fn call_api_maybe_fail_fast(
                 inference_attempt_budget,
                 preserve_external_attempt,
                 None,
-                move || build_thinking_signature_retry_body(kiro_request),
+                move || build_thinking_signature_retry_body(local_upstream_request),
             )
             .await;
     }
@@ -6554,7 +6558,7 @@ async fn call_api_maybe_fail_fast(
         .await
 }
 
-fn build_thinking_signature_retry_body(request: &KiroRequest) -> anyhow::Result<String> {
+fn build_thinking_signature_retry_body(request: &LocalUpstreamRequest) -> anyhow::Result<String> {
     let mut retry_request = request.clone();
     let removed = retry_request
         .conversation_state
@@ -6886,7 +6890,7 @@ fn budgeted_local_rescue_reason_after_account_error(
 async fn call_stream_local_rescue_after_account_error(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
-    kiro_request: Option<&KiroRequest>,
+    local_upstream_request: Option<&LocalUpstreamRequest>,
     request_id: &str,
     external: &AccountFallbackContext,
     capacity_weight_units: u32,
@@ -6898,8 +6902,8 @@ async fn call_stream_local_rescue_after_account_error(
         )),
         external.inference_attempt_budget.as_ref(),
     );
-    if let Some(kiro_request) =
-        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    if let Some(local_upstream_request) = local_upstream_request
+        .filter(|request| request.conversation_state.has_history_reasoning_content())
     {
         return provider
             .call_api_stream_with_request_id_and_thinking_signature_retry(
@@ -6911,7 +6915,7 @@ async fn call_stream_local_rescue_after_account_error(
                 external.inference_attempt_budget.clone(),
                 false,
                 Some(1),
-                move || build_thinking_signature_retry_body(kiro_request),
+                move || build_thinking_signature_retry_body(local_upstream_request),
             )
             .await;
     }
@@ -6937,7 +6941,7 @@ async fn call_stream_local_rescue_after_account_error(
 async fn call_non_stream_local_rescue_after_account_error(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
-    kiro_request: Option<&KiroRequest>,
+    local_upstream_request: Option<&LocalUpstreamRequest>,
     request_id: &str,
     external: &AccountFallbackContext,
     capacity_weight_units: u32,
@@ -6949,8 +6953,8 @@ async fn call_non_stream_local_rescue_after_account_error(
         )),
         external.inference_attempt_budget.as_ref(),
     );
-    if let Some(kiro_request) =
-        kiro_request.filter(|request| request.conversation_state.has_history_reasoning_content())
+    if let Some(local_upstream_request) = local_upstream_request
+        .filter(|request| request.conversation_state.has_history_reasoning_content())
     {
         return provider
             .call_api_with_context_with_request_id_and_thinking_signature_retry(
@@ -6962,7 +6966,7 @@ async fn call_non_stream_local_rescue_after_account_error(
                 external.inference_attempt_budget.clone(),
                 false,
                 Some(1),
-                move || build_thinking_signature_retry_body(kiro_request),
+                move || build_thinking_signature_retry_body(local_upstream_request),
             )
             .await;
     }
@@ -7030,7 +7034,7 @@ struct StreamRetryPlan {
     config: LocalStreamRetryConfig,
     provider: Arc<LocalUpstreamProvider>,
     request_body: Arc<str>,
-    kiro_request: Option<Arc<KiroRequest>>,
+    local_upstream_request: Option<Arc<LocalUpstreamRequest>>,
     request_id: String,
     account_fallback: Option<AccountFallbackContext>,
     capacity_weight_units: u32,
@@ -7042,7 +7046,7 @@ struct StreamRetryPlan {
 struct SseStreamState {
     body_stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     ctx: StreamContext,
-    decoder: EventStreamDecoder,
+    decoder: LocalUpstreamEventStreamDecoder,
     json_sniffer: JsonStreamErrorSniffer,
     finished: bool,
     completion: LocalUpstreamStreamCompletion,
@@ -7075,7 +7079,7 @@ impl SseStreamState {
         Self {
             body_stream: response.bytes_stream().boxed(),
             ctx,
-            decoder: EventStreamDecoder::new(),
+            decoder: LocalUpstreamEventStreamDecoder::new(),
             json_sniffer: JsonStreamErrorSniffer::new(upstream_content_type.as_deref()),
             finished: false,
             completion,
@@ -7112,7 +7116,7 @@ impl SseStreamState {
 
         self.body_stream = response.bytes_stream().boxed();
         self.ctx = ctx;
-        self.decoder = EventStreamDecoder::new();
+        self.decoder = LocalUpstreamEventStreamDecoder::new();
         self.json_sniffer = JsonStreamErrorSniffer::new(upstream_content_type.as_deref());
         self.finished = false;
         self.completion = completion;
@@ -7152,7 +7156,7 @@ fn account_rescue_preflight(reason: &str, err: &AccountFinalError) -> serde_json
 async fn handle_stream_request(
     provider: std::sync::Arc<LocalUpstreamProvider>,
     request_body: &str,
-    kiro_request: KiroRequest,
+    local_upstream_request: LocalUpstreamRequest,
     model: &str,
     preflight_model: &str,
     requested_max_tokens: i32,
@@ -7179,7 +7183,7 @@ async fn handle_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<LocalUpstreamCredentialAttempt> = Vec::new();
-    let mut successful_derived_request: Option<(String, KiroRequest)> = None;
+    let mut successful_derived_request: Option<(String, LocalUpstreamRequest)> = None;
     let response = if let Some(outcome) =
         maybe_local_pool_preflight_account_outcome_for_local_request(
             account_fallback.as_ref(),
@@ -7215,7 +7219,7 @@ async fn handle_stream_request(
                         match call_stream_local_rescue_after_account_error(
                             &provider,
                             request_body,
-                            Some(&kiro_request),
+                            Some(&local_upstream_request),
                             &request_id,
                             external,
                             capacity_weight_units,
@@ -7266,7 +7270,7 @@ async fn handle_stream_request(
         match call_api_stream_maybe_fail_fast(
             &provider,
             request_body,
-            Some(&kiro_request),
+            Some(&local_upstream_request),
             Some(&request_id),
             account_fallback.as_ref(),
             capacity_weight_units,
@@ -7284,7 +7288,7 @@ async fn handle_stream_request(
                 attach_and_log_tool_use_format_diagnostics(
                     &message,
                     request_body,
-                    &kiro_request,
+                    &local_upstream_request,
                     &mut usage_context,
                     &endpoint,
                     model,
@@ -7302,7 +7306,7 @@ async fn handle_stream_request(
                         && should_retry_without_cache_point_after_error(&message)
                 }) {
                     retry_attempt_prefix = attempts.clone();
-                    let (retry_body, retry_kiro_request) =
+                    let (retry_body, retry_local_upstream_request) =
                         match retry.build_retry_body(&message, &mut usage_context) {
                             Ok(result) => result,
                             Err(err) => {
@@ -7323,7 +7327,7 @@ async fn handle_stream_request(
                     match call_api_stream_maybe_fail_fast(
                         &provider,
                         &retry_body,
-                        Some(&retry_kiro_request),
+                        Some(&retry_local_upstream_request),
                         Some(&request_id),
                         account_fallback.as_ref(),
                         capacity_weight_units,
@@ -7333,7 +7337,8 @@ async fn handle_stream_request(
                     .await
                     {
                         Ok(resp) => {
-                            successful_derived_request = Some((retry_body, retry_kiro_request));
+                            successful_derived_request =
+                                Some((retry_body, retry_local_upstream_request));
                             resp
                         }
                         Err(retry_error) => {
@@ -7353,7 +7358,7 @@ async fn handle_stream_request(
                             attach_and_log_tool_use_format_diagnostics(
                                 &retry_message,
                                 &retry_body,
-                                &retry_kiro_request,
+                                &retry_local_upstream_request,
                                 &mut usage_context,
                                 &endpoint,
                                 model,
@@ -7415,7 +7420,7 @@ async fn handle_stream_request(
                         "local-upstream stream request rejected as too long; applying configured payload guard and retrying once"
                     );
                     retry_attempt_prefix = attempts.clone();
-                    let (retry_body, retry_warnings_header, retry_kiro_request) =
+                    let (retry_body, retry_warnings_header, retry_local_upstream_request) =
                         match retry.build_retry_body(&mut usage_context) {
                             Ok(result) => result,
                             Err(err) => {
@@ -7437,7 +7442,7 @@ async fn handle_stream_request(
                     match call_api_stream_maybe_fail_fast(
                         &provider,
                         &retry_body,
-                        Some(&retry_kiro_request),
+                        Some(&retry_local_upstream_request),
                         Some(&request_id),
                         account_fallback.as_ref(),
                         capacity_weight_units,
@@ -7447,7 +7452,8 @@ async fn handle_stream_request(
                     .await
                     {
                         Ok(resp) => {
-                            successful_derived_request = Some((retry_body, retry_kiro_request));
+                            successful_derived_request =
+                                Some((retry_body, retry_local_upstream_request));
                             resp
                         }
                         Err(retry_error) => {
@@ -7467,7 +7473,7 @@ async fn handle_stream_request(
                             attach_and_log_tool_use_format_diagnostics(
                                 &retry_message,
                                 &retry_body,
-                                &retry_kiro_request,
+                                &retry_local_upstream_request,
                                 &mut usage_context,
                                 &endpoint,
                                 model,
@@ -7530,7 +7536,7 @@ async fn handle_stream_request(
                                                 match call_stream_local_rescue_after_account_error(
                                                     &provider,
                                                     &retry_body,
-                                                    Some(&retry_kiro_request),
+                                                    Some(&retry_local_upstream_request),
                                                     &request_id,
                                                     external,
                                                     capacity_weight_units,
@@ -7540,7 +7546,7 @@ async fn handle_stream_request(
                                                 {
                                                     Ok(resp) => {
                                                         successful_derived_request =
-                                                            Some((retry_body, retry_kiro_request));
+                                                            Some((retry_body, retry_local_upstream_request));
                                                         resp
                                                     }
                                                     Err(rescue_error) => {
@@ -7666,7 +7672,7 @@ async fn handle_stream_request(
                                         match call_stream_local_rescue_after_account_error(
                                             &provider,
                                             request_body,
-                                            Some(&kiro_request),
+                                            Some(&local_upstream_request),
                                             &request_id,
                                             external,
                                             capacity_weight_units,
@@ -7771,7 +7777,7 @@ async fn handle_stream_request(
     let retry_plan = if stream_retry_config.active() {
         let (mut effective_body, mut effective_request) = successful_derived_request
             .take()
-            .unwrap_or_else(|| (request_body.to_string(), kiro_request));
+            .unwrap_or_else(|| (request_body.to_string(), local_upstream_request));
         if thinking_signature_retry_succeeded {
             let removed = effective_request
                 .conversation_state
@@ -7790,7 +7796,7 @@ async fn handle_stream_request(
                             config: stream_retry_config,
                             provider: provider.clone(),
                             request_body: Arc::<str>::from(effective_body),
-                            kiro_request: None,
+                            local_upstream_request: None,
                             request_id: request_id.clone(),
                             account_fallback: account_fallback.clone(),
                             capacity_weight_units,
@@ -7809,7 +7815,7 @@ async fn handle_stream_request(
                 }
             }
         } else {
-            let retry_kiro_request = effective_request
+            let retry_local_upstream_request = effective_request
                 .conversation_state
                 .has_history_reasoning_content()
                 .then(|| Arc::new(effective_request));
@@ -7817,7 +7823,7 @@ async fn handle_stream_request(
                 config: stream_retry_config,
                 provider: provider.clone(),
                 request_body: Arc::<str>::from(effective_body),
-                kiro_request: retry_kiro_request,
+                local_upstream_request: retry_local_upstream_request,
                 request_id: request_id.clone(),
                 account_fallback: account_fallback.clone(),
                 capacity_weight_units,
@@ -7949,10 +7955,10 @@ impl JsonStreamErrorSniffer {
             return JsonStreamSniffResult::Pass(chunk);
         }
 
-        // Kiro can label a binary EventStream as application/json. The first
-        // non-whitespace byte of an EventStream prelude is normally binary, so
-        // decide it in place and keep the hot path zero-copy. Buffering is only
-        // needed for a JSON-looking body that may span chunks.
+        // A local upstream can label a binary EventStream as application/json.
+        // The first non-whitespace byte of an EventStream prelude is normally
+        // binary, so decide it in place and keep the hot path zero-copy.
+        // Buffering is only needed for a JSON-looking body that may span chunks.
         let first_non_ws = self
             .buffer
             .is_empty()
@@ -8343,8 +8349,8 @@ fn inspect_complete_upstream_body(
     }
 }
 
-fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<Event>, String> {
-    let mut decoder = EventStreamDecoder::new();
+fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<LocalUpstreamEvent>, String> {
+    let mut decoder = LocalUpstreamEventStreamDecoder::new();
     decoder
         .feed(body)
         .map_err(|error| format!("upstream eventstream buffer error: {}", error))?;
@@ -8353,7 +8359,7 @@ fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<Event>, String> {
     for result in decoder.decode_iter() {
         let frame = result
             .map_err(|error| format!("upstream eventstream frame decode error: {}", error))?;
-        let event = Event::from_frame(frame)
+        let event = LocalUpstreamEvent::from_frame(frame)
             .map_err(|error| format!("upstream event payload parse error: {}", error))?;
         events.push(event);
     }
@@ -8500,7 +8506,7 @@ async fn retry_stream_before_downstream_commit(
     let retry_dispatch = call_api_stream_maybe_fail_fast(
         &plan.provider,
         plan.request_body.as_ref(),
-        plan.kiro_request.as_deref(),
+        plan.local_upstream_request.as_deref(),
         Some(&plan.request_id),
         plan.account_fallback.as_ref(),
         plan.capacity_weight_units,
@@ -8527,7 +8533,7 @@ async fn retry_stream_before_downstream_commit(
                 attempt.action == "response_headers_received_after_thinking_signature_retry"
             });
             let next_retry_plan = thinking_signature_retry_succeeded.then(|| {
-                let Some(request) = plan.kiro_request.as_deref() else {
+                let Some(request) = plan.local_upstream_request.as_deref() else {
                     tracing::warn!(
                         request_id = %plan.request_id,
                         "thinking signature stream retry succeeded without a typed request; disabling further precommit retries"
@@ -8546,7 +8552,7 @@ async fn retry_stream_before_downstream_commit(
                     Ok(body) => {
                         let mut updated = plan.clone();
                         updated.request_body = Arc::<str>::from(body);
-                        updated.kiro_request = None;
+                        updated.local_upstream_request = None;
                         Some(updated)
                     }
                     Err(_) => {
@@ -8762,7 +8768,7 @@ fn create_sse_stream(
                                         let before_first_output =
                                             !first_output_reached_in_chunk
                                                 && !state.usage_guard.context().request.has_first_output();
-                                        match Event::from_frame(frame) {
+                                        match LocalUpstreamEvent::from_frame(frame) {
                                             Ok(event) => {
                                                 let suppressed_before = state
                                                     .ctx
@@ -9408,7 +9414,7 @@ fn sanitize_complete_thinking_segment<'a>(
 async fn handle_non_stream_request(
     provider: std::sync::Arc<LocalUpstreamProvider>,
     request_body: &str,
-    kiro_request: &KiroRequest,
+    local_upstream_request: &LocalUpstreamRequest,
     model: &str,
     preflight_model: &str,
     input_tokens: i32,
@@ -9465,7 +9471,7 @@ async fn handle_non_stream_request(
                         match call_non_stream_local_rescue_after_account_error(
                             &provider,
                             request_body,
-                            Some(kiro_request),
+                            Some(local_upstream_request),
                             &request_id,
                             external,
                             capacity_weight_units,
@@ -9516,7 +9522,7 @@ async fn handle_non_stream_request(
         match call_api_maybe_fail_fast(
             &provider,
             request_body,
-            Some(kiro_request),
+            Some(local_upstream_request),
             Some(&request_id),
             account_fallback.as_ref(),
             capacity_weight_units,
@@ -9534,7 +9540,7 @@ async fn handle_non_stream_request(
                 attach_and_log_tool_use_format_diagnostics(
                     &message,
                     request_body,
-                    kiro_request,
+                    local_upstream_request,
                     &mut usage_context,
                     &endpoint,
                     model,
@@ -9552,7 +9558,7 @@ async fn handle_non_stream_request(
                         && should_retry_without_cache_point_after_error(&message)
                 }) {
                     retry_attempt_prefix = attempts.clone();
-                    let (retry_body, retry_kiro_request) =
+                    let (retry_body, retry_local_upstream_request) =
                         match retry.build_retry_body(&message, &mut usage_context) {
                             Ok(result) => result,
                             Err(err) => {
@@ -9573,7 +9579,7 @@ async fn handle_non_stream_request(
                     match call_api_maybe_fail_fast(
                         &provider,
                         &retry_body,
-                        Some(&retry_kiro_request),
+                        Some(&retry_local_upstream_request),
                         Some(&request_id),
                         account_fallback.as_ref(),
                         capacity_weight_units,
@@ -9600,7 +9606,7 @@ async fn handle_non_stream_request(
                             attach_and_log_tool_use_format_diagnostics(
                                 &retry_message,
                                 &retry_body,
-                                &retry_kiro_request,
+                                &retry_local_upstream_request,
                                 &mut usage_context,
                                 &endpoint,
                                 model,
@@ -9662,7 +9668,7 @@ async fn handle_non_stream_request(
                         "local-upstream non-stream request rejected as too long; applying configured payload guard and retrying once"
                     );
                     retry_attempt_prefix = attempts.clone();
-                    let (retry_body, retry_warnings_header, retry_kiro_request) =
+                    let (retry_body, retry_warnings_header, retry_local_upstream_request) =
                         match retry.build_retry_body(&mut usage_context) {
                             Ok(result) => result,
                             Err(err) => {
@@ -9684,7 +9690,7 @@ async fn handle_non_stream_request(
                     match call_api_maybe_fail_fast(
                         &provider,
                         &retry_body,
-                        Some(&retry_kiro_request),
+                        Some(&retry_local_upstream_request),
                         Some(&request_id),
                         account_fallback.as_ref(),
                         capacity_weight_units,
@@ -9711,7 +9717,7 @@ async fn handle_non_stream_request(
                             attach_and_log_tool_use_format_diagnostics(
                                 &retry_message,
                                 &retry_body,
-                                &retry_kiro_request,
+                                &retry_local_upstream_request,
                                 &mut usage_context,
                                 &endpoint,
                                 model,
@@ -9774,7 +9780,7 @@ async fn handle_non_stream_request(
                                                 match call_non_stream_local_rescue_after_account_error(
                                                 &provider,
                                                 &retry_body,
-                                                Some(&retry_kiro_request),
+                                                Some(&retry_local_upstream_request),
                                                 &request_id,
                                                 external,
                                                 capacity_weight_units,
@@ -9901,7 +9907,7 @@ async fn handle_non_stream_request(
                                         match call_non_stream_local_rescue_after_account_error(
                                             &provider,
                                             request_body,
-                                            Some(kiro_request),
+                                            Some(local_upstream_request),
                                             &request_id,
                                             external,
                                             capacity_weight_units,
@@ -10096,7 +10102,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
-    let mut metadata_usage: Option<crate::kiro::model::events::MetadataTokenUsage> = None;
+    let mut metadata_usage: Option<LocalUpstreamMetadataTokenUsage> = None;
     let mut upstream_metering_units: Option<f64> = None;
     let mut native_thinking_content = String::new();
     let mut native_thinking_signature: Option<String> = None;
@@ -10121,7 +10127,7 @@ async fn handle_non_stream_request(
 
     for event in upstream_events {
         match event {
-            Event::AssistantResponse(resp) => {
+            LocalUpstreamEvent::AssistantResponse(resp) => {
                 saw_meaningful_upstream_response |= !resp.content.is_empty();
                 if let Some(status) = resp
                     .message_status
@@ -10133,11 +10139,11 @@ async fn handle_non_stream_request(
                 }
                 text_content.push_str(&transcript_sanitizer.push(&resp.content));
             }
-            Event::Code(code) => {
+            LocalUpstreamEvent::Code(code) => {
                 saw_meaningful_upstream_response |= !code.content.is_empty();
                 text_content.push_str(&transcript_sanitizer.push(&code.content));
             }
-            Event::ReasoningContent(reasoning) => {
+            LocalUpstreamEvent::ReasoningContent(reasoning) => {
                 saw_meaningful_upstream_response |= !reasoning.text.is_empty()
                     || reasoning
                         .signature
@@ -10161,7 +10167,7 @@ async fn handle_non_stream_request(
                     native_thinking_signature = reasoning.signature;
                 }
             }
-            Event::ToolUse(tool_use) => {
+            LocalUpstreamEvent::ToolUse(tool_use) => {
                 saw_meaningful_upstream_response = true;
                 text_content.push_str(&transcript_sanitizer.structured_tool_boundary());
                 has_tool_use = true;
@@ -10236,7 +10242,7 @@ async fn handle_non_stream_request(
                     }
                 }
             }
-            Event::ContextUsage(context_usage) => {
+            LocalUpstreamEvent::ContextUsage(context_usage) => {
                 saw_upstream_context_usage |= context_usage.context_usage_percentage.is_finite();
                 // 从上下文使用百分比计算实际的 input_tokens
                 let window_size = credential_usage.request.context_window_tokens;
@@ -10259,7 +10265,7 @@ async fn handle_non_stream_request(
                     actual_input_tokens
                 );
             }
-            Event::Metadata(metadata) => {
+            LocalUpstreamEvent::Metadata(metadata) => {
                 saw_upstream_metadata = true;
                 if let Some(token_usage) = metadata.token_usage {
                     tracing::debug!(
@@ -10274,7 +10280,7 @@ async fn handle_non_stream_request(
                         .merge_positive_from(&token_usage);
                 }
             }
-            Event::MessageMetadata(metadata) => {
+            LocalUpstreamEvent::MessageMetadata(metadata) => {
                 saw_upstream_metadata = true;
                 if let Some(token_usage) = metadata.token_usage {
                     tracing::debug!(
@@ -10291,7 +10297,7 @@ async fn handle_non_stream_request(
                         .merge_positive_from(&token_usage);
                 }
             }
-            Event::Metering(metering) => {
+            LocalUpstreamEvent::Metering(metering) => {
                 if metering.usage.is_finite() {
                     upstream_metering_units = Some(metering.usage);
                     saw_upstream_metering = true;
@@ -10316,7 +10322,7 @@ async fn handle_non_stream_request(
                     "非流式响应收到 meteringEvent"
                 );
             }
-            Event::InvalidState(invalid) => {
+            LocalUpstreamEvent::InvalidState(invalid) => {
                 let message = invalid.error_text();
                 tracing::warn!(
                     reason = %invalid.reason,
@@ -10336,7 +10342,7 @@ async fn handle_non_stream_request(
                     &credential_usage.request.request_id,
                 );
             }
-            Event::Error {
+            LocalUpstreamEvent::Error {
                 error_code,
                 error_message,
             } => {
@@ -10351,7 +10357,7 @@ async fn handle_non_stream_request(
                     &credential_usage.request.request_id,
                 );
             }
-            Event::Exception {
+            LocalUpstreamEvent::Exception {
                 exception_type,
                 message,
             } => {
