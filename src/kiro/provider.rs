@@ -23,7 +23,7 @@ use crate::anthropic::inference_attempt_budget::{
     InferenceAttemptBudget, InferenceAttemptKind, InferenceAttemptRejection,
 };
 use crate::anthropic::model_capabilities::{
-    KiroReasoningCapabilityState, intersect_authoritative_reasoning_schemas,
+    UpstreamReasoningCapabilityState, intersect_authoritative_reasoning_schemas,
 };
 use crate::common::upstream_error::RawUpstreamError;
 use crate::http_client::{
@@ -111,12 +111,12 @@ fn merge_model_discovery_catalogs(
 
     for (model_id, model) in &mut merged {
         let state = if !cohort_complete {
-            KiroReasoningCapabilityState::Unknown
+            UpstreamReasoningCapabilityState::Unknown
         } else if per_credential
             .iter()
             .any(|catalog| !catalog.contains_key(model_id))
         {
-            KiroReasoningCapabilityState::AuthoritativeInvalid
+            UpstreamReasoningCapabilityState::AuthoritativeInvalid
         } else {
             intersect_authoritative_reasoning_schemas(per_credential.iter().map(|catalog| {
                 catalog
@@ -125,11 +125,13 @@ fn merge_model_discovery_catalogs(
             }))
         };
         model.additional_model_request_fields_schema = match state {
-            KiroReasoningCapabilityState::Supported(capability) => Some(capability.to_schema()),
-            KiroReasoningCapabilityState::AuthoritativeAbsent => None,
-            KiroReasoningCapabilityState::LegacyFallback
-            | KiroReasoningCapabilityState::Unknown
-            | KiroReasoningCapabilityState::AuthoritativeInvalid => Some(serde_json::Value::Null),
+            UpstreamReasoningCapabilityState::Supported(capability) => Some(capability.to_schema()),
+            UpstreamReasoningCapabilityState::AuthoritativeAbsent => None,
+            UpstreamReasoningCapabilityState::LegacyFallback
+            | UpstreamReasoningCapabilityState::Unknown
+            | UpstreamReasoningCapabilityState::AuthoritativeInvalid => {
+                Some(serde_json::Value::Null)
+            }
         };
     }
     merged.into_values().collect()
@@ -2490,7 +2492,8 @@ mod tests {
     async fn provider_sends_converter_max_effort_with_native_adaptive_thinking_for_five_rounds() {
         use crate::anthropic::converter::{ConverterOptions, convert_request_with_options};
         use crate::anthropic::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use crate::anthropic::types::{
             Message as AnthropicMessage, MessagesRequest, OutputConfig, Thinking,
@@ -2519,9 +2522,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["high", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("high".to_string()),
                 },
@@ -3455,7 +3458,7 @@ mod tests {
                 true,
             );
             let capability =
-                crate::anthropic::model_capabilities::KiroReasoningFieldCapability::from_schema(
+                crate::anthropic::model_capabilities::UpstreamReasoningFieldCapability::from_schema(
                     common[0]
                         .additional_model_request_fields_schema
                         .as_ref()
@@ -3481,7 +3484,7 @@ mod tests {
                 true,
             );
             let capability =
-                crate::anthropic::model_capabilities::KiroReasoningFieldCapability::from_schema(
+                crate::anthropic::model_capabilities::UpstreamReasoningFieldCapability::from_schema(
                     default_mismatch[0]
                         .additional_model_request_fields_schema
                         .as_ref()

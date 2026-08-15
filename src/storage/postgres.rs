@@ -11,9 +11,9 @@ use sqlx::{
 use uuid::Uuid;
 
 #[cfg(test)]
-use crate::anthropic::model_capabilities::KiroReasoningFieldPath;
+use crate::anthropic::model_capabilities::UpstreamReasoningFieldPath;
 use crate::anthropic::model_capabilities::{
-    KiroReasoningFieldCapability, MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
+    MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem, UpstreamReasoningFieldCapability,
 };
 use crate::anthropic::pricing::{
     MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
@@ -4568,7 +4568,7 @@ impl PostgresStore {
             String,
             Option<String>,
             Option<String>,
-            BTreeMap<String, KiroReasoningFieldCapability>,
+            BTreeMap<String, UpstreamReasoningFieldCapability>,
             Vec<LocalUpstreamModelCapabilityCohortKey>,
             bool,
             u32,
@@ -15653,8 +15653,8 @@ mod tests {
             }],
             reasoning_fields: BTreeMap::from([(
                 "claude-sonnet-4-9".to_string(),
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::Reasoning,
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::Reasoning,
                     efforts: vec!["low".to_string(), "high".to_string(), "max".to_string()],
                     default_effort: Some("high".to_string()),
                 },
@@ -15703,7 +15703,7 @@ mod tests {
                 .reasoning_fields
                 .get("claude-sonnet-4-9")
                 .map(|capability| capability.path),
-            Some(KiroReasoningFieldPath::Reasoning)
+            Some(UpstreamReasoningFieldPath::Reasoning)
         );
         assert_eq!(
             loaded_capabilities.models[0].max_input_tokens,

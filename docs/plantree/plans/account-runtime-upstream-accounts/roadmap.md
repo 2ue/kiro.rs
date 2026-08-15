@@ -105,6 +105,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Anthropic stream tests now use local-upstream event facade aliases, removing direct legacy event imports from `src/anthropic`.
 - Admin service model-test request construction and response parsing now use local-upstream request/event/decoder aliases instead of direct legacy paths.
 - Model capability cohort fencing and startup readiness now use upstream reasoning contract-match naming instead of the old Kiro-named type.
+- Model capability reasoning field path, capability and state types now use upstream names as their real Rust types, including Postgres persistence and local-upstream provider call sites.
 - Main process wiring now uses local-upstream provider naming for the optional local executor and model capability recovery worker.
 - Admin service dependencies and internal provider state now use local-upstream provider naming, leaving legacy credential behavior behind the local executor boundary.
 - Admin service credential backup, validation, balance and snapshot code now uses local-upstream credential/usage-limit/manager aliases instead of direct legacy credential manager imports.

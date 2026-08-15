@@ -22,15 +22,15 @@ const SEED_JSON: &str = include_str!("../../data/upstream-models.seed.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum KiroReasoningFieldPath {
+pub enum UpstreamReasoningFieldPath {
     OutputConfig,
     Reasoning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroReasoningFieldCapability {
-    pub path: KiroReasoningFieldPath,
+pub struct UpstreamReasoningFieldCapability {
+    pub path: UpstreamReasoningFieldPath,
     pub efforts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_effort: Option<String>,
@@ -42,7 +42,7 @@ pub struct KiroReasoningFieldCapability {
 /// proven are intentionally distinct. In particular, neither authoritative state may be replaced
 /// by a model-name heuristic.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KiroReasoningCapabilityState {
+pub enum UpstreamReasoningCapabilityState {
     /// No authoritative upstream catalog has been observed for this model. Unit/legacy conversion
     /// may use the narrow, versioned compatibility table.
     LegacyFallback,
@@ -55,12 +55,8 @@ pub enum KiroReasoningCapabilityState {
     AuthoritativeInvalid,
     /// All authoritative cohort members share this safe contract (possibly an effort
     /// intersection).
-    Supported(KiroReasoningFieldCapability),
+    Supported(UpstreamReasoningFieldCapability),
 }
-
-pub type UpstreamReasoningFieldPath = KiroReasoningFieldPath;
-pub type UpstreamReasoningFieldCapability = KiroReasoningFieldCapability;
-pub type UpstreamReasoningCapabilityState = KiroReasoningCapabilityState;
 
 /// Relationship between the verified cohort fence and the cohorts that can dispatch locally now.
 ///
@@ -74,8 +70,8 @@ pub(crate) enum UpstreamReasoningCohortContractMatch {
     ConservativeSubset,
 }
 
-impl KiroReasoningCapabilityState {
-    pub(crate) fn capability(&self) -> Option<&KiroReasoningFieldCapability> {
+impl UpstreamReasoningCapabilityState {
+    pub(crate) fn capability(&self) -> Option<&UpstreamReasoningFieldCapability> {
         match self {
             Self::Supported(capability) => Some(capability),
             Self::LegacyFallback
@@ -115,12 +111,12 @@ fn reasoning_cohort_contract_match(
     UpstreamReasoningCohortContractMatch::None
 }
 
-impl KiroReasoningFieldCapability {
+impl UpstreamReasoningFieldCapability {
     pub(crate) fn from_schema(schema: &serde_json::Value) -> Option<Self> {
         let mut discovered = None;
         'field_candidates: for (field, path) in [
-            ("output_config", KiroReasoningFieldPath::OutputConfig),
-            ("reasoning", KiroReasoningFieldPath::Reasoning),
+            ("output_config", UpstreamReasoningFieldPath::OutputConfig),
+            ("reasoning", UpstreamReasoningFieldPath::Reasoning),
         ] {
             let Some(container) = schema
                 .get("properties")
@@ -210,8 +206,8 @@ impl KiroReasoningFieldCapability {
 
     pub(crate) fn to_schema(&self) -> serde_json::Value {
         let field = match self.path {
-            KiroReasoningFieldPath::OutputConfig => "output_config",
-            KiroReasoningFieldPath::Reasoning => "reasoning",
+            UpstreamReasoningFieldPath::OutputConfig => "output_config",
+            UpstreamReasoningFieldPath::Reasoning => "reasoning",
         };
         let mut effort = serde_json::json!({
             "type": "string",
@@ -235,7 +231,7 @@ impl KiroReasoningFieldCapability {
 /// Compute the only native reasoning schema that is safe for every credential in a cohort.
 pub(crate) fn intersect_authoritative_reasoning_schemas<'a>(
     schemas: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
-) -> KiroReasoningCapabilityState {
+) -> UpstreamReasoningCapabilityState {
     let mut capabilities = Vec::new();
     let mut observed = 0usize;
     let mut saw_authoritative_absence = false;
@@ -245,27 +241,27 @@ pub(crate) fn intersect_authoritative_reasoning_schemas<'a>(
             saw_authoritative_absence = true;
             continue;
         };
-        let Some(capability) = KiroReasoningFieldCapability::from_schema(schema) else {
-            return KiroReasoningCapabilityState::AuthoritativeInvalid;
+        let Some(capability) = UpstreamReasoningFieldCapability::from_schema(schema) else {
+            return UpstreamReasoningCapabilityState::AuthoritativeInvalid;
         };
         capabilities.push(capability);
     }
     if observed == 0 {
-        return KiroReasoningCapabilityState::Unknown;
+        return UpstreamReasoningCapabilityState::Unknown;
     }
     if saw_authoritative_absence {
-        return KiroReasoningCapabilityState::AuthoritativeAbsent;
+        return UpstreamReasoningCapabilityState::AuthoritativeAbsent;
     }
 
     let mut capabilities = capabilities.into_iter();
     let Some(first) = capabilities.next() else {
-        return KiroReasoningCapabilityState::AuthoritativeAbsent;
+        return UpstreamReasoningCapabilityState::AuthoritativeAbsent;
     };
     let mut efforts = first.efforts.clone();
     let mut default_effort = first.default_effort.clone();
     for capability in capabilities {
         if capability.path != first.path {
-            return KiroReasoningCapabilityState::AuthoritativeInvalid;
+            return UpstreamReasoningCapabilityState::AuthoritativeInvalid;
         }
         efforts.retain(|effort| {
             capability
@@ -278,7 +274,7 @@ pub(crate) fn intersect_authoritative_reasoning_schemas<'a>(
         }
     }
     if efforts.is_empty() {
-        return KiroReasoningCapabilityState::AuthoritativeInvalid;
+        return UpstreamReasoningCapabilityState::AuthoritativeInvalid;
     }
     if default_effort
         .as_ref()
@@ -286,7 +282,7 @@ pub(crate) fn intersect_authoritative_reasoning_schemas<'a>(
     {
         default_effort = None;
     }
-    KiroReasoningCapabilityState::Supported(KiroReasoningFieldCapability {
+    UpstreamReasoningCapabilityState::Supported(UpstreamReasoningFieldCapability {
         path: first.path,
         efforts,
         default_effort,
@@ -319,7 +315,7 @@ pub struct ModelCapabilitiesStatus {
     pub last_error: Option<String>,
     pub models: Vec<ModelCapabilityItem>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub reasoning_fields: BTreeMap<String, KiroReasoningFieldCapability>,
+    pub reasoning_fields: BTreeMap<String, UpstreamReasoningFieldCapability>,
     /// Persistence-only fence. Admin JSON must not expose account cohort metadata.
     #[serde(skip)]
     pub reasoning_capability_cohort_keys: Vec<LocalUpstreamModelCapabilityCohortKey>,
@@ -340,8 +336,8 @@ impl ModelCapabilitiesStatus {
 #[derive(Debug, Clone)]
 struct ModelCapabilitiesSnapshot {
     models: BTreeMap<String, ModelCapabilityItem>,
-    reasoning_fields: BTreeMap<String, KiroReasoningFieldCapability>,
-    reasoning_states: BTreeMap<String, KiroReasoningCapabilityState>,
+    reasoning_fields: BTreeMap<String, UpstreamReasoningFieldCapability>,
+    reasoning_states: BTreeMap<String, UpstreamReasoningCapabilityState>,
     reasoning_capability_cohort_keys: Option<Vec<LocalUpstreamModelCapabilityCohortKey>>,
     source: String,
     last_synced_at: Option<String>,
@@ -369,8 +365,11 @@ impl ModelCapabilitiesSnapshot {
                 .reasoning_states
                 .iter()
                 .filter_map(|(model, state)| {
-                    matches!(state, KiroReasoningCapabilityState::AuthoritativeInvalid)
-                        .then_some(model.clone())
+                    matches!(
+                        state,
+                        UpstreamReasoningCapabilityState::AuthoritativeInvalid
+                    )
+                    .then_some(model.clone())
                 })
                 .collect(),
         }
@@ -386,7 +385,7 @@ impl Default for ModelCapabilitiesSnapshot {
         let reasoning_states = models
             .keys()
             .cloned()
-            .map(|model| (model, KiroReasoningCapabilityState::LegacyFallback))
+            .map(|model| (model, UpstreamReasoningCapabilityState::LegacyFallback))
             .collect();
         Self {
             models,
@@ -448,11 +447,11 @@ impl ModelCapabilitiesCatalog {
             .iter()
             .map(|(model, item)| {
                 let state = if is_manual_source(item.source.as_deref()) {
-                    KiroReasoningCapabilityState::Unknown
+                    UpstreamReasoningCapabilityState::Unknown
                 } else if is_authoritative_upstream_source(item.source.as_deref()) {
-                    KiroReasoningCapabilityState::AuthoritativeAbsent
+                    UpstreamReasoningCapabilityState::AuthoritativeAbsent
                 } else {
-                    KiroReasoningCapabilityState::LegacyFallback
+                    UpstreamReasoningCapabilityState::LegacyFallback
                 };
                 (model.clone(), state)
             })
@@ -460,7 +459,7 @@ impl ModelCapabilitiesCatalog {
         for (model, capability) in &reasoning_fields {
             reasoning_states.insert(
                 model.clone(),
-                KiroReasoningCapabilityState::Supported(capability.clone()),
+                UpstreamReasoningCapabilityState::Supported(capability.clone()),
             );
         }
         for model in status.reasoning_invalid_models {
@@ -470,7 +469,10 @@ impl ModelCapabilitiesCatalog {
                 .is_some_and(|item| !is_manual_source(item.source.as_deref()))
                 && !reasoning_fields.contains_key(&model)
             {
-                reasoning_states.insert(model, KiroReasoningCapabilityState::AuthoritativeInvalid);
+                reasoning_states.insert(
+                    model,
+                    UpstreamReasoningCapabilityState::AuthoritativeInvalid,
+                );
             }
         }
         let mut persisted_cohort_keys = status.reasoning_capability_cohort_keys;
@@ -580,7 +582,7 @@ impl ModelCapabilitiesCatalog {
     pub(crate) fn reasoning_field_capability_for(
         &self,
         model: &str,
-    ) -> Option<KiroReasoningFieldCapability> {
+    ) -> Option<UpstreamReasoningFieldCapability> {
         let model = normalize_model_id(model);
         self.inner.read().reasoning_fields.get(&model).cloned()
     }
@@ -589,7 +591,7 @@ impl ModelCapabilitiesCatalog {
         &self,
         model: &str,
         current_capability_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
-    ) -> KiroReasoningCapabilityState {
+    ) -> UpstreamReasoningCapabilityState {
         let model = normalize_model_id(model);
         let inner = self.inner.read();
         if reasoning_cohort_contract_match(
@@ -597,13 +599,13 @@ impl ModelCapabilitiesCatalog {
             current_capability_cohort_keys,
         ) == UpstreamReasoningCohortContractMatch::None
         {
-            return KiroReasoningCapabilityState::Unknown;
+            return UpstreamReasoningCapabilityState::Unknown;
         }
         inner
             .reasoning_states
             .get(&model)
             .cloned()
-            .unwrap_or(KiroReasoningCapabilityState::Unknown)
+            .unwrap_or(UpstreamReasoningCapabilityState::Unknown)
     }
 
     pub(crate) fn reasoning_capability_cohort_contract_match(
@@ -754,17 +756,17 @@ impl ModelCapabilitiesCatalog {
         for model in models {
             let reasoning_state = if cohort_complete {
                 match model.additional_model_request_fields_schema.as_ref() {
-                    None => KiroReasoningCapabilityState::AuthoritativeAbsent,
-                    Some(schema) => KiroReasoningFieldCapability::from_schema(schema)
-                        .map(KiroReasoningCapabilityState::Supported)
-                        .unwrap_or(KiroReasoningCapabilityState::AuthoritativeInvalid),
+                    None => UpstreamReasoningCapabilityState::AuthoritativeAbsent,
+                    Some(schema) => UpstreamReasoningFieldCapability::from_schema(schema)
+                        .map(UpstreamReasoningCapabilityState::Supported)
+                        .unwrap_or(UpstreamReasoningCapabilityState::AuthoritativeInvalid),
                 }
             } else {
-                KiroReasoningCapabilityState::Unknown
+                UpstreamReasoningCapabilityState::Unknown
             };
             if let Some(item) = model_capability_from_upstream_catalog_item(model) {
                 upstream_model_ids.insert(item.model.clone());
-                if let KiroReasoningCapabilityState::Supported(capability) = &reasoning_state {
+                if let UpstreamReasoningCapabilityState::Supported(capability) = &reasoning_state {
                     reasoning_fields.insert(item.model.clone(), capability.clone());
                 }
                 reasoning_states.insert(item.model.clone(), reasoning_state);
@@ -780,7 +782,7 @@ impl ModelCapabilitiesCatalog {
             reasoning_states = merged
                 .keys()
                 .cloned()
-                .map(|model| (model, KiroReasoningCapabilityState::LegacyFallback))
+                .map(|model| (model, UpstreamReasoningCapabilityState::LegacyFallback))
                 .collect();
         }
         let mut inner = self.inner.write();
@@ -791,12 +793,12 @@ impl ModelCapabilitiesCatalog {
             for (model, previous_state) in &inner.reasoning_states {
                 if matches!(
                     previous_state,
-                    KiroReasoningCapabilityState::AuthoritativeInvalid
+                    UpstreamReasoningCapabilityState::AuthoritativeInvalid
                 ) && merged.contains_key(model)
                 {
                     reasoning_states.insert(
                         model.clone(),
-                        KiroReasoningCapabilityState::AuthoritativeInvalid,
+                        UpstreamReasoningCapabilityState::AuthoritativeInvalid,
                     );
                     reasoning_fields.remove(model);
                 }
@@ -819,8 +821,10 @@ impl ModelCapabilitiesCatalog {
             };
             for item in fallback_claude_models {
                 if !upstream_model_ids.contains(&item.model) {
-                    reasoning_states
-                        .insert(item.model.clone(), KiroReasoningCapabilityState::Unknown);
+                    reasoning_states.insert(
+                        item.model.clone(),
+                        UpstreamReasoningCapabilityState::Unknown,
+                    );
                 }
                 merged.entry(item.model.clone()).or_insert(item);
             }
@@ -832,7 +836,10 @@ impl ModelCapabilitiesCatalog {
             .cloned()
             .collect::<Vec<_>>();
         for item in manual_models {
-            reasoning_states.insert(item.model.clone(), KiroReasoningCapabilityState::Unknown);
+            reasoning_states.insert(
+                item.model.clone(),
+                UpstreamReasoningCapabilityState::Unknown,
+            );
             reasoning_fields.remove(&item.model);
             if using_seed_fallback {
                 merged.insert(item.model.clone(), item);
@@ -871,9 +878,10 @@ impl ModelCapabilitiesCatalog {
         };
         let mut inner = self.inner.write();
         inner.reasoning_fields.remove(&item.model);
-        inner
-            .reasoning_states
-            .insert(item.model.clone(), KiroReasoningCapabilityState::Unknown);
+        inner.reasoning_states.insert(
+            item.model.clone(),
+            UpstreamReasoningCapabilityState::Unknown,
+        );
         inner.models.insert(item.model.clone(), item);
         inner.status()
     }
@@ -1926,9 +1934,9 @@ mod tests {
             Some("high"),
         );
         for round in 0..5 {
-            let capability = KiroReasoningFieldCapability::from_schema(&schema)
+            let capability = UpstreamReasoningFieldCapability::from_schema(&schema)
                 .unwrap_or_else(|| panic!("round {round}: capability"));
-            assert_eq!(capability.path, KiroReasoningFieldPath::OutputConfig);
+            assert_eq!(capability.path, UpstreamReasoningFieldPath::OutputConfig);
             assert_eq!(
                 capability.efforts,
                 ["low", "medium", "high", "xhigh", "max"].map(str::to_string)
@@ -1974,14 +1982,14 @@ mod tests {
                     "claude-cohort-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::Supported(_)
+                UpstreamReasoningCapabilityState::Supported(_)
             ));
             assert_eq!(
                 catalog.reasoning_capability_state_for(
                     "claude-cohort-state",
                     &[key.clone(), capability_cohort_key("free")]
                 ),
-                KiroReasoningCapabilityState::Unknown,
+                UpstreamReasoningCapabilityState::Unknown,
                 "round {round}: a new capability cohort invalidates the old contract"
             );
 
@@ -2002,7 +2010,7 @@ mod tests {
                     "claude-cohort-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::AuthoritativeAbsent
+                UpstreamReasoningCapabilityState::AuthoritativeAbsent
             );
 
             let invalid = ModelCapabilitiesCatalog::new();
@@ -2022,7 +2030,7 @@ mod tests {
                     "claude-cohort-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::AuthoritativeInvalid
+                UpstreamReasoningCapabilityState::AuthoritativeInvalid
             );
             let invalid_restored = ModelCapabilitiesCatalog::new();
             invalid_restored.load_persisted_status(invalid.status());
@@ -2031,7 +2039,7 @@ mod tests {
                     "claude-cohort-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::AuthoritativeInvalid,
+                UpstreamReasoningCapabilityState::AuthoritativeInvalid,
                 "round {round}: invalid authoritative schema survives restart"
             );
             invalid_restored.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
@@ -2054,7 +2062,7 @@ mod tests {
                     "claude-cohort-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::AuthoritativeInvalid,
+                UpstreamReasoningCapabilityState::AuthoritativeInvalid,
                 "round {round}: a sampled conflict remains sticky for the same cohort contract"
             );
 
@@ -2081,7 +2089,7 @@ mod tests {
             assert!(!status.reasoning_capability_cohort_complete);
             assert_eq!(
                 incomplete.reasoning_capability_state_for("claude-cohort-state", &incomplete_keys),
-                KiroReasoningCapabilityState::Unknown,
+                UpstreamReasoningCapabilityState::Unknown,
                 "round {round}: more than four cohorts must fail closed"
             );
         }
@@ -2119,7 +2127,7 @@ mod tests {
             );
             assert!(matches!(
                 restored.reasoning_capability_state_for("claude-persisted-subset", &verified_keys),
-                KiroReasoningCapabilityState::Supported(_)
+                UpstreamReasoningCapabilityState::Supported(_)
             ));
 
             let current_subset = vec![capability_cohort_key("pro")];
@@ -2130,7 +2138,7 @@ mod tests {
             );
             assert!(matches!(
                 restored.reasoning_capability_state_for("claude-persisted-subset", &current_subset),
-                KiroReasoningCapabilityState::Supported(_)
+                UpstreamReasoningCapabilityState::Supported(_)
             ));
 
             let mut current_with_addition = verified_keys.clone();
@@ -2146,7 +2154,7 @@ mod tests {
                     "claude-persisted-subset",
                     &current_with_addition
                 ),
-                KiroReasoningCapabilityState::Unknown
+                UpstreamReasoningCapabilityState::Unknown
             );
 
             assert_eq!(
@@ -2156,7 +2164,7 @@ mod tests {
             );
             assert_eq!(
                 restored.reasoning_capability_state_for("claude-persisted-subset", &[]),
-                KiroReasoningCapabilityState::Unknown
+                UpstreamReasoningCapabilityState::Unknown
             );
 
             let incomplete_status =
@@ -2176,7 +2184,7 @@ mod tests {
             );
             assert!(matches!(
                 restored.reasoning_capability_state_for("claude-persisted-subset", &current_subset),
-                KiroReasoningCapabilityState::Supported(_)
+                UpstreamReasoningCapabilityState::Supported(_)
             ));
         }
     }
@@ -2210,7 +2218,7 @@ mod tests {
                     "claude-restart-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::Supported(_)
+                UpstreamReasoningCapabilityState::Supported(_)
             ));
             restored.record_sync_error("controlled startup sync failure");
             assert!(matches!(
@@ -2218,7 +2226,7 @@ mod tests {
                     "claude-restart-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::Supported(_)
+                UpstreamReasoningCapabilityState::Supported(_)
             ));
             restored.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
                 models: vec![LocalUpstreamAvailableModel {
@@ -2235,7 +2243,7 @@ mod tests {
                     "claude-restart-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::Supported(_)
+                UpstreamReasoningCapabilityState::Supported(_)
             ));
 
             let mut old_row = persisted;
@@ -2249,7 +2257,7 @@ mod tests {
                     "claude-restart-state",
                     std::slice::from_ref(&key)
                 ),
-                KiroReasoningCapabilityState::Unknown,
+                UpstreamReasoningCapabilityState::Unknown,
                 "round {round}: an old row has no safe startup fence"
             );
         }
@@ -2267,9 +2275,9 @@ mod tests {
             "properties": {"effort": {"type": "string", "enum": ["high"]}}
         });
         for round in 0..5 {
-            let capability = KiroReasoningFieldCapability::from_schema(&schema)
+            let capability = UpstreamReasoningFieldCapability::from_schema(&schema)
                 .unwrap_or_else(|| panic!("round {round}: reasoning fallback"));
-            assert_eq!(capability.path, KiroReasoningFieldPath::Reasoning);
+            assert_eq!(capability.path, UpstreamReasoningFieldPath::Reasoning);
             assert_eq!(
                 capability.efforts,
                 ["low", "high", "max"].map(str::to_string)
@@ -2314,7 +2322,7 @@ mod tests {
         for round in 0..5 {
             for schema in &invalid {
                 assert!(
-                    KiroReasoningFieldCapability::from_schema(schema).is_none(),
+                    UpstreamReasoningFieldCapability::from_schema(schema).is_none(),
                     "round {round}: malformed schema must not become a runtime capability"
                 );
             }
@@ -2337,7 +2345,7 @@ mod tests {
             let capability = catalog
                 .reasoning_field_capability_for("claude-test-reasoning")
                 .unwrap_or_else(|| panic!("round {round}: synced capability"));
-            assert_eq!(capability.path, KiroReasoningFieldPath::Reasoning);
+            assert_eq!(capability.path, UpstreamReasoningFieldPath::Reasoning);
             assert_eq!(capability.default_effort.as_deref(), Some("high"));
 
             catalog.sync_from_upstream_models(vec![LocalUpstreamAvailableModel {
@@ -2370,8 +2378,8 @@ mod tests {
             let mut status = source.status();
             status.reasoning_fields.insert(
                 "missing-model".to_string(),
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::Reasoning,
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::Reasoning,
                     efforts: vec!["high".to_string()],
                     default_effort: Some("high".to_string()),
                 },
@@ -2388,8 +2396,8 @@ mod tests {
             });
             status.reasoning_fields.insert(
                 "claude-corrupt-reasoning".to_string(),
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::Reasoning,
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::Reasoning,
                     efforts: vec!["High".to_string()],
                     default_effort: Some("High".to_string()),
                 },
@@ -2400,7 +2408,7 @@ mod tests {
             let capability = restored
                 .reasoning_field_capability_for("claude-persisted-reasoning")
                 .unwrap_or_else(|| panic!("round {round}: persisted capability"));
-            assert_eq!(capability.path, KiroReasoningFieldPath::OutputConfig);
+            assert_eq!(capability.path, UpstreamReasoningFieldPath::OutputConfig);
             assert_eq!(capability.default_effort.as_deref(), Some("high"));
             assert!(
                 restored

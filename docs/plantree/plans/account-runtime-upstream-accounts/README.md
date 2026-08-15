@@ -143,6 +143,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic stream tests now construct local-upstream event fixtures through the `local_upstream` event facade, including metering/code/invalid-state aliases, so `src/anthropic` no longer imports legacy event paths directly.
 - Admin service local model-test request construction and EventStream response parsing now import local-upstream request/event/decoder aliases instead of direct legacy request, event and decoder paths. The old request-module re-exports remain only as legacy compatibility exports.
 - Model capability cohort fencing now exposes `UpstreamReasoningCohortContractMatch`; startup recovery decisions and model capability tests no longer use the old Kiro-named contract-match type for upstream reasoning readiness.
+- Model capability reasoning field path, reasoning field capability and capability state are now real upstream-named types rather than Kiro-named types hidden behind aliases. Postgres persistence and the current local-upstream provider implementation use those upstream names.
 - Main process wiring now constructs and passes the optional local executor as `local_upstream_provider` using the local-upstream provider alias. The remaining Admin `kiro_provider` field is an unmigrated compatibility service boundary, not the process-level provider name.
 - Admin service dependencies and internal provider state now use `local_upstream_provider` and `LocalUpstreamProvider`, removing the old provider field/type name from main/Admin wiring while legacy credential operations remain behind that local-upstream executor.
 - Admin service credential backup, validation and balance code now uses local-upstream credential, usage-limit and manager snapshot aliases instead of importing legacy credential and token-manager types directly.
@@ -379,6 +380,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh admin-local-upstream-alias-test2 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh upstream-reasoning-cohort-name-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh upstream-reasoning-cohort-name-test1 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh upstream-reasoning-field-types-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-reasoning-field-types-test2 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture && cargo test postgres -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh main-local-upstream-provider-name-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh main-local-upstream-provider-name-test1 -- bash -lc 'cargo check && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh admin-provider-field-alias-fmt1 -- cargo fmt`
