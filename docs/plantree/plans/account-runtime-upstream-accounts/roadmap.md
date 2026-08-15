@@ -82,6 +82,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream payload diagnostics now use wrapper names for byte breakdown and tool-use format diagnostics at handler/local body pipeline call sites, leaving Kiro-named helpers inside the legacy payload implementation only.
 - Anthropic handler runtime log/comment text for local-upstream cache-point retry, payload guard, tool-format, slow interaction and stream/non-stream retry diagnostics now uses local-upstream/account wording instead of Kiro product wording.
 - The local body pipeline now exposes `PreparedLocalUpstreamBody.local_upstream_request` and local-upstream helper parameter names at the handler boundary, while the concrete legacy request type remains isolated behind that boundary.
+- Stream conversion now offers `process_local_upstream_event` as the handler-facing event processor; the legacy concrete event method remains internal to the stream module and existing stream tests until the event model is replaced.
 
 ## In Progress
 

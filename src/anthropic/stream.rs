@@ -1,6 +1,6 @@
 //! 流式响应处理模块
 //!
-//! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
+//! 实现本地上游事件到 Anthropic SSE 的转换和状态管理
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -919,8 +919,8 @@ fn fallback_question_for_ask_user_question(question: &serde_json::Map<String, Va
 }
 
 /// Claude Code validates `AskUserQuestion.questions[*].question` locally before
-/// rendering the prompt. Some Kiro responses include header/options but omit
-/// that required field, which turns into `Invalid tool parameters` in the CLI.
+/// rendering the prompt. Some local-upstream responses include header/options
+/// but omit that required field, which turns into `Invalid tool parameters` in the CLI.
 /// Only repair this display-only tool; never synthesize parameters for tools
 /// with side effects such as Bash/Edit/Write.
 pub(crate) fn repair_tool_use_input_for_cli(name: &str, mut input: Value) -> Value {
@@ -1537,7 +1537,7 @@ pub struct StreamContext {
     pub metadata_usage: Option<MetadataTokenUsage>,
     /// Metadata-provided output tokens when available.
     pub output_tokens: i32,
-    /// 下游请求声明的 max_tokens。Kiro 上游没有等价字段时，用于最终 stop_reason 推断。
+    /// 下游请求声明的 max_tokens。本地上游没有等价字段时，用于最终 stop_reason 推断。
     requested_max_tokens: i32,
     /// Chunk-invariant estimates count only content actually emitted downstream.
     output_token_estimate: StreamTokenEstimate,
@@ -2392,7 +2392,12 @@ impl StreamContext {
         events
     }
 
-    /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
+    /// 处理本地上游事件并转换为 Anthropic SSE 事件
+    pub fn process_local_upstream_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        self.process_kiro_event(event)
+    }
+
+    /// 处理 legacy concrete event 并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         self.record_upstream_event(event);
         match event {

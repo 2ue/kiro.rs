@@ -8750,7 +8750,9 @@ fn create_sse_stream(
                                                 let suppressed_before = state
                                                     .ctx
                                                     .suppressed_tool_context_leak_blocks();
-                                                let sse_events = state.ctx.process_kiro_event(&event);
+                                                let sse_events = state
+                                                    .ctx
+                                                    .process_local_upstream_event(&event);
                                                 if state.ctx.suppressed_tool_context_leak_blocks()
                                                     > suppressed_before
                                                 {

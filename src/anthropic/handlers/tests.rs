@@ -7633,20 +7633,24 @@ fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
         content: "near token limit".to_string(),
         ..Default::default()
     };
-    events.extend(stream_context.process_kiro_event(&Event::AssistantResponse(assistant_response)));
-    events.extend(stream_context.process_kiro_event(&Event::MessageMetadata(
-        crate::kiro::model::events::MessageMetadataEvent {
-            conversation_id: Some("conv-stop-reason".to_string()),
-            utterance_id: Some("utt-stop-reason".to_string()),
-            token_usage: Some(MetadataTokenUsage {
-                uncached_input_tokens: 50,
-                output_tokens: 95,
-                total_tokens: 145,
-                cache_read_input_tokens: 0,
-                cache_write_input_tokens: 0,
-            }),
-        },
-    )));
+    events.extend(
+        stream_context.process_local_upstream_event(&Event::AssistantResponse(assistant_response)),
+    );
+    events.extend(
+        stream_context.process_local_upstream_event(&Event::MessageMetadata(
+            crate::kiro::model::events::MessageMetadataEvent {
+                conversation_id: Some("conv-stop-reason".to_string()),
+                utterance_id: Some("utt-stop-reason".to_string()),
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 50,
+                    output_tokens: 95,
+                    total_tokens: 145,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                }),
+            },
+        )),
+    );
     events.extend(stream_context.generate_final_events());
     assert!(events.iter().any(|event| {
         event.event == "message_delta" && event.data["delta"]["stop_reason"] == "max_tokens"
@@ -7708,14 +7712,14 @@ fn stream_zero_context_and_metadata_record_request_estimate_consistently() {
         ..Default::default()
     };
     let mut events =
-        stream_context.process_kiro_event(&Event::AssistantResponse(assistant_response));
+        stream_context.process_local_upstream_event(&Event::AssistantResponse(assistant_response));
     events.extend(
-        stream_context.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+        stream_context.process_local_upstream_event(&Event::ContextUsage(ContextUsageEvent {
             context_usage_percentage: 0.0,
         })),
     );
     events.extend(
-        stream_context.process_kiro_event(&Event::Metadata(MetadataEvent {
+        stream_context.process_local_upstream_event(&Event::Metadata(MetadataEvent {
             token_usage: Some(MetadataTokenUsage::default()),
         })),
     );
