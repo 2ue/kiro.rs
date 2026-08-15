@@ -506,7 +506,7 @@ impl RefreshAttemptIdentity {
         }]);
         for value in [
             Some(credentials.effective_auth_region(config)),
-            Some(config.kiro_version.as_str()),
+            Some(config.local_upstream_client_version.as_str()),
             config.machine_id.as_deref(),
             Some(config.system_version.as_str()),
             Some(config.node_version.as_str()),

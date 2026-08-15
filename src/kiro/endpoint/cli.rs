@@ -55,7 +55,7 @@ impl CliEndpoint {
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
-            ctx.config.system_version, ctx.config.kiro_version,
+            ctx.config.system_version, ctx.config.local_upstream_client_version,
         )
     }
 
@@ -69,7 +69,7 @@ impl CliEndpoint {
     fn management_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
-            ctx.config.system_version, ctx.config.kiro_version,
+            ctx.config.system_version, ctx.config.local_upstream_client_version,
         )
     }
 

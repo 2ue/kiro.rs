@@ -3399,8 +3399,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
-    #[serde(default = "default_kiro_version")]
-    pub kiro_version: String,
+    #[serde(
+        default = "default_local_upstream_client_version",
+        alias = "kiroVersion"
+    )]
+    pub local_upstream_client_version: String,
 
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -3972,7 +3975,7 @@ fn default_region() -> String {
 
 const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 8;
 
-fn default_kiro_version() -> String {
+fn default_local_upstream_client_version() -> String {
     "0.11.107".to_string()
 }
 
@@ -4795,7 +4798,7 @@ impl Default for Config {
             region: default_region(),
             auth_region: None,
             api_region: None,
-            kiro_version: default_kiro_version(),
+            local_upstream_client_version: default_local_upstream_client_version(),
             machine_id: None,
             api_key: None,
             api_keys: Vec::new(),
@@ -6245,6 +6248,7 @@ mod tests {
         config.local_upstream_cache_point_tools_only = false;
         config.local_upstream_cache_point_record_plan = false;
         config.local_upstream_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
+        config.local_upstream_client_version = "1.2.3".to_string();
 
         let serialized = serde_json::to_value(&config).unwrap();
         assert_eq!(serialized["localUpstreamResponseTimeoutSecs"], 31);
@@ -6262,6 +6266,7 @@ mod tests {
         assert_eq!(serialized["localUpstreamCachePointToolsOnly"], false);
         assert_eq!(serialized["localUpstreamCachePointRecordPlan"], false);
         assert_eq!(serialized["localUpstreamAgentModeStrategy"], "auto");
+        assert_eq!(serialized["localUpstreamClientVersion"], "1.2.3");
         assert!(serialized.get("kiroUpstreamResponseTimeoutSecs").is_none());
         assert!(
             serialized
@@ -6273,6 +6278,7 @@ mod tests {
         assert!(serialized.get("kiroCachePointToolsOnly").is_none());
         assert!(serialized.get("kiroCachePointRecordPlan").is_none());
         assert!(serialized.get("kiroAgentModeStrategy").is_none());
+        assert!(serialized.get("kiroVersion").is_none());
 
         let legacy: Config = serde_json::from_value(serde_json::json!({
             "kiroUpstreamResponseTimeoutSecs": 41,
@@ -6286,7 +6292,8 @@ mod tests {
             "kiroCachePointEnabled": true,
             "kiroCachePointToolsOnly": false,
             "kiroCachePointRecordPlan": false,
-            "kiroAgentModeStrategy": "spec"
+            "kiroAgentModeStrategy": "spec",
+            "kiroVersion": "4.5.6"
         }))
         .unwrap();
 
@@ -6308,6 +6315,7 @@ mod tests {
             legacy.local_upstream_agent_mode_strategy,
             LocalUpstreamAgentModeStrategy::Spec
         );
+        assert_eq!(legacy.local_upstream_client_version, "4.5.6");
     }
 
     #[test]

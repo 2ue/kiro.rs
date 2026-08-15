@@ -5858,7 +5858,7 @@ mod tests {
         );
         let expected_x_amz_user_agent = format!(
             "aws-sdk-js/1.0.34 KiroIDE-{}-machine",
-            Config::default().kiro_version
+            Config::default().local_upstream_client_version
         );
         assert_eq!(
             headers
@@ -7518,14 +7518,14 @@ impl KiroProvider {
             "x-amz-user-agent",
             HeaderValue::from_str(&format!(
                 "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-                config.kiro_version, machine_id
+                config.local_upstream_client_version, machine_id
             ))?,
         );
         headers.insert(
             "user-agent",
             HeaderValue::from_str(&format!(
                 "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.34 m/E KiroIDE-{}-{}",
-                config.system_version, config.node_version, config.kiro_version, machine_id
+                config.system_version, config.node_version, config.local_upstream_client_version, machine_id
             ))?,
         );
         headers.insert("host", HeaderValue::from_str(host)?);

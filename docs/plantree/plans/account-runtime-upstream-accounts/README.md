@@ -172,9 +172,13 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-upstream timeout, stream-retry and base-URL runtime config fields now use `local_upstream_*` / `localUpstream*` as primary Rust/Admin/UI names. Existing `kiroUpstream*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
 - Local-upstream cachePoint runtime config fields now use `local_upstream_cache_point_*` / `localUpstreamCachePoint*` as primary Rust/Admin/UI names. Existing `kiroCachePoint*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
 - Local-upstream agent-mode runtime config now uses `local_upstream_agent_mode_strategy` / `localUpstreamAgentModeStrategy` as primary Rust/Admin/UI names. Existing `kiroAgentModeStrategy` remains a read-only compatibility alias in backend and UI normalization, and runtime UI labels no longer use Kiro wording.
+- Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field. Existing `kiroVersion` remains a read-only compatibility alias, and the current legacy local executor reads the new field.
 
 Last verified on 2026-08-16:
 
+- `feature/tests/run-cargo-scoped.sh local-upstream-client-version-field-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-client-version-field-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture'`
+- `git diff --check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-agent-mode-field-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-agent-mode-field-test2 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test admin::types -- --nocapture'`
 - `pnpm --dir ui check && pnpm --dir admin-ui exec tsc -b --pretty false`

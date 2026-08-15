@@ -690,7 +690,7 @@ async fn refresh_social_token(
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let local_upstream_client_version = &config.local_upstream_client_version;
 
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
@@ -702,7 +702,7 @@ async fn refresh_social_token(
         .header("Content-Type", "application/json")
         .header(
             "User-Agent",
-            format!("KiroIDE-{}-{}", kiro_version, machine_id),
+            format!("KiroIDE-{}-{}", local_upstream_client_version, machine_id),
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
@@ -783,7 +783,10 @@ async fn refresh_external_idp_token(
     let request = client
         .post(token_endpoint)
         .header("Accept", "application/json")
-        .header("User-Agent", format!("KiroIDE-{}", config.kiro_version))
+        .header(
+            "User-Agent",
+            format!("KiroIDE-{}", config.local_upstream_client_version),
+        )
         .header("Connection", "close")
         .form(&form);
     let request = build_token_refresh_request(request)?;
@@ -922,7 +925,7 @@ pub(crate) async fn get_usage_limits(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let local_upstream_client_version = &config.local_upstream_client_version;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -946,8 +949,13 @@ pub(crate) async fn get_usage_limits(
     }
 
     // 构建 User-Agent headers
-    let user_agent = usage_limits_user_agent(os_name, node_version, kiro_version, &machine_id);
-    let amz_user_agent = usage_limits_amz_user_agent(kiro_version, &machine_id);
+    let user_agent = usage_limits_user_agent(
+        os_name,
+        node_version,
+        local_upstream_client_version,
+        &machine_id,
+    );
+    let amz_user_agent = usage_limits_amz_user_agent(local_upstream_client_version, &machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -1005,7 +1013,7 @@ pub(crate) async fn set_overage_status(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let local_upstream_client_version = &config.local_upstream_client_version;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
     let status = if enabled { "ENABLED" } else { "DISABLED" };
@@ -1014,8 +1022,13 @@ pub(crate) async fn set_overage_status(
 
     let url = configured_upstream_url(config, "setUserPreference")
         .unwrap_or_else(|| format!("https://{}/setUserPreference", host));
-    let user_agent = usage_limits_user_agent(os_name, node_version, kiro_version, &machine_id);
-    let amz_user_agent = usage_limits_amz_user_agent(kiro_version, &machine_id);
+    let user_agent = usage_limits_user_agent(
+        os_name,
+        node_version,
+        local_upstream_client_version,
+        &machine_id,
+    );
+    let amz_user_agent = usage_limits_amz_user_agent(local_upstream_client_version, &machine_id);
     let payload = json!({
         "overageConfiguration": {
             "overageStatus": status,
@@ -1063,17 +1076,23 @@ pub(crate) async fn set_overage_status(
 pub(super) fn usage_limits_user_agent(
     os_name: &str,
     node_version: &str,
-    kiro_version: &str,
+    local_upstream_client_version: &str,
     machine_id: &str,
 ) -> String {
     format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
+        os_name, node_version, local_upstream_client_version, machine_id
     )
 }
 
-pub(super) fn usage_limits_amz_user_agent(kiro_version: &str, machine_id: &str) -> String {
-    format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id)
+pub(super) fn usage_limits_amz_user_agent(
+    local_upstream_client_version: &str,
+    machine_id: &str,
+) -> String {
+    format!(
+        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        local_upstream_client_version, machine_id
+    )
 }
 
 #[cfg(test)]

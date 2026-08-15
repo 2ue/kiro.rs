@@ -50,7 +50,7 @@ impl IdeEndpoint {
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            ctx.config.kiro_version, ctx.machine_id
+            ctx.config.local_upstream_client_version, ctx.machine_id
         )
     }
 
@@ -59,7 +59,7 @@ impl IdeEndpoint {
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             ctx.config.system_version,
             ctx.config.node_version,
-            ctx.config.kiro_version,
+            ctx.config.local_upstream_client_version,
             ctx.machine_id
         )
     }
@@ -663,8 +663,10 @@ mod tests {
             headers.get("TokenType").and_then(|v| v.to_str().ok()),
             Some("EXTERNAL_IDP")
         );
-        let expected_x_amz_user_agent =
-            format!("aws-sdk-js/1.0.34 KiroIDE-{}-machine", config.kiro_version);
+        let expected_x_amz_user_agent = format!(
+            "aws-sdk-js/1.0.34 KiroIDE-{}-machine",
+            config.local_upstream_client_version
+        );
         assert_eq!(
             headers
                 .get("x-amz-user-agent")
@@ -673,7 +675,7 @@ mod tests {
         );
         let expected_user_agent = format!(
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-machine",
-            config.system_version, config.node_version, config.kiro_version
+            config.system_version, config.node_version, config.local_upstream_client_version
         );
         assert_eq!(
             headers.get("user-agent").and_then(|v| v.to_str().ok()),
