@@ -45,41 +45,42 @@ pub(crate) mod event {
 }
 
 pub(crate) mod request {
-    #[cfg(test)]
     pub(crate) type LocalUpstreamAdditionalModelRequestFields =
         crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamAssistantMessage =
         crate::kiro::model::requests::conversation::AssistantMessage;
     pub(crate) type LocalUpstreamConversationMessage =
         crate::kiro::model::requests::conversation::Message;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamConversationState =
         crate::kiro::model::requests::conversation::ConversationState;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamCurrentMessage =
         crate::kiro::model::requests::conversation::CurrentMessage;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamHistoryAssistantMessage =
         crate::kiro::model::requests::conversation::HistoryAssistantMessage;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamHistoryUserMessage =
         crate::kiro::model::requests::conversation::HistoryUserMessage;
-    #[cfg(test)]
+    pub(crate) type LocalUpstreamImage = crate::kiro::model::requests::conversation::KiroImage;
+    pub(crate) type LocalUpstreamInputSchema = crate::kiro::model::requests::tool::InputSchema;
     pub(crate) type LocalUpstreamOutputConfig =
         crate::kiro::model::requests::kiro::KiroOutputConfig;
+    pub(crate) type LocalUpstreamReasoningConfig =
+        crate::kiro::model::requests::kiro::KiroReasoningConfig;
+    pub(crate) type LocalUpstreamReasoningContent =
+        crate::kiro::model::requests::conversation::ReasoningContent;
     pub(crate) type LocalUpstreamRequest = crate::kiro::model::requests::kiro::KiroRequest;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamThinkingConfig =
         crate::kiro::model::requests::kiro::KiroThinkingConfig;
+    pub(crate) type LocalUpstreamTool = crate::kiro::model::requests::tool::Tool;
     pub(crate) type LocalUpstreamToolResult = crate::kiro::model::requests::tool::ToolResult;
+    pub(crate) type LocalUpstreamToolSpecification =
+        crate::kiro::model::requests::tool::ToolSpecification;
     pub(crate) type LocalUpstreamToolUseEntry = crate::kiro::model::requests::tool::ToolUseEntry;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamUserInputMessageContext =
         crate::kiro::model::requests::conversation::UserInputMessageContext;
-    #[cfg(test)]
     pub(crate) type LocalUpstreamUserInputMessage =
         crate::kiro::model::requests::conversation::UserInputMessage;
+    pub(crate) type LocalUpstreamUserMessage =
+        crate::kiro::model::requests::conversation::UserMessage;
 }
 
 pub(crate) mod stream {

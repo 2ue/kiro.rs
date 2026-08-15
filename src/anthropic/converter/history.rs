@@ -5,11 +5,14 @@ use std::collections::{HashMap, HashSet};
 use crate::anthropic::types::{
     ContentBlock, Message as AnthropicMessage, MessagesRequest, validate_redacted_thinking_data,
 };
-use crate::kiro::model::requests::conversation::{
-    AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ReasoningContent,
-    UserInputMessageContext, UserMessage,
+use crate::local_upstream::request::{
+    LocalUpstreamAssistantMessage as AssistantMessage, LocalUpstreamConversationMessage as Message,
+    LocalUpstreamHistoryAssistantMessage as HistoryAssistantMessage,
+    LocalUpstreamHistoryUserMessage as HistoryUserMessage,
+    LocalUpstreamReasoningContent as ReasoningContent, LocalUpstreamToolUseEntry as ToolUseEntry,
+    LocalUpstreamUserInputMessageContext as UserInputMessageContext,
+    LocalUpstreamUserMessage as UserMessage,
 };
-use crate::kiro::model::requests::tool::ToolUseEntry;
 use crate::model::config::CompatProfile;
 
 use super::content::{normalize_tool_use_input, process_message_content, sanitize_tool_use_id};

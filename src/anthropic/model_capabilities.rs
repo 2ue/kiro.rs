@@ -57,6 +57,8 @@ pub enum KiroReasoningCapabilityState {
     Supported(KiroReasoningFieldCapability),
 }
 
+pub type UpstreamReasoningFieldPath = KiroReasoningFieldPath;
+pub type UpstreamReasoningFieldCapability = KiroReasoningFieldCapability;
 pub type UpstreamReasoningCapabilityState = KiroReasoningCapabilityState;
 
 /// Relationship between the verified cohort fence and the cohorts that can dispatch locally now.

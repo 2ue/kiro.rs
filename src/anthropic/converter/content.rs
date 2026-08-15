@@ -6,8 +6,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 
 use crate::anthropic::types::{ContentBlock, ImageSource};
-use crate::kiro::model::requests::conversation::KiroImage;
-use crate::kiro::model::requests::tool::ToolResult;
+use crate::local_upstream::request::{LocalUpstreamImage, LocalUpstreamToolResult as ToolResult};
 
 use super::{ConversionError, EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER};
 
@@ -16,7 +15,7 @@ const TOOL_RESULT_IMAGE_PLACEHOLDER: &str = "[image attached]";
 /// 处理消息内容，提取文本、图片和工具结果
 pub(super) fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+) -> Result<(String, Vec<LocalUpstreamImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut tool_results = Vec::new();
@@ -93,7 +92,7 @@ pub(super) fn process_message_content(
     Ok((text_parts.join("\n"), images, tool_results))
 }
 
-fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionError> {
+fn convert_image_source(source: ImageSource) -> Result<LocalUpstreamImage, ConversionError> {
     match source.source_type.as_str() {
         "base64" => {
             let data = source.data.ok_or_else(|| {
@@ -117,7 +116,7 @@ fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionErro
                 image_format_from_base64_or_media_type(&media_type, &data).ok_or_else(|| {
                     ConversionError::UnsupportedContent(invalid_image_source_message(&media_type))
                 })?;
-            Ok(KiroImage::from_base64(format, data))
+            Ok(LocalUpstreamImage::from_base64(format, data))
         }
         "url" => {
             let url = source.url.ok_or_else(|| {
@@ -137,7 +136,7 @@ fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionErro
                             &media_type,
                         ))
                     })?;
-                Ok(KiroImage::from_base64(format, data))
+                Ok(LocalUpstreamImage::from_base64(format, data))
             } else {
                 Err(ConversionError::UnsupportedContent(
                     "remote image URL source was not materialized before conversion".to_string(),
@@ -626,7 +625,7 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 
 fn extract_tool_result_images(
     content: &Option<serde_json::Value>,
-) -> Result<Vec<KiroImage>, ConversionError> {
+) -> Result<Vec<LocalUpstreamImage>, ConversionError> {
     let Some(serde_json::Value::Array(items)) = content else {
         return Ok(Vec::new());
     };

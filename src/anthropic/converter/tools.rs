@@ -6,8 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::anthropic::tool_schema_keys::{SchemaKeyMapper, ToolSchemaKeyMap};
 use crate::anthropic::types::{MessagesRequest, Tool as AnthropicTool};
-use crate::kiro::model::requests::conversation::Message;
-use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolSpecification};
+use crate::local_upstream::request::{
+    LocalUpstreamConversationMessage as Message, LocalUpstreamInputSchema as InputSchema,
+    LocalUpstreamTool as Tool, LocalUpstreamToolSpecification as ToolSpecification,
+};
 
 use super::schema::normalize_json_schema;
 use super::{ConversionError, ConverterOptions};

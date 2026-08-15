@@ -2,11 +2,12 @@
 
 use crate::anthropic::model_capabilities::strip_model_1m_suffix;
 use crate::anthropic::model_capabilities::{
-    KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+    UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability, UpstreamReasoningFieldPath,
 };
 use crate::anthropic::types::{MessagesRequest, parse_thinking_effort};
-use crate::kiro::model::requests::kiro::{
-    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
+use crate::local_upstream::request::{
+    LocalUpstreamAdditionalModelRequestFields as AdditionalModelRequestFields,
+    LocalUpstreamOutputConfig, LocalUpstreamReasoningConfig, LocalUpstreamThinkingConfig,
 };
 
 /// 模型映射：将 Anthropic 模型名映射到上游模型 ID
@@ -118,7 +119,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
 const EFFORTS_WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const EFFORTS_WITHOUT_XHIGH: &[&str] = &["low", "medium", "high", "max"];
 
-fn legacy_native_reasoning_capability(model_id: &str) -> Option<KiroReasoningFieldCapability> {
+fn legacy_native_reasoning_capability(model_id: &str) -> Option<UpstreamReasoningFieldCapability> {
     let (efforts, default_effort) = match model_id {
         "claude-opus-4.8" | "claude-opus-4-8" | "claude-opus-4.7" | "claude-opus-4-7" => {
             (EFFORTS_WITH_XHIGH, "xhigh")
@@ -128,8 +129,8 @@ fn legacy_native_reasoning_capability(model_id: &str) -> Option<KiroReasoningFie
         }
         _ => return None,
     };
-    Some(KiroReasoningFieldCapability {
-        path: KiroReasoningFieldPath::OutputConfig,
+    Some(UpstreamReasoningFieldCapability {
+        path: UpstreamReasoningFieldPath::OutputConfig,
         efforts: efforts.iter().map(|effort| (*effort).to_string()).collect(),
         default_effort: Some(default_effort.to_string()),
     })
@@ -166,7 +167,7 @@ fn effort_from_budget_tokens(tokens: i32) -> &'static str {
 
 fn select_native_reasoning_effort(
     req: &MessagesRequest,
-    capability: &KiroReasoningFieldCapability,
+    capability: &UpstreamReasoningFieldCapability,
 ) -> Result<String, super::ConversionError> {
     if let Some(explicit_effort) = req
         .output_config
@@ -218,7 +219,7 @@ pub(super) fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_id: &str,
     enabled: bool,
-    capability_state: &KiroReasoningCapabilityState,
+    capability_state: &UpstreamReasoningCapabilityState,
     force_visible_thinking: bool,
 ) -> Result<Option<AdditionalModelRequestFields>, super::ConversionError> {
     if !enabled {
@@ -233,32 +234,32 @@ pub(super) fn build_additional_model_request_fields(
     }
 
     let capability = match capability_state {
-        KiroReasoningCapabilityState::Supported(capability) => capability.clone(),
-        KiroReasoningCapabilityState::LegacyFallback => {
+        UpstreamReasoningCapabilityState::Supported(capability) => capability.clone(),
+        UpstreamReasoningCapabilityState::LegacyFallback => {
             let Some(capability) = legacy_native_reasoning_capability(model_id) else {
                 return Ok(None);
             };
             capability
         }
-        KiroReasoningCapabilityState::Unknown
-        | KiroReasoningCapabilityState::AuthoritativeAbsent
-        | KiroReasoningCapabilityState::AuthoritativeInvalid => return Ok(None),
+        UpstreamReasoningCapabilityState::Unknown
+        | UpstreamReasoningCapabilityState::AuthoritativeAbsent
+        | UpstreamReasoningCapabilityState::AuthoritativeInvalid => return Ok(None),
     };
 
     let effort = select_native_reasoning_effort(req, &capability)?;
     Ok(Some(match capability.path {
-        KiroReasoningFieldPath::OutputConfig => AdditionalModelRequestFields {
-            thinking: (!thinking_is_disabled(req)).then(|| KiroThinkingConfig {
+        UpstreamReasoningFieldPath::OutputConfig => AdditionalModelRequestFields {
+            thinking: (!thinking_is_disabled(req)).then(|| LocalUpstreamThinkingConfig {
                 thinking_type: "adaptive".to_string(),
                 display: force_visible_thinking.then(|| "summarized".to_string()),
             }),
-            output_config: Some(KiroOutputConfig { effort }),
+            output_config: Some(LocalUpstreamOutputConfig { effort }),
             reasoning: None,
         },
-        KiroReasoningFieldPath::Reasoning => AdditionalModelRequestFields {
+        UpstreamReasoningFieldPath::Reasoning => AdditionalModelRequestFields {
             thinking: None,
             output_config: None,
-            reasoning: Some(KiroReasoningConfig { effort }),
+            reasoning: Some(LocalUpstreamReasoningConfig { effort }),
         },
     }))
 }
@@ -267,7 +268,7 @@ pub(super) fn uses_native_reasoning_fields(
     req: &MessagesRequest,
     model_id: &str,
     enabled: bool,
-    capability_state: &KiroReasoningCapabilityState,
+    capability_state: &UpstreamReasoningCapabilityState,
 ) -> bool {
     let disabled_without_explicit_effort =
         thinking_is_disabled(req) && !has_explicit_output_effort(req);
@@ -277,6 +278,6 @@ pub(super) fn uses_native_reasoning_fields(
         && (capability_state.capability().is_some()
             || (matches!(
                 capability_state,
-                KiroReasoningCapabilityState::LegacyFallback
+                UpstreamReasoningCapabilityState::LegacyFallback
             ) && legacy_native_reasoning_capability(model_id).is_some()))
 }

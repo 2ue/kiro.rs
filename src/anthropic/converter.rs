@@ -10,20 +10,24 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::anthropic::body_capabilities::LocalUpstreamConverterPlan;
-use crate::anthropic::model_capabilities::{KiroReasoningCapabilityState, ModelResolution};
+use crate::anthropic::model_capabilities::{ModelResolution, UpstreamReasoningCapabilityState};
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
-#[cfg(test)]
-use crate::kiro::model::requests::conversation::{
-    AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ReasoningContent,
-    UserMessage,
+use crate::local_upstream::request::{
+    LocalUpstreamAdditionalModelRequestFields as AdditionalModelRequestFields,
+    LocalUpstreamConversationState as ConversationState,
+    LocalUpstreamCurrentMessage as CurrentMessage,
+    LocalUpstreamUserInputMessage as UserInputMessage,
+    LocalUpstreamUserInputMessageContext as UserInputMessageContext,
 };
-use crate::kiro::model::requests::conversation::{
-    ConversationState, CurrentMessage, UserInputMessage, UserInputMessageContext,
-};
-use crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
 #[cfg(test)]
-use crate::kiro::model::requests::tool::ToolResult;
+use crate::local_upstream::request::{
+    LocalUpstreamAssistantMessage as AssistantMessage, LocalUpstreamConversationMessage as Message,
+    LocalUpstreamHistoryAssistantMessage as HistoryAssistantMessage,
+    LocalUpstreamHistoryUserMessage as HistoryUserMessage,
+    LocalUpstreamReasoningContent as ReasoningContent, LocalUpstreamToolResult as ToolResult,
+    LocalUpstreamUserMessage as UserMessage,
+};
 use crate::model::config::{CompatProfile, PromptCacheSimulationMode, PromptSteeringConfig};
 
 #[cfg(test)]
@@ -117,7 +121,7 @@ pub struct ConverterOptions {
     pub local_upstream_cache_point_tools_only: bool,
     pub local_upstream_cache_point_record_plan: bool,
     pub force_visible_thinking: bool,
-    pub(crate) native_reasoning_capability: KiroReasoningCapabilityState,
+    pub(crate) native_reasoning_capability: UpstreamReasoningCapabilityState,
     pub prompt_steering: PromptSteeringConfig,
 }
 
@@ -131,7 +135,7 @@ impl Default for ConverterOptions {
             local_upstream_cache_point_tools_only: true,
             local_upstream_cache_point_record_plan: true,
             force_visible_thinking: false,
-            native_reasoning_capability: KiroReasoningCapabilityState::LegacyFallback,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::LegacyFallback,
             prompt_steering: PromptSteeringConfig::default(),
         }
     }
@@ -974,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_collect_history_tool_names() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 创建包含工具使用的历史消息
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -1003,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_collect_history_tool_names_dedupes_case_insensitive() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         let mut assistant_msg = AssistantMessage::new("Using tools");
         assistant_msg = assistant_msg.with_tool_uses(vec![
@@ -2449,7 +2453,7 @@ mod tests {
     #[test]
     fn test_anthropic_strict_avoids_chunk_policy_and_thinking_prefix() {
         use crate::anthropic::model_capabilities::{
-            KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningFieldCapability, UpstreamReasoningFieldPath,
         };
 
         use super::super::types::{Message as AnthropicMessage, SystemMessage, Thinking};
@@ -2480,9 +2484,9 @@ mod tests {
             &req,
             ConverterOptions {
                 compat_profile: CompatProfile::AnthropicStrict,
-                native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                    KiroReasoningFieldCapability {
-                        path: KiroReasoningFieldPath::OutputConfig,
+                native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                    UpstreamReasoningFieldCapability {
+                        path: UpstreamReasoningFieldPath::OutputConfig,
                         efforts: ["low", "medium", "high", "max"]
                             .map(str::to_string)
                             .to_vec(),
@@ -2755,10 +2759,10 @@ mod tests {
 
         for round in 0..5 {
             for state in [
-                KiroReasoningCapabilityState::LegacyFallback,
-                KiroReasoningCapabilityState::Unknown,
-                KiroReasoningCapabilityState::AuthoritativeAbsent,
-                KiroReasoningCapabilityState::AuthoritativeInvalid,
+                UpstreamReasoningCapabilityState::LegacyFallback,
+                UpstreamReasoningCapabilityState::Unknown,
+                UpstreamReasoningCapabilityState::AuthoritativeAbsent,
+                UpstreamReasoningCapabilityState::AuthoritativeInvalid,
             ] {
                 let result = convert_request_with_options(
                     &req,
@@ -2797,7 +2801,8 @@ mod tests {
                 &req,
                 ConverterOptions {
                     conversion,
-                    native_reasoning_capability: KiroReasoningCapabilityState::AuthoritativeAbsent,
+                    native_reasoning_capability:
+                        UpstreamReasoningCapabilityState::AuthoritativeAbsent,
                     ..ConverterOptions::default()
                 },
             )
@@ -2814,7 +2819,7 @@ mod tests {
     #[test]
     fn opus_legacy_and_advertised_reasoning_defaults_are_exact_for_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningFieldCapability, UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, Thinking};
 
@@ -2874,9 +2879,9 @@ mod tests {
             let fields = convert_request_with_options(
                 &req,
                 ConverterOptions {
-                    native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                        KiroReasoningFieldCapability {
-                            path: KiroReasoningFieldPath::Reasoning,
+                    native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                        UpstreamReasoningFieldCapability {
+                            path: UpstreamReasoningFieldPath::Reasoning,
                             efforts: ["high", "max"].map(str::to_string).to_vec(),
                             default_effort: Some("max".to_string()),
                         },
@@ -2898,7 +2903,8 @@ mod tests {
     #[test]
     fn omitted_output_config_effort_uses_authoritative_max_wire_default_for_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -2921,9 +2927,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["low", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("max".to_string()),
                 },
@@ -2950,7 +2956,8 @@ mod tests {
     #[test]
     fn explicit_high_output_config_effort_survives_authoritative_wire_conversion_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -2975,9 +2982,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["high", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("max".to_string()),
                 },
@@ -3004,7 +3011,8 @@ mod tests {
     #[test]
     fn explicit_max_output_config_effort_survives_authoritative_wire_conversion_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3029,9 +3037,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["high", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("high".to_string()),
                 },
@@ -3058,7 +3066,8 @@ mod tests {
     #[test]
     fn native_output_config_visible_thinking_sets_summarized_display_for_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3084,9 +3093,9 @@ mod tests {
         };
         let options = ConverterOptions {
             force_visible_thinking: true,
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["low", "high", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("high".to_string()),
                 },
@@ -3113,7 +3122,8 @@ mod tests {
     #[test]
     fn omitted_output_config_effort_fails_closed_without_authoritative_default_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3136,9 +3146,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: vec!["max".to_string()],
                     default_effort: None,
                 },
@@ -3203,7 +3213,8 @@ mod tests {
     #[test]
     fn disabled_thinking_remains_authoritative_over_omitted_output_config_effort_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3226,9 +3237,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: vec!["max".to_string()],
                     default_effort: Some("max".to_string()),
                 },
@@ -3261,7 +3272,8 @@ mod tests {
     #[test]
     fn disabled_thinking_keeps_explicit_output_effort_without_forcing_adaptive_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3286,9 +3298,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["high", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("high".to_string()),
                 },
@@ -3314,7 +3326,8 @@ mod tests {
     #[test]
     fn enabled_thinking_budget_remains_authoritative_over_omitted_output_effort_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3337,9 +3350,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["high", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("max".to_string()),
                 },
@@ -3366,7 +3379,8 @@ mod tests {
     #[test]
     fn enabled_thinking_accepts_explicit_output_effort_for_native_output_config_five_rounds() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3391,9 +3405,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::OutputConfig,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::OutputConfig,
                     efforts: ["high", "max"].map(str::to_string).to_vec(),
                     default_effort: Some("high".to_string()),
                 },
@@ -3420,7 +3434,8 @@ mod tests {
     #[test]
     fn native_reasoning_uses_discovered_reasoning_path_and_preserves_max() {
         use super::super::model_capabilities::{
-            KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
+            UpstreamReasoningCapabilityState, UpstreamReasoningFieldCapability,
+            UpstreamReasoningFieldPath,
         };
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -3445,9 +3460,9 @@ mod tests {
             metadata: None,
         };
         let options = ConverterOptions {
-            native_reasoning_capability: KiroReasoningCapabilityState::Supported(
-                KiroReasoningFieldCapability {
-                    path: KiroReasoningFieldPath::Reasoning,
+            native_reasoning_capability: UpstreamReasoningCapabilityState::Supported(
+                UpstreamReasoningFieldCapability {
+                    path: UpstreamReasoningFieldPath::Reasoning,
                     efforts: vec!["low".to_string(), "high".to_string(), "max".to_string()],
                     default_effort: Some("high".to_string()),
                 },
@@ -4140,7 +4155,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_orphaned_use() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 测试孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -4173,7 +4188,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_valid() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 测试正常配对的情况
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -4205,7 +4220,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_mixed() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 测试混合情况：部分配对成功，部分孤立
         let mut assistant_msg = AssistantMessage::new("I'll use two tools.");
@@ -4241,7 +4256,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_history_already_paired() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 测试历史中已配对的 tool_use 不应该被报告为孤立
         // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
@@ -4289,7 +4304,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_duplicate_result() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
@@ -4330,7 +4345,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_drops_duplicate_current_result_without_textifying() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         let mut assistant_msg = AssistantMessage::new("I'll read the file.");
         assistant_msg = assistant_msg.with_tool_uses(vec![
@@ -4371,7 +4386,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_allows_current_result_for_reused_last_tool_use_id() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         let mut first_assistant = AssistantMessage::new("First read.");
         first_assistant = first_assistant.with_tool_uses(vec![
@@ -4413,7 +4428,7 @@ mod tests {
 
     #[test]
     fn test_validate_tool_pairing_drops_result_for_non_adjacent_tool_use() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         let mut first_assistant = AssistantMessage::new("First read.");
         first_assistant = first_assistant.with_tool_uses(vec![
@@ -5067,7 +5082,7 @@ mod tests {
 
     #[test]
     fn test_remove_orphaned_tool_uses() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 测试从历史中移除孤立的 tool_use
         let mut assistant_msg = AssistantMessage::new("I'll use multiple tools.");
@@ -5107,7 +5122,7 @@ mod tests {
 
     #[test]
     fn test_remove_orphaned_tool_uses_all_removed() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
+        use crate::local_upstream::request::LocalUpstreamToolUseEntry as ToolUseEntry;
 
         // 测试移除所有 tool_use 后，tool_uses 变为 None
         let mut assistant_msg = AssistantMessage::new("I'll use a tool.");

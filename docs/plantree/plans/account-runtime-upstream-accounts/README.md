@@ -134,6 +134,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Payload guard reports now serialize local-upstream cache-point diagnostic fields (`localUpstreamCachePointsPlanned` / `localUpstreamCachePointsInserted`) while still accepting legacy Kiro-named JSON fields as read aliases.
 - Local body preparation now receives upstream reasoning capability state through an upstream-named alias, and its test request fixtures use local-upstream request aliases instead of importing legacy request config types directly.
 - Converter tool-use/tool-result pairing now imports local-upstream request aliases for local conversation messages and tool results instead of importing legacy request model paths directly.
+- Converter body, history, tool and model modules now import local-upstream request aliases for conversation state, images, tools, tool results and native reasoning request fields. Converter model logic uses upstream reasoning aliases, leaving the concrete legacy request types behind the `local_upstream` facade.
 
 Last verified on 2026-08-14:
 
@@ -339,6 +340,9 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-body-upstream-alias-test2 -- bash -lc 'cargo check && cargo test disabled_thinking_suppresses_downstream_thinking_even_with_native_effort_for_five_rounds -- --nocapture && cargo test adaptive_or_omitted_thinking_with_output_effort_exposes_downstream_thinking_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh converter-tool-pairing-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh converter-tool-pairing-alias-test1 -- bash -lc 'cargo check && cargo test test_validate_tool_pairing -- --nocapture && cargo test converted_request_never_copies_duplicate_or_orphan_tool_result_content_into_text -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh converter-request-alias-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh converter-request-alias-test2 -- bash -lc 'cargo check && cargo test native_reasoning_uses_discovered_reasoning_path_and_preserves_max -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh converter-request-alias-test3 -- cargo test anthropic::converter::tests:: -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

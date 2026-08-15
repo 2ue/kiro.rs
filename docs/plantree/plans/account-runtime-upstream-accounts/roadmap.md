@@ -96,6 +96,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Payload guard report cache-point diagnostics now serialize local-upstream field names and accept old Kiro-named JSON fields only as compatibility read aliases.
 - Local body preparation now uses an upstream reasoning capability alias and local-upstream request aliases at its handler/test boundary.
 - Converter tool-use/tool-result pairing now uses local-upstream request aliases at its production import boundary.
+- Converter body, history, tool and model modules now use local-upstream request aliases and upstream reasoning aliases instead of direct legacy request model imports.
 
 ## In Progress
 
