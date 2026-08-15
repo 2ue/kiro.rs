@@ -584,6 +584,7 @@ export interface AddCredentialRequest {
   proxyUsername?: string
   proxyPassword?: string
   proxyResourceId?: number | null
+  apiKey?: string
   kiroApiKey?: string
   endpoint?: string
   supportedModels?: string[]

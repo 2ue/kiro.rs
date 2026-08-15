@@ -447,7 +447,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
     add.mutate({
       authMethod: form.authMethod,
       refreshToken: isApiKey ? undefined : form.refreshToken.trim(),
-      kiroApiKey: isApiKey ? form.kiroApiKey.trim() : undefined,
+      apiKey: isApiKey ? form.kiroApiKey.trim() : undefined,
       profileArn: form.profileArn.trim() || undefined,
       region: form.region.trim() || undefined,
       authRegion: form.authRegion.trim() || undefined,

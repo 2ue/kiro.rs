@@ -666,8 +666,8 @@ pub struct UpdateCredentialAuthRequest {
     pub issuer_url: Option<String>,
     #[serde(default, alias = "scope")]
     pub scopes: Option<String>,
-    #[serde(default)]
-    pub kiro_api_key: Option<String>,
+    #[serde(default, alias = "kiroApiKey", alias = "kiro_api_key")]
+    pub api_key: Option<String>,
     #[serde(default)]
     pub region: Option<String>,
     #[serde(default)]
@@ -924,10 +924,10 @@ pub struct AddCredentialRequest {
     #[serde(alias = "proxy_resource_id")]
     pub proxy_resource_id: Option<u64>,
 
-    /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
+    /// 上游 API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
-    #[serde(skip_serializing_if = "Option::is_none", alias = "kiro_api_key")]
-    pub kiro_api_key: Option<String>,
+    #[serde(default, alias = "kiroApiKey", alias = "kiro_api_key")]
+    pub api_key: Option<String>,
 
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2421,25 +2421,66 @@ mod tests {
     #[test]
     fn import_requests_default_model_autodiscovery_off_but_accept_override() {
         let add_req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-            "kiroApiKey": "ksk_fake",
+            "apiKey": "ksk_fake",
             "autoDiscoverSupportedModels": true
         }))
         .unwrap();
+        assert_eq!(add_req.api_key.as_deref(), Some("ksk_fake"));
         assert_eq!(add_req.auto_discover_supported_models, Some(true));
 
         let batch_req: BatchCredentialImportRequest = serde_json::from_value(serde_json::json!({
             "credentials": [{ "kiroApiKey": "ksk_fake" }]
         }))
         .unwrap();
+        assert_eq!(
+            batch_req.credentials[0].api_key.as_deref(),
+            Some("ksk_fake")
+        );
         assert!(!batch_req.auto_discover_supported_models);
 
         let batch_override: BatchCredentialImportRequest =
             serde_json::from_value(serde_json::json!({
                 "autoDiscoverSupportedModels": true,
-                "credentials": [{ "kiroApiKey": "ksk_fake" }]
+                "credentials": [{ "apiKey": "ksk_fake" }]
             }))
             .unwrap();
+        assert_eq!(
+            batch_override.credentials[0].api_key.as_deref(),
+            Some("ksk_fake")
+        );
         assert!(batch_override.auto_discover_supported_models);
+    }
+
+    #[test]
+    fn credential_auth_requests_accept_api_key_primary_and_legacy_aliases() {
+        let add_primary: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "apiKey": "ksk_primary"
+        }))
+        .unwrap();
+        assert_eq!(add_primary.api_key.as_deref(), Some("ksk_primary"));
+
+        let add_legacy: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "kiroApiKey": "ksk_legacy"
+        }))
+        .unwrap();
+        assert_eq!(add_legacy.api_key.as_deref(), Some("ksk_legacy"));
+
+        let update_primary: UpdateCredentialAuthRequest =
+            serde_json::from_value(serde_json::json!({
+                "apiKey": "ksk_update_primary"
+            }))
+            .unwrap();
+        assert_eq!(
+            update_primary.api_key.as_deref(),
+            Some("ksk_update_primary")
+        );
+
+        let update_legacy: UpdateCredentialAuthRequest =
+            serde_json::from_value(serde_json::json!({
+                "kiroApiKey": "ksk_update_legacy"
+            }))
+            .unwrap();
+        assert_eq!(update_legacy.api_key.as_deref(), Some("ksk_update_legacy"));
     }
 
     #[test]

@@ -1548,7 +1548,7 @@ fn handle_credentials_command(
                     println!("error: duplicate credential id #{id}");
                 }
                 if credential.is_api_key_credential() && credential.kiro_api_key.is_none() {
-                    println!("error: credential #{id} authMethod=api_key but missing kiroApiKey");
+                    println!("error: credential #{id} authMethod=api_key but missing apiKey");
                 }
                 if !credential.is_api_key_credential() && credential.refresh_token.is_none() {
                     println!("warning: credential #{id} missing refreshToken");

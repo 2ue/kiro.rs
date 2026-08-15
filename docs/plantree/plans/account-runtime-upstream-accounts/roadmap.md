@@ -146,6 +146,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `kiro.rs` conversation-id hash domain remains unchanged to avoid behavior drift.
 - Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `kiroMeteringUsage` compatibility field assertion remains unchanged.
 - Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Kiro API-key/API wording while keeping `kiroApiKey` as a compatibility field.
+- Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `kiroApiKey` / `kiro_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
 
 ## In Progress
 

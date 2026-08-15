@@ -184,9 +184,17 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `kiro.rs` conversation-id hash domain remains unchanged to avoid behavior drift.
 - Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `kiroMeteringUsage` compatibility field assertion remains unchanged.
 - Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Kiro API-key/API wording while keeping `kiroApiKey` as a compatibility field.
+- Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `kiroApiKey` / `kiro_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
 
 Last verified on 2026-08-16:
 
+- `rg -n "req\\.kiro_api_key|missing kiroApiKey|Kiro API Key（API Key 凭据|toast\\.error\\('请输入 Kiro API Key'\\)|label=\\\"Kiro API Key\\\"|kiroApiKey: isApiKey" src/admin src/main.rs ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `feature/tests/run-cargo-scoped.sh credential-api-key-request-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh credential-api-key-request-test1 -- bash -lc 'cargo check && cargo test admin::types -- --nocapture && cargo test admin::service_tests -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh credential-api-key-request-test2 -- cargo test missing_auth_method_with_api_key_is_inferred_as_api_key -- --nocapture`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "Kiro API Key|请输入 Kiro API Key|Kiro 凭据|Kiro API|缺少 kiroApiKey" ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`

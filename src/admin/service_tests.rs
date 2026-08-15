@@ -93,9 +93,9 @@ fn missing_auth_method_with_external_idp_fields_is_inferred_as_external_idp() {
 }
 
 #[test]
-fn missing_auth_method_with_kiro_api_key_is_inferred_as_api_key() {
+fn missing_auth_method_with_api_key_is_inferred_as_api_key() {
     let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-        "kiroApiKey": "ksk_test_key|eu-central-1"
+        "apiKey": "ksk_test_key|eu-central-1"
     }))
     .unwrap();
 

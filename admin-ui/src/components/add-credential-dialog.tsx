@@ -339,7 +339,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
-        kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
+        apiKey: isApiKey ? kiroApiKey.trim() : undefined,
         profileArn: profileArn.trim() || undefined,
         region: region.trim() || undefined,
         authRegion: authRegion.trim() || undefined,

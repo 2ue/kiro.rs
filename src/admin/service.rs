@@ -2032,7 +2032,7 @@ impl AdminService {
             proxy_password: req.proxy_password,
             proxy_resource_id: req.proxy_resource_id,
             disabled,
-            kiro_api_key: req.kiro_api_key,
+            kiro_api_key: req.api_key,
             endpoint: req.endpoint,
         };
         credentials
@@ -2081,7 +2081,7 @@ impl AdminService {
             else {
                 return Ok(());
             };
-            (credential_secret_hash(value), "kiroApiKey", true)
+            (credential_secret_hash(value), "apiKey", true)
         } else {
             let Some(value) = credential
                 .refresh_token
@@ -3561,7 +3561,7 @@ impl AdminService {
             token_endpoint: req.token_endpoint,
             issuer_url: req.issuer_url,
             scopes: req.scopes,
-            kiro_api_key: req.kiro_api_key,
+            kiro_api_key: req.api_key,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -5900,6 +5900,7 @@ impl AdminService {
 
         if msg.contains("凭据已存在")
             || msg.contains("refreshToken 重复")
+            || msg.contains("apiKey 重复")
             || msg.contains("kiroApiKey 重复")
         {
             return AdminServiceError::Conflict(msg);
@@ -5909,6 +5910,8 @@ impl AdminService {
         let is_invalid_credential = msg.contains("缺少 refreshToken")
             || msg.contains("refreshToken 为空")
             || msg.contains("refreshToken 已被截断")
+            || msg.contains("缺少 apiKey")
+            || msg.contains("apiKey 为空")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
             || msg.contains("代理资源不存在")
@@ -6446,7 +6449,7 @@ fn resolve_add_credential_auth_method(req: &AddCredentialRequest) -> String {
         return explicit.to_string();
     }
 
-    if req.kiro_api_key.as_deref().is_some_and(has_text) {
+    if req.api_key.as_deref().is_some_and(has_text) {
         return "api_key".to_string();
     }
 
@@ -6490,6 +6493,7 @@ fn has_text(value: &str) -> bool {
 fn is_duplicate_credential_error(err: &AdminServiceError) -> bool {
     let message = err.to_string();
     message.contains("凭据已存在")
+        || message.contains("apiKey 重复")
         || message.contains("kiroApiKey 重复")
         || message.contains("refreshToken 重复")
 }
