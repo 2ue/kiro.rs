@@ -106,6 +106,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Model capability cohort fencing and startup readiness now use upstream reasoning contract-match naming instead of the old Kiro-named type.
 - Main process wiring now uses local-upstream provider naming for the optional local executor and model capability recovery worker.
 - Admin service dependencies and internal provider state now use local-upstream provider naming, leaving legacy credential behavior behind the local executor boundary.
+- Admin service credential backup, validation, balance and snapshot code now uses local-upstream credential/usage-limit/manager aliases instead of direct legacy credential manager imports.
 - The unmounted `src/test.rs` Kiro-specific manual stream caller was removed.
 - Account-route local auxiliary attempt traces now use local-upstream credential-attempt aliases instead of direct legacy call-trace paths.
 - Account-route Redis lease cleanup now uses an account-runtime critical storage-task alias instead of importing the helper from the legacy token-manager module.

@@ -144,6 +144,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Model capability cohort fencing now exposes `UpstreamReasoningCohortContractMatch`; startup recovery decisions and model capability tests no longer use the old Kiro-named contract-match type for upstream reasoning readiness.
 - Main process wiring now constructs and passes the optional local executor as `local_upstream_provider` using the local-upstream provider alias. The remaining Admin `kiro_provider` field is an unmigrated compatibility service boundary, not the process-level provider name.
 - Admin service dependencies and internal provider state now use `local_upstream_provider` and `LocalUpstreamProvider`, removing the old provider field/type name from main/Admin wiring while legacy credential operations remain behind that local-upstream executor.
+- Admin service credential backup, validation and balance code now uses local-upstream credential, usage-limit and manager snapshot aliases instead of importing legacy credential and token-manager types directly.
 - Removed the unmounted `src/test.rs` manual stream caller, which was a Kiro-specific scratch entrypoint and not part of the compiled scheduler/proxy/usage runtime.
 - Account-route request state now stores local auxiliary attempt traces as `LocalUpstreamCredentialAttempt` through the local-upstream call-trace facade instead of directly naming the legacy credential attempt type.
 - Account-route Redis lease cleanup now calls the critical storage-task helper through an `account_runtime::storage_task` alias instead of importing it from the legacy token-manager module.
@@ -378,6 +379,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh main-local-upstream-provider-name-test1 -- bash -lc 'cargo check && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh admin-provider-field-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh admin-provider-field-alias-test1 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh admin-credential-manager-alias-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh admin-credential-manager-alias-test2 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh remove-unused-kiro-scratch-test-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh external-route-local-attempt-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh external-route-local-attempt-alias-test1 -- bash -lc 'cargo check && cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture && cargo test account_fallback -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`

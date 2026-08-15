@@ -79,12 +79,12 @@ use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
     response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
-use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
-use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::token_manager::{
-    CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
-};
+use crate::local_upstream::credentials::{LocalUpstreamCredentials, local_upstream_profile_region};
 use crate::local_upstream::event::LocalUpstreamEvent as Event;
+use crate::local_upstream::manager::{
+    LocalUpstreamCredentialAuthUpdate, LocalUpstreamCredentialBaseSnapshot,
+    LocalUpstreamCredentialEntrySnapshot, LocalUpstreamCredentialManager,
+};
 use crate::local_upstream::provider::LocalUpstreamProvider;
 use crate::local_upstream::request::{
     LocalUpstreamConversationState as ConversationState,
@@ -92,6 +92,7 @@ use crate::local_upstream::request::{
     LocalUpstreamUserInputMessage as UserInputMessage,
 };
 use crate::local_upstream::stream::LocalUpstreamEventStreamDecoder as EventStreamDecoder;
+use crate::local_upstream::usage_limits::LocalUpstreamUsageLimitsResponse;
 use crate::model::config::{
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
     MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
@@ -528,14 +529,14 @@ fn remove_request_api_key_by_id(
 struct CredentialsBackupExport {
     format: &'static str,
     exported_at: String,
-    credentials: Vec<KiroCredentials>,
+    credentials: Vec<LocalUpstreamCredentials>,
 }
 
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
-    token_manager: Arc<MultiTokenManager>,
+    token_manager: Arc<LocalUpstreamCredentialManager>,
     postgres_store: Arc<PostgresStore>,
     /// Optional independent Redis for usage/statistics/Admin caches and cleanup only.
     observability_redis_store: Option<Arc<RedisStore>>,
@@ -557,7 +558,7 @@ pub struct AdminService {
 }
 
 pub struct AdminServiceDependencies {
-    pub token_manager: Arc<MultiTokenManager>,
+    pub token_manager: Arc<LocalUpstreamCredentialManager>,
     pub known_endpoints: Vec<String>,
     pub usage_recorder: Arc<UsageRecorder>,
     pub prompt_cache: Arc<PromptCacheTracker>,
@@ -1984,7 +1985,7 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
         disabled: bool,
-    ) -> Result<KiroCredentials, AdminServiceError> {
+    ) -> Result<LocalUpstreamCredentials, AdminServiceError> {
         if let Some(ref name) = req.endpoint {
             let name = name.trim();
             if !name.is_empty() && !self.known_endpoints.contains(name) {
@@ -1999,7 +2000,7 @@ impl AdminService {
         }
 
         let auth_method = resolve_add_credential_auth_method(&req);
-        let mut credentials = KiroCredentials {
+        let mut credentials = LocalUpstreamCredentials {
             id: None,
             created_at: None,
             updated_at: None,
@@ -2049,7 +2050,7 @@ impl AdminService {
             if let Some(region) = credentials
                 .profile_arn
                 .as_deref()
-                .and_then(profile_arn_region)
+                .and_then(local_upstream_profile_region)
             {
                 credentials.api_region = Some(region.to_string());
             }
@@ -2070,7 +2071,7 @@ impl AdminService {
 
     fn reject_duplicate_credential_before_auxiliary_calls(
         &self,
-        credential: &KiroCredentials,
+        credential: &LocalUpstreamCredentials,
     ) -> Result<(), AdminServiceError> {
         let (candidate_hash, duplicate_label, api_key) = if credential.is_api_key_credential() {
             let Some(value) = credential
@@ -2741,7 +2742,7 @@ impl AdminService {
 
     async fn discover_supported_models_for_external_credential(
         &self,
-        credential: KiroCredentials,
+        credential: LocalUpstreamCredentials,
     ) -> anyhow::Result<Vec<String>> {
         let provider = self
             .local_upstream_provider
@@ -3257,7 +3258,7 @@ impl AdminService {
 
     async fn test_external_credential_liveness(
         &self,
-        credential: KiroCredentials,
+        credential: LocalUpstreamCredentials,
         model: &str,
         prompt: &str,
     ) -> Result<String, AdminServiceError> {
@@ -3549,7 +3550,7 @@ impl AdminService {
         }
 
         let reset_runtime_state = req.reset_runtime_state;
-        let update = CredentialAuthUpdate {
+        let update = LocalUpstreamCredentialAuthUpdate {
             access_token: req.access_token,
             expires_at: req.expires_at,
             refresh_token: req.refresh_token,
@@ -6110,8 +6111,8 @@ fn normalize_proxy_url(value: Option<String>) -> Result<Option<String>, AdminSer
             let value = value.trim();
             if value.is_empty() {
                 Ok(None)
-            } else if value.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
-                Ok(Some(KiroCredentials::PROXY_DIRECT.to_string()))
+            } else if value.eq_ignore_ascii_case(LocalUpstreamCredentials::PROXY_DIRECT) {
+                Ok(Some(LocalUpstreamCredentials::PROXY_DIRECT.to_string()))
             } else {
                 validate_proxy_url(value).map(Some)
             }
@@ -6544,7 +6545,7 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
 }
 
 fn credential_status_item_from_snapshot(
-    entry: CredentialEntrySnapshot,
+    entry: LocalUpstreamCredentialEntrySnapshot,
     default_endpoint: &str,
     current_id: u64,
 ) -> CredentialStatusItem {
@@ -6625,7 +6626,7 @@ fn credential_status_item_from_snapshot(
 }
 
 fn credential_list_item_from_base(
-    credential: CredentialBaseSnapshot,
+    credential: LocalUpstreamCredentialBaseSnapshot,
     default_endpoint: &str,
 ) -> CredentialListItem {
     CredentialListItem {
@@ -6670,7 +6671,7 @@ fn credential_list_item_from_base(
 }
 
 fn credential_runtime_item_from_snapshot(
-    credential: CredentialEntrySnapshot,
+    credential: LocalUpstreamCredentialEntrySnapshot,
     current_id: u64,
 ) -> CredentialRuntimeItem {
     CredentialRuntimeItem {
@@ -6746,7 +6747,10 @@ fn credential_account_info_item_from_row(
     }
 }
 
-fn balance_response_from_usage(id: u64, usage: UsageLimitsResponse) -> BalanceResponse {
+fn balance_response_from_usage(
+    id: u64,
+    usage: LocalUpstreamUsageLimitsResponse,
+) -> BalanceResponse {
     let current_usage = usage.current_usage();
     let usage_limit = usage.usage_limit();
     let remaining = (usage_limit - current_usage).max(0.0);
@@ -7442,7 +7446,9 @@ fn validation_info_from_balance(balance: &BalanceResponse) -> CredentialValidati
     }
 }
 
-fn validation_info_from_usage(usage: &UsageLimitsResponse) -> CredentialValidationInfo {
+fn validation_info_from_usage(
+    usage: &LocalUpstreamUsageLimitsResponse,
+) -> CredentialValidationInfo {
     let current_usage = usage.current_usage();
     let usage_limit = usage.usage_limit();
     let usage_percentage = if usage_limit > 0.0 {
@@ -8530,7 +8536,7 @@ async fn persist_usage_cleanup_progress(
 }
 
 fn filter_export_credentials_by_ids(
-    credentials: &mut Vec<KiroCredentials>,
+    credentials: &mut Vec<LocalUpstreamCredentials>,
     selected_id_set: &HashSet<u64>,
 ) -> Result<(), AdminServiceError> {
     if selected_id_set.is_empty() {

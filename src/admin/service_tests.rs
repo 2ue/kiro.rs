@@ -30,19 +30,19 @@ fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
 #[test]
 fn export_credentials_filter_keeps_selected_ids_and_rejects_missing_ids() {
     let mut credentials = vec![
-        KiroCredentials {
+        LocalUpstreamCredentials {
             id: Some(1),
             ..Default::default()
         },
-        KiroCredentials {
+        LocalUpstreamCredentials {
             id: Some(2),
             ..Default::default()
         },
-        KiroCredentials {
+        LocalUpstreamCredentials {
             id: Some(3),
             ..Default::default()
         },
-        KiroCredentials {
+        LocalUpstreamCredentials {
             id: None,
             ..Default::default()
         },
@@ -56,7 +56,7 @@ fn export_credentials_filter_keeps_selected_ids_and_rejects_missing_ids() {
         vec![1, 3]
     );
 
-    let mut credentials = vec![KiroCredentials {
+    let mut credentials = vec![LocalUpstreamCredentials {
         id: Some(1),
         ..Default::default()
     }];

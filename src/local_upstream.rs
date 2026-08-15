@@ -18,6 +18,7 @@ pub(crate) mod call_trace {
 }
 
 pub(crate) mod credentials {
+    pub(crate) use crate::kiro::model::credentials::profile_arn_region as local_upstream_profile_region;
     pub(crate) type LocalUpstreamCredentials = crate::kiro::model::credentials::KiroCredentials;
     pub(crate) type LocalUpstreamCredentialsConfig =
         crate::kiro::model::credentials::CredentialsConfig;
@@ -85,7 +86,18 @@ pub(crate) mod model_catalog {
 }
 
 pub(crate) mod manager {
+    pub(crate) type LocalUpstreamCredentialAuthUpdate =
+        crate::kiro::token_manager::CredentialAuthUpdate;
+    pub(crate) type LocalUpstreamCredentialBaseSnapshot =
+        crate::kiro::token_manager::CredentialBaseSnapshot;
+    pub(crate) type LocalUpstreamCredentialEntrySnapshot =
+        crate::kiro::token_manager::CredentialEntrySnapshot;
     pub(crate) type LocalUpstreamCredentialManager = crate::kiro::token_manager::MultiTokenManager;
+}
+
+pub(crate) mod usage_limits {
+    pub(crate) type LocalUpstreamUsageLimitsResponse =
+        crate::kiro::model::usage_limits::UsageLimitsResponse;
 }
 
 pub(crate) mod request {
