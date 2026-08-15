@@ -69,6 +69,7 @@ use crate::{
     },
     http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout},
     kiro::token_manager::storage_task::spawn_critical_storage_task,
+    local_upstream::call_trace::LocalUpstreamCredentialAttempt,
     model::config::{
         ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode, ExternalPoolRouteMode,
         ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
@@ -853,7 +854,7 @@ pub struct ExternalRouteRequest {
     pub direct_policy_reason: Option<String>,
     pub local_attempted: bool,
     pub local_preflight: Option<serde_json::Value>,
-    pub local_attempts: Vec<crate::kiro::call_trace::KiroCredentialAttempt>,
+    pub local_attempts: Vec<LocalUpstreamCredentialAttempt>,
     pub reported_usage: ReportedUsageConfig,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,

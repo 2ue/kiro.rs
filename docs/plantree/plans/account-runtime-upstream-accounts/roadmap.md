@@ -107,6 +107,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Main process wiring now uses local-upstream provider naming for the optional local executor and model capability recovery worker.
 - Admin service dependencies and internal provider state now use local-upstream provider naming, leaving legacy credential behavior behind the local executor boundary.
 - The unmounted `src/test.rs` Kiro-specific manual stream caller was removed.
+- Account-route local auxiliary attempt traces now use local-upstream credential-attempt aliases instead of direct legacy call-trace paths.
 
 ## In Progress
 
