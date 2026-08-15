@@ -132,6 +132,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-provider raw upstream error diagnostics now use neutral `official_upstream` source labels and redacted body metadata for provider status/non-eventstream bodies, preserving body size, content type, status and a short fingerprint without copying provider error messages into attempt/usage diagnostics.
 - `Config` now exposes local-upstream accessors for response timeout, stream retry and cache-point compatibility settings. Anthropic router/AppState/request runtime/converter/Admin model-test/WebSearch call sites use local-upstream field names or accessors while persisted config and Admin runtime DTO compatibility fields remain unchanged.
 - Payload guard reports now serialize local-upstream cache-point diagnostic fields (`localUpstreamCachePointsPlanned` / `localUpstreamCachePointsInserted`) while still accepting legacy Kiro-named JSON fields as read aliases.
+- Local body preparation now receives upstream reasoning capability state through an upstream-named alias, and its test request fixtures use local-upstream request aliases instead of importing legacy request config types directly.
 
 Last verified on 2026-08-14:
 
@@ -333,6 +334,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-upstream-runtime-config-accessors-test3 -- bash -lc 'cargo check && cargo test body_capabilities -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture && cargo test anthropic::converter::tests:: -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh payload-report-local-upstream-fields-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh payload-report-local-upstream-fields-test2 -- bash -lc 'cargo check && cargo test payload_guard_report_uses_local_upstream_cache_point_fields_with_legacy_aliases -- --nocapture && cargo test cache_point_plan_inserts_markers_in_serialized_kiro_body -- --nocapture && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-body-upstream-alias-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-body-upstream-alias-test2 -- bash -lc 'cargo check && cargo test disabled_thinking_suppresses_downstream_thinking_even_with_native_effort_for_five_rounds -- --nocapture && cargo test adaptive_or_omitted_thinking_with_output_effort_exposes_downstream_thinking_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

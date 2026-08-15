@@ -26,7 +26,7 @@ pub(super) fn prepare(
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
-    native_reasoning_capability: KiroReasoningCapabilityState,
+    native_reasoning_capability: UpstreamReasoningCapabilityState,
 ) -> Result<PreparedLocalUpstreamBody, Response> {
     let plan = LocalUpstreamBodyPlan::compatible_with_config(
         runtime_config.initial_payload_guard_config(),
@@ -49,7 +49,7 @@ pub(super) fn prepare_with_plan(
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
-    native_reasoning_capability: KiroReasoningCapabilityState,
+    native_reasoning_capability: UpstreamReasoningCapabilityState,
     plan: LocalUpstreamBodyPlan,
 ) -> Result<PreparedLocalUpstreamBody, Response> {
     debug_assert_eq!(plan.profile.as_str(), "local_credential");
@@ -57,7 +57,7 @@ pub(super) fn prepare_with_plan(
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
     let discovered_reasoning_capability = matches!(
         &native_reasoning_capability,
-        KiroReasoningCapabilityState::Supported(_)
+        UpstreamReasoningCapabilityState::Supported(_)
     );
     let conversion_result = match convert_request_with_resolved_model(
         payload,
@@ -262,9 +262,10 @@ fn should_expose_downstream_thinking(
 mod tests {
     use super::*;
     use crate::anthropic::types::{Message as AnthropicMessage, OutputConfig, Thinking};
-    use crate::kiro::model::requests::{
-        conversation::{ConversationState, CurrentMessage, UserInputMessage},
-        kiro::{AdditionalModelRequestFields, KiroOutputConfig, KiroThinkingConfig},
+    use crate::local_upstream::request::{
+        LocalUpstreamAdditionalModelRequestFields, LocalUpstreamConversationState,
+        LocalUpstreamCurrentMessage, LocalUpstreamOutputConfig, LocalUpstreamThinkingConfig,
+        LocalUpstreamUserInputMessage,
     };
 
     fn messages_request(
@@ -295,16 +296,19 @@ mod tests {
 
     fn local_upstream_request_with_native_output_config() -> LocalUpstreamRequest {
         LocalUpstreamRequest {
-            conversation_state: ConversationState::new("conv").with_current_message(
-                CurrentMessage::new(UserInputMessage::new("hello", "claude-opus-4.8")),
+            conversation_state: LocalUpstreamConversationState::new("conv").with_current_message(
+                LocalUpstreamCurrentMessage::new(LocalUpstreamUserInputMessage::new(
+                    "hello",
+                    "claude-opus-4.8",
+                )),
             ),
             profile_arn: None,
-            additional_model_request_fields: Some(AdditionalModelRequestFields {
-                thinking: Some(KiroThinkingConfig {
+            additional_model_request_fields: Some(LocalUpstreamAdditionalModelRequestFields {
+                thinking: Some(LocalUpstreamThinkingConfig {
                     thinking_type: "adaptive".to_string(),
                     display: None,
                 }),
-                output_config: Some(KiroOutputConfig {
+                output_config: Some(LocalUpstreamOutputConfig {
                     effort: "max".to_string(),
                 }),
                 reasoning: None,

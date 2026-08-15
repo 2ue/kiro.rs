@@ -52,7 +52,7 @@ use super::inference_attempt_budget::{
 };
 use super::middleware::AppState;
 use super::model_capabilities::{
-    KiroReasoningCapabilityState, ModelResolution, ModelResolutionSource,
+    ModelResolution, ModelResolutionSource, UpstreamReasoningCapabilityState,
     strip_model_compat_suffixes,
 };
 use super::payload_guard::{
@@ -6346,7 +6346,7 @@ async fn post_messages_inner(
                 .model_capabilities
                 .reasoning_capability_state_for(model, &capability_cohort_keys)
         })
-        .unwrap_or(KiroReasoningCapabilityState::Unknown);
+        .unwrap_or(UpstreamReasoningCapabilityState::Unknown);
     let prepared_local = match local_body_pipeline::prepare(
         &endpoint,
         &payload,

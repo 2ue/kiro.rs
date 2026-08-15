@@ -46,6 +46,9 @@ pub(crate) mod event {
 
 pub(crate) mod request {
     #[cfg(test)]
+    pub(crate) type LocalUpstreamAdditionalModelRequestFields =
+        crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
+    #[cfg(test)]
     pub(crate) type LocalUpstreamAssistantMessage =
         crate::kiro::model::requests::conversation::AssistantMessage;
     pub(crate) type LocalUpstreamConversationMessage =
@@ -62,7 +65,13 @@ pub(crate) mod request {
     #[cfg(test)]
     pub(crate) type LocalUpstreamHistoryUserMessage =
         crate::kiro::model::requests::conversation::HistoryUserMessage;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamOutputConfig =
+        crate::kiro::model::requests::kiro::KiroOutputConfig;
     pub(crate) type LocalUpstreamRequest = crate::kiro::model::requests::kiro::KiroRequest;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamThinkingConfig =
+        crate::kiro::model::requests::kiro::KiroThinkingConfig;
     pub(crate) type LocalUpstreamToolResult = crate::kiro::model::requests::tool::ToolResult;
     pub(crate) type LocalUpstreamToolUseEntry = crate::kiro::model::requests::tool::ToolUseEntry;
     #[cfg(test)]
