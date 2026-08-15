@@ -73,23 +73,23 @@ enum NativeReasoningUnknownReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeReasoningStartupDecision {
-    ContinueReady(anthropic::model_capabilities::KiroReasoningCohortContractMatch),
+    ContinueReady(anthropic::model_capabilities::UpstreamReasoningCohortContractMatch),
     ContinueReasoningUnknown(NativeReasoningUnknownReason),
 }
 
 fn decide_native_reasoning_startup(
     discovery: ModelCapabilityDiscoveryOutcome,
     current_cohort_count: usize,
-    contract_match: anthropic::model_capabilities::KiroReasoningCohortContractMatch,
+    contract_match: anthropic::model_capabilities::UpstreamReasoningCohortContractMatch,
 ) -> NativeReasoningStartupDecision {
-    use anthropic::model_capabilities::KiroReasoningCohortContractMatch;
+    use anthropic::model_capabilities::UpstreamReasoningCohortContractMatch;
 
     if current_cohort_count == 0 {
         return NativeReasoningStartupDecision::ContinueReasoningUnknown(
             NativeReasoningUnknownReason::NoLocalCohorts,
         );
     }
-    if contract_match != KiroReasoningCohortContractMatch::None {
+    if contract_match != UpstreamReasoningCohortContractMatch::None {
         return NativeReasoningStartupDecision::ContinueReady(contract_match);
     }
     let reason = match discovery {
@@ -937,7 +937,7 @@ fn spawn_model_capability_recovery_worker(
             let contract_match =
                 model_capabilities.reasoning_capability_cohort_contract_match(&current_cohort_keys);
             if contract_match
-                != anthropic::model_capabilities::KiroReasoningCohortContractMatch::None
+                != anthropic::model_capabilities::UpstreamReasoningCohortContractMatch::None
             {
                 if consecutive_failures > 0 {
                     tracing::info!(
@@ -1588,14 +1588,14 @@ mod lifecycle_tests {
 
     #[test]
     fn native_reasoning_startup_decision_never_blocks_service_for_five_rounds() {
-        use anthropic::model_capabilities::KiroReasoningCohortContractMatch;
+        use anthropic::model_capabilities::UpstreamReasoningCohortContractMatch;
 
         for round in 0..5 {
             assert_eq!(
                 decide_native_reasoning_startup(
                     ModelCapabilityDiscoveryOutcome::Failed,
                     1,
-                    KiroReasoningCohortContractMatch::None,
+                    UpstreamReasoningCohortContractMatch::None,
                 ),
                 NativeReasoningStartupDecision::ContinueReasoningUnknown(
                     NativeReasoningUnknownReason::DiscoveryFailed
@@ -1606,7 +1606,7 @@ mod lifecycle_tests {
                 decide_native_reasoning_startup(
                     ModelCapabilityDiscoveryOutcome::Incomplete,
                     5,
-                    KiroReasoningCohortContractMatch::None,
+                    UpstreamReasoningCohortContractMatch::None,
                 ),
                 NativeReasoningStartupDecision::ContinueReasoningUnknown(
                     NativeReasoningUnknownReason::DiscoveryIncomplete
@@ -1617,10 +1617,10 @@ mod lifecycle_tests {
                 decide_native_reasoning_startup(
                     ModelCapabilityDiscoveryOutcome::Failed,
                     1,
-                    KiroReasoningCohortContractMatch::ConservativeSubset,
+                    UpstreamReasoningCohortContractMatch::ConservativeSubset,
                 ),
                 NativeReasoningStartupDecision::ContinueReady(
-                    KiroReasoningCohortContractMatch::ConservativeSubset
+                    UpstreamReasoningCohortContractMatch::ConservativeSubset
                 ),
                 "round {round}: a verified superset contract remains safe after discovery failure"
             );
@@ -1628,7 +1628,7 @@ mod lifecycle_tests {
                 decide_native_reasoning_startup(
                     ModelCapabilityDiscoveryOutcome::Pending,
                     0,
-                    KiroReasoningCohortContractMatch::Exact,
+                    UpstreamReasoningCohortContractMatch::Exact,
                 ),
                 NativeReasoningStartupDecision::ContinueReasoningUnknown(
                     NativeReasoningUnknownReason::NoLocalCohorts

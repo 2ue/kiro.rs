@@ -103,6 +103,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Payload guard production code and local payload fixtures now use local-upstream request aliases instead of direct legacy request model imports.
 - Anthropic stream tests now use local-upstream event facade aliases, removing direct legacy event imports from `src/anthropic`.
 - Admin service model-test request construction and response parsing now use local-upstream request/event/decoder aliases instead of direct legacy paths.
+- Model capability cohort fencing and startup readiness now use upstream reasoning contract-match naming instead of the old Kiro-named type.
 
 ## In Progress
 

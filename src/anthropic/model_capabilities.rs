@@ -68,7 +68,7 @@ pub type UpstreamReasoningCapabilityState = KiroReasoningCapabilityState;
 /// effort enum is already the intersection across every old cohort. The reverse is unsafe because
 /// a newly introduced cohort was never represented in that intersection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KiroReasoningCohortContractMatch {
+pub(crate) enum UpstreamReasoningCohortContractMatch {
     None,
     Exact,
     ConservativeSubset,
@@ -89,7 +89,7 @@ impl KiroReasoningCapabilityState {
 fn reasoning_cohort_contract_match(
     verified_cohort_keys: Option<&[LocalUpstreamModelCapabilityCohortKey]>,
     current_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
-) -> KiroReasoningCohortContractMatch {
+) -> UpstreamReasoningCohortContractMatch {
     // An empty local cohort means there is no local dispatch population whose wire contract can be
     // proven. In particular, it must not vacuously match every persisted contract.
     if current_cohort_keys.is_empty()
@@ -97,22 +97,22 @@ fn reasoning_cohort_contract_match(
             .windows(2)
             .any(|pair| pair[0] >= pair[1])
     {
-        return KiroReasoningCohortContractMatch::None;
+        return UpstreamReasoningCohortContractMatch::None;
     }
     let Some(verified_cohort_keys) = verified_cohort_keys else {
-        return KiroReasoningCohortContractMatch::None;
+        return UpstreamReasoningCohortContractMatch::None;
     };
     if verified_cohort_keys == current_cohort_keys {
-        return KiroReasoningCohortContractMatch::Exact;
+        return UpstreamReasoningCohortContractMatch::Exact;
     }
     if current_cohort_keys.len() < verified_cohort_keys.len()
         && current_cohort_keys
             .iter()
             .all(|key| verified_cohort_keys.binary_search(key).is_ok())
     {
-        return KiroReasoningCohortContractMatch::ConservativeSubset;
+        return UpstreamReasoningCohortContractMatch::ConservativeSubset;
     }
-    KiroReasoningCohortContractMatch::None
+    UpstreamReasoningCohortContractMatch::None
 }
 
 impl KiroReasoningFieldCapability {
@@ -595,7 +595,7 @@ impl ModelCapabilitiesCatalog {
         if reasoning_cohort_contract_match(
             inner.reasoning_capability_cohort_keys.as_deref(),
             current_capability_cohort_keys,
-        ) == KiroReasoningCohortContractMatch::None
+        ) == UpstreamReasoningCohortContractMatch::None
         {
             return KiroReasoningCapabilityState::Unknown;
         }
@@ -609,7 +609,7 @@ impl ModelCapabilitiesCatalog {
     pub(crate) fn reasoning_capability_cohort_contract_match(
         &self,
         current_capability_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
-    ) -> KiroReasoningCohortContractMatch {
+    ) -> UpstreamReasoningCohortContractMatch {
         let inner = self.inner.read();
         reasoning_cohort_contract_match(
             inner.reasoning_capability_cohort_keys.as_deref(),
@@ -699,7 +699,7 @@ impl ModelCapabilitiesCatalog {
                 inner.reasoning_capability_cohort_keys.as_deref(),
                 &catalog.capability_cohort_keys,
             );
-            if contract_match != KiroReasoningCohortContractMatch::None {
+            if contract_match != UpstreamReasoningCohortContractMatch::None {
                 inner.last_error = Some(format!(
                     "native reasoning capability discovery is incomplete ({}/{} cohorts observed); retained the {:?} verified contract",
                     catalog.successful_cohort_count, catalog.cohort_count, contract_match
@@ -2114,7 +2114,7 @@ mod tests {
             restored.load_persisted_status(source.status());
             assert_eq!(
                 restored.reasoning_capability_cohort_contract_match(&verified_keys),
-                KiroReasoningCohortContractMatch::Exact,
+                UpstreamReasoningCohortContractMatch::Exact,
                 "round {round}: exact persisted fence"
             );
             assert!(matches!(
@@ -2125,7 +2125,7 @@ mod tests {
             let current_subset = vec![capability_cohort_key("pro")];
             assert_eq!(
                 restored.reasoning_capability_cohort_contract_match(&current_subset),
-                KiroReasoningCohortContractMatch::ConservativeSubset,
+                UpstreamReasoningCohortContractMatch::ConservativeSubset,
                 "round {round}: a persisted superset is a conservative contract"
             );
             assert!(matches!(
@@ -2138,7 +2138,7 @@ mod tests {
             current_with_addition.sort();
             assert_eq!(
                 restored.reasoning_capability_cohort_contract_match(&current_with_addition),
-                KiroReasoningCohortContractMatch::None,
+                UpstreamReasoningCohortContractMatch::None,
                 "round {round}: any new cohort invalidates the old fence"
             );
             assert_eq!(
@@ -2151,7 +2151,7 @@ mod tests {
 
             assert_eq!(
                 restored.reasoning_capability_cohort_contract_match(&[]),
-                KiroReasoningCohortContractMatch::None,
+                UpstreamReasoningCohortContractMatch::None,
                 "round {round}: an empty local cohort is never a verified match"
             );
             assert_eq!(

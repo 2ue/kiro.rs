@@ -141,6 +141,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Payload guard production code and local payload fixtures now use local-upstream request aliases for request bodies, images, tools, tool results and native reasoning config instead of importing legacy request model paths directly.
 - Anthropic stream tests now construct local-upstream event fixtures through the `local_upstream` event facade, including metering/code/invalid-state aliases, so `src/anthropic` no longer imports legacy event paths directly.
 - Admin service local model-test request construction and EventStream response parsing now import local-upstream request/event/decoder aliases instead of direct legacy request, event and decoder paths. The old request-module re-exports remain only as legacy compatibility exports.
+- Model capability cohort fencing now exposes `UpstreamReasoningCohortContractMatch`; startup recovery decisions and model capability tests no longer use the old Kiro-named contract-match type for upstream reasoning readiness.
 
 Last verified on 2026-08-15:
 
@@ -361,6 +362,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh stream-event-test-alias-test1 -- bash -lc 'cargo check && cargo test anthropic::stream -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh admin-local-upstream-alias-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh admin-local-upstream-alias-test2 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh upstream-reasoning-cohort-name-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-reasoning-cohort-name-test1 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
