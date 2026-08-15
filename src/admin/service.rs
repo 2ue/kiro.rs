@@ -2731,10 +2731,10 @@ impl AdminService {
     }
 
     fn normalize_discovered_supported_models(model_ids: Vec<String>) -> Vec<String> {
-        let kiro_model_ids = normalize_supported_models(model_ids);
-        let supported_models = expand_claude_supported_model_variants(kiro_model_ids.clone());
+        let upstream_model_ids = normalize_supported_models(model_ids);
+        let supported_models = expand_claude_supported_model_variants(upstream_model_ids.clone());
         if supported_models.is_empty() {
-            kiro_model_ids
+            upstream_model_ids
         } else {
             supported_models
         }

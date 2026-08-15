@@ -162,6 +162,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Runtime config defaults now read the local-upstream IDE endpoint name through the `local_upstream` endpoint facade instead of importing the legacy endpoint module directly.
 - Main endpoint registry construction now uses local-upstream endpoint and trait aliases for IDE/CLI endpoint setup instead of importing the legacy endpoint types directly in process wiring.
 - Main startup, Redis runtime-event listener and credential-file CLI diagnostics now use local-upstream credential/config/manager aliases instead of importing legacy credential and manager types directly in process wiring.
+- Main startup local API-key bootstrap variables and Admin supported-model normalization variables now use local-upstream/upstream naming while legacy environment/config field names remain compatibility boundaries.
 
 Last verified on 2026-08-15:
 
@@ -425,6 +426,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh main-endpoint-alias-test2 -- bash -lc 'cargo check && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh main-credential-manager-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh main-credential-manager-alias-test1 -- bash -lc 'cargo check && cargo test legacy_provider_is_not_required_when_upstream_accounts_are_enabled -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-variable-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-variable-names-test1 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

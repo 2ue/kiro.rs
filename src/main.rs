@@ -240,7 +240,7 @@ async fn main() {
             std::process::exit(1);
         });
     let start_legacy_credential_provider = legacy_credential_provider_required(&config);
-    let env_kiro_api_key = if start_legacy_credential_provider {
+    let env_local_upstream_api_key = if start_legacy_credential_provider {
         match std::env::var("KIRO_API_KEY") {
             Ok(value) if value.trim().is_empty() => {
                 tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
@@ -267,7 +267,7 @@ async fn main() {
                         std::process::exit(1);
                     });
             }
-            Err(err) if env_kiro_api_key.is_some() => {
+            Err(err) if env_local_upstream_api_key.is_some() => {
                 tracing::warn!(
                     "首次导入凭据文件不可用，将仅使用 KIRO_API_KEY 自动导入: {}",
                     err
@@ -280,9 +280,9 @@ async fn main() {
         }
     }
 
-    if let Some(kiro_api_key) = &env_kiro_api_key {
+    if let Some(local_upstream_api_key) = &env_local_upstream_api_key {
         postgres_store
-            .ensure_api_key_credential(kiro_api_key)
+            .ensure_api_key_credential(local_upstream_api_key)
             .await
             .map(|credential| {
                 tracing::info!(
