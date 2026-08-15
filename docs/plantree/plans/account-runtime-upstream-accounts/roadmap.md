@@ -22,9 +22,9 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account-named Admin/API aliases were added for the existing upstream account management surface while the old UI and DTO names are migrated.
 - Admin UI navigation now points to `/accounts` as "上游账号"; legacy `/external-pools` redirects to the account page.
 - The upstream account page now uses account-named API calls, while component/type filenames remain to be migrated.
-- Account-only `/cc/v1/messages` routing now works through configured upstream accounts when no `KiroProvider` is installed, covering normalized stream and non-stream requests.
+- Account-only `/cc/v1/messages` routing now works through configured upstream accounts when no local-upstream provider is installed, covering normalized stream and non-stream requests.
 - Account eligibility and availability checks now honor request body mode, so raw passthrough and normalized account routes are scheduled against compatible accounts only.
-- Startup no longer installs the legacy `KiroProvider` when upstream account runtime is enabled, and missing legacy credential files do not block account-only deployments.
+- Startup no longer installs the legacy credential provider when upstream account runtime is enabled, and missing legacy credential files do not block account-only deployments.
 - Admin service construction accepts an absent legacy provider; old credential/model-test actions fail explicitly in that mode while account management and usage surfaces can remain mounted.
 - `/api/admin/accounts` now has account-named handlers, service wrappers and DTOs; list/status responses expose `accounts` while legacy `/external-pools` remains compatibility-only.
 - The upstream account page consumes the account-shaped responses through the account API client, with temporary normalization for older `pools` payloads.
@@ -83,6 +83,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Anthropic handler runtime log/comment text for local-upstream cache-point retry, payload guard, tool-format, slow interaction and stream/non-stream retry diagnostics now uses local-upstream/account wording instead of Kiro product wording.
 - The local body pipeline now exposes `PreparedLocalUpstreamBody.local_upstream_request` and local-upstream helper parameter names at the handler boundary, while the concrete legacy request type remains isolated behind that boundary.
 - Stream conversion now offers `process_local_upstream_event` as the handler-facing event processor; the legacy concrete event method remains internal to the stream module and existing stream tests until the event model is replaced.
+- Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor, keeping the concrete legacy provider type behind the protocol boundary.
 
 ## In Progress
 

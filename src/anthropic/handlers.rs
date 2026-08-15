@@ -1255,7 +1255,7 @@ fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestR
 
 fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
     state
-        .kiro_provider
+        .local_upstream_provider
         .as_ref()
         .map(|provider| request_runtime_config(state, provider).image_processing)
         .unwrap_or_else(|| state.image_processing.normalized())
@@ -1283,7 +1283,7 @@ async fn maybe_raw_account_direct_response(
 ) -> Option<Response> {
     let manager = state.account_runtime_manager.clone()?;
     let runtime_config = state
-        .kiro_provider
+        .local_upstream_provider
         .as_ref()
         .map(|provider| request_runtime_config(state, provider))
         .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(state));
@@ -1303,7 +1303,7 @@ async fn maybe_raw_account_direct_response(
         return None;
     }
 
-    let reason = if state.kiro_provider.is_none() {
+    let reason = if state.local_upstream_provider.is_none() {
         "account_route".to_string()
     } else {
         account_direct_policy_reason(
@@ -1361,7 +1361,7 @@ async fn maybe_raw_account_preflight_response(
     request_api_key_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<RawAccountPreflightDecision> {
-    let provider = state.kiro_provider.as_ref()?.clone();
+    let provider = state.local_upstream_provider.as_ref()?.clone();
     let manager = state.account_runtime_manager.clone()?;
     let runtime_config = request_runtime_config(state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
@@ -1654,7 +1654,7 @@ fn build_account_fallback_context(
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
     let policy = &effective_cache_route.policy;
     Some(AccountFallbackContext {
-        provider: state.kiro_provider.clone(),
+        provider: state.local_upstream_provider.clone(),
         manager,
         config,
         effective_raw_body,
@@ -5814,7 +5814,7 @@ fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, 
         ));
     };
     let defined_cache_routes = state
-        .kiro_provider
+        .local_upstream_provider
         .as_ref()
         .map(|provider| {
             normalize_defined_cache_routes(&provider.runtime_config().defined_cache_routes)
@@ -6009,7 +6009,7 @@ async fn post_messages_inner(
         "Received POST messages request"
     );
     log_anthropic_request_summary(&endpoint, &payload);
-    let provider = state.kiro_provider.clone();
+    let provider = state.local_upstream_provider.clone();
     let runtime_config = provider
         .as_ref()
         .map(|provider| request_runtime_config(&state, provider))

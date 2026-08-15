@@ -37,9 +37,9 @@ use super::{
 pub struct AppState {
     /// 客户端请求 API Key 内存索引。
     pub request_api_keys: Arc<RequestApiKeyStore>,
-    /// Kiro Provider（可选，用于实际 API 调用）
-    /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
-    pub kiro_provider: Option<Arc<KiroProvider>>,
+    /// 本地上游 provider（可选，用于 legacy local upstream API 调用）。
+    /// 内部使用 MultiTokenManager，已支持线程安全的多账号管理。
+    pub local_upstream_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
     /// thinking 触发策略
@@ -90,11 +90,11 @@ pub struct AppState {
     pub model_mapping: ModelMappingConfig,
     /// 是否在响应头中暴露代理改写动作
     pub expose_proxy_warnings: bool,
-    /// 是否启用发送 Kiro 上游前的最终 payload 防护
+    /// 是否启用发送本地上游前的最终 payload 防护
     pub payload_guard_enabled: bool,
     /// payload guard 大小裁剪触发模式
     pub payload_guard_mode: PayloadGuardMode,
-    /// Kiro 上游请求 JSON body 最大字节数
+    /// 本地上游请求 JSON body 最大字节数
     pub payload_guard_max_bytes: usize,
     /// payload guard 安全余量字节数
     pub payload_guard_safety_margin_bytes: usize,
@@ -102,17 +102,17 @@ pub struct AppState {
     pub payload_guard_trim_history: bool,
     /// 上游账号路由是否复用同一套 payload guard / shaping 配置
     pub payload_guard_account_enabled: bool,
-    /// 是否把工具 cache_control 转成 Kiro cachePoint
+    /// 是否把工具 cache_control 转成本地上游 cachePoint
     pub kiro_cache_point_enabled: bool,
     /// cachePoint 是否仅按工具 cache_control 插入
     pub kiro_cache_point_tools_only: bool,
     /// 是否记录 cachePoint 插入计划
     pub kiro_cache_point_record_plan: bool,
-    /// Kiro 上游流式响应正文静默超时秒数
+    /// 本地上游流式响应正文静默超时秒数
     pub kiro_upstream_stream_idle_timeout_secs: u64,
     /// 多模态图片/文件预处理配置
     pub image_processing: ImageProcessingConfig,
-    /// 本地 Anthropic -> Kiro 转换能力配置
+    /// 本地 Anthropic -> local-upstream 转换能力配置
     pub body_conversion: BodyConversionConfig,
     /// 统一提示词引导配置
     pub prompt_steering: PromptSteeringConfig,
@@ -141,7 +141,7 @@ impl AppState {
     ) -> Self {
         Self {
             request_api_keys,
-            kiro_provider: None,
+            local_upstream_provider: None,
             extract_thinking,
             thinking_trigger_mode: ThinkingTriggerMode::RealRequest,
             usage_recorder,
@@ -306,9 +306,9 @@ impl AppState {
         self
     }
 
-    /// 设置 KiroProvider
-    pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
-        self.kiro_provider = Some(provider);
+    /// 设置本地上游 provider
+    pub fn with_local_upstream_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.local_upstream_provider = Some(provider);
         self
     }
 

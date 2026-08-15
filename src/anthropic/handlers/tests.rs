@@ -667,7 +667,7 @@ fn multimodal_handler_test_router_from_config(config: Config) -> (Router, Arc<Us
             request_admission: Arc::new(RequestAdmissionController::new(
                 RequestAdmissionConfig::disabled(),
             )),
-            kiro_provider: Some(provider),
+            local_upstream_provider: Some(provider),
             usage_recorder: usage_recorder.clone(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
@@ -890,7 +890,7 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
             request_admission: Arc::new(RequestAdmissionController::new(
                 RequestAdmissionConfig::disabled(),
             )),
-            kiro_provider: Some(provider),
+            local_upstream_provider: Some(provider),
             usage_recorder: usage_recorder.clone(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
@@ -1028,7 +1028,7 @@ fn websearch_handler_test_router_with_external_options(
             request_admission: Arc::new(RequestAdmissionController::new(
                 RequestAdmissionConfig::disabled(),
             )),
-            kiro_provider: Some(provider),
+            local_upstream_provider: Some(provider),
             usage_recorder: usage_recorder.clone(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
@@ -1063,7 +1063,7 @@ fn account_only_handler_test_router(
             request_admission: Arc::new(RequestAdmissionController::new(
                 RequestAdmissionConfig::disabled(),
             )),
-            kiro_provider: None,
+            local_upstream_provider: None,
             usage_recorder: usage_recorder.clone(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
@@ -1656,7 +1656,7 @@ fn normalized_external_direct_policy_skips_raw_preparse_without_raw_pool() {
     });
 }
 
-async fn run_account_only_routes_normalized_requests_without_kiro_provider() {
+async fn run_account_only_routes_normalized_requests_without_local_upstream_provider() {
     let external_upstream = ExternalMessagesUpstream::start().await;
     let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
         &external_upstream.base_url,
@@ -1729,9 +1729,9 @@ async fn run_account_only_routes_normalized_requests_without_kiro_provider() {
 }
 
 #[test]
-fn account_only_routes_normalized_requests_without_kiro_provider() {
+fn account_only_routes_normalized_requests_without_local_upstream_provider() {
     run_handler_fixture_on_four_mib_thread("account-only-normalized", || async {
-        run_account_only_routes_normalized_requests_without_kiro_provider().await;
+        run_account_only_routes_normalized_requests_without_local_upstream_provider().await;
     });
 }
 
@@ -3561,7 +3561,7 @@ fn handler_eventstream_fault_router_with_limits(
             request_admission: Arc::new(RequestAdmissionController::new(
                 RequestAdmissionConfig::disabled(),
             )),
-            kiro_provider: Some(provider),
+            local_upstream_provider: Some(provider),
             usage_recorder: usage_recorder.clone(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),

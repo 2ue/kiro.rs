@@ -12,7 +12,7 @@ pub(super) async fn handle_messages_endpoint(
     attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
     let runtime_config = state
-        .kiro_provider
+        .local_upstream_provider
         .as_ref()
         .map(|provider| request_runtime_config(&state, provider))
         .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
@@ -21,7 +21,7 @@ pub(super) async fn handle_messages_endpoint(
         runtime_config.auxiliary_upstream_max_attempts,
     ));
     let local_dispatch_max_wait_secs = state
-        .kiro_provider
+        .local_upstream_provider
         .as_ref()
         .map(|provider| provider.runtime_config().credential_dispatch_max_wait_secs)
         .unwrap_or(5);
@@ -195,7 +195,7 @@ async fn continue_messages_endpoint_after_raw_account_routes(
     raw_preflight_failure: Option<RawAccountPreflightFailure>,
 ) -> Response {
     let runtime_config = state
-        .kiro_provider
+        .local_upstream_provider
         .as_ref()
         .map(|provider| request_runtime_config(&state, provider))
         .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
@@ -245,7 +245,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
     attribution: Option<&RequestRejectionAttribution>,
     raw_probe: &RawMessagesBodyProbe,
 ) -> Option<Response> {
-    let provider = state.kiro_provider.as_ref()?;
+    let provider = state.local_upstream_provider.as_ref()?;
     let model = raw_probe
         .model
         .as_deref()

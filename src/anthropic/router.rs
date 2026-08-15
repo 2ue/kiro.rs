@@ -45,7 +45,7 @@ use super::{
 pub struct AnthropicRouterDependencies {
     pub request_api_keys: Arc<RequestApiKeyStore>,
     pub request_admission: Arc<RequestAdmissionController>,
-    pub kiro_provider: Option<Arc<KiroProvider>>,
+    pub local_upstream_provider: Option<Arc<KiroProvider>>,
     pub usage_recorder: Arc<UsageRecorder>,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -155,7 +155,7 @@ impl AnthropicRouterConfig {
 /// - `x-api-key` header
 /// - `Authorization: Bearer <token>` header
 ///
-/// 创建带有 KiroProvider 的 Anthropic API 路由
+/// 创建带有可选本地上游 provider 的 Anthropic API 路由
 pub fn create_router_with_provider(
     dependencies: AnthropicRouterDependencies,
     config: AnthropicRouterConfig,
@@ -163,7 +163,7 @@ pub fn create_router_with_provider(
     let AnthropicRouterDependencies {
         request_api_keys,
         request_admission,
-        kiro_provider,
+        local_upstream_provider,
         usage_recorder,
         prompt_cache,
         prompt_cache_creation_controller,
@@ -257,8 +257,8 @@ pub fn create_router_with_provider(
     .with_tool_format_debug_recorder(tool_format_debug_recorder)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
-    if let Some(provider) = kiro_provider {
-        base_state = base_state.with_kiro_provider(provider);
+    if let Some(provider) = local_upstream_provider {
+        base_state = base_state.with_local_upstream_provider(provider);
     }
     if let Some(manager) = account_runtime_manager {
         base_state = base_state.with_account_runtime_manager(manager);
@@ -563,7 +563,7 @@ mod tests {
                             queue_timeout_ms: 0,
                         },
                     )),
-                    kiro_provider: None,
+                    local_upstream_provider: None,
                     usage_recorder: Arc::new(UsageRecorder::new(10)),
                     prompt_cache: Arc::new(PromptCacheTracker::default()),
                     prompt_cache_creation_controller: Arc::new(
@@ -615,7 +615,7 @@ mod tests {
                 request_admission: Arc::new(RequestAdmissionController::new(
                     RequestAdmissionConfig::disabled(),
                 )),
-                kiro_provider: None,
+                local_upstream_provider: None,
                 usage_recorder: Arc::new(UsageRecorder::new(10)),
                 prompt_cache: Arc::new(PromptCacheTracker::default()),
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
@@ -691,7 +691,7 @@ mod tests {
                 request_admission: Arc::new(RequestAdmissionController::new(
                     RequestAdmissionConfig::disabled(),
                 )),
-                kiro_provider: None,
+                local_upstream_provider: None,
                 usage_recorder: Arc::new(UsageRecorder::new(10)),
                 prompt_cache: Arc::new(PromptCacheTracker::default()),
                 prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),

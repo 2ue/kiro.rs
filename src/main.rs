@@ -642,7 +642,7 @@ async fn main() {
         anthropic::AnthropicRouterDependencies {
             request_api_keys: request_api_key_store.clone(),
             request_admission: request_admission.clone(),
-            kiro_provider: kiro_provider.clone(),
+            local_upstream_provider: kiro_provider.clone(),
             usage_recorder: usage_recorder.clone(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),

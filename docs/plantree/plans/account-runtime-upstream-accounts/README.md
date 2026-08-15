@@ -61,9 +61,9 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - `/api/admin/accounts` aliases for the existing external-pool Admin handlers and matching frontend account API aliases, giving new callers an account-named boundary while the old UI is migrated.
 - the Admin UI resource navigation now exposes the upstream account page at `/accounts`, with the old `/external-pools` route redirecting to it.
 - the upstream account page now calls the account-named Admin API aliases for list, status, create, update, enable, cooldown, supported-model discovery, delete and test actions.
-- `/cc/v1/messages` can now run through configured upstream accounts when no `KiroProvider` is installed, for both stream and non-stream normalized requests.
+- `/cc/v1/messages` can now run through configured upstream accounts when no local-upstream provider is installed, for both stream and non-stream normalized requests.
 - account selection now honors the configured request body mode during eligibility and immediate-availability checks, so raw-preparse routing does not steal normalized-only accounts and normalized routing does not select raw-only accounts.
-- startup can now run without installing a legacy `KiroProvider` when the upstream account runtime is enabled, so missing legacy credential files do not block account-only deployments.
+- startup can now run without installing the legacy credential provider when the upstream account runtime is enabled, so missing legacy credential files do not block account-only deployments.
 - Admin service dependencies now treat the legacy provider as optional; old credential/model-test endpoints return explicit compatibility errors when the provider is absent while account management remains available.
 - `/api/admin/accounts` now has account-named handlers, service methods and response DTOs. List and status responses expose `accounts`, while legacy `/api/admin/external-pools` remains as a compatibility surface with `pools`.
 - the upstream account page now consumes the account-shaped `accounts` responses, with frontend compatibility normalization retained for older server responses during migration.
@@ -121,6 +121,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - JSON stream error-envelope diagnostics now avoid retaining complete provider JSON error messages in usage raw-body fields. Usage keeps shape/fingerprint metadata for these envelopes, and remaining malformed/incomplete raw upstream snippets use the neutral `official_upstream` source label instead of a Kiro-specific source.
 - Anthropic handler runtime log/comment text for local-upstream cache-point retries, payload guard diagnostics, tool-use rejection diagnostics, slow interaction diagnostics and stream/non-stream retry paths now uses local-upstream/account wording rather than Kiro product wording. The remaining handler Kiro names are type/module compatibility boundaries.
 - Stream conversion now exposes `process_local_upstream_event` as the handler-facing event processor. The old concrete `process_kiro_event` method remains inside the stream module for the current legacy event type and stream tests, while runtime handler code enters through the local-upstream wrapper.
+- Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor. The underlying concrete type is still the legacy provider until the provider implementation is replaced, but the Claude/Anthropic protocol boundary no longer exposes a Kiro-named provider field.
 
 Last verified on 2026-08-14:
 
@@ -299,6 +300,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-field-test1 -- bash -lc 'cargo check && cargo test body_capabilities -- --nocapture && cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-stream-event-wrapper-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-stream-event-wrapper-test1 -- bash -lc 'cargo check && cargo test stream_success_records_requested_max_tokens_and_downstream_stop_reason -- --nocapture && cargo test test_requested_max_tokens_infers_max_tokens_stop_reason -- --nocapture && cargo test test_context_usage_percentage_uses_catalog_window_for_final_usage -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-provider-field-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-provider-field-test1 -- bash -lc 'cargo check && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
