@@ -217,7 +217,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
-        const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+        const candidateApiKey = cred.apiKey?.trim() || cred.kiroApiKey?.trim() || ''
+        const isApiKeyCred = !!candidateApiKey || cred.authMethod === 'api_key'
 
         // 更新状态为检查中
         setCurrentProcessing(`正在处理账号 ${i + 1}/${credentials.length}`)
@@ -227,11 +228,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           return newResults
         })
 
-        // 客户端去重：OAuth 基于 refreshToken hash，API Key 基于 kiroApiKey hash
+        // 客户端去重：OAuth 基于 refreshToken hash，API Key 基于 apiKey hash
         let credHash = ''
         if (isApiKeyCred) {
-          const apiKey = cred.kiroApiKey?.trim() || ''
-          if (!apiKey) {
+          if (!candidateApiKey) {
             setResults(prev => {
               const newResults = [...prev]
               newResults[i] = {
@@ -245,7 +245,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             setProgress({ current: i + 1, total: credentials.length })
             continue
           }
-          credHash = await sha256Hex(apiKey)
+          credHash = await sha256Hex(candidateApiKey)
           if (existingApiKeyHashes.has(credHash)) {
             duplicateCount++
             const existingCred = existingCredentials?.credentials.find(c => c.apiKeyHash === credHash)
@@ -312,7 +312,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             // API Key 账号
             const addedCred = await addCredential({
               authMethod: 'api_key',
-              kiroApiKey: optionalTrimmed(cred.kiroApiKey),
+              apiKey: candidateApiKey,
               email: optionalTrimmed(cred.email),
               profileArn: optionalTrimmed(cred.profileArn),
               priority: cred.priority || 0,
@@ -622,7 +622,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               </Button>
             </div>
             <textarea
-              placeholder={'粘贴 JSON / JSONL 格式的账号，或选择一个/多个文件\n\n每个文件可以是单个对象、数组、jsonl 多行，或导出的 { "credentials": [...] } / { "accounts": [...] }\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON / JSONL 格式的账号，或选择一个/多个文件\n\n每个文件可以是单个对象、数组、jsonl 多行，或导出的 { "credentials": [...] } / { "accounts": [...] }\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"apiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

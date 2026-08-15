@@ -185,9 +185,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `kiroMeteringUsage` compatibility field assertion remains unchanged.
 - Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Kiro API-key/API wording while keeping `kiroApiKey` as a compatibility field.
 - Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `kiroApiKey` / `kiro_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
+- Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `kiroApiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
 
 Last verified on 2026-08-16:
 
+- `rg -n "splitKiro|parseKiro|parsePlainKiro|rawKiro|parsedKiro|kiroApiKey:|kiroApiKey hash|\\[\\{\\\"kiroApiKey\\\"|导出内容包含完整 refreshToken、kiroApiKey" ui/src/lib/credential-import.ts admin-ui/src/lib/credential-import.ts ui/src/features/credentials/credential-dialogs.tsx admin-ui/src/components/batch-import-dialog.tsx admin-ui/src/components/credential-export-dialog.tsx`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "req\\.kiro_api_key|missing kiroApiKey|Kiro API Key（API Key 凭据|toast\\.error\\('请输入 Kiro API Key'\\)|label=\\\"Kiro API Key\\\"|kiroApiKey: isApiKey" src/admin src/main.rs ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh credential-api-key-request-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh credential-api-key-request-test1 -- bash -lc 'cargo check && cargo test admin::types -- --nocapture && cargo test admin::service_tests -- --nocapture'`

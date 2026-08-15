@@ -16,19 +16,19 @@ function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
-function splitKiroApiKeyValue(value: string): { key: string; region?: string } {
+function splitApiKeyValue(value: string): { key: string; region?: string } {
   const [rawKey, rawRegion] = value.trim().split('|', 2)
   return { key: rawKey?.trim() || '', region: rawRegion?.trim() || undefined }
 }
 
-function parseKiroApiKeyLine(line: string): AddCredentialRequest | null {
+function parseApiKeyLine(line: string): AddCredentialRequest | null {
   const trimmed = line.trim()
   if (!trimmed || trimmed.startsWith('#')) return null
-  const { key, region } = splitKiroApiKeyValue(trimmed)
+  const { key, region } = splitApiKeyValue(trimmed)
   if (!key || !key.startsWith('ksk_')) return null
   return {
     authMethod: 'api_key',
-    kiroApiKey: key,
+    apiKey: key,
     region,
     authRegion: region,
     apiRegion: region,
@@ -36,10 +36,10 @@ function parseKiroApiKeyLine(line: string): AddCredentialRequest | null {
   }
 }
 
-function parsePlainKiroApiKeys(text: string): AddCredentialRequest[] | null {
+function parsePlainApiKeys(text: string): AddCredentialRequest[] | null {
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'))
   if (lines.length === 0) return null
-  const credentials = lines.map(parseKiroApiKeyLine)
+  const credentials = lines.map(parseApiKeyLine)
   if (credentials.some((credential) => credential === null)) return null
   return credentials as AddCredentialRequest[]
 }
@@ -135,16 +135,16 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   const accessToken = stringField(normalized.accessToken) ?? stringField(nested?.accessToken)
   const expiresAt = stringLikeField(normalized.expiresAt) ?? stringLikeField(normalized.expired) ?? stringLikeField(nested?.expiresAt) ?? stringLikeField(nested?.expired)
   const refreshToken = stringField(normalized.refreshToken) ?? stringField(nested?.refreshToken)
-  const rawKiroApiKey = stringField(normalized.kiroApiKey) ?? stringField(normalized.apiKey)
-  const parsedKiroApiKey = rawKiroApiKey ? splitKiroApiKeyValue(rawKiroApiKey) : undefined
-  const kiroApiKey = parsedKiroApiKey?.key
+  const rawApiKey = stringField(normalized.apiKey) ?? stringField(normalized.kiroApiKey)
+  const parsedApiKey = rawApiKey ? splitApiKeyValue(rawApiKey) : undefined
+  const apiKey = parsedApiKey?.key
   const clientId = stringField(normalized.clientId) ?? stringField(nested?.clientId)
   const clientSecret = stringField(normalized.clientSecret) ?? stringField(nested?.clientSecret)
   const tokenEndpoint = stringField(normalized.tokenEndpoint) ?? stringField(nested?.tokenEndpoint)
   const issuerUrl = stringField(normalized.issuerUrl) ?? stringField(nested?.issuerUrl)
   const scopes = stringField(normalized.scopes) ?? stringField(normalized.scope) ?? stringField(nested?.scopes) ?? stringField(nested?.scope)
   const profileArn = stringField(normalized.profileArn) ?? stringField(nested?.profileArn)
-  const region = stringField(normalized.region) ?? stringField(nested?.region) ?? parsedKiroApiKey?.region
+  const region = stringField(normalized.region) ?? stringField(nested?.region) ?? parsedApiKey?.region
   const authRegion =
     stringField(normalized.authRegion) ??
     stringField(nested?.authRegion) ??
@@ -152,15 +152,15 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   const apiRegion =
     stringField(normalized.apiRegion) ??
     stringField(nested?.apiRegion) ??
-    parsedKiroApiKey?.region ??
+    parsedApiKey?.region ??
     profileArnRegion(profileArn)
   const rawAuthMethod = authMethodField(normalized.authMethod) ?? authMethodField(nested?.authMethod)
-  const authMethod: AddCredentialRequest['authMethod'] = kiroApiKey
+  const authMethod: AddCredentialRequest['authMethod'] = apiKey
     ? 'api_key'
     : rawAuthMethod ?? (clientId && clientSecret ? 'idc' : 'social')
 
   if (authMethod === 'api_key') {
-    if (!kiroApiKey) return null
+    if (!apiKey) return null
   } else if (!refreshToken) {
     return null
   }
@@ -170,7 +170,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     accessToken: authMethod === 'api_key' ? undefined : accessToken,
     expiresAt: authMethod === 'api_key' ? undefined : expiresAt,
     refreshToken: authMethod === 'api_key' ? undefined : refreshToken,
-    kiroApiKey: authMethod === 'api_key' ? kiroApiKey : undefined,
+    apiKey: authMethod === 'api_key' ? apiKey : undefined,
     clientId: authMethod === 'api_key' ? undefined : clientId,
     clientSecret: authMethod === 'idc' ? clientSecret : undefined,
     tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint : undefined,
@@ -196,7 +196,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
 }
 
 export function parseCredentialImportText(text: string): AddCredentialRequest[] {
-  const plainApiKeys = parsePlainKiroApiKeys(text)
+  const plainApiKeys = parsePlainApiKeys(text)
   if (plainApiKeys) return plainApiKeys
 
   return parseJsonOrJsonl(text)

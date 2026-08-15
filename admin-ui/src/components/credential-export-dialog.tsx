@@ -84,7 +84,7 @@ export function CredentialExportDialog({ open, onOpenChange, selectedIds = [] }:
         <DialogHeader>
           <DialogTitle>导出凭据</DialogTitle>
           <DialogDescription>
-            导出内容包含完整 refreshToken、kiroApiKey、代理等敏感字段。
+            导出内容包含完整 refreshToken、API Key、代理等敏感字段。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">

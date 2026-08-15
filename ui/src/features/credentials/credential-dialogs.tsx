@@ -180,10 +180,11 @@ function initialCredentialForm() {
 }
 
 function formFromCredential(c: AddCredentialRequest) {
+  const apiKey = c.apiKey || c.kiroApiKey || ''
   return {
     ...initialCredentialForm(),
-    authMethod: (c.authMethod || (c.kiroApiKey ? 'api_key' : c.clientId && c.clientSecret ? 'idc' : 'social')) as AuthMethod,
-    refreshToken: c.refreshToken || '', kiroApiKey: c.kiroApiKey || '', profileArn: c.profileArn || '',
+    authMethod: (c.authMethod || (apiKey ? 'api_key' : c.clientId && c.clientSecret ? 'idc' : 'social')) as AuthMethod,
+    refreshToken: c.refreshToken || '', kiroApiKey: apiKey, profileArn: c.profileArn || '',
     region: c.region || '', authRegion: c.authRegion || '', apiRegion: c.apiRegion || '',
     clientId: c.clientId || '', clientSecret: c.clientSecret || '', tokenEndpoint: c.tokenEndpoint || '',
     issuerUrl: c.issuerUrl || '', scopes: c.scopes || '', email: c.email || '',
@@ -207,7 +208,7 @@ function optionalTrimmed(v: unknown): string | undefined {
   return t || undefined
 }
 
-function splitKiroApiKeyDraft(value: string): { key: string; region?: string } {
+function splitApiKeyDraft(value: string): { key: string; region?: string } {
   const trimmed = value.trim()
   const [rawKey, rawRegion] = trimmed.split('|', 2)
   return {
@@ -405,7 +406,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
         }
       }
       if (key === 'kiroApiKey') {
-        const parsed = splitKiroApiKeyDraft(value)
+        const parsed = splitApiKeyDraft(value)
         if (parsed.region) {
           return {
             ...prev,
@@ -656,8 +657,9 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
       const hash = await sha256Hex(cred.refreshToken)
       return existingHashes.has(hash)
     }
-    if (cred.kiroApiKey) {
-      const hash = await sha256Hex(cred.kiroApiKey)
+    const apiKey = cred.apiKey || cred.kiroApiKey
+    if (apiKey) {
+      const hash = await sha256Hex(apiKey)
       return existingHashes.has(hash)
     }
     return false
@@ -792,7 +794,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
             {running && <Progress value={Math.round((results.filter((r) => r.status !== 'pending').length / parsed.length) * 100)} className="h-1.5" />}
             <ImportProgressList
               results={results}
-              getLabel={(i) => parsed[i]?.email || parsed[i]?.kiroApiKey?.slice(0, 20) || `账号 ${i + 1}`}
+              getLabel={(i) => parsed[i]?.email || (parsed[i]?.apiKey ?? parsed[i]?.kiroApiKey)?.slice(0, 20) || `账号 ${i + 1}`}
             />
             <ImportResultFooter
               running={running}
