@@ -174,9 +174,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-upstream agent-mode runtime config now uses `local_upstream_agent_mode_strategy` / `localUpstreamAgentModeStrategy` as primary Rust/Admin/UI names. Existing `kiroAgentModeStrategy` remains a read-only compatibility alias in backend and UI normalization, and runtime UI labels no longer use Kiro wording.
 - Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field. Existing `kiroVersion` remains a read-only compatibility alias, and the current legacy local executor reads the new field.
 - Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Kiro wording while preserving the already migrated compatibility field aliases.
+- Maintained UI/Admin UI usage API types now model local auxiliary credential traces as `LocalUpstreamCredentialAttempt`; the `credentialAttempts` wire field remains unchanged.
 
 Last verified on 2026-08-16:
 
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `rg -n "KiroCredentialAttempt" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `git diff --check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-runtime-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-runtime-text-check1 -- cargo check`
 - `pnpm --dir ui check`

@@ -735,7 +735,7 @@ export interface UsageLatencyTrace {
   filteredTrivialTextChars?: number
 }
 
-export interface KiroCredentialAttempt {
+export interface LocalUpstreamCredentialAttempt {
   attempt: number
   credentialId: number
   credentialLabel?: string
@@ -796,7 +796,7 @@ export interface UsageRecord {
   simulated: boolean
   stickyBound: boolean
   fallbackFromSticky: boolean
-  credentialAttempts?: KiroCredentialAttempt[]
+  credentialAttempts?: LocalUpstreamCredentialAttempt[]
   routeKind?: 'local_credential' | 'account' | 'external_pool'
   routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_account' | 'local_rescue_after_external' | 'account_fallback_preflight' | 'account_fallback_after_local_attempts' | 'account_direct_policy' | 'account_error' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
   fallbackReason?: string
