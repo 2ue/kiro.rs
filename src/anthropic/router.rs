@@ -11,7 +11,7 @@ use axum::{
 
 use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::common::auth::RequestApiKeyStore;
-use crate::kiro::provider::KiroProvider;
+use crate::local_upstream::provider::LocalUpstreamProvider;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ImageProcessingConfig,
     MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
@@ -45,7 +45,7 @@ use super::{
 pub struct AnthropicRouterDependencies {
     pub request_api_keys: Arc<RequestApiKeyStore>,
     pub request_admission: Arc<RequestAdmissionController>,
-    pub local_upstream_provider: Option<Arc<KiroProvider>>,
+    pub local_upstream_provider: Option<Arc<LocalUpstreamProvider>>,
     pub usage_recorder: Arc<UsageRecorder>,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,

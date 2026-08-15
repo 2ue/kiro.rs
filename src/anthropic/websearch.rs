@@ -16,10 +16,10 @@ use super::inference_attempt_budget::InferenceAttemptBudget;
 use super::stream::SseEvent;
 use super::types::MessagesRequest;
 use crate::http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout};
-use crate::kiro::call_trace::McpCallAttributionSink;
-use crate::kiro::provider::{McpCallAttribution, McpCallFailureKind};
-
-type LocalAuxiliaryMcpProvider = crate::kiro::provider::KiroProvider;
+use crate::local_upstream::{
+    call_trace::LocalAuxiliaryMcpAttributionSink,
+    provider::{LocalAuxiliaryMcpAttribution, LocalAuxiliaryMcpFailureKind, LocalUpstreamProvider},
+};
 
 const MAX_MCP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const WEB_SEARCH_QUERY_PREFIX: &str = "Perform a web search for the query:";
@@ -110,13 +110,13 @@ pub enum WebSearchOutcome {
     Success {
         response: Response,
         output_tokens: i32,
-        attribution: McpCallAttribution,
+        attribution: LocalAuxiliaryMcpAttribution,
     },
     Failure {
         response: Response,
         error_type: &'static str,
         internal_reason: &'static str,
-        attribution: McpCallAttribution,
+        attribution: LocalAuxiliaryMcpAttribution,
     },
 }
 
@@ -135,7 +135,7 @@ enum WebSearchFailureKind {
 struct WebSearchFailure {
     kind: WebSearchFailureKind,
     internal_reason: &'static str,
-    attribution: Box<McpCallAttribution>,
+    attribution: Box<LocalAuxiliaryMcpAttribution>,
 }
 
 impl WebSearchFailure {
@@ -147,51 +147,51 @@ impl WebSearchFailure {
         }
     }
 
-    fn with_attribution(mut self, attribution: McpCallAttribution) -> Self {
+    fn with_attribution(mut self, attribution: LocalAuxiliaryMcpAttribution) -> Self {
         self.attribution = Box::new(attribution);
         self
     }
 
     fn from_provider_error(error: &anyhow::Error) -> Self {
         let failure = match local_auxiliary_mcp_failure_kind_from_error(error) {
-            Some(McpCallFailureKind::Scheduler) => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::Scheduler) => Self::new(
                 WebSearchFailureKind::Scheduler,
                 "websearch_mcp_scheduler_unavailable",
             ),
-            Some(McpCallFailureKind::InvalidRequest) => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::InvalidRequest) => Self::new(
                 WebSearchFailureKind::InvalidRequest,
                 "websearch_mcp_invalid_request",
             ),
-            Some(McpCallFailureKind::RateLimit) => {
+            Some(LocalAuxiliaryMcpFailureKind::RateLimit) => {
                 Self::new(WebSearchFailureKind::RateLimit, "websearch_mcp_rate_limit")
             }
-            Some(McpCallFailureKind::Timeout) => {
+            Some(LocalAuxiliaryMcpFailureKind::Timeout) => {
                 Self::new(WebSearchFailureKind::Timeout, "websearch_mcp_timeout")
             }
-            Some(McpCallFailureKind::ResponseTooLarge) => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::ResponseTooLarge) => Self::new(
                 WebSearchFailureKind::Protocol,
                 "websearch_mcp_response_too_large",
             ),
-            Some(McpCallFailureKind::BodyRead) => {
+            Some(LocalAuxiliaryMcpFailureKind::BodyRead) => {
                 Self::new(WebSearchFailureKind::Upstream, "websearch_mcp_body_read")
             }
-            Some(McpCallFailureKind::Protocol) => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::Protocol) => Self::new(
                 WebSearchFailureKind::Protocol,
                 "websearch_mcp_protocol_error",
             ),
-            Some(McpCallFailureKind::AttemptLimit) => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::AttemptLimit) => Self::new(
                 WebSearchFailureKind::AttemptLimit,
                 "websearch_mcp_attempt_limit",
             ),
-            Some(McpCallFailureKind::AuxiliaryAttemptLimit) => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::AuxiliaryAttemptLimit) => Self::new(
                 WebSearchFailureKind::AttemptLimit,
                 "websearch_auxiliary_attempt_limit",
             ),
-            Some(McpCallFailureKind::AuxiliaryConcurrency) => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::AuxiliaryConcurrency) => Self::new(
                 WebSearchFailureKind::AttemptLimit,
                 "websearch_auxiliary_concurrency",
             ),
-            Some(McpCallFailureKind::Upstream) | None => Self::new(
+            Some(LocalAuxiliaryMcpFailureKind::Upstream) | None => Self::new(
                 WebSearchFailureKind::Upstream,
                 "websearch_mcp_upstream_error",
             ),
@@ -260,17 +260,22 @@ impl WebSearchFailure {
 
 fn local_auxiliary_mcp_failure_kind_from_error(
     error: &anyhow::Error,
-) -> Option<McpCallFailureKind> {
-    LocalAuxiliaryMcpProvider::mcp_failure_kind_from_error(error)
+) -> Option<LocalAuxiliaryMcpFailureKind> {
+    LocalUpstreamProvider::mcp_failure_kind_from_error(error)
 }
 
-fn local_auxiliary_mcp_attribution_from_error(error: &anyhow::Error) -> McpCallAttribution {
-    LocalAuxiliaryMcpProvider::mcp_attribution_from_error(error)
+fn local_auxiliary_mcp_attribution_from_error(
+    error: &anyhow::Error,
+) -> LocalAuxiliaryMcpAttribution {
+    LocalUpstreamProvider::mcp_attribution_from_error(error)
 }
 
 #[cfg(test)]
-fn local_auxiliary_mcp_failure_error(kind: McpCallFailureKind, message: &str) -> anyhow::Error {
-    LocalAuxiliaryMcpProvider::mcp_failure_error(kind, message)
+fn local_auxiliary_mcp_failure_error(
+    kind: LocalAuxiliaryMcpFailureKind,
+    message: &str,
+) -> anyhow::Error {
+    LocalUpstreamProvider::mcp_failure_error(kind, message)
 }
 
 fn is_known_native_web_search_tool_type(tool_type: &str) -> bool {
@@ -815,11 +820,11 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 
 /// 处理 WebSearch 请求
 pub async fn handle_websearch_request(
-    provider: std::sync::Arc<LocalAuxiliaryMcpProvider>,
+    provider: std::sync::Arc<LocalUpstreamProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
-    attribution_sink: Arc<McpCallAttributionSink>,
+    attribution_sink: Arc<LocalAuxiliaryMcpAttributionSink>,
     request_id: &str,
     error_id: &str,
 ) -> WebSearchOutcome {
@@ -906,12 +911,12 @@ pub async fn handle_websearch_request(
 
 /// 调用本地辅助上游 MCP API
 async fn call_local_auxiliary_mcp_api(
-    provider: &LocalAuxiliaryMcpProvider,
+    provider: &LocalUpstreamProvider,
     request: &McpRequest,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
-    attribution_sink: Arc<McpCallAttributionSink>,
+    attribution_sink: Arc<LocalAuxiliaryMcpAttributionSink>,
     request_id: &str,
-) -> Result<(WebSearchResults, McpCallAttribution), WebSearchFailure> {
+) -> Result<(WebSearchResults, LocalAuxiliaryMcpAttribution), WebSearchFailure> {
     let request_body = serde_json::to_string(request).map_err(|_| {
         WebSearchFailure::new(
             WebSearchFailureKind::InvalidRequest,
@@ -943,21 +948,21 @@ async fn call_local_auxiliary_mcp_api(
             let (completion_kind, failure) = match error {
                 HttpSendError::ResponseBodyTimeout { .. }
                 | HttpSendError::ResponseHeaderTimeout { .. } => (
-                    McpCallFailureKind::Timeout,
+                    LocalAuxiliaryMcpFailureKind::Timeout,
                     WebSearchFailure::new(
                         WebSearchFailureKind::Timeout,
                         "websearch_mcp_body_timeout",
                     ),
                 ),
                 HttpSendError::ResponseBodyTooLarge { .. } => (
-                    McpCallFailureKind::ResponseTooLarge,
+                    LocalAuxiliaryMcpFailureKind::ResponseTooLarge,
                     WebSearchFailure::new(
                         WebSearchFailureKind::Protocol,
                         "websearch_mcp_response_too_large",
                     ),
                 ),
                 HttpSendError::Request(_) => (
-                    McpCallFailureKind::BodyRead,
+                    LocalAuxiliaryMcpFailureKind::BodyRead,
                     WebSearchFailure::new(
                         WebSearchFailureKind::Upstream,
                         "websearch_mcp_body_read",
@@ -971,7 +976,7 @@ async fn call_local_auxiliary_mcp_api(
     let body = match std::str::from_utf8(&body) {
         Ok(body) => body,
         Err(_) => {
-            completion.report_failure(McpCallFailureKind::Protocol);
+            completion.report_failure(LocalAuxiliaryMcpFailureKind::Protocol);
             return Err(WebSearchFailure::new(
                 WebSearchFailureKind::Protocol,
                 "websearch_mcp_non_utf8_response",
@@ -986,13 +991,15 @@ async fn call_local_auxiliary_mcp_api(
         }
         Err(failure) => {
             let completion_kind = match failure.kind {
-                WebSearchFailureKind::Scheduler => McpCallFailureKind::Scheduler,
-                WebSearchFailureKind::InvalidRequest => McpCallFailureKind::InvalidRequest,
-                WebSearchFailureKind::RateLimit => McpCallFailureKind::RateLimit,
-                WebSearchFailureKind::Timeout => McpCallFailureKind::Timeout,
-                WebSearchFailureKind::AttemptLimit => McpCallFailureKind::AttemptLimit,
-                WebSearchFailureKind::Upstream => McpCallFailureKind::Upstream,
-                WebSearchFailureKind::Protocol => McpCallFailureKind::Protocol,
+                WebSearchFailureKind::Scheduler => LocalAuxiliaryMcpFailureKind::Scheduler,
+                WebSearchFailureKind::InvalidRequest => {
+                    LocalAuxiliaryMcpFailureKind::InvalidRequest
+                }
+                WebSearchFailureKind::RateLimit => LocalAuxiliaryMcpFailureKind::RateLimit,
+                WebSearchFailureKind::Timeout => LocalAuxiliaryMcpFailureKind::Timeout,
+                WebSearchFailureKind::AttemptLimit => LocalAuxiliaryMcpFailureKind::AttemptLimit,
+                WebSearchFailureKind::Upstream => LocalAuxiliaryMcpFailureKind::Upstream,
+                WebSearchFailureKind::Protocol => LocalAuxiliaryMcpFailureKind::Protocol,
             };
             completion.report_failure(completion_kind);
             Err(failure.with_attribution(completion.attribution()))
@@ -1424,57 +1431,57 @@ mod tests {
     fn auxiliary_focus_provider_typed_failures_ignore_misleading_error_text_for_five_rounds() {
         let cases = [
             (
-                McpCallFailureKind::Scheduler,
+                LocalAuxiliaryMcpFailureKind::Scheduler,
                 "private-response contains scheduler internals",
                 WebSearchFailureKind::Scheduler,
             ),
             (
-                McpCallFailureKind::InvalidRequest,
+                LocalAuxiliaryMcpFailureKind::InvalidRequest,
                 "private-response falsely says 429 timeout",
                 WebSearchFailureKind::InvalidRequest,
             ),
             (
-                McpCallFailureKind::RateLimit,
+                LocalAuxiliaryMcpFailureKind::RateLimit,
                 "private-response falsely says 400 timeout",
                 WebSearchFailureKind::RateLimit,
             ),
             (
-                McpCallFailureKind::Upstream,
+                LocalAuxiliaryMcpFailureKind::Upstream,
                 "private-response falsely says 429 timeout 400",
                 WebSearchFailureKind::Upstream,
             ),
             (
-                McpCallFailureKind::Timeout,
+                LocalAuxiliaryMcpFailureKind::Timeout,
                 "private-response falsely says 400 and 429",
                 WebSearchFailureKind::Timeout,
             ),
             (
-                McpCallFailureKind::ResponseTooLarge,
+                LocalAuxiliaryMcpFailureKind::ResponseTooLarge,
                 "private-response falsely says valid small body",
                 WebSearchFailureKind::Protocol,
             ),
             (
-                McpCallFailureKind::BodyRead,
+                LocalAuxiliaryMcpFailureKind::BodyRead,
                 "private-response falsely says invalid request",
                 WebSearchFailureKind::Upstream,
             ),
             (
-                McpCallFailureKind::Protocol,
+                LocalAuxiliaryMcpFailureKind::Protocol,
                 "private-response contains raw search result",
                 WebSearchFailureKind::Protocol,
             ),
             (
-                McpCallFailureKind::AttemptLimit,
+                LocalAuxiliaryMcpFailureKind::AttemptLimit,
                 "private-response falsely says success",
                 WebSearchFailureKind::AttemptLimit,
             ),
             (
-                McpCallFailureKind::AuxiliaryAttemptLimit,
+                LocalAuxiliaryMcpFailureKind::AuxiliaryAttemptLimit,
                 "private-response contains auxiliary budget details",
                 WebSearchFailureKind::AttemptLimit,
             ),
             (
-                McpCallFailureKind::AuxiliaryConcurrency,
+                LocalAuxiliaryMcpFailureKind::AuxiliaryConcurrency,
                 "private-response contains auxiliary concurrency details",
                 WebSearchFailureKind::AttemptLimit,
             ),

@@ -13,7 +13,7 @@ use axum::{
 use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::common::auth;
 use crate::common::auth::RequestApiKeyStore;
-use crate::kiro::provider::KiroProvider;
+use crate::local_upstream::provider::LocalUpstreamProvider;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, ImageProcessingConfig,
     MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
@@ -39,7 +39,7 @@ pub struct AppState {
     pub request_api_keys: Arc<RequestApiKeyStore>,
     /// 本地上游 provider（可选，用于 legacy local upstream API 调用）。
     /// 内部使用 MultiTokenManager，已支持线程安全的多账号管理。
-    pub local_upstream_provider: Option<Arc<KiroProvider>>,
+    pub local_upstream_provider: Option<Arc<LocalUpstreamProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
     /// thinking 触发策略
@@ -307,7 +307,7 @@ impl AppState {
     }
 
     /// 设置本地上游 provider
-    pub fn with_local_upstream_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+    pub fn with_local_upstream_provider(mut self, provider: Arc<LocalUpstreamProvider>) -> Self {
         self.local_upstream_provider = Some(provider);
         self
     }

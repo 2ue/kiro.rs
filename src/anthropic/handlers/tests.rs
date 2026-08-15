@@ -18,13 +18,13 @@ use crate::external_pool::{
     ExternalPoolManager, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
     ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
 };
-use crate::kiro::call_trace::{
-    AccountRejectReason, KiroCallError, SelectionFailureStage, SelectionFailureSummary,
-};
 use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::MetadataTokenUsage;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::local_upstream::call_trace::{
+    AccountRejectReason, LocalUpstreamCallError, SelectionFailureStage, SelectionFailureSummary,
+};
 use crate::model::config::{
     CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch, CacheSimulationPolicyPatch,
     PromptCacheCreationControlConfig, PromptSteeringRouteMode, PromptSteeringScope,
@@ -619,7 +619,7 @@ async fn multimodal_handler_upstream(
         .into_response()
 }
 
-fn multimodal_handler_test_provider(config: Config) -> Arc<KiroProvider> {
+fn multimodal_handler_test_provider(config: Config) -> Arc<LocalUpstreamProvider> {
     let credentials = vec![KiroCredentials {
         id: Some(1),
         access_token: Some("multimodal-handler-test-token".to_string()),
@@ -637,7 +637,7 @@ fn multimodal_handler_test_provider(config: Config) -> Arc<KiroProvider> {
     );
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-    Arc::new(KiroProvider::with_proxy(
+    Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
         endpoints,
@@ -877,7 +877,7 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
     );
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-    let provider = Arc::new(KiroProvider::with_proxy(
+    let provider = Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
         endpoints,
@@ -1015,7 +1015,7 @@ fn websearch_handler_test_router_with_external_options(
     );
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-    let provider = Arc::new(KiroProvider::with_proxy(
+    let provider = Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
         endpoints,
@@ -3548,7 +3548,7 @@ fn handler_eventstream_fault_router_with_limits(
     );
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-    let provider = Arc::new(KiroProvider::with_proxy(
+    let provider = Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
         endpoints,
@@ -5825,8 +5825,8 @@ fn thinking_signature_typed_failures_never_enter_account_fallback_five_rounds() 
     config.fallback_on_unsupported_model = true;
     for round in 1..=5 {
         for kind in [
-            KiroCallFailureKind::ThinkingSignatureInvalid,
-            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+            LocalUpstreamCallFailureKind::ThinkingSignatureInvalid,
+            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
         ] {
             for misleading_message in [
                 "429 rate limit capacity exhausted",
@@ -5854,13 +5854,13 @@ async fn thinking_signature_typed_failures_map_to_stable_public_errors_five_roun
     for round in 1..=5 {
         for (kind, expected_status, expected_type, expected_message) in [
             (
-                KiroCallFailureKind::ThinkingSignatureInvalid,
+                LocalUpstreamCallFailureKind::ThinkingSignatureInvalid,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 UPSTREAM_INVALID_REQUEST_MESSAGE,
             ),
             (
-                KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
@@ -5868,7 +5868,7 @@ async fn thinking_signature_typed_failures_map_to_stable_public_errors_five_roun
         ] {
             let private_marker = format!("PRIVATE_SIGNATURE_HANDLER_ERROR_{round}_{kind:?}");
             let error: anyhow::Error =
-                crate::kiro::call_trace::KiroCallError::new(private_marker.clone(), Vec::new())
+                LocalUpstreamCallError::new(private_marker.clone(), Vec::new())
                     .with_failure_kind(kind)
                     .into();
             let response = map_provider_error(
@@ -5913,35 +5913,36 @@ fn signature_error_token_cannot_trigger_cache_point_retry_five_rounds() {
 async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_internal_terms() {
     for _ in 0..5 {
         for failure_kind in [
-            KiroCallFailureKind::InferenceAttemptsExhausted,
-            KiroCallFailureKind::InferenceAttemptReservedForFallback,
-            KiroCallFailureKind::DownstreamCommitted,
-            KiroCallFailureKind::AuxiliaryAttemptsExhausted,
-            KiroCallFailureKind::AuxiliaryConcurrencySaturated,
-            KiroCallFailureKind::LocalPoolRiskCircuitOpen,
+            LocalUpstreamCallFailureKind::InferenceAttemptsExhausted,
+            LocalUpstreamCallFailureKind::InferenceAttemptReservedForFallback,
+            LocalUpstreamCallFailureKind::DownstreamCommitted,
+            LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted,
+            LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated,
+            LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen,
         ] {
-            let error_message = if failure_kind == KiroCallFailureKind::LocalPoolRiskCircuitOpen {
-                "本地账号池风险保护已打开（retry_after_secs=7）"
-            } else {
-                "local inference attempt reserved for fallback"
-            };
-            let err: anyhow::Error =
-                crate::kiro::call_trace::KiroCallError::new(error_message, Vec::new())
-                    .with_failure_kind(failure_kind)
-                    .into();
+            let error_message =
+                if failure_kind == LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen {
+                    "本地账号池风险保护已打开（retry_after_secs=7）"
+                } else {
+                    "local inference attempt reserved for fallback"
+                };
+            let err: anyhow::Error = LocalUpstreamCallError::new(error_message, Vec::new())
+                .with_failure_kind(failure_kind)
+                .into();
             let response = map_provider_error(
                 err,
                 Some("req_attempt_limit_test"),
                 Some("req_attempt_limit_error"),
                 None,
             );
-            let expected_status = if failure_kind == KiroCallFailureKind::DownstreamCommitted {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
+            let expected_status =
+                if failure_kind == LocalUpstreamCallFailureKind::DownstreamCommitted {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
             assert_eq!(response.status(), expected_status);
-            if failure_kind == KiroCallFailureKind::LocalPoolRiskCircuitOpen {
+            if failure_kind == LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen {
                 assert_eq!(
                     response
                         .headers()
@@ -5983,11 +5984,11 @@ fn auxiliary_focus_typed_failures_use_local_transient_fallback_policy_for_five_r
         config.fallback_on_local_transient_exhausted = true;
         for (kind, expected) in [
             (
-                KiroCallFailureKind::AuxiliaryAttemptsExhausted,
+                LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted,
                 "local_auxiliary_attempts_exhausted",
             ),
             (
-                KiroCallFailureKind::AuxiliaryConcurrencySaturated,
+                LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated,
                 "local_auxiliary_concurrency_saturated",
             ),
         ] {
@@ -8230,7 +8231,7 @@ fn provider_error_metadata_wraps_selection_failure_without_error_id_duplication(
         queue_depth: 0,
         global_in_flight: 0,
     };
-    let err: Error = KiroCallError::new("local selection failed", Vec::new())
+    let err: Error = LocalUpstreamCallError::new("local selection failed", Vec::new())
         .with_selection_failure(Some(summary))
         .into();
 
@@ -9763,7 +9764,7 @@ fn account_fallback_classifier_rejects_request_errors() {
         None
     );
 
-    let attempts = vec![KiroCredentialAttempt::new(
+    let attempts = vec![LocalUpstreamCredentialAttempt::new(
         0,
         1,
         None,
@@ -9801,7 +9802,7 @@ fn account_fallback_classifier_allows_capacity_and_transient_errors() {
 #[test]
 fn account_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard_retry() {
     let config = AccountRuntimeConfig::default();
-    let prior_too_long_attempt = KiroCredentialAttempt::new(
+    let prior_too_long_attempt = LocalUpstreamCredentialAttempt::new(
         0,
         63,
         Some("account@example.com".to_string()),
@@ -9833,7 +9834,7 @@ fn account_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard_
         Some("local_capacity_exhausted")
     );
 
-    let retry_bad_request_attempt = vec![KiroCredentialAttempt::new(
+    let retry_bad_request_attempt = vec![LocalUpstreamCredentialAttempt::new(
         0,
         64,
         Some("retry@example.com".to_string()),
@@ -9907,7 +9908,7 @@ fn account_fallback_classifier_respects_scheduler_fallback_toggles() {
     assert_eq!(
         classify_local_error_for_account_fallback(
             "upstream server_error",
-            &[KiroCredentialAttempt::new(
+            &[LocalUpstreamCredentialAttempt::new(
                 0,
                 1,
                 None,
@@ -10181,7 +10182,7 @@ fn account_fallback_classifier_gates_unsupported_model() {
     assert_eq!(
             classify_local_error_for_account_fallback(
                 r#"非流式 API 请求失败: 400 Bad Request {"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#,
-                &[KiroCredentialAttempt::new(
+                &[LocalUpstreamCredentialAttempt::new(
                     0,
                     1,
                     None,

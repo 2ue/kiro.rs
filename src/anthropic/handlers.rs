@@ -107,12 +107,15 @@ use crate::account_runtime::{
     immediately_available_account_for_route_body_mode_and_model,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
-use crate::kiro::call_trace::{
-    AccountRejectReason, KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink,
-    SelectionFailureStage,
-};
-use crate::kiro::provider::{KiroProvider, KiroStreamCompletion, McpCallAttribution};
 use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteState, LocalPoolRouteStateKind};
+use crate::local_upstream::call_trace::{
+    AccountRejectReason, LocalAuxiliaryMcpAttributionSink, LocalUpstreamCallFailureKind,
+    LocalUpstreamCredentialAttempt, SelectionFailureStage,
+};
+use crate::local_upstream::provider::{
+    LocalAuxiliaryMcpAttribution, LocalUpstreamApiResponse, LocalUpstreamProvider,
+    LocalUpstreamStreamCompletion, LocalUpstreamStreamResponse,
+};
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
@@ -754,7 +757,7 @@ fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
 
 #[derive(Clone)]
 struct AccountFallbackContext {
-    provider: Option<Arc<KiroProvider>>,
+    provider: Option<Arc<LocalUpstreamProvider>>,
     manager: Arc<AccountRuntimeManager>,
     config: AccountRuntimeConfig,
     effective_raw_body: Bytes,
@@ -818,7 +821,7 @@ struct CredentialUsageContext {
     credential_label: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
-    credential_attempts: Vec<KiroCredentialAttempt>,
+    credential_attempts: Vec<LocalUpstreamCredentialAttempt>,
     error_metadata: Option<serde_json::Value>,
 }
 
@@ -1246,7 +1249,10 @@ impl CachePointRetryRequest {
     }
 }
 
-fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestRuntimeConfig {
+fn request_runtime_config(
+    state: &AppState,
+    provider: &LocalUpstreamProvider,
+) -> RequestRuntimeConfig {
     RequestRuntimeConfig::from_config_with_fallback(
         &provider.runtime_config(),
         RequestRuntimeConfig::from_app_state(state),
@@ -1929,7 +1935,7 @@ impl AccountFallbackContext {
         &self,
         request_id: &str,
         error_message: &str,
-        local_attempts: Vec<KiroCredentialAttempt>,
+        local_attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> Option<Response> {
         match self
             .fallback_after_local_error_outcome(request_id, error_message, None, local_attempts)
@@ -1944,8 +1950,8 @@ impl AccountFallbackContext {
         &self,
         request_id: &str,
         error_message: &str,
-        call_failure_kind: Option<KiroCallFailureKind>,
-        local_attempts: Vec<KiroCredentialAttempt>,
+        call_failure_kind: Option<LocalUpstreamCallFailureKind>,
+        local_attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> Option<AccountForwardOutcome> {
         let classification_attempts = local_attempts.clone();
         self.fallback_after_local_error_outcome_with_diagnostics(
@@ -1962,9 +1968,9 @@ impl AccountFallbackContext {
         &self,
         request_id: &str,
         error_message: &str,
-        call_failure_kind: Option<KiroCallFailureKind>,
-        classification_attempts: Vec<KiroCredentialAttempt>,
-        diagnostic_attempts: Vec<KiroCredentialAttempt>,
+        call_failure_kind: Option<LocalUpstreamCallFailureKind>,
+        classification_attempts: Vec<LocalUpstreamCredentialAttempt>,
+        diagnostic_attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> Option<AccountForwardOutcome> {
         let Some(classified_reason) = classify_local_error_for_account_fallback_with_kind(
             error_message,
@@ -1984,10 +1990,10 @@ impl AccountFallbackContext {
             .as_ref()?
             .local_pool_route_state_fresh(Some(&self.payload.model));
         let typed_auxiliary_route_reason = match call_failure_kind {
-            Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted) => {
+            Some(LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted) => {
                 Some("local_auxiliary_attempts_exhausted")
             }
-            Some(KiroCallFailureKind::AuxiliaryConcurrencySaturated) => {
+            Some(LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated) => {
                 Some("local_auxiliary_concurrency_saturated")
             }
             _ => None,
@@ -2104,7 +2110,7 @@ impl AccountFallbackContext {
         direct_policy_reason: Option<String>,
         local_attempted: bool,
         local_preflight: Option<serde_json::Value>,
-        local_attempts: Vec<KiroCredentialAttempt>,
+        local_attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> Result<AccountRouteRequest, PayloadGuardError> {
         Ok(AccountRouteRequest {
             effective_raw_body: self.effective_raw_body.clone(),
@@ -2223,7 +2229,10 @@ fn clamp_acquire_mode_to_dispatch_deadline(
     }
 }
 
-fn capacity_weight_units_for_local_request(provider: &KiroProvider, input_tokens: i32) -> u32 {
+fn capacity_weight_units_for_local_request(
+    provider: &LocalUpstreamProvider,
+    input_tokens: i32,
+) -> u32 {
     let config = provider.runtime_config();
     if !config.weighted_capacity.enabled {
         return 1;
@@ -2305,7 +2314,7 @@ fn bounded_preflight_capacity_wait(
 }
 
 async fn local_pool_preflight_reason_after_capacity_grace(
-    provider: &KiroProvider,
+    provider: &LocalUpstreamProvider,
     config: &AccountRuntimeConfig,
     model: Option<&str>,
     max_wait: Duration,
@@ -2402,7 +2411,7 @@ fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
 #[cfg(test)]
 fn classify_local_error_for_account_fallback(
     message: &str,
-    attempts: &[KiroCredentialAttempt],
+    attempts: &[LocalUpstreamCredentialAttempt],
     config: &AccountRuntimeConfig,
 ) -> Option<String> {
     classify_local_error_for_account_fallback_with_kind(message, attempts, config, None)
@@ -2410,39 +2419,39 @@ fn classify_local_error_for_account_fallback(
 
 fn classify_local_error_for_account_fallback_with_kind(
     message: &str,
-    attempts: &[KiroCredentialAttempt],
+    attempts: &[LocalUpstreamCredentialAttempt],
     config: &AccountRuntimeConfig,
-    call_failure_kind: Option<KiroCallFailureKind>,
+    call_failure_kind: Option<LocalUpstreamCallFailureKind>,
 ) -> Option<String> {
     match call_failure_kind {
         Some(
-            KiroCallFailureKind::ThinkingSignatureInvalid
-            | KiroCallFailureKind::ThinkingSignatureRetryFailed,
+            LocalUpstreamCallFailureKind::ThinkingSignatureInvalid
+            | LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
         ) => return None,
-        Some(KiroCallFailureKind::InferenceAttemptReservedForFallback) => {
+        Some(LocalUpstreamCallFailureKind::InferenceAttemptReservedForFallback) => {
             return Some("local_attempt_reserved_for_fallback".to_string());
         }
-        Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted)
+        Some(LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted)
             if config.fallback_on_local_transient_exhausted =>
         {
             return Some("local_auxiliary_attempts_exhausted".to_string());
         }
-        Some(KiroCallFailureKind::AuxiliaryConcurrencySaturated)
+        Some(LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated)
             if config.fallback_on_local_transient_exhausted =>
         {
             return Some("local_auxiliary_concurrency_saturated".to_string());
         }
-        Some(KiroCallFailureKind::LocalPoolRiskCircuitOpen)
+        Some(LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen)
             if config.local_pool_circuit_enabled =>
         {
             return Some("local_pool_risk_circuit_open".to_string());
         }
         Some(
-            KiroCallFailureKind::InferenceAttemptsExhausted
-            | KiroCallFailureKind::DownstreamCommitted
-            | KiroCallFailureKind::AuxiliaryAttemptsExhausted
-            | KiroCallFailureKind::AuxiliaryConcurrencySaturated
-            | KiroCallFailureKind::LocalPoolRiskCircuitOpen,
+            LocalUpstreamCallFailureKind::InferenceAttemptsExhausted
+            | LocalUpstreamCallFailureKind::DownstreamCommitted
+            | LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted
+            | LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated
+            | LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen,
         )
         | None => {}
     }
@@ -2523,7 +2532,10 @@ fn classify_local_error_for_account_fallback_with_kind(
     }
 }
 
-fn is_unsupported_model_error(lower_message: &str, attempts: &[KiroCredentialAttempt]) -> bool {
+fn is_unsupported_model_error(
+    lower_message: &str,
+    attempts: &[LocalUpstreamCredentialAttempt],
+) -> bool {
     if lower_message.contains("invalid_model_id")
         || lower_message.contains("invalid model")
         || lower_message.contains("model_not_found")
@@ -2545,7 +2557,7 @@ fn is_unsupported_model_error(lower_message: &str, attempts: &[KiroCredentialAtt
 
 fn is_request_error_that_must_not_fallback(
     lower_message: &str,
-    attempts: &[KiroCredentialAttempt],
+    attempts: &[LocalUpstreamCredentialAttempt],
 ) -> bool {
     if lower_message.contains("bad request")
         || lower_message.contains("invalid_request")
@@ -3107,7 +3119,7 @@ impl RequestUsageContext {
         credential_label: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
-        credential_attempts: Vec<KiroCredentialAttempt>,
+        credential_attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> CredentialUsageContext {
         CredentialUsageContext {
             request: self,
@@ -3175,9 +3187,9 @@ impl RequestUsageContext {
 
     fn attach_provider_error_credential(
         self,
-        provider: &crate::kiro::provider::KiroProvider,
+        provider: &LocalUpstreamProvider,
         error_message: &str,
-        credential_attempts: Vec<KiroCredentialAttempt>,
+        credential_attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> CredentialUsageContext {
         let hint = extract_credential_error_hint(error_message);
         let attempt_hint = credential_attempts.last();
@@ -4382,9 +4394,9 @@ fn standard_usage_for_status(
 }
 
 fn provider_error_metadata(err: &Error) -> Option<serde_json::Value> {
-    let selection_failure = KiroProvider::selection_failure_from_error(err);
-    let call_failure_kind = KiroProvider::call_failure_kind_from_error(err);
-    let upstream_body_metadata = KiroProvider::error_metadata_from_error(err);
+    let selection_failure = LocalUpstreamProvider::selection_failure_from_error(err);
+    let call_failure_kind = LocalUpstreamProvider::call_failure_kind_from_error(err);
+    let upstream_body_metadata = LocalUpstreamProvider::error_metadata_from_error(err);
     if selection_failure.is_none()
         && call_failure_kind.is_none()
         && upstream_body_metadata.is_none()
@@ -4417,7 +4429,7 @@ fn merge_error_metadata_values(
 }
 
 fn websearch_error_metadata(
-    attribution: &McpCallAttribution,
+    attribution: &LocalAuxiliaryMcpAttribution,
     internal_reason: &'static str,
 ) -> Option<serde_json::Value> {
     let selection_failure = attribution.selection_failure.as_ref()?;
@@ -4454,13 +4466,13 @@ struct StreamUsageGuard {
 
 struct WebSearchPreResponseUsageGuard {
     usage_context: Option<RequestUsageContext>,
-    attribution_sink: Arc<McpCallAttributionSink>,
+    attribution_sink: Arc<LocalAuxiliaryMcpAttributionSink>,
 }
 
 impl WebSearchPreResponseUsageGuard {
     fn new(
         usage_context: RequestUsageContext,
-        attribution_sink: Arc<McpCallAttributionSink>,
+        attribution_sink: Arc<LocalAuxiliaryMcpAttributionSink>,
     ) -> Self {
         Self {
             usage_context: Some(usage_context),
@@ -4598,7 +4610,7 @@ fn wrap_websearch_stream_usage_record(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> Option<String> {
+fn credential_label(provider: &LocalUpstreamProvider, id: u64) -> Option<String> {
     provider.credential_label(id)
 }
 
@@ -4831,11 +4843,11 @@ fn build_simulated_usage(
 
 fn prepare_credential_usage_context(
     usage_context: RequestUsageContext,
-    provider: &crate::kiro::provider::KiroProvider,
+    provider: &LocalUpstreamProvider,
     credential_id: u64,
     sticky_bound: bool,
     fallback_from_sticky: bool,
-    credential_attempts: Vec<KiroCredentialAttempt>,
+    credential_attempts: Vec<LocalUpstreamCredentialAttempt>,
 ) -> CredentialUsageContext {
     let mut usage_context = usage_context;
     if matches!(
@@ -4881,10 +4893,7 @@ fn prepare_credential_usage_context(
 }
 
 /// 将 legacy local provider 错误映射为 HTTP 响应
-fn cooldown_retry_after_secs(
-    provider: Option<&crate::kiro::provider::KiroProvider>,
-    fallback_secs: u64,
-) -> u64 {
+fn cooldown_retry_after_secs(provider: Option<&LocalUpstreamProvider>, fallback_secs: u64) -> u64 {
     let fallback_secs = fallback_secs.max(1);
     let Some(provider) = provider else {
         return fallback_secs;
@@ -4919,7 +4928,7 @@ fn usage_public_error(
 fn provider_public_error_for_message(
     err_str: &str,
     error_id: Option<&str>,
-    provider: Option<&crate::kiro::provider::KiroProvider>,
+    provider: Option<&LocalUpstreamProvider>,
 ) -> UsagePublicError {
     if err_str.contains("reason=THINKING_SIGNATURE_INVALID") {
         return usage_public_error(
@@ -5073,11 +5082,11 @@ fn is_local_temporary_scheduler_error(value: &str) -> bool {
 
 fn local_temporary_admission_backoff_secs(
     err: &Error,
-    provider: Option<&crate::kiro::provider::KiroProvider>,
+    provider: Option<&LocalUpstreamProvider>,
 ) -> Option<u64> {
     if matches!(
-        KiroProvider::call_failure_kind_from_error(err),
-        Some(KiroCallFailureKind::LocalPoolRiskCircuitOpen)
+        LocalUpstreamProvider::call_failure_kind_from_error(err),
+        Some(LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen)
     ) {
         return Some(
             retry_after_secs_from_error(&err.to_string())
@@ -5100,7 +5109,7 @@ fn local_temporary_admission_backoff_secs(
 fn apply_local_temporary_admission_backoff(
     attribution: Option<&RequestRejectionAttribution>,
     err: &Error,
-    provider: Option<&crate::kiro::provider::KiroProvider>,
+    provider: Option<&LocalUpstreamProvider>,
 ) {
     let Some(attribution) = attribution else {
         return;
@@ -5115,7 +5124,7 @@ fn map_provider_error_with_admission_feedback(
     err: Error,
     request_id: Option<&str>,
     error_id: Option<&str>,
-    provider: Option<&crate::kiro::provider::KiroProvider>,
+    provider: Option<&LocalUpstreamProvider>,
     attribution: Option<&RequestRejectionAttribution>,
 ) -> Response {
     apply_local_temporary_admission_backoff(attribution, &err, provider);
@@ -5126,18 +5135,20 @@ fn map_provider_error(
     err: Error,
     request_id: Option<&str>,
     error_id: Option<&str>,
-    provider: Option<&crate::kiro::provider::KiroProvider>,
+    provider: Option<&LocalUpstreamProvider>,
 ) -> Response {
-    if let Some(failure_kind) = KiroProvider::call_failure_kind_from_error(&err) {
+    if let Some(failure_kind) = LocalUpstreamProvider::call_failure_kind_from_error(&err) {
         let status = match failure_kind {
-            KiroCallFailureKind::InferenceAttemptsExhausted
-            | KiroCallFailureKind::InferenceAttemptReservedForFallback
-            | KiroCallFailureKind::AuxiliaryAttemptsExhausted
-            | KiroCallFailureKind::AuxiliaryConcurrencySaturated
-            | KiroCallFailureKind::LocalPoolRiskCircuitOpen => StatusCode::SERVICE_UNAVAILABLE,
-            KiroCallFailureKind::DownstreamCommitted => StatusCode::BAD_GATEWAY,
-            KiroCallFailureKind::ThinkingSignatureInvalid => StatusCode::BAD_REQUEST,
-            KiroCallFailureKind::ThinkingSignatureRetryFailed => StatusCode::BAD_GATEWAY,
+            LocalUpstreamCallFailureKind::InferenceAttemptsExhausted
+            | LocalUpstreamCallFailureKind::InferenceAttemptReservedForFallback
+            | LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted
+            | LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated
+            | LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            LocalUpstreamCallFailureKind::DownstreamCommitted => StatusCode::BAD_GATEWAY,
+            LocalUpstreamCallFailureKind::ThinkingSignatureInvalid => StatusCode::BAD_REQUEST,
+            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed => StatusCode::BAD_GATEWAY,
         };
         log_provider_error_with_hint(
             &err.to_string(),
@@ -5145,13 +5156,13 @@ fn map_provider_error(
             error_id,
         );
         let (error_type, public_message) = match failure_kind {
-            KiroCallFailureKind::ThinkingSignatureInvalid => {
+            LocalUpstreamCallFailureKind::ThinkingSignatureInvalid => {
                 ("invalid_request_error", UPSTREAM_INVALID_REQUEST_MESSAGE)
             }
             _ => ("api_error", envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE),
         };
         let retry_after_headers = match failure_kind {
-            KiroCallFailureKind::LocalPoolRiskCircuitOpen => {
+            LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen => {
                 retry_after_secs_from_error(&err.to_string())
                     .map(|secs| vec![("retry-after", secs.max(1).to_string())])
                     .unwrap_or_default()
@@ -5477,9 +5488,9 @@ fn attach_and_log_tool_use_format_diagnostics(
 }
 
 fn merge_credential_attempts(
-    mut prefix: Vec<KiroCredentialAttempt>,
-    attempts: Vec<KiroCredentialAttempt>,
-) -> Vec<KiroCredentialAttempt> {
+    mut prefix: Vec<LocalUpstreamCredentialAttempt>,
+    attempts: Vec<LocalUpstreamCredentialAttempt>,
+) -> Vec<LocalUpstreamCredentialAttempt> {
     if prefix.is_empty() {
         return attempts;
     }
@@ -6226,7 +6237,7 @@ async fn post_messages_inner(
         );
         let request_id = usage_context.request_id.clone();
         let error_id = usage_context.error_id.clone();
-        let attribution_sink = Arc::new(McpCallAttributionSink::default());
+        let attribution_sink = Arc::new(LocalAuxiliaryMcpAttributionSink::default());
         let mut usage_guard =
             WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
         let outcome = websearch::handle_websearch_request(
@@ -6450,7 +6461,7 @@ async fn post_messages_inner(
 }
 
 async fn call_api_stream_maybe_fail_fast(
-    provider: &Arc<KiroProvider>,
+    provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: Option<&str>,
@@ -6458,7 +6469,7 @@ async fn call_api_stream_maybe_fail_fast(
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
-) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
+) -> anyhow::Result<LocalUpstreamStreamResponse> {
     let (acquire_mode, preserve_external_attempt) = if let Some(external) = account_fallback {
         external.local_attempt_policy().await
     } else {
@@ -6497,7 +6508,7 @@ async fn call_api_stream_maybe_fail_fast(
 }
 
 async fn call_api_maybe_fail_fast(
-    provider: &Arc<KiroProvider>,
+    provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: Option<&str>,
@@ -6505,7 +6516,7 @@ async fn call_api_maybe_fail_fast(
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
-) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
+) -> anyhow::Result<LocalUpstreamApiResponse> {
     let (acquire_mode, preserve_external_attempt) = if let Some(external) = account_fallback {
         external.local_attempt_policy().await
     } else {
@@ -6559,7 +6570,7 @@ async fn maybe_forward_account_after_local_error(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     message: &str,
-    attempts: Vec<KiroCredentialAttempt>,
+    attempts: Vec<LocalUpstreamCredentialAttempt>,
 ) -> Option<Response> {
     account_fallback?
         .fallback_after_local_error(request_id, message, attempts)
@@ -6570,8 +6581,8 @@ async fn maybe_account_fallback_after_local_error_outcome(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     message: &str,
-    call_failure_kind: Option<KiroCallFailureKind>,
-    attempts: Vec<KiroCredentialAttempt>,
+    call_failure_kind: Option<LocalUpstreamCallFailureKind>,
+    attempts: Vec<LocalUpstreamCredentialAttempt>,
 ) -> Option<AccountForwardOutcome> {
     account_fallback?
         .fallback_after_local_error_outcome(request_id, message, call_failure_kind, attempts)
@@ -6582,9 +6593,9 @@ async fn maybe_account_fallback_after_local_error_outcome_with_diagnostics(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     message: &str,
-    call_failure_kind: Option<KiroCallFailureKind>,
-    classification_attempts: Vec<KiroCredentialAttempt>,
-    diagnostic_attempts: Vec<KiroCredentialAttempt>,
+    call_failure_kind: Option<LocalUpstreamCallFailureKind>,
+    classification_attempts: Vec<LocalUpstreamCredentialAttempt>,
+    diagnostic_attempts: Vec<LocalUpstreamCredentialAttempt>,
 ) -> Option<AccountForwardOutcome> {
     account_fallback?
         .fallback_after_local_error_outcome_with_diagnostics(
@@ -6646,8 +6657,8 @@ async fn maybe_local_pool_preflight_account_outcome_for_local_request(
 
 fn websearch_mcp_account_fallback_signal(
     internal_reason: &str,
-    attribution: &McpCallAttribution,
-) -> Option<(&'static str, Option<KiroCallFailureKind>)> {
+    attribution: &LocalAuxiliaryMcpAttribution,
+) -> Option<(&'static str, Option<LocalUpstreamCallFailureKind>)> {
     if internal_reason == "websearch_mcp_scheduler_unavailable" {
         if let Some(selection_failure) = attribution.selection_failure.as_ref() {
             return match selection_failure.primary_reason {
@@ -6667,7 +6678,7 @@ fn websearch_mcp_account_fallback_signal(
                 | AccountRejectReason::RefreshFailed => Some(("临时冷却", None)),
                 AccountRejectReason::RiskCircuitOpen => Some((
                     "本地账号池风险保护已打开",
-                    Some(KiroCallFailureKind::LocalPoolRiskCircuitOpen),
+                    Some(LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen),
                 )),
                 AccountRejectReason::StickyTargetUnavailable => Some(("临时排除", None)),
                 AccountRejectReason::Unknown
@@ -6683,11 +6694,11 @@ fn websearch_mcp_account_fallback_signal(
     match internal_reason {
         "websearch_auxiliary_attempt_limit" => Some((
             "WebSearch MCP auxiliary attempts exhausted",
-            Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted),
+            Some(LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted),
         )),
         "websearch_auxiliary_concurrency" => Some((
             "WebSearch MCP auxiliary concurrency saturated",
-            Some(KiroCallFailureKind::AuxiliaryConcurrencySaturated),
+            Some(LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated),
         )),
         "websearch_mcp_rate_limit" => Some(("WebSearch MCP 429 rate limit", None)),
         "websearch_mcp_timeout" | "websearch_mcp_body_timeout" => {
@@ -6703,7 +6714,7 @@ async fn maybe_account_fallback_after_websearch_mcp_failure(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     internal_reason: &str,
-    attribution: &McpCallAttribution,
+    attribution: &LocalAuxiliaryMcpAttribution,
 ) -> Option<Response> {
     let (message, call_failure_kind) =
         websearch_mcp_account_fallback_signal(internal_reason, attribution)?;
@@ -6791,7 +6802,7 @@ fn account_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) -
 }
 
 fn account_fallback_route_subtype_for_attempts(
-    attempts: &[KiroCredentialAttempt],
+    attempts: &[LocalUpstreamCredentialAttempt],
 ) -> UsageRouteSubtype {
     if attempts.is_empty() {
         UsageRouteSubtype::AccountFallbackPreflight
@@ -6873,14 +6884,14 @@ fn budgeted_local_rescue_reason_after_account_error(
 /// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
 /// `AccountFallbackContext::*fallback*`; those paths can choose an upstream account again.
 async fn call_stream_local_rescue_after_account_error(
-    provider: &Arc<KiroProvider>,
+    provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: &str,
     external: &AccountFallbackContext,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
-) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
+) -> anyhow::Result<LocalUpstreamStreamResponse> {
     let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
         AcquireMode::WaitForCapacityMax(Duration::from_secs(
             external.config.account_local_rescue_max_wait_secs(),
@@ -6924,14 +6935,14 @@ async fn call_stream_local_rescue_after_account_error(
 /// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
 /// `AccountFallbackContext::*fallback*`; those paths can choose an upstream account again.
 async fn call_non_stream_local_rescue_after_account_error(
-    provider: &Arc<KiroProvider>,
+    provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
     request_id: &str,
     external: &AccountFallbackContext,
     capacity_weight_units: u32,
     dispatch_model_filter: Option<&str>,
-) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
+) -> anyhow::Result<LocalUpstreamApiResponse> {
     let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
         AcquireMode::WaitForCapacityMax(Duration::from_secs(
             external.config.account_local_rescue_max_wait_secs(),
@@ -7017,7 +7028,7 @@ impl StreamContextTemplate {
 #[derive(Clone)]
 struct StreamRetryPlan {
     config: LocalStreamRetryConfig,
-    provider: Arc<KiroProvider>,
+    provider: Arc<LocalUpstreamProvider>,
     request_body: Arc<str>,
     kiro_request: Option<Arc<KiroRequest>>,
     request_id: String,
@@ -7034,7 +7045,7 @@ struct SseStreamState {
     decoder: EventStreamDecoder,
     json_sniffer: JsonStreamErrorSniffer,
     finished: bool,
-    completion: KiroStreamCompletion,
+    completion: LocalUpstreamStreamCompletion,
     usage_guard: StreamUsageGuard,
     ping_interval: tokio::time::Interval,
     idle_deadline: Instant,
@@ -7043,7 +7054,7 @@ struct SseStreamState {
     downstream_committed: bool,
     retry_plan: Option<StreamRetryPlan>,
     attempt_number: u32,
-    prior_attempts: Vec<KiroCredentialAttempt>,
+    prior_attempts: Vec<LocalUpstreamCredentialAttempt>,
 }
 
 impl SseStreamState {
@@ -7051,7 +7062,7 @@ impl SseStreamState {
         response: reqwest::Response,
         ctx: StreamContext,
         initial_events: Vec<SseEvent>,
-        completion: KiroStreamCompletion,
+        completion: LocalUpstreamStreamCompletion,
         usage_guard: StreamUsageGuard,
         stream_idle_timeout_secs: u64,
         retry_plan: Option<StreamRetryPlan>,
@@ -7083,7 +7094,7 @@ impl SseStreamState {
     fn with_retry_attempt(
         mut self,
         response: reqwest::Response,
-        completion: KiroStreamCompletion,
+        completion: LocalUpstreamStreamCompletion,
         credential_usage: CredentialUsageContext,
     ) -> Self {
         let retry_plan = self.retry_plan.clone();
@@ -7139,7 +7150,7 @@ fn account_rescue_preflight(reason: &str, err: &AccountFinalError) -> serde_json
 
 /// 处理流式请求
 async fn handle_stream_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<LocalUpstreamProvider>,
     request_body: &str,
     kiro_request: KiroRequest,
     model: &str,
@@ -7167,7 +7178,7 @@ async fn handle_stream_request(
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
-    let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
+    let mut retry_attempt_prefix: Vec<LocalUpstreamCredentialAttempt> = Vec::new();
     let mut successful_derived_request: Option<(String, KiroRequest)> = None;
     let response = if let Some(outcome) =
         maybe_local_pool_preflight_account_outcome_for_local_request(
@@ -7216,7 +7227,7 @@ async fn handle_stream_request(
                             Err(rescue_error) => {
                                 let rescue_message = rescue_error.to_string();
                                 let rescue_attempts =
-                                    KiroProvider::attempts_from_error(&rescue_error);
+                                    LocalUpstreamProvider::attempts_from_error(&rescue_error);
                                 log_provider_call_failure(
                                     &rescue_message,
                                     Some(&usage_context.error_id),
@@ -7267,7 +7278,7 @@ async fn handle_stream_request(
             Ok(resp) => resp,
             Err(e) => {
                 let message = e.to_string();
-                let attempts = KiroProvider::attempts_from_error(&e);
+                let attempts = LocalUpstreamProvider::attempts_from_error(&e);
                 log_provider_call_failure(&message, Some(&usage_context.error_id));
                 let endpoint = usage_context.endpoint.clone();
                 attach_and_log_tool_use_format_diagnostics(
@@ -7327,7 +7338,8 @@ async fn handle_stream_request(
                         }
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                LocalUpstreamProvider::attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -7352,7 +7364,9 @@ async fn handle_stream_request(
                                     account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
-                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    LocalUpstreamProvider::call_failure_kind_from_error(
+                                        &retry_error,
+                                    ),
                                     classification_attempts,
                                     all_attempts.clone(),
                                 )
@@ -7438,7 +7452,8 @@ async fn handle_stream_request(
                         }
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                LocalUpstreamProvider::attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -7463,7 +7478,9 @@ async fn handle_stream_request(
                                     account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
-                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    LocalUpstreamProvider::call_failure_kind_from_error(
+                                        &retry_error,
+                                    ),
                                     classification_attempts.clone(),
                                     all_attempts.clone(),
                                 )
@@ -7480,7 +7497,7 @@ async fn handle_stream_request(
                                                     &retry_message,
                                                     &classification_attempts,
                                                     &external.config,
-                                                    KiroProvider::call_failure_kind_from_error(
+                                                    LocalUpstreamProvider::call_failure_kind_from_error(
                                                         &retry_error,
                                                     ),
                                                 );
@@ -7530,7 +7547,7 @@ async fn handle_stream_request(
                                                         let rescue_message =
                                                             rescue_error.to_string();
                                                         let rescue_attempts =
-                                                            KiroProvider::attempts_from_error(
+                                                            LocalUpstreamProvider::attempts_from_error(
                                                                 &rescue_error,
                                                             );
                                                         let all_attempts =
@@ -7606,7 +7623,7 @@ async fn handle_stream_request(
                         account_fallback.as_ref(),
                         &request_id,
                         &message,
-                        KiroProvider::call_failure_kind_from_error(&e),
+                        LocalUpstreamProvider::call_failure_kind_from_error(&e),
                         attempts.clone(),
                     )
                     .await
@@ -7620,7 +7637,7 @@ async fn handle_stream_request(
                                             &message,
                                             &attempts,
                                             &external.config,
-                                            KiroProvider::call_failure_kind_from_error(&e),
+                                            LocalUpstreamProvider::call_failure_kind_from_error(&e),
                                         );
                                     if let Some(reason) =
                                         budgeted_local_rescue_reason_after_account_route_error(
@@ -7661,7 +7678,7 @@ async fn handle_stream_request(
                                             Err(rescue_error) => {
                                                 let rescue_message = rescue_error.to_string();
                                                 let rescue_attempts =
-                                                    KiroProvider::attempts_from_error(
+                                                    LocalUpstreamProvider::attempts_from_error(
                                                         &rescue_error,
                                                     );
                                                 let all_attempts = merge_credential_attempts(
@@ -8581,7 +8598,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
-    completion: KiroStreamCompletion,
+    completion: LocalUpstreamStreamCompletion,
     usage_context: CredentialUsageContext,
     stream_idle_timeout_secs: u64,
     retry_plan: Option<StreamRetryPlan>,
@@ -9389,7 +9406,7 @@ fn sanitize_complete_thinking_segment<'a>(
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    provider: std::sync::Arc<LocalUpstreamProvider>,
     request_body: &str,
     kiro_request: &KiroRequest,
     model: &str,
@@ -9412,7 +9429,7 @@ async fn handle_non_stream_request(
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
-    let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
+    let mut retry_attempt_prefix: Vec<LocalUpstreamCredentialAttempt> = Vec::new();
     let api_response = if let Some(outcome) =
         maybe_local_pool_preflight_account_outcome_for_local_request(
             account_fallback.as_ref(),
@@ -9460,7 +9477,7 @@ async fn handle_non_stream_request(
                             Err(rescue_error) => {
                                 let rescue_message = rescue_error.to_string();
                                 let rescue_attempts =
-                                    KiroProvider::attempts_from_error(&rescue_error);
+                                    LocalUpstreamProvider::attempts_from_error(&rescue_error);
                                 log_provider_call_failure(
                                     &rescue_message,
                                     Some(&usage_context.error_id),
@@ -9511,7 +9528,7 @@ async fn handle_non_stream_request(
             Ok(resp) => resp,
             Err(e) => {
                 let message = e.to_string();
-                let attempts = KiroProvider::attempts_from_error(&e);
+                let attempts = LocalUpstreamProvider::attempts_from_error(&e);
                 log_provider_call_failure(&message, Some(&usage_context.error_id));
                 let endpoint = usage_context.endpoint.clone();
                 attach_and_log_tool_use_format_diagnostics(
@@ -9568,7 +9585,8 @@ async fn handle_non_stream_request(
                         Ok(resp) => resp,
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                LocalUpstreamProvider::attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -9593,7 +9611,9 @@ async fn handle_non_stream_request(
                                     account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
-                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    LocalUpstreamProvider::call_failure_kind_from_error(
+                                        &retry_error,
+                                    ),
                                     classification_attempts,
                                     all_attempts.clone(),
                                 )
@@ -9676,7 +9696,8 @@ async fn handle_non_stream_request(
                         Ok(resp) => resp,
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                LocalUpstreamProvider::attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -9701,7 +9722,9 @@ async fn handle_non_stream_request(
                                     account_fallback.as_ref(),
                                     &request_id,
                                     &retry_message,
-                                    KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    LocalUpstreamProvider::call_failure_kind_from_error(
+                                        &retry_error,
+                                    ),
                                     classification_attempts.clone(),
                                     all_attempts.clone(),
                                 )
@@ -9718,7 +9741,7 @@ async fn handle_non_stream_request(
                                                     &retry_message,
                                                     &classification_attempts,
                                                     &external.config,
-                                                    KiroProvider::call_failure_kind_from_error(
+                                                    LocalUpstreamProvider::call_failure_kind_from_error(
                                                         &retry_error,
                                                     ),
                                                 );
@@ -9763,7 +9786,7 @@ async fn handle_non_stream_request(
                                                 Err(rescue_error) => {
                                                     let rescue_message = rescue_error.to_string();
                                                     let rescue_attempts =
-                                                        KiroProvider::attempts_from_error(
+                                                        LocalUpstreamProvider::attempts_from_error(
                                                             &rescue_error,
                                                         );
                                                     let all_attempts = merge_credential_attempts(
@@ -9835,7 +9858,7 @@ async fn handle_non_stream_request(
                         account_fallback.as_ref(),
                         &request_id,
                         &message,
-                        KiroProvider::call_failure_kind_from_error(&e),
+                        LocalUpstreamProvider::call_failure_kind_from_error(&e),
                         attempts.clone(),
                     )
                     .await
@@ -9849,7 +9872,7 @@ async fn handle_non_stream_request(
                                             &message,
                                             &attempts,
                                             &external.config,
-                                            KiroProvider::call_failure_kind_from_error(&e),
+                                            LocalUpstreamProvider::call_failure_kind_from_error(&e),
                                         );
                                     if let Some(reason) =
                                         budgeted_local_rescue_reason_after_account_route_error(
@@ -9890,7 +9913,7 @@ async fn handle_non_stream_request(
                                             Err(rescue_error) => {
                                                 let rescue_message = rescue_error.to_string();
                                                 let rescue_attempts =
-                                                    KiroProvider::attempts_from_error(
+                                                    LocalUpstreamProvider::attempts_from_error(
                                                         &rescue_error,
                                                     );
                                                 let all_attempts = merge_credential_attempts(

@@ -6,6 +6,7 @@ mod common;
 mod external_pool;
 mod http_client;
 mod kiro;
+pub(crate) mod local_upstream;
 mod model;
 mod storage;
 pub mod token;

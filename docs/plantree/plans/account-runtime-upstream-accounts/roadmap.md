@@ -87,6 +87,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Anthropic converter module docs, diagnostics, tool-name collision errors and compatibility comments now describe local-upstream/upstream-safe behavior instead of Kiro protocol behavior.
 - Model capability seed/status source values now use upstream-account terminology for new writes, normalize old `kiro-*` source strings on read, and expose `sync_from_upstream_catalog` as the main/Admin synchronization entrypoint.
 - Native WebSearch MCP routing now uses local-auxiliary-upstream names for provider/error helper wrappers, MCP call helper names and runtime comments while retaining the concrete legacy provider type as a compatibility detail.
+- `local_upstream` now provides compatibility aliases for the legacy local provider, call-trace, MCP attribution and response types; Anthropic router, middleware, handler and WebSearch boundaries import those aliases instead of legacy provider names.
 
 ## In Progress
 
