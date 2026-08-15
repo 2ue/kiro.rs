@@ -1962,7 +1962,7 @@ mod tests {
         );
         assert!(
             second.usage().cache_read_input_tokens > 0,
-            "dynamic system text before the first cache_control must not poison Kiro-RS-Tool cache hits"
+            "dynamic system text before the first cache_control must not poison Claude Code Tool cache hits"
         );
     }
 

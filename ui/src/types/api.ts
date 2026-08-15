@@ -1437,7 +1437,7 @@ export interface AdminAuditLogPageQuery {
 }
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
-export type KiroAgentModeStrategy = 'vibe' | 'spec' | 'auto'
+export type LocalUpstreamAgentModeStrategy = 'vibe' | 'spec' | 'auto'
 export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
 export type ThinkingTriggerMode = 'real_request' | 'always'
 export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
@@ -2060,7 +2060,7 @@ export interface RuntimeConfig {
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile
-  kiroAgentModeStrategy: KiroAgentModeStrategy
+  kiroAgentModeStrategy: LocalUpstreamAgentModeStrategy
   modelResolutionMode: ModelResolutionMode
   modelMapping: ModelMappingConfig
   extractThinking: boolean

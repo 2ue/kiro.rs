@@ -622,7 +622,7 @@ impl ReportedCacheUsagePolicy {
 
     /// Apply only the final downstream-standard cache field caps.
     ///
-    /// This intentionally ignores `reportedUsage.enabled`: routes such as `kiro_rs_tool` can opt
+    /// This intentionally ignores `reportedUsage.enabled`: routes such as `claude_code_tool` can opt
     /// out of full reported-usage projection while still keeping public standard fields bounded.
     /// Raw and diagnostic usage snapshots are preserved by their callers.
     pub fn apply_final_standard_cache_guards_for_standard_fields(

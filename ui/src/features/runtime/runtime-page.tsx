@@ -62,7 +62,7 @@ import {
   useUpdateRuntimeConfig,
 } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
-import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
+import type { LocalUpstreamAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
 import {
   CachePolicySettingsSection,
   normalizeDefinedCacheRoute,
@@ -1493,7 +1493,7 @@ export function RuntimePage() {
                   </div>
                   <div className="space-y-1.5">
                     <div className="text-sm font-semibold">Kiro 工作模式</div>
-                    <Select value={draft.kiroAgentModeStrategy} onValueChange={(v) => set('kiroAgentModeStrategy')(v as KiroAgentModeStrategy)}>
+                    <Select value={draft.kiroAgentModeStrategy} onValueChange={(v) => set('kiroAgentModeStrategy')(v as LocalUpstreamAgentModeStrategy)}>
                       <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="vibe">Vibe</SelectItem>

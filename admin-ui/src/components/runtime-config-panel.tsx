@@ -23,7 +23,7 @@ import type {
   CacheRoutePolicyPatch,
   CompatProfile,
   ImageProcessingConfig,
-  KiroAgentModeStrategy,
+  LocalUpstreamAgentModeStrategy,
   ModelCapabilitiesStatus,
   ModelMappingConfig,
   ModelMappingRule,
@@ -1243,12 +1243,12 @@ interface ModelResolutionSelectFieldProps {
   onChange: (value: ModelResolutionMode) => void
 }
 
-interface KiroAgentModeSelectFieldProps {
-  value: KiroAgentModeStrategy
-  onChange: (value: KiroAgentModeStrategy) => void
+interface LocalUpstreamAgentModeSelectFieldProps {
+  value: LocalUpstreamAgentModeStrategy
+  onChange: (value: LocalUpstreamAgentModeStrategy) => void
 }
 
-function KiroAgentModeSelectField({ value, onChange }: KiroAgentModeSelectFieldProps) {
+function LocalUpstreamAgentModeSelectField({ value, onChange }: LocalUpstreamAgentModeSelectFieldProps) {
   return (
     <label className="block rounded-md border bg-background p-4">
       <div className="mb-3">
@@ -1260,7 +1260,7 @@ function KiroAgentModeSelectField({ value, onChange }: KiroAgentModeSelectFieldP
       <select
         className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         value={value}
-        onChange={(event) => onChange(event.target.value as KiroAgentModeStrategy)}
+        onChange={(event) => onChange(event.target.value as LocalUpstreamAgentModeStrategy)}
       >
         <option value="vibe">vibe（默认兼容）</option>
         <option value="spec">spec（强制规格模式）</option>
@@ -4232,7 +4232,7 @@ export function RuntimeConfigPanel() {
               value={draft.compatProfile}
               onChange={(compatProfile) => setDraft((prev) => ({ ...prev, compatProfile }))}
             />
-            <KiroAgentModeSelectField
+            <LocalUpstreamAgentModeSelectField
               value={draft.kiroAgentModeStrategy}
               onChange={(kiroAgentModeStrategy) =>
                 setDraft((prev) => ({ ...prev, kiroAgentModeStrategy }))
