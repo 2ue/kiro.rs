@@ -1,4 +1,4 @@
-//! Synthetic thinking prompt controls for Kiro-compatible requests.
+//! Synthetic thinking prompt controls for local-upstream-compatible requests.
 
 use crate::anthropic::model_capabilities::strip_model_1m_suffix;
 use crate::anthropic::types::{

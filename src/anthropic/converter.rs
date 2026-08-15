@@ -1,6 +1,6 @@
-//! Anthropic → Kiro 协议转换器
+//! Anthropic -> local-upstream 协议转换器
 //!
-//! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
+//! 负责将 Anthropic API 请求格式转换为本地上游请求格式
 
 use std::collections::HashMap;
 
@@ -75,7 +75,7 @@ pub(crate) fn legacy_overlong_mapped_tool_name(name: &str) -> Option<String> {
     tools::legacy_overlong_mapped_tool_name(name)
 }
 
-/// Kiro requires a non-empty user message even when structured tool results
+/// The local upstream requires a non-empty user message even when structured tool results
 /// carry the entire turn. A bare "." makes the model ignore current tool
 /// results in real CLI follow-up turns, while this short marker preserves the
 /// tool-result boundary without recreating an internal `user Continue`
@@ -87,13 +87,13 @@ const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was emp
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
-    /// 转换后的 Kiro 请求
+    /// 转换后的本地上游请求
     pub conversation_state: ConversationState,
-    /// 最终 Kiro tools 数组里需要在对应工具后插入 cachePoint 的工具下标。
+    /// 最终本地上游 tools 数组里需要在对应工具后插入 cachePoint 的工具下标。
     pub tool_cache_point_insert_after: Vec<usize>,
     /// 是否把 cachePoint 插入计划记录到 payload diagnostics。
     pub cache_point_plan_recording_enabled: bool,
-    /// 工具名称映射（Kiro-safe 名称 → 原始名称），当名称规范化或超长缩短时非空。
+    /// 工具名称映射（upstream-safe 名称 -> 原始名称），当名称规范化或超长缩短时非空。
     pub tool_name_map: HashMap<String, String>,
     /// 工具 input_schema property key 映射（上游工具名 → 清洗 key 到原始 key），仅在本次请求内使用。
     pub tool_schema_key_map: ToolSchemaKeyMap,
@@ -379,13 +379,13 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
-/// 将 Anthropic 请求转换为 Kiro 请求
+/// 将 Anthropic 请求转换为本地上游请求
 #[allow(dead_code)]
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
     convert_request_with_options(req, ConverterOptions::default())
 }
 
-/// 将 Anthropic 请求转换为 Kiro 请求，并按兼容 profile 控制代理侧改写。
+/// 将 Anthropic 请求转换为本地上游请求，并按兼容 profile 控制代理侧改写。
 pub fn convert_request_with_options(
     req: &MessagesRequest,
     options: ConverterOptions,
@@ -395,7 +395,7 @@ pub fn convert_request_with_options(
     convert_request_with_model_id(req, options, model_id)
 }
 
-/// 将 Anthropic 请求转换为 Kiro 请求，并使用已经按当前 Kiro 上游目录解析过的模型 ID。
+/// 将 Anthropic 请求转换为本地上游请求，并使用已经按当前上游目录解析过的模型 ID。
 pub fn convert_request_with_resolved_model(
     req: &MessagesRequest,
     options: ConverterOptions,
@@ -421,7 +421,7 @@ fn convert_request_with_model_id(
     }
 
     // 2.5. 预处理 prefill：如果末尾不是 user，静默丢弃尾部 prefill 并截断到最后一条 user
-    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不接受 assistant 作为最终消息
+    // Claude 4.x 已弃用 assistant prefill，本地上游也不接受 assistant 作为最终消息
     let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
         warnings.prefill_dropped += 1;
         tracing::info!("检测到末尾非 user 消息（prefill），静默丢弃");
@@ -501,14 +501,14 @@ fn convert_request_with_model_id(
         ));
     }
 
-    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
+    // 9. 从历史中移除孤立的 tool_use（本地上游要求 tool_use 必须有对应的 tool_result）
     if !options.is_strict() && repair_tool_pairing {
         remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
     }
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
-    // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
-    // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
+    // 本地上游要求：历史消息中引用的工具必须在 tools 列表中有定义
+    // 注意：上游匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
     let mut existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
@@ -1346,7 +1346,7 @@ mod tests {
         let mut map = HashMap::new();
         let result = map_tool_name("shortName", &mut map, ConverterOptions::default());
         assert_eq!(result, "shortName");
-        assert!(map.is_empty(), "Kiro-safe 短名称不应产生映射");
+        assert!(map.is_empty(), "upstream-safe 短名称不应产生映射");
     }
 
     #[test]
@@ -1421,7 +1421,7 @@ mod tests {
             let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
                 .expect_err("raw-vs-mapped collision must be rejected");
 
-            assert!(error.to_string().contains("same Kiro tool name"));
+            assert!(error.to_string().contains("same local-upstream tool name"));
             assert_eq!(reverse_map, before, "reverse map commit must be atomic");
         }
     }
@@ -1429,7 +1429,7 @@ mod tests {
     #[test]
     fn convert_tools_rejects_real_32_bit_hash_collision_in_either_order() {
         // Precomputed SHA-256 first-8-hex collision. Both sanitized names share
-        // the same 51-byte prefix, so the final 63-byte Kiro names are equal.
+        // the same 51-byte prefix, so the final 63-byte upstream names are equal.
         let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa__collision_4197";
         let second = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa__collision_65941";
         assert_eq!(
@@ -1443,7 +1443,7 @@ mod tests {
             let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
                 .expect_err("hash collision must be rejected instead of silently skipping a tool");
 
-            assert!(error.to_string().contains("same Kiro tool name"));
+            assert!(error.to_string().contains("same local-upstream tool name"));
             assert!(reverse_map.is_empty());
         }
     }
@@ -1590,7 +1590,7 @@ mod tests {
         assert_eq!(original, long_tool_name);
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
-        // Kiro 请求中的工具名应该是短名称
+        // 本地上游请求中的工具名应该是短名称
         let tools = &result
             .conversation_state
             .current_message
@@ -2154,7 +2154,7 @@ mod tests {
         assert_eq!(current.content, TOOL_RESULTS_PROVIDED_PLACEHOLDER);
         assert_ne!(
             current.content, EMPTY_USER_CONTENT_PLACEHOLDER,
-            "tool-result-only turns need a semantic marker so Kiro consumes the structured result"
+            "tool-result-only turns need a semantic marker so the local upstream consumes the structured result"
         );
         assert_eq!(current.user_input_message_context.tool_results.len(), 1);
         assert_eq!(result.warnings.tool_result_content_placeholders, 1);
@@ -3835,7 +3835,7 @@ mod tests {
                     Message::User(user)
                         if user.user_input_message.content.contains("<tool_choice>none</tool_choice>")
                 )),
-            "compat mode should steer Kiro away from tool calls when tool_choice is none"
+            "compat mode should steer the local upstream away from tool calls when tool_choice is none"
         );
     }
 
@@ -3854,9 +3854,9 @@ mod tests {
             .user_input_message_context;
 
         assert_eq!(context.tools.len(), 1);
-        let kiro_tool_name = &context.tools[0].tool_specification.name;
+        let local_upstream_tool_name = &context.tools[0].tool_specification.name;
         assert_eq!(
-            result.tool_name_map.get(kiro_tool_name),
+            result.tool_name_map.get(local_upstream_tool_name),
             Some(&"read_file".to_string())
         );
         assert!(
@@ -4560,7 +4560,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         // 测试仅包含 tool_use 的 assistant 消息（无 text 块）
-        // Kiro API 要求 content 字段不能为空
+        // 本地上游要求 content 字段不能为空
         let msg = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([

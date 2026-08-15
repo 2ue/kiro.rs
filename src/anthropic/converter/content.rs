@@ -79,7 +79,7 @@ pub(super) fn process_message_content(
                         }
                         "redacted_thinking" => {
                             tracing::debug!(
-                                "用户消息中的 redacted_thinking 无法传递给当前 Kiro upstream，已跳过"
+                                "用户消息中的 redacted_thinking 无法传递给当前本地上游，已跳过"
                             );
                         }
                         _ => {}

@@ -57,7 +57,7 @@ pub(super) fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 }
 
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
-/// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
+/// 本地上游要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 pub(super) fn create_placeholder_tool(name: &str, options: ConverterOptions) -> Tool {
     let schema = serde_json::json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -78,7 +78,7 @@ pub(super) fn create_placeholder_tool(name: &str, options: ConverterOptions) -> 
     }
 }
 
-/// Kiro API 工具名称最大长度限制
+/// 本地上游工具名称最大长度限制
 pub(super) const TOOL_NAME_MAX_LEN: usize = 63;
 pub(super) const TOOL_HASH_MARKER: &str = "Hash";
 
@@ -133,7 +133,7 @@ fn sanitize_tool_name(name: &str) -> String {
     }
 }
 
-/// Returns the exact deterministic name used when a request tool must be mapped for Kiro.
+/// Returns the exact deterministic name used when a request tool must be mapped for the local upstream.
 pub(super) fn deterministic_mapped_tool_name(name: &str) -> String {
     let sanitized = sanitize_tool_name(name);
     if sanitized != name || sanitized.len() > TOOL_NAME_MAX_LEN {
@@ -145,7 +145,7 @@ pub(super) fn deterministic_mapped_tool_name(name: &str) -> String {
 
 /// Exact name emitted by the pre-2026-05-29 mapper for an overlong tool.
 /// This is response/history compatibility only; new requests always use the
-/// current Kiro-safe mapper above.
+/// current upstream-safe mapper above.
 pub(super) fn legacy_overlong_mapped_tool_name(name: &str) -> Option<String> {
     if name.len() <= TOOL_NAME_MAX_LEN {
         return None;
@@ -162,7 +162,7 @@ pub(super) fn legacy_overlong_mapped_tool_name(name: &str) -> Option<String> {
     Some(format!("{prefix}_{hash_suffix}"))
 }
 
-/// 生成确定性 Kiro-safe 名称：截断前缀 + Hash + 8 位 SHA256 hex
+/// 生成确定性 upstream-safe 名称：截断前缀 + Hash + 8 位 SHA256 hex
 pub(super) fn shorten_tool_name(name: &str, hash_input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(hash_input.as_bytes());
@@ -356,7 +356,8 @@ fn allocate_selected_tool_names(
                     "拒绝歧义工具名映射"
                 );
                 return Err(ConversionError::UnsupportedContent(
-                    "multiple tool definitions resolve to the same Kiro tool name".to_string(),
+                    "multiple tool definitions resolve to the same local-upstream tool name"
+                        .to_string(),
                 ));
             }
         }

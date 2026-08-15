@@ -84,6 +84,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - The local body pipeline now exposes `PreparedLocalUpstreamBody.local_upstream_request` and local-upstream helper parameter names at the handler boundary, while the concrete legacy request type remains isolated behind that boundary.
 - Stream conversion now offers `process_local_upstream_event` as the handler-facing event processor; the legacy concrete event method remains internal to the stream module and existing stream tests until the event model is replaced.
 - Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor, keeping the concrete legacy provider type behind the protocol boundary.
+- Anthropic converter module docs, diagnostics, tool-name collision errors and compatibility comments now describe local-upstream/upstream-safe behavior instead of Kiro protocol behavior.
 
 ## In Progress
 

@@ -1,4 +1,4 @@
-//! Conversation history construction for Anthropic -> Kiro conversion.
+//! Conversation history construction for Anthropic -> local-upstream conversion.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,7 +25,7 @@ use crate::anthropic::transcript_sanitizer::ToolTranscriptSanitizer;
 /// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
-/// * `model_id` - 已映射的 Kiro 模型 ID
+/// * `model_id` - 已映射的上游模型 ID
 pub(super) fn build_history(
     req: &MessagesRequest,
     messages: &[AnthropicMessage],
@@ -365,7 +365,7 @@ fn convert_assistant_message_with_known_tools(
 
     // 组合 unsigned thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
+    // 注意: 本地上游要求 content 字段不能为空，当只有 tool_use 时需要占位符
     let final_content = if !thinking_content.is_empty() {
         if !text_content.is_empty() {
             format!(
@@ -400,7 +400,7 @@ fn set_native_reasoning_content(
 ) -> Result<(), ConversionError> {
     if current.is_some() {
         return Err(ConversionError::UnsupportedContent(
-            "assistant history contains multiple or mixed native reasoning blocks; Kiro accepts one reasoningContent union value per assistant message"
+            "assistant history contains multiple or mixed native reasoning blocks; local upstream accepts one reasoningContent union value per assistant message"
                 .to_string(),
         ));
     }
@@ -478,7 +478,7 @@ fn merge_assistant_messages_with_known_tools(
         }
     }
 
-    // A Kiro assistant history item flattens every Anthropic visible text block into one string and
+    // A local-upstream assistant history item flattens every Anthropic visible text block into one string and
     // joins consecutive assistant messages with two newlines. Scan that reconstructed visible text
     // as a second line of defence: source block boundaries can otherwise hide a scaffold that only
     // becomes complete after flattening or joining. Generated `<thinking>` prefixes are preserved as

@@ -122,6 +122,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic handler runtime log/comment text for local-upstream cache-point retries, payload guard diagnostics, tool-use rejection diagnostics, slow interaction diagnostics and stream/non-stream retry paths now uses local-upstream/account wording rather than Kiro product wording. The remaining handler Kiro names are type/module compatibility boundaries.
 - Stream conversion now exposes `process_local_upstream_event` as the handler-facing event processor. The old concrete `process_kiro_event` method remains inside the stream module for the current legacy event type and stream tests, while runtime handler code enters through the local-upstream wrapper.
 - Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor. The underlying concrete type is still the legacy provider until the provider implementation is replaced, but the Claude/Anthropic protocol boundary no longer exposes a Kiro-named provider field.
+- Anthropic converter module docs, diagnostics, collision errors and compatibility comments now use local-upstream/upstream-safe wording instead of presenting the request conversion as a Kiro protocol surface. The concrete legacy request type remains isolated behind the current local-upstream body boundary until the provider/body implementation is replaced.
 
 Last verified on 2026-08-14:
 
@@ -302,6 +303,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-upstream-stream-event-wrapper-test1 -- bash -lc 'cargo check && cargo test stream_success_records_requested_max_tokens_and_downstream_stop_reason -- --nocapture && cargo test test_requested_max_tokens_infers_max_tokens_stop_reason -- --nocapture && cargo test test_context_usage_percentage_uses_catalog_window_for_final_usage -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-field-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-field-test1 -- bash -lc 'cargo check && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh converter-neutral-text-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh converter-neutral-text-test1 -- bash -lc 'cargo check && cargo test convert_tools_rejects -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

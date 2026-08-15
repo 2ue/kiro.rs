@@ -1,9 +1,9 @@
-//! JSON Schema normalization for Kiro tool definitions.
+//! JSON Schema normalization for local-upstream tool definitions.
 
 /// 规范化 JSON Schema，修复 MCP/OpenAPI/Zod 工具定义中常见的兼容性问题。
 ///
 /// 上游按 draft 2020-12 校验工具 `input_schema`，但 Claude Code / MCP 工具定义
-/// 经常混入旧 draft、OpenAPI 或简写结构。这里保守清洗成 Kiro/Anthropic 更容易
+/// 经常混入旧 draft、OpenAPI 或简写结构。这里保守清洗成本地上游/Anthropic 更容易
 /// 接受的 JSON Schema 子集，避免单个脏工具 schema 导致整次请求被 400 拒绝。
 pub(super) fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {

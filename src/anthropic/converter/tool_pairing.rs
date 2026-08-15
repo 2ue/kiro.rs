@@ -200,7 +200,7 @@ pub(super) fn validate_tool_pairing(
 
 /// 从历史消息中移除孤立的 tool_use
 ///
-/// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
+/// 本地上游要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
 /// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
 ///
 /// # Arguments
