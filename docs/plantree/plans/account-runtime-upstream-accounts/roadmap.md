@@ -78,6 +78,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account runtime facade comments and upstream-account integration-test skip messages now avoid presenting the migrated runtime as an external-pool feature.
 - Proxy warning responses now use `x-account-runtime-warnings` as the primary header and double-write the old warning header for compatibility.
 - Anthropic handler payload guard call sites now enter local-upstream wrappers for guarding and serialization; cache-point retry and thinking-signature retry no longer call the legacy Kiro-named guard helpers directly.
+- JSON stream error-envelope usage diagnostics now keep provider-message privacy by storing shape/fingerprint metadata for complete JSON error envelopes instead of raw message bodies, and remaining malformed/incomplete raw snippet sources use neutral official-upstream wording.
 
 ## In Progress
 

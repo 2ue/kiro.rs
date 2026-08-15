@@ -116,6 +116,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Runtime config now exposes account-named retry status accessors (`same_account_retry_status_codes`, `cross_account_retry_status_codes`) and the retry pipeline uses them. Old accessor names remain as compatibility delegates.
 - Account runtime facade comments and upstream-account integration-test skip messages no longer present the migrated runtime as an external-pool feature.
 - Proxy warning responses now write `x-account-runtime-warnings` as the primary header while also writing the old `x-kiro-rs-warnings` compatibility copy. Code comments and maintained Admin UI text describe the account-runtime header.
+- JSON stream error-envelope diagnostics now avoid retaining complete provider JSON error messages in usage raw-body fields. Usage keeps shape/fingerprint metadata for these envelopes, and remaining malformed/incomplete raw upstream snippets use the neutral `official_upstream` source label instead of a Kiro-specific source.
 
 Last verified on 2026-08-14:
 
@@ -281,6 +282,10 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-test1b -- cargo test disabled_local_guard_serializes_without_report -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-body-tests -- bash -lc 'cargo test thinking_signature_retry_body_removes_only_native_reasoning_five_rounds -- --nocapture && cargo test cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds -- --nocapture && cargo test payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_rounds -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-test1 -- cargo test handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-test2 -- cargo test signature_retry -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-check1 -- cargo check`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

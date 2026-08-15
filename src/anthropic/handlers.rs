@@ -7999,7 +7999,7 @@ impl JsonStreamErrorSniffer {
                     false,
                 )),
                 raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                    "kiro_official",
+                    "official_upstream",
                     Some(StatusCode::OK.as_u16()),
                     self.content_type.as_deref(),
                     trimmed,
@@ -8029,7 +8029,7 @@ impl JsonStreamErrorSniffer {
                     false,
                 )),
                 raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                    "kiro_official",
+                    "official_upstream",
                     Some(StatusCode::OK.as_u16()),
                     self.content_type.as_deref(),
                     trimmed,
@@ -8050,7 +8050,7 @@ impl JsonStreamErrorSniffer {
                 false,
             )),
             raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                "kiro_official",
+                "official_upstream",
                 Some(StatusCode::OK.as_u16()),
                 self.content_type.as_deref(),
                 trimmed,
@@ -8078,7 +8078,7 @@ impl JsonStreamErrorSniffer {
                 true,
             )),
             raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                "kiro_official",
+                "official_upstream",
                 Some(StatusCode::OK.as_u16()),
                 self.content_type.as_deref(),
                 trimmed,
@@ -8289,12 +8289,9 @@ fn classify_json_stream_error(
             Some(value),
             false,
         )),
-        raw_upstream_error: Some(RawUpstreamError::from_bytes(
-            "kiro_official",
-            Some(StatusCode::OK.as_u16()),
-            content_type,
-            raw_body,
-        )),
+        // Body diagnostics keep shape and fingerprint evidence; usage records
+        // must not retain a provider JSON error message verbatim.
+        raw_upstream_error: None,
     }
 }
 
