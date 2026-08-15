@@ -1,7 +1,8 @@
 //! tool_use/tool_result pairing validation and compatibility repair.
 
-use crate::kiro::model::requests::conversation::Message;
-use crate::kiro::model::requests::tool::ToolResult;
+use crate::local_upstream::request::{
+    LocalUpstreamConversationMessage as Message, LocalUpstreamToolResult as ToolResult,
+};
 
 use super::ProxyWarnings;
 
