@@ -150,6 +150,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Main shutdown lifecycle now reads, drains and shuts down best-effort storage tasks through account-runtime storage-task aliases instead of calling legacy token-manager functions directly.
 - Postgres model-capability persistence now uses local-upstream model catalog aliases for reasoning cohort keys instead of directly importing legacy available-model key types.
 - Runtime config defaults now read the local-upstream IDE endpoint name through the `local_upstream` endpoint facade instead of importing the legacy endpoint module directly.
+- Main endpoint registry construction now uses local-upstream endpoint and trait aliases for IDE/CLI endpoint setup instead of importing the legacy endpoint types directly in process wiring.
 
 Last verified on 2026-08-15:
 
@@ -387,6 +388,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh postgres-model-catalog-alias-test1 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture && cargo test postgres -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-endpoint-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-endpoint-alias-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test account_runtime_config_ext_applies_enablement_and_route_policy -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh main-endpoint-alias-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh main-endpoint-alias-test2 -- bash -lc 'cargo check && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

@@ -40,10 +40,15 @@ use chrono::Utc;
 use clap::Parser;
 use common::auth::RequestApiKeyStore;
 use futures::StreamExt;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::token_manager::MultiTokenManager;
-use local_upstream::provider::LocalUpstreamProvider;
+use local_upstream::{
+    endpoint::{
+        LocalUpstreamCliEndpoint, LocalUpstreamEndpoint, LocalUpstreamEndpointTrait,
+        LocalUpstreamIdeEndpoint,
+    },
+    provider::LocalUpstreamProvider,
+};
 use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
 use model::config::Config;
 use serde_json::{Value, json};
@@ -430,11 +435,11 @@ async fn main() {
     }
 
     // 构建端点注册表
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    let mut endpoints: HashMap<String, Arc<LocalUpstreamEndpoint>> = HashMap::new();
     {
-        let ide = IdeEndpoint::new();
+        let ide = LocalUpstreamIdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = CliEndpoint::new();
+        let cli = LocalUpstreamCliEndpoint::new();
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
     }
 

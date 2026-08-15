@@ -112,6 +112,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Main shutdown lifecycle now uses account-runtime storage-task aliases for best-effort storage task stats, drain and shutdown calls.
 - Postgres model-capability persistence now uses local-upstream model catalog aliases for reasoning cohort keys.
 - Runtime config default endpoint lookup now uses the local-upstream endpoint facade instead of a direct legacy endpoint path.
+- Main endpoint registry construction now uses local-upstream endpoint aliases for IDE/CLI endpoint setup instead of direct legacy endpoint imports.
 
 ## In Progress
 
