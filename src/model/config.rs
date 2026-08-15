@@ -1841,7 +1841,7 @@ impl CacheBoundsPolicyPatch {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroRsToolCachePolicy {
+pub struct ClaudeCodeToolCachePolicy {
     #[serde(default = "default_kiro_rs_tool_coverage_ratio")]
     pub coverage_ratio: f64,
     #[serde(default)]
@@ -1860,7 +1860,7 @@ pub struct KiroRsToolCachePolicy {
     pub reported_input_max_tokens: i32,
 }
 
-impl Default for KiroRsToolCachePolicy {
+impl Default for ClaudeCodeToolCachePolicy {
     fn default() -> Self {
         Self {
             coverage_ratio: default_kiro_rs_tool_coverage_ratio(),
@@ -1875,7 +1875,7 @@ impl Default for KiroRsToolCachePolicy {
     }
 }
 
-impl KiroRsToolCachePolicy {
+impl ClaudeCodeToolCachePolicy {
     pub fn normalized(mut self) -> Self {
         if !self.coverage_ratio.is_finite() {
             self.coverage_ratio = default_kiro_rs_tool_coverage_ratio();
@@ -1932,7 +1932,7 @@ impl KiroRsToolCachePolicy {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroRsToolCachePolicyPatch {
+pub struct ClaudeCodeToolCachePolicyPatch {
     #[serde(default)]
     pub coverage_ratio: Option<f64>,
     #[serde(default)]
@@ -1951,8 +1951,8 @@ pub struct KiroRsToolCachePolicyPatch {
     pub reported_input_max_tokens: Option<i32>,
 }
 
-impl KiroRsToolCachePolicyPatch {
-    fn apply_to(self, mut policy: KiroRsToolCachePolicy) -> KiroRsToolCachePolicy {
+impl ClaudeCodeToolCachePolicyPatch {
+    fn apply_to(self, mut policy: ClaudeCodeToolCachePolicy) -> ClaudeCodeToolCachePolicy {
         if let Some(value) = self.coverage_ratio {
             policy.coverage_ratio = value;
         }
@@ -2056,7 +2056,7 @@ pub struct CacheRoutePolicyPatch {
     #[serde(default)]
     pub bounds: Option<CacheBoundsPolicyPatch>,
     #[serde(default)]
-    pub kiro_rs_tool: Option<KiroRsToolCachePolicyPatch>,
+    pub kiro_rs_tool: Option<ClaudeCodeToolCachePolicyPatch>,
 }
 
 impl CacheRoutePolicyPatch {
@@ -2178,7 +2178,7 @@ impl CacheRoutePolicyPatch {
             && self
                 .kiro_rs_tool
                 .as_ref()
-                .is_none_or(KiroRsToolCachePolicyPatch::is_empty)
+                .is_none_or(ClaudeCodeToolCachePolicyPatch::is_empty)
     }
 }
 
@@ -2301,7 +2301,7 @@ impl CachePolicyConfig {
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
             cache_point: CachePointPolicy::default(),
             bounds: base.bounds,
-            kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            kiro_rs_tool: ClaudeCodeToolCachePolicy::default(),
         };
         self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
     }
@@ -2359,7 +2359,7 @@ pub struct CacheRoutePolicy {
     pub reported_usage: ReportedUsagePathPolicy,
     pub cache_point: CachePointPolicy,
     pub bounds: CacheBoundsPolicy,
-    pub kiro_rs_tool: KiroRsToolCachePolicy,
+    pub kiro_rs_tool: ClaudeCodeToolCachePolicy,
 }
 
 impl CacheRoutePolicy {
@@ -4979,7 +4979,7 @@ impl Config {
                 entry_ttl_secs: self.prompt_cache_entry_ttl_secs,
                 estimated_bytes_limit: self.prompt_cache_estimated_bytes_limit,
             },
-            kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            kiro_rs_tool: ClaudeCodeToolCachePolicy::default(),
         }
         .normalized()
     }
@@ -6530,7 +6530,7 @@ mod tests {
                     entry_ttl_secs: Some(700),
                     estimated_bytes_limit: Some(7_000),
                 }),
-                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
+                kiro_rs_tool: Some(ClaudeCodeToolCachePolicyPatch {
                     coverage_ratio: Some(0.7),
                     max_coverage_tokens: Some(70_000),
                     incremental_create_enabled: Some(false),
@@ -6569,9 +6569,9 @@ mod tests {
                     entry_ttl_secs: Some(200),
                     estimated_bytes_limit: Some(2_000),
                 }),
-                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
+                kiro_rs_tool: Some(ClaudeCodeToolCachePolicyPatch {
                     coverage_ratio: Some(0.2),
-                    ..KiroRsToolCachePolicyPatch::default()
+                    ..ClaudeCodeToolCachePolicyPatch::default()
                 }),
             },
         );
@@ -6601,7 +6601,7 @@ mod tests {
                     entry_ttl_secs: Some(500),
                     estimated_bytes_limit: Some(5_000),
                 }),
-                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
+                kiro_rs_tool: Some(ClaudeCodeToolCachePolicyPatch {
                     coverage_ratio: Some(0.5),
                     max_coverage_tokens: Some(50_000),
                     incremental_create_enabled: Some(false),
@@ -6873,7 +6873,7 @@ mod tests {
 
     #[test]
     fn kiro_rs_tool_cache_policy_defaults_match_current_behavior() {
-        let policy = KiroRsToolCachePolicy::default();
+        let policy = ClaudeCodeToolCachePolicy::default();
 
         assert_eq!(policy.coverage_ratio, 1.0);
         assert_eq!(policy.max_coverage_tokens, 0);

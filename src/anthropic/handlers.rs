@@ -13,7 +13,7 @@ use std::{
 use crate::common::upstream_error::RawUpstreamError;
 use crate::model::config::{
     BodyConversionConfig, CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
-    CacheSimulationPolicy, CompatProfile, Config, ImageProcessingConfig, KiroRsToolCachePolicy,
+    CacheSimulationPolicy, ClaudeCodeToolCachePolicy, CompatProfile, Config, ImageProcessingConfig,
     MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
     PromptCacheSimulationMode, PromptCacheStrategyType, PromptSteeringConfig, ReportedUsageConfig,
@@ -63,7 +63,7 @@ use super::payload_guard::{
 };
 use super::payload_guard_runtime::prepare_local_upstream_request_body;
 use super::prompt_cache::{
-    KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
+    ClaudeCodeToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
 };
 use super::request_admission::{RequestRejectionAttribution, RequestRejectionReason};
 use super::request_body::MessagesBody;
@@ -279,7 +279,7 @@ struct RequestUsageContext {
     input_tokens: i32,
     context_window_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
-    kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
+    kiro_rs_tool_prompt_cache_plan: Option<ClaudeCodeToolPromptCachePlan>,
     prompt_cache_route_namespace: Option<String>,
     prompt_cache_strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
@@ -788,7 +788,7 @@ struct AccountFallbackContext {
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
-    kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
+    kiro_rs_tool_cache_policy: ClaudeCodeToolCachePolicy,
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
@@ -1067,7 +1067,7 @@ impl RequestRuntimeConfig {
                 entry_ttl_secs: self.prompt_cache_bounds.entry_ttl.as_secs(),
                 estimated_bytes_limit: self.prompt_cache_bounds.estimated_bytes_limit,
             },
-            kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            kiro_rs_tool: ClaudeCodeToolCachePolicy::default(),
         }
         .normalized()
     }

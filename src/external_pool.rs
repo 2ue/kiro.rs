@@ -45,7 +45,7 @@ use crate::{
         payload_guard_runtime::{PreparedAccountMessagesPayload, prepare_account_messages_payload},
         pricing::PricingCatalog,
         prompt_cache::{
-            KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
+            ClaudeCodeToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
             PromptCacheTracker,
         },
         prompt_cache_creation_control::PromptCacheCreationController,
@@ -71,10 +71,11 @@ use crate::{
     http_client::{HttpSendError, response_bytes_with_limit_and_body_timeout},
     local_upstream::call_trace::LocalUpstreamCredentialAttempt,
     model::config::{
-        ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode, ExternalPoolRouteMode,
-        ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
-        ModelMappingRule, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-        PromptCacheStrategyType, ReportedUsageConfig, normalize_route_rules, route_rule_matches,
+        ClaudeCodeToolCachePolicy, ExternalPoolCapacityMode,
+        ExternalPoolModelUnavailableCooldownMode, ExternalPoolRouteMode,
+        ExternalPoolStreamResponseMode, ExternalPoolsConfig, ModelMappingRule,
+        PromptCacheCreationControlConfig, PromptCacheSimulationMode, PromptCacheStrategyType,
+        ReportedUsageConfig, normalize_route_rules, route_rule_matches,
     },
     model::model_processing::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
@@ -869,7 +870,7 @@ pub struct ExternalRouteRequest {
     pub prompt_cache_scale_min_input_tokens: i32,
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pub prompt_cache_bounds: PromptCacheBounds,
-    pub kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
+    pub kiro_rs_tool_cache_policy: ClaudeCodeToolCachePolicy,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub request_id: String,

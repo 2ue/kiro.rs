@@ -7,7 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Tool};
-use crate::model::config::KiroRsToolCachePolicy;
+use crate::model::config::ClaudeCodeToolCachePolicy;
 use crate::token;
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -78,13 +78,13 @@ impl PromptCacheProfile {
 }
 
 #[derive(Debug, Clone)]
-pub struct KiroRsToolPromptCachePlan {
+pub struct ClaudeCodeToolPromptCachePlan {
     profile: Option<PromptCacheProfile>,
     usage: PromptCacheUsage,
     committed_cache_tokens: i32,
 }
 
-impl KiroRsToolPromptCachePlan {
+impl ClaudeCodeToolPromptCachePlan {
     pub fn usage(&self) -> PromptCacheUsage {
         self.usage
     }
@@ -194,14 +194,14 @@ impl PromptCacheTracker {
         total_input_tokens: i32,
         cache_model: &str,
         bounds: PromptCacheBounds,
-        policy: KiroRsToolCachePolicy,
-    ) -> KiroRsToolPromptCachePlan {
+        policy: ClaudeCodeToolCachePolicy,
+    ) -> ClaudeCodeToolPromptCachePlan {
         let policy = policy.normalized();
         let profile =
             self.build_kiro_rs_tool_profile_for_model(req, total_input_tokens, cache_model, policy);
         let usage =
             self.compute_kiro_rs_tool_profile_with_bounds(scope, profile.as_ref(), bounds, policy);
-        KiroRsToolPromptCachePlan {
+        ClaudeCodeToolPromptCachePlan {
             profile,
             usage,
             committed_cache_tokens: usage
@@ -214,7 +214,7 @@ impl PromptCacheTracker {
     pub fn commit_kiro_rs_tool_success_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
-        plan: &KiroRsToolPromptCachePlan,
+        plan: &ClaudeCodeToolPromptCachePlan,
         bounds: PromptCacheBounds,
     ) {
         self.update_kiro_rs_tool_profile_with_bounds(
@@ -230,7 +230,7 @@ impl PromptCacheTracker {
         req: &MessagesRequest,
         total_input_tokens: i32,
         cache_model: &str,
-        policy: KiroRsToolCachePolicy,
+        policy: ClaudeCodeToolCachePolicy,
     ) -> Option<PromptCacheProfile> {
         self.build_profile_with_blocks(
             kiro_rs_tool_cache_blocks(req, policy),
@@ -498,7 +498,7 @@ impl PromptCacheTracker {
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
         bounds: PromptCacheBounds,
-        policy: KiroRsToolCachePolicy,
+        policy: ClaudeCodeToolCachePolicy,
     ) -> PromptCacheUsage {
         let policy = policy.normalized();
         let Some(scope) = scope else {
@@ -743,7 +743,7 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheBlock> {
 
 fn kiro_rs_tool_cache_blocks(
     req: &MessagesRequest,
-    policy: KiroRsToolCachePolicy,
+    policy: ClaudeCodeToolCachePolicy,
 ) -> Vec<CacheBlock> {
     let mut blocks = Vec::new();
     let policy = policy.normalized();
@@ -917,7 +917,7 @@ fn message_has_explicit_cache_control(msg: &Message) -> bool {
 fn append_kiro_rs_tool_current_user_stable_prefix_block(
     blocks: &mut Vec<CacheBlock>,
     msg: &Message,
-    policy: KiroRsToolCachePolicy,
+    policy: ClaudeCodeToolCachePolicy,
 ) {
     let max_tokens = policy.current_user_stable_prefix_max_tokens.max(0);
     if max_tokens <= 0 {
@@ -1188,7 +1188,10 @@ fn is_valid_uuid(value: &str) -> bool {
     true
 }
 
-fn apply_kiro_rs_tool_coverage_policy(covered_tokens: i32, policy: KiroRsToolCachePolicy) -> i32 {
+fn apply_kiro_rs_tool_coverage_policy(
+    covered_tokens: i32,
+    policy: ClaudeCodeToolCachePolicy,
+) -> i32 {
     let policy = policy.normalized();
     let mut covered_tokens = covered_tokens.max(0);
     if policy.coverage_ratio < 1.0 {
@@ -1820,7 +1823,7 @@ mod tests {
             12_000,
             &first_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
         assert!(first.usage().cache_creation_input_tokens > 0);
         assert_eq!(first.usage().cache_read_input_tokens, 0);
@@ -1837,7 +1840,7 @@ mod tests {
             12_000,
             &first_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
         assert!(second.usage().cache_read_input_tokens > 0);
         assert_eq!(second.usage().cache_creation_input_tokens, 0);
@@ -1869,7 +1872,7 @@ mod tests {
             12_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
         assert!(failed.usage().cache_creation_input_tokens > 0);
         assert_eq!(failed.usage().cache_read_input_tokens, 0);
@@ -1880,7 +1883,7 @@ mod tests {
             12_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
         assert_eq!(retry.usage().cache_read_input_tokens, 0);
         assert!(retry.usage().cache_creation_input_tokens > 0);
@@ -1932,7 +1935,7 @@ mod tests {
             12_000,
             &first_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
         tracker.commit_kiro_rs_tool_success_with_bounds(
             Some(scope.clone()),
@@ -1947,7 +1950,7 @@ mod tests {
             12_000,
             &second_req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
         assert!(
             second.usage().cache_read_input_tokens > 0,
@@ -1980,7 +1983,7 @@ mod tests {
             1_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
 
         assert_eq!(plan.usage().cache_read_input_tokens, 0);
@@ -2014,7 +2017,7 @@ mod tests {
                 12_000,
                 &req.model,
                 bounds,
-                KiroRsToolCachePolicy::default(),
+                ClaudeCodeToolCachePolicy::default(),
             );
             tracker.commit_kiro_rs_tool_success_with_bounds(Some(scope), &plan, bounds);
         }
@@ -2041,9 +2044,9 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let policy = KiroRsToolCachePolicy {
+        let policy = ClaudeCodeToolCachePolicy {
             coverage_ratio: 0.5,
-            ..KiroRsToolCachePolicy::default()
+            ..ClaudeCodeToolCachePolicy::default()
         };
 
         let first = tracker.compute_kiro_rs_tool_with_bounds(
@@ -2094,9 +2097,9 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let policy = KiroRsToolCachePolicy {
+        let policy = ClaudeCodeToolCachePolicy {
             max_new_creation_tokens_per_request: 2_048,
-            ..KiroRsToolCachePolicy::default()
+            ..ClaudeCodeToolCachePolicy::default()
         };
 
         let first = tracker.compute_kiro_rs_tool_with_bounds(
@@ -2146,13 +2149,13 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let first_policy = KiroRsToolCachePolicy {
+        let first_policy = ClaudeCodeToolCachePolicy {
             max_new_creation_tokens_per_request: 2_048,
-            ..KiroRsToolCachePolicy::default()
+            ..ClaudeCodeToolCachePolicy::default()
         };
-        let second_policy = KiroRsToolCachePolicy {
+        let second_policy = ClaudeCodeToolCachePolicy {
             incremental_create_enabled: false,
-            ..KiroRsToolCachePolicy::default()
+            ..ClaudeCodeToolCachePolicy::default()
         };
 
         let first = tracker.compute_kiro_rs_tool_with_bounds(
@@ -2200,9 +2203,9 @@ mod tests {
                 content: json!("current question"),
             },
         ];
-        let policy = KiroRsToolCachePolicy {
+        let policy = ClaudeCodeToolCachePolicy {
             max_coverage_tokens: 3_000,
-            ..KiroRsToolCachePolicy::default()
+            ..ClaudeCodeToolCachePolicy::default()
         };
 
         let first = tracker.compute_kiro_rs_tool_with_bounds(
@@ -2257,15 +2260,15 @@ mod tests {
             10_000,
             &req.model,
             PromptCacheBounds::default(),
-            KiroRsToolCachePolicy::default(),
+            ClaudeCodeToolCachePolicy::default(),
         );
         assert_eq!(default_plan.usage().cache_creation_input_tokens, 0);
         assert_eq!(default_plan.usage().cache_read_input_tokens, 0);
 
-        let policy = KiroRsToolCachePolicy {
+        let policy = ClaudeCodeToolCachePolicy {
             cache_current_user_stable_prefix: true,
             current_user_stable_prefix_max_tokens: 1_500,
-            ..KiroRsToolCachePolicy::default()
+            ..ClaudeCodeToolCachePolicy::default()
         };
         let scope = test_scope("kiro-current-user-opt-in");
         let first = tracker.compute_kiro_rs_tool_with_bounds(
