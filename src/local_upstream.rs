@@ -17,6 +17,12 @@ pub(crate) mod call_trace {
         crate::kiro::call_trace::McpCallAttributionSink;
 }
 
+pub(crate) mod credentials {
+    pub(crate) type LocalUpstreamCredentials = crate::kiro::model::credentials::KiroCredentials;
+    pub(crate) type LocalUpstreamCredentialsConfig =
+        crate::kiro::model::credentials::CredentialsConfig;
+}
+
 pub(crate) mod dispatch {
     pub(crate) type LocalUpstreamAcquireMode = crate::kiro::token_manager::AcquireMode;
     pub(crate) type LocalUpstreamRouteState = crate::kiro::token_manager::LocalPoolRouteState;
@@ -76,6 +82,10 @@ pub(crate) mod model_catalog {
     #[cfg(test)]
     pub(crate) type LocalUpstreamModelTokenLimits =
         crate::kiro::model::available_models::KiroModelTokenLimits;
+}
+
+pub(crate) mod manager {
+    pub(crate) type LocalUpstreamCredentialManager = crate::kiro::token_manager::MultiTokenManager;
 }
 
 pub(crate) mod request {

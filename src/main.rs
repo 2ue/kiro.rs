@@ -40,13 +40,13 @@ use chrono::Utc;
 use clap::Parser;
 use common::auth::RequestApiKeyStore;
 use futures::StreamExt;
-use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
-use kiro::token_manager::MultiTokenManager;
 use local_upstream::{
+    credentials::{LocalUpstreamCredentials, LocalUpstreamCredentialsConfig},
     endpoint::{
         LocalUpstreamCliEndpoint, LocalUpstreamEndpoint, LocalUpstreamEndpointTrait,
         LocalUpstreamIdeEndpoint,
     },
+    manager::LocalUpstreamCredentialManager,
     provider::LocalUpstreamProvider,
 };
 use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
@@ -153,7 +153,7 @@ async fn main() {
     if let Some(command) = args.command {
         let credentials_path = args
             .credentials
-            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+            .unwrap_or_else(|| LocalUpstreamCredentials::default_credentials_path().to_string());
         if let Err(err) = handle_cli_command(command, &file_config, &credentials_path).await {
             tracing::error!("{}", err);
             std::process::exit(1);
@@ -255,8 +255,8 @@ async fn main() {
     if !credentials_exist && start_legacy_credential_provider {
         let credentials_path = args
             .credentials
-            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-        match CredentialsConfig::load(&credentials_path) {
+            .unwrap_or_else(|| LocalUpstreamCredentials::default_credentials_path().to_string());
+        match LocalUpstreamCredentialsConfig::load(&credentials_path) {
             Ok(file_credentials) => {
                 let file_credentials_list = file_credentials.into_sorted_credentials();
                 postgres_store
@@ -540,19 +540,20 @@ async fn main() {
     }
 
     // 创建运行时管理器。旧凭据 provider 仅在未启用上游账号运行时时安装。
-    let token_manager = MultiTokenManager::new_with_stores_and_runtime_state_and_account_info(
-        config.clone(),
-        credentials_list,
-        proxy_config.clone(),
-        Some(postgres_store.clone()),
-        Some(redis_store.clone()),
-        Some(initial_runtime_states),
-        Some(initial_account_info),
-    )
-    .unwrap_or_else(|e| {
-        tracing::error!("创建 Token 管理器失败: {}", e);
-        std::process::exit(1);
-    });
+    let token_manager =
+        LocalUpstreamCredentialManager::new_with_stores_and_runtime_state_and_account_info(
+            config.clone(),
+            credentials_list,
+            proxy_config.clone(),
+            Some(postgres_store.clone()),
+            Some(redis_store.clone()),
+            Some(initial_runtime_states),
+            Some(initial_account_info),
+        )
+        .unwrap_or_else(|e| {
+            tracing::error!("创建 Token 管理器失败: {}", e);
+            std::process::exit(1);
+        });
     let token_manager = Arc::new(token_manager);
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
     let account_runtime_manager = Arc::new(AccountRuntimeManager::new(
@@ -1325,7 +1326,7 @@ async fn new_ui_index_redirect() -> Redirect {
 
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
-    token_manager: Arc<MultiTokenManager>,
+    token_manager: Arc<LocalUpstreamCredentialManager>,
     account_runtime_manager: Arc<AccountRuntimeManager>,
     request_api_key_store: Arc<RequestApiKeyStore>,
     request_admission: Arc<anthropic::request_admission::RequestAdmissionController>,
@@ -1434,7 +1435,7 @@ async fn handle_cli_command(
     match command {
         Command::Credentials { command } => {
             // CLI 凭据诊断仍然面向本地文件，用于首次导入前排查 credentials.json。
-            let credentials_config = CredentialsConfig::load(credentials_path)?;
+            let credentials_config = LocalUpstreamCredentialsConfig::load(credentials_path)?;
             handle_credentials_command(command, config, credentials_config, credentials_path)
         }
         Command::Maintenance { command } => handle_maintenance_command(command, config).await,
@@ -1478,7 +1479,7 @@ async fn handle_maintenance_command(
 fn handle_credentials_command(
     command: CredentialsCommand,
     config: &Config,
-    credentials_config: CredentialsConfig,
+    credentials_config: LocalUpstreamCredentialsConfig,
     credentials_path: &str,
 ) -> anyhow::Result<()> {
     let is_multiple = credentials_config.is_multiple();
