@@ -109,7 +109,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin service credential backup, validation, balance and snapshot code now uses local-upstream credential/usage-limit/manager aliases instead of direct legacy credential manager imports.
 - The unmounted `src/test.rs` Kiro-specific manual stream caller was removed.
 - Account-route local auxiliary attempt traces now use local-upstream credential-attempt aliases instead of direct legacy call-trace paths.
-- Account-route Redis lease cleanup now uses an account-runtime critical storage-task alias instead of importing the helper from the legacy token-manager module.
+- Account-route Redis lease cleanup now uses an account-runtime critical storage-task alias, and that bridge now resolves through the local-upstream facade instead of direct legacy token-manager imports.
 - Main shutdown lifecycle now uses account-runtime storage-task aliases for best-effort storage task stats, drain and shutdown calls.
 - Postgres model-capability persistence now uses local-upstream model catalog aliases for reasoning cohort keys.
 - Postgres credential persistence and API-key bootstrap now use local-upstream credential aliases instead of direct legacy credential imports.

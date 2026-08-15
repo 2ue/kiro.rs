@@ -144,3 +144,12 @@ pub(crate) mod stream {
     pub(crate) type LocalUpstreamEventStreamDecoder =
         crate::kiro::parser::decoder::EventStreamDecoder;
 }
+
+pub(crate) mod storage_task {
+    pub(crate) use crate::kiro::token_manager::storage_task::{
+        best_effort_storage_task_stats as local_upstream_storage_task_stats,
+        drain_best_effort_storage_tasks as drain_local_upstream_storage_tasks,
+        shutdown_best_effort_storage_tasks as shutdown_local_upstream_storage_tasks,
+        spawn_critical_storage_task as spawn_local_upstream_critical_storage_task,
+    };
+}
