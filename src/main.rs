@@ -21,7 +21,13 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use account_runtime::AccountRuntimeManager;
+use account_runtime::{
+    AccountRuntimeManager,
+    storage_task::{
+        account_runtime_storage_task_stats, drain_account_runtime_storage_tasks,
+        shutdown_account_runtime_storage_tasks,
+    },
+};
 use anyhow::Context as _;
 use axum::{
     Json, Router,
@@ -797,7 +803,7 @@ async fn main() {
         || stats_report.pending_stats_deltas > 0
         || stats_report.pending_runtime_mutations > 0;
 
-    let storage_stats = kiro::token_manager::best_effort_storage_task_stats();
+    let storage_stats = account_runtime_storage_task_stats();
     let usage_drain_timeout =
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
     let storage_drain_timeout =
@@ -808,7 +814,7 @@ async fn main() {
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
     let (usage_drain, storage_drain, external_release_drain, scheduler_release_drained) = tokio::join!(
         usage_recorder.drain(usage_drain_timeout),
-        kiro::token_manager::drain_best_effort_storage_tasks(storage_drain_timeout),
+        drain_account_runtime_storage_tasks(storage_drain_timeout),
         account_runtime_manager.drain_release_intents(external_release_drain_timeout),
         token_manager.drain_scheduler_redis_releases(scheduler_release_drain_timeout),
     );
@@ -852,7 +858,7 @@ async fn main() {
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_SHUTDOWN_TIMEOUT);
     let (usage_report, storage_report) = tokio::join!(
         usage_recorder.shutdown(usage_shutdown_timeout),
-        kiro::token_manager::shutdown_best_effort_storage_tasks(storage_shutdown_timeout),
+        shutdown_account_runtime_storage_tasks(storage_shutdown_timeout),
     );
     tracing::info!(
         already_started = usage_report.already_started,

@@ -109,6 +109,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - The unmounted `src/test.rs` Kiro-specific manual stream caller was removed.
 - Account-route local auxiliary attempt traces now use local-upstream credential-attempt aliases instead of direct legacy call-trace paths.
 - Account-route Redis lease cleanup now uses an account-runtime critical storage-task alias instead of importing the helper from the legacy token-manager module.
+- Main shutdown lifecycle now uses account-runtime storage-task aliases for best-effort storage task stats, drain and shutdown calls.
 
 ## In Progress
 

@@ -9,7 +9,12 @@ pub mod migration;
 pub mod runtime;
 pub mod scheduler;
 pub(crate) mod storage_task {
-    pub(crate) use crate::kiro::token_manager::storage_task::spawn_critical_storage_task as spawn_account_runtime_critical_storage_task;
+    pub(crate) use crate::kiro::token_manager::storage_task::{
+        best_effort_storage_task_stats as account_runtime_storage_task_stats,
+        drain_best_effort_storage_tasks as drain_account_runtime_storage_tasks,
+        shutdown_best_effort_storage_tasks as shutdown_account_runtime_storage_tasks,
+        spawn_critical_storage_task as spawn_account_runtime_critical_storage_task,
+    };
 }
 pub mod store;
 pub mod usage;
