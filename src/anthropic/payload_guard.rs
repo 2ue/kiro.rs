@@ -1,9 +1,9 @@
-//! Final Kiro payload size guard.
+//! Final local-upstream payload size guard.
 //!
-//! Kiro upstream can return a generic `400 Improperly formed request` when the
-//! serialized request body is too large. This guard runs after Anthropic->Kiro
+//! The local upstream can return a generic `400 Improperly formed request` when the
+//! serialized request body is too large. This guard runs after Anthropic->local-upstream
 //! conversion, measures the actual JSON payload bytes, and trims old history
-//! entries while preserving Kiro history invariants.
+//! entries while preserving local-upstream history invariants.
 
 use std::{
     collections::HashSet,
@@ -14,10 +14,10 @@ use std::{
 use crate::anthropic::types::{
     Message as AnthropicMessage, MessagesRequest, Tool as AnthropicTool,
 };
-use crate::kiro::model::requests::{
-    conversation::{Message, UserInputMessage, UserMessage},
-    kiro::KiroRequest,
-    tool::{Tool, ToolResult},
+use crate::local_upstream::request::{
+    LocalUpstreamConversationMessage as Message, LocalUpstreamImage, LocalUpstreamRequest,
+    LocalUpstreamTool as Tool, LocalUpstreamToolResult as ToolResult,
+    LocalUpstreamUserInputMessage as UserInputMessage, LocalUpstreamUserMessage as UserMessage,
 };
 use crate::model::config::{OversizedImageHandling, PayloadShapingConfig};
 use bytes::Bytes;
@@ -416,7 +416,7 @@ impl std::fmt::Display for PayloadGuardError {
 }
 
 pub fn guard_kiro_request(
-    request: &mut KiroRequest,
+    request: &mut LocalUpstreamRequest,
     config: PayloadGuardConfig,
 ) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
     let guard_started_at = Instant::now();
@@ -518,7 +518,7 @@ pub fn guard_kiro_request(
         let shaping_started_at = Instant::now();
         reject_oversized_images_if_configured(
             config.shaping,
-            find_oversized_kiro_images(request, UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
+            find_oversized_local_upstream_images(request, UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
             UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
         )?;
         let safety_shaping = apply_payload_safety_shaping(request, config.shaping);
@@ -666,14 +666,14 @@ pub fn guard_kiro_request(
 }
 
 pub fn guard_local_upstream_request(
-    request: &mut KiroRequest,
+    request: &mut LocalUpstreamRequest,
     config: PayloadGuardConfig,
 ) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
     guard_kiro_request(request, config)
 }
 
 pub fn breakdown_kiro_request(
-    request: &KiroRequest,
+    request: &LocalUpstreamRequest,
     serialized_body: &str,
 ) -> PayloadByteBreakdown {
     let state = &request.conversation_state;
@@ -712,13 +712,13 @@ pub fn breakdown_kiro_request(
 }
 
 pub fn breakdown_local_upstream_request(
-    request: &KiroRequest,
+    request: &LocalUpstreamRequest,
     serialized_body: &str,
 ) -> PayloadByteBreakdown {
     breakdown_kiro_request(request, serialized_body)
 }
 
-pub fn diagnose_kiro_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiagnostics {
+pub fn diagnose_kiro_tool_use_format(request: &LocalUpstreamRequest) -> ToolUseFormatDiagnostics {
     let state = &request.conversation_state;
     let current_user = &state.current_message.user_input_message;
     let current_context = &current_user.user_input_message_context;
@@ -896,7 +896,9 @@ pub fn diagnose_kiro_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiag
     }
 }
 
-pub fn diagnose_local_upstream_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiagnostics {
+pub fn diagnose_local_upstream_tool_use_format(
+    request: &LocalUpstreamRequest,
+) -> ToolUseFormatDiagnostics {
     diagnose_kiro_tool_use_format(request)
 }
 
@@ -1411,17 +1413,17 @@ fn sha256_hex(value: &str) -> String {
     sha256_hex_bytes(value.as_bytes())
 }
 
-pub fn serialize_kiro_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
+pub fn serialize_kiro_request(request: &LocalUpstreamRequest) -> Result<String, PayloadGuardError> {
     serialize_request(request)
 }
 
 pub fn serialize_local_upstream_request(
-    request: &KiroRequest,
+    request: &LocalUpstreamRequest,
 ) -> Result<String, PayloadGuardError> {
     serialize_kiro_request(request)
 }
 
-fn serialize_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
+fn serialize_request(request: &LocalUpstreamRequest) -> Result<String, PayloadGuardError> {
     let normalized_request;
     let request = if request
         .additional_model_request_fields
@@ -1458,7 +1460,7 @@ fn serialize_anthropic_request(request: &MessagesRequest) -> Result<String, Payl
     serde_json::to_string(request).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
 }
 
-fn set_cache_point_report_fields(report: &mut PayloadGuardReport, request: &KiroRequest) {
+fn set_cache_point_report_fields(report: &mut PayloadGuardReport, request: &LocalUpstreamRequest) {
     if !request.cache_point_plan_recording_enabled {
         return;
     }
@@ -1467,7 +1469,7 @@ fn set_cache_point_report_fields(report: &mut PayloadGuardReport, request: &Kiro
         valid_tool_cache_point_insertions(request, &request.tool_cache_point_insert_after);
 }
 
-fn valid_tool_cache_point_insertions(request: &KiroRequest, plan: &[usize]) -> usize {
+fn valid_tool_cache_point_insertions(request: &LocalUpstreamRequest, plan: &[usize]) -> usize {
     if plan.is_empty() {
         return 0;
     }
@@ -1754,7 +1756,7 @@ fn history_reasoning_content_stats(history: &[Message]) -> (usize, usize) {
         })
 }
 
-fn kiro_image_source_bytes(image: &crate::kiro::model::requests::conversation::KiroImage) -> usize {
+fn local_upstream_image_source_bytes(image: &LocalUpstreamImage) -> usize {
     image
         .source
         .bytes
@@ -1853,8 +1855,8 @@ fn reject_oversized_images_if_configured(
     })
 }
 
-fn find_oversized_kiro_images(
-    request: &KiroRequest,
+fn find_oversized_local_upstream_images(
+    request: &LocalUpstreamRequest,
     max_source_bytes: usize,
 ) -> OversizedImageViolation {
     if max_source_bytes == 0 {
@@ -1868,7 +1870,7 @@ fn find_oversized_kiro_images(
         .user_input_message
         .images
     {
-        let bytes = kiro_image_source_bytes(image);
+        let bytes = local_upstream_image_source_bytes(image);
         if bytes > max_source_bytes {
             violation.current_images += 1;
             violation.current_image_bytes += bytes;
@@ -1879,7 +1881,7 @@ fn find_oversized_kiro_images(
             continue;
         };
         for image in &user.user_input_message.images {
-            let bytes = kiro_image_source_bytes(image);
+            let bytes = local_upstream_image_source_bytes(image);
             if bytes > max_source_bytes {
                 violation.historical_images += 1;
                 violation.historical_image_bytes += bytes;
@@ -1909,7 +1911,7 @@ fn drop_oversized_history_images(
         }
         let before = images.len();
         images.retain(|image| {
-            let bytes = kiro_image_source_bytes(image);
+            let bytes = local_upstream_image_source_bytes(image);
             if bytes > max_source_bytes {
                 dropped += 1;
                 dropped_bytes += bytes;
@@ -1983,7 +1985,7 @@ fn add_current_shaping_stats_to_report(
 }
 
 fn apply_payload_safety_shaping(
-    request: &mut KiroRequest,
+    request: &mut LocalUpstreamRequest,
     config: PayloadShapingConfig,
 ) -> ShapingStats {
     let mut stats = ShapingStats::default();
@@ -2024,7 +2026,7 @@ fn apply_anthropic_payload_safety_shaping(
 }
 
 fn apply_current_payload_safety_shaping(
-    request: &mut KiroRequest,
+    request: &mut LocalUpstreamRequest,
     config: PayloadShapingConfig,
 ) -> CurrentShapingStats {
     let mut stats = CurrentShapingStats::default();
@@ -2064,7 +2066,10 @@ pub fn sanitize_anthropic_messages_for_account_forwarding(
     apply_anthropic_payload_safety_shaping(request, config).was_modified()
 }
 
-fn apply_payload_shaping(request: &mut KiroRequest, config: PayloadShapingConfig) -> ShapingStats {
+fn apply_payload_shaping(
+    request: &mut LocalUpstreamRequest,
+    config: PayloadShapingConfig,
+) -> ShapingStats {
     let mut stats = ShapingStats::default();
 
     if config.truncate_historical_tool_results {
@@ -3370,7 +3375,7 @@ fn current_payload_shaping_enabled(config: PayloadShapingConfig) -> bool {
 }
 
 fn apply_current_payload_shaping_until_fit(
-    request: &mut KiroRequest,
+    request: &mut LocalUpstreamRequest,
     config: PayloadShapingConfig,
     max_bytes: usize,
     body: String,
@@ -3957,7 +3962,7 @@ fn nested_value_mut<'a>(value: &'a mut Value, path: &[&str]) -> Option<&'a mut V
 }
 
 fn truncate_current_tool_results(
-    request: &mut KiroRequest,
+    request: &mut LocalUpstreamRequest,
     max_chars: Option<usize>,
 ) -> (usize, usize) {
     let Some(max_chars) = max_chars else {
@@ -4212,7 +4217,7 @@ fn drop_oversized_current_images(
     let before = user.images.len();
     let mut dropped_bytes = 0usize;
     user.images.retain(|image| {
-        let bytes = kiro_image_source_bytes(image);
+        let bytes = local_upstream_image_source_bytes(image);
         if bytes > max_source_bytes {
             dropped_bytes += bytes;
             false
@@ -4383,7 +4388,7 @@ impl RepairStats {
     }
 }
 
-fn repair_request(request: &mut KiroRequest) -> RepairStats {
+fn repair_request(request: &mut LocalUpstreamRequest) -> RepairStats {
     let mut stats = RepairStats::default();
     let conversation_state = &mut request.conversation_state;
     let history = &mut conversation_state.history;
@@ -4772,21 +4777,26 @@ fn append_text(content: &mut String, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiro::model::requests::conversation::{
-        AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-        HistoryUserMessage, KiroImage, ReasoningContent, UserInputMessage, UserInputMessageContext,
-    };
-    use crate::kiro::model::requests::kiro::{
-        AdditionalModelRequestFields, KiroOutputConfig, KiroThinkingConfig,
-    };
-    use crate::kiro::model::requests::tool::{
-        InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
+    use crate::local_upstream::request::{
+        LocalUpstreamAdditionalModelRequestFields,
+        LocalUpstreamAssistantMessage as AssistantMessage,
+        LocalUpstreamConversationState as ConversationState,
+        LocalUpstreamCurrentMessage as CurrentMessage,
+        LocalUpstreamHistoryAssistantMessage as HistoryAssistantMessage,
+        LocalUpstreamHistoryUserMessage as HistoryUserMessage, LocalUpstreamImage,
+        LocalUpstreamInputSchema as InputSchema, LocalUpstreamOutputConfig,
+        LocalUpstreamReasoningContent as ReasoningContent, LocalUpstreamThinkingConfig,
+        LocalUpstreamTool as Tool, LocalUpstreamToolResult as ToolResult,
+        LocalUpstreamToolSpecification as ToolSpecification,
+        LocalUpstreamToolUseEntry as ToolUseEntry,
+        LocalUpstreamUserInputMessage as UserInputMessage,
+        LocalUpstreamUserInputMessageContext as UserInputMessageContext,
     };
 
     const TEST_MODEL: &str = "test-model";
 
-    fn request_with_history(history: Vec<Message>) -> KiroRequest {
-        KiroRequest {
+    fn request_with_history(history: Vec<Message>) -> LocalUpstreamRequest {
+        LocalUpstreamRequest {
             conversation_state: ConversationState::new("conv-test")
                 .with_current_message(CurrentMessage::new(UserInputMessage::new(
                     "current", TEST_MODEL,
@@ -4829,16 +4839,17 @@ mod tests {
     {
         for round in 0..5 {
             let mut request = request_with_history(Vec::new());
-            request.additional_model_request_fields = Some(AdditionalModelRequestFields {
-                thinking: Some(KiroThinkingConfig {
-                    thinking_type: "disabled".to_string(),
-                    display: None,
-                }),
-                output_config: Some(KiroOutputConfig {
-                    effort: "max".to_string(),
-                }),
-                reasoning: None,
-            });
+            request.additional_model_request_fields =
+                Some(LocalUpstreamAdditionalModelRequestFields {
+                    thinking: Some(LocalUpstreamThinkingConfig {
+                        thinking_type: "disabled".to_string(),
+                        display: None,
+                    }),
+                    output_config: Some(LocalUpstreamOutputConfig {
+                        effort: "max".to_string(),
+                    }),
+                    reasoning: None,
+                });
 
             let body = serialize_kiro_request(&request).expect("serialize Kiro request");
             let value: Value = serde_json::from_str(&body).expect("Kiro body JSON");
@@ -6083,7 +6094,7 @@ mod tests {
 
     #[test]
     fn guard_marks_oversized_without_rejecting_current_message() {
-        let mut request = KiroRequest {
+        let mut request = LocalUpstreamRequest {
             conversation_state: ConversationState::new("conv-test").with_current_message(
                 CurrentMessage::new(UserInputMessage::new("x".repeat(10_000), TEST_MODEL)),
             ),
@@ -6292,7 +6303,7 @@ mod tests {
             .iter()
             .find_map(|(mapped, original)| (original == "Bash").then(|| mapped.clone()))
             .expect("mapped Bash name");
-        let mut request = KiroRequest {
+        let mut request = LocalUpstreamRequest {
             conversation_state: converted.conversation_state,
             profile_arn: None,
             additional_model_request_fields: converted.additional_model_request_fields,
@@ -6341,7 +6352,7 @@ mod tests {
 
     #[test]
     fn converted_20_and_100_cycle_histories_trim_atomically_for_five_rounds() {
-        fn build_request(tool_cycles: usize) -> (KiroRequest, String) {
+        fn build_request(tool_cycles: usize) -> (LocalUpstreamRequest, String) {
             let mut messages = vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("run structured check 0"),
@@ -6413,7 +6424,7 @@ mod tests {
                 .find_map(|(mapped, original)| (original == "Bash").then(|| mapped.clone()))
                 .expect("mapped Bash name");
             (
-                KiroRequest {
+                LocalUpstreamRequest {
                     conversation_state: converted.conversation_state,
                     profile_arn: None,
                     additional_model_request_fields: converted.additional_model_request_fields,
@@ -6642,7 +6653,7 @@ mod tests {
                 ToolResult::success("tool-last", "duplicate"),
             ]);
 
-        let request = KiroRequest {
+        let request = LocalUpstreamRequest {
             conversation_state: ConversationState::new("conv-test")
                 .with_history(vec![
                     Message::Assistant(first_assistant),
@@ -6699,7 +6710,7 @@ mod tests {
                 },
             }]);
 
-        let request = KiroRequest {
+        let request = LocalUpstreamRequest {
             conversation_state: ConversationState::new("conv-test")
                 .with_current_message(CurrentMessage::new(current)),
             profile_arn: None,
@@ -6752,7 +6763,7 @@ mod tests {
                 },
             }]);
 
-        let request = KiroRequest {
+        let request = LocalUpstreamRequest {
             conversation_state: ConversationState::new("conv-test")
                 .with_current_message(CurrentMessage::new(current)),
             profile_arn: None,
@@ -6883,7 +6894,7 @@ mod tests {
                 },
             },
         ]);
-        let mut request = KiroRequest {
+        let mut request = LocalUpstreamRequest {
             conversation_state: ConversationState::new("conv-test")
                 .with_current_message(CurrentMessage::new(current)),
             profile_arn: None,
@@ -7310,8 +7321,8 @@ mod tests {
             .current_message
             .user_input_message
             .images = vec![
-            KiroImage::from_base64("png", "a".repeat(12_000)),
-            KiroImage::from_base64("jpeg", "b".repeat(12_000)),
+            LocalUpstreamImage::from_base64("png", "a".repeat(12_000)),
+            LocalUpstreamImage::from_base64("jpeg", "b".repeat(12_000)),
         ];
 
         let (body, report) = guard_kiro_request(
@@ -7379,14 +7390,14 @@ mod tests {
                 .current_message
                 .user_input_message
                 .images = (0..4)
-                .map(|_| KiroImage::from_base64("png", encoded.clone()))
+                .map(|_| LocalUpstreamImage::from_base64("png", encoded.clone()))
                 .collect();
             let mut one_kiro_image = request_with_history(Vec::new());
             one_kiro_image
                 .conversation_state
                 .current_message
                 .user_input_message
-                .images = vec![KiroImage::from_base64("png", encoded.clone())];
+                .images = vec![LocalUpstreamImage::from_base64("png", encoded.clone())];
             let kiro_target = serialize_kiro_request(&one_kiro_image)
                 .unwrap()
                 .len()
@@ -7821,9 +7832,9 @@ mod tests {
                     "round {round}"
                 );
 
-                let kiro = KiroImage::from_base64("png", encoded);
+                let kiro = LocalUpstreamImage::from_base64("png", encoded);
                 assert_eq!(
-                    kiro_image_source_bytes(&kiro),
+                    local_upstream_image_source_bytes(&kiro),
                     decoded_bytes,
                     "round {round}"
                 );
@@ -7863,7 +7874,7 @@ mod tests {
             kiro.conversation_state
                 .current_message
                 .user_input_message
-                .images = vec![KiroImage::from_base64(
+                .images = vec![LocalUpstreamImage::from_base64(
                 "png",
                 base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
             )];
@@ -8376,7 +8387,8 @@ mod tests {
     #[test]
     fn image_history_bytes_are_counted() {
         let mut user = HistoryUserMessage::new("image", TEST_MODEL);
-        user.user_input_message.images = vec![KiroImage::from_base64("png", "a".repeat(2048))];
+        user.user_input_message.images =
+            vec![LocalUpstreamImage::from_base64("png", "a".repeat(2048))];
         let mut request = request_with_history(vec![Message::User(user)]);
 
         let (_body, report) =
@@ -8388,7 +8400,7 @@ mod tests {
     #[test]
     fn kiro_guard_drops_oversized_historical_images_even_when_body_fits() {
         let mut user = HistoryUserMessage::new("image", TEST_MODEL);
-        user.user_input_message.images = vec![KiroImage::from_base64(
+        user.user_input_message.images = vec![LocalUpstreamImage::from_base64(
             "png",
             base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
         )];
@@ -8419,7 +8431,7 @@ mod tests {
             .conversation_state
             .current_message
             .user_input_message
-            .images = vec![KiroImage::from_base64(
+            .images = vec![LocalUpstreamImage::from_base64(
             "png",
             base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
         )];
@@ -8458,7 +8470,7 @@ mod tests {
             .conversation_state
             .current_message
             .user_input_message
-            .images = vec![KiroImage::from_base64(
+            .images = vec![LocalUpstreamImage::from_base64(
             "png",
             base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
         )];
