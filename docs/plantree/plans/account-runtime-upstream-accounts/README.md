@@ -124,6 +124,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor. The underlying concrete type is still the legacy provider until the provider implementation is replaced, but the Claude/Anthropic protocol boundary no longer exposes a Kiro-named provider field.
 - Anthropic converter module docs, diagnostics, collision errors and compatibility comments now use local-upstream/upstream-safe wording instead of presenting the request conversion as a Kiro protocol surface. The concrete legacy request type remains isolated behind the current local-upstream body boundary until the provider/body implementation is replaced.
 - The model capability seed/source boundary now uses upstream-account terminology. New seed/status writes use `upstream-model-seed` and `upstream-account-model-catalog`, old `kiro-*` source values are normalized on read, and main/Admin model capability sync call the account-neutral `sync_from_upstream_catalog` entrypoint while the legacy provider method remains a compatibility delegate.
+- Stale Kiro-named model capability sync wrappers were removed; runtime and test callers now use upstream-named sync entrypoints directly.
 - Native WebSearch MCP routing now enters through local-auxiliary-upstream names in `websearch.rs`: provider/error helper wrappers, MCP call helper names and runtime comments no longer present WebSearch as a Kiro MCP surface. The concrete legacy provider type and timeout config field remain compatibility details behind the wrapper.
 - `local_upstream` now provides a compatibility facade for the current legacy local provider/call-trace response types. Anthropic router, middleware, handler and WebSearch boundaries import local-upstream aliases instead of directly depending on legacy provider type names, while the underlying implementation remains unchanged.
 - The `local_upstream` facade now also exposes request/event aliases for local-upstream request bodies, tool-use diagnostics and metadata usage. `payload_guard_runtime`, `tool_format_debug`, `cache` and native reasoning comments use those aliases/neutral wording instead of importing legacy request/event types directly at those small boundaries.
@@ -344,6 +345,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh converter-neutral-text-test1 -- bash -lc 'cargo check && cargo test convert_tools_rejects -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh upstream-model-source-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh upstream-model-source-test3 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh upstream-model-sync-wrapper-remove-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-model-sync-wrapper-remove-test1 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-aux-mcp-websearch-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-aux-mcp-websearch-test1 -- bash -lc 'cargo check && cargo test websearch -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-facade-fmt4 -- cargo fmt`

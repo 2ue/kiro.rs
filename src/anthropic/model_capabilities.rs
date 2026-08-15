@@ -718,27 +718,12 @@ impl ModelCapabilitiesCatalog {
         )
     }
 
-    pub fn sync_from_kiro_catalog(
-        &self,
-        catalog: LocalUpstreamAvailableModelCatalog,
-    ) -> ModelCapabilitiesStatus {
-        self.sync_from_upstream_catalog(catalog)
-    }
-
     #[cfg(test)]
     pub fn sync_from_upstream_models(
         &self,
         models: Vec<LocalUpstreamAvailableModel>,
     ) -> ModelCapabilitiesStatus {
         self.sync_from_upstream_models_with_cohort(models, None, true, 1, 1)
-    }
-
-    #[cfg(test)]
-    pub fn sync_from_kiro_models(
-        &self,
-        models: Vec<LocalUpstreamAvailableModel>,
-    ) -> ModelCapabilitiesStatus {
-        self.sync_from_upstream_models(models)
     }
 
     fn sync_from_upstream_models_with_cohort(
