@@ -111,6 +111,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic handler call sites now enter local-upstream payload guard wrappers (`guard_local_upstream_request` / `serialize_local_upstream_request`) instead of calling legacy Kiro-named guard functions directly. The old guard functions remain inside the concrete legacy local payload implementation while request handling, cache-point retry and thinking-signature retry use local-upstream naming.
 - Local-upstream payload diagnostics now enter through `breakdown_local_upstream_request` and `diagnose_local_upstream_tool_use_format`, so handler and local body pipeline diagnostics no longer call Kiro-named payload breakdown/tool-format helpers directly.
 - Account-route body/model/retry pipeline diagnostics now use account wording for normalized/raw payload guard, model rewrite, model mapping and model cooldown errors while the delegated executor types remain under the legacy `external_pool` module.
+- Account-route usage debug JSON now writes its local processing details under `upstreamProcessing` instead of the old Kiro-named processing key.
 - `PreparedLocalUpstreamBody` now exposes its typed local body as `local_upstream_request` instead of `kiro_request`, and the local-upstream conversion/diagnostic helper parameters use local-upstream naming at that boundary. The concrete payload type remains the legacy `KiroRequest` until the provider/body implementation is replaced.
 - Account-route model processing helpers now use account names (`account_outbound_model_for_raw`, `process_account_model`, `account_model_processing_error`) inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while compatibility config fields such as `external_pool_same_pool_*` remain unchanged.
@@ -302,6 +303,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-pipeline-errors-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-pipeline-errors-test1 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-pipeline-errors-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-usage-debug-processing-name-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-usage-debug-processing-name-test1 -- bash -lc 'cargo check && cargo test external_pool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh account-model-helper-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-model-helper-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-model-helper-test1 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`

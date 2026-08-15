@@ -1825,7 +1825,7 @@ fn external_pool_usage_debug_non_stream_record(ctx: ExternalUsageDebugNonStreamR
         "outboundRequest": {
             "body": external_pool_usage_debug_bytes(outbound_body, max_bytes),
         },
-        "kiroRsProcessing": {
+        "upstreamProcessing": {
             "usageCapture": external_pool_usage_debug_capture(&projected.usage_capture),
             "protocolContamination": projected.protocol_contamination,
             "downstreamBodyChanged": projected.body.as_ref() != upstream_body.as_ref(),
@@ -1886,7 +1886,7 @@ fn external_pool_usage_debug_stream_record(ctx: ExternalUsageDebugStreamRecordCo
         "outboundRequest": {
             "body": external_pool_usage_debug_bytes(outbound_body, max_bytes),
         },
-        "kiroRsProcessing": {
+        "upstreamProcessing": {
             "terminalStatus": status,
             "terminalMessage": terminal_message,
             "estimatedOutputTokensFromForwardedStream": estimated_output_tokens,

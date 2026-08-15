@@ -71,6 +71,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Official upstream error-message extraction now uses account-neutral envelope/helper names while preserving the public-message filtering that blocks sensitive or internal scheduler/account/provider wording from downstream protocol errors.
 - Payload guard runtime wrappers and account-forwarding sanitizer now use local-upstream/account names, while the concrete legacy local payload type remains isolated until the provider/body implementation is replaced.
 - Account-route body/model/retry pipeline diagnostics now use account wording for payload guard, model rewrite, model mapping and cooldown failures inside the delegated legacy executor.
+- Account-route usage debug JSON now writes local processing details under `upstreamProcessing` instead of the old Kiro-named processing key.
 - Account-route model processing helpers now use account names for outbound raw model selection and model processing errors inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while old config field names remain compatibility storage.
 - Core retry/failover tests now use same-account/cross-account terminology for behavior names and assertions while compatibility config fixture fields remain unchanged.
