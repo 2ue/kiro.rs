@@ -1648,7 +1648,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
     assert_eq!(
         kiro_upstream.state.normal_hits(),
         0,
-        "direct account policy must not call local Kiro upstream for stream or non-stream"
+        "direct account policy must not call local upstream for stream or non-stream"
     );
 }
 
@@ -4231,13 +4231,13 @@ async fn run_single_credential_precommit_retry_matrix() {
 
     let logs = captured.snapshot();
     assert_eq!(
-        logs.matches("本地 Kiro 流式响应在首个下游事件前失败，准备换号重试")
+        logs.matches("本地上游流式响应在首个下游事件前失败，准备换号重试")
             .count(),
         5,
         "logs={logs}"
     );
     assert_eq!(
-        logs.matches("本地 Kiro 流式首输出前重试失败").count(),
+        logs.matches("本地上游流式首输出前重试失败").count(),
         5,
         "logs={logs}"
     );
@@ -4679,7 +4679,7 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
                 assert!(
                     (record.kiro_metering_usage - expected_upstream_metering_units).abs()
                         < 0.000_001,
-                    "fault={fault:?} stream={stream} round={round} legacy_kiro_metering_usage={}",
+                    "fault={fault:?} stream={stream} round={round} legacy_metering_usage={}",
                     record.kiro_metering_usage
                 );
                 if matches!(fault, HandlerEventStreamFault::UsageOnlyMeteringNoStatus) {
@@ -5354,7 +5354,7 @@ fn direct_account_policy_resolves_model_before_route_request() {
     );
     assert!(
         source.contains("account_route_model_resolution(direct_model_resolution)"),
-        "direct account policy must use the same processed 模型（上游） that local Kiro dispatch would use"
+        "direct account policy must use the same processed 模型（上游） that local upstream dispatch would use"
     );
 }
 

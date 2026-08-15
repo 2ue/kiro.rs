@@ -189,9 +189,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `kiroApiKey` remains only as a compatibility fallback when reading older credential/import objects.
 - Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
 - Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
+- Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
 
 Last verified on 2026-08-16:
 
+- `rg -n "local Kiro|本地 Kiro|Kiro dispatch|legacy_kiro_metering_usage" src/anthropic/handlers/tests.rs`
+- `feature/tests/run-cargo-scoped.sh handler-local-upstream-test-text-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh handler-local-upstream-test-text-test1 -- bash -lc 'cargo test direct_account_policy -- --nocapture && cargo test stream_pre_output -- --nocapture && cargo test metering -- --nocapture && cargo test official_upstream_message_with_internal_brand_term_is_masked -- --nocapture'`
+- `git diff --check`
 - `rg -n "Kiro 额度|Anthropic/Kiro|Kiro API|Kiro 上游|Kiro credits|kiroApiKey 的" admin-ui/src/types/api.ts admin-ui/src/components/usage-records-panel.tsx src/admin/types.rs`
 - `feature/tests/run-cargo-scoped.sh admin-upstream-comment-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh admin-upstream-comment-text-test1 -- cargo test admin::types -- --nocapture`
