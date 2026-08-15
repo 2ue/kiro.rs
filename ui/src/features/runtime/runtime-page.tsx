@@ -101,7 +101,7 @@ const runtimeSections: Array<{
   { key: 'cachePolicy', title: '缓存策略', desc: '策略模板默认参数和路径绑定', icon: <Zap className="h-4 w-4" /> },
   { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
   { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
-  { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
+  { key: 'compat', title: '接口兼容', desc: '兼容模式、本地上游工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
 ]
 
 // ─── 原子组件 ──────────────────────────────────────────────────────────────────
@@ -1492,8 +1492,8 @@ export function RuntimePage() {
                     </p>
                   </div>
                   <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">Kiro 工作模式</div>
-                    <Select value={draft.kiroAgentModeStrategy} onValueChange={(v) => set('kiroAgentModeStrategy')(v as LocalUpstreamAgentModeStrategy)}>
+                    <div className="text-sm font-semibold">本地上游工作模式</div>
+                    <Select value={draft.localUpstreamAgentModeStrategy} onValueChange={(v) => set('localUpstreamAgentModeStrategy')(v as LocalUpstreamAgentModeStrategy)}>
                       <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="vibe">Vibe</SelectItem>
@@ -1502,9 +1502,9 @@ export function RuntimePage() {
                       </SelectContent>
                     </Select>
                     <p className="text-xs leading-5 text-muted-foreground">
-                      {draft.kiroAgentModeStrategy === 'auto'
+                      {draft.localUpstreamAgentModeStrategy === 'auto'
                         ? '根据请求内容自动选择工作方式。'
-                        : draft.kiroAgentModeStrategy === 'spec'
+                        : draft.localUpstreamAgentModeStrategy === 'spec'
                           ? '偏向规格化流程，适合明确需求和分步骤实现。'
                           : '偏向自由对话流程，适合快速探索和直接执行。'}
                     </p>

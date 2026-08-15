@@ -82,6 +82,7 @@ type LocalUpstreamRuntimeConfigKeys =
   | 'localUpstreamCachePointEnabled'
   | 'localUpstreamCachePointToolsOnly'
   | 'localUpstreamCachePointRecordPlan'
+  | 'localUpstreamAgentModeStrategy'
 
 type LegacyLocalUpstreamRuntimeConfigWire = {
   kiroUpstreamResponseTimeoutSecs?: number
@@ -94,6 +95,7 @@ type LegacyLocalUpstreamRuntimeConfigWire = {
   kiroCachePointEnabled?: boolean
   kiroCachePointToolsOnly?: boolean
   kiroCachePointRecordPlan?: boolean
+  kiroAgentModeStrategy?: RuntimeConfig['localUpstreamAgentModeStrategy']
 }
 
 type RuntimeConfigWire = Omit<
@@ -117,6 +119,7 @@ function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
     kiroCachePointEnabled,
     kiroCachePointToolsOnly,
     kiroCachePointRecordPlan,
+    kiroAgentModeStrategy,
     ...current
   } = data
   const accountRuntime = data.accountRuntime ?? data.externalPools ?? defaultAccountRuntimeConfig()
@@ -142,6 +145,8 @@ function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
       data.localUpstreamCachePointToolsOnly ?? kiroCachePointToolsOnly ?? true,
     localUpstreamCachePointRecordPlan:
       data.localUpstreamCachePointRecordPlan ?? kiroCachePointRecordPlan ?? true,
+    localUpstreamAgentModeStrategy:
+      data.localUpstreamAgentModeStrategy ?? kiroAgentModeStrategy ?? 'vibe',
     accountRuntime,
     externalPools: accountRuntime,
   } as RuntimeConfig

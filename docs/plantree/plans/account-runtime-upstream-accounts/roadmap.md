@@ -133,6 +133,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Main startup local API-key bootstrap variables and Admin supported-model normalization variables now use local-upstream/upstream naming while legacy environment/config field names remain compatibility boundaries.
 - Local-upstream timeout, stream-retry and base-URL runtime config fields now use `local_upstream_*` / `localUpstream*` as primary Rust/Admin/UI names, while old `kiroUpstream*` config/request/response shapes remain read-only compatibility aliases.
 - Local-upstream cachePoint runtime config fields now use `local_upstream_cache_point_*` / `localUpstreamCachePoint*` as primary Rust/Admin/UI names, while old `kiroCachePoint*` config/request/response shapes remain read-only compatibility aliases.
+- Local-upstream agent-mode runtime config now uses `local_upstream_agent_mode_strategy` / `localUpstreamAgentModeStrategy` as primary Rust/Admin/UI names, while old `kiroAgentModeStrategy` config/request/response shapes remain read-only compatibility aliases.
 
 ## In Progress
 

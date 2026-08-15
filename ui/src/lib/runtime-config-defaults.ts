@@ -523,7 +523,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
-  kiroAgentModeStrategy: 'vibe',
+  localUpstreamAgentModeStrategy: 'vibe',
   modelResolutionMode: 'compatible',
   modelMapping: defaultModelMappingConfig(),
   extractThinking: true,

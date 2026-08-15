@@ -161,7 +161,7 @@ pub fn resolve_streaming_profile_arn(
 }
 
 pub fn resolve_agent_mode(credentials: &KiroCredentials, config: &Config) -> &'static str {
-    match config.kiro_agent_mode_strategy {
+    match config.local_upstream_agent_mode_strategy {
         LocalUpstreamAgentModeStrategy::Vibe => "vibe",
         LocalUpstreamAgentModeStrategy::Spec => "spec",
         LocalUpstreamAgentModeStrategy::Auto => {
@@ -390,12 +390,12 @@ mod tests {
 
         assert_eq!(resolve_agent_mode(&social, &config), "vibe");
 
-        config.kiro_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
+        config.local_upstream_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
         assert_eq!(resolve_agent_mode(&social, &config), "spec");
         assert_eq!(resolve_agent_mode(&idc, &config), "vibe");
         assert_eq!(resolve_agent_mode(&api_key, &config), "vibe");
 
-        config.kiro_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Spec;
+        config.local_upstream_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Spec;
         assert_eq!(resolve_agent_mode(&idc, &config), "spec");
     }
 }

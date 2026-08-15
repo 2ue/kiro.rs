@@ -639,7 +639,7 @@ mod tests {
             ..Default::default()
         };
         let mut config = Config::default();
-        config.kiro_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
+        config.local_upstream_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
         let ctx = RequestContext {
             credentials: &credentials,
             token: "token",

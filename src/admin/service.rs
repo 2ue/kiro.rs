@@ -5070,7 +5070,7 @@ impl AdminService {
             external_pools: config.account_runtime_config().clone(),
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
-            kiro_agent_mode_strategy: config.kiro_agent_mode_strategy,
+            local_upstream_agent_mode_strategy: config.local_upstream_agent_mode_strategy,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
             extract_thinking: config.extract_thinking,
@@ -5343,9 +5343,9 @@ impl AdminService {
             .high_cache_threshold
             .unwrap_or(current_config.high_cache_threshold);
         let compat_profile = req.compat_profile.unwrap_or(current_config.compat_profile);
-        let kiro_agent_mode_strategy = req
-            .kiro_agent_mode_strategy
-            .unwrap_or(current_config.kiro_agent_mode_strategy);
+        let local_upstream_agent_mode_strategy = req
+            .local_upstream_agent_mode_strategy
+            .unwrap_or(current_config.local_upstream_agent_mode_strategy);
         let model_resolution_mode = req
             .model_resolution_mode
             .unwrap_or(current_config.model_resolution_mode);
@@ -5709,7 +5709,7 @@ impl AdminService {
                 config.set_account_runtime_config(account_runtime);
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
-                config.kiro_agent_mode_strategy = kiro_agent_mode_strategy;
+                config.local_upstream_agent_mode_strategy = local_upstream_agent_mode_strategy;
                 config.model_resolution_mode = model_resolution_mode;
                 config.model_mapping = model_mapping;
                 config.extract_thinking = extract_thinking;

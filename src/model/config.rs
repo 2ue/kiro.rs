@@ -2532,10 +2532,10 @@ impl Default for ThinkingTriggerMode {
     }
 }
 
-/// Kiro IDE `x-amzn-kiro-agent-mode` header strategy.
+/// Local-upstream agent-mode compatibility strategy.
 ///
-/// `vibe` preserves the current Kiro IDE / Claude Code compatible behavior.
-/// `spec` forces the alternate Kiro planning-oriented mode. `auto` derives the
+/// `vibe` preserves the current Claude Code compatible behavior.
+/// `spec` forces the alternate planning-oriented mode. `auto` derives the
 /// mode from credential protocol metadata: IdC, Enterprise/external IdP and API
 /// key credentials stay on `vibe`; social/provider credentials use `spec`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3820,9 +3820,12 @@ pub struct Config {
     #[serde(default = "default_compat_profile")]
     pub compat_profile: CompatProfile,
 
-    /// Kiro IDE agent-mode header 策略（默认 vibe，保持现有成功链路）。
-    #[serde(default = "default_kiro_agent_mode_strategy")]
-    pub kiro_agent_mode_strategy: LocalUpstreamAgentModeStrategy,
+    /// 本地上游 agent-mode header 策略（默认 vibe，保持现有成功链路）。
+    #[serde(
+        default = "default_local_upstream_agent_mode_strategy",
+        alias = "kiroAgentModeStrategy"
+    )]
+    pub local_upstream_agent_mode_strategy: LocalUpstreamAgentModeStrategy,
 
     /// 请求模型解析策略（默认 compatible）。
     ///
@@ -4278,7 +4281,7 @@ fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
 
-fn default_kiro_agent_mode_strategy() -> LocalUpstreamAgentModeStrategy {
+fn default_local_upstream_agent_mode_strategy() -> LocalUpstreamAgentModeStrategy {
     LocalUpstreamAgentModeStrategy::Vibe
 }
 
@@ -4881,7 +4884,7 @@ impl Default for Config {
             selection_failure_sample_limit: default_selection_failure_sample_limit(),
             selection_failure_record_enabled: default_selection_failure_record_enabled(),
             compat_profile: default_compat_profile(),
-            kiro_agent_mode_strategy: default_kiro_agent_mode_strategy(),
+            local_upstream_agent_mode_strategy: default_local_upstream_agent_mode_strategy(),
             model_resolution_mode: default_model_resolution_mode(),
             model_mapping: ModelMappingConfig::default(),
             extract_thinking: default_extract_thinking(),
@@ -5387,9 +5390,9 @@ mod tests {
     }
 
     #[test]
-    fn default_kiro_agent_mode_strategy_preserves_vibe() {
+    fn default_local_upstream_agent_mode_strategy_preserves_vibe() {
         assert_eq!(
-            Config::default().kiro_agent_mode_strategy,
+            Config::default().local_upstream_agent_mode_strategy,
             LocalUpstreamAgentModeStrategy::Vibe
         );
     }
@@ -5675,7 +5678,7 @@ mod tests {
 
         assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
         assert_eq!(
-            config.kiro_agent_mode_strategy,
+            config.local_upstream_agent_mode_strategy,
             LocalUpstreamAgentModeStrategy::Auto
         );
     }
@@ -6241,6 +6244,7 @@ mod tests {
         config.local_upstream_cache_point_enabled = true;
         config.local_upstream_cache_point_tools_only = false;
         config.local_upstream_cache_point_record_plan = false;
+        config.local_upstream_agent_mode_strategy = LocalUpstreamAgentModeStrategy::Auto;
 
         let serialized = serde_json::to_value(&config).unwrap();
         assert_eq!(serialized["localUpstreamResponseTimeoutSecs"], 31);
@@ -6257,6 +6261,7 @@ mod tests {
         assert_eq!(serialized["localUpstreamCachePointEnabled"], true);
         assert_eq!(serialized["localUpstreamCachePointToolsOnly"], false);
         assert_eq!(serialized["localUpstreamCachePointRecordPlan"], false);
+        assert_eq!(serialized["localUpstreamAgentModeStrategy"], "auto");
         assert!(serialized.get("kiroUpstreamResponseTimeoutSecs").is_none());
         assert!(
             serialized
@@ -6267,6 +6272,7 @@ mod tests {
         assert!(serialized.get("kiroCachePointEnabled").is_none());
         assert!(serialized.get("kiroCachePointToolsOnly").is_none());
         assert!(serialized.get("kiroCachePointRecordPlan").is_none());
+        assert!(serialized.get("kiroAgentModeStrategy").is_none());
 
         let legacy: Config = serde_json::from_value(serde_json::json!({
             "kiroUpstreamResponseTimeoutSecs": 41,
@@ -6279,7 +6285,8 @@ mod tests {
             "kiroUpstreamBaseUrl": "http://127.0.0.1:39091/mock",
             "kiroCachePointEnabled": true,
             "kiroCachePointToolsOnly": false,
-            "kiroCachePointRecordPlan": false
+            "kiroCachePointRecordPlan": false,
+            "kiroAgentModeStrategy": "spec"
         }))
         .unwrap();
 
@@ -6297,6 +6304,10 @@ mod tests {
         assert!(legacy.local_upstream_cache_point_enabled);
         assert!(!legacy.local_upstream_cache_point_tools_only);
         assert!(!legacy.local_upstream_cache_point_record_plan);
+        assert_eq!(
+            legacy.local_upstream_agent_mode_strategy,
+            LocalUpstreamAgentModeStrategy::Spec
+        );
     }
 
     #[test]

@@ -2060,7 +2060,7 @@ export interface RuntimeConfig {
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile
-  kiroAgentModeStrategy: LocalUpstreamAgentModeStrategy
+  localUpstreamAgentModeStrategy: LocalUpstreamAgentModeStrategy
   modelResolutionMode: ModelResolutionMode
   modelMapping: ModelMappingConfig
   extractThinking: boolean

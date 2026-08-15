@@ -1924,7 +1924,7 @@ pub struct RuntimeConfigResponse {
     pub external_pools: AccountRuntimeConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
-    pub kiro_agent_mode_strategy: LocalUpstreamAgentModeStrategy,
+    pub local_upstream_agent_mode_strategy: LocalUpstreamAgentModeStrategy,
     pub model_resolution_mode: ModelResolutionMode,
     pub model_mapping: ModelMappingConfig,
     pub extract_thinking: bool,
@@ -2094,8 +2094,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub high_cache_threshold: Option<i32>,
     #[serde(default)]
     pub compat_profile: Option<CompatProfile>,
-    #[serde(default)]
-    pub kiro_agent_mode_strategy: Option<LocalUpstreamAgentModeStrategy>,
+    #[serde(default, alias = "kiroAgentModeStrategy")]
+    pub local_upstream_agent_mode_strategy: Option<LocalUpstreamAgentModeStrategy>,
     #[serde(default)]
     pub model_resolution_mode: Option<ModelResolutionMode>,
     #[serde(default)]
@@ -2578,7 +2578,8 @@ mod tests {
             "kiroUpstreamStreamRetryOnStatusError": false,
             "kiroCachePointEnabled": true,
             "kiroCachePointToolsOnly": false,
-            "kiroCachePointRecordPlan": false
+            "kiroCachePointRecordPlan": false,
+            "kiroAgentModeStrategy": "spec"
         }))
         .unwrap();
 
@@ -2592,6 +2593,10 @@ mod tests {
         assert_eq!(req.local_upstream_cache_point_enabled, Some(true));
         assert_eq!(req.local_upstream_cache_point_tools_only, Some(false));
         assert_eq!(req.local_upstream_cache_point_record_plan, Some(false));
+        assert_eq!(
+            req.local_upstream_agent_mode_strategy,
+            Some(LocalUpstreamAgentModeStrategy::Spec)
+        );
     }
 
     #[test]

@@ -610,7 +610,7 @@ const emptyConfig: RuntimeConfig = {
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
-  kiroAgentModeStrategy: 'vibe',
+  localUpstreamAgentModeStrategy: 'vibe',
   modelResolutionMode: 'compatible',
   modelMapping: defaultModelMappingConfig(),
   extractThinking: true,
@@ -1252,7 +1252,7 @@ function LocalUpstreamAgentModeSelectField({ value, onChange }: LocalUpstreamAge
   return (
     <label className="block rounded-md border bg-background p-4">
       <div className="mb-3">
-        <div className="text-sm font-medium">Kiro Agent Mode</div>
+        <div className="text-sm font-medium">Local Upstream Agent Mode</div>
         <div className="mt-1 text-xs leading-5 text-muted-foreground">
           控制发往旧 IDE 上游的 x-amzn-kiro-agent-mode。vibe 保持当前 Claude Code 成功链路；spec 强制规格模式；auto 会按账号协议自动选择。
         </div>
@@ -4233,9 +4233,9 @@ export function RuntimeConfigPanel() {
               onChange={(compatProfile) => setDraft((prev) => ({ ...prev, compatProfile }))}
             />
             <LocalUpstreamAgentModeSelectField
-              value={draft.kiroAgentModeStrategy}
-              onChange={(kiroAgentModeStrategy) =>
-                setDraft((prev) => ({ ...prev, kiroAgentModeStrategy }))
+              value={draft.localUpstreamAgentModeStrategy}
+              onChange={(localUpstreamAgentModeStrategy) =>
+                setDraft((prev) => ({ ...prev, localUpstreamAgentModeStrategy }))
               }
             />
             <ModelResolutionSelectField
