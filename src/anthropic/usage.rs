@@ -14,7 +14,9 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::common::upstream_error::RawUpstreamError;
-use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
+use crate::local_upstream::call_trace::{
+    LocalUpstreamCredentialAttempt, summarize_local_upstream_attempts,
+};
 use crate::storage::postgres::PostgresUsageStore;
 use crate::storage::redis_cache::RedisStore;
 
@@ -529,7 +531,7 @@ pub struct UsageRecord {
     pub sticky_bound: bool,
     pub fallback_from_sticky: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub credential_attempts: Vec<KiroCredentialAttempt>,
+    pub credential_attempts: Vec<LocalUpstreamCredentialAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_kind: Option<UsageRouteKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4034,7 +4036,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let estimated_cost = record.estimated_cost_usd.to_string();
     let original_cost = record.original_cost_usd.to_string();
     let upstream_metering_units = record.upstream_metering_units().to_string();
-    let attempt_chain = summarize_attempts(&record.credential_attempts);
+    let attempt_chain = summarize_local_upstream_attempts(&record.credential_attempts);
 
     [
         Some(record.id.as_str()),
@@ -5795,7 +5797,7 @@ mod tests {
 
         let mut chained = record("3", 30, UsageSource::LocalPromptCache);
         chained.credential_attempts = vec![
-            KiroCredentialAttempt::new(
+            LocalUpstreamCredentialAttempt::new(
                 0,
                 6,
                 Some("first@example.com".to_string()),
@@ -5805,7 +5807,7 @@ mod tests {
                 Some("429 Too Many Requests".to_string()),
                 10,
             ),
-            KiroCredentialAttempt::new(
+            LocalUpstreamCredentialAttempt::new(
                 1,
                 9,
                 Some("second@example.com".to_string()),

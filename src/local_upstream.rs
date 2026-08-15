@@ -7,6 +7,7 @@
 pub(crate) mod call_trace {
     #[cfg(test)]
     pub(crate) use crate::kiro::call_trace::SelectionFailureSummary;
+    pub(crate) use crate::kiro::call_trace::summarize_attempts as summarize_local_upstream_attempts;
     pub(crate) use crate::kiro::call_trace::{AccountRejectReason, SelectionFailureStage};
     #[cfg(test)]
     pub(crate) type LocalUpstreamCallError = crate::kiro::call_trace::KiroCallError;

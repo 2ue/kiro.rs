@@ -135,6 +135,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local body preparation now receives upstream reasoning capability state through an upstream-named alias, and its test request fixtures use local-upstream request aliases instead of importing legacy request config types directly.
 - Converter tool-use/tool-result pairing now imports local-upstream request aliases for local conversation messages and tool results instead of importing legacy request model paths directly.
 - Converter body, history, tool and model modules now import local-upstream request aliases for conversation state, images, tools, tool results and native reasoning request fields. Converter model logic uses upstream reasoning aliases, leaving the concrete legacy request types behind the `local_upstream` facade.
+- Usage attempt-chain recording now imports local-upstream call-trace aliases for local credential attempts and attempt-chain summaries instead of depending on the legacy call-trace path directly.
 
 Last verified on 2026-08-14:
 
@@ -343,6 +344,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh converter-request-alias-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh converter-request-alias-test2 -- bash -lc 'cargo check && cargo test native_reasoning_uses_discovered_reasoning_path_and_preserves_max -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh converter-request-alias-test3 -- cargo test anthropic::converter::tests:: -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh usage-call-trace-alias-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh usage-call-trace-alias-test1 -- bash -lc 'cargo check && cargo test recorder_search_matches_model_account_session_and_error_text -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
