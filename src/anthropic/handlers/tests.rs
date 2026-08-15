@@ -6707,7 +6707,7 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
     cache_policy.path_overrides.insert(
         "/kiro/v1/messages".to_string(),
         CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+            cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
             reported_usage: Some(ReportedUsagePathPolicy {
                 skip_non_stream_usage_projection: true,
                 ..ReportedUsagePathPolicy::default()
@@ -6730,13 +6730,16 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
 
     let route =
         RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
-    assert_eq!(route.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
+    assert_eq!(
+        route.policy.cache_type,
+        PromptCacheStrategyType::ClaudeCodeTool
+    );
     assert!(route.policy.reported_usage.skip_non_stream_usage_projection);
 
     let stream_route = cache_route_for_request_stream(route.clone(), true);
     assert_eq!(
         stream_route.policy.cache_type,
-        PromptCacheStrategyType::KiroRsTool
+        PromptCacheStrategyType::ClaudeCodeTool
     );
     assert!(
         stream_route
@@ -6939,7 +6942,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         prompt_cache_profile: None,
         claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: Some("/dfcache/team".to_string()),
-        prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
+        prompt_cache_strategy_type: PromptCacheStrategyType::ClaudeCodeTool,
         simulation_mode: PromptCacheSimulationMode::Disabled,
         prompt_cache_target_read_ratio: 0.0,
         prompt_cache_token_scale: 1.0,
@@ -7322,7 +7325,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         prompt_cache_profile: None,
         claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: Some("/kiro".to_string()),
-        prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
+        prompt_cache_strategy_type: PromptCacheStrategyType::ClaudeCodeTool,
         simulation_mode: PromptCacheSimulationMode::Disabled,
         prompt_cache_target_read_ratio: 0.5,
         prompt_cache_token_scale: 3.0,
@@ -7333,7 +7336,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         reported_cache_usage_policy: reported_cache_usage_policy(
-            PromptCacheStrategyType::KiroRsTool,
+            PromptCacheStrategyType::ClaudeCodeTool,
             PromptCacheSimulationMode::Disabled,
             &ReportedUsagePathPolicy {
                 input: ReportedUsageFieldPolicy::sample_input_max(96),
@@ -8156,7 +8159,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         prompt_cache_profile: None,
         claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: Some("/dfcache/team".to_string()),
-        prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
+        prompt_cache_strategy_type: PromptCacheStrategyType::ClaudeCodeTool,
         simulation_mode: PromptCacheSimulationMode::Disabled,
         prompt_cache_target_read_ratio: 0.0,
         prompt_cache_token_scale: 1.0,
@@ -9018,7 +9021,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
     cache_policy.path_overrides.insert(
         "/kiro/v1/messages".to_string(),
         CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+            cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
             ..CacheRoutePolicyPatch::default()
         },
     );
@@ -9059,7 +9062,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
     assert_eq!(
         cache_route.policy.cache_type,
-        PromptCacheStrategyType::KiroRsTool
+        PromptCacheStrategyType::ClaudeCodeTool
     );
     let first_context = prepare_usage_context(
         &state,
@@ -9070,7 +9073,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         None,
         Some(session_id.to_string()),
         prompt_cache_scope_conversation_id(
-            PromptCacheStrategyType::KiroRsTool,
+            PromptCacheStrategyType::ClaudeCodeTool,
             PromptCacheSimulationMode::Disabled,
             &first_payload,
         ),
@@ -9125,7 +9128,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         None,
         Some(session_id.to_string()),
         prompt_cache_scope_conversation_id(
-            PromptCacheStrategyType::KiroRsTool,
+            PromptCacheStrategyType::ClaudeCodeTool,
             PromptCacheSimulationMode::Disabled,
             &first_payload,
         ),
@@ -9157,7 +9160,7 @@ fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
     cache_policy.path_overrides.insert(
         "/kiro/v1/messages".to_string(),
         CacheRoutePolicyPatch {
-            cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+            cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
             ..CacheRoutePolicyPatch::default()
         },
     );
@@ -9204,7 +9207,7 @@ fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
         None,
         Some(session_id.to_string()),
         prompt_cache_scope_conversation_id(
-            PromptCacheStrategyType::KiroRsTool,
+            PromptCacheStrategyType::ClaudeCodeTool,
             PromptCacheSimulationMode::Disabled,
             &payload,
         ),
@@ -9241,7 +9244,7 @@ fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
         None,
         Some(session_id.to_string()),
         prompt_cache_scope_conversation_id(
-            PromptCacheStrategyType::KiroRsTool,
+            PromptCacheStrategyType::ClaudeCodeTool,
             PromptCacheSimulationMode::Disabled,
             &payload,
         ),

@@ -240,7 +240,7 @@ fn build_template(
             });
             (profile, None, simulated_usage)
         }
-        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
+        PromptCacheStrategyType::ClaudeCodeTool if prompt_cache_supported => {
             let plan = route.prompt_cache.compute_claude_code_tool_with_bounds(
                 scope.clone(),
                 payload,
@@ -279,11 +279,11 @@ fn build_template(
                     ^ fastrand::u64(..),
             )
         }
-        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => reported_usage
+        PromptCacheStrategyType::ClaudeCodeTool if prompt_cache_supported => reported_usage
             .enabled
             .then(|| ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..)))
             .flatten(),
-        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool => None,
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::ClaudeCodeTool => None,
     };
     Some(ExternalUsageProjectionTemplate {
         uplift_percent,

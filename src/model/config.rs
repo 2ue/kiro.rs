@@ -1842,7 +1842,7 @@ impl CacheBoundsPolicyPatch {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeCodeToolCachePolicy {
-    #[serde(default = "default_kiro_rs_tool_coverage_ratio")]
+    #[serde(default = "default_claude_code_tool_coverage_ratio")]
     pub coverage_ratio: f64,
     #[serde(default)]
     pub max_coverage_tokens: i32,
@@ -1854,23 +1854,23 @@ pub struct ClaudeCodeToolCachePolicy {
     pub cache_current_user_stable_prefix: bool,
     #[serde(default)]
     pub current_user_stable_prefix_max_tokens: i32,
-    #[serde(default = "default_kiro_rs_tool_reported_input_min_tokens")]
+    #[serde(default = "default_claude_code_tool_reported_input_min_tokens")]
     pub reported_input_min_tokens: i32,
-    #[serde(default = "default_kiro_rs_tool_reported_input_max_tokens")]
+    #[serde(default = "default_claude_code_tool_reported_input_max_tokens")]
     pub reported_input_max_tokens: i32,
 }
 
 impl Default for ClaudeCodeToolCachePolicy {
     fn default() -> Self {
         Self {
-            coverage_ratio: default_kiro_rs_tool_coverage_ratio(),
+            coverage_ratio: default_claude_code_tool_coverage_ratio(),
             max_coverage_tokens: 0,
             incremental_create_enabled: true,
             max_new_creation_tokens_per_request: 0,
             cache_current_user_stable_prefix: false,
             current_user_stable_prefix_max_tokens: 0,
-            reported_input_min_tokens: default_kiro_rs_tool_reported_input_min_tokens(),
-            reported_input_max_tokens: default_kiro_rs_tool_reported_input_max_tokens(),
+            reported_input_min_tokens: default_claude_code_tool_reported_input_min_tokens(),
+            reported_input_max_tokens: default_claude_code_tool_reported_input_max_tokens(),
         }
     }
 }
@@ -1878,7 +1878,7 @@ impl Default for ClaudeCodeToolCachePolicy {
 impl ClaudeCodeToolCachePolicy {
     pub fn normalized(mut self) -> Self {
         if !self.coverage_ratio.is_finite() {
-            self.coverage_ratio = default_kiro_rs_tool_coverage_ratio();
+            self.coverage_ratio = default_claude_code_tool_coverage_ratio();
         }
         self.coverage_ratio = self.coverage_ratio.clamp(0.0, 1.0);
         self.max_coverage_tokens = self.max_coverage_tokens.max(0);
@@ -2119,7 +2119,9 @@ impl CacheRoutePolicyPatch {
         match policy.cache_type {
             PromptCacheStrategyType::NoCache => self.apply_no_cache_fields_to(policy),
             PromptCacheStrategyType::CurrentHighCache => self.apply_fields_to(policy),
-            PromptCacheStrategyType::KiroRsTool => self.apply_kiro_rs_tool_fields_to(policy),
+            PromptCacheStrategyType::ClaudeCodeTool => {
+                self.apply_claude_code_tool_fields_to(policy)
+            }
         }
     }
 
@@ -2128,7 +2130,7 @@ impl CacheRoutePolicyPatch {
         policy.normalized()
     }
 
-    fn apply_kiro_rs_tool_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+    fn apply_claude_code_tool_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
         if let Some(cache_type) = self.cache_type {
             policy.cache_type = cache_type;
         }
@@ -2188,7 +2190,8 @@ pub enum PromptCacheStrategyType {
     NoCache,
     #[default]
     CurrentHighCache,
-    KiroRsTool,
+    #[serde(rename = "kiro_rs_tool", alias = "claude_code_tool")]
+    ClaudeCodeTool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -2265,7 +2268,7 @@ impl CachePolicyConfig {
         self.current_high_cache
             .validate("当前本地模拟策略模板", base.clone())?;
         self.kiro_rs_tool
-            .validate("Kiro-RS-Tool 缓存策略模板", base.clone())?;
+            .validate("Claude Code Tool 缓存策略模板", base.clone())?;
         for (prefix, policy) in &self.path_overrides {
             let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
                 return Err("缓存策略路径前缀不能为空".to_string());
@@ -2280,9 +2283,9 @@ impl CachePolicyConfig {
         self.current_high_cache.apply_fields_to(policy)
     }
 
-    fn kiro_rs_tool_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+    fn claude_code_tool_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
         let neutral = CacheRoutePolicy {
-            cache_type: PromptCacheStrategyType::KiroRsTool,
+            cache_type: PromptCacheStrategyType::ClaudeCodeTool,
             simulation: CacheSimulationPolicy {
                 enabled: false,
                 target_read_ratio: default_prompt_cache_target_read_ratio(),
@@ -2303,7 +2306,7 @@ impl CachePolicyConfig {
             bounds: base.bounds,
             kiro_rs_tool: ClaudeCodeToolCachePolicy::default(),
         };
-        self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
+        self.kiro_rs_tool.apply_claude_code_tool_fields_to(neutral)
     }
 
     fn no_cache_policy(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
@@ -2342,9 +2345,9 @@ impl CachePolicyConfig {
                 policy.cache_type = PromptCacheStrategyType::CurrentHighCache;
                 policy.normalized()
             }
-            PromptCacheStrategyType::KiroRsTool => {
-                let mut policy = self.kiro_rs_tool_template(base);
-                policy.cache_type = PromptCacheStrategyType::KiroRsTool;
+            PromptCacheStrategyType::ClaudeCodeTool => {
+                let mut policy = self.claude_code_tool_template(base);
+                policy.cache_type = PromptCacheStrategyType::ClaudeCodeTool;
                 policy.normalized()
             }
         }
@@ -2425,7 +2428,7 @@ pub fn resolve_cache_policy_for_path(
     let policy = override_policy.apply_fields_for_strategy(policy);
     let namespace = match cache_type {
         PromptCacheStrategyType::NoCache => None,
-        PromptCacheStrategyType::KiroRsTool => Some(prefix.clone()),
+        PromptCacheStrategyType::ClaudeCodeTool => Some(prefix.clone()),
         PromptCacheStrategyType::CurrentHighCache => override_policy
             .route_namespace
             .unwrap_or_else(|| override_policy.affects_cache_state())
@@ -4270,15 +4273,15 @@ fn default_prompt_cache_target_read_ratio() -> f64 {
     0.98
 }
 
-fn default_kiro_rs_tool_coverage_ratio() -> f64 {
+fn default_claude_code_tool_coverage_ratio() -> f64 {
     1.0
 }
 
-fn default_kiro_rs_tool_reported_input_min_tokens() -> i32 {
+fn default_claude_code_tool_reported_input_min_tokens() -> i32 {
     32
 }
 
-fn default_kiro_rs_tool_reported_input_max_tokens() -> i32 {
+fn default_claude_code_tool_reported_input_max_tokens() -> i32 {
     4_096
 }
 
@@ -6381,7 +6384,7 @@ mod tests {
         config.cache_policy.path_overrides.insert(
             "/cc".to_string(),
             CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
                 simulation: Some(CacheSimulationPolicyPatch {
                     enabled: Some(false),
                     token_scale: Some(1.2),
@@ -6402,7 +6405,10 @@ mod tests {
         let cc = config.cache_policy_for_path("/cc/v1/messages");
 
         assert_eq!(cc.namespace.as_deref(), Some("/cc"));
-        assert_eq!(cc.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
+        assert_eq!(
+            cc.policy.cache_type,
+            PromptCacheStrategyType::ClaudeCodeTool
+        );
         assert!(!cc.policy.simulation.enabled);
         assert_eq!(cc.policy.simulation.token_scale, 1.0);
         assert_eq!(cc.policy.simulation.target_read_ratio, 0.98);
@@ -6578,7 +6584,7 @@ mod tests {
         config.cache_policy.path_overrides.insert(
             "/tool-matrix".to_string(),
             CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
                 route_namespace: None,
                 simulation: Some(CacheSimulationPolicyPatch {
                     enabled: Some(true),
@@ -6723,7 +6729,10 @@ mod tests {
 
         let tool = config.cache_policy_for_path("/tool-matrix/v1/messages");
         assert_eq!(tool.namespace.as_deref(), Some("/tool-matrix"));
-        assert_eq!(tool.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
+        assert_eq!(
+            tool.policy.cache_type,
+            PromptCacheStrategyType::ClaudeCodeTool
+        );
         assert!(!tool.policy.simulation.enabled);
         assert_eq!(tool.policy.simulation.token_scale, 1.0);
         assert!(!tool.policy.creation_control.enabled);
@@ -6841,7 +6850,7 @@ mod tests {
         config.cache_policy.path_overrides.insert(
             "/tool".to_string(),
             CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
                 ..CacheRoutePolicyPatch::default()
             },
         );
@@ -6853,7 +6862,7 @@ mod tests {
         assert_eq!(resolved.namespace.as_deref(), Some("/tool"));
         assert_eq!(
             resolved.policy.cache_type,
-            PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::ClaudeCodeTool
         );
         assert!(!resolved.policy.reported_usage.enabled);
         assert!(
@@ -6872,7 +6881,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_cache_policy_defaults_match_current_behavior() {
+    fn claude_code_tool_cache_policy_defaults_match_current_behavior() {
         let policy = ClaudeCodeToolCachePolicy::default();
 
         assert_eq!(policy.coverage_ratio, 1.0);
@@ -6886,7 +6895,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_cache_policy_deserializes_template_and_path_patch() {
+    fn claude_code_tool_cache_policy_deserializes_template_and_path_patch() {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "cachePolicy": {
                 "kiroRsTool": {
@@ -6912,6 +6921,12 @@ mod tests {
                             "maxNewCreationTokensPerRequest": 1000,
                             "reportedInputMinTokens": 128
                         }
+                    },
+                    "/dfcache/claude-code-tool-param": {
+                        "cacheType": "claude_code_tool",
+                        "kiroRsTool": {
+                            "coverageRatio": 0.6
+                        }
                     }
                 }
             }
@@ -6933,7 +6948,7 @@ mod tests {
         assert_eq!(resolved.namespace.as_deref(), Some("/dfcache/kiro-param"));
         assert_eq!(
             resolved.policy.cache_type,
-            PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::ClaudeCodeTool
         );
         assert!(
             resolved
@@ -6968,10 +6983,17 @@ mod tests {
             resolved.policy.kiro_rs_tool.reported_input_max_tokens,
             2_048
         );
+
+        let new_value = config.cache_policy_for_path("/dfcache/claude-code-tool-param/v1/messages");
+        assert_eq!(
+            new_value.policy.cache_type,
+            PromptCacheStrategyType::ClaudeCodeTool
+        );
+        assert_eq!(new_value.policy.kiro_rs_tool.coverage_ratio, 0.6);
     }
 
     #[test]
-    fn kiro_rs_tool_cache_policy_rejects_invalid_values() {
+    fn claude_code_tool_cache_policy_rejects_invalid_values() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "cachePolicy": {
                 "pathOverrides": {
@@ -7196,7 +7218,7 @@ mod tests {
         cache_policy.path_overrides.insert(
             "/cc".to_string(),
             CacheRoutePolicyPatch {
-                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
                 ..CacheRoutePolicyPatch::default()
             },
         );
@@ -7222,7 +7244,7 @@ mod tests {
                 .path_overrides
                 .get("/cc")
                 .and_then(|policy| policy.cache_type),
-            Some(PromptCacheStrategyType::KiroRsTool)
+            Some(PromptCacheStrategyType::ClaudeCodeTool)
         );
         assert_eq!(
             with_builtins

@@ -1116,7 +1116,7 @@ fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptC
         }
         PromptCacheStrategyType::NoCache
         | PromptCacheStrategyType::CurrentHighCache
-        | PromptCacheStrategyType::KiroRsTool => PromptCacheSimulationMode::Disabled,
+        | PromptCacheStrategyType::ClaudeCodeTool => PromptCacheSimulationMode::Disabled,
     }
 }
 
@@ -1126,7 +1126,7 @@ fn prompt_cache_converter_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCa
         PromptCacheStrategyType::CurrentHighCache => {
             prompt_cache_simulation_mode_for_policy(policy)
         }
-        PromptCacheStrategyType::KiroRsTool => PromptCacheSimulationMode::HighCache,
+        PromptCacheStrategyType::ClaudeCodeTool => PromptCacheSimulationMode::HighCache,
     }
 }
 
@@ -3331,7 +3331,7 @@ impl RequestUsageContext {
     fn uses_local_prompt_cache_strategy(&self) -> bool {
         matches!(
             self.prompt_cache_strategy_type,
-            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::ClaudeCodeTool
         ) && (self.simulation_mode == PromptCacheSimulationMode::HighCache
             || self.claude_code_tool_prompt_cache_plan.is_some())
     }
@@ -3346,7 +3346,7 @@ impl RequestUsageContext {
         }
         if !matches!(
             self.prompt_cache_strategy_type,
-            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::ClaudeCodeTool
         ) {
             return usage;
         }
@@ -3502,7 +3502,7 @@ fn should_apply_reported_usage(
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
-        PromptCacheStrategyType::KiroRsTool => false,
+        PromptCacheStrategyType::ClaudeCodeTool => false,
     }
 }
 
@@ -3515,7 +3515,7 @@ fn should_build_local_prompt_cache_usage(
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
-        PromptCacheStrategyType::KiroRsTool => true,
+        PromptCacheStrategyType::ClaudeCodeTool => true,
     }
 }
 
@@ -3849,8 +3849,8 @@ impl CredentialUsageContext {
     ) -> bool {
         matches!(
             self.request.prompt_cache_strategy_type,
-            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
-        ) && (self.request.prompt_cache_strategy_type == PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::ClaudeCodeTool
+        ) && (self.request.prompt_cache_strategy_type == PromptCacheStrategyType::ClaudeCodeTool
             || self.request.simulation_mode == PromptCacheSimulationMode::HighCache)
             && metadata_usage.is_some_and(super::cache::metadata_cache_is_empty)
             && self.request.simulated_source == Some(UsageSource::LocalPromptCache)
@@ -4052,7 +4052,7 @@ impl CredentialUsageContext {
                         self.request.prompt_cache_bounds,
                     );
                 }
-                PromptCacheStrategyType::KiroRsTool => {
+                PromptCacheStrategyType::ClaudeCodeTool => {
                     if let Some(plan) = self.request.claude_code_tool_prompt_cache_plan.as_ref() {
                         self.request
                             .prompt_cache
@@ -4709,7 +4709,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
             ),
             PromptCacheSimulationMode::HighCache => (None, None),
         },
-        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => (
+        PromptCacheStrategyType::ClaudeCodeTool if prompt_cache_supported => (
             None,
             Some(state.prompt_cache.compute_claude_code_tool_with_bounds(
                 scope.clone(),
@@ -4720,7 +4720,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
                 policy.kiro_rs_tool,
             )),
         ),
-        PromptCacheStrategyType::KiroRsTool => (None, None),
+        PromptCacheStrategyType::ClaudeCodeTool => (None, None),
     };
     let (simulated_usage, simulated_source) = match strategy_type {
         PromptCacheStrategyType::NoCache => (None, None),
@@ -4729,7 +4729,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
             stable_conversation_id.as_deref(),
             prompt_cache_profile.as_ref(),
         ),
-        PromptCacheStrategyType::KiroRsTool => {
+        PromptCacheStrategyType::ClaudeCodeTool => {
             let simulated_usage = claude_code_tool_prompt_cache_plan.as_ref().and_then(|plan| {
                 let policy = policy.kiro_rs_tool.normalized();
                 super::cache::CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
@@ -4835,7 +4835,7 @@ fn prompt_cache_scope_conversation_id(
 ) -> Option<String> {
     match strategy_type {
         PromptCacheStrategyType::NoCache => None,
-        PromptCacheStrategyType::KiroRsTool => extract_stable_conversation_id(payload),
+        PromptCacheStrategyType::ClaudeCodeTool => extract_stable_conversation_id(payload),
         PromptCacheStrategyType::CurrentHighCache => match mode {
             PromptCacheSimulationMode::Disabled => None,
             PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),

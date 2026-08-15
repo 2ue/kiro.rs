@@ -96,6 +96,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-provider raw upstream error diagnostics now use neutral `official_upstream` source labels and redacted body metadata for provider status/non-eventstream bodies, so private provider messages do not persist in attempt or usage diagnostics.
 - Local-upstream timeout, stream-retry and cache-point settings now have `Config` accessors, and Anthropic router/AppState/request runtime/converter/Admin model-test/WebSearch call sites use local-upstream runtime names while persisted compatibility fields remain unchanged.
 - The local-upstream agent mode strategy now uses `LocalUpstreamAgentModeStrategy` as the Rust type name while retaining existing compatibility config/wire field names.
+- The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant while serde keeps legacy `kiro_rs_tool` serialization and accepts `claude_code_tool` on read.
 - Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
 - Claude Code tool prompt-cache internal methods/helpers now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
 - Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.

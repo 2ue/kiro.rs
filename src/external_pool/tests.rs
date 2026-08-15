@@ -14564,7 +14564,7 @@ fn kiro_rs_tool_usage_projection_commits_external_pool_cache_only_after_success(
         );
     let mut route = test_route("claude-sonnet-4-5");
     route.endpoint = "/kiro/v1/messages".to_string();
-    route.prompt_cache_strategy_type = PromptCacheStrategyType::KiroRsTool;
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::ClaudeCodeTool;
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
     route.reported_usage = ReportedUsageConfig {
         default: ReportedUsagePathPolicy::disabled(),
@@ -14663,7 +14663,7 @@ fn kiro_rs_tool_usage_projection_applies_path_cache_creation_policy() {
         );
     let mut route = test_route("claude-opus-4-8");
     route.endpoint = "/cc/v1/messages".to_string();
-    route.prompt_cache_strategy_type = PromptCacheStrategyType::KiroRsTool;
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::ClaudeCodeTool;
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
     route.reported_usage.path_overrides.insert(
         "/cc".to_string(),

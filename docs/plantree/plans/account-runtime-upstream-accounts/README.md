@@ -134,6 +134,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-provider raw upstream error diagnostics now use neutral `official_upstream` source labels and redacted body metadata for provider status/non-eventstream bodies, preserving body size, content type, status and a short fingerprint without copying provider error messages into attempt/usage diagnostics.
 - `Config` now exposes local-upstream accessors for response timeout, stream retry and cache-point compatibility settings. Anthropic router/AppState/request runtime/converter/Admin model-test/WebSearch call sites use local-upstream field names or accessors while persisted config and Admin runtime DTO compatibility fields remain unchanged.
 - The local-upstream agent mode strategy is now represented by `LocalUpstreamAgentModeStrategy` in Rust config/Admin/protocol code while the existing `kiroAgentModeStrategy` wire/config field remains as a compatibility boundary.
+- The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant. Serde still serializes the legacy `kiro_rs_tool` value for current compatibility and also accepts `claude_code_tool` on read.
 - Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries until the route-policy schema is migrated.
 - Claude Code tool prompt-cache methods and helper functions now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
 - Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names in handler and account-route execution structs. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
@@ -368,6 +369,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh local-upstream-runtime-config-accessors-test3 -- bash -lc 'cargo check && cargo test body_capabilities -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture && cargo test anthropic::converter::tests:: -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-agent-mode-type-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-agent-mode-type-test2 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test admin::service::tests -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-strategy-variant-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-strategy-variant-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-fmt3 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-test3 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test prompt_cache -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-methods-fmt1 -- cargo fmt`
