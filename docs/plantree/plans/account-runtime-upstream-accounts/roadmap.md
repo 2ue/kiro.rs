@@ -138,6 +138,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Kiro wording while preserving compatibility aliases for old config shapes.
 - Maintained UI/Admin UI usage API types now name local auxiliary credential traces `LocalUpstreamCredentialAttempt`, while the `credentialAttempts` wire field stays unchanged.
 - Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording, and the sidebar brand mark no longer presents Kiro as the product name.
+- Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
 
 ## In Progress
 

@@ -383,9 +383,9 @@ export function ModelPricingPanel() {
 
       <div className="flex flex-col gap-3 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between">
         <div className="min-w-0">
-          <div className="font-medium">Kiro 模型能力目录</div>
+          <div className="font-medium">上游模型能力目录</div>
           <div className="text-sm text-muted-foreground">
-            从 Kiro 上游同步可用模型、上下文窗口、输出上限和缓存能力；手动模型作为补充保留。
+            从上游同步可用模型、上下文窗口、输出上限和缓存能力；手动模型作为补充保留。
           </div>
         </div>
         <div className="flex flex-wrap gap-2">

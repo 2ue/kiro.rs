@@ -918,7 +918,7 @@ export function CredentialCard({
             </div>
             <div className="mt-1 text-xs text-muted-foreground">保存空列表表示该账号可参与任意模型调度；非空时只允许精确匹配模型调用该账号。</div>
           </div>
-          <Field label="支持模型" description="点击自动生成会先拉取当前 Kiro 账号支持模型，再生成可靠的 Claude/Claude Code 常用请求名；也可以手工添加或删除标签。">
+          <Field label="支持模型" description="点击自动生成会先拉取当前上游凭据支持模型，再生成可靠的 Claude/Claude Code 常用请求名；也可以手工添加或删除标签。">
             <SupportedModelTagsEditor
               value={supportedModelsDraft}
               disabled={setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending}

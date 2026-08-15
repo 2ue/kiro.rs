@@ -1211,7 +1211,7 @@ export function CredentialCard({
           <DialogHeader>
             <DialogTitle>Region 设置：{displayName}</DialogTitle>
             <DialogDescription>
-              `us-east-1` 这类值是 AWS 区域。Auth Region 用于刷新 Token，API Region 用于请求 Kiro API；清空字段表示回退全局配置。
+              `us-east-1` 这类值是 AWS 区域。Auth Region 用于刷新 Token，API Region 用于请求上游 API；清空字段表示回退全局配置。
             </DialogDescription>
           </DialogHeader>
 

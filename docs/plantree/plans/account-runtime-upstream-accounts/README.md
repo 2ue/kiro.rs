@@ -176,9 +176,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Kiro wording while preserving the already migrated compatibility field aliases.
 - Maintained UI/Admin UI usage API types now model local auxiliary credential traces as `LocalUpstreamCredentialAttempt`; the `credentialAttempts` wire field remains unchanged.
 - Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording and the sidebar brand mark no longer exposes Kiro as the product name.
+- Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro 模型能力目录|从 Kiro 上游|当前 Kiro 账号支持模型|请求 Kiro API|获取 Kiro 模型能力同步状态|手动同步 Kiro 模型能力" src/admin/handlers.rs ui/src/features/credentials/credential-card.tsx admin-ui/src/components/model-pricing-panel.tsx admin-ui/src/components/credential-card.tsx`
+- `feature/tests/run-cargo-scoped.sh upstream-model-text-fmt1 -- cargo fmt`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "Kiro Console|Kiro Admin|Kiro 控制台|Kiro Console 设计系统" ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
