@@ -3525,39 +3525,51 @@ pub struct Config {
     #[serde(default = "default_credential_dispatch_max_wait_secs")]
     pub credential_dispatch_max_wait_secs: u64,
 
-    /// Kiro 上游响应头最长等待秒数。
+    /// 本地上游响应头最长等待秒数。
     ///
     /// 只限制请求发出到拿到响应头的阶段；响应头之后的流式 body 读取仍由
     /// Anthropic SSE 层的上游 idle timeout 控制，避免长输出被整段请求超时误杀。
     /// `0` 表示关闭该额外保护，仅使用底层 HTTP client 的全局超时。
-    #[serde(default = "default_kiro_upstream_response_timeout_secs")]
-    pub kiro_upstream_response_timeout_secs: u64,
+    #[serde(
+        default = "default_local_upstream_response_timeout_secs",
+        alias = "kiroUpstreamResponseTimeoutSecs"
+    )]
+    pub local_upstream_response_timeout_secs: u64,
 
-    /// Kiro 上游流式响应正文的静默超时秒数。
+    /// 本地上游流式响应正文的静默超时秒数。
     ///
     /// 响应头回来后，如果 eventstream 在该时间内没有任何新 chunk，就按上游
     /// stream idle 处理并释放并发占用。`0` 表示使用默认值，避免错误关闭保护。
-    #[serde(default = "default_kiro_upstream_stream_idle_timeout_secs")]
-    pub kiro_upstream_stream_idle_timeout_secs: u64,
+    #[serde(
+        default = "default_local_upstream_stream_idle_timeout_secs",
+        alias = "kiroUpstreamStreamIdleTimeoutSecs"
+    )]
+    pub local_upstream_stream_idle_timeout_secs: u64,
 
     /// 是否允许流式响应在尚未向下游发送任何 SSE 字节前，对上游流读取/空闲/错误事件进行重试。
     ///
     /// 该开关只覆盖“下游尚未提交”的安全窗口。只要已经发送过 message_start、ping、
     /// text/thinking/tool_use 或 error 等任意 SSE 字节，就不会自动换号重试，避免重复工具调用
     /// 或事件乱序。
-    #[serde(default = "default_kiro_upstream_stream_retry_enabled")]
-    pub kiro_upstream_stream_retry_enabled: bool,
+    #[serde(
+        default = "default_local_upstream_stream_retry_enabled",
+        alias = "kiroUpstreamStreamRetryEnabled"
+    )]
+    pub local_upstream_stream_retry_enabled: bool,
 
     /// 单个流式请求在“未向下游提交”窗口内最多尝试多少次上游流。
     ///
     /// 包含首次调用；默认 2 表示最多补一次重试。0/1 都等价于不额外重试。
-    #[serde(default = "default_kiro_upstream_stream_retry_max_attempts")]
-    pub kiro_upstream_stream_retry_max_attempts: u32,
+    #[serde(
+        default = "default_local_upstream_stream_retry_max_attempts",
+        alias = "kiroUpstreamStreamRetryMaxAttempts"
+    )]
+    pub local_upstream_stream_retry_max_attempts: u32,
 
     /// 单个下游 Messages 请求允许发出的推理上游 HTTP 请求硬上限。
     ///
-    /// 本地凭据重试、首输出前流重试、payload/cachePoint 重试、外部池 failover
-    /// 和本地 rescue 共享这一预算。该值与账号、外部池数量无关。
+    /// 本地上游重试、首输出前流重试、payload/cachePoint 重试、账号 failover
+    /// 和本地 rescue 共享这一预算。该值与账号数量无关。
     #[serde(default = "default_inference_upstream_max_attempts")]
     pub inference_upstream_max_attempts: u32,
 
@@ -3585,24 +3597,30 @@ pub struct Config {
     pub token_refresh_burst: u32,
 
     /// 上游 eventstream idle timeout 发生在下游提交前时是否允许重试。
-    #[serde(default = "default_true")]
-    pub kiro_upstream_stream_retry_on_idle_timeout: bool,
+    #[serde(
+        default = "default_true",
+        alias = "kiroUpstreamStreamRetryOnIdleTimeout"
+    )]
+    pub local_upstream_stream_retry_on_idle_timeout: bool,
 
     /// 上游 body read error 发生在下游提交前时是否允许重试。
-    #[serde(default = "default_true")]
-    pub kiro_upstream_stream_retry_on_read_error: bool,
+    #[serde(default = "default_true", alias = "kiroUpstreamStreamRetryOnReadError")]
+    pub local_upstream_stream_retry_on_read_error: bool,
 
     /// 上游 2xx JSON 错误体、流内 error/invalidState 等状态错误发生在下游提交前时是否允许重试。
-    #[serde(default = "default_true")]
-    pub kiro_upstream_stream_retry_on_status_error: bool,
+    #[serde(
+        default = "default_true",
+        alias = "kiroUpstreamStreamRetryOnStatusError"
+    )]
+    pub local_upstream_stream_retry_on_status_error: bool,
 
-    /// Kiro 上游基础 URL 覆盖。
+    /// 本地上游基础 URL 覆盖。
     ///
-    /// 默认 `None` 时使用官方 `https://q.{region}.amazonaws.com`。仅用于本地压测、
+    /// 默认 `None` 时使用当前本地上游实现的官方地址。仅用于本地压测、
     /// staging 或显式内网代理验证；生产不配置时不会改变官方调用协议。
-    #[serde(default)]
+    #[serde(default, alias = "kiroUpstreamBaseUrl")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kiro_upstream_base_url: Option<String>,
+    pub local_upstream_base_url: Option<String>,
 
     /// 单次上游调用最多尝试多少个凭据/重试轮次。
     ///
@@ -4026,19 +4044,19 @@ fn default_credential_dispatch_max_wait_secs() -> u64 {
     5
 }
 
-fn default_kiro_upstream_response_timeout_secs() -> u64 {
+fn default_local_upstream_response_timeout_secs() -> u64 {
     180
 }
 
-fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
+fn default_local_upstream_stream_idle_timeout_secs() -> u64 {
     180
 }
 
-fn default_kiro_upstream_stream_retry_enabled() -> bool {
+fn default_local_upstream_stream_retry_enabled() -> bool {
     true
 }
 
-fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
+fn default_local_upstream_stream_retry_max_attempts() -> u32 {
     2
 }
 
@@ -4797,22 +4815,22 @@ impl Default for Config {
             credential_probation_secs: default_credential_probation_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
-            kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
-            kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
-            ),
-            kiro_upstream_stream_retry_enabled: default_kiro_upstream_stream_retry_enabled(),
-            kiro_upstream_stream_retry_max_attempts:
-                default_kiro_upstream_stream_retry_max_attempts(),
+            local_upstream_response_timeout_secs: default_local_upstream_response_timeout_secs(),
+            local_upstream_stream_idle_timeout_secs:
+                default_local_upstream_stream_idle_timeout_secs(),
+            local_upstream_stream_retry_enabled: default_local_upstream_stream_retry_enabled(),
+            local_upstream_stream_retry_max_attempts:
+                default_local_upstream_stream_retry_max_attempts(),
             inference_upstream_max_attempts: default_inference_upstream_max_attempts(),
             auxiliary_upstream_max_attempts: default_auxiliary_upstream_max_attempts(),
             auxiliary_upstream_max_concurrent_requests:
                 default_auxiliary_upstream_max_concurrent_requests(),
             token_refresh_max_rpm: default_token_refresh_max_rpm(),
             token_refresh_burst: default_token_refresh_burst(),
-            kiro_upstream_stream_retry_on_idle_timeout: true,
-            kiro_upstream_stream_retry_on_read_error: true,
-            kiro_upstream_stream_retry_on_status_error: true,
-            kiro_upstream_base_url: None,
+            local_upstream_stream_retry_on_idle_timeout: true,
+            local_upstream_stream_retry_on_read_error: true,
+            local_upstream_stream_retry_on_status_error: true,
+            local_upstream_base_url: None,
             credential_retry_max_attempts: 0,
             credential_prompt_logic_retry_enabled: false,
             credential_prompt_logic_retry_max_attempts: 0,
@@ -4915,31 +4933,31 @@ impl Config {
     }
 
     pub fn local_upstream_response_timeout_secs(&self) -> u64 {
-        self.kiro_upstream_response_timeout_secs
+        self.local_upstream_response_timeout_secs
     }
 
     pub fn local_upstream_stream_idle_timeout_secs(&self) -> u64 {
-        self.kiro_upstream_stream_idle_timeout_secs
+        self.local_upstream_stream_idle_timeout_secs
     }
 
     pub fn local_upstream_stream_retry_enabled(&self) -> bool {
-        self.kiro_upstream_stream_retry_enabled
+        self.local_upstream_stream_retry_enabled
     }
 
     pub fn local_upstream_stream_retry_max_attempts(&self) -> u32 {
-        self.kiro_upstream_stream_retry_max_attempts
+        self.local_upstream_stream_retry_max_attempts
     }
 
     pub fn local_upstream_stream_retry_on_idle_timeout(&self) -> bool {
-        self.kiro_upstream_stream_retry_on_idle_timeout
+        self.local_upstream_stream_retry_on_idle_timeout
     }
 
     pub fn local_upstream_stream_retry_on_read_error(&self) -> bool {
-        self.kiro_upstream_stream_retry_on_read_error
+        self.local_upstream_stream_retry_on_read_error
     }
 
     pub fn local_upstream_stream_retry_on_status_error(&self) -> bool {
-        self.kiro_upstream_stream_retry_on_status_error
+        self.local_upstream_stream_retry_on_status_error
     }
 
     pub fn local_upstream_cache_point_policy(&self) -> CachePointPolicy {
@@ -5443,14 +5461,14 @@ mod tests {
         assert_eq!(config.credential_probation_secs, 30);
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 5);
-        assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
-        assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
-        assert!(config.kiro_upstream_stream_retry_enabled);
-        assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 2);
-        assert!(config.kiro_upstream_stream_retry_on_idle_timeout);
-        assert!(config.kiro_upstream_stream_retry_on_read_error);
-        assert!(config.kiro_upstream_stream_retry_on_status_error);
-        assert_eq!(config.kiro_upstream_base_url, None);
+        assert_eq!(config.local_upstream_response_timeout_secs, 180);
+        assert_eq!(config.local_upstream_stream_idle_timeout_secs, 180);
+        assert!(config.local_upstream_stream_retry_enabled);
+        assert_eq!(config.local_upstream_stream_retry_max_attempts, 2);
+        assert!(config.local_upstream_stream_retry_on_idle_timeout);
+        assert!(config.local_upstream_stream_retry_on_read_error);
+        assert!(config.local_upstream_stream_retry_on_status_error);
+        assert_eq!(config.local_upstream_base_url, None);
         assert_eq!(config.credential_retry_max_attempts, 0);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.dispatch_global_max_concurrent_requests, 512);
@@ -6200,6 +6218,63 @@ mod tests {
     }
 
     #[test]
+    fn local_upstream_runtime_fields_emit_new_names_and_accept_legacy_aliases() {
+        let mut config = Config::default();
+        config.local_upstream_response_timeout_secs = 31;
+        config.local_upstream_stream_idle_timeout_secs = 32;
+        config.local_upstream_stream_retry_enabled = false;
+        config.local_upstream_stream_retry_max_attempts = 3;
+        config.local_upstream_stream_retry_on_idle_timeout = false;
+        config.local_upstream_stream_retry_on_read_error = false;
+        config.local_upstream_stream_retry_on_status_error = false;
+        config.local_upstream_base_url = Some("http://127.0.0.1:39090/mock".to_string());
+
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["localUpstreamResponseTimeoutSecs"], 31);
+        assert_eq!(serialized["localUpstreamStreamIdleTimeoutSecs"], 32);
+        assert_eq!(serialized["localUpstreamStreamRetryEnabled"], false);
+        assert_eq!(serialized["localUpstreamStreamRetryMaxAttempts"], 3);
+        assert_eq!(serialized["localUpstreamStreamRetryOnIdleTimeout"], false);
+        assert_eq!(serialized["localUpstreamStreamRetryOnReadError"], false);
+        assert_eq!(serialized["localUpstreamStreamRetryOnStatusError"], false);
+        assert_eq!(
+            serialized["localUpstreamBaseUrl"],
+            "http://127.0.0.1:39090/mock"
+        );
+        assert!(serialized.get("kiroUpstreamResponseTimeoutSecs").is_none());
+        assert!(
+            serialized
+                .get("kiroUpstreamStreamIdleTimeoutSecs")
+                .is_none()
+        );
+        assert!(serialized.get("kiroUpstreamBaseUrl").is_none());
+
+        let legacy: Config = serde_json::from_value(serde_json::json!({
+            "kiroUpstreamResponseTimeoutSecs": 41,
+            "kiroUpstreamStreamIdleTimeoutSecs": 42,
+            "kiroUpstreamStreamRetryEnabled": false,
+            "kiroUpstreamStreamRetryMaxAttempts": 4,
+            "kiroUpstreamStreamRetryOnIdleTimeout": false,
+            "kiroUpstreamStreamRetryOnReadError": false,
+            "kiroUpstreamStreamRetryOnStatusError": false,
+            "kiroUpstreamBaseUrl": "http://127.0.0.1:39091/mock"
+        }))
+        .unwrap();
+
+        assert_eq!(legacy.local_upstream_response_timeout_secs, 41);
+        assert_eq!(legacy.local_upstream_stream_idle_timeout_secs, 42);
+        assert!(!legacy.local_upstream_stream_retry_enabled);
+        assert_eq!(legacy.local_upstream_stream_retry_max_attempts, 4);
+        assert!(!legacy.local_upstream_stream_retry_on_idle_timeout);
+        assert!(!legacy.local_upstream_stream_retry_on_read_error);
+        assert!(!legacy.local_upstream_stream_retry_on_status_error);
+        assert_eq!(
+            legacy.local_upstream_base_url.as_deref(),
+            Some("http://127.0.0.1:39091/mock")
+        );
+    }
+
+    #[test]
     fn prompt_cache_token_amplification_deserializes_from_camel_case_config() {
         let config: Config = serde_json::from_str(
             r#"{
@@ -6241,7 +6316,7 @@ mod tests {
 
         assert_eq!(config.selection_failure_sample_limit, 12);
         assert!(!config.selection_failure_record_enabled);
-        assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 45);
+        assert_eq!(config.local_upstream_stream_idle_timeout_secs, 45);
         assert!(config.kiro_cache_point_enabled);
         assert!(!config.kiro_cache_point_tools_only);
         assert!(!config.kiro_cache_point_record_plan);

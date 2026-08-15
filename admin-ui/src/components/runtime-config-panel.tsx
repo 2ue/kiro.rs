@@ -521,10 +521,10 @@ const emptyConfig: RuntimeConfig = {
   credentialProbationSecs: 30,
   credentialMaxCooldownSecs: 300,
   credentialDispatchMaxWaitSecs: 120,
-  kiroUpstreamResponseTimeoutSecs: 180,
-  kiroUpstreamStreamIdleTimeoutSecs: 180,
-  kiroUpstreamStreamRetryEnabled: true,
-  kiroUpstreamStreamRetryMaxAttempts: 2,
+  localUpstreamResponseTimeoutSecs: 180,
+  localUpstreamStreamIdleTimeoutSecs: 180,
+  localUpstreamStreamRetryEnabled: true,
+  localUpstreamStreamRetryMaxAttempts: 2,
   inferenceUpstreamMaxAttempts: 4,
   auxiliaryUpstreamMaxAttempts: 2,
   auxiliaryUpstreamMaxConcurrentRequests: 16,
@@ -553,9 +553,9 @@ const emptyConfig: RuntimeConfig = {
     refreshClientMisses: 0,
     refreshClientCacheSaturated: 0,
   },
-  kiroUpstreamStreamRetryOnIdleTimeout: true,
-  kiroUpstreamStreamRetryOnReadError: true,
-  kiroUpstreamStreamRetryOnStatusError: true,
+  localUpstreamStreamRetryOnIdleTimeout: true,
+  localUpstreamStreamRetryOnReadError: true,
+  localUpstreamStreamRetryOnStatusError: true,
   credentialRetryMaxAttempts: 0,
   credentialPromptLogicRetryEnabled: false,
   credentialPromptLogicRetryMaxAttempts: 0,
@@ -2916,18 +2916,18 @@ export function RuntimeConfigPanel() {
       credentialProbationSecs: toWhole(draft.credentialProbationSecs),
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
-      kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
-      kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
-      kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
-      kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
+      localUpstreamResponseTimeoutSecs: toWhole(draft.localUpstreamResponseTimeoutSecs),
+      localUpstreamStreamIdleTimeoutSecs: toWhole(draft.localUpstreamStreamIdleTimeoutSecs),
+      localUpstreamStreamRetryEnabled: Boolean(draft.localUpstreamStreamRetryEnabled),
+      localUpstreamStreamRetryMaxAttempts: toWhole(draft.localUpstreamStreamRetryMaxAttempts, 1, 100),
       inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
       auxiliaryUpstreamMaxAttempts: toWhole(draft.auxiliaryUpstreamMaxAttempts, 1, 10),
       auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
       tokenRefreshMaxRpm: toWhole(draft.tokenRefreshMaxRpm, 1, 6000),
       tokenRefreshBurst: toWhole(draft.tokenRefreshBurst, 1, 256),
-      kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
-      kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
-      kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
+      localUpstreamStreamRetryOnIdleTimeout: Boolean(draft.localUpstreamStreamRetryOnIdleTimeout),
+      localUpstreamStreamRetryOnReadError: Boolean(draft.localUpstreamStreamRetryOnReadError),
+      localUpstreamStreamRetryOnStatusError: Boolean(draft.localUpstreamStreamRetryOnStatusError),
       credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
       credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
       credentialPromptLogicRetryMaxAttempts: toWhole(
@@ -3214,43 +3214,43 @@ export function RuntimeConfigPanel() {
               }
             />
             <NumberField
-              title="Kiro 上游响应头超时"
-              description="限制请求发出后等待 Kiro 上游返回响应头的最长时间，不影响后续流式输出。填 0 表示只用底层 HTTP client 超时。"
-              value={draft.kiroUpstreamResponseTimeoutSecs}
+              title="本地上游响应头超时"
+              description="限制请求发出后等待本地上游返回响应头的最长时间，不影响后续流式输出。填 0 表示只用底层 HTTP client 超时。"
+              value={draft.localUpstreamResponseTimeoutSecs}
               min={0}
               suffix="秒"
-              onChange={(kiroUpstreamResponseTimeoutSecs) =>
-                setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))
+              onChange={(localUpstreamResponseTimeoutSecs) =>
+                setDraft((prev) => ({ ...prev, localUpstreamResponseTimeoutSecs }))
               }
             />
             <NumberField
               title="流式静默超时"
               description="流式响应长时间没有新内容时结束本次请求。填 0 表示不按流式空闲时间主动结束。"
-              value={draft.kiroUpstreamStreamIdleTimeoutSecs}
+              value={draft.localUpstreamStreamIdleTimeoutSecs}
               min={0}
               suffix="秒"
-              onChange={(kiroUpstreamStreamIdleTimeoutSecs) =>
-                setDraft((prev) => ({ ...prev, kiroUpstreamStreamIdleTimeoutSecs }))
+              onChange={(localUpstreamStreamIdleTimeoutSecs) =>
+                setDraft((prev) => ({ ...prev, localUpstreamStreamIdleTimeoutSecs }))
               }
             />
             <ToggleField
               title="首输出前流式换号"
               description="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试，避免重复消息和重复工具调用。"
-              checked={draft.kiroUpstreamStreamRetryEnabled}
-              onCheckedChange={(kiroUpstreamStreamRetryEnabled) =>
-                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryEnabled }))
+              checked={draft.localUpstreamStreamRetryEnabled}
+              onCheckedChange={(localUpstreamStreamRetryEnabled) =>
+                setDraft((prev) => ({ ...prev, localUpstreamStreamRetryEnabled }))
               }
             />
             <NumberField
               title="首输出前最多尝试"
               description="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。"
-              value={draft.kiroUpstreamStreamRetryMaxAttempts}
+              value={draft.localUpstreamStreamRetryMaxAttempts}
               min={1}
               max={100}
               suffix="次"
-              disabled={!draft.kiroUpstreamStreamRetryEnabled}
-              onChange={(kiroUpstreamStreamRetryMaxAttempts) =>
-                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryMaxAttempts }))
+              disabled={!draft.localUpstreamStreamRetryEnabled}
+              onChange={(localUpstreamStreamRetryMaxAttempts) =>
+                setDraft((prev) => ({ ...prev, localUpstreamStreamRetryMaxAttempts }))
               }
             />
             <NumberField
@@ -3315,28 +3315,28 @@ export function RuntimeConfigPanel() {
             <ToggleField
               title="静默超时可换号"
               description="上游流在首输出前长时间无内容时允许换号。"
-              checked={draft.kiroUpstreamStreamRetryOnIdleTimeout}
-              disabled={!draft.kiroUpstreamStreamRetryEnabled}
-              onCheckedChange={(kiroUpstreamStreamRetryOnIdleTimeout) =>
-                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryOnIdleTimeout }))
+              checked={draft.localUpstreamStreamRetryOnIdleTimeout}
+              disabled={!draft.localUpstreamStreamRetryEnabled}
+              onCheckedChange={(localUpstreamStreamRetryOnIdleTimeout) =>
+                setDraft((prev) => ({ ...prev, localUpstreamStreamRetryOnIdleTimeout }))
               }
             />
             <ToggleField
               title="读取错误可换号"
               description="首输出前连接中断、流读取失败时允许换号。"
-              checked={draft.kiroUpstreamStreamRetryOnReadError}
-              disabled={!draft.kiroUpstreamStreamRetryEnabled}
-              onCheckedChange={(kiroUpstreamStreamRetryOnReadError) =>
-                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryOnReadError }))
+              checked={draft.localUpstreamStreamRetryOnReadError}
+              disabled={!draft.localUpstreamStreamRetryEnabled}
+              onCheckedChange={(localUpstreamStreamRetryOnReadError) =>
+                setDraft((prev) => ({ ...prev, localUpstreamStreamRetryOnReadError }))
               }
             />
             <ToggleField
               title="状态错误可换号"
               description="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。"
-              checked={draft.kiroUpstreamStreamRetryOnStatusError}
-              disabled={!draft.kiroUpstreamStreamRetryEnabled}
-              onCheckedChange={(kiroUpstreamStreamRetryOnStatusError) =>
-                setDraft((prev) => ({ ...prev, kiroUpstreamStreamRetryOnStatusError }))
+              checked={draft.localUpstreamStreamRetryOnStatusError}
+              disabled={!draft.localUpstreamStreamRetryEnabled}
+              onCheckedChange={(localUpstreamStreamRetryOnStatusError) =>
+                setDraft((prev) => ({ ...prev, localUpstreamStreamRetryOnStatusError }))
               }
             />
             <NumberField

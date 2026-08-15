@@ -378,7 +378,8 @@ mod tests {
     fn cli_upstream_override_changes_transport_but_preserves_region_headers() {
         let endpoint = CliEndpoint::new();
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(" http://127.0.0.1:39091/aws-lifecycle/ ".to_string());
+        config.local_upstream_base_url =
+            Some(" http://127.0.0.1:39091/aws-lifecycle/ ".to_string());
         let credentials = KiroCredentials {
             auth_method: Some("api_key".to_string()),
             kiro_api_key: Some("ksk_fake_lifecycle".to_string()),

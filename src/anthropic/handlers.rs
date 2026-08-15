@@ -10026,7 +10026,7 @@ async fn handle_non_stream_request(
         response,
         provider
             .runtime_config()
-            .kiro_upstream_response_timeout_secs,
+            .local_upstream_response_timeout_secs,
         LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
     )
     .await

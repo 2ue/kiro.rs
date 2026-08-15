@@ -1855,10 +1855,10 @@ pub struct RuntimeConfigResponse {
     pub credential_probation_secs: u64,
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
-    pub kiro_upstream_response_timeout_secs: u64,
-    pub kiro_upstream_stream_idle_timeout_secs: u64,
-    pub kiro_upstream_stream_retry_enabled: bool,
-    pub kiro_upstream_stream_retry_max_attempts: u32,
+    pub local_upstream_response_timeout_secs: u64,
+    pub local_upstream_stream_idle_timeout_secs: u64,
+    pub local_upstream_stream_retry_enabled: bool,
+    pub local_upstream_stream_retry_max_attempts: u32,
     pub inference_upstream_max_attempts: u32,
     pub auxiliary_upstream_max_attempts: u32,
     pub auxiliary_upstream_max_concurrent_requests: u32,
@@ -1866,9 +1866,9 @@ pub struct RuntimeConfigResponse {
     pub token_refresh_max_rpm: u32,
     pub token_refresh_burst: u32,
     pub token_refresh_admission_runtime: TokenRefreshAdmissionRuntimeResponse,
-    pub kiro_upstream_stream_retry_on_idle_timeout: bool,
-    pub kiro_upstream_stream_retry_on_read_error: bool,
-    pub kiro_upstream_stream_retry_on_status_error: bool,
+    pub local_upstream_stream_retry_on_idle_timeout: bool,
+    pub local_upstream_stream_retry_on_read_error: bool,
+    pub local_upstream_stream_retry_on_status_error: bool,
     pub credential_retry_max_attempts: u32,
     pub credential_prompt_logic_retry_enabled: bool,
     pub credential_prompt_logic_retry_max_attempts: u32,
@@ -1962,14 +1962,14 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_max_cooldown_secs: u64,
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
-    #[serde(default)]
-    pub kiro_upstream_response_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub kiro_upstream_stream_idle_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub kiro_upstream_stream_retry_enabled: Option<bool>,
-    #[serde(default)]
-    pub kiro_upstream_stream_retry_max_attempts: Option<u32>,
+    #[serde(default, alias = "kiroUpstreamResponseTimeoutSecs")]
+    pub local_upstream_response_timeout_secs: Option<u64>,
+    #[serde(default, alias = "kiroUpstreamStreamIdleTimeoutSecs")]
+    pub local_upstream_stream_idle_timeout_secs: Option<u64>,
+    #[serde(default, alias = "kiroUpstreamStreamRetryEnabled")]
+    pub local_upstream_stream_retry_enabled: Option<bool>,
+    #[serde(default, alias = "kiroUpstreamStreamRetryMaxAttempts")]
+    pub local_upstream_stream_retry_max_attempts: Option<u32>,
     #[serde(default)]
     pub inference_upstream_max_attempts: Option<u32>,
     #[serde(default)]
@@ -1980,12 +1980,12 @@ pub struct UpdateRuntimeConfigRequest {
     pub token_refresh_max_rpm: Option<u32>,
     #[serde(default)]
     pub token_refresh_burst: Option<u32>,
-    #[serde(default)]
-    pub kiro_upstream_stream_retry_on_idle_timeout: Option<bool>,
-    #[serde(default)]
-    pub kiro_upstream_stream_retry_on_read_error: Option<bool>,
-    #[serde(default)]
-    pub kiro_upstream_stream_retry_on_status_error: Option<bool>,
+    #[serde(default, alias = "kiroUpstreamStreamRetryOnIdleTimeout")]
+    pub local_upstream_stream_retry_on_idle_timeout: Option<bool>,
+    #[serde(default, alias = "kiroUpstreamStreamRetryOnReadError")]
+    pub local_upstream_stream_retry_on_read_error: Option<bool>,
+    #[serde(default, alias = "kiroUpstreamStreamRetryOnStatusError")]
+    pub local_upstream_stream_retry_on_status_error: Option<bool>,
     #[serde(default)]
     pub credential_retry_max_attempts: Option<u32>,
     #[serde(default)]
@@ -2559,6 +2559,33 @@ mod tests {
         );
         assert_eq!(storage_discover.api_key.as_deref(), Some(""));
         assert_eq!(storage_discover.auth_type, Some(AccountAuthType::Bearer));
+    }
+
+    #[test]
+    fn update_runtime_config_accepts_legacy_local_upstream_field_aliases() {
+        let req: UpdateRuntimeConfigRequest = serde_json::from_value(serde_json::json!({
+            "credentialRpm": 0,
+            "credentialTransientCooldownSecs": 10,
+            "credentialMaxCooldownSecs": 300,
+            "credentialWarmupRequests": 3,
+            "compressionEnabled": false,
+            "kiroUpstreamResponseTimeoutSecs": 41,
+            "kiroUpstreamStreamIdleTimeoutSecs": 42,
+            "kiroUpstreamStreamRetryEnabled": false,
+            "kiroUpstreamStreamRetryMaxAttempts": 4,
+            "kiroUpstreamStreamRetryOnIdleTimeout": false,
+            "kiroUpstreamStreamRetryOnReadError": false,
+            "kiroUpstreamStreamRetryOnStatusError": false
+        }))
+        .unwrap();
+
+        assert_eq!(req.local_upstream_response_timeout_secs, Some(41));
+        assert_eq!(req.local_upstream_stream_idle_timeout_secs, Some(42));
+        assert_eq!(req.local_upstream_stream_retry_enabled, Some(false));
+        assert_eq!(req.local_upstream_stream_retry_max_attempts, Some(4));
+        assert_eq!(req.local_upstream_stream_retry_on_idle_timeout, Some(false));
+        assert_eq!(req.local_upstream_stream_retry_on_read_error, Some(false));
+        assert_eq!(req.local_upstream_stream_retry_on_status_error, Some(false));
     }
 
     #[test]

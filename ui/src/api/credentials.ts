@@ -71,13 +71,62 @@ import type {
 
 const CREDENTIALS_LIST_PAGE_LIMIT = 500
 
-type RuntimeConfigWire = Omit<RuntimeConfig, 'accountRuntime' | 'externalPools'> &
-  Partial<Pick<RuntimeConfig, 'accountRuntime' | 'externalPools'>>
+type LocalUpstreamRuntimeConfigKeys =
+  | 'localUpstreamResponseTimeoutSecs'
+  | 'localUpstreamStreamIdleTimeoutSecs'
+  | 'localUpstreamStreamRetryEnabled'
+  | 'localUpstreamStreamRetryMaxAttempts'
+  | 'localUpstreamStreamRetryOnIdleTimeout'
+  | 'localUpstreamStreamRetryOnReadError'
+  | 'localUpstreamStreamRetryOnStatusError'
+
+type LegacyLocalUpstreamRuntimeConfigWire = {
+  kiroUpstreamResponseTimeoutSecs?: number
+  kiroUpstreamStreamIdleTimeoutSecs?: number
+  kiroUpstreamStreamRetryEnabled?: boolean
+  kiroUpstreamStreamRetryMaxAttempts?: number
+  kiroUpstreamStreamRetryOnIdleTimeout?: boolean
+  kiroUpstreamStreamRetryOnReadError?: boolean
+  kiroUpstreamStreamRetryOnStatusError?: boolean
+}
+
+type RuntimeConfigWire = Omit<
+  RuntimeConfig,
+  'accountRuntime' | 'externalPools' | LocalUpstreamRuntimeConfigKeys
+> &
+  Partial<
+    Pick<RuntimeConfig, 'accountRuntime' | 'externalPools' | LocalUpstreamRuntimeConfigKeys>
+  > &
+  LegacyLocalUpstreamRuntimeConfigWire
 
 function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
+  const {
+    kiroUpstreamResponseTimeoutSecs,
+    kiroUpstreamStreamIdleTimeoutSecs,
+    kiroUpstreamStreamRetryEnabled,
+    kiroUpstreamStreamRetryMaxAttempts,
+    kiroUpstreamStreamRetryOnIdleTimeout,
+    kiroUpstreamStreamRetryOnReadError,
+    kiroUpstreamStreamRetryOnStatusError,
+    ...current
+  } = data
   const accountRuntime = data.accountRuntime ?? data.externalPools ?? defaultAccountRuntimeConfig()
   return {
-    ...data,
+    ...current,
+    localUpstreamResponseTimeoutSecs:
+      data.localUpstreamResponseTimeoutSecs ?? kiroUpstreamResponseTimeoutSecs ?? 180,
+    localUpstreamStreamIdleTimeoutSecs:
+      data.localUpstreamStreamIdleTimeoutSecs ?? kiroUpstreamStreamIdleTimeoutSecs ?? 180,
+    localUpstreamStreamRetryEnabled:
+      data.localUpstreamStreamRetryEnabled ?? kiroUpstreamStreamRetryEnabled ?? true,
+    localUpstreamStreamRetryMaxAttempts:
+      data.localUpstreamStreamRetryMaxAttempts ?? kiroUpstreamStreamRetryMaxAttempts ?? 2,
+    localUpstreamStreamRetryOnIdleTimeout:
+      data.localUpstreamStreamRetryOnIdleTimeout ?? kiroUpstreamStreamRetryOnIdleTimeout ?? true,
+    localUpstreamStreamRetryOnReadError:
+      data.localUpstreamStreamRetryOnReadError ?? kiroUpstreamStreamRetryOnReadError ?? true,
+    localUpstreamStreamRetryOnStatusError:
+      data.localUpstreamStreamRetryOnStatusError ?? kiroUpstreamStreamRetryOnStatusError ?? true,
     accountRuntime,
     externalPools: accountRuntime,
   } as RuntimeConfig

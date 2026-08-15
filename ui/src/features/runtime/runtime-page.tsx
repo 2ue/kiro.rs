@@ -351,18 +351,18 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialProbationSecs: toWhole(draft.credentialProbationSecs),
     credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
     credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
-    kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
-    kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
-    kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
-    kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
+    localUpstreamResponseTimeoutSecs: toWhole(draft.localUpstreamResponseTimeoutSecs),
+    localUpstreamStreamIdleTimeoutSecs: toWhole(draft.localUpstreamStreamIdleTimeoutSecs),
+    localUpstreamStreamRetryEnabled: Boolean(draft.localUpstreamStreamRetryEnabled),
+    localUpstreamStreamRetryMaxAttempts: toWhole(draft.localUpstreamStreamRetryMaxAttempts, 1, 100),
     inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
     auxiliaryUpstreamMaxAttempts: toWhole(draft.auxiliaryUpstreamMaxAttempts, 1, 10),
     auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
     tokenRefreshMaxRpm: toWhole(draft.tokenRefreshMaxRpm, 1, 6000),
     tokenRefreshBurst: toWhole(draft.tokenRefreshBurst, 1, 256),
-    kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
-    kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
-    kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
+    localUpstreamStreamRetryOnIdleTimeout: Boolean(draft.localUpstreamStreamRetryOnIdleTimeout),
+    localUpstreamStreamRetryOnReadError: Boolean(draft.localUpstreamStreamRetryOnReadError),
+    localUpstreamStreamRetryOnStatusError: Boolean(draft.localUpstreamStreamRetryOnStatusError),
     credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
     credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
     credentialPromptLogicRetryMaxAttempts: toWhole(draft.credentialPromptLogicRetryMaxAttempts),
@@ -806,10 +806,10 @@ export function RuntimePage() {
                   </div>
                 </div>
                 <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
-                <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
-                <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
-                <TogField label="首输出前流式换号" desc="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试。" checked={draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryEnabled')} />
-                <NumField label="首输出前最多尝试" desc="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。" value={draft.kiroUpstreamStreamRetryMaxAttempts} min={1} max={100} suffix="次" disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryMaxAttempts')} />
+                <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.localUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('localUpstreamResponseTimeoutSecs')} />
+                <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.localUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('localUpstreamStreamIdleTimeoutSecs')} />
+                <TogField label="首输出前流式换号" desc="仅在还没向客户端发送任何 SSE 事件前生效；已输出 message_start、文本或工具调用后不会重试。" checked={draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryEnabled')} />
+                <NumField label="首输出前最多尝试" desc="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。" value={draft.localUpstreamStreamRetryMaxAttempts} min={1} max={100} suffix="次" disabled={!draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryMaxAttempts')} />
                 <NumField label="单请求推理发送硬上限" desc="本地换号、首输出前重试、请求体重试、上游账号故障转移和本地救援共享；默认 4，与账号数量无关。" value={draft.inferenceUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('inferenceUpstreamMaxAttempts')} />
                 <NumField label="单请求辅助发送硬上限" desc="Token 刷新与企业 Profile 探测共享；默认 2，与账号数量无关，不计入推理发送次数。" value={draft.auxiliaryUpstreamMaxAttempts} min={1} max={10} suffix="次" onChange={set('auxiliaryUpstreamMaxAttempts')} />
                 <NumField label="单实例辅助并发上限" desc="限制同时进行的 Token 刷新、Profile 探测和模型目录请求；饱和时立即拒绝，不进入无界等待队列。" value={draft.auxiliaryUpstreamMaxConcurrentRequests} min={1} max={256} suffix="路" onChange={set('auxiliaryUpstreamMaxConcurrentRequests')} />
@@ -819,9 +819,9 @@ export function RuntimePage() {
                   当前辅助通道：进行中 {draft.auxiliaryUpstreamRuntime.inFlight}，历史峰值 {draft.auxiliaryUpstreamRuntime.peakInFlight}，饱和拒绝 {draft.auxiliaryUpstreamRuntime.rejected}。Refresh client 缓存 {draft.auxiliaryUpstreamRuntime.refreshClientCacheEntries}/{draft.auxiliaryUpstreamRuntime.refreshClientCacheMaxEntries}，构建 {draft.auxiliaryUpstreamRuntime.refreshClientBuilds}，命中 {draft.auxiliaryUpstreamRuntime.refreshClientHits}，未命中 {draft.auxiliaryUpstreamRuntime.refreshClientMisses}，容量拒绝 {draft.auxiliaryUpstreamRuntime.refreshClientCacheSaturated}。
                   <br />Token refresh authority {draft.tokenRefreshAdmissionRuntime.authority}，准入 {draft.tokenRefreshAdmissionRuntime.admitted}，RPM 拒绝 {draft.tokenRefreshAdmissionRuntime.rateLimited}，协调拒绝 {draft.tokenRefreshAdmissionRuntime.coordinationRejected}，Redis 错误 {draft.tokenRefreshAdmissionRuntime.redisErrors}，剩余 {draft.tokenRefreshAdmissionRuntime.remainingMilliTokens / 1000} tokens。
                 </div>
-                <TogField label="静默超时可换号" desc="上游流在首输出前长时间无内容时允许换号。" checked={draft.kiroUpstreamStreamRetryOnIdleTimeout} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnIdleTimeout')} />
-                <TogField label="读取错误可换号" desc="首输出前连接中断、流读取失败时允许换号。" checked={draft.kiroUpstreamStreamRetryOnReadError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnReadError')} />
-                <TogField label="状态错误可换号" desc="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。" checked={draft.kiroUpstreamStreamRetryOnStatusError} disabled={!draft.kiroUpstreamStreamRetryEnabled} onChange={set('kiroUpstreamStreamRetryOnStatusError')} />
+                <TogField label="静默超时可换号" desc="上游流在首输出前长时间无内容时允许换号。" checked={draft.localUpstreamStreamRetryOnIdleTimeout} disabled={!draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryOnIdleTimeout')} />
+                <TogField label="读取错误可换号" desc="首输出前连接中断、流读取失败时允许换号。" checked={draft.localUpstreamStreamRetryOnReadError} disabled={!draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryOnReadError')} />
+                <TogField label="状态错误可换号" desc="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。" checked={draft.localUpstreamStreamRetryOnStatusError} disabled={!draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryOnStatusError')} />
                 <NumField label="本地 provider 尝试上限" desc="单次本地调用最多尝试多少个凭据；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
                 <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />

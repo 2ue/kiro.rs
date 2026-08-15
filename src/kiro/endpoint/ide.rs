@@ -39,7 +39,7 @@ impl IdeEndpoint {
 
     fn base_url(&self, ctx: &RequestContext<'_>) -> String {
         ctx.config
-            .kiro_upstream_base_url
+            .local_upstream_base_url
             .as_deref()
             .map(str::trim)
             .filter(|base| !base.is_empty())
@@ -762,11 +762,11 @@ mod tests {
     }
 
     #[test]
-    fn test_kiro_upstream_base_url_override_only_changes_target_url() {
+    fn test_local_upstream_base_url_override_only_changes_target_url() {
         let endpoint = IdeEndpoint::new();
         let credentials = KiroCredentials::default();
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some("http://127.0.0.1:39090/mock/".to_string());
+        config.local_upstream_base_url = Some("http://127.0.0.1:39090/mock/".to_string());
         let ctx = RequestContext {
             credentials: &credentials,
             token: "token",

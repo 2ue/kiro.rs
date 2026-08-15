@@ -1933,8 +1933,8 @@ async fn unused_loopback_base_url() -> String {
 
 fn auxiliary_fallback_local_provider(base_url: &str, expired_for_refresh: bool) -> KiroProvider {
     let mut config = Config::default();
-    config.kiro_upstream_base_url = Some(base_url.to_string());
-    config.kiro_upstream_response_timeout_secs = 2;
+    config.local_upstream_base_url = Some(base_url.to_string());
+    config.local_upstream_response_timeout_secs = 2;
     config.credential_retry_max_attempts = 1;
     config.credential_prompt_logic_retry_enabled = false;
     let credentials = KiroCredentials {

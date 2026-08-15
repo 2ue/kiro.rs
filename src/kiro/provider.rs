@@ -2053,8 +2053,8 @@ mod tests {
         credential.token_endpoint = Some(format!("{base_url}/oauth-refresh"));
 
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(base_url.to_string());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(base_url.to_string());
+        config.local_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 1;
         let manager = Arc::new(
             MultiTokenManager::new(config, vec![credential], None, None, false)
@@ -2243,8 +2243,8 @@ mod tests {
         auxiliary_limit: Option<u32>,
     ) -> (Arc<KiroProvider>, Arc<MultiTokenManager>) {
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(base_url.to_string());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(base_url.to_string());
+        config.local_upstream_response_timeout_secs = 2;
         if let Some(auxiliary_limit) = auxiliary_limit {
             config.auxiliary_upstream_max_concurrent_requests = auxiliary_limit;
         }
@@ -2281,8 +2281,8 @@ mod tests {
             })
             .collect();
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(base_url.to_string());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(base_url.to_string());
+        config.local_upstream_response_timeout_secs = 2;
         let manager = Arc::new(
             MultiTokenManager::new(config, credentials, None, None, false)
                 .expect("fake model discovery token manager"),
@@ -2304,8 +2304,8 @@ mod tests {
         compression_enabled: bool,
     ) -> KiroProvider {
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(base_url.to_string());
-        config.kiro_upstream_response_timeout_secs = 5;
+        config.local_upstream_base_url = Some(base_url.to_string());
+        config.local_upstream_response_timeout_secs = 5;
         config.compression.enabled = compression_enabled;
         config.compression.whitespace_compression = true;
 
@@ -3358,8 +3358,8 @@ mod tests {
         const SCENARIO: &str = "model_discovery_failure";
         let server = FakeBadRequestServer::start().await;
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(server.base_url.clone());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(server.base_url.clone());
+        config.local_upstream_response_timeout_secs = 2;
         let mut credentials = fake_bad_request_credentials(60);
         for (index, credential) in credentials.iter_mut().enumerate() {
             credential.subscription_title = Some(format!("capability-class-{index}"));
@@ -3729,8 +3729,8 @@ mod tests {
         let hits_before = server.state.scenario_hits(scenario);
         let total_hits_before = server.state.total_hits.load(Ordering::Relaxed);
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(server.base_url.clone());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(server.base_url.clone());
+        config.local_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 100;
         config.credential_prompt_logic_retry_enabled = prompt_logic_retry_enabled;
         config.credential_prompt_logic_retry_max_attempts = 100;
@@ -3795,8 +3795,8 @@ mod tests {
         pool_size: usize,
     ) -> (KiroProvider, Arc<MultiTokenManager>) {
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(base_url.to_string());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(base_url.to_string());
+        config.local_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 100;
         config.credential_rate_limit_cooldown_secs = 60;
         config.credential_server_error_cooldown_secs = 60;
@@ -3967,8 +3967,8 @@ mod tests {
             if is_stream { "stream" } else { "nonstream" }
         );
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(server.base_url.clone());
-        config.kiro_upstream_response_timeout_secs = response_timeout_secs;
+        config.local_upstream_base_url = Some(server.base_url.clone());
+        config.local_upstream_response_timeout_secs = response_timeout_secs;
         config.credential_retry_max_attempts = 100;
         config.credential_rate_limit_cooldown_secs = 60;
         config.credential_server_error_cooldown_secs = 60;
@@ -5413,8 +5413,8 @@ mod tests {
         for is_stream in [false, true] {
             for round in 1..=5 {
                 let mut config = Config::default();
-                config.kiro_upstream_base_url = Some(server.base_url.clone());
-                config.kiro_upstream_response_timeout_secs = 2;
+                config.local_upstream_base_url = Some(server.base_url.clone());
+                config.local_upstream_response_timeout_secs = 2;
                 config.credential_retry_max_attempts = 100;
                 config.credential_server_error_cooldown_secs = 60;
                 config.credential_cooldown_jitter_percent = 0;
@@ -5558,8 +5558,8 @@ mod tests {
         for is_stream in [false, true] {
             for round in 1..=5 {
                 let mut config = Config::default();
-                config.kiro_upstream_base_url = Some(server.base_url.clone());
-                config.kiro_upstream_response_timeout_secs = 10;
+                config.local_upstream_base_url = Some(server.base_url.clone());
+                config.local_upstream_response_timeout_secs = 10;
                 config.credential_retry_max_attempts = 100;
                 let manager = Arc::new(
                     MultiTokenManager::new(
@@ -5662,8 +5662,8 @@ mod tests {
         for is_stream in [false, true] {
             for round in 1..=5 {
                 let mut config = Config::default();
-                config.kiro_upstream_base_url = Some(server.base_url.clone());
-                config.kiro_upstream_response_timeout_secs = 10;
+                config.local_upstream_base_url = Some(server.base_url.clone());
+                config.local_upstream_response_timeout_secs = 10;
                 config.credential_retry_max_attempts = 100;
                 let manager = Arc::new(
                     MultiTokenManager::new(
@@ -6246,8 +6246,8 @@ mod tests {
     async fn mcp_success_header_keeps_real_lease_until_body_validation_for_five_rounds() {
         let server = FakeBadRequestServer::start().await;
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(server.base_url.clone());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(server.base_url.clone());
+        config.local_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 1;
         let manager = Arc::new(
             MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
@@ -6309,8 +6309,8 @@ mod tests {
         for pool_size in [1, 20, 60] {
             for round in 1..=5 {
                 let mut config = Config::default();
-                config.kiro_upstream_base_url = Some(server.base_url.clone());
-                config.kiro_upstream_response_timeout_secs = 2;
+                config.local_upstream_base_url = Some(server.base_url.clone());
+                config.local_upstream_response_timeout_secs = 2;
                 config.credential_retry_max_attempts = 100;
                 let manager = Arc::new(
                     MultiTokenManager::new(
@@ -6395,8 +6395,8 @@ mod tests {
         ] {
             for round in 1..=5 {
                 let mut config = Config::default();
-                config.kiro_upstream_base_url = Some(server.base_url.clone());
-                config.kiro_upstream_response_timeout_secs = 2;
+                config.local_upstream_base_url = Some(server.base_url.clone());
+                config.local_upstream_response_timeout_secs = 2;
                 config.credential_retry_max_attempts = 1;
                 let manager = Arc::new(
                     MultiTokenManager::new(
@@ -6465,8 +6465,8 @@ mod tests {
         const SCENARIO: &str = "rescue_server_error";
         let server = FakeBadRequestServer::start().await;
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(server.base_url.clone());
-        config.kiro_upstream_response_timeout_secs = 2;
+        config.local_upstream_base_url = Some(server.base_url.clone());
+        config.local_upstream_response_timeout_secs = 2;
         config.credential_retry_max_attempts = 100;
         let manager = Arc::new(
             MultiTokenManager::new(config, fake_bad_request_credentials(20), None, None, false)
@@ -7604,7 +7604,7 @@ impl KiroProvider {
             "sending bounded auxiliary profile discovery request"
         );
         let response =
-            send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+            send_with_response_header_timeout(request, config.local_upstream_response_timeout_secs)
                 .await?;
 
         let status = response.status();
@@ -7613,7 +7613,7 @@ impl KiroProvider {
         if !status.is_success() {
             let diagnostic = match Self::read_upstream_body_strict(
                 response,
-                config.kiro_upstream_response_timeout_secs,
+                config.local_upstream_response_timeout_secs,
                 PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
             )
             .await
@@ -7648,7 +7648,7 @@ impl KiroProvider {
 
         let body = Self::read_upstream_body_strict(
             response,
-            config.kiro_upstream_response_timeout_secs,
+            config.local_upstream_response_timeout_secs,
             PROVIDER_AUXILIARY_BODY_MAX_BYTES,
         )
         .await
@@ -8447,7 +8447,7 @@ impl KiroProvider {
         let request = endpoint.decorate_api(base, &rctx);
 
         let response =
-            send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+            send_with_response_header_timeout(request, config.local_upstream_response_timeout_secs)
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!("非流式 API 请求发送失败（{}）: {}", credential_context, e)
@@ -8474,7 +8474,7 @@ impl KiroProvider {
         let retry_after = Self::retry_after_duration(response.headers());
         let message = match Self::read_upstream_body_strict(
             response,
-            config.kiro_upstream_response_timeout_secs,
+            config.local_upstream_response_timeout_secs,
             PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
         )
         .await
@@ -8703,7 +8703,7 @@ impl KiroProvider {
             let response = execute_with_response_header_timeout(
                 &client,
                 request,
-                config.kiro_upstream_response_timeout_secs,
+                config.local_upstream_response_timeout_secs,
             )
             .await?;
             let status = response.status();
@@ -8711,7 +8711,7 @@ impl KiroProvider {
             let retry_after = Self::retry_after_duration(response.headers());
             let body = Self::read_upstream_body_strict(
                 response,
-                config.kiro_upstream_response_timeout_secs,
+                config.local_upstream_response_timeout_secs,
                 PROVIDER_AUXILIARY_BODY_MAX_BYTES,
             )
             .await
@@ -9328,7 +9328,7 @@ impl KiroProvider {
 
             let response = match send_with_response_header_timeout(
                 request,
-                config.kiro_upstream_response_timeout_secs,
+                config.local_upstream_response_timeout_secs,
             )
             .await
             {
@@ -9422,7 +9422,7 @@ impl KiroProvider {
             // 失败响应
             let body = match response_text_with_limit_and_body_timeout(
                 response,
-                config.kiro_upstream_response_timeout_secs,
+                config.local_upstream_response_timeout_secs,
                 PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
             )
             .await
@@ -10348,7 +10348,7 @@ impl KiroProvider {
 
             let response = match send_with_response_header_timeout(
                 request,
-                config.kiro_upstream_response_timeout_secs,
+                config.local_upstream_response_timeout_secs,
             )
             .await
             {
@@ -10485,7 +10485,7 @@ impl KiroProvider {
             // this scope through logs, attempt attribution, scheduler state, or provider errors.
             let upstream_body = match Self::read_upstream_body_strict(
                 response,
-                config.kiro_upstream_response_timeout_secs,
+                config.local_upstream_response_timeout_secs,
                 PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
             )
             .await
@@ -11163,7 +11163,7 @@ impl KiroProvider {
                 let retry_request = endpoint.decorate_api(retry_base, &retry_rctx);
                 let retry_response = match send_with_response_header_timeout(
                     retry_request,
-                    config.kiro_upstream_response_timeout_secs,
+                    config.local_upstream_response_timeout_secs,
                 )
                 .await
                 {
@@ -11248,7 +11248,7 @@ impl KiroProvider {
 
                 let retry_body_result = Self::read_upstream_body_strict(
                     retry_response,
-                    config.kiro_upstream_response_timeout_secs,
+                    config.local_upstream_response_timeout_secs,
                     PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES,
                 )
                 .await;

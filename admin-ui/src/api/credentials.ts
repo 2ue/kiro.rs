@@ -60,6 +60,59 @@ import type {
   UpdateExternalPoolRequest,
 } from '@/types/api'
 
+type LocalUpstreamRuntimeConfigKeys =
+  | 'localUpstreamResponseTimeoutSecs'
+  | 'localUpstreamStreamIdleTimeoutSecs'
+  | 'localUpstreamStreamRetryEnabled'
+  | 'localUpstreamStreamRetryMaxAttempts'
+  | 'localUpstreamStreamRetryOnIdleTimeout'
+  | 'localUpstreamStreamRetryOnReadError'
+  | 'localUpstreamStreamRetryOnStatusError'
+
+type LegacyLocalUpstreamRuntimeConfigWire = {
+  kiroUpstreamResponseTimeoutSecs?: number
+  kiroUpstreamStreamIdleTimeoutSecs?: number
+  kiroUpstreamStreamRetryEnabled?: boolean
+  kiroUpstreamStreamRetryMaxAttempts?: number
+  kiroUpstreamStreamRetryOnIdleTimeout?: boolean
+  kiroUpstreamStreamRetryOnReadError?: boolean
+  kiroUpstreamStreamRetryOnStatusError?: boolean
+}
+
+type RuntimeConfigWire = Omit<RuntimeConfig, LocalUpstreamRuntimeConfigKeys> &
+  Partial<Pick<RuntimeConfig, LocalUpstreamRuntimeConfigKeys>> &
+  LegacyLocalUpstreamRuntimeConfigWire
+
+function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
+  const {
+    kiroUpstreamResponseTimeoutSecs,
+    kiroUpstreamStreamIdleTimeoutSecs,
+    kiroUpstreamStreamRetryEnabled,
+    kiroUpstreamStreamRetryMaxAttempts,
+    kiroUpstreamStreamRetryOnIdleTimeout,
+    kiroUpstreamStreamRetryOnReadError,
+    kiroUpstreamStreamRetryOnStatusError,
+    ...current
+  } = data
+  return {
+    ...current,
+    localUpstreamResponseTimeoutSecs:
+      data.localUpstreamResponseTimeoutSecs ?? kiroUpstreamResponseTimeoutSecs ?? 180,
+    localUpstreamStreamIdleTimeoutSecs:
+      data.localUpstreamStreamIdleTimeoutSecs ?? kiroUpstreamStreamIdleTimeoutSecs ?? 180,
+    localUpstreamStreamRetryEnabled:
+      data.localUpstreamStreamRetryEnabled ?? kiroUpstreamStreamRetryEnabled ?? true,
+    localUpstreamStreamRetryMaxAttempts:
+      data.localUpstreamStreamRetryMaxAttempts ?? kiroUpstreamStreamRetryMaxAttempts ?? 2,
+    localUpstreamStreamRetryOnIdleTimeout:
+      data.localUpstreamStreamRetryOnIdleTimeout ?? kiroUpstreamStreamRetryOnIdleTimeout ?? true,
+    localUpstreamStreamRetryOnReadError:
+      data.localUpstreamStreamRetryOnReadError ?? kiroUpstreamStreamRetryOnReadError ?? true,
+    localUpstreamStreamRetryOnStatusError:
+      data.localUpstreamStreamRetryOnStatusError ?? kiroUpstreamStreamRetryOnStatusError ?? true,
+  } as RuntimeConfig
+}
+
 // 创建 axios 实例
 const api = axios.create({
   baseURL: '/api/admin',
@@ -465,8 +518,8 @@ export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ m
 }
 
 export async function getRuntimeConfig(): Promise<RuntimeConfig> {
-  const { data } = await api.get<RuntimeConfig>('/config/runtime')
-  return data
+  const { data } = await api.get<RuntimeConfigWire>('/config/runtime')
+  return normalizeRuntimeConfig(data)
 }
 
 export async function getSystemVersion(): Promise<SystemVersionResponse> {
@@ -477,8 +530,8 @@ export async function getSystemVersion(): Promise<SystemVersionResponse> {
 export async function updateRuntimeConfig(
   req: UpdateRuntimeConfigRequest
 ): Promise<RuntimeConfig> {
-  const { data } = await api.put<RuntimeConfig>('/config/runtime', req)
-  return data
+  const { data } = await api.put<RuntimeConfigWire>('/config/runtime', req)
+  return normalizeRuntimeConfig(data)
 }
 
 export async function getAccessKeys(): Promise<AccessKeysResponse> {

@@ -654,8 +654,8 @@ fn multimodal_handler_test_router(base_url: &str) -> Router {
 
 fn multimodal_handler_test_router_with_usage(base_url: &str) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
-    config.kiro_upstream_base_url = Some(base_url.to_string());
-    config.kiro_upstream_response_timeout_secs = 2;
+    config.local_upstream_base_url = Some(base_url.to_string());
+    config.local_upstream_response_timeout_secs = 2;
     config.credential_retry_max_attempts = 1;
     config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
     multimodal_handler_test_router_from_config(config)
@@ -686,8 +686,8 @@ fn multimodal_handler_test_router_from_config(config: Config) -> (Router, Arc<Us
 async fn run_strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds() {
     let upstream = MultimodalHandlerUpstream::start().await;
     let mut config = Config::default();
-    config.kiro_upstream_base_url = Some(upstream.base_url.clone());
-    config.kiro_upstream_response_timeout_secs = 2;
+    config.local_upstream_base_url = Some(upstream.base_url.clone());
+    config.local_upstream_response_timeout_secs = 2;
     config.credential_retry_max_attempts = 1;
     config.compat_profile = CompatProfile::AnthropicStrict;
     let (app, usage_recorder) = multimodal_handler_test_router_from_config(config);
@@ -848,8 +848,8 @@ fn local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_
 
 fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
-    config.kiro_upstream_base_url = Some(base_url.to_string());
-    config.kiro_upstream_response_timeout_secs = 1;
+    config.local_upstream_base_url = Some(base_url.to_string());
+    config.local_upstream_response_timeout_secs = 1;
     config.credential_retry_max_attempts = 1;
     config.credential_transient_cooldown_secs = 0;
     config.credential_rate_limit_cooldown_secs = 0;
@@ -992,8 +992,8 @@ fn websearch_handler_test_router_with_external_options(
     external_direct_policy_enabled: bool,
 ) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
-    config.kiro_upstream_base_url = Some(kiro_base_url.to_string());
-    config.kiro_upstream_response_timeout_secs = 1;
+    config.local_upstream_base_url = Some(kiro_base_url.to_string());
+    config.local_upstream_response_timeout_secs = 1;
     config.credential_retry_max_attempts = 0;
     {
         let account_runtime = config.account_runtime_config_mut();
@@ -2611,8 +2611,8 @@ fn multimodal_handler_request(path: &str, body: String) -> Request<Body> {
 
 fn route_policy_matrix_config(base_url: &str) -> Config {
     let mut config = Config::default();
-    config.kiro_upstream_base_url = Some(base_url.to_string());
-    config.kiro_upstream_response_timeout_secs = 2;
+    config.local_upstream_base_url = Some(base_url.to_string());
+    config.local_upstream_response_timeout_secs = 2;
     config.credential_retry_max_attempts = 1;
 
     config.cache_policy.path_overrides.insert(
@@ -3517,19 +3517,19 @@ fn handler_eventstream_fault_router_with_limits(
 ) -> (Router, Arc<UsageRecorder>) {
     assert!(credential_count > 0);
     let mut config = Config::default();
-    config.kiro_upstream_base_url = Some(base_url.to_string());
+    config.local_upstream_base_url = Some(base_url.to_string());
     // The non-stream exact-limit fixture intentionally reads and decodes a 16 MiB
     // EventStream body.  Under the full all-target test tree, CPU contention can
     // make that boundary-control path exceed the previous 3s fixture timeout and
     // turn a limit test into a false upstream body-timeout 502.  The caller-side
     // test timeout remains 5s, so real stalls still fail the fixture promptly.
-    config.kiro_upstream_response_timeout_secs = 10;
-    config.kiro_upstream_stream_idle_timeout_secs = 1;
-    config.kiro_upstream_stream_retry_enabled = true;
-    config.kiro_upstream_stream_retry_max_attempts = 2;
-    config.kiro_upstream_stream_retry_on_idle_timeout = true;
-    config.kiro_upstream_stream_retry_on_read_error = true;
-    config.kiro_upstream_stream_retry_on_status_error = true;
+    config.local_upstream_response_timeout_secs = 10;
+    config.local_upstream_stream_idle_timeout_secs = 1;
+    config.local_upstream_stream_retry_enabled = true;
+    config.local_upstream_stream_retry_max_attempts = 2;
+    config.local_upstream_stream_retry_on_idle_timeout = true;
+    config.local_upstream_stream_retry_on_read_error = true;
+    config.local_upstream_stream_retry_on_status_error = true;
     config.credential_retry_max_attempts = credential_retry_max_attempts;
     config.inference_upstream_max_attempts = 4;
     let credentials = (1..=credential_count)

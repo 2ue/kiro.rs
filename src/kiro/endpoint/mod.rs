@@ -23,7 +23,7 @@ pub use ide::IdeEndpoint;
 /// with the logical AWS/Kiro host derived from the credential region.
 pub(crate) fn configured_upstream_url(config: &Config, suffix: &str) -> Option<String> {
     let base = config
-        .kiro_upstream_base_url
+        .local_upstream_base_url
         .as_deref()
         .map(str::trim)
         .filter(|base| !base.is_empty())?

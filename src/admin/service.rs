@@ -4967,10 +4967,11 @@ impl AdminService {
             credential_probation_secs: config.credential_probation_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
-            kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
-            kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
-            kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
-            kiro_upstream_stream_retry_max_attempts: config.kiro_upstream_stream_retry_max_attempts,
+            local_upstream_response_timeout_secs: config.local_upstream_response_timeout_secs,
+            local_upstream_stream_idle_timeout_secs: config.local_upstream_stream_idle_timeout_secs,
+            local_upstream_stream_retry_enabled: config.local_upstream_stream_retry_enabled,
+            local_upstream_stream_retry_max_attempts: config
+                .local_upstream_stream_retry_max_attempts,
             inference_upstream_max_attempts: config.inference_upstream_max_attempts,
             auxiliary_upstream_max_attempts: config.auxiliary_upstream_max_attempts,
             auxiliary_upstream_max_concurrent_requests: config
@@ -5002,12 +5003,12 @@ impl AdminService {
                 last_retry_after_ms: token_refresh_admission.last_retry_after_ms,
                 remaining_milli_tokens: token_refresh_admission.remaining_milli_tokens,
             },
-            kiro_upstream_stream_retry_on_idle_timeout: config
-                .kiro_upstream_stream_retry_on_idle_timeout,
-            kiro_upstream_stream_retry_on_read_error: config
-                .kiro_upstream_stream_retry_on_read_error,
-            kiro_upstream_stream_retry_on_status_error: config
-                .kiro_upstream_stream_retry_on_status_error,
+            local_upstream_stream_retry_on_idle_timeout: config
+                .local_upstream_stream_retry_on_idle_timeout,
+            local_upstream_stream_retry_on_read_error: config
+                .local_upstream_stream_retry_on_read_error,
+            local_upstream_stream_retry_on_status_error: config
+                .local_upstream_stream_retry_on_status_error,
             credential_retry_max_attempts: config.credential_retry_max_attempts,
             credential_prompt_logic_retry_enabled: config.credential_prompt_logic_retry_enabled,
             credential_prompt_logic_retry_max_attempts: config
@@ -5091,18 +5092,18 @@ impl AdminService {
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
-        let kiro_upstream_response_timeout_secs = req
-            .kiro_upstream_response_timeout_secs
-            .unwrap_or(current_config.kiro_upstream_response_timeout_secs);
-        let kiro_upstream_stream_idle_timeout_secs = req
-            .kiro_upstream_stream_idle_timeout_secs
-            .unwrap_or(current_config.kiro_upstream_stream_idle_timeout_secs);
-        let kiro_upstream_stream_retry_enabled = req
-            .kiro_upstream_stream_retry_enabled
-            .unwrap_or(current_config.kiro_upstream_stream_retry_enabled);
-        let kiro_upstream_stream_retry_max_attempts = req
-            .kiro_upstream_stream_retry_max_attempts
-            .unwrap_or(current_config.kiro_upstream_stream_retry_max_attempts);
+        let local_upstream_response_timeout_secs = req
+            .local_upstream_response_timeout_secs
+            .unwrap_or(current_config.local_upstream_response_timeout_secs);
+        let local_upstream_stream_idle_timeout_secs = req
+            .local_upstream_stream_idle_timeout_secs
+            .unwrap_or(current_config.local_upstream_stream_idle_timeout_secs);
+        let local_upstream_stream_retry_enabled = req
+            .local_upstream_stream_retry_enabled
+            .unwrap_or(current_config.local_upstream_stream_retry_enabled);
+        let local_upstream_stream_retry_max_attempts = req
+            .local_upstream_stream_retry_max_attempts
+            .unwrap_or(current_config.local_upstream_stream_retry_max_attempts);
         let inference_upstream_max_attempts = req
             .inference_upstream_max_attempts
             .unwrap_or(current_config.inference_upstream_max_attempts);
@@ -5118,15 +5119,15 @@ impl AdminService {
         let token_refresh_burst = req
             .token_refresh_burst
             .unwrap_or(current_config.token_refresh_burst);
-        let kiro_upstream_stream_retry_on_idle_timeout = req
-            .kiro_upstream_stream_retry_on_idle_timeout
-            .unwrap_or(current_config.kiro_upstream_stream_retry_on_idle_timeout);
-        let kiro_upstream_stream_retry_on_read_error = req
-            .kiro_upstream_stream_retry_on_read_error
-            .unwrap_or(current_config.kiro_upstream_stream_retry_on_read_error);
-        let kiro_upstream_stream_retry_on_status_error = req
-            .kiro_upstream_stream_retry_on_status_error
-            .unwrap_or(current_config.kiro_upstream_stream_retry_on_status_error);
+        let local_upstream_stream_retry_on_idle_timeout = req
+            .local_upstream_stream_retry_on_idle_timeout
+            .unwrap_or(current_config.local_upstream_stream_retry_on_idle_timeout);
+        let local_upstream_stream_retry_on_read_error = req
+            .local_upstream_stream_retry_on_read_error
+            .unwrap_or(current_config.local_upstream_stream_retry_on_read_error);
+        let local_upstream_stream_retry_on_status_error = req
+            .local_upstream_stream_retry_on_status_error
+            .unwrap_or(current_config.local_upstream_stream_retry_on_status_error);
         let credential_retry_max_attempts = req
             .credential_retry_max_attempts
             .unwrap_or(current_config.credential_retry_max_attempts);
@@ -5430,19 +5431,19 @@ impl AdminService {
                 "credentialPromptLogicRetryMaxAttempts 不能大于 10000".to_string(),
             ));
         }
-        if kiro_upstream_response_timeout_secs > 86_400 {
+        if local_upstream_response_timeout_secs > 86_400 {
             return Err(AdminServiceError::InvalidCredential(
-                "kiroUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
+                "localUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
             ));
         }
-        if kiro_upstream_stream_idle_timeout_secs > 86_400 {
+        if local_upstream_stream_idle_timeout_secs > 86_400 {
             return Err(AdminServiceError::InvalidCredential(
-                "kiroUpstreamStreamIdleTimeoutSecs 不能大于 86400".to_string(),
+                "localUpstreamStreamIdleTimeoutSecs 不能大于 86400".to_string(),
             ));
         }
-        if kiro_upstream_stream_retry_max_attempts > 100 {
+        if local_upstream_stream_retry_max_attempts > 100 {
             return Err(AdminServiceError::InvalidCredential(
-                "kiroUpstreamStreamRetryMaxAttempts 不能大于 100".to_string(),
+                "localUpstreamStreamRetryMaxAttempts 不能大于 100".to_string(),
             ));
         }
         if !scheduler_error_ewma_alpha.is_finite()
@@ -5628,24 +5629,24 @@ impl AdminService {
                 config.credential_probation_secs = credential_probation_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
-                config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
-                config.kiro_upstream_stream_idle_timeout_secs =
-                    kiro_upstream_stream_idle_timeout_secs;
-                config.kiro_upstream_stream_retry_enabled = kiro_upstream_stream_retry_enabled;
-                config.kiro_upstream_stream_retry_max_attempts =
-                    kiro_upstream_stream_retry_max_attempts;
+                config.local_upstream_response_timeout_secs = local_upstream_response_timeout_secs;
+                config.local_upstream_stream_idle_timeout_secs =
+                    local_upstream_stream_idle_timeout_secs;
+                config.local_upstream_stream_retry_enabled = local_upstream_stream_retry_enabled;
+                config.local_upstream_stream_retry_max_attempts =
+                    local_upstream_stream_retry_max_attempts;
                 config.inference_upstream_max_attempts = inference_upstream_max_attempts;
                 config.auxiliary_upstream_max_attempts = auxiliary_upstream_max_attempts;
                 config.auxiliary_upstream_max_concurrent_requests =
                     auxiliary_upstream_max_concurrent_requests;
                 config.token_refresh_max_rpm = token_refresh_max_rpm;
                 config.token_refresh_burst = token_refresh_burst;
-                config.kiro_upstream_stream_retry_on_idle_timeout =
-                    kiro_upstream_stream_retry_on_idle_timeout;
-                config.kiro_upstream_stream_retry_on_read_error =
-                    kiro_upstream_stream_retry_on_read_error;
-                config.kiro_upstream_stream_retry_on_status_error =
-                    kiro_upstream_stream_retry_on_status_error;
+                config.local_upstream_stream_retry_on_idle_timeout =
+                    local_upstream_stream_retry_on_idle_timeout;
+                config.local_upstream_stream_retry_on_read_error =
+                    local_upstream_stream_retry_on_read_error;
+                config.local_upstream_stream_retry_on_status_error =
+                    local_upstream_stream_retry_on_status_error;
                 config.credential_retry_max_attempts = credential_retry_max_attempts;
                 config.credential_prompt_logic_retry_enabled =
                     credential_prompt_logic_retry_enabled;

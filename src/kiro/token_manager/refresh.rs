@@ -969,13 +969,13 @@ pub(crate) async fn get_usage_limits(
     }
 
     let response =
-        send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+        send_with_response_header_timeout(request, config.local_upstream_response_timeout_secs)
             .await?;
 
     let status = response.status();
     let response_body = response_bytes_with_limit_and_body_timeout(
         response,
-        config.kiro_upstream_response_timeout_secs,
+        config.local_upstream_response_timeout_secs,
         TOKEN_SERVICE_RESPONSE_MAX_BYTES,
     )
     .await?;
@@ -1045,12 +1045,12 @@ pub(crate) async fn set_overage_status(
     }
 
     let response =
-        send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+        send_with_response_header_timeout(request, config.local_upstream_response_timeout_secs)
             .await?;
     let status_code = response.status();
     let _response_body = response_bytes_with_limit_and_body_timeout(
         response,
-        config.kiro_upstream_response_timeout_secs,
+        config.local_upstream_response_timeout_secs,
         TOKEN_SERVICE_RESPONSE_MAX_BYTES,
     )
     .await?;
@@ -1744,7 +1744,7 @@ mod tests {
             ..Default::default()
         };
         let mut config = Config::default();
-        config.kiro_upstream_base_url = Some(format!("http://{addr}/fake"));
+        config.local_upstream_base_url = Some(format!("http://{addr}/fake"));
 
         let usage = get_usage_limits(
             &credentials,

@@ -1992,10 +1992,10 @@ export interface RuntimeConfig {
   credentialProbationSecs: number
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
-  kiroUpstreamResponseTimeoutSecs: number
-  kiroUpstreamStreamIdleTimeoutSecs: number
-  kiroUpstreamStreamRetryEnabled: boolean
-  kiroUpstreamStreamRetryMaxAttempts: number
+  localUpstreamResponseTimeoutSecs: number
+  localUpstreamStreamIdleTimeoutSecs: number
+  localUpstreamStreamRetryEnabled: boolean
+  localUpstreamStreamRetryMaxAttempts: number
   inferenceUpstreamMaxAttempts: number
   auxiliaryUpstreamMaxAttempts: number
   auxiliaryUpstreamMaxConcurrentRequests: number
@@ -2003,9 +2003,9 @@ export interface RuntimeConfig {
   tokenRefreshMaxRpm: number
   tokenRefreshBurst: number
   tokenRefreshAdmissionRuntime: TokenRefreshAdmissionRuntime
-  kiroUpstreamStreamRetryOnIdleTimeout: boolean
-  kiroUpstreamStreamRetryOnReadError: boolean
-  kiroUpstreamStreamRetryOnStatusError: boolean
+  localUpstreamStreamRetryOnIdleTimeout: boolean
+  localUpstreamStreamRetryOnReadError: boolean
+  localUpstreamStreamRetryOnStatusError: boolean
   credentialRetryMaxAttempts: number
   credentialPromptLogicRetryEnabled: boolean
   credentialPromptLogicRetryMaxAttempts: number
