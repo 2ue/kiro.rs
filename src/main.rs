@@ -36,8 +36,8 @@ use common::auth::RequestApiKeyStore;
 use futures::StreamExt;
 use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
-use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
+use local_upstream::provider::LocalUpstreamProvider;
 use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
 use model::config::Config;
 use serde_json::{Value, json};
@@ -557,8 +557,8 @@ async fn main() {
         request_admission.clone(),
         runtime_event_health.clone(),
     );
-    let kiro_provider = if start_legacy_credential_provider {
-        let provider = KiroProvider::with_proxy(
+    let local_upstream_provider = if start_legacy_credential_provider {
+        let provider = LocalUpstreamProvider::with_proxy(
             token_manager.clone(),
             proxy_config.clone(),
             endpoints,
@@ -568,8 +568,10 @@ async fn main() {
     } else {
         None
     };
-    let model_capability_recovery_task = if let Some(kiro_provider) = kiro_provider.as_ref() {
-        let initial_capability_cohort_keys = kiro_provider.model_capability_cohort_keys();
+    let model_capability_recovery_task = if let Some(local_upstream_provider) =
+        local_upstream_provider.as_ref()
+    {
+        let initial_capability_cohort_keys = local_upstream_provider.model_capability_cohort_keys();
         let initial_contract_match = model_capabilities
             .reasoning_capability_cohort_contract_match(&initial_capability_cohort_keys);
         match decide_native_reasoning_startup(
@@ -596,7 +598,7 @@ async fn main() {
             }
         }
         Some(spawn_model_capability_recovery_worker(
-            kiro_provider.clone(),
+            local_upstream_provider.clone(),
             model_capabilities.clone(),
             postgres_store.clone(),
         ))
@@ -645,7 +647,7 @@ async fn main() {
         anthropic::AnthropicRouterDependencies {
             request_api_keys: request_api_key_store.clone(),
             request_admission: request_admission.clone(),
-            local_upstream_provider: kiro_provider.clone(),
+            local_upstream_provider: local_upstream_provider.clone(),
             usage_recorder: usage_recorder.clone(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
@@ -677,7 +679,7 @@ async fn main() {
                 prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
                 pricing_catalog: pricing_catalog.clone(),
                 model_capabilities: model_capabilities.clone(),
-                kiro_provider: kiro_provider.clone(),
+                kiro_provider: local_upstream_provider.clone(),
                 postgres_store: postgres_store.clone(),
                 observability_redis_store: observability_redis_store.clone(),
                 request_api_key_store: request_api_key_store.clone(),
@@ -901,7 +903,7 @@ async fn main() {
 }
 
 fn spawn_model_capability_recovery_worker(
-    kiro_provider: Arc<KiroProvider>,
+    local_upstream_provider: Arc<LocalUpstreamProvider>,
     model_capabilities: Arc<anthropic::model_capabilities::ModelCapabilitiesCatalog>,
     postgres_store: Arc<PostgresStore>,
 ) -> tokio::task::JoinHandle<()> {
@@ -910,7 +912,7 @@ fn spawn_model_capability_recovery_worker(
         let mut reported_empty_local_cohort = false;
 
         loop {
-            let current_cohort_keys = kiro_provider.model_capability_cohort_keys();
+            let current_cohort_keys = local_upstream_provider.model_capability_cohort_keys();
             if current_cohort_keys.is_empty() {
                 consecutive_failures = 0;
                 if !reported_empty_local_cohort {
@@ -951,7 +953,7 @@ fn spawn_model_capability_recovery_worker(
                 continue;
             }
 
-            let (status, discovery) = match kiro_provider.list_available_models().await {
+            let (status, discovery) = match local_upstream_provider.list_available_models().await {
                 Ok(catalog) => {
                     let discovery = if catalog.complete {
                         ModelCapabilityDiscoveryOutcome::Complete
@@ -982,7 +984,7 @@ fn spawn_model_capability_recovery_worker(
 
             // Cohorts may change while discovery is in flight. Fence the result against a fresh
             // in-memory snapshot before declaring recovery.
-            let refreshed_cohort_keys = kiro_provider.model_capability_cohort_keys();
+            let refreshed_cohort_keys = local_upstream_provider.model_capability_cohort_keys();
             let refreshed_contract_match = model_capabilities
                 .reasoning_capability_cohort_contract_match(&refreshed_cohort_keys);
             match decide_native_reasoning_startup(
