@@ -177,9 +177,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained UI/Admin UI usage API types now model local auxiliary credential traces as `LocalUpstreamCredentialAttempt`; the `credentialAttempts` wire field remains unchanged.
 - Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording and the sidebar brand mark no longer exposes Kiro as the product name.
 - Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
+- Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Kiro request/body/guard behavior; test function names remain a later cleanup target.
 
 Last verified on 2026-08-16:
 
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-text-fmt1 -- cargo fmt`
+- `rg -n "Kiro request|Kiro body|Kiro serialization|Kiro guard|Kiro perf|Kiro history|passed through to Kiro|serialized Kiro|Kiro current image|Kiro image" src/anthropic/payload_guard.rs`
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-text-test1 -- cargo test payload_guard -- --nocapture`
+- `git diff --check`
 - `rg -n "Kiro 模型能力目录|从 Kiro 上游|当前 Kiro 账号支持模型|请求 Kiro API|获取 Kiro 模型能力同步状态|手动同步 Kiro 模型能力" src/admin/handlers.rs ui/src/features/credentials/credential-card.tsx admin-ui/src/components/model-pricing-panel.tsx admin-ui/src/components/credential-card.tsx`
 - `feature/tests/run-cargo-scoped.sh upstream-model-text-fmt1 -- cargo fmt`
 - `pnpm --dir ui check`

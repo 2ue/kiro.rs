@@ -4829,8 +4829,9 @@ mod tests {
                     reasoning: None,
                 });
 
-            let body = serialize_local_upstream_request(&request).expect("serialize Kiro request");
-            let value: Value = serde_json::from_str(&body).expect("Kiro body JSON");
+            let body = serialize_local_upstream_request(&request)
+                .expect("serialize local upstream request");
+            let value: Value = serde_json::from_str(&body).expect("local upstream body JSON");
             assert!(
                 value["additionalModelRequestFields"]
                     .get("thinking")
@@ -5014,8 +5015,8 @@ mod tests {
                 .current_message
                 .user_input_message
                 .content = "x".repeat(content_bytes);
-            let expected =
-                serialize_local_upstream_request(&template).expect("baseline Kiro serialization");
+            let expected = serialize_local_upstream_request(&template)
+                .expect("baseline local upstream serialization");
 
             for round in 0..100 {
                 let mut request = template.clone();
@@ -5023,7 +5024,7 @@ mod tests {
                     &mut request,
                     guard_config(expected.len().saturating_add(1)),
                 )
-                .expect("clean Kiro guard");
+                .expect("clean local upstream guard");
 
                 assert_eq!(
                     body, expected,
@@ -5031,7 +5032,7 @@ mod tests {
                 );
                 assert_eq!(
                     report.guard_serializations, 1,
-                    "clean Kiro guard must not perform a redundant second full serialization: content_bytes={content_bytes}, round={round}"
+                    "clean local upstream guard must not perform a redundant second full serialization: content_bytes={content_bytes}, round={round}"
                 );
                 assert_eq!(report.history_trim_passes, 0);
                 assert!(!report.was_modified());
@@ -5185,7 +5186,7 @@ mod tests {
                             &mut request,
                             guard_config(input_bytes.saturating_add(1)),
                         )
-                        .expect("Kiro perf probe");
+                        .expect("local upstream perf probe");
                         assert_eq!(body.len(), input_bytes, "round {round}");
                         assert_eq!(report.guard_serializations, 1, "round {round}");
                         report
@@ -5536,7 +5537,7 @@ mod tests {
         let mut request = request_with_history(history);
 
         let (body, report) = guard_local_upstream_request(&mut request, guard_config(40_000))
-            .expect("large Kiro history should be trimmed in one batch");
+            .expect("large local upstream history should be trimmed in one batch");
 
         assert!(body.len() <= 40_000);
         assert_eq!(report.history_trim_passes, 1);
@@ -6085,7 +6086,7 @@ mod tests {
         };
 
         let (body, report) = guard_local_upstream_request(&mut request, guard_config(1_000))
-            .expect("oversized current message should be passed through to Kiro");
+            .expect("oversized current message should be passed through to local upstream");
 
         assert!(body.len() > 1_000);
         assert!(report.still_oversized);
@@ -6186,7 +6187,8 @@ mod tests {
             1 + TOOL_CYCLES * 2
         );
 
-        let serialized: Value = serde_json::from_str(&body).expect("serialized Kiro request");
+        let serialized: Value =
+            serde_json::from_str(&body).expect("serialized local upstream request");
         let serialized_history = serialized["conversationState"]["history"]
             .as_array()
             .expect("serialized history");
@@ -7399,7 +7401,7 @@ mod tests {
                 &mut kiro_template,
                 guard_config_with_shaping(kiro_target, false, shaping),
             )
-            .expect("batched Kiro current image fit");
+            .expect("batched local upstream current image fit");
             assert!(kiro_body.len() <= kiro_target, "round {round}");
             assert_eq!(kiro_report.dropped_current_images, 3, "round {round}");
             assert_eq!(kiro_report.guard_serializations, 3, "round {round}");
@@ -7859,7 +7861,7 @@ mod tests {
                 base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
             )];
             let (_body, report) = guard_local_upstream_request(&mut kiro, guard_config(usize::MAX))
-                .expect("exact-limit Kiro image");
+                .expect("exact-limit local upstream image");
             assert_eq!(report.dropped_current_images, 0);
             assert_eq!(
                 kiro.conversation_state
