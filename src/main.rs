@@ -679,7 +679,7 @@ async fn main() {
                 prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
                 pricing_catalog: pricing_catalog.clone(),
                 model_capabilities: model_capabilities.clone(),
-                kiro_provider: local_upstream_provider.clone(),
+                local_upstream_provider: local_upstream_provider.clone(),
                 postgres_store: postgres_store.clone(),
                 observability_redis_store: observability_redis_store.clone(),
                 request_api_key_store: request_api_key_store.clone(),

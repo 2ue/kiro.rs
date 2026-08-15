@@ -105,6 +105,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin service model-test request construction and response parsing now use local-upstream request/event/decoder aliases instead of direct legacy paths.
 - Model capability cohort fencing and startup readiness now use upstream reasoning contract-match naming instead of the old Kiro-named type.
 - Main process wiring now uses local-upstream provider naming for the optional local executor and model capability recovery worker.
+- Admin service dependencies and internal provider state now use local-upstream provider naming, leaving legacy credential behavior behind the local executor boundary.
 
 ## In Progress
 

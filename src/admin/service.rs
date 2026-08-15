@@ -81,11 +81,11 @@ use crate::http_client::{
 };
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
 use crate::local_upstream::event::LocalUpstreamEvent as Event;
+use crate::local_upstream::provider::LocalUpstreamProvider;
 use crate::local_upstream::request::{
     LocalUpstreamConversationState as ConversationState,
     LocalUpstreamCurrentMessage as CurrentMessage, LocalUpstreamRequest,
@@ -548,7 +548,7 @@ pub struct AdminService {
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    kiro_provider: Option<Arc<KiroProvider>>,
+    local_upstream_provider: Option<Arc<LocalUpstreamProvider>>,
     account_runtime_manager: Arc<AccountRuntimeManager>,
     /// Serializes credential imports so duplicate preflight cannot fan out auxiliary model calls.
     credential_import_lock: Arc<tokio::sync::Mutex<()>>,
@@ -564,7 +564,7 @@ pub struct AdminServiceDependencies {
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    pub kiro_provider: Option<Arc<KiroProvider>>,
+    pub local_upstream_provider: Option<Arc<LocalUpstreamProvider>>,
     pub postgres_store: Arc<PostgresStore>,
     pub observability_redis_store: Option<Arc<RedisStore>>,
     pub request_api_key_store: Arc<RequestApiKeyStore>,
@@ -639,7 +639,7 @@ impl AdminService {
             prompt_cache_creation_controller,
             pricing_catalog,
             model_capabilities,
-            kiro_provider,
+            local_upstream_provider,
             postgres_store,
             observability_redis_store,
             request_api_key_store,
@@ -664,7 +664,7 @@ impl AdminService {
             prompt_cache_creation_controller,
             pricing_catalog,
             model_capabilities,
-            kiro_provider,
+            local_upstream_provider,
             account_runtime_manager,
             credential_import_lock: Arc::new(tokio::sync::Mutex::new(())),
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
@@ -2707,7 +2707,7 @@ impl AdminService {
         &self,
         id: u64,
     ) -> Result<Vec<String>, AdminServiceError> {
-        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+        let provider = self.local_upstream_provider.as_ref().ok_or_else(|| {
             AdminServiceError::InvalidCredential(
                 "当前运行时未启用旧凭据模型发现；请使用上游账号模型发现".to_string(),
             )
@@ -2744,7 +2744,7 @@ impl AdminService {
         credential: KiroCredentials,
     ) -> anyhow::Result<Vec<String>> {
         let provider = self
-            .kiro_provider
+            .local_upstream_provider
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("当前运行时未启用旧凭据模型发现"))?;
         let models = provider
@@ -3212,7 +3212,7 @@ impl AdminService {
         let (model, model_id, prompt, request_body) =
             self.build_model_test_request(&req.model, &prompt)?;
 
-        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+        let provider = self.local_upstream_provider.as_ref().ok_or_else(|| {
             AdminServiceError::InvalidCredential(
                 "当前运行时未启用旧凭据测试；请使用上游账号测试".to_string(),
             )
@@ -3263,7 +3263,7 @@ impl AdminService {
     ) -> Result<String, AdminServiceError> {
         let (_, _, _, request_body) = self.build_model_test_request(model, prompt)?;
         let runtime_config = self.token_manager.runtime_config();
-        let provider = self.kiro_provider.as_ref().ok_or_else(|| {
+        let provider = self.local_upstream_provider.as_ref().ok_or_else(|| {
             AdminServiceError::UpstreamError(
                 "当前运行时未启用旧凭据验活；请使用上游账号测试".to_string(),
             )
@@ -4450,7 +4450,7 @@ impl AdminService {
 
     /// 手动同步本地上游模型能力。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_capabilities(&self) -> ModelCapabilitiesStatus {
-        let status = match self.kiro_provider.as_ref() {
+        let status = match self.local_upstream_provider.as_ref() {
             Some(provider) => match provider.list_available_models().await {
                 Ok(models) => self.model_capabilities.sync_from_upstream_catalog(models),
                 Err(err) => {
