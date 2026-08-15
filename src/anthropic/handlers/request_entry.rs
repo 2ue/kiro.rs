@@ -296,7 +296,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
 }
 
 fn local_pool_fast_fail_response_parts(
-    kind: LocalPoolRouteStateKind,
+    kind: LocalUpstreamRouteStateKind,
     retry_after_secs: Option<u64>,
 ) -> Option<(
     StatusCode,
@@ -306,16 +306,16 @@ fn local_pool_fast_fail_response_parts(
     Option<u64>,
 )> {
     Some(match kind {
-        LocalPoolRouteStateKind::NoCredentials
-        | LocalPoolRouteStateKind::AllDisabled
-        | LocalPoolRouteStateKind::ProxyBlocked => (
+        LocalUpstreamRouteStateKind::NoCredentials
+        | LocalUpstreamRouteStateKind::AllDisabled
+        | LocalUpstreamRouteStateKind::ProxyBlocked => (
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE.to_string(),
             RequestRejectionReason::LocalPoolUnavailable,
             None,
         ),
-        LocalPoolRouteStateKind::SchedulerRedisDegraded => {
+        LocalUpstreamRouteStateKind::SchedulerRedisDegraded => {
             let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
             (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -325,7 +325,7 @@ fn local_pool_fast_fail_response_parts(
                 Some(retry_after_secs),
             )
         }
-        LocalPoolRouteStateKind::RiskCircuitOpen => {
+        LocalUpstreamRouteStateKind::RiskCircuitOpen => {
             let retry_after_secs = retry_after_secs.unwrap_or(1).max(1);
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -335,10 +335,10 @@ fn local_pool_fast_fail_response_parts(
                 Some(retry_after_secs),
             )
         }
-        LocalPoolRouteStateKind::Ready
-        | LocalPoolRouteStateKind::NoModelCompatible
-        | LocalPoolRouteStateKind::AllCoolingDown
-        | LocalPoolRouteStateKind::CapacityFull => return None,
+        LocalUpstreamRouteStateKind::Ready
+        | LocalUpstreamRouteStateKind::NoModelCompatible
+        | LocalUpstreamRouteStateKind::AllCoolingDown
+        | LocalUpstreamRouteStateKind::CapacityFull => return None,
     })
 }
 
@@ -985,9 +985,9 @@ mod tests {
     fn local_pool_fast_fail_maps_only_terminal_or_temporary_pool_states_for_five_rounds() {
         for round in 0..5 {
             for kind in [
-                LocalPoolRouteStateKind::NoCredentials,
-                LocalPoolRouteStateKind::AllDisabled,
-                LocalPoolRouteStateKind::ProxyBlocked,
+                LocalUpstreamRouteStateKind::NoCredentials,
+                LocalUpstreamRouteStateKind::AllDisabled,
+                LocalUpstreamRouteStateKind::ProxyBlocked,
             ] {
                 let (status, error_type, message, reason, retry_after) =
                     local_pool_fast_fail_response_parts(kind, None)
@@ -1009,7 +1009,7 @@ mod tests {
 
             let (status, error_type, message, reason, retry_after) =
                 local_pool_fast_fail_response_parts(
-                    LocalPoolRouteStateKind::SchedulerRedisDegraded,
+                    LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
                     Some(4),
                 )
                 .expect("scheduler degraded should fast-fail");
@@ -1027,8 +1027,11 @@ mod tests {
             assert_eq!(retry_after, Some(4), "round {round}");
 
             let (status, error_type, message, reason, retry_after) =
-                local_pool_fast_fail_response_parts(LocalPoolRouteStateKind::RiskCircuitOpen, None)
-                    .expect("risk circuit should fast-fail");
+                local_pool_fast_fail_response_parts(
+                    LocalUpstreamRouteStateKind::RiskCircuitOpen,
+                    None,
+                )
+                .expect("risk circuit should fast-fail");
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "round {round}");
             assert_eq!(error_type, "api_error", "round {round}");
             assert_eq!(
@@ -1049,10 +1052,10 @@ mod tests {
     fn local_pool_fast_fail_does_not_preempt_waitable_or_model_states_for_five_rounds() {
         for round in 0..5 {
             for kind in [
-                LocalPoolRouteStateKind::Ready,
-                LocalPoolRouteStateKind::NoModelCompatible,
-                LocalPoolRouteStateKind::AllCoolingDown,
-                LocalPoolRouteStateKind::CapacityFull,
+                LocalUpstreamRouteStateKind::Ready,
+                LocalUpstreamRouteStateKind::NoModelCompatible,
+                LocalUpstreamRouteStateKind::AllCoolingDown,
+                LocalUpstreamRouteStateKind::CapacityFull,
             ] {
                 assert!(
                     local_pool_fast_fail_response_parts(kind, Some(2)).is_none(),

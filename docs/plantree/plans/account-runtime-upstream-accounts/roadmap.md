@@ -98,6 +98,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Converter tool-use/tool-result pairing now uses local-upstream request aliases at its production import boundary.
 - Converter body, history, tool and model modules now use local-upstream request aliases and upstream reasoning aliases instead of direct legacy request model imports.
 - Usage attempt-chain search and diagnostics now use local-upstream call-trace aliases for credential attempts and summary formatting.
+- Handler local dispatch policy, account fallback preflight and request-entry fast-fail code now use local-upstream dispatch aliases instead of direct token-manager route-state/acquire-mode imports.
 
 ## In Progress
 

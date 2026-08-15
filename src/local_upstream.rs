@@ -17,6 +17,13 @@ pub(crate) mod call_trace {
         crate::kiro::call_trace::McpCallAttributionSink;
 }
 
+pub(crate) mod dispatch {
+    pub(crate) type LocalUpstreamAcquireMode = crate::kiro::token_manager::AcquireMode;
+    pub(crate) type LocalUpstreamRouteState = crate::kiro::token_manager::LocalPoolRouteState;
+    pub(crate) type LocalUpstreamRouteStateKind =
+        crate::kiro::token_manager::LocalPoolRouteStateKind;
+}
+
 pub(crate) mod provider {
     pub(crate) type LocalAuxiliaryMcpAttribution = crate::kiro::provider::McpCallAttribution;
     pub(crate) type LocalAuxiliaryMcpFailureKind = crate::kiro::provider::McpCallFailureKind;

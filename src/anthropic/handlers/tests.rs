@@ -6557,7 +6557,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
     for round in 1..=5 {
         assert_eq!(
             local_pool_acquire_mode(&config),
-            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_millis(
+            LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_millis(
                 LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS
             )),
             "round {round}: external eligibility was already established, so local capacity races still fail fast for reselect/fallback, while Redis degraded only consumes a short fallback grace"
@@ -6566,7 +6566,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
         config.fallback_on_scheduler_redis_degraded = false;
         assert_eq!(
             local_pool_acquire_mode(&config),
-            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
+            LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
             "round {round}: disabling Redis degraded fallback keeps the configured local dispatch wait"
         );
         config.fallback_on_scheduler_redis_degraded = true;
@@ -6574,7 +6574,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
         config.fallback_on_local_capacity_exhausted = false;
         assert_eq!(
             local_pool_acquire_mode(&config),
-            AcquireMode::WaitForCapacity,
+            LocalUpstreamAcquireMode::WaitForCapacity,
             "round {round}: the capacity fallback toggle remains authoritative"
         );
         config.fallback_on_local_capacity_exhausted = true;
@@ -6582,7 +6582,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
         config.local_pool_preflight_enabled = false;
         assert_eq!(
             local_pool_acquire_mode(&config),
-            AcquireMode::WaitForCapacity,
+            LocalUpstreamAcquireMode::WaitForCapacity,
             "round {round}: the operator preflight switch remains authoritative"
         );
         config.local_pool_preflight_enabled = true;
@@ -6594,11 +6594,11 @@ fn local_acquire_mode_is_clamped_to_shared_request_deadline() {
     let budget = InferenceAttemptBudget::new(4);
     budget.set_dispatch_deadline_after(Duration::from_millis(25));
     let mode = clamp_acquire_mode_to_dispatch_deadline(
-        AcquireMode::WaitForCapacityMax(Duration::from_secs(7)),
+        LocalUpstreamAcquireMode::WaitForCapacityMax(Duration::from_secs(7)),
         &budget,
     );
     match mode {
-        AcquireMode::WaitForCapacityMax(wait) => {
+        LocalUpstreamAcquireMode::WaitForCapacityMax(wait) => {
             assert!(wait <= Duration::from_millis(25));
             assert!(wait < Duration::from_secs(7));
         }
@@ -9949,52 +9949,55 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
 
     assert!(local_pool_capacity_fail_fast_enabled(&config));
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoCredentials, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoCredentials, &config),
         Some("local_no_credentials")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllDisabled, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllDisabled, &config),
         Some("local_all_disabled")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::ProxyBlocked, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::ProxyBlocked, &config),
         Some("local_proxy_blocked")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllCoolingDown, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllCoolingDown, &config),
         Some("local_all_cooling_down")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::CapacityFull, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::CapacityFull, &config),
         Some("local_capacity_full")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::SchedulerRedisDegraded, &config),
+        local_pool_route_fallback_reason(
+            LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
+            &config
+        ),
         Some("local_scheduler_redis_degraded")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoModelCompatible, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoModelCompatible, &config),
         None
     );
 
     config.fallback_on_no_available_credentials = false;
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoCredentials, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoCredentials, &config),
         None
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllDisabled, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllDisabled, &config),
         None
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::ProxyBlocked, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::ProxyBlocked, &config),
         None
     );
 
     config = AccountRuntimeConfig::default();
     config.fallback_on_local_transient_exhausted = false;
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllCoolingDown, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllCoolingDown, &config),
         None
     );
 
@@ -10002,21 +10005,24 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
     config.fallback_on_local_capacity_exhausted = false;
     assert!(!local_pool_capacity_fail_fast_enabled(&config));
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::CapacityFull, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::CapacityFull, &config),
         None
     );
 
     config = AccountRuntimeConfig::default();
     config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::SchedulerRedisDegraded, &config),
+        local_pool_route_fallback_reason(
+            LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
+            &config
+        ),
         None
     );
 
     config = AccountRuntimeConfig::default();
     config.fallback_on_unsupported_model = true;
     assert_eq!(
-        local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoModelCompatible, &config),
+        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoModelCompatible, &config),
         Some("local_no_model_compatible")
     );
 
@@ -10062,12 +10068,12 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     let mut config = AccountRuntimeConfig::default();
 
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(LocalPoolRouteStateKind::Ready, 1, &config,),
+        local_pool_fallback_reason_for_fresh_state(LocalUpstreamRouteStateKind::Ready, 1, &config,),
         None
     );
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::AllCoolingDown,
+            LocalUpstreamRouteStateKind::AllCoolingDown,
             1,
             &config,
         ),
@@ -10075,7 +10081,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     );
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::CapacityFull,
+            LocalUpstreamRouteStateKind::CapacityFull,
             1,
             &config,
         ),
@@ -10084,7 +10090,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
 
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::AllCoolingDown,
+            LocalUpstreamRouteStateKind::AllCoolingDown,
             0,
             &config,
         ),
@@ -10092,7 +10098,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     );
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::CapacityFull,
+            LocalUpstreamRouteStateKind::CapacityFull,
             0,
             &config,
         ),
@@ -10100,7 +10106,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     );
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::SchedulerRedisDegraded,
+            LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
             0,
             &config,
         ),
@@ -10108,7 +10114,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     );
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::SchedulerRedisDegraded,
+            LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
             1,
             &config,
         ),
@@ -10119,7 +10125,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     config.fallback_on_unsupported_model = true;
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::NoModelCompatible,
+            LocalUpstreamRouteStateKind::NoModelCompatible,
             0,
             &config,
         ),
@@ -10129,7 +10135,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::SchedulerRedisDegraded,
+            LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
             1,
             &config,
         ),
@@ -10158,7 +10164,7 @@ fn classified_scheduler_degraded_fallback_is_not_suppressed_by_stale_ready_snaps
     );
     assert_eq!(
         local_pool_fallback_reason_for_fresh_state(
-            LocalPoolRouteStateKind::Ready,
+            LocalUpstreamRouteStateKind::Ready,
             1,
             &AccountRuntimeConfig::default(),
         ),

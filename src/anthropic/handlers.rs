@@ -104,10 +104,12 @@ use crate::account_runtime::{
     immediately_available_account_for_route_body_mode_and_model,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
-use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteState, LocalPoolRouteStateKind};
 use crate::local_upstream::call_trace::{
     AccountRejectReason, LocalAuxiliaryMcpAttributionSink, LocalUpstreamCallFailureKind,
     LocalUpstreamCredentialAttempt, SelectionFailureStage,
+};
+use crate::local_upstream::dispatch::{
+    LocalUpstreamAcquireMode, LocalUpstreamRouteState, LocalUpstreamRouteStateKind,
 };
 use crate::local_upstream::event::{LocalUpstreamEvent, LocalUpstreamMetadataTokenUsage};
 use crate::local_upstream::provider::{
@@ -1711,11 +1713,13 @@ impl AccountFallbackContext {
         let provider = self.provider.as_ref()?;
         let model = model.or(Some(self.payload.model.as_str()));
         let state = provider.local_pool_route_state_fresh(model);
-        Some(if matches!(state.kind, LocalPoolRouteStateKind::Ready) {
-            state.dispatchable
-        } else {
-            0
-        })
+        Some(
+            if matches!(state.kind, LocalUpstreamRouteStateKind::Ready) {
+                state.dispatchable
+            } else {
+                0
+            },
+        )
     }
 
     fn refresh_payload(&mut self, payload: &MessagesRequest) {
@@ -1749,13 +1753,13 @@ impl AccountFallbackContext {
         self.request_input_tokens = original_input_tokens.max(normalized_input_tokens);
     }
 
-    async fn local_attempt_policy(&self) -> (AcquireMode, bool) {
+    async fn local_attempt_policy(&self) -> (LocalUpstreamAcquireMode, bool) {
         if self.provider.is_none() {
-            return (AcquireMode::FailFastOnCapacity, false);
+            return (LocalUpstreamAcquireMode::FailFastOnCapacity, false);
         }
         if self.has_cached_immediately_available_account_for_model(&self.payload.model) {
             let acquire_mode = local_pool_acquire_mode(&self.config);
-            if acquire_mode != AcquireMode::WaitForCapacity {
+            if acquire_mode != LocalUpstreamAcquireMode::WaitForCapacity {
                 return (
                     clamp_acquire_mode_to_dispatch_deadline(
                         acquire_mode,
@@ -1773,7 +1777,7 @@ impl AccountFallbackContext {
         {
             return (
                 clamp_acquire_mode_to_dispatch_deadline(
-                    AcquireMode::WaitForCapacityRedisDegradedMax(
+                    LocalUpstreamAcquireMode::WaitForCapacityRedisDegradedMax(
                         local_scheduler_redis_degraded_fallback_wait(&self.config),
                     ),
                     self.inference_attempt_budget.as_ref(),
@@ -1781,7 +1785,7 @@ impl AccountFallbackContext {
                 true,
             );
         }
-        (AcquireMode::WaitForCapacity, false)
+        (LocalUpstreamAcquireMode::WaitForCapacity, false)
     }
 
     fn has_cached_eligible_account_for_model(&self, model: &str) -> bool {
@@ -2189,13 +2193,13 @@ fn local_pool_capacity_fail_fast_enabled(config: &AccountRuntimeConfig) -> bool 
     config.local_pool_preflight_enabled && config.fallback_on_local_capacity_exhausted
 }
 
-fn local_pool_acquire_mode(config: &AccountRuntimeConfig) -> AcquireMode {
+fn local_pool_acquire_mode(config: &AccountRuntimeConfig) -> LocalUpstreamAcquireMode {
     if local_pool_capacity_fail_fast_enabled(config) {
-        AcquireMode::FailFastOnCapacityWaitForRedis(local_scheduler_redis_degraded_fallback_wait(
-            config,
-        ))
+        LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(
+            local_scheduler_redis_degraded_fallback_wait(config),
+        )
     } else {
-        AcquireMode::WaitForCapacity
+        LocalUpstreamAcquireMode::WaitForCapacity
     }
 }
 
@@ -2211,24 +2215,28 @@ fn local_scheduler_redis_degraded_fallback_wait(config: &AccountRuntimeConfig) -
 }
 
 fn clamp_acquire_mode_to_dispatch_deadline(
-    mode: AcquireMode,
+    mode: LocalUpstreamAcquireMode,
     budget: &InferenceAttemptBudget,
-) -> AcquireMode {
+) -> LocalUpstreamAcquireMode {
     let Some(remaining) = budget.dispatch_remaining() else {
         return mode;
     };
     match mode {
-        AcquireMode::WaitForCapacity => AcquireMode::WaitForCapacityMax(remaining),
-        AcquireMode::WaitForCapacityMax(max_wait) => {
-            AcquireMode::WaitForCapacityMax(max_wait.min(remaining))
+        LocalUpstreamAcquireMode::WaitForCapacity => {
+            LocalUpstreamAcquireMode::WaitForCapacityMax(remaining)
         }
-        AcquireMode::FailFastOnCapacityWaitForRedis(max_wait) => {
-            AcquireMode::FailFastOnCapacityWaitForRedis(max_wait.min(remaining))
+        LocalUpstreamAcquireMode::WaitForCapacityMax(max_wait) => {
+            LocalUpstreamAcquireMode::WaitForCapacityMax(max_wait.min(remaining))
         }
-        AcquireMode::WaitForCapacityRedisDegradedMax(max_wait) => {
-            AcquireMode::WaitForCapacityRedisDegradedMax(max_wait.min(remaining))
+        LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(max_wait) => {
+            LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(max_wait.min(remaining))
         }
-        AcquireMode::FailFastOnCapacity => AcquireMode::FailFastOnCapacity,
+        LocalUpstreamAcquireMode::WaitForCapacityRedisDegradedMax(max_wait) => {
+            LocalUpstreamAcquireMode::WaitForCapacityRedisDegradedMax(max_wait.min(remaining))
+        }
+        LocalUpstreamAcquireMode::FailFastOnCapacity => {
+            LocalUpstreamAcquireMode::FailFastOnCapacity
+        }
     }
 }
 
@@ -2247,35 +2255,43 @@ fn capacity_weight_units_for_local_request(
 }
 
 fn local_pool_route_fallback_reason(
-    kind: LocalPoolRouteStateKind,
+    kind: LocalUpstreamRouteStateKind,
     config: &AccountRuntimeConfig,
 ) -> Option<&'static str> {
     match kind {
-        LocalPoolRouteStateKind::Ready => None,
-        LocalPoolRouteStateKind::NoCredentials if config.fallback_on_no_available_credentials => {
+        LocalUpstreamRouteStateKind::Ready => None,
+        LocalUpstreamRouteStateKind::NoCredentials
+            if config.fallback_on_no_available_credentials =>
+        {
             Some("local_no_credentials")
         }
-        LocalPoolRouteStateKind::AllDisabled if config.fallback_on_no_available_credentials => {
+        LocalUpstreamRouteStateKind::AllDisabled if config.fallback_on_no_available_credentials => {
             Some("local_all_disabled")
         }
-        LocalPoolRouteStateKind::ProxyBlocked if config.fallback_on_no_available_credentials => {
+        LocalUpstreamRouteStateKind::ProxyBlocked
+            if config.fallback_on_no_available_credentials =>
+        {
             Some("local_proxy_blocked")
         }
-        LocalPoolRouteStateKind::NoModelCompatible if config.fallback_on_unsupported_model => {
+        LocalUpstreamRouteStateKind::NoModelCompatible if config.fallback_on_unsupported_model => {
             Some("local_no_model_compatible")
         }
-        LocalPoolRouteStateKind::AllCoolingDown if config.fallback_on_local_transient_exhausted => {
+        LocalUpstreamRouteStateKind::AllCoolingDown
+            if config.fallback_on_local_transient_exhausted =>
+        {
             Some("local_all_cooling_down")
         }
-        LocalPoolRouteStateKind::CapacityFull if config.fallback_on_local_capacity_exhausted => {
+        LocalUpstreamRouteStateKind::CapacityFull
+            if config.fallback_on_local_capacity_exhausted =>
+        {
             Some("local_capacity_full")
         }
-        LocalPoolRouteStateKind::SchedulerRedisDegraded
+        LocalUpstreamRouteStateKind::SchedulerRedisDegraded
             if config.fallback_on_scheduler_redis_degraded =>
         {
             Some("local_scheduler_redis_degraded")
         }
-        LocalPoolRouteStateKind::RiskCircuitOpen if config.local_pool_circuit_enabled => {
+        LocalUpstreamRouteStateKind::RiskCircuitOpen if config.local_pool_circuit_enabled => {
             Some("local_pool_risk_circuit_open")
         }
         _ => None,
@@ -2283,16 +2299,17 @@ fn local_pool_route_fallback_reason(
 }
 
 fn local_pool_fallback_reason_for_fresh_state(
-    kind: LocalPoolRouteStateKind,
+    kind: LocalUpstreamRouteStateKind,
     dispatchable: usize,
     config: &AccountRuntimeConfig,
 ) -> Option<&'static str> {
-    if matches!(kind, LocalPoolRouteStateKind::Ready) {
+    if matches!(kind, LocalUpstreamRouteStateKind::Ready) {
         return None;
     }
     let degraded_state_overrides_dispatchable = matches!(
         kind,
-        LocalPoolRouteStateKind::RiskCircuitOpen | LocalPoolRouteStateKind::SchedulerRedisDegraded
+        LocalUpstreamRouteStateKind::RiskCircuitOpen
+            | LocalUpstreamRouteStateKind::SchedulerRedisDegraded
     );
     if !degraded_state_overrides_dispatchable && dispatchable > 0 {
         return None;
@@ -2323,7 +2340,7 @@ async fn local_pool_preflight_reason_after_capacity_grace(
     max_wait: Duration,
     stage: &'static str,
     request_id: Option<&str>,
-) -> Option<(String, LocalPoolRouteState)> {
+) -> Option<(String, LocalUpstreamRouteState)> {
     let mut state = provider.local_pool_route_state_fresh(model);
     let mut reason =
         local_pool_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)?;
@@ -6483,7 +6500,7 @@ async fn call_api_stream_maybe_fail_fast(
     let (acquire_mode, preserve_external_attempt) = if let Some(external) = account_fallback {
         external.local_attempt_policy().await
     } else {
-        (AcquireMode::WaitForCapacity, false)
+        (LocalUpstreamAcquireMode::WaitForCapacity, false)
     };
     let acquire_mode =
         clamp_acquire_mode_to_dispatch_deadline(acquire_mode, inference_attempt_budget.as_ref());
@@ -6530,7 +6547,7 @@ async fn call_api_maybe_fail_fast(
     let (acquire_mode, preserve_external_attempt) = if let Some(external) = account_fallback {
         external.local_attempt_policy().await
     } else {
-        (AcquireMode::WaitForCapacity, false)
+        (LocalUpstreamAcquireMode::WaitForCapacity, false)
     };
     let acquire_mode =
         clamp_acquire_mode_to_dispatch_deadline(acquire_mode, inference_attempt_budget.as_ref());
@@ -6903,7 +6920,7 @@ async fn call_stream_local_rescue_after_account_error(
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<LocalUpstreamStreamResponse> {
     let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
-        AcquireMode::WaitForCapacityMax(Duration::from_secs(
+        LocalUpstreamAcquireMode::WaitForCapacityMax(Duration::from_secs(
             external.config.account_local_rescue_max_wait_secs(),
         )),
         external.inference_attempt_budget.as_ref(),
@@ -6954,7 +6971,7 @@ async fn call_non_stream_local_rescue_after_account_error(
     dispatch_model_filter: Option<&str>,
 ) -> anyhow::Result<LocalUpstreamApiResponse> {
     let acquire_mode = clamp_acquire_mode_to_dispatch_deadline(
-        AcquireMode::WaitForCapacityMax(Duration::from_secs(
+        LocalUpstreamAcquireMode::WaitForCapacityMax(Duration::from_secs(
             external.config.account_local_rescue_max_wait_secs(),
         )),
         external.inference_attempt_budget.as_ref(),
