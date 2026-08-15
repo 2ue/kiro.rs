@@ -1534,7 +1534,7 @@ export interface CacheBoundsPolicyPatch {
   estimatedBytesLimit?: number
 }
 
-export interface KiroRsToolCachePolicyPatch {
+export interface ClaudeCodeToolCachePolicyPatch {
   coverageRatio?: number
   maxCoverageTokens?: number
   incrementalCreateEnabled?: boolean
@@ -1543,7 +1543,7 @@ export interface KiroRsToolCachePolicyPatch {
   currentUserStablePrefixMaxTokens?: number
 }
 
-export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool'
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'claude_code_tool' | 'kiro_rs_tool'
 
 export interface CacheRoutePolicyPatch {
   cacheType?: PromptCacheStrategyType
@@ -1553,13 +1553,15 @@ export interface CacheRoutePolicyPatch {
   reportedUsage?: ReportedUsagePathPolicy
   cachePoint?: CachePointPolicyPatch
   bounds?: CacheBoundsPolicyPatch
-  kiroRsTool?: KiroRsToolCachePolicyPatch
+  claudeCodeTool?: ClaudeCodeToolCachePolicyPatch
+  kiroRsTool?: ClaudeCodeToolCachePolicyPatch
 }
 
 export interface CachePolicyConfig {
   default: CacheRoutePolicyPatch
   currentHighCache: CacheRoutePolicyPatch
-  kiroRsTool: CacheRoutePolicyPatch
+  claudeCodeTool?: CacheRoutePolicyPatch
+  kiroRsTool?: CacheRoutePolicyPatch
   pathOverrides: Record<string, CacheRoutePolicyPatch>
 }
 

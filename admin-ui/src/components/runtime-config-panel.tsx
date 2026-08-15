@@ -167,7 +167,7 @@ const defaultReportedUsage = (): ReportedUsageConfig => ({
 const defaultCachePolicy = (): CachePolicyConfig => ({
   default: {},
   currentHighCache: {},
-  kiroRsTool: {},
+  claudeCodeTool: {},
   pathOverrides: {},
 })
 
@@ -1877,8 +1877,26 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
   return canonicalCachePolicyPath(withSlash.replace(/\/+$/, '') || '/')
 }
 
+function normalizeCacheStrategyType(
+  cacheType?: CacheRoutePolicyPatch['cacheType']
+): CacheRoutePolicyPatch['cacheType'] {
+  return cacheType === 'kiro_rs_tool' ? 'claude_code_tool' : cacheType
+}
+
+function normalizeCacheRoutePolicyPatch(policy?: CacheRoutePolicyPatch): CacheRoutePolicyPatch {
+  const source = policy ?? {}
+  const { kiroRsTool: _legacyClaudeCodeTool, ...rest } = source
+  const cacheType = normalizeCacheStrategyType(source.cacheType)
+  const claudeCodeTool = source.claudeCodeTool ?? source.kiroRsTool
+  return {
+    ...rest,
+    ...(cacheType ? { cacheType } : {}),
+    ...(claudeCodeTool ? { claudeCodeTool } : {}),
+  }
+}
+
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.claudeCodeTool && !policy.kiroRsTool
 }
 
 function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -1887,21 +1905,22 @@ function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
     Object.entries(source.pathOverrides ?? {})
       .map(([prefix, policy]) => {
         const normalizedPrefix = normalizeCachePolicyPathPrefix(prefix)
-        if (!normalizedPrefix || isEmptyCachePolicyPatch(policy)) return null
-        return [normalizedPrefix, policy] as const
+        const normalizedPolicy = normalizeCacheRoutePolicyPatch(policy)
+        if (!normalizedPrefix || isEmptyCachePolicyPatch(normalizedPolicy)) return null
+        return [normalizedPrefix, normalizedPolicy] as const
       })
       .filter((entry): entry is readonly [string, CacheRoutePolicyPatch] => Boolean(entry))
   )
   return {
-    default: source.default ?? {},
-    currentHighCache: source.currentHighCache ?? {},
-    kiroRsTool: source.kiroRsTool ?? {},
+    default: normalizeCacheRoutePolicyPatch(source.default),
+    currentHighCache: normalizeCacheRoutePolicyPatch(source.currentHighCache),
+    claudeCodeTool: normalizeCacheRoutePolicyPatch(source.claudeCodeTool ?? source.kiroRsTool),
     pathOverrides,
   }
 }
 
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
-type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
+type ClaudeCodeToolPatch = NonNullable<CacheRoutePolicyPatch['claudeCodeTool']>
 type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
 
 const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
@@ -1924,7 +1943,7 @@ function defaultSimulationPatch(): CacheSimulationPatch {
   }
 }
 
-function defaultKiroRsToolPatch(): KiroRsToolPatch {
+function defaultClaudeCodeToolPatch(): ClaudeCodeToolPatch {
   return {
     coverageRatio: 1,
     maxCoverageTokens: 0,
@@ -1950,8 +1969,8 @@ function defaultPathCachePatch(
   if (cacheType === 'no_cache') {
     return { cacheType: 'no_cache' }
   }
-  if (cacheType === 'kiro_rs_tool') {
-    return { cacheType: 'kiro_rs_tool', kiroRsTool: defaultKiroRsToolPatch() }
+  if (cacheType === 'claude_code_tool') {
+    return { cacheType: 'claude_code_tool', claudeCodeTool: defaultClaudeCodeToolPatch() }
   }
   return {
     cacheType: 'current_high_cache',
@@ -1966,8 +1985,8 @@ function cacheTypeDesc(cacheType: CacheRoutePolicyPatch['cacheType']): string {
   if (cacheType === 'no_cache') {
     return '这个路径不进入缓存计算，直接使用原始用量返回和记录，CPU 和内存开销最低。'
   }
-  if (cacheType === 'kiro_rs_tool') {
-    return '按 Kiro-RS Tool 的会话和路径规则计算缓存；第一次请求不会显示缓存读取，失败请求不会写入缓存。'
+  if (cacheType === 'claude_code_tool') {
+    return '按 Claude Code Tool 的会话和路径规则计算缓存；第一次请求不会显示缓存读取，失败请求不会写入缓存。'
   }
   return '使用当前系统的本地模拟缓存逻辑，把原始用量换算成对外显示的缓存用量。'
 }
@@ -2049,7 +2068,7 @@ function CacheTypeSegment({
   const options: Array<{ value: CacheStrategyType; label: string }> = [
     { value: 'no_cache', label: '无缓存' },
     { value: 'current_high_cache', label: '本地模拟缓存策略' },
-    { value: 'kiro_rs_tool', label: 'Kiro-RS Tool' },
+    { value: 'claude_code_tool', label: 'Claude Code Tool' },
   ]
   return (
     <div className="flex flex-wrap gap-2">
@@ -2168,25 +2187,25 @@ function CreationControlOverrideForm({
   )
 }
 
-function KiroRsToolPolicyForm({
+function ClaudeCodeToolPolicyForm({
   value,
   onChange,
 }: {
-  value: KiroRsToolPatch
-  onChange: (next: KiroRsToolPatch) => void
+  value: ClaudeCodeToolPatch
+  onChange: (next: ClaudeCodeToolPatch) => void
 }) {
-  const merged = { ...defaultKiroRsToolPatch(), ...value }
-  const set = <K extends keyof KiroRsToolPatch>(key: K) => (nextValue: KiroRsToolPatch[K]) =>
+  const merged = { ...defaultClaudeCodeToolPatch(), ...value }
+  const set = <K extends keyof ClaudeCodeToolPatch>(key: K) => (nextValue: ClaudeCodeToolPatch[K]) =>
     onChange({ ...merged, [key]: nextValue })
 
   return (
     <div className="grid gap-4">
-      <NumberField title="缓存覆盖比例" description="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。" value={merged.coverageRatio ?? 1} min={0} max={1} step={0.05} suffix="比例" onChange={set('coverageRatio')} />
-      <NumberField title="覆盖上限" description="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。" value={merged.maxCoverageTokens ?? 0} min={0} suffix="Token" onChange={set('maxCoverageTokens')} />
+      <NumberField title="缓存覆盖比例" description="本轮最多把多少稳定内容纳入 Claude Code Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。" value={merged.coverageRatio ?? 1} min={0} max={1} step={0.05} suffix="比例" onChange={set('coverageRatio')} />
+      <NumberField title="覆盖上限" description="单次最多纳入多少 Token。0 表示不限制，保持当前 Claude Code Tool 表现。" value={merged.maxCoverageTokens ?? 0} min={0} suffix="Token" onChange={set('maxCoverageTokens')} />
       <NumberField title="单次新增创建上限" description="一次请求最多新增多少缓存。0 表示不限制；后续读取不会超过之前真正创建过的数量。" value={merged.maxNewCreationTokensPerRequest ?? 0} min={0} suffix="Token" onChange={set('maxNewCreationTokensPerRequest')} />
       <NumberField title="当前用户前缀上限" description="开启下方选项后，最多取当前用户文本前段多少 Token。0 表示不取。" value={merged.currentUserStablePrefixMaxTokens ?? 0} min={0} suffix="Token" disabled={!merged.cacheCurrentUserStablePrefix} onChange={set('currentUserStablePrefixMaxTokens')} />
       <ToggleField title="允许后续继续创建" description="同一会话命中旧缓存后，如果又出现新的稳定内容，是否继续补创建。关闭后命中时只读不补建。" checked={merged.incrementalCreateEnabled ?? true} onCheckedChange={set('incrementalCreateEnabled')} />
-      <ToggleField title="缓存当前用户稳定前缀" description="默认关闭，和当前 Kiro-RS Tool 表现一致。开启后只取当前用户文本前段，适合确实有稳定长前缀的请求。" checked={merged.cacheCurrentUserStablePrefix ?? false} onCheckedChange={set('cacheCurrentUserStablePrefix')} />
+      <ToggleField title="缓存当前用户稳定前缀" description="默认关闭，和当前 Claude Code Tool 表现一致。开启后只取当前用户文本前段，适合确实有稳定长前缀的请求。" checked={merged.cacheCurrentUserStablePrefix ?? false} onCheckedChange={set('cacheCurrentUserStablePrefix')} />
     </div>
   )
 }
@@ -2208,7 +2227,7 @@ function StrategyTemplateCard({
   const setSimulation = (simulation: CacheSimulationPatch) => onChange({ ...template, simulation })
   const setCreationControl = (creationControl: PromptCacheCreationControlConfig) => onChange({ ...template, creationControl })
   const setReportedUsage = (reportedUsage: ReportedUsagePathPolicy) => onChange({ ...template, reportedUsage })
-  const setKiroRsTool = (kiroRsTool: KiroRsToolPatch) => onChange({ ...template, kiroRsTool })
+  const setClaudeCodeTool = (claudeCodeTool: ClaudeCodeToolPatch) => onChange({ ...template, claudeCodeTool })
 
   return (
     <div className="space-y-4 rounded-lg border bg-background p-4">
@@ -2237,9 +2256,9 @@ function StrategyTemplateCard({
           </div>
         </>
       ) : (
-        <KiroRsToolPolicyForm
-          value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
-          onChange={setKiroRsTool}
+        <ClaudeCodeToolPolicyForm
+          value={template.claudeCodeTool ?? defaultClaudeCodeToolPatch()}
+          onChange={setClaudeCodeTool}
         />
       )}
     </div>
@@ -2248,7 +2267,7 @@ function StrategyTemplateCard({
 
 function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
-  if (cacheType === 'kiro_rs_tool') return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch() }
+  if (cacheType === 'claude_code_tool') return { cacheType: 'claude_code_tool', claudeCodeTool: policy.claudeCodeTool ?? defaultClaudeCodeToolPatch() }
   return {
     cacheType: 'current_high_cache',
     simulation: policy.simulation ?? defaultSimulationPatch(),
@@ -2274,8 +2293,8 @@ function pathPolicyWithStrategyDefaults(
 ): CacheRoutePolicyPatch {
   const cacheType = policy.cacheType ?? 'no_cache'
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
-  const template = cacheType === 'kiro_rs_tool'
-    ? cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
+  const template = cacheType === 'claude_code_tool'
+    ? cachePolicyForStrategyTemplate(cachePolicy.claudeCodeTool ?? {}, 'claude_code_tool')
     : cachePolicyForStrategyTemplate(
         {
           ...(cachePolicy.default ?? {}),
@@ -2295,7 +2314,7 @@ function pathPolicyWithStrategyDefaults(
           reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
         }
       : {
-          kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
+          claudeCodeTool: policy.claudeCodeTool ?? template.claudeCodeTool ?? defaultClaudeCodeToolPatch(),
         }),
   }
 }
@@ -2473,11 +2492,11 @@ function PathCachePolicyCard({
         <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
           <h4 className="text-sm font-semibold">本路径策略参数</h4>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            这里只展示 Kiro-RS Tool 自己需要的参数，不读取本地模拟缓存策略的参数。
+            这里只展示 Claude Code Tool 自己需要的参数，不读取本地模拟缓存策略的参数。
           </p>
-          <KiroRsToolPolicyForm
-            value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
-            onChange={(kiroRsTool) => patch({ kiroRsTool })}
+          <ClaudeCodeToolPolicyForm
+            value={effectivePolicy.claudeCodeTool ?? defaultClaudeCodeToolPatch()}
+            onChange={(claudeCodeTool) => patch({ claudeCodeTool })}
           />
         </div>
       )}
@@ -2520,7 +2539,7 @@ function CachePolicyEditor({
     const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
     const legacyReportedUsage = reportedUsageForPrefix(value.reportedUsage.pathOverrides, normalizedPrefix)
     if (existing) {
-      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool') {
+      if (existing.cacheType === 'no_cache' || existing.cacheType === 'claude_code_tool') {
         return existing
       }
       return legacyReportedUsage ? { ...existing, reportedUsage: existing.reportedUsage ?? legacyReportedUsage } : existing
@@ -2626,15 +2645,15 @@ function CachePolicyEditor({
     })
   }
 
-  const setKiroTemplate = (next: CacheRoutePolicyPatch) => {
-    updateCachePolicy({ ...cachePolicy, kiroRsTool: next })
+  const setClaudeCodeTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({ ...cachePolicy, claudeCodeTool: next })
   }
 
   const currentTemplate = cachePolicyForStrategyTemplate(
     { ...(cachePolicy.default ?? {}), ...(cachePolicy.currentHighCache ?? {}) },
     'current_high_cache'
   )
-  const kiroTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
+  const claudeCodeTemplate = cachePolicyForStrategyTemplate(cachePolicy.claudeCodeTool ?? {}, 'claude_code_tool')
 
   return (
     <div className="md:col-span-2 space-y-5">
@@ -2647,11 +2666,11 @@ function CachePolicyEditor({
           onChange={setCurrentTemplate}
         />
         <StrategyTemplateCard
-          title="Kiro-RS Tool 缓存策略默认参数"
-          description="使用本策略的路径只读取这里属于 Kiro-RS Tool 的参数，不读取本地模拟策略参数。"
-          cacheType="kiro_rs_tool"
-          policy={kiroTemplate}
-          onChange={setKiroTemplate}
+          title="Claude Code Tool 缓存策略默认参数"
+          description="使用本策略的路径只读取这里属于 Claude Code Tool 的参数，不读取本地模拟策略参数。"
+          cacheType="claude_code_tool"
+          policy={claudeCodeTemplate}
+          onChange={setClaudeCodeTemplate}
         />
       </div>
 
@@ -2659,7 +2678,7 @@ function CachePolicyEditor({
         <div>
           <h4 className="text-sm font-semibold">路径绑定</h4>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            每个路径都显式选择无缓存、本地模拟缓存策略或 Kiro-RS Tool 缓存策略。
+            每个路径都显式选择无缓存、本地模拟缓存策略或 Claude Code Tool 缓存策略。
           </p>
         </div>
         <div className="flex flex-col gap-3 lg:flex-row lg:items-end">

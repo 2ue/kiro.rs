@@ -122,7 +122,7 @@ export function defaultCachePolicy(): CachePolicyConfig {
   return {
     default: {},
     currentHighCache: {},
-    kiroRsTool: {},
+    claudeCodeTool: {},
     pathOverrides: {},
   }
 }
@@ -679,8 +679,26 @@ function canonicalCachePolicyPath(prefix: string): string {
   return normalized
 }
 
+function normalizeCacheStrategyType(
+  cacheType?: CacheRoutePolicyPatch['cacheType']
+): CacheRoutePolicyPatch['cacheType'] {
+  return cacheType === 'kiro_rs_tool' ? 'claude_code_tool' : cacheType
+}
+
+function normalizeCacheRoutePolicyPatch(policy?: CacheRoutePolicyPatch): CacheRoutePolicyPatch {
+  const source = policy ?? {}
+  const { kiroRsTool: _legacyClaudeCodeTool, ...rest } = source
+  const cacheType = normalizeCacheStrategyType(source.cacheType)
+  const claudeCodeTool = source.claudeCodeTool ?? source.kiroRsTool
+  return {
+    ...rest,
+    ...(cacheType ? { cacheType } : {}),
+    ...(claudeCodeTool ? { claudeCodeTool } : {}),
+  }
+}
+
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.claudeCodeTool && !policy.kiroRsTool
 }
 
 export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -689,15 +707,16 @@ export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyCon
     Object.entries(source.pathOverrides ?? {})
       .map(([prefix, policy]) => {
         const normalizedPrefix = normalizeCachePolicyPathPrefix(prefix)
-        if (!normalizedPrefix || isEmptyCachePolicyPatch(policy)) return null
-        return [normalizedPrefix, policy] as const
+        const normalizedPolicy = normalizeCacheRoutePolicyPatch(policy)
+        if (!normalizedPrefix || isEmptyCachePolicyPatch(normalizedPolicy)) return null
+        return [normalizedPrefix, normalizedPolicy] as const
       })
       .filter((entry): entry is readonly [string, CacheRoutePolicyPatch] => Boolean(entry))
   )
   return {
-    default: source.default ?? {},
-    currentHighCache: source.currentHighCache ?? {},
-    kiroRsTool: source.kiroRsTool ?? {},
+    default: normalizeCacheRoutePolicyPatch(source.default),
+    currentHighCache: normalizeCacheRoutePolicyPatch(source.currentHighCache),
+    claudeCodeTool: normalizeCacheRoutePolicyPatch(source.claudeCodeTool ?? source.kiroRsTool),
     pathOverrides,
   }
 }

@@ -136,6 +136,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The local-upstream agent mode strategy is now represented by `LocalUpstreamAgentModeStrategy` in Rust config/Admin/protocol code while the existing `kiroAgentModeStrategy` wire/config field remains as a compatibility boundary.
 - The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant. Serde still serializes the legacy `kiro_rs_tool` value for current compatibility and also accepts `claude_code_tool` on read.
 - Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code. Serde keeps `kiroRsTool` as the current compatibility output field and also accepts `claudeCodeTool` on read.
+- Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field, render Claude Code Tool wording, and normalize legacy `kiro_rs_tool` / `kiroRsTool` responses into the new UI state.
 - Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries until the route-policy schema is migrated.
 - Claude Code tool prompt-cache methods and helper functions now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
 - Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names in handler and account-route execution structs. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
@@ -374,6 +375,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-strategy-variant-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-policy-field-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-policy-field-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-fmt3 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-test3 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test prompt_cache -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-methods-fmt1 -- cargo fmt`

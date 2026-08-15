@@ -98,6 +98,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - The local-upstream agent mode strategy now uses `LocalUpstreamAgentModeStrategy` as the Rust type name while retaining existing compatibility config/wire field names.
 - The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant while serde keeps legacy `kiro_rs_tool` serialization and accepts `claude_code_tool` on read.
 - Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code while serde keeps `kiroRsTool` output and accepts `claudeCodeTool` on read.
+- Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field and normalize legacy `kiro_rs_tool` / `kiroRsTool` responses into the new UI state.
 - Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
 - Claude Code tool prompt-cache internal methods/helpers now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
 - Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
