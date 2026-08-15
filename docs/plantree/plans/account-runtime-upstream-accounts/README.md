@@ -6,7 +6,7 @@ Status: In Progress; implementation branch created
 
 Authority: Defines the target boundary for the current-repository refactor requested after `feature/usage-correction-cost-floor`
 
-As of: 2026-08-14
+As of: 2026-08-15
 
 Related: [Plan Tree](../../README.md), [current module map](../../baseline/module-map.md), [protocol contracts](../../baseline/protocol-and-api-contracts.md), [runtime flows](../../baseline/runtime-flows.md), [target architecture](topics/final-target-plan.md)
 
@@ -108,6 +108,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account-route body capability planning now uses account body plan names (`AccountBodyPlan`, `AccountBodyBytesPlan`, `AccountRaw`, `AccountNormalized`). The delegated legacy route executor still lives in `external_pool`, but body processing decisions no longer expose external-pool names at the capability-plan boundary.
 - Anthropic upstream error-envelope helpers now use account-neutral official-upstream naming (`official_upstream_public_message` / `official_upstream_public_error`) while retaining the existing sensitive/internal-term filtering behavior.
 - Payload guard runtime wrappers now use local-upstream/account names (`PreparedLocalUpstreamRequestBody`, `prepare_local_upstream_request_body`, `PreparedAccountMessagesPayload`, `prepare_account_messages_payload`, `sanitize_anthropic_messages_for_account_forwarding`). The underlying legacy local payload still uses `KiroRequest` until the provider/body implementation is replaced.
+- Anthropic handler call sites now enter local-upstream payload guard wrappers (`guard_local_upstream_request` / `serialize_local_upstream_request`) instead of calling legacy Kiro-named guard functions directly. The old guard functions remain inside the concrete legacy local payload implementation while request handling, cache-point retry and thinking-signature retry use local-upstream naming.
 - Account-route body/model/retry pipeline diagnostics now use account wording for normalized/raw payload guard, model rewrite, model mapping and model cooldown errors while the delegated executor types remain under the legacy `external_pool` module.
 - Account-route model processing helpers now use account names (`account_outbound_model_for_raw`, `process_account_model`, `account_model_processing_error`) inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while compatibility config fields such as `external_pool_same_pool_*` remain unchanged.
@@ -275,6 +276,11 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh account-warning-header-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-warning-header-test1 -- cargo test warnings_header_writes_account_header_with_legacy_copy -- --nocapture`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-test1b -- cargo test disabled_local_guard_serializes_without_report -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-body-tests -- bash -lc 'cargo test thinking_signature_retry_body_removes_only_native_reasoning_five_rounds -- --nocapture && cargo test cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds -- --nocapture && cargo test payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_rounds -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

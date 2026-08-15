@@ -5629,7 +5629,8 @@ fn count_serialized_cache_points(value: &serde_json::Value) -> usize {
 fn thinking_signature_retry_body_removes_only_native_reasoning_five_rounds() {
     for round in 1..=5 {
         let request = thinking_signature_retry_kiro_fixture();
-        let original_body = serialize_kiro_request(&request).expect("serialize original fixture");
+        let original_body =
+            serialize_local_upstream_request(&request).expect("serialize original fixture");
         let original: serde_json::Value =
             serde_json::from_str(&original_body).expect("original fixture JSON");
         let retry_body = build_thinking_signature_retry_body(&request)
@@ -5683,7 +5684,7 @@ fn thinking_signature_retry_body_removes_only_native_reasoning_five_rounds() {
         assert!(!retry_body.contains("private-signed-thought"));
         assert!(!retry_body.contains("cHJpdmF0ZS1yZWRhY3RlZA=="));
         assert_eq!(
-            serialize_kiro_request(&request).expect("reserialize original fixture"),
+            serialize_local_upstream_request(&request).expect("reserialize original fixture"),
             original_body,
             "round {round}: lazy retry clone must not mutate original request"
         );
@@ -5695,8 +5696,8 @@ fn cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds()
     for round in 1..=5 {
         let mut cache_retry_request = thinking_signature_retry_kiro_fixture();
         assert_eq!(cache_retry_request.clear_tool_cache_point_plan(), 1);
-        let cache_retry_body =
-            serialize_kiro_request(&cache_retry_request).expect("serialize cache retry fixture");
+        let cache_retry_body = serialize_local_upstream_request(&cache_retry_request)
+            .expect("serialize cache retry fixture");
         let cache_retry: serde_json::Value =
             serde_json::from_str(&cache_retry_body).expect("cache retry JSON");
         assert_eq!(count_serialized_cache_points(&cache_retry), 0);
@@ -5780,12 +5781,12 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
         .expect("deserialize payload guard signature fixture");
         let mut expected_trimmed = request.clone();
         expected_trimmed.conversation_state.history.drain(0..2);
-        let expected_trimmed_len = serialize_kiro_request(&expected_trimmed)
+        let expected_trimmed_len = serialize_local_upstream_request(&expected_trimmed)
             .expect("serialize expected trimmed fixture")
             .len();
         let mut shaping = PayloadShapingConfig::default();
         shaping.enabled = false;
-        let (guarded_body, report) = guard_kiro_request(
+        let (guarded_body, report) = guard_local_upstream_request(
             &mut request,
             PayloadGuardConfig {
                 enabled: true,

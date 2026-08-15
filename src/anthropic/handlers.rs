@@ -61,7 +61,7 @@ use super::model_capabilities::{
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
     ToolUseFormatDiagnostics, breakdown_kiro_request, diagnose_kiro_tool_use_format,
-    guard_kiro_request, serialize_kiro_request,
+    guard_local_upstream_request, serialize_local_upstream_request,
 };
 use super::payload_guard_runtime::prepare_local_upstream_request_body;
 use super::prompt_cache::{
@@ -1172,7 +1172,7 @@ impl PayloadTooLongRetryRequest {
         usage_context: &mut RequestUsageContext,
     ) -> Result<(String, Option<String>, KiroRequest), PayloadGuardError> {
         let mut request = self.request;
-        let (request_body, report) = guard_kiro_request(&mut request, self.config)?;
+        let (request_body, report) = guard_local_upstream_request(&mut request, self.config)?;
         log_payload_guard_report(
             &report,
             &self.endpoint,
@@ -1229,7 +1229,7 @@ impl CachePointRetryRequest {
         let mut request = self.request;
         let planned = request.clear_tool_cache_point_plan();
         usage_context.attach_cache_point_retry(planned, reason);
-        let body = serialize_kiro_request(&request)?;
+        let body = serialize_local_upstream_request(&request)?;
         tracing::warn!(
             request_id = %usage_context.request_id,
             endpoint = %self.endpoint,
@@ -6548,7 +6548,8 @@ fn build_thinking_signature_retry_body(request: &KiroRequest) -> anyhow::Result<
     if removed == 0 {
         anyhow::bail!("thinking signature retry request has no historical reasoningContent");
     }
-    serialize_kiro_request(&retry_request).map_err(|error| anyhow::anyhow!(error.to_string()))
+    serialize_local_upstream_request(&retry_request)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 async fn maybe_forward_account_after_local_error(
@@ -7762,7 +7763,7 @@ async fn handle_stream_request(
                 );
                 None
             } else {
-                match serialize_kiro_request(&effective_request) {
+                match serialize_local_upstream_request(&effective_request) {
                     Ok(body) => {
                         effective_body = body;
                         Some(StreamRetryPlan {
@@ -8524,7 +8525,7 @@ async fn retry_stream_before_downstream_commit(
                 {
                     return None;
                 }
-                match serialize_kiro_request(&request) {
+                match serialize_local_upstream_request(&request) {
                     Ok(body) => {
                         let mut updated = plan.clone();
                         updated.request_body = Arc::<str>::from(body);

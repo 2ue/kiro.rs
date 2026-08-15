@@ -6,7 +6,7 @@ Status: Planning
 
 Authority: Tracks readiness and execution order for the current-repository target only
 
-As of: 2026-08-14
+As of: 2026-08-15
 
 Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md)
 
@@ -77,6 +77,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Runtime config now provides account-named retry status accessors used by the retry pipeline, with old accessor names retained as compatibility delegates.
 - Account runtime facade comments and upstream-account integration-test skip messages now avoid presenting the migrated runtime as an external-pool feature.
 - Proxy warning responses now use `x-account-runtime-warnings` as the primary header and double-write the old warning header for compatibility.
+- Anthropic handler payload guard call sites now enter local-upstream wrappers for guarding and serialization; cache-point retry and thinking-signature retry no longer call the legacy Kiro-named guard helpers directly.
 
 ## In Progress
 

@@ -665,6 +665,13 @@ pub fn guard_kiro_request(
     Ok((body, report))
 }
 
+pub fn guard_local_upstream_request(
+    request: &mut KiroRequest,
+    config: PayloadGuardConfig,
+) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
+    guard_kiro_request(request, config)
+}
+
 pub fn breakdown_kiro_request(
     request: &KiroRequest,
     serialized_body: &str,
@@ -1395,6 +1402,12 @@ fn sha256_hex(value: &str) -> String {
 
 pub fn serialize_kiro_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
     serialize_request(request)
+}
+
+pub fn serialize_local_upstream_request(
+    request: &KiroRequest,
+) -> Result<String, PayloadGuardError> {
+    serialize_kiro_request(request)
 }
 
 fn serialize_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {

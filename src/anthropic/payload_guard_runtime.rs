@@ -6,8 +6,8 @@ use crate::{
     anthropic::{
         payload_guard::{
             PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
-            guard_anthropic_messages_request_reusing_body, guard_kiro_request,
-            serialize_kiro_request,
+            guard_anthropic_messages_request_reusing_body, guard_local_upstream_request,
+            serialize_local_upstream_request,
         },
         types::MessagesRequest,
     },
@@ -26,14 +26,14 @@ pub(crate) fn prepare_local_upstream_request_body(
 ) -> Result<PreparedLocalUpstreamRequestBody, PayloadGuardError> {
     if !config.enabled {
         return Ok(PreparedLocalUpstreamRequestBody {
-            body: serialize_kiro_request(request)?,
+            body: serialize_local_upstream_request(request)?,
             report: None,
             guard_elapsed: None,
         });
     }
 
     let started_at = Instant::now();
-    let (body, report) = guard_kiro_request(request, config)?;
+    let (body, report) = guard_local_upstream_request(request, config)?;
     Ok(PreparedLocalUpstreamRequestBody {
         body,
         report: Some(report),
