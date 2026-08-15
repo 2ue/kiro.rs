@@ -14558,7 +14558,7 @@ fn usage_projection_updates_external_pool_cache_after_success() {
 }
 
 #[test]
-fn kiro_rs_tool_usage_projection_commits_external_pool_cache_only_after_success() {
+fn claude_code_tool_usage_projection_commits_external_pool_cache_only_after_success() {
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
         );
@@ -14645,7 +14645,7 @@ fn kiro_rs_tool_usage_projection_commits_external_pool_cache_only_after_success(
     assert!(reported.cache_read_input_tokens > 0);
     assert!(
         (32..=4_096).contains(&reported.input_tokens),
-        "Kiro-RS Tool reported input range must remain authoritative, got {}",
+        "Claude Code Tool reported input range must remain authoritative, got {}",
         reported.input_tokens
     );
     assert_eq!(
@@ -14657,7 +14657,7 @@ fn kiro_rs_tool_usage_projection_commits_external_pool_cache_only_after_success(
 }
 
 #[test]
-fn kiro_rs_tool_usage_projection_applies_path_cache_creation_policy() {
+fn claude_code_tool_usage_projection_applies_path_cache_creation_policy() {
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}"#,
         );

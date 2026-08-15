@@ -6917,7 +6917,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
 }
 
 #[test]
-fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache() {
+fn unreported_claude_code_tool_usage_caps_standard_cache_fields_only_for_local_cache() {
     let usage_context = RequestUsageContext {
         recorder: Arc::new(UsageRecorder::new(10)),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
@@ -7299,7 +7299,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
 }
 
 #[test]
-fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage() {
+fn claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage() {
     let usage_recorder = Arc::new(UsageRecorder::new(10));
     let usage_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
@@ -9014,7 +9014,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
 }
 
 #[test]
-fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
+fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
     let prompt_cache = Arc::new(PromptCacheTracker::default());
     let usage_recorder = Arc::new(UsageRecorder::new(10));
     let mut cache_policy = CachePolicyConfig::default();
@@ -9153,7 +9153,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
 }
 
 #[test]
-fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
+fn claude_code_tool_route_strategy_commits_without_credential_id() {
     let prompt_cache = Arc::new(PromptCacheTracker::default());
     let usage_recorder = Arc::new(UsageRecorder::new(10));
     let mut cache_policy = CachePolicyConfig::default();

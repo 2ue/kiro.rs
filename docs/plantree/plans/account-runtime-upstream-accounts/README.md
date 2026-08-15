@@ -138,6 +138,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code. Serde keeps `kiroRsTool` as the current compatibility output field and also accepts `claudeCodeTool` on read.
 - Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field, render Claude Code Tool wording, and normalize legacy `kiro_rs_tool` / `kiroRsTool` responses into the new UI state.
 - Rust serde now emits `claude_code_tool` / `claudeCodeTool` as the primary prompt-cache strategy value and field while keeping `kiro_rs_tool` / `kiroRsTool` as read aliases.
+- Claude Code tool prompt-cache tests now use Claude Code Tool names for focused prompt-cache, handler and account-route usage projection cases while compatibility test data keeps old wire aliases where needed.
 - Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names. Legacy `kiro_rs_tool` config values and `kiroRsTool` fields remain read aliases for existing stored/runtime configuration.
 - Claude Code tool prompt-cache methods and helper functions now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
 - Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names in handler and account-route execution structs. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
@@ -380,6 +381,8 @@ Last verified on 2026-08-15:
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-wire-primary-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-wire-primary-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-test-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-test-names-test1 -- bash -lc 'cargo check && cargo test claude_code_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-fmt3 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-test3 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test prompt_cache -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-methods-fmt1 -- cargo fmt`

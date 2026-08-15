@@ -100,6 +100,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code while serde keeps `kiroRsTool` output and accepts `claudeCodeTool` on read.
 - Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field and normalize legacy `kiro_rs_tool` / `kiroRsTool` responses into the new UI state.
 - Rust serde now emits `claude_code_tool` / `claudeCodeTool` as the primary prompt-cache strategy value and field while keeping `kiro_rs_tool` / `kiroRsTool` as read aliases.
+- Claude Code tool prompt-cache tests now use Claude Code Tool names for focused prompt-cache, handler and account-route usage projection cases.
 - Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names while legacy `kiro_rs_tool` config values and `kiroRsTool` fields remain read aliases.
 - Claude Code tool prompt-cache internal methods/helpers now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
 - Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.

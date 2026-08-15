@@ -1806,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_first_miss_then_success_commit_hits() {
+    fn claude_code_tool_first_miss_then_success_commit_hits() {
         let tracker = PromptCacheTracker::default();
         let scope = test_scope("kiro-session");
         let mut first_req = request("stable system prompt ".repeat(300));
@@ -1855,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_failed_request_does_not_commit_segments() {
+    fn claude_code_tool_failed_request_does_not_commit_segments() {
         let tracker = PromptCacheTracker::default();
         let scope = test_scope("kiro-failed-session");
         let mut req = request("stable system prompt ".repeat(300));
@@ -1898,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_skips_dynamic_system_before_first_cache_control() {
+    fn claude_code_tool_skips_dynamic_system_before_first_cache_control() {
         let tracker = PromptCacheTracker::default();
         let scope = test_scope("kiro-dynamic-system");
         let make_req = |dynamic: &str| MessagesRequest {
@@ -1967,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_single_current_message_without_prefix_is_uncached() {
+    fn claude_code_tool_single_current_message_without_prefix_is_uncached() {
         let tracker = PromptCacheTracker::default();
         let req = MessagesRequest {
             model: "claude-sonnet-4-5".to_string(),
@@ -1999,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_cache_respects_global_entry_bounds() {
+    fn claude_code_tool_cache_respects_global_entry_bounds() {
         let tracker = PromptCacheTracker::default();
         let bounds = PromptCacheBounds::from_config(10, 2, 3600, 0);
         for idx in 0..5 {
@@ -2034,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_coverage_ratio_caps_committed_reads() {
+    fn claude_code_tool_coverage_ratio_caps_committed_reads() {
         let tracker = PromptCacheTracker::default();
         let scope = test_scope("kiro-coverage-ratio");
         let mut req = request("stable system prompt ".repeat(300));
@@ -2087,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_creation_cap_commits_only_created_tokens() {
+    fn claude_code_tool_creation_cap_commits_only_created_tokens() {
         let tracker = PromptCacheTracker::default();
         let scope = test_scope("kiro-creation-cap");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
@@ -2139,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_can_disable_incremental_creation_after_read() {
+    fn claude_code_tool_can_disable_incremental_creation_after_read() {
         let tracker = PromptCacheTracker::default();
         let scope = test_scope("kiro-no-incremental-create");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
@@ -2193,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_max_coverage_tokens_caps_default_creation() {
+    fn claude_code_tool_max_coverage_tokens_caps_default_creation() {
         let tracker = PromptCacheTracker::default();
         let scope = test_scope("kiro-max-coverage");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
@@ -2244,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_rs_tool_current_user_prefix_is_opt_in() {
+    fn claude_code_tool_current_user_prefix_is_opt_in() {
         let tracker = PromptCacheTracker::default();
         let req = MessagesRequest {
             model: "claude-sonnet-4-5".to_string(),
