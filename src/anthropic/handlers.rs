@@ -3174,7 +3174,8 @@ impl RequestUsageContext {
 
     fn attach_cache_point_retry(&mut self, planned: usize, reason: &str) {
         if let Some(report) = self.payload_guard_report.as_mut() {
-            report.kiro_cache_points_planned = report.kiro_cache_points_planned.max(planned);
+            report.local_upstream_cache_points_planned =
+                report.local_upstream_cache_points_planned.max(planned);
             report.cache_point_retry_without_cache_point = true;
             report.cache_point_retry_reason = Some(reason.to_string());
         }
@@ -4459,8 +4460,8 @@ fn should_persist_payload_diagnostics(
     };
     report.was_modified()
         || report.still_oversized
-        || report.kiro_cache_points_planned > 0
-        || report.kiro_cache_points_inserted > 0
+        || report.local_upstream_cache_points_planned > 0
+        || report.local_upstream_cache_points_inserted > 0
         || report.cache_point_retry_without_cache_point
         || (report.max_bytes > 0 && report.final_bytes > report.max_bytes.saturating_mul(70) / 100)
 }
@@ -5668,14 +5669,16 @@ fn log_payload_guard_report(
     if !report.enabled {
         return;
     }
-    if report.kiro_cache_points_planned > 0 || report.kiro_cache_points_inserted > 0 {
+    if report.local_upstream_cache_points_planned > 0
+        || report.local_upstream_cache_points_inserted > 0
+    {
         tracing::debug!(
             endpoint,
             requested_model,
             upstream_model,
             conversation_id,
-            cache_points_planned = report.kiro_cache_points_planned,
-            cache_points_inserted = report.kiro_cache_points_inserted,
+            cache_points_planned = report.local_upstream_cache_points_planned,
+            cache_points_inserted = report.local_upstream_cache_points_inserted,
             "local-upstream cachePoint insertion plan applied"
         );
     }

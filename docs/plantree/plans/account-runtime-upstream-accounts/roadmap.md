@@ -93,6 +93,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Anthropic stream conversion and debug helpers now consume local-upstream event aliases from the facade, and stream tests use `process_local_upstream_event` as the primary event processor entrypoint.
 - Local-provider raw upstream error diagnostics now use neutral `official_upstream` source labels and redacted body metadata for provider status/non-eventstream bodies, so private provider messages do not persist in attempt or usage diagnostics.
 - Local-upstream timeout, stream-retry and cache-point settings now have `Config` accessors, and Anthropic router/AppState/request runtime/converter/Admin model-test/WebSearch call sites use local-upstream runtime names while persisted compatibility fields remain unchanged.
+- Payload guard report cache-point diagnostics now serialize local-upstream field names and accept old Kiro-named JSON fields only as compatibility read aliases.
 
 ## In Progress
 

@@ -159,10 +159,10 @@ pub struct PayloadGuardReport {
     pub dropped_historical_images: usize,
     #[serde(default)]
     pub dropped_historical_image_bytes: usize,
-    #[serde(default)]
-    pub kiro_cache_points_planned: usize,
-    #[serde(default)]
-    pub kiro_cache_points_inserted: usize,
+    #[serde(default, alias = "kiroCachePointsPlanned")]
+    pub local_upstream_cache_points_planned: usize,
+    #[serde(default, alias = "kiroCachePointsInserted")]
+    pub local_upstream_cache_points_inserted: usize,
     #[serde(default)]
     pub cache_point_retry_without_cache_point: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,8 +218,8 @@ impl PayloadGuardReport {
             dropped_current_image_bytes: 0,
             dropped_historical_images: 0,
             dropped_historical_image_bytes: 0,
-            kiro_cache_points_planned: 0,
-            kiro_cache_points_inserted: 0,
+            local_upstream_cache_points_planned: 0,
+            local_upstream_cache_points_inserted: 0,
             cache_point_retry_without_cache_point: false,
             cache_point_retry_reason: None,
             body_sha256: None,
@@ -484,8 +484,8 @@ pub fn guard_kiro_request(
         dropped_current_image_bytes: 0,
         dropped_historical_images: 0,
         dropped_historical_image_bytes: 0,
-        kiro_cache_points_planned: 0,
-        kiro_cache_points_inserted: 0,
+        local_upstream_cache_points_planned: 0,
+        local_upstream_cache_points_inserted: 0,
         cache_point_retry_without_cache_point: false,
         cache_point_retry_reason: None,
         body_sha256: None,
@@ -1390,8 +1390,8 @@ fn new_payload_guard_report(
         dropped_current_image_bytes: 0,
         dropped_historical_images: 0,
         dropped_historical_image_bytes: 0,
-        kiro_cache_points_planned: 0,
-        kiro_cache_points_inserted: 0,
+        local_upstream_cache_points_planned: 0,
+        local_upstream_cache_points_inserted: 0,
         cache_point_retry_without_cache_point: false,
         cache_point_retry_reason: None,
         body_sha256: None,
@@ -1462,8 +1462,8 @@ fn set_cache_point_report_fields(report: &mut PayloadGuardReport, request: &Kiro
     if !request.cache_point_plan_recording_enabled {
         return;
     }
-    report.kiro_cache_points_planned = request.tool_cache_point_insert_after.len();
-    report.kiro_cache_points_inserted =
+    report.local_upstream_cache_points_planned = request.tool_cache_point_insert_after.len();
+    report.local_upstream_cache_points_inserted =
         valid_tool_cache_point_insertions(request, &request.tool_cache_point_insert_after);
 }
 
@@ -6811,8 +6811,8 @@ mod tests {
             dropped_current_image_bytes: 10,
             dropped_historical_images: 1,
             dropped_historical_image_bytes: 10,
-            kiro_cache_points_planned: 0,
-            kiro_cache_points_inserted: 0,
+            local_upstream_cache_points_planned: 0,
+            local_upstream_cache_points_inserted: 0,
             cache_point_retry_without_cache_point: false,
             cache_point_retry_reason: None,
             body_sha256: None,
@@ -6907,8 +6907,31 @@ mod tests {
         assert_eq!(tools[1]["cachePoint"]["type"], "default");
         assert!(tools[2].get("toolSpecification").is_some());
         assert_eq!(tools[3]["cachePoint"]["type"], "default");
-        assert_eq!(report.kiro_cache_points_planned, 4);
-        assert_eq!(report.kiro_cache_points_inserted, 2);
+        assert_eq!(report.local_upstream_cache_points_planned, 4);
+        assert_eq!(report.local_upstream_cache_points_inserted, 2);
+    }
+
+    #[test]
+    fn payload_guard_report_uses_local_upstream_cache_point_fields_with_legacy_aliases() {
+        let mut report = PayloadGuardReport::disabled(128, 2);
+        report.local_upstream_cache_points_planned = 4;
+        report.local_upstream_cache_points_inserted = 2;
+
+        let mut value = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(value["localUpstreamCachePointsPlanned"], 4);
+        assert_eq!(value["localUpstreamCachePointsInserted"], 2);
+        assert!(value.get("kiroCachePointsPlanned").is_none());
+        assert!(value.get("kiroCachePointsInserted").is_none());
+
+        let object = value.as_object_mut().expect("report object");
+        object.insert("kiroCachePointsPlanned".to_string(), Value::from(7));
+        object.insert("kiroCachePointsInserted".to_string(), Value::from(3));
+        object.remove("localUpstreamCachePointsPlanned");
+        object.remove("localUpstreamCachePointsInserted");
+
+        let legacy = serde_json::from_value::<PayloadGuardReport>(value).expect("legacy report");
+        assert_eq!(legacy.local_upstream_cache_points_planned, 7);
+        assert_eq!(legacy.local_upstream_cache_points_inserted, 3);
     }
 
     #[test]
