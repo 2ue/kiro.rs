@@ -19,6 +19,7 @@ pub(crate) mod call_trace {
 
 pub(crate) mod credentials {
     pub(crate) use crate::kiro::model::credentials::profile_arn_region as local_upstream_profile_region;
+    pub(crate) use crate::kiro::model::credentials::split_kiro_api_key_and_region as split_local_upstream_api_key_and_region;
     pub(crate) type LocalUpstreamCredentials = crate::kiro::model::credentials::KiroCredentials;
     pub(crate) type LocalUpstreamCredentialsConfig =
         crate::kiro::model::credentials::CredentialsConfig;

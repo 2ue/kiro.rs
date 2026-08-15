@@ -38,7 +38,9 @@ use crate::external_pool::{
     ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
     UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_model_mapping_rules,
 };
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream::credentials::{
+    LocalUpstreamCredentials, split_local_upstream_api_key_and_region,
+};
 use crate::local_upstream::model_catalog::LocalUpstreamModelCapabilityCohortKey;
 use crate::model::config::{
     Config, ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ModelMappingRule,
@@ -494,7 +496,7 @@ fn sha256_hex(input: &str) -> String {
 }
 
 fn credential_hash_columns(
-    credential: &KiroCredentials,
+    credential: &LocalUpstreamCredentials,
 ) -> (String, Option<String>, Option<String>) {
     let is_api_key = credential.is_api_key_credential();
     let auth_kind = if is_api_key {
@@ -537,7 +539,7 @@ fn duplicate_credential_message(err: sqlx::Error) -> anyhow::Error {
     anyhow::Error::new(err)
 }
 
-fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
+fn credential_from_row(row: PgRow) -> anyhow::Result<LocalUpstreamCredentials> {
     let id: i64 = row.try_get("id")?;
     let priority: i32 = row.try_get("priority")?;
     let disabled: bool = row.try_get("disabled")?;
@@ -545,7 +547,7 @@ fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
     let revision: i64 = row.try_get("revision")?;
     let value: serde_json::Value = row.try_get("data")?;
-    let mut credential: KiroCredentials = serde_json::from_value(value)?;
+    let mut credential: LocalUpstreamCredentials = serde_json::from_value(value)?;
     credential.id = Some(id as u64);
     credential.created_at = Some(created_at.to_rfc3339());
     credential.updated_at = Some(updated_at.to_rfc3339());
@@ -559,7 +561,7 @@ fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
     Ok(credential)
 }
 
-fn credentials_from_rows(rows: Vec<PgRow>) -> anyhow::Result<Vec<KiroCredentials>> {
+fn credentials_from_rows(rows: Vec<PgRow>) -> anyhow::Result<Vec<LocalUpstreamCredentials>> {
     rows.into_iter().map(credential_from_row).collect()
 }
 
@@ -1837,7 +1839,7 @@ impl PostgresStore {
     }
 
     #[cfg(test)]
-    pub async fn load_credentials(&self) -> anyhow::Result<Vec<KiroCredentials>> {
+    pub async fn load_credentials(&self) -> anyhow::Result<Vec<LocalUpstreamCredentials>> {
         let rows = sqlx::query(ACTIVE_CREDENTIALS_SELECT_SQL)
             .fetch_all(&self.pool)
             .await?;
@@ -1848,7 +1850,7 @@ impl PostgresStore {
     pub async fn load_credential(
         &self,
         credential_id: u64,
-    ) -> anyhow::Result<Option<KiroCredentials>> {
+    ) -> anyhow::Result<Option<LocalUpstreamCredentials>> {
         let credential_id_i64 = i64::try_from(credential_id)
             .map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
         let row = sqlx::query(
@@ -1869,7 +1871,7 @@ impl PostgresStore {
     pub async fn load_credentials_with_runtime_state(
         &self,
     ) -> anyhow::Result<(
-        Vec<KiroCredentials>,
+        Vec<LocalUpstreamCredentials>,
         HashMap<u64, CredentialRuntimeStateRow>,
     )> {
         let mut tx = self.pool.begin().await?;
@@ -1898,7 +1900,7 @@ impl PostgresStore {
     pub async fn load_credentials_with_runtime_state_and_account_info(
         &self,
     ) -> anyhow::Result<(
-        Vec<KiroCredentials>,
+        Vec<LocalUpstreamCredentials>,
         HashMap<u64, CredentialRuntimeStateRow>,
         HashMap<u64, CredentialAccountInfoRow>,
     )> {
@@ -1959,7 +1961,7 @@ impl PostgresStore {
     pub async fn load_credential_with_runtime_state(
         &self,
         credential_id: u64,
-    ) -> anyhow::Result<Option<(KiroCredentials, Option<CredentialRuntimeStateRow>)>> {
+    ) -> anyhow::Result<Option<(LocalUpstreamCredentials, Option<CredentialRuntimeStateRow>)>> {
         let credential_id_i64 = i64::try_from(credential_id)
             .map_err(|_| anyhow::anyhow!("凭据 id 超出 PgSQL BIGINT 范围"))?;
         let mut tx = self.pool.begin().await?;
@@ -2007,7 +2009,7 @@ impl PostgresStore {
     pub async fn find_existing_api_key_credential(
         &self,
         api_key: &str,
-    ) -> anyhow::Result<Option<KiroCredentials>> {
+    ) -> anyhow::Result<Option<LocalUpstreamCredentials>> {
         let api_key = api_key.trim();
         if api_key.is_empty() {
             return Ok(None);
@@ -2032,10 +2034,9 @@ impl PostgresStore {
     pub async fn ensure_api_key_credential(
         &self,
         api_key: &str,
-    ) -> anyhow::Result<KiroCredentials> {
-        let (api_key, region) =
-            crate::kiro::model::credentials::split_kiro_api_key_and_region(api_key)
-                .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 为空"))?;
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
+        let (api_key, region) = split_local_upstream_api_key_and_region(api_key)
+            .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 为空"))?;
         if api_key.trim().is_empty() {
             anyhow::bail!("KIRO_API_KEY 为空");
         }
@@ -2043,7 +2044,7 @@ impl PostgresStore {
             return Ok(existing);
         }
 
-        let mut credential = KiroCredentials {
+        let mut credential = LocalUpstreamCredentials {
             kiro_api_key: Some(api_key.to_string()),
             auth_method: Some("api_key".to_string()),
             priority: 0,
@@ -2073,7 +2074,7 @@ impl PostgresStore {
 
     pub async fn bootstrap_credentials_from_file(
         &self,
-        credentials: &[KiroCredentials],
+        credentials: &[LocalUpstreamCredentials],
     ) -> anyhow::Result<()> {
         if self.credentials_exist().await? || credentials.is_empty() {
             return Ok(());
@@ -2129,8 +2130,8 @@ impl PostgresStore {
     /// PgSQL 中其他未软删除凭据，避免旧进程内存快照覆盖其他实例新增的凭据。
     pub async fn save_credentials(
         &self,
-        credentials: &[KiroCredentials],
-    ) -> anyhow::Result<Vec<KiroCredentials>> {
+        credentials: &[LocalUpstreamCredentials],
+    ) -> anyhow::Result<Vec<LocalUpstreamCredentials>> {
         let mut saved = Vec::with_capacity(credentials.len());
         for credential in credentials {
             let authoritative = if credential.id.is_some() {
@@ -2148,8 +2149,8 @@ impl PostgresStore {
 
     pub async fn insert_credential(
         &self,
-        credential: &KiroCredentials,
-    ) -> anyhow::Result<KiroCredentials> {
+        credential: &LocalUpstreamCredentials,
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         let mut canonical = credential.clone();
         canonical.storage_revision = 0;
         match self
@@ -2170,7 +2171,7 @@ impl PostgresStore {
 
     pub async fn upsert_credential(
         &self,
-        credential: &KiroCredentials,
+        credential: &LocalUpstreamCredentials,
     ) -> anyhow::Result<CredentialUpsertCasOutcome> {
         if credential.id.is_none() {
             anyhow::bail!("保存到 PgSQL 的凭据必须先分配 id");
@@ -2181,7 +2182,7 @@ impl PostgresStore {
 
     async fn upsert_credential_with_optional_id(
         &self,
-        credential: &KiroCredentials,
+        credential: &LocalUpstreamCredentials,
         allocate_missing_id: bool,
     ) -> anyhow::Result<CredentialUpsertCasOutcome> {
         if credential.id.is_none() && !allocate_missing_id {
@@ -2319,10 +2320,13 @@ impl PostgresStore {
 
     pub async fn insert_credential_with_runtime_patch(
         &self,
-        credential: &KiroCredentials,
+        credential: &LocalUpstreamCredentials,
         operation_id: Uuid,
         patch: &CredentialRuntimeStatePatch,
-    ) -> anyhow::Result<(KiroCredentials, CredentialRuntimeStateMutationResult)> {
+    ) -> anyhow::Result<(
+        LocalUpstreamCredentials,
+        CredentialRuntimeStateMutationResult,
+    )> {
         validate_credential_runtime_state_patch(patch)?;
         let mut tx = self.pool.begin().await?;
         Self::lock_credential_id_sequence_in_tx(&mut tx).await?;
@@ -2399,7 +2403,7 @@ impl PostgresStore {
 
     pub async fn update_credential_with_runtime_patch_cas(
         &self,
-        credential: &KiroCredentials,
+        credential: &LocalUpstreamCredentials,
         operation_id: Uuid,
         patch: &CredentialRuntimeStatePatch,
     ) -> anyhow::Result<CredentialWithRuntimePatchCasOutcome> {
@@ -5001,7 +5005,7 @@ async fn repair_active_credential_hashes_in_tx(
         let existing_api_key_hash: Option<String> = row.try_get("api_key_hash")?;
         let existing_refresh_token_hash: Option<String> = row.try_get("refresh_token_hash")?;
         let data: serde_json::Value = row.try_get("data")?;
-        let mut credential: KiroCredentials = serde_json::from_value(data)?;
+        let mut credential: LocalUpstreamCredentials = serde_json::from_value(data)?;
         credential.id = Some(credential_id.max(0) as u64);
         credential.canonicalize_auth_method();
         credential.normalize_api_key_defaults();
@@ -5107,19 +5111,19 @@ pub struct CredentialRefreshFieldsPatch {
 #[derive(Debug, Clone)]
 #[must_use = "credential upsert CAS conflicts must be handled explicitly"]
 pub enum CredentialUpsertCasOutcome {
-    Applied(KiroCredentials),
-    Conflict { current: KiroCredentials },
+    Applied(LocalUpstreamCredentials),
+    Conflict { current: LocalUpstreamCredentials },
 }
 
 #[derive(Debug, Clone)]
 #[must_use = "credential/runtime CAS conflicts must be handled explicitly"]
 pub enum CredentialWithRuntimePatchCasOutcome {
     Applied {
-        credential: KiroCredentials,
+        credential: LocalUpstreamCredentials,
         runtime: CredentialRuntimeStateMutationResult,
     },
     Conflict {
-        current: KiroCredentials,
+        current: LocalUpstreamCredentials,
     },
 }
 
@@ -5136,7 +5140,7 @@ pub struct CredentialRefreshExpectedContext {
 }
 
 impl CredentialRefreshExpectedContext {
-    pub fn from_credentials(credentials: &KiroCredentials) -> anyhow::Result<Self> {
+    pub fn from_credentials(credentials: &LocalUpstreamCredentials) -> anyhow::Result<Self> {
         let mut credentials = credentials.clone();
         credentials.canonicalize_auth_method();
         let refresh_token = credentials
@@ -5160,8 +5164,10 @@ impl CredentialRefreshExpectedContext {
 #[derive(Debug, Clone)]
 #[must_use = "credential refresh field CAS conflicts must be handled explicitly"]
 pub enum CredentialRefreshFieldsCasOutcome {
-    Applied(KiroCredentials),
-    Conflict { current: Option<KiroCredentials> },
+    Applied(LocalUpstreamCredentials),
+    Conflict {
+        current: Option<LocalUpstreamCredentials>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -14097,7 +14103,7 @@ mod tests {
         .await
         .unwrap();
         store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_migration_atomicity_fixture".to_string()),
                 auth_method: Some("api_key".to_string()),
                 priority: 23,
@@ -15281,7 +15287,7 @@ mod tests {
             42
         );
 
-        let credential = KiroCredentials {
+        let credential = LocalUpstreamCredentials {
             id: Some(7),
             email: Some("alpha@example.com".to_string()),
             refresh_token: Some("refresh".to_string()),
@@ -15327,7 +15333,7 @@ mod tests {
         assert_eq!(account_info.usage_limit, 1000.0);
 
         let inserted = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("beta@example.com".to_string()),
                 kiro_api_key: Some("ksk_beta_key".to_string()),
                 auth_method: Some("api_key".to_string()),
@@ -15351,7 +15357,7 @@ mod tests {
             "保存旧快照不应软删除数据库中其他未软删除凭据"
         );
         store
-            .save_credentials(&[KiroCredentials {
+            .save_credentials(&[LocalUpstreamCredentials {
                 email: Some("gamma@example.com".to_string()),
                 kiro_api_key: Some("ksk_gamma_key".to_string()),
                 auth_method: Some("api_key".to_string()),
@@ -15806,7 +15812,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let inserted = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("before-delete@example.com".to_string()),
                 refresh_token: Some("refresh-before-delete".to_string()),
                 auth_method: Some("social".to_string()),
@@ -15859,7 +15865,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let original = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 access_token: Some("revision-access-old".to_string()),
                 refresh_token: Some("revision-refresh-old".to_string()),
                 auth_method: Some("social".to_string()),
@@ -15997,7 +16003,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_credential_revision_migration".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -16055,7 +16061,7 @@ mod tests {
         .execute(store.pool())
         .await
         .unwrap();
-        let credential = KiroCredentials {
+        let credential = LocalUpstreamCredentials {
             refresh_token: Some("atomic-insert-refresh".to_string()),
             auth_method: Some("social".to_string()),
             email: Some("atomic-insert@example.com".to_string()),
@@ -16139,7 +16145,7 @@ mod tests {
         clean(&store).await;
         let (original, original_runtime) = store
             .insert_credential_with_runtime_patch(
-                &KiroCredentials {
+                &LocalUpstreamCredentials {
                     refresh_token: Some("atomic-update-refresh-old".to_string()),
                     access_token: Some("atomic-update-access-old".to_string()),
                     auth_method: Some("social".to_string()),
@@ -16307,7 +16313,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let inserted = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 access_token: Some("access-old".to_string()),
                 refresh_token: Some("refresh-old".to_string()),
                 profile_arn: Some("profile-old".to_string()),
@@ -16482,7 +16488,7 @@ mod tests {
             let old_access = format!("access-old-{round}");
             let shared_refresh = format!("refresh-non-rotating-{round}");
             let inserted = store
-                .insert_credential(&KiroCredentials {
+                .insert_credential(&LocalUpstreamCredentials {
                     access_token: Some(old_access),
                     refresh_token: Some(shared_refresh.clone()),
                     expires_at: Some("2026-07-10T00:00:00Z".to_string()),
@@ -16695,7 +16701,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let first_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_stats_exactly_once_first".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -16705,7 +16711,7 @@ mod tests {
             .id
             .unwrap();
         let second_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_stats_exactly_once_second".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -16926,7 +16932,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_stats_soft_delete_race".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17018,7 +17024,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_last_used_rfc3339_order".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17125,7 +17131,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_mutation_revision".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17214,7 +17220,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_generation_fence".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17436,7 +17442,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_disable_mutation_idempotency".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17593,7 +17599,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_patch_idempotency".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17774,7 +17780,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let mutation_credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_patch_soft_delete".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17818,7 +17824,7 @@ mod tests {
         assert!(patch_error.to_string().contains("不存在或已删除"));
 
         let snapshot_credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_snapshot_soft_delete".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17894,7 +17900,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_snapshot_stale".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -17973,7 +17979,7 @@ mod tests {
         assert_eq!(stored, fresh);
 
         let missing_state_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_snapshot_missing".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -18017,7 +18023,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_snapshot_concurrent".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -18116,7 +18122,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_mutation_cleanup".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -18208,7 +18214,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let first_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("consistent-first@example.com".to_string()),
                 kiro_api_key: Some("ksk_consistent_first".to_string()),
                 auth_method: Some("api_key".to_string()),
@@ -18221,7 +18227,7 @@ mod tests {
             .id
             .unwrap();
         store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("consistent-second@example.com".to_string()),
                 kiro_api_key: Some("ksk_consistent_second".to_string()),
                 auth_method: Some("api_key".to_string()),
@@ -18294,7 +18300,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_revision_migration".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -18365,7 +18371,7 @@ mod tests {
         let store = PostgresStore::connect_test(&config).await.unwrap();
         clean(&store).await;
         let credential_id = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 kiro_api_key: Some("ksk_runtime_generation_migration".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
@@ -18436,7 +18442,7 @@ mod tests {
             let store = store.clone();
             handles.push(tokio::spawn(async move {
                 store
-                    .insert_credential(&KiroCredentials {
+                    .insert_credential(&LocalUpstreamCredentials {
                         email: Some(format!("concurrent-{}@example.com", index)),
                         kiro_api_key: Some(format!("ksk_concurrent_{}", index)),
                         auth_method: Some("api_key".to_string()),
@@ -18469,7 +18475,7 @@ mod tests {
         assert_eq!(env_first.id, env_second.id);
 
         let duplicate = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("duplicate@example.com".to_string()),
                 kiro_api_key: Some("ksk_concurrent_0".to_string()),
                 auth_method: Some("api_key".to_string()),
@@ -18493,7 +18499,7 @@ mod tests {
         clean(&store).await;
 
         store
-            .save_credentials(&[KiroCredentials {
+            .save_credentials(&[LocalUpstreamCredentials {
                 id: Some(7),
                 email: Some("explicit-seven@example.com".to_string()),
                 kiro_api_key: Some("ksk_explicit_seven".to_string()),
@@ -18503,7 +18509,7 @@ mod tests {
             .await
             .unwrap();
         let after_explicit = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("after-explicit@example.com".to_string()),
                 kiro_api_key: Some("ksk_after_explicit".to_string()),
                 auth_method: Some("api_key".to_string()),
@@ -18519,7 +18525,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .save_credentials(&[KiroCredentials {
+            .save_credentials(&[LocalUpstreamCredentials {
                 id: Some(50),
                 email: Some("explicit-fifty@example.com".to_string()),
                 kiro_api_key: Some("ksk_explicit_fifty".to_string()),
@@ -18529,7 +18535,7 @@ mod tests {
             .await
             .unwrap();
         let after_higher_sequence = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("after-higher-sequence@example.com".to_string()),
                 kiro_api_key: Some("ksk_after_higher_sequence".to_string()),
                 auth_method: Some("api_key".to_string()),
@@ -18565,7 +18571,7 @@ mod tests {
                 let id = ((index + 1) * 10_000) as u64;
                 barrier.wait().await;
                 let saved = store
-                    .save_credentials(&[KiroCredentials {
+                    .save_credentials(&[LocalUpstreamCredentials {
                         id: Some(id),
                         email: Some(format!("explicit-concurrent-{index}@example.com")),
                         kiro_api_key: Some(format!("ksk_explicit_concurrent_{index}")),
@@ -18583,7 +18589,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
                 store
-                    .insert_credential(&KiroCredentials {
+                    .insert_credential(&LocalUpstreamCredentials {
                         email: Some(format!("automatic-concurrent-{index}@example.com")),
                         kiro_api_key: Some(format!("ksk_automatic_concurrent_{index}")),
                         auth_method: Some("api_key".to_string()),
@@ -18609,7 +18615,7 @@ mod tests {
             inserted_count
         );
         let after_concurrent_inserts = store
-            .insert_credential(&KiroCredentials {
+            .insert_credential(&LocalUpstreamCredentials {
                 email: Some("after-concurrent-allocation@example.com".to_string()),
                 kiro_api_key: Some("ksk_after_concurrent_allocation".to_string()),
                 auth_method: Some("api_key".to_string()),

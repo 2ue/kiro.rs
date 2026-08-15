@@ -150,6 +150,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account-route Redis lease cleanup now calls the critical storage-task helper through an `account_runtime::storage_task` alias instead of importing it from the legacy token-manager module.
 - Main shutdown lifecycle now reads, drains and shuts down best-effort storage tasks through account-runtime storage-task aliases instead of calling legacy token-manager functions directly.
 - Postgres model-capability persistence now uses local-upstream model catalog aliases for reasoning cohort keys instead of directly importing legacy available-model key types.
+- Postgres credential persistence and API-key bootstrap now use local-upstream credential aliases and split helpers instead of importing legacy credential types or helper paths directly.
 - Runtime config defaults now read the local-upstream IDE endpoint name through the `local_upstream` endpoint facade instead of importing the legacy endpoint module directly.
 - Main endpoint registry construction now uses local-upstream endpoint and trait aliases for IDE/CLI endpoint setup instead of importing the legacy endpoint types directly in process wiring.
 - Main startup, Redis runtime-event listener and credential-file CLI diagnostics now use local-upstream credential/config/manager aliases instead of importing legacy credential and manager types directly in process wiring.
@@ -390,6 +391,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh main-storage-task-lifecycle-alias-test1 -- bash -lc 'cargo check && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh postgres-model-catalog-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh postgres-model-catalog-alias-test1 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture && cargo test postgres -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh postgres-credential-alias-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh postgres-credential-alias-test1 -- bash -lc 'cargo check && cargo test postgres -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-endpoint-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-endpoint-alias-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test account_runtime_config_ext_applies_enablement_and_route_policy -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh main-endpoint-alias-fmt2 -- cargo fmt`
