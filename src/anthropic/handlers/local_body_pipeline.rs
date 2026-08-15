@@ -123,7 +123,7 @@ pub(super) fn prepare_with_plan(
     let payload_breakdown = if plan.diagnostics.is_enabled() {
         payload_guard_report.as_ref().and_then(|report| {
             should_log_payload_byte_breakdown(report)
-                .then(|| breakdown_kiro_request(&kiro_request, &request_body))
+                .then(|| breakdown_local_upstream_request(&kiro_request, &request_body))
         })
     } else {
         None

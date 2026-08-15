@@ -60,8 +60,9 @@ use super::model_capabilities::{
 };
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
-    ToolUseFormatDiagnostics, breakdown_kiro_request, diagnose_kiro_tool_use_format,
-    guard_local_upstream_request, serialize_local_upstream_request,
+    ToolUseFormatDiagnostics, breakdown_local_upstream_request,
+    diagnose_local_upstream_tool_use_format, guard_local_upstream_request,
+    serialize_local_upstream_request,
 };
 use super::payload_guard_runtime::prepare_local_upstream_request_body;
 use super::prompt_cache::{
@@ -1180,7 +1181,7 @@ impl PayloadTooLongRetryRequest {
             self.upstream_model.as_deref(),
             Some(&self.conversation_id),
         );
-        let breakdown = breakdown_kiro_request(&request, &request_body);
+        let breakdown = breakdown_local_upstream_request(&request, &request_body);
         log_payload_byte_breakdown(
             should_log_payload_byte_breakdown(&report).then_some(breakdown),
             &report,
@@ -5424,7 +5425,7 @@ fn attach_and_log_tool_use_format_diagnostics(
         return;
     }
 
-    let diagnostics = diagnose_kiro_tool_use_format(request);
+    let diagnostics = diagnose_local_upstream_tool_use_format(request);
     usage_context.attach_tool_use_format_diagnostics(diagnostics);
     let debug_ref = usage_context
         .tool_format_debug_recorder

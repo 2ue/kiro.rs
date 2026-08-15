@@ -711,6 +711,13 @@ pub fn breakdown_kiro_request(
     }
 }
 
+pub fn breakdown_local_upstream_request(
+    request: &KiroRequest,
+    serialized_body: &str,
+) -> PayloadByteBreakdown {
+    breakdown_kiro_request(request, serialized_body)
+}
+
 pub fn diagnose_kiro_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiagnostics {
     let state = &request.conversation_state;
     let current_user = &state.current_message.user_input_message;
@@ -887,6 +894,10 @@ pub fn diagnose_kiro_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiag
         non_object_tool_use_inputs,
         history_tool_names_missing_from_tools,
     }
+}
+
+pub fn diagnose_local_upstream_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiagnostics {
+    diagnose_kiro_tool_use_format(request)
 }
 
 fn count_invalid_tool_schema_property_keys(

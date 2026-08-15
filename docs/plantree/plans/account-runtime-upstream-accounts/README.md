@@ -109,6 +109,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic upstream error-envelope helpers now use account-neutral official-upstream naming (`official_upstream_public_message` / `official_upstream_public_error`) while retaining the existing sensitive/internal-term filtering behavior.
 - Payload guard runtime wrappers now use local-upstream/account names (`PreparedLocalUpstreamRequestBody`, `prepare_local_upstream_request_body`, `PreparedAccountMessagesPayload`, `prepare_account_messages_payload`, `sanitize_anthropic_messages_for_account_forwarding`). The underlying legacy local payload still uses `KiroRequest` until the provider/body implementation is replaced.
 - Anthropic handler call sites now enter local-upstream payload guard wrappers (`guard_local_upstream_request` / `serialize_local_upstream_request`) instead of calling legacy Kiro-named guard functions directly. The old guard functions remain inside the concrete legacy local payload implementation while request handling, cache-point retry and thinking-signature retry use local-upstream naming.
+- Local-upstream payload diagnostics now enter through `breakdown_local_upstream_request` and `diagnose_local_upstream_tool_use_format`, so handler and local body pipeline diagnostics no longer call Kiro-named payload breakdown/tool-format helpers directly.
 - Account-route body/model/retry pipeline diagnostics now use account wording for normalized/raw payload guard, model rewrite, model mapping and model cooldown errors while the delegated executor types remain under the legacy `external_pool` module.
 - Account-route model processing helpers now use account names (`account_outbound_model_for_raw`, `process_account_model`, `account_model_processing_error`) inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while compatibility config fields such as `external_pool_same_pool_*` remain unchanged.
@@ -286,6 +287,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-test1 -- cargo test handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-test2 -- cargo test signature_retry -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-diagnostics-wrapper-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-diagnostics-wrapper-test1 -- bash -lc 'cargo check && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
