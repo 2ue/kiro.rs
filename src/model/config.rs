@@ -407,7 +407,7 @@ pub struct PromptSteeringConfig {
     pub route_mode: PromptSteeringRouteMode,
     #[serde(default = "default_prompt_steering_route_rules")]
     pub route_rules: Vec<String>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub apply_to_external_pool: bool,
     #[serde(default = "default_true")]
     pub apply_to_count_tokens: bool,
@@ -432,7 +432,7 @@ impl Default for PromptSteeringConfig {
             scope: PromptSteeringScope::RouteRules,
             route_mode: PromptSteeringRouteMode::AllowList,
             route_rules: default_prompt_steering_route_rules(),
-            apply_to_external_pool: true,
+            apply_to_external_pool: false,
             apply_to_count_tokens: true,
             language_constraint: default_language_constraint_block(),
             task_quality: default_task_quality_block(),
@@ -2965,6 +2965,16 @@ pub struct ExternalPoolsConfig {
     pub external_pool_usage_debug_max_body_bytes: u32,
     #[serde(default = "default_external_pool_usage_debug_max_files")]
     pub external_pool_usage_debug_max_files: u32,
+    /// 外部池 wire/交互诊断文件记录。默认关闭，用于临时排查 Claude Code CLI
+    /// 空回、流式终止、追问未进入上游请求、以及 downstream SSE 形状问题。
+    #[serde(default)]
+    pub external_pool_wire_debug_enabled: bool,
+    #[serde(default = "default_external_pool_wire_debug_dir")]
+    pub external_pool_wire_debug_dir: String,
+    #[serde(default = "default_external_pool_wire_debug_max_body_bytes")]
+    pub external_pool_wire_debug_max_body_bytes: u32,
+    #[serde(default = "default_external_pool_wire_debug_max_files")]
+    pub external_pool_wire_debug_max_files: u32,
 }
 
 impl Default for ExternalPoolsConfig {
@@ -3057,6 +3067,11 @@ impl Default for ExternalPoolsConfig {
             external_pool_usage_debug_max_body_bytes:
                 default_external_pool_usage_debug_max_body_bytes(),
             external_pool_usage_debug_max_files: default_external_pool_usage_debug_max_files(),
+            external_pool_wire_debug_enabled: false,
+            external_pool_wire_debug_dir: default_external_pool_wire_debug_dir(),
+            external_pool_wire_debug_max_body_bytes:
+                default_external_pool_wire_debug_max_body_bytes(),
+            external_pool_wire_debug_max_files: default_external_pool_wire_debug_max_files(),
         }
     }
 }
@@ -3927,7 +3942,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 8;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 9;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -4556,6 +4571,18 @@ fn default_external_pool_usage_debug_max_files() -> u32 {
     1_000
 }
 
+fn default_external_pool_wire_debug_dir() -> String {
+    "/tmp/kiro-rs/external-pool-wire-debug".to_string()
+}
+
+fn default_external_pool_wire_debug_max_body_bytes() -> u32 {
+    8 * 1024
+}
+
+fn default_external_pool_wire_debug_max_files() -> u32 {
+    1_000
+}
+
 fn default_postgres_max_connections() -> u32 {
     10
 }
@@ -5102,6 +5129,14 @@ impl Config {
             // v8 makes it a local-account safety circuit as well.
             self.external_pools.local_pool_circuit_enabled = true;
             self.runtime_config_migration_version = 8;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 9 {
+            // External pools should behave like the configured upstream service by default. The
+            // older default injected operator prompt steering into fallback pool requests, which
+            // changes prompt content, token accounting, and third-party protocol compliance tests.
+            self.prompt_steering.apply_to_external_pool = false;
+            self.runtime_config_migration_version = 9;
             changed = true;
         }
         changed
@@ -7240,6 +7275,40 @@ mod tests {
         config.postgres.compress_usage_rollups_on_start = true;
         assert!(!config.apply_runtime_config_migrations());
         assert!(config.postgres.compress_usage_rollups_on_start);
+    }
+
+    #[test]
+    fn runtime_config_migration_disables_legacy_external_pool_prompt_steering_once() {
+        let mut config = Config::default();
+        config.runtime_config_migration_version = 8;
+        config.prompt_steering.apply_to_external_pool = true;
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        assert!(!config.prompt_steering.apply_to_external_pool);
+
+        config.prompt_steering.apply_to_external_pool = true;
+        assert!(!config.apply_runtime_config_migrations());
+        assert!(config.prompt_steering.apply_to_external_pool);
+
+        let current: Config = serde_json::from_value(serde_json::json!({
+            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
+            "promptSteering": {
+                "applyToExternalPool": true
+            }
+        }))
+        .unwrap();
+        assert!(current.prompt_steering.apply_to_external_pool);
+
+        let current_without_field: Config = serde_json::from_value(serde_json::json!({
+            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
+            "promptSteering": {}
+        }))
+        .unwrap();
+        assert!(!current_without_field.prompt_steering.apply_to_external_pool);
     }
 
     #[test]

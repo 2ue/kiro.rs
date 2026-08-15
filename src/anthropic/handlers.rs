@@ -95,6 +95,7 @@ use super::websearch;
 use crate::external_pool::{
     ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager,
     ExternalPoolRequestBodyMode, ExternalRouteRequest, ExternalRouteRequestPreparationCache,
+    record_external_pool_wire_debug_handler_ingress,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
 use crate::kiro::call_trace::{
@@ -5996,6 +5997,14 @@ async fn post_messages_inner(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
+    record_external_pool_wire_debug_handler_ingress(
+        &runtime_config.external_pools,
+        &endpoint,
+        &effective_raw_body,
+        &raw_body,
+        &payload,
+        request_api_key_id.as_deref(),
+    );
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let mut external_fallback = build_external_fallback_context(
         &state,

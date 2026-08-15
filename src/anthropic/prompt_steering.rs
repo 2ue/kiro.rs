@@ -277,6 +277,34 @@ mod tests {
     }
 
     #[test]
+    fn external_pool_prompt_steering_is_opt_in() {
+        let config = PromptSteeringConfig::default();
+        assert!(!should_apply_to_external_pool(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+        ));
+
+        let mut enabled = config;
+        enabled.apply_to_external_pool = true;
+        assert!(should_apply_to_external_pool(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &enabled,
+        ));
+        assert!(!should_apply_to_external_pool(
+            "/v1/messages",
+            CompatProfile::ClaudeCode,
+            &enabled,
+        ));
+        assert!(!should_apply_to_external_pool(
+            "/cc/v1/messages",
+            CompatProfile::AnthropicStrict,
+            &enabled,
+        ));
+    }
+
+    #[test]
     fn strict_profile_never_gets_prompt_steering() {
         let mut req = request();
 

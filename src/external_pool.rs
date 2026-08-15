@@ -139,6 +139,16 @@ const EXTERNAL_POOL_USAGE_DEBUG_USAGE_SAMPLE_LIMIT: usize = 20;
 const EXTERNAL_POOL_USAGE_DEBUG_EVENT_SAMPLE_BYTES: usize = 2 * 1024;
 const EXTERNAL_POOL_USAGE_DEBUG_USAGE_JSON_BYTES: usize = 4 * 1024;
 static EXTERNAL_POOL_USAGE_DEBUG_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+const EXTERNAL_POOL_WIRE_DEBUG_DEFAULT_DIR: &str = "/tmp/kiro-rs/external-pool-wire-debug";
+const EXTERNAL_POOL_WIRE_DEBUG_DEFAULT_MAX_BODY_BYTES: usize = 8 * 1024;
+const EXTERNAL_POOL_WIRE_DEBUG_MAX_BODY_BYTES: usize = 1024 * 1024;
+const EXTERNAL_POOL_WIRE_DEBUG_DEFAULT_MAX_FILES: u64 = 1_000;
+const EXTERNAL_POOL_WIRE_DEBUG_TEXT_PREVIEW_CHARS: usize = 160;
+const EXTERNAL_POOL_WIRE_DEBUG_LAST_MESSAGE_LIMIT: usize = 8;
+const EXTERNAL_POOL_WIRE_DEBUG_TEXT_SAMPLE_LIMIT: usize = 4;
+const EXTERNAL_POOL_WIRE_DEBUG_USAGE_SAMPLE_LIMIT: usize = 20;
+const EXTERNAL_POOL_WIRE_DEBUG_EVENT_SAMPLE_BYTES: usize = 2 * 1024;
+static EXTERNAL_POOL_WIRE_DEBUG_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
 const EXTERNAL_POOL_STATIC_SNAPSHOT_FRESH_TTL: Duration = Duration::from_secs(5);
@@ -1511,6 +1521,7 @@ struct ExternalUsageCapture {
     raw_upstream_error: Option<RawUpstreamError>,
     stream_response_mode: Option<ExternalPoolStreamResponseMode>,
     debug_stream: ExternalUsageDebugStreamCapture,
+    wire_debug: ExternalWireDebugCapture,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1550,6 +1561,64 @@ struct ExternalUsageDebugUsageCandidate {
     normalized_anthropic_usage: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalWireDebugCapture {
+    raw_upstream_stream: ExternalWireDebugSseCapture,
+    processed_downstream_stream: ExternalWireDebugSseCapture,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalWireDebugSseCapture {
+    chunks_seen: u64,
+    empty_outputs_seen: u64,
+    events_seen: u64,
+    data_lines_seen: u64,
+    done_events_seen: u64,
+    json_parse_errors: u64,
+    usage_events_seen: u64,
+    bytes_seen: u64,
+    preview_base64: String,
+    preview_utf8: String,
+    preview_truncated: bool,
+    event_types: BTreeMap<String, u64>,
+    usage_paths: BTreeMap<String, u64>,
+    usage_event_samples: Vec<ExternalUsageDebugRawEventSample>,
+    semantic: ExternalWireDebugSseSemanticSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalWireDebugSseSemanticSummary {
+    message_start_events: u64,
+    message_delta_events: u64,
+    message_stop_events: u64,
+    content_block_start_events: u64,
+    content_block_delta_events: u64,
+    content_block_stop_events: u64,
+    text_block_start_events: u64,
+    text_block_start_chars: u64,
+    text_delta_events: u64,
+    text_delta_chars: u64,
+    thinking_block_start_events: u64,
+    thinking_block_start_chars: u64,
+    thinking_delta_events: u64,
+    thinking_delta_chars: u64,
+    redacted_thinking_block_start_events: u64,
+    redacted_thinking_block_start_chars: u64,
+    signature_delta_events: u64,
+    tool_use_block_start_events: u64,
+    server_tool_use_block_start_events: u64,
+    input_json_delta_events: u64,
+    input_json_delta_chars: u64,
+    error_events: u64,
+    ping_events: u64,
+    first_visible_text_event_index: Option<u64>,
+    first_semantic_output_event_index: Option<u64>,
+    last_stop_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExternalStreamProcessingPlan {
     response_mode: ExternalPoolStreamResponseMode,
@@ -1557,6 +1626,8 @@ struct ExternalStreamProcessingPlan {
     capture_usage: bool,
     usage_debug_enabled: bool,
     usage_debug_max_body_bytes: usize,
+    wire_debug_enabled: bool,
+    wire_debug_max_body_bytes: usize,
 }
 
 impl ExternalStreamProcessingPlan {
@@ -1568,6 +1639,8 @@ impl ExternalStreamProcessingPlan {
                 capture_usage: true,
                 usage_debug_enabled: false,
                 usage_debug_max_body_bytes: 0,
+                wire_debug_enabled: false,
+                wire_debug_max_body_bytes: 0,
             },
         }
     }
@@ -1577,6 +1650,10 @@ impl ExternalStreamProcessingPlan {
         if external_pool_usage_debug_enabled(config) {
             plan.usage_debug_enabled = true;
             plan.usage_debug_max_body_bytes = external_pool_usage_debug_max_body_bytes(config);
+        }
+        if external_pool_wire_debug_enabled(config) {
+            plan.wire_debug_enabled = true;
+            plan.wire_debug_max_body_bytes = external_pool_wire_debug_max_body_bytes(config);
         }
         plan
     }
@@ -1616,6 +1693,37 @@ fn external_pool_usage_debug_max_files(config: &ExternalPoolsConfig) -> u64 {
     let configured = config.external_pool_usage_debug_max_files as u64;
     if configured == 0 {
         EXTERNAL_POOL_USAGE_DEBUG_DEFAULT_MAX_FILES
+    } else {
+        configured
+    }
+}
+
+fn external_pool_wire_debug_enabled(config: &ExternalPoolsConfig) -> bool {
+    config.external_pool_wire_debug_enabled && config.external_pool_wire_debug_max_files > 0
+}
+
+fn external_pool_wire_debug_dir(config: &ExternalPoolsConfig) -> PathBuf {
+    let configured = config.external_pool_wire_debug_dir.trim();
+    if configured.is_empty() {
+        PathBuf::from(EXTERNAL_POOL_WIRE_DEBUG_DEFAULT_DIR)
+    } else {
+        PathBuf::from(configured)
+    }
+}
+
+fn external_pool_wire_debug_max_body_bytes(config: &ExternalPoolsConfig) -> usize {
+    let configured = config.external_pool_wire_debug_max_body_bytes as usize;
+    if configured == 0 {
+        EXTERNAL_POOL_WIRE_DEBUG_DEFAULT_MAX_BODY_BYTES
+    } else {
+        configured.min(EXTERNAL_POOL_WIRE_DEBUG_MAX_BODY_BYTES)
+    }
+}
+
+fn external_pool_wire_debug_max_files(config: &ExternalPoolsConfig) -> u64 {
+    let configured = config.external_pool_wire_debug_max_files as u64;
+    if configured == 0 {
+        EXTERNAL_POOL_WIRE_DEBUG_DEFAULT_MAX_FILES
     } else {
         configured
     }
@@ -1662,6 +1770,61 @@ fn spawn_external_pool_usage_debug_write(
                 path = %path.display(),
                 error = %err,
                 "external pool usage debug write failed"
+            );
+        }
+    });
+}
+
+fn spawn_external_pool_wire_debug_write(
+    config: &ExternalPoolsConfig,
+    route: &ExternalRouteRequest,
+    stage: &'static str,
+    payload: serde_json::Value,
+) {
+    spawn_external_pool_wire_debug_write_with_id(config, &route.request_id, stage, payload);
+}
+
+fn spawn_external_pool_wire_debug_write_with_id(
+    config: &ExternalPoolsConfig,
+    request_id: &str,
+    stage: &'static str,
+    payload: serde_json::Value,
+) {
+    if !external_pool_wire_debug_enabled(config) {
+        return;
+    }
+    let max_files = external_pool_wire_debug_max_files(config);
+    let sequence = EXTERNAL_POOL_WIRE_DEBUG_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if sequence >= max_files {
+        if sequence == max_files {
+            tracing::warn!(
+                request_id = %request_id,
+                max_files,
+                "external pool wire debug file limit reached"
+            );
+        }
+        return;
+    }
+    let dir = external_pool_wire_debug_dir(config);
+    let request_id_part = sanitize_usage_debug_filename_part(request_id);
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let file_name = format!("{timestamp}-{request_id_part}-{sequence:06}-{stage}.json");
+    let path = dir.join(file_name);
+    let request_id_for_log = request_id.to_string();
+    tokio::spawn(async move {
+        let result = async {
+            tokio::fs::create_dir_all(&dir).await?;
+            let body = serde_json::to_vec_pretty(&payload)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            tokio::fs::write(&path, body).await
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                request_id = %request_id_for_log,
+                path = %path.display(),
+                error = %err,
+                "external pool wire debug write failed"
             );
         }
     });
@@ -1776,6 +1939,369 @@ fn external_pool_usage_debug_header_context(headers: &HeaderMap) -> serde_json::
     })
 }
 
+fn external_pool_wire_debug_route_context(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    config: &ExternalPoolsConfig,
+    outbound_model: Option<&str>,
+) -> serde_json::Value {
+    let effective_stream_response_mode = effective_external_pool_stream_response_mode(pool, config);
+    let stream_response_mode_source = if pool.stream_response_mode.is_some() {
+        "pool"
+    } else {
+        "global"
+    };
+    json!({
+        "requestId": route.request_id.as_str(),
+        "errorId": route.error_id.as_str(),
+        "createdAt": Utc::now().to_rfc3339(),
+        "endpoint": route.endpoint.as_str(),
+        "stream": route.is_stream(),
+        "requestedModel": route.requested_model(),
+        "requestedMaxTokens": route.requested_max_tokens(),
+        "upstreamModel": route.upstream_model.as_deref(),
+        "externalOutboundModel": outbound_model,
+        "conversationId": route.stable_conversation_id(),
+        "requestApiKeyId": route.request_api_key_id.as_deref(),
+        "routeSubtype": route.route_subtype,
+        "fallbackReason": route.fallback_reason.as_deref(),
+        "directPolicyReason": route.direct_policy_reason.as_deref(),
+        "localAttempted": route.local_attempted,
+        "requestInputTokens": route.request_input_tokens,
+        "pool": {
+            "id": pool.id,
+            "name": pool.name.as_str(),
+            "usageProjectionMode": pool.usage_projection_mode.as_str(),
+            "requestBodyMode": pool.request_body_mode.as_str(),
+            "rawModelMode": pool.raw_model_mode.as_str(),
+            "streamResponseMode": effective_stream_response_mode.as_str(),
+            "streamResponseModeSource": stream_response_mode_source,
+            "preOutputStreamRetryMode": pool.pre_output_stream_retry_mode.as_str(),
+            "effectivePreOutputStreamRetryEnabled": effective_external_pool_pre_output_stream_retry_enabled(pool, config),
+            "preservePath": pool.preserve_path,
+            "normalizeModelVersionDots": pool.normalize_model_version_dots,
+            "modelMappingMode": pool.model_mapping_mode.as_str(),
+            "modelMappingRequireMatch": pool.model_mapping_require_match,
+        },
+    })
+}
+
+fn external_pool_wire_debug_request_snapshots(
+    route: &ExternalRouteRequest,
+    max_bytes: usize,
+) -> serde_json::Value {
+    json!({
+        "effectiveRawBody": {
+            "body": external_pool_wire_debug_bytes(&route.effective_raw_body, max_bytes),
+            "summary": external_pool_wire_debug_request_summary(&route.effective_raw_body),
+        },
+        "workingRawBody": {
+            "body": external_pool_wire_debug_bytes(&route.raw_body, max_bytes),
+            "summary": external_pool_wire_debug_request_summary(&route.raw_body),
+            "differsFromEffectiveRawBody": route.raw_body.as_ref() != route.effective_raw_body.as_ref(),
+        },
+    })
+}
+
+fn external_pool_wire_debug_bytes(value: &[u8], max_bytes: usize) -> serde_json::Value {
+    let capped = value.len().min(max_bytes);
+    let preview = &value[..capped];
+    let mut hasher = Sha256::new();
+    hasher.update(value);
+    json!({
+        "bytes": value.len(),
+        "sha256": hex::encode(hasher.finalize()),
+        "previewBytes": capped,
+        "previewTruncated": value.len() > capped,
+        "previewUtf8": String::from_utf8_lossy(preview),
+        "previewBase64": BASE64_STANDARD.encode(preview),
+    })
+}
+
+fn external_pool_wire_debug_request_summary(body: &[u8]) -> serde_json::Value {
+    let mut body_hasher = Sha256::new();
+    body_hasher.update(body);
+    let body_sha256 = hex::encode(body_hasher.finalize());
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return json!({
+            "parseOk": false,
+            "bodyBytes": body.len(),
+            "bodySha256": body_sha256,
+        });
+    };
+
+    let messages = value
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let system_items = match value.get("system") {
+        Some(serde_json::Value::Array(items)) => items.len(),
+        Some(_) => 1,
+        None => 0,
+    };
+    let tool_count = value
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let user_message_count = external_pool_wire_debug_message_role_count(messages, "user");
+    let assistant_message_count =
+        external_pool_wire_debug_message_role_count(messages, "assistant");
+    let last_messages_start = messages
+        .len()
+        .saturating_sub(EXTERNAL_POOL_WIRE_DEBUG_LAST_MESSAGE_LIMIT);
+    let last_messages = messages[last_messages_start..]
+        .iter()
+        .enumerate()
+        .map(|(offset, message)| {
+            let index = last_messages_start + offset;
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            json!({
+                "index": index,
+                "role": role,
+                "content": external_pool_wire_debug_content_summary(message.get("content")),
+            })
+        })
+        .collect::<Vec<_>>();
+    let last_user_content = messages.iter().rev().find_map(|message| {
+        (message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+            .then(|| external_pool_wire_debug_content_summary(message.get("content")))
+    });
+
+    json!({
+        "parseOk": true,
+        "bodyBytes": body.len(),
+        "bodySha256": body_sha256,
+        "model": value.get("model").and_then(serde_json::Value::as_str),
+        "stream": value.get("stream").and_then(serde_json::Value::as_bool),
+        "maxTokens": value.get("max_tokens").and_then(serde_json::Value::as_i64),
+        "systemItems": system_items,
+        "toolCount": tool_count,
+        "messageCount": messages.len(),
+        "userMessageCount": user_message_count,
+        "assistantMessageCount": assistant_message_count,
+        "lastUserContent": last_user_content,
+        "lastMessages": last_messages,
+    })
+}
+
+fn external_pool_wire_debug_message_role_count(
+    messages: &[serde_json::Value],
+    role: &str,
+) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|candidate| candidate == role)
+        })
+        .count()
+}
+
+fn external_pool_wire_debug_response_summary(body: &[u8]) -> serde_json::Value {
+    let mut body_hasher = Sha256::new();
+    body_hasher.update(body);
+    let body_sha256 = hex::encode(body_hasher.finalize());
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return json!({
+            "parseOk": false,
+            "bodyBytes": body.len(),
+            "bodySha256": body_sha256,
+        });
+    };
+    let content = value
+        .get("content")
+        .or_else(|| value.pointer("/message/content"));
+    json!({
+        "parseOk": true,
+        "bodyBytes": body.len(),
+        "bodySha256": body_sha256,
+        "type": value.get("type").and_then(serde_json::Value::as_str),
+        "id": value.get("id").and_then(serde_json::Value::as_str),
+        "model": value.get("model").and_then(serde_json::Value::as_str),
+        "stopReason": external_stop_reason_from_value(&value),
+        "content": external_pool_wire_debug_content_summary(content),
+        "usageCandidates": collect_external_pool_usage_debug_candidates(&value),
+    })
+}
+
+fn external_pool_wire_debug_content_summary(
+    content: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(content) = content else {
+        return json!({ "kind": "missing" });
+    };
+    match content {
+        serde_json::Value::String(text) => {
+            json!({
+                "kind": "string",
+                "text": external_pool_wire_debug_text_summary(text),
+            })
+        }
+        serde_json::Value::Array(items) => {
+            let mut item_types: BTreeMap<String, u64> = BTreeMap::new();
+            let mut text_part_count = 0u64;
+            let mut text_chars = 0u64;
+            let mut text_bytes = 0u64;
+            let mut text_hasher = Sha256::new();
+            let mut text_samples = Vec::new();
+            let mut thinking_part_count = 0u64;
+            let mut thinking_chars = 0u64;
+            let mut tool_result_count = 0u64;
+            let mut tool_use_count = 0u64;
+            let mut server_tool_use_count = 0u64;
+            for item in items {
+                let item_type = item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                *item_types.entry(item_type.to_string()).or_default() += 1;
+                match item_type {
+                    "text" => {
+                        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                            let chars = text.chars().count() as u64;
+                            text_part_count = text_part_count.saturating_add(1);
+                            text_chars = text_chars.saturating_add(chars);
+                            text_bytes = text_bytes.saturating_add(text.len() as u64);
+                            text_hasher.update(text.as_bytes());
+                            if text_samples.len() < EXTERNAL_POOL_WIRE_DEBUG_TEXT_SAMPLE_LIMIT {
+                                text_samples.push(external_pool_wire_debug_text_summary(text));
+                            }
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(thinking) =
+                            item.get("thinking").and_then(serde_json::Value::as_str)
+                        {
+                            thinking_part_count = thinking_part_count.saturating_add(1);
+                            thinking_chars =
+                                thinking_chars.saturating_add(thinking.chars().count() as u64);
+                        }
+                    }
+                    "tool_result" => {
+                        tool_result_count = tool_result_count.saturating_add(1);
+                    }
+                    "tool_use" => {
+                        tool_use_count = tool_use_count.saturating_add(1);
+                    }
+                    "server_tool_use" => {
+                        server_tool_use_count = server_tool_use_count.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            let text_sha256 = if text_part_count > 0 {
+                Some(hex::encode(text_hasher.finalize()))
+            } else {
+                None
+            };
+            json!({
+                "kind": "array",
+                "items": items.len(),
+                "itemTypes": item_types,
+                "textPartCount": text_part_count,
+                "textChars": text_chars,
+                "textBytes": text_bytes,
+                "textSha256": text_sha256,
+                "textSamples": text_samples,
+                "thinkingPartCount": thinking_part_count,
+                "thinkingChars": thinking_chars,
+                "toolUseCount": tool_use_count,
+                "serverToolUseCount": server_tool_use_count,
+                "toolResultCount": tool_result_count,
+            })
+        }
+        other => json!({
+            "kind": match other {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Object(_) => "object",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::String(_) => "string",
+            },
+        }),
+    }
+}
+
+fn external_pool_wire_debug_text_summary(text: &str) -> serde_json::Value {
+    let chars = text.chars().count();
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let preview = text
+        .chars()
+        .take(EXTERNAL_POOL_WIRE_DEBUG_TEXT_PREVIEW_CHARS)
+        .collect::<String>();
+    json!({
+        "chars": chars,
+        "bytes": text.len(),
+        "sha256": hex::encode(hasher.finalize()),
+        "preview": preview,
+        "previewTruncated": chars > EXTERNAL_POOL_WIRE_DEBUG_TEXT_PREVIEW_CHARS,
+    })
+}
+
+pub(crate) fn record_external_pool_wire_debug_handler_ingress(
+    config: &ExternalPoolsConfig,
+    endpoint: &str,
+    effective_raw_body: &Bytes,
+    raw_body: &Bytes,
+    payload: &MessagesRequest,
+    request_api_key_id: Option<&str>,
+) {
+    if !external_pool_wire_debug_enabled(config) {
+        return;
+    }
+    let max_bytes = external_pool_wire_debug_max_body_bytes(config);
+    let ingress_request_id = crate::anthropic::envelope::request_id();
+    let typed_payload_body = serde_json::to_vec(payload).ok().map(Bytes::from);
+    let payload_summary = typed_payload_body
+        .as_ref()
+        .map(|body| external_pool_wire_debug_request_summary(body))
+        .unwrap_or_else(|| {
+            json!({
+                "parseOk": false,
+                "serializeError": true,
+            })
+        });
+    let payload = json!({
+        "kind": "external_pool_wire_debug",
+        "stage": "handler_ingress",
+        "ingress": {
+            "ingressRequestId": ingress_request_id.as_str(),
+            "createdAt": Utc::now().to_rfc3339(),
+            "endpoint": endpoint,
+            "requestApiKeyId": request_api_key_id,
+            "externalPoolsEnabled": config.external_pools_enabled,
+            "routeAllowed": config.external_pool_route_allowed(endpoint),
+        },
+        "request": {
+            "effectiveRawBody": {
+                "body": external_pool_wire_debug_bytes(effective_raw_body, max_bytes),
+                "summary": external_pool_wire_debug_request_summary(effective_raw_body),
+            },
+            "workingRawBody": {
+                "body": external_pool_wire_debug_bytes(raw_body, max_bytes),
+                "summary": external_pool_wire_debug_request_summary(raw_body),
+                "differsFromEffectiveRawBody": raw_body.as_ref() != effective_raw_body.as_ref(),
+            },
+            "typedPayloadSummary": payload_summary,
+        },
+    });
+    spawn_external_pool_wire_debug_write_with_id(
+        config,
+        &ingress_request_id,
+        "handler-ingress",
+        payload,
+    );
+}
+
 struct ExternalUsageDebugNonStreamRecordContext<'a> {
     config: &'a ExternalPoolsConfig,
     route: &'a ExternalRouteRequest,
@@ -1829,6 +2355,61 @@ fn external_pool_usage_debug_non_stream_record(ctx: ExternalUsageDebugNonStreamR
         },
     });
     spawn_external_pool_usage_debug_write(config, route, "non-stream", payload);
+}
+
+fn external_pool_wire_debug_non_stream_record(ctx: ExternalUsageDebugNonStreamRecordContext<'_>) {
+    let ExternalUsageDebugNonStreamRecordContext {
+        config,
+        route,
+        pool,
+        outbound_model,
+        status,
+        response_headers,
+        outbound_body,
+        upstream_body,
+        projected,
+    } = ctx;
+    if !external_pool_wire_debug_enabled(config) {
+        return;
+    }
+    let max_bytes = external_pool_wire_debug_max_body_bytes(config);
+    let upstream_json = serde_json::from_slice::<serde_json::Value>(upstream_body).ok();
+    let downstream_json = serde_json::from_slice::<serde_json::Value>(&projected.body).ok();
+    let payload = json!({
+        "kind": "external_pool_wire_debug",
+        "stage": "non_stream_final",
+        "route": external_pool_wire_debug_route_context(route, pool, config, outbound_model),
+        "inboundRequest": external_pool_wire_debug_request_snapshots(route, max_bytes),
+        "outboundRequest": {
+            "body": external_pool_wire_debug_bytes(outbound_body, max_bytes),
+            "summary": external_pool_wire_debug_request_summary(outbound_body),
+            "differsFromEffectiveRawBody": outbound_body.as_ref() != route.effective_raw_body.as_ref(),
+        },
+        "upstream": {
+            "status": status.as_u16(),
+            "headers": external_pool_usage_debug_header_context(response_headers),
+            "body": external_pool_wire_debug_bytes(upstream_body, max_bytes),
+            "summary": external_pool_wire_debug_response_summary(upstream_body),
+            "usageCandidates": upstream_json
+                .as_ref()
+                .map(collect_external_pool_usage_debug_candidates)
+                .unwrap_or_default(),
+        },
+        "processing": {
+            "usageCapture": external_pool_usage_debug_capture(&projected.usage_capture),
+            "protocolContamination": projected.protocol_contamination,
+            "downstreamBodyChanged": projected.body.as_ref() != upstream_body.as_ref(),
+        },
+        "downstream": {
+            "body": external_pool_wire_debug_bytes(&projected.body, max_bytes),
+            "summary": external_pool_wire_debug_response_summary(&projected.body),
+            "usageCandidates": downstream_json
+                .as_ref()
+                .map(collect_external_pool_usage_debug_candidates)
+                .unwrap_or_default(),
+        },
+    });
+    spawn_external_pool_wire_debug_write(config, route, "non-stream", payload);
 }
 
 struct ExternalUsageDebugStreamRecordContext<'a> {
@@ -1904,6 +2485,74 @@ fn external_pool_usage_debug_stream_record(ctx: ExternalUsageDebugStreamRecordCo
         },
     });
     spawn_external_pool_usage_debug_write(config, route, "stream", payload);
+}
+
+fn external_pool_wire_debug_stream_record(ctx: ExternalUsageDebugStreamRecordContext<'_>) {
+    let ExternalUsageDebugStreamRecordContext {
+        config,
+        route,
+        pool,
+        outbound_model,
+        status,
+        response_status,
+        response_content_type,
+        outbound_body,
+        capture,
+        billing,
+        estimated_output_tokens,
+        terminal_message,
+    } = ctx;
+    if !external_pool_wire_debug_enabled(config) {
+        return;
+    }
+    let max_bytes = external_pool_wire_debug_max_body_bytes(config);
+    let capture_snapshot = capture.map(|capture| capture.lock().clone());
+    let payload = json!({
+        "kind": "external_pool_wire_debug",
+        "stage": "stream_final",
+        "route": external_pool_wire_debug_route_context(route, pool, config, outbound_model),
+        "inboundRequest": external_pool_wire_debug_request_snapshots(route, max_bytes),
+        "outboundRequest": {
+            "body": external_pool_wire_debug_bytes(outbound_body, max_bytes),
+            "summary": external_pool_wire_debug_request_summary(outbound_body),
+            "differsFromEffectiveRawBody": outbound_body.as_ref() != route.effective_raw_body.as_ref(),
+        },
+        "upstream": {
+            "status": response_status.as_u16(),
+            "headers": {
+                "contentType": response_content_type.unwrap_or_default(),
+            },
+            "rawStream": capture_snapshot
+                .as_ref()
+                .map(|capture| &capture.wire_debug.raw_upstream_stream),
+        },
+        "processing": {
+            "terminalStatus": status,
+            "terminalMessage": terminal_message,
+            "estimatedOutputTokensFromForwardedStream": estimated_output_tokens,
+            "usageCapture": capture_snapshot
+                .as_ref()
+                .map(external_pool_usage_debug_capture),
+            "billing": billing.map(|billing| {
+                json!({
+                    "rawUsage": billing.raw_usage,
+                    "shapedUsage": billing.shaped_usage,
+                    "reportedUsage": billing.reported_usage,
+                    "usageEstimated": billing.usage_estimated,
+                    "usageEstimateReason": billing.usage_estimate_reason.as_deref(),
+                    "usageCandidatePath": billing.usage_candidate_path.as_deref(),
+                    "usageProjectionApplied": billing.usage_projection_applied,
+                    "bodyUsageProjectionApplied": billing.body_usage_projection_applied,
+                })
+            }),
+        },
+        "downstream": {
+            "processedStream": capture_snapshot
+                .as_ref()
+                .map(|capture| &capture.wire_debug.processed_downstream_stream),
+        },
+    });
+    spawn_external_pool_wire_debug_write(config, route, "stream", payload);
 }
 
 fn collect_external_pool_usage_debug_candidates(
@@ -6351,10 +7000,17 @@ impl ExternalPoolManager {
                                             };
                                             {
                                                 let mut transcript_state = transcript_state.lock();
-                                                tail.extend(finish_external_transcript_state(
+                                                let finished_tail = finish_external_transcript_state(
                                                     &mut transcript_state,
                                                     Some(&usage_capture),
-                                                ));
+                                                );
+                                                record_external_wire_debug_sse_bytes(
+                                                    &finished_tail,
+                                                    Some(&usage_capture),
+                                                    stream_plan,
+                                                    ExternalWireDebugStreamSide::ProcessedDownstream,
+                                                );
+                                                tail.extend(finished_tail);
                                             }
                                             drop(lease);
                                             if tail.is_empty() {
@@ -6530,6 +7186,17 @@ impl ExternalPoolManager {
                 known_tool_names.iter().cloned(),
             );
             external_pool_usage_debug_non_stream_record(ExternalUsageDebugNonStreamRecordContext {
+                config,
+                route,
+                pool,
+                outbound_model: outbound_model.as_deref(),
+                status,
+                response_headers: &response_headers,
+                outbound_body: &outbound_body,
+                upstream_body: &upstream_body,
+                projected: &projected,
+            });
+            external_pool_wire_debug_non_stream_record(ExternalUsageDebugNonStreamRecordContext {
                 config,
                 route,
                 pool,
@@ -8616,6 +9283,20 @@ impl ExternalStreamUsageGuard {
                 estimated_output_tokens: self.estimated_output_tokens,
                 terminal_message: Some(&message),
             });
+            external_pool_wire_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+                config: &self.config,
+                route: &self.route,
+                pool: &self.pool,
+                outbound_model: self.outbound_model.as_deref(),
+                status: UsageRecordStatus::StreamError,
+                response_status: self.response_status,
+                response_content_type: self.response_content_type.as_deref(),
+                outbound_body: &self.outbound_body,
+                capture: self.usage_capture.as_ref(),
+                billing: None,
+                estimated_output_tokens: self.estimated_output_tokens,
+                terminal_message: Some(&message),
+            });
             self.manager.record_external(
                 &self.route,
                 Some(&self.pool),
@@ -8682,6 +9363,20 @@ impl ExternalStreamUsageGuard {
             estimated_output_tokens: self.estimated_output_tokens,
             terminal_message: None,
         });
+        external_pool_wire_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+            config: &self.config,
+            route: &self.route,
+            pool: &self.pool,
+            outbound_model: self.outbound_model.as_deref(),
+            status: UsageRecordStatus::Success,
+            response_status: self.response_status,
+            response_content_type: self.response_content_type.as_deref(),
+            outbound_body: &self.outbound_body,
+            capture: self.usage_capture.as_ref(),
+            billing: billing.as_ref(),
+            estimated_output_tokens: self.estimated_output_tokens,
+            terminal_message: None,
+        });
         self.manager.record_external_success(
             &self.route,
             &self.pool,
@@ -8697,6 +9392,20 @@ impl ExternalStreamUsageGuard {
             return;
         }
         external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+            config: &self.config,
+            route: &self.route,
+            pool: &self.pool,
+            outbound_model: self.outbound_model.as_deref(),
+            status: UsageRecordStatus::StreamError,
+            response_status: self.response_status,
+            response_content_type: self.response_content_type.as_deref(),
+            outbound_body: &self.outbound_body,
+            capture: self.usage_capture.as_ref(),
+            billing: None,
+            estimated_output_tokens: self.estimated_output_tokens,
+            terminal_message: Some(message),
+        });
+        external_pool_wire_debug_stream_record(ExternalUsageDebugStreamRecordContext {
             config: &self.config,
             route: &self.route,
             pool: &self.pool,
@@ -8741,6 +9450,20 @@ impl ExternalStreamUsageGuard {
         }
         let message = "external stream body dropped before completion";
         external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
+            config: &self.config,
+            route: &self.route,
+            pool: &self.pool,
+            outbound_model: self.outbound_model.as_deref(),
+            status: UsageRecordStatus::ClientDropped,
+            response_status: self.response_status,
+            response_content_type: self.response_content_type.as_deref(),
+            outbound_body: &self.outbound_body,
+            capture: self.usage_capture.as_ref(),
+            billing: None,
+            estimated_output_tokens: self.estimated_output_tokens,
+            terminal_message: Some(message),
+        });
+        external_pool_wire_debug_stream_record(ExternalUsageDebugStreamRecordContext {
             config: &self.config,
             route: &self.route,
             pool: &self.pool,
@@ -11352,6 +12075,343 @@ fn record_external_usage_debug_sse_event(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ExternalWireDebugStreamSide {
+    RawUpstream,
+    ProcessedDownstream,
+}
+
+impl ExternalWireDebugSseCapture {
+    fn append_preview(&mut self, bytes: &[u8], max_preview: usize) {
+        self.bytes_seen = self.bytes_seen.saturating_add(bytes.len() as u64);
+        if max_preview == 0 {
+            return;
+        }
+        let existing = BASE64_STANDARD
+            .decode(self.preview_base64.as_bytes())
+            .unwrap_or_default();
+        if existing.len() >= max_preview {
+            self.preview_truncated = true;
+            return;
+        }
+        let remaining = max_preview - existing.len();
+        let append = &bytes[..bytes.len().min(remaining)];
+        let mut combined = existing;
+        combined.extend_from_slice(append);
+        self.preview_base64 = BASE64_STANDARD.encode(&combined);
+        self.preview_utf8 = String::from_utf8_lossy(&combined).to_string();
+        if append.len() < bytes.len() || self.bytes_seen as usize > max_preview {
+            self.preview_truncated = true;
+        }
+    }
+}
+
+fn record_external_wire_debug_sse_bytes(
+    bytes: &[u8],
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    plan: ExternalStreamProcessingPlan,
+    side: ExternalWireDebugStreamSide,
+) {
+    if !plan.wire_debug_enabled {
+        return;
+    }
+    let Some(capture) = capture else {
+        return;
+    };
+    let mut capture = capture.lock();
+    let target = match side {
+        ExternalWireDebugStreamSide::RawUpstream => &mut capture.wire_debug.raw_upstream_stream,
+        ExternalWireDebugStreamSide::ProcessedDownstream => {
+            &mut capture.wire_debug.processed_downstream_stream
+        }
+    };
+    if matches!(side, ExternalWireDebugStreamSide::ProcessedDownstream) {
+        target.chunks_seen = target.chunks_seen.saturating_add(1);
+        if bytes.is_empty() {
+            target.empty_outputs_seen = target.empty_outputs_seen.saturating_add(1);
+            return;
+        }
+    }
+    target.append_preview(bytes, plan.wire_debug_max_body_bytes);
+    let mut offset = 0usize;
+    while let Some((idx, delimiter_len)) = find_sse_event_delimiter(&bytes[offset..]) {
+        let event_end = offset + idx + delimiter_len;
+        external_pool_wire_debug_observe_sse_event(&bytes[offset..event_end], target);
+        offset = event_end;
+    }
+    if offset < bytes.len() {
+        target.json_parse_errors = target.json_parse_errors.saturating_add(1);
+    }
+}
+
+fn external_pool_wire_debug_observe_sse_event(
+    event: &[u8],
+    target: &mut ExternalWireDebugSseCapture,
+) {
+    let event_index = target.events_seen.saturating_add(1);
+    target.events_seen = target.events_seen.saturating_add(1);
+    let text = String::from_utf8_lossy(event);
+    let mut event_name: Option<String> = None;
+    let mut payload_type: Option<String> = None;
+    let mut usage_candidates = Vec::new();
+    let mut saw_usage = false;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed_line_end = line.trim_end_matches(['\r', '\n']);
+        if let Some(value) = trimmed_line_end.strip_prefix("event:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                event_name = Some(value.to_string());
+            }
+            continue;
+        }
+        let Some(data) = trimmed_line_end.strip_prefix("data:") else {
+            continue;
+        };
+        target.data_lines_seen = target.data_lines_seen.saturating_add(1);
+        let data_json = data.trim();
+        if data_json.is_empty() {
+            continue;
+        }
+        if data_json == "[DONE]" {
+            target.done_events_seen = target.done_events_seen.saturating_add(1);
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(data_json) {
+            Ok(value) => {
+                payload_type = payload_type.or_else(|| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+                external_pool_wire_debug_record_sse_semantic(
+                    &mut target.semantic,
+                    event_index,
+                    &value,
+                );
+                let candidates = collect_external_pool_usage_debug_candidates(&value);
+                if !candidates.is_empty() {
+                    saw_usage = true;
+                    usage_candidates.extend(candidates);
+                    if usage_candidates.len() > EXTERNAL_POOL_WIRE_DEBUG_USAGE_SAMPLE_LIMIT {
+                        usage_candidates.truncate(EXTERNAL_POOL_WIRE_DEBUG_USAGE_SAMPLE_LIMIT);
+                    }
+                }
+            }
+            Err(_) => {
+                target.json_parse_errors = target.json_parse_errors.saturating_add(1);
+            }
+        }
+    }
+
+    if let Some(event_name) = event_name.as_deref().or(payload_type.as_deref()) {
+        *target
+            .event_types
+            .entry(event_name.to_string())
+            .or_default() += 1;
+    }
+    if saw_usage {
+        target.usage_events_seen = target.usage_events_seen.saturating_add(1);
+        for candidate in &usage_candidates {
+            *target
+                .usage_paths
+                .entry(candidate.path.clone())
+                .or_default() += 1;
+        }
+        if target.usage_event_samples.len() < EXTERNAL_POOL_WIRE_DEBUG_USAGE_SAMPLE_LIMIT {
+            let raw_event_cap = event.len().min(EXTERNAL_POOL_WIRE_DEBUG_EVENT_SAMPLE_BYTES);
+            let raw_event_preview = &event[..raw_event_cap];
+            target
+                .usage_event_samples
+                .push(ExternalUsageDebugRawEventSample {
+                    event: event_name,
+                    payload_type,
+                    raw_event_utf8: String::from_utf8_lossy(raw_event_preview).to_string(),
+                    raw_event_base64: BASE64_STANDARD.encode(raw_event_preview),
+                    raw_event_truncated: event.len() > raw_event_cap,
+                    usage_candidates,
+                });
+        }
+    }
+}
+
+fn external_pool_wire_debug_record_sse_semantic(
+    summary: &mut ExternalWireDebugSseSemanticSummary,
+    event_index: u64,
+    value: &serde_json::Value,
+) {
+    if let Some(stop_reason) = external_stop_reason_from_value(value) {
+        summary.last_stop_reason = Some(stop_reason);
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("message_start") => {
+            summary.message_start_events = summary.message_start_events.saturating_add(1);
+        }
+        Some("message_delta") => {
+            summary.message_delta_events = summary.message_delta_events.saturating_add(1);
+        }
+        Some("message_stop") => {
+            summary.message_stop_events = summary.message_stop_events.saturating_add(1);
+        }
+        Some("content_block_start") => {
+            summary.content_block_start_events =
+                summary.content_block_start_events.saturating_add(1);
+            let block = value.get("content_block");
+            match block
+                .and_then(|block| block.get("type"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("text") => {
+                    summary.text_block_start_events =
+                        summary.text_block_start_events.saturating_add(1);
+                    if let Some(text) = block
+                        .and_then(|block| block.get("text"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let chars = text.chars().count() as u64;
+                        summary.text_block_start_chars =
+                            summary.text_block_start_chars.saturating_add(chars);
+                        if chars > 0 {
+                            external_pool_wire_debug_mark_visible_text(summary, event_index);
+                            external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                        }
+                    }
+                }
+                Some("thinking") => {
+                    summary.thinking_block_start_events =
+                        summary.thinking_block_start_events.saturating_add(1);
+                    if let Some(thinking) = block
+                        .and_then(|block| block.get("thinking"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let chars = thinking.chars().count() as u64;
+                        summary.thinking_block_start_chars =
+                            summary.thinking_block_start_chars.saturating_add(chars);
+                        if chars > 0 {
+                            external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                        }
+                    }
+                }
+                Some("redacted_thinking") => {
+                    summary.redacted_thinking_block_start_events = summary
+                        .redacted_thinking_block_start_events
+                        .saturating_add(1);
+                    if let Some(data) = block
+                        .and_then(|block| block.get("data"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let chars = data.chars().count() as u64;
+                        summary.redacted_thinking_block_start_chars = summary
+                            .redacted_thinking_block_start_chars
+                            .saturating_add(chars);
+                        if chars > 0 {
+                            external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                        }
+                    }
+                }
+                Some("tool_use") => {
+                    summary.tool_use_block_start_events =
+                        summary.tool_use_block_start_events.saturating_add(1);
+                    external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                }
+                Some("server_tool_use") => {
+                    summary.server_tool_use_block_start_events =
+                        summary.server_tool_use_block_start_events.saturating_add(1);
+                    external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                }
+                _ => {}
+            }
+        }
+        Some("content_block_delta") => {
+            summary.content_block_delta_events =
+                summary.content_block_delta_events.saturating_add(1);
+            match value
+                .get("delta")
+                .and_then(|delta| delta.get("type"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("text_delta") => {
+                    summary.text_delta_events = summary.text_delta_events.saturating_add(1);
+                    if let Some(text) = value
+                        .pointer("/delta/text")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let chars = text.chars().count() as u64;
+                        summary.text_delta_chars = summary.text_delta_chars.saturating_add(chars);
+                        if chars > 0 {
+                            external_pool_wire_debug_mark_visible_text(summary, event_index);
+                            external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                        }
+                    }
+                }
+                Some("thinking_delta") => {
+                    summary.thinking_delta_events = summary.thinking_delta_events.saturating_add(1);
+                    if let Some(thinking) = value
+                        .pointer("/delta/thinking")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let chars = thinking.chars().count() as u64;
+                        summary.thinking_delta_chars =
+                            summary.thinking_delta_chars.saturating_add(chars);
+                        if chars > 0 {
+                            external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                        }
+                    }
+                }
+                Some("signature_delta") => {
+                    summary.signature_delta_events =
+                        summary.signature_delta_events.saturating_add(1);
+                }
+                Some("input_json_delta") => {
+                    summary.input_json_delta_events =
+                        summary.input_json_delta_events.saturating_add(1);
+                    if let Some(partial_json) = value
+                        .pointer("/delta/partial_json")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let chars = partial_json.chars().count() as u64;
+                        summary.input_json_delta_chars =
+                            summary.input_json_delta_chars.saturating_add(chars);
+                        if chars > 0 {
+                            external_pool_wire_debug_mark_semantic_output(summary, event_index);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some("content_block_stop") => {
+            summary.content_block_stop_events = summary.content_block_stop_events.saturating_add(1);
+        }
+        Some("error") => {
+            summary.error_events = summary.error_events.saturating_add(1);
+        }
+        Some("ping") => {
+            summary.ping_events = summary.ping_events.saturating_add(1);
+        }
+        _ => {}
+    }
+}
+
+fn external_pool_wire_debug_mark_visible_text(
+    summary: &mut ExternalWireDebugSseSemanticSummary,
+    event_index: u64,
+) {
+    if summary.first_visible_text_event_index.is_none() {
+        summary.first_visible_text_event_index = Some(event_index);
+    }
+}
+
+fn external_pool_wire_debug_mark_semantic_output(
+    summary: &mut ExternalWireDebugSseSemanticSummary,
+    event_index: u64,
+) {
+    if summary.first_semantic_output_event_index.is_none() {
+        summary.first_semantic_output_event_index = Some(event_index);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SseUsageProcessingResult {
     changed: bool,
@@ -11984,28 +13044,41 @@ fn process_sse_event_with_plan_and_transcript(
     transcript_state: Option<&mut ExternalAnthropicTranscriptState>,
 ) -> Vec<u8> {
     record_external_usage_debug_sse_event(event, capture, plan);
+    record_external_wire_debug_sse_bytes(
+        event,
+        capture,
+        plan,
+        ExternalWireDebugStreamSide::RawUpstream,
+    );
     let masked = plan
         .mask_errors
         .then(|| maybe_mask_external_stream_error_event(event, capture, stream_error_mask))
         .flatten();
-    if let Some(masked) = masked {
-        return transcript_state
+    let output = if let Some(masked) = masked {
+        transcript_state
             .map(|state| process_external_transcript_state(state, &masked, capture))
-            .unwrap_or(masked);
-    }
-    let processed = if projection.is_some() {
-        rewrite_sse_event_usage(event, projection, capture)
+            .unwrap_or(masked)
     } else {
-        if plan.capture_usage {
-            capture_sse_event_usage(event, projection, capture);
+        let processed = if projection.is_some() {
+            rewrite_sse_event_usage(event, projection, capture)
+        } else {
+            if plan.capture_usage {
+                capture_sse_event_usage(event, projection, capture);
+            }
+            event.to_vec()
+        };
+        if let Some(state) = transcript_state {
+            process_external_transcript_state(state, &processed, capture)
+        } else {
+            processed
         }
-        event.to_vec()
     };
-    let output = if let Some(state) = transcript_state {
-        process_external_transcript_state(state, &processed, capture)
-    } else {
-        processed
-    };
+    record_external_wire_debug_sse_bytes(
+        &output,
+        capture,
+        plan,
+        ExternalWireDebugStreamSide::ProcessedDownstream,
+    );
     update_external_usage_capture_output_estimate(
         capture,
         estimate_external_stream_output_tokens(&Bytes::from(output.clone())),

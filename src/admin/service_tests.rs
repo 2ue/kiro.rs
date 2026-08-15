@@ -187,6 +187,31 @@ fn external_pool_cost_floor_margin_validation_is_bounded() {
 }
 
 #[test]
+fn external_pool_wire_debug_validation_is_bounded() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_wire_debug_max_body_bytes: 1024 * 1024,
+        external_pool_wire_debug_max_files: 100_000,
+        ..ExternalPoolsConfig::default()
+    };
+    validate_external_pools_config(&config).expect("upper bounds should be accepted");
+
+    config.external_pool_wire_debug_max_body_bytes = 1024 * 1024 + 1;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(
+        err.contains("externalPoolWireDebugMaxBodyBytes"),
+        "unexpected validation error: {err}"
+    );
+
+    config.external_pool_wire_debug_max_body_bytes = 1024 * 1024;
+    config.external_pool_wire_debug_max_files = 100_001;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(
+        err.contains("externalPoolWireDebugMaxFiles"),
+        "unexpected validation error: {err}"
+    );
+}
+
+#[test]
 fn request_admission_admin_save_refresh_returns_canonical_queue_fields() {
     let queue_only = RequestAdmissionConfig {
         rpm: 0,

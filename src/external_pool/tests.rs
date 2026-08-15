@@ -95,6 +95,119 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 }
 
 #[test]
+fn external_wire_debug_request_summary_keeps_last_user_marker() {
+    let body = br#"{
+        "model":"claude-opus-4-8",
+        "stream":true,
+        "max_tokens":512,
+        "messages":[
+            {"role":"user","content":[{"type":"text","text":"first task"}]},
+            {"role":"assistant","content":[{"type":"text","text":"first answer"}]},
+            {"role":"user","content":[{"type":"text","text":"FOLLOWUP_MARKER_F2 compute 31+40"}]}
+        ],
+        "tools":[{"name":"noop","input_schema":{"type":"object"}}]
+    }"#;
+
+    let summary = external_pool_wire_debug_request_summary(body);
+
+    assert_eq!(summary["parseOk"], true);
+    assert_eq!(summary["model"], "claude-opus-4-8");
+    assert_eq!(summary["stream"], true);
+    assert_eq!(summary["messageCount"], 3);
+    assert_eq!(summary["userMessageCount"], 2);
+    assert_eq!(summary["toolCount"], 1);
+    assert!(
+        summary["lastUserContent"]
+            .to_string()
+            .contains("FOLLOWUP_MARKER_F2"),
+        "last user content preview must make follow-up marker correlation possible"
+    );
+    assert!(
+        summary["lastUserContent"].to_string().contains("sha256"),
+        "last user content must include stable hashes for long-context correlation"
+    );
+}
+
+#[test]
+fn external_wire_debug_stream_records_raw_and_processed_text_usage_and_stop() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+    plan.wire_debug_enabled = true;
+    plan.wire_debug_max_body_bytes = 4096;
+
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}
+
+"#;
+    let usage_event = br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}
+
+"#;
+    let stop_event = br#"event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+    assert_eq!(
+        process_sse_event_with_plan(text_event, None, Some(&capture), None, plan),
+        text_event
+    );
+    assert_eq!(
+        process_sse_event_with_plan(usage_event, None, Some(&capture), None, plan),
+        usage_event
+    );
+    assert_eq!(
+        process_sse_event_with_plan(stop_event, None, Some(&capture), None, plan),
+        stop_event
+    );
+
+    let snapshot = capture.lock().wire_debug.clone();
+    assert_eq!(snapshot.raw_upstream_stream.events_seen, 3);
+    assert_eq!(snapshot.processed_downstream_stream.events_seen, 3);
+    assert_eq!(snapshot.raw_upstream_stream.semantic.text_delta_chars, 2);
+    assert_eq!(
+        snapshot
+            .processed_downstream_stream
+            .semantic
+            .text_delta_chars,
+        2
+    );
+    assert_eq!(snapshot.raw_upstream_stream.usage_events_seen, 1);
+    assert_eq!(snapshot.processed_downstream_stream.usage_events_seen, 1);
+    assert_eq!(snapshot.raw_upstream_stream.semantic.message_stop_events, 1);
+    assert_eq!(
+        snapshot
+            .processed_downstream_stream
+            .semantic
+            .message_stop_events,
+        1
+    );
+    assert_eq!(
+        snapshot
+            .raw_upstream_stream
+            .semantic
+            .last_stop_reason
+            .as_deref(),
+        Some("end_turn")
+    );
+    assert_eq!(
+        snapshot
+            .processed_downstream_stream
+            .semantic
+            .last_stop_reason
+            .as_deref(),
+        Some("end_turn")
+    );
+    assert!(
+        snapshot
+            .processed_downstream_stream
+            .preview_utf8
+            .contains("\"text\":\"OK\"")
+    );
+}
+
+#[test]
 fn persisted_external_pool_enum_parsers_reject_unknown_values_for_five_rounds() {
     for round in 1..=5 {
         assert_eq!(
