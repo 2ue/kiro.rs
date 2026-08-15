@@ -480,7 +480,7 @@ pub(super) fn convert_tools(
     if options.local_upstream_cache_point_enabled && !options.local_upstream_cache_point_tools_only
     {
         tracing::debug!(
-            "kiroCachePointToolsOnly is disabled, but this phase only supports tool-level cachePoint insertion"
+            "localUpstreamCachePointToolsOnly is disabled, but this phase only supports tool-level cachePoint insertion"
         );
     }
 

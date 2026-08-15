@@ -2039,9 +2039,9 @@ export interface RuntimeConfig {
   payloadGuardSafetyMarginBytes: number
   payloadGuardTrimHistory: boolean
   payloadGuardExternalEnabled: boolean
-  kiroCachePointEnabled: boolean
-  kiroCachePointToolsOnly: boolean
-  kiroCachePointRecordPlan: boolean
+  localUpstreamCachePointEnabled: boolean
+  localUpstreamCachePointToolsOnly: boolean
+  localUpstreamCachePointRecordPlan: boolean
   payloadShaping: PayloadShapingConfig
   promptCacheTargetReadRatio: number
   promptCacheTokenScale: number

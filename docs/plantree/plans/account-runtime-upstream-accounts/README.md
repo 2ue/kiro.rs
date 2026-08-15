@@ -170,9 +170,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Main startup, Redis runtime-event listener and credential-file CLI diagnostics now use local-upstream credential/config/manager aliases instead of importing legacy credential and manager types directly in process wiring.
 - Main startup local API-key bootstrap variables and Admin supported-model normalization variables now use local-upstream/upstream naming while legacy environment/config field names remain compatibility boundaries.
 - Local-upstream timeout, stream-retry and base-URL runtime config fields now use `local_upstream_*` / `localUpstream*` as primary Rust/Admin/UI names. Existing `kiroUpstream*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
+- Local-upstream cachePoint runtime config fields now use `local_upstream_cache_point_*` / `localUpstreamCachePoint*` as primary Rust/Admin/UI names. Existing `kiroCachePoint*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
 
 Last verified on 2026-08-16:
 
+- `feature/tests/run-cargo-scoped.sh local-upstream-cache-point-fields-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-cache-point-fields-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test admin::types -- --nocapture && cargo test claude_code_tool -- --nocapture'`
+- `pnpm --dir ui check && pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-config-fields-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-config-fields-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test admin::types -- --nocapture'`
 - `pnpm --dir ui check`

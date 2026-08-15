@@ -1902,9 +1902,9 @@ pub struct RuntimeConfigResponse {
     pub payload_guard_safety_margin_bytes: u64,
     pub payload_guard_trim_history: bool,
     pub payload_guard_external_enabled: bool,
-    pub kiro_cache_point_enabled: bool,
-    pub kiro_cache_point_tools_only: bool,
-    pub kiro_cache_point_record_plan: bool,
+    pub local_upstream_cache_point_enabled: bool,
+    pub local_upstream_cache_point_tools_only: bool,
+    pub local_upstream_cache_point_record_plan: bool,
     pub payload_shaping: PayloadShapingConfig,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
@@ -2050,12 +2050,12 @@ pub struct UpdateRuntimeConfigRequest {
     pub payload_guard_trim_history: Option<bool>,
     #[serde(default)]
     pub payload_guard_external_enabled: Option<bool>,
-    #[serde(default)]
-    pub kiro_cache_point_enabled: Option<bool>,
-    #[serde(default)]
-    pub kiro_cache_point_tools_only: Option<bool>,
-    #[serde(default)]
-    pub kiro_cache_point_record_plan: Option<bool>,
+    #[serde(default, alias = "kiroCachePointEnabled")]
+    pub local_upstream_cache_point_enabled: Option<bool>,
+    #[serde(default, alias = "kiroCachePointToolsOnly")]
+    pub local_upstream_cache_point_tools_only: Option<bool>,
+    #[serde(default, alias = "kiroCachePointRecordPlan")]
+    pub local_upstream_cache_point_record_plan: Option<bool>,
     #[serde(default)]
     pub payload_shaping: Option<PayloadShapingConfigPatch>,
     #[serde(default)]
@@ -2575,7 +2575,10 @@ mod tests {
             "kiroUpstreamStreamRetryMaxAttempts": 4,
             "kiroUpstreamStreamRetryOnIdleTimeout": false,
             "kiroUpstreamStreamRetryOnReadError": false,
-            "kiroUpstreamStreamRetryOnStatusError": false
+            "kiroUpstreamStreamRetryOnStatusError": false,
+            "kiroCachePointEnabled": true,
+            "kiroCachePointToolsOnly": false,
+            "kiroCachePointRecordPlan": false
         }))
         .unwrap();
 
@@ -2586,6 +2589,9 @@ mod tests {
         assert_eq!(req.local_upstream_stream_retry_on_idle_timeout, Some(false));
         assert_eq!(req.local_upstream_stream_retry_on_read_error, Some(false));
         assert_eq!(req.local_upstream_stream_retry_on_status_error, Some(false));
+        assert_eq!(req.local_upstream_cache_point_enabled, Some(true));
+        assert_eq!(req.local_upstream_cache_point_tools_only, Some(false));
+        assert_eq!(req.local_upstream_cache_point_record_plan, Some(false));
     }
 
     #[test]

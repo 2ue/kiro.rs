@@ -68,6 +68,9 @@ type LocalUpstreamRuntimeConfigKeys =
   | 'localUpstreamStreamRetryOnIdleTimeout'
   | 'localUpstreamStreamRetryOnReadError'
   | 'localUpstreamStreamRetryOnStatusError'
+  | 'localUpstreamCachePointEnabled'
+  | 'localUpstreamCachePointToolsOnly'
+  | 'localUpstreamCachePointRecordPlan'
 
 type LegacyLocalUpstreamRuntimeConfigWire = {
   kiroUpstreamResponseTimeoutSecs?: number
@@ -77,6 +80,9 @@ type LegacyLocalUpstreamRuntimeConfigWire = {
   kiroUpstreamStreamRetryOnIdleTimeout?: boolean
   kiroUpstreamStreamRetryOnReadError?: boolean
   kiroUpstreamStreamRetryOnStatusError?: boolean
+  kiroCachePointEnabled?: boolean
+  kiroCachePointToolsOnly?: boolean
+  kiroCachePointRecordPlan?: boolean
 }
 
 type RuntimeConfigWire = Omit<RuntimeConfig, LocalUpstreamRuntimeConfigKeys> &
@@ -92,6 +98,9 @@ function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
     kiroUpstreamStreamRetryOnIdleTimeout,
     kiroUpstreamStreamRetryOnReadError,
     kiroUpstreamStreamRetryOnStatusError,
+    kiroCachePointEnabled,
+    kiroCachePointToolsOnly,
+    kiroCachePointRecordPlan,
     ...current
   } = data
   return {
@@ -110,6 +119,12 @@ function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
       data.localUpstreamStreamRetryOnReadError ?? kiroUpstreamStreamRetryOnReadError ?? true,
     localUpstreamStreamRetryOnStatusError:
       data.localUpstreamStreamRetryOnStatusError ?? kiroUpstreamStreamRetryOnStatusError ?? true,
+    localUpstreamCachePointEnabled:
+      data.localUpstreamCachePointEnabled ?? kiroCachePointEnabled ?? false,
+    localUpstreamCachePointToolsOnly:
+      data.localUpstreamCachePointToolsOnly ?? kiroCachePointToolsOnly ?? true,
+    localUpstreamCachePointRecordPlan:
+      data.localUpstreamCachePointRecordPlan ?? kiroCachePointRecordPlan ?? true,
   } as RuntimeConfig
 }
 

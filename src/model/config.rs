@@ -1708,20 +1708,20 @@ impl CacheSimulationPolicyPatch {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CachePointPolicy {
-    #[serde(default = "default_kiro_cache_point_enabled")]
+    #[serde(default = "default_local_upstream_cache_point_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_kiro_cache_point_tools_only")]
+    #[serde(default = "default_local_upstream_cache_point_tools_only")]
     pub tools_only: bool,
-    #[serde(default = "default_kiro_cache_point_record_plan")]
+    #[serde(default = "default_local_upstream_cache_point_record_plan")]
     pub record_plan: bool,
 }
 
 impl Default for CachePointPolicy {
     fn default() -> Self {
         Self {
-            enabled: default_kiro_cache_point_enabled(),
-            tools_only: default_kiro_cache_point_tools_only(),
-            record_plan: default_kiro_cache_point_record_plan(),
+            enabled: default_local_upstream_cache_point_enabled(),
+            tools_only: default_local_upstream_cache_point_tools_only(),
+            record_plan: default_local_upstream_cache_point_record_plan(),
         }
     }
 }
@@ -3741,19 +3741,28 @@ pub struct Config {
     #[serde(default = "default_payload_guard_external_enabled")]
     pub payload_guard_external_enabled: bool,
 
-    /// 是否把 Anthropic tool cache_control 转成 Kiro cachePoint 发送给上游。
+    /// 是否把 Anthropic tool cache_control 转成本地上游 cachePoint。
     ///
-    /// 默认关闭；开启后仅对实际发送给 Kiro 的工具定义插入 cachePoint。
-    #[serde(default = "default_kiro_cache_point_enabled")]
-    pub kiro_cache_point_enabled: bool,
+    /// 默认关闭；开启后仅对实际发送给本地上游的工具定义插入 cachePoint。
+    #[serde(
+        default = "default_local_upstream_cache_point_enabled",
+        alias = "kiroCachePointEnabled"
+    )]
+    pub local_upstream_cache_point_enabled: bool,
 
     /// cachePoint 第一阶段只根据工具上的 cache_control 插入，不自动改写系统消息或历史消息。
-    #[serde(default = "default_kiro_cache_point_tools_only")]
-    pub kiro_cache_point_tools_only: bool,
+    #[serde(
+        default = "default_local_upstream_cache_point_tools_only",
+        alias = "kiroCachePointToolsOnly"
+    )]
+    pub local_upstream_cache_point_tools_only: bool,
 
     /// 是否把 cachePoint 插入计划写入 payload diagnostics，便于定位上游 body invalid。
-    #[serde(default = "default_kiro_cache_point_record_plan")]
-    pub kiro_cache_point_record_plan: bool,
+    #[serde(
+        default = "default_local_upstream_cache_point_record_plan",
+        alias = "kiroCachePointRecordPlan"
+    )]
+    pub local_upstream_cache_point_record_plan: bool,
 
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
@@ -4253,15 +4262,15 @@ fn default_payload_guard_external_enabled() -> bool {
     true
 }
 
-fn default_kiro_cache_point_enabled() -> bool {
+fn default_local_upstream_cache_point_enabled() -> bool {
     false
 }
 
-fn default_kiro_cache_point_tools_only() -> bool {
+fn default_local_upstream_cache_point_tools_only() -> bool {
     true
 }
 
-fn default_kiro_cache_point_record_plan() -> bool {
+fn default_local_upstream_cache_point_record_plan() -> bool {
     true
 }
 
@@ -4855,9 +4864,10 @@ impl Default for Config {
             payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
             payload_guard_external_enabled: default_payload_guard_external_enabled(),
-            kiro_cache_point_enabled: default_kiro_cache_point_enabled(),
-            kiro_cache_point_tools_only: default_kiro_cache_point_tools_only(),
-            kiro_cache_point_record_plan: default_kiro_cache_point_record_plan(),
+            local_upstream_cache_point_enabled: default_local_upstream_cache_point_enabled(),
+            local_upstream_cache_point_tools_only: default_local_upstream_cache_point_tools_only(),
+            local_upstream_cache_point_record_plan: default_local_upstream_cache_point_record_plan(
+            ),
             load_balancing_mode: default_load_balancing_mode(),
             scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
             scheduler_priority_weight: default_scheduler_priority_weight(),
@@ -4962,22 +4972,22 @@ impl Config {
 
     pub fn local_upstream_cache_point_policy(&self) -> CachePointPolicy {
         CachePointPolicy {
-            enabled: self.kiro_cache_point_enabled,
-            tools_only: self.kiro_cache_point_tools_only,
-            record_plan: self.kiro_cache_point_record_plan,
+            enabled: self.local_upstream_cache_point_enabled,
+            tools_only: self.local_upstream_cache_point_tools_only,
+            record_plan: self.local_upstream_cache_point_record_plan,
         }
     }
 
     pub fn local_upstream_cache_point_enabled(&self) -> bool {
-        self.kiro_cache_point_enabled
+        self.local_upstream_cache_point_enabled
     }
 
     pub fn local_upstream_cache_point_tools_only(&self) -> bool {
-        self.kiro_cache_point_tools_only
+        self.local_upstream_cache_point_tools_only
     }
 
     pub fn local_upstream_cache_point_record_plan(&self) -> bool {
-        self.kiro_cache_point_record_plan
+        self.local_upstream_cache_point_record_plan
     }
 
     pub fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
@@ -5483,9 +5493,9 @@ mod tests {
         assert_eq!(config.payload_guard_safety_margin_bytes, 32 * 1024);
         assert!(config.payload_guard_trim_history);
         assert!(config.payload_guard_external_enabled);
-        assert!(!config.kiro_cache_point_enabled);
-        assert!(config.kiro_cache_point_tools_only);
-        assert!(config.kiro_cache_point_record_plan);
+        assert!(!config.local_upstream_cache_point_enabled);
+        assert!(config.local_upstream_cache_point_tools_only);
+        assert!(config.local_upstream_cache_point_record_plan);
         assert!(config.payload_shaping.enabled);
         assert!(config.payload_shaping.truncate_historical_tool_results);
         assert_eq!(
@@ -6228,6 +6238,9 @@ mod tests {
         config.local_upstream_stream_retry_on_read_error = false;
         config.local_upstream_stream_retry_on_status_error = false;
         config.local_upstream_base_url = Some("http://127.0.0.1:39090/mock".to_string());
+        config.local_upstream_cache_point_enabled = true;
+        config.local_upstream_cache_point_tools_only = false;
+        config.local_upstream_cache_point_record_plan = false;
 
         let serialized = serde_json::to_value(&config).unwrap();
         assert_eq!(serialized["localUpstreamResponseTimeoutSecs"], 31);
@@ -6241,6 +6254,9 @@ mod tests {
             serialized["localUpstreamBaseUrl"],
             "http://127.0.0.1:39090/mock"
         );
+        assert_eq!(serialized["localUpstreamCachePointEnabled"], true);
+        assert_eq!(serialized["localUpstreamCachePointToolsOnly"], false);
+        assert_eq!(serialized["localUpstreamCachePointRecordPlan"], false);
         assert!(serialized.get("kiroUpstreamResponseTimeoutSecs").is_none());
         assert!(
             serialized
@@ -6248,6 +6264,9 @@ mod tests {
                 .is_none()
         );
         assert!(serialized.get("kiroUpstreamBaseUrl").is_none());
+        assert!(serialized.get("kiroCachePointEnabled").is_none());
+        assert!(serialized.get("kiroCachePointToolsOnly").is_none());
+        assert!(serialized.get("kiroCachePointRecordPlan").is_none());
 
         let legacy: Config = serde_json::from_value(serde_json::json!({
             "kiroUpstreamResponseTimeoutSecs": 41,
@@ -6257,7 +6276,10 @@ mod tests {
             "kiroUpstreamStreamRetryOnIdleTimeout": false,
             "kiroUpstreamStreamRetryOnReadError": false,
             "kiroUpstreamStreamRetryOnStatusError": false,
-            "kiroUpstreamBaseUrl": "http://127.0.0.1:39091/mock"
+            "kiroUpstreamBaseUrl": "http://127.0.0.1:39091/mock",
+            "kiroCachePointEnabled": true,
+            "kiroCachePointToolsOnly": false,
+            "kiroCachePointRecordPlan": false
         }))
         .unwrap();
 
@@ -6272,6 +6294,9 @@ mod tests {
             legacy.local_upstream_base_url.as_deref(),
             Some("http://127.0.0.1:39091/mock")
         );
+        assert!(legacy.local_upstream_cache_point_enabled);
+        assert!(!legacy.local_upstream_cache_point_tools_only);
+        assert!(!legacy.local_upstream_cache_point_record_plan);
     }
 
     #[test]
@@ -6317,9 +6342,9 @@ mod tests {
         assert_eq!(config.selection_failure_sample_limit, 12);
         assert!(!config.selection_failure_record_enabled);
         assert_eq!(config.local_upstream_stream_idle_timeout_secs, 45);
-        assert!(config.kiro_cache_point_enabled);
-        assert!(!config.kiro_cache_point_tools_only);
-        assert!(!config.kiro_cache_point_record_plan);
+        assert!(config.local_upstream_cache_point_enabled);
+        assert!(!config.local_upstream_cache_point_tools_only);
+        assert!(!config.local_upstream_cache_point_record_plan);
         assert_eq!(config.prompt_cache_max_entries_per_account, 50);
         assert_eq!(config.prompt_cache_max_entries_global, 500);
         assert_eq!(config.prompt_cache_entry_ttl_secs, 600);

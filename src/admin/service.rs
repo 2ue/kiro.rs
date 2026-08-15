@@ -5043,9 +5043,9 @@ impl AdminService {
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes as u64,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_guard_external_enabled: config.payload_guard_external_enabled,
-            kiro_cache_point_enabled: config.kiro_cache_point_enabled,
-            kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
-            kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
+            local_upstream_cache_point_enabled: config.local_upstream_cache_point_enabled,
+            local_upstream_cache_point_tools_only: config.local_upstream_cache_point_tools_only,
+            local_upstream_cache_point_record_plan: config.local_upstream_cache_point_record_plan,
             payload_shaping: config.payload_shaping,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: config.prompt_cache_token_scale,
@@ -5257,15 +5257,15 @@ impl AdminService {
         let payload_guard_external_enabled = req
             .payload_guard_external_enabled
             .unwrap_or(current_config.payload_guard_external_enabled);
-        let kiro_cache_point_enabled = req
-            .kiro_cache_point_enabled
-            .unwrap_or(current_config.kiro_cache_point_enabled);
-        let kiro_cache_point_tools_only = req
-            .kiro_cache_point_tools_only
-            .unwrap_or(current_config.kiro_cache_point_tools_only);
-        let kiro_cache_point_record_plan = req
-            .kiro_cache_point_record_plan
-            .unwrap_or(current_config.kiro_cache_point_record_plan);
+        let local_upstream_cache_point_enabled = req
+            .local_upstream_cache_point_enabled
+            .unwrap_or(current_config.local_upstream_cache_point_enabled);
+        let local_upstream_cache_point_tools_only = req
+            .local_upstream_cache_point_tools_only
+            .unwrap_or(current_config.local_upstream_cache_point_tools_only);
+        let local_upstream_cache_point_record_plan = req
+            .local_upstream_cache_point_record_plan
+            .unwrap_or(current_config.local_upstream_cache_point_record_plan);
         let payload_shaping = req
             .payload_shaping
             .map(|patch| patch.apply_to(current_config.payload_shaping))
@@ -5590,9 +5590,12 @@ impl AdminService {
         cache_validation_config.prompt_cache_estimated_bytes_limit =
             prompt_cache_estimated_bytes_limit;
         cache_validation_config.reported_usage = reported_usage.clone();
-        cache_validation_config.kiro_cache_point_enabled = kiro_cache_point_enabled;
-        cache_validation_config.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
-        cache_validation_config.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
+        cache_validation_config.local_upstream_cache_point_enabled =
+            local_upstream_cache_point_enabled;
+        cache_validation_config.local_upstream_cache_point_tools_only =
+            local_upstream_cache_point_tools_only;
+        cache_validation_config.local_upstream_cache_point_record_plan =
+            local_upstream_cache_point_record_plan;
         cache_policy_raw
             .validate(cache_validation_config.legacy_cache_route_policy_default())
             .map_err(AdminServiceError::InvalidCredential)?;
@@ -5682,9 +5685,11 @@ impl AdminService {
                 config.payload_guard_safety_margin_bytes = payload_guard_safety_margin_bytes;
                 config.payload_guard_trim_history = payload_guard_trim_history;
                 config.payload_guard_external_enabled = payload_guard_external_enabled;
-                config.kiro_cache_point_enabled = kiro_cache_point_enabled;
-                config.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
-                config.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
+                config.local_upstream_cache_point_enabled = local_upstream_cache_point_enabled;
+                config.local_upstream_cache_point_tools_only =
+                    local_upstream_cache_point_tools_only;
+                config.local_upstream_cache_point_record_plan =
+                    local_upstream_cache_point_record_plan;
                 config.payload_shaping = payload_shaping;
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
                 config.prompt_cache_token_scale = prompt_cache_token_scale;
