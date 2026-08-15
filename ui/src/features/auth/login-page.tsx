@@ -62,7 +62,7 @@ export function LoginPage({
                     <ShieldCheck className="size-5" />
                   </div>
                   <div>
-                    <div className="text-xl font-bold tracking-tight">Kiro Console</div>
+                    <div className="text-xl font-bold tracking-tight">Account Runtime Console</div>
                     <div className="text-[0.72rem] font-semibold text-muted-foreground">
                       管理控制台
                     </div>
@@ -103,7 +103,7 @@ export function LoginPage({
               <div className="flex size-10 items-center justify-center rounded-xl bg-secondary text-primary">
                 <ShieldCheck className="size-5" />
               </div>
-              <span className="text-xl font-bold">Kiro Console</span>
+              <span className="text-xl font-bold">Account Runtime Console</span>
             </div>
 
             <div className="mb-8">

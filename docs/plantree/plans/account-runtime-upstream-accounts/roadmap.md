@@ -137,6 +137,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field, while old `kiroVersion` config shape remains a read-only compatibility alias.
 - Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Kiro wording while preserving compatibility aliases for old config shapes.
 - Maintained UI/Admin UI usage API types now name local auxiliary credential traces `LocalUpstreamCredentialAttempt`, while the `credentialAttempts` wire field stays unchanged.
+- Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording, and the sidebar brand mark no longer presents Kiro as the product name.
 
 ## In Progress
 

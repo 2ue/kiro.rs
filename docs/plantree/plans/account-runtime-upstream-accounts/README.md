@@ -175,9 +175,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field. Existing `kiroVersion` remains a read-only compatibility alias, and the current legacy local executor reads the new field.
 - Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Kiro wording while preserving the already migrated compatibility field aliases.
 - Maintained UI/Admin UI usage API types now model local auxiliary credential traces as `LocalUpstreamCredentialAttempt`; the `credentialAttempts` wire field remains unchanged.
+- Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording and the sidebar brand mark no longer exposes Kiro as the product name.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro Console|Kiro Admin|Kiro 控制台|Kiro Console 设计系统" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "KiroCredentialAttempt" ui/src admin-ui/src --glob '!**/node_modules/**'`
