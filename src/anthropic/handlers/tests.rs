@@ -6828,7 +6828,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         input_tokens: 100_000,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -6937,7 +6937,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         input_tokens: 304_883,
         context_window_tokens: 1_000_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: Some("/dfcache/team".to_string()),
         prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
         simulation_mode: PromptCacheSimulationMode::Disabled,
@@ -7024,7 +7024,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         input_tokens: 1_234,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -7116,7 +7116,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         input_tokens: request_input_tokens,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -7243,7 +7243,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         input_tokens: 141,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::NoCache,
         simulation_mode: PromptCacheSimulationMode::Disabled,
@@ -7320,7 +7320,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         input_tokens: 100_000,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: Some("/kiro".to_string()),
         prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
         simulation_mode: PromptCacheSimulationMode::Disabled,
@@ -7461,7 +7461,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         input_tokens: 100,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::Disabled,
@@ -7800,7 +7800,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         input_tokens: 100_000,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -7968,7 +7968,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         input_tokens: 100_000,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -8071,7 +8071,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         input_tokens: 4096,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -8154,7 +8154,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         input_tokens: request_input_tokens,
         context_window_tokens: 1_000_000,
         prompt_cache_profile: None,
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: Some("/dfcache/team".to_string()),
         prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
         simulation_mode: PromptCacheSimulationMode::Disabled,
@@ -8714,7 +8714,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         input_tokens: 4096,
         context_window_tokens: 200_000,
         prompt_cache_profile: profile.clone(),
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -8808,7 +8808,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         input_tokens: 4096,
         context_window_tokens: 200_000,
         prompt_cache_profile: profile.clone(),
-        kiro_rs_tool_prompt_cache_plan: None,
+        claude_code_tool_prompt_cache_plan: None,
         prompt_cache_route_namespace: None,
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -9085,7 +9085,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         first_context.prompt_cache_scope_conversation_id.as_deref(),
         Some(session_id)
     );
-    assert!(first_context.kiro_rs_tool_prompt_cache_plan.is_some());
+    assert!(first_context.claude_code_tool_prompt_cache_plan.is_some());
     let first_simulation = first_context
         .simulated_usage
         .expect("first kiro request should project cache creation");
@@ -9131,7 +9131,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         ),
         8192,
     );
-    assert!(second_context.kiro_rs_tool_prompt_cache_plan.is_some());
+    assert!(second_context.claude_code_tool_prompt_cache_plan.is_some());
     let second_simulation = second_context
         .simulated_usage
         .expect("second kiro request should project a cache read");
@@ -9380,7 +9380,7 @@ fn builtin_na_path_does_not_build_local_profile_or_reporting_policy() {
     );
     assert_eq!(context.simulation_mode, PromptCacheSimulationMode::Disabled);
     assert!(context.prompt_cache_profile.is_none());
-    assert!(context.kiro_rs_tool_prompt_cache_plan.is_none());
+    assert!(context.claude_code_tool_prompt_cache_plan.is_none());
     assert!(context.prompt_cache_scope_conversation_id.is_none());
     assert_eq!(context.prompt_cache_route_namespace, None);
     assert!(context.simulated_usage.is_none());
@@ -9483,7 +9483,7 @@ fn no_cache_route_does_not_build_cache_profile_plan_or_shape_reporting() {
     );
     assert_eq!(context.simulation_mode, PromptCacheSimulationMode::Disabled);
     assert!(context.prompt_cache_profile.is_none());
-    assert!(context.kiro_rs_tool_prompt_cache_plan.is_none());
+    assert!(context.claude_code_tool_prompt_cache_plan.is_none());
     assert!(context.prompt_cache_scope_conversation_id.is_none());
     assert_eq!(context.prompt_cache_route_namespace, None);
     assert!(context.simulated_usage.is_none());

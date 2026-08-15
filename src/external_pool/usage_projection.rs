@@ -18,7 +18,7 @@ pub(super) struct ExternalUsageProjectionContext {
     pub(super) scope: Option<PromptCacheScope>,
     pub(super) prompt_cache: Arc<PromptCacheTracker>,
     pub(super) prompt_cache_profile: Option<PromptCacheProfile>,
-    pub(super) kiro_rs_tool_prompt_cache_plan: Option<ClaudeCodeToolPromptCachePlan>,
+    pub(super) claude_code_tool_prompt_cache_plan: Option<ClaudeCodeToolPromptCachePlan>,
     pub(super) prompt_cache_target_read_ratio: f64,
     pub(super) prompt_cache_bounds: PromptCacheBounds,
     pub(super) prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -47,7 +47,7 @@ pub(super) struct ExternalUsageProjectionTemplate {
     scope: Option<PromptCacheScope>,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
-    kiro_rs_tool_prompt_cache_plan: Option<ClaudeCodeToolPromptCachePlan>,
+    claude_code_tool_prompt_cache_plan: Option<ClaudeCodeToolPromptCachePlan>,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_bounds: PromptCacheBounds,
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -83,7 +83,7 @@ impl ExternalUsageProjectionTemplate {
             scope: self.scope.clone(),
             prompt_cache: self.prompt_cache.clone(),
             prompt_cache_profile: self.prompt_cache_profile.clone(),
-            kiro_rs_tool_prompt_cache_plan: self.kiro_rs_tool_prompt_cache_plan.clone(),
+            claude_code_tool_prompt_cache_plan: self.claude_code_tool_prompt_cache_plan.clone(),
             prompt_cache_target_read_ratio: self.prompt_cache_target_read_ratio,
             prompt_cache_bounds: self.prompt_cache_bounds,
             prompt_cache_creation_controller: self.prompt_cache_creation_controller.clone(),
@@ -213,7 +213,7 @@ fn build_template(
             )
         })
         .flatten();
-    let (profile, kiro_rs_tool_prompt_cache_plan, simulated_usage) = match route
+    let (profile, claude_code_tool_prompt_cache_plan, simulated_usage) = match route
         .prompt_cache_strategy_type
     {
         PromptCacheStrategyType::CurrentHighCache
@@ -247,9 +247,9 @@ fn build_template(
                 raw_input_tokens,
                 &model,
                 route.prompt_cache_bounds,
-                route.kiro_rs_tool_cache_policy,
+                route.claude_code_tool_cache_policy,
             );
-            let policy = route.kiro_rs_tool_cache_policy.normalized();
+            let policy = route.claude_code_tool_cache_policy.normalized();
             let simulated_usage =
                 CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
                     plan.usage(),
@@ -299,7 +299,7 @@ fn build_template(
         scope,
         prompt_cache: route.prompt_cache.clone(),
         prompt_cache_profile: profile,
-        kiro_rs_tool_prompt_cache_plan,
+        claude_code_tool_prompt_cache_plan,
         prompt_cache_target_read_ratio: route.prompt_cache_target_read_ratio,
         prompt_cache_bounds: route.prompt_cache_bounds,
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
@@ -359,7 +359,7 @@ impl ExternalUsageProjectionContext {
                     Some(self.model.as_str()),
                 );
         }
-        if let Some(plan) = self.kiro_rs_tool_prompt_cache_plan.as_ref() {
+        if let Some(plan) = self.claude_code_tool_prompt_cache_plan.as_ref() {
             self.prompt_cache
                 .commit_claude_code_tool_success_with_bounds(
                     self.scope.clone(),

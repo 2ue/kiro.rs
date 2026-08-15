@@ -279,7 +279,7 @@ struct RequestUsageContext {
     input_tokens: i32,
     context_window_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
-    kiro_rs_tool_prompt_cache_plan: Option<ClaudeCodeToolPromptCachePlan>,
+    claude_code_tool_prompt_cache_plan: Option<ClaudeCodeToolPromptCachePlan>,
     prompt_cache_route_namespace: Option<String>,
     prompt_cache_strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
@@ -788,7 +788,7 @@ struct AccountFallbackContext {
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
-    kiro_rs_tool_cache_policy: ClaudeCodeToolCachePolicy,
+    claude_code_tool_cache_policy: ClaudeCodeToolCachePolicy,
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
@@ -1623,7 +1623,7 @@ fn raw_account_route_request_with_hints(
         prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
-        kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        claude_code_tool_cache_policy: policy.kiro_rs_tool,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         request_id: request_id.clone(),
@@ -1691,7 +1691,7 @@ fn build_account_fallback_context(
         prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
-        kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        claude_code_tool_cache_policy: policy.kiro_rs_tool,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         recorder: state.usage_recorder.clone(),
@@ -2163,7 +2163,7 @@ impl AccountFallbackContext {
             prompt_cache_scale_min_input_tokens: self.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: self.prompt_cache_creation_control,
             prompt_cache_bounds: self.prompt_cache_bounds,
-            kiro_rs_tool_cache_policy: self.kiro_rs_tool_cache_policy,
+            claude_code_tool_cache_policy: self.claude_code_tool_cache_policy,
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
             request_id,
@@ -3333,7 +3333,7 @@ impl RequestUsageContext {
             self.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
         ) && (self.simulation_mode == PromptCacheSimulationMode::HighCache
-            || self.kiro_rs_tool_prompt_cache_plan.is_some())
+            || self.claude_code_tool_prompt_cache_plan.is_some())
     }
 
     fn apply_unreported_local_standard_cache_guard(
@@ -4053,7 +4053,7 @@ impl CredentialUsageContext {
                     );
                 }
                 PromptCacheStrategyType::KiroRsTool => {
-                    if let Some(plan) = self.request.kiro_rs_tool_prompt_cache_plan.as_ref() {
+                    if let Some(plan) = self.request.claude_code_tool_prompt_cache_plan.as_ref() {
                         self.request
                             .prompt_cache
                             .commit_claude_code_tool_success_with_bounds(
@@ -4695,7 +4695,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
     let scope = stable_conversation_id.as_ref().map(|conversation_id| {
         PromptCacheScope::new(conversation_id.clone(), cache_route.namespace.clone())
     });
-    let (prompt_cache_profile, kiro_rs_tool_prompt_cache_plan) = match strategy_type {
+    let (prompt_cache_profile, claude_code_tool_prompt_cache_plan) = match strategy_type {
         PromptCacheStrategyType::NoCache => (None, None),
         PromptCacheStrategyType::CurrentHighCache => match simulation_mode {
             PromptCacheSimulationMode::Disabled => (None, None),
@@ -4730,7 +4730,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
             prompt_cache_profile.as_ref(),
         ),
         PromptCacheStrategyType::KiroRsTool => {
-            let simulated_usage = kiro_rs_tool_prompt_cache_plan.as_ref().and_then(|plan| {
+            let simulated_usage = claude_code_tool_prompt_cache_plan.as_ref().and_then(|plan| {
                 let policy = policy.kiro_rs_tool.normalized();
                 super::cache::CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
                     plan.usage(),
@@ -4798,7 +4798,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
                 get_context_window_size(model)
             }),
         prompt_cache_profile,
-        kiro_rs_tool_prompt_cache_plan,
+        claude_code_tool_prompt_cache_plan,
         prompt_cache_route_namespace: cache_route.namespace,
         prompt_cache_strategy_type: strategy_type,
         simulation_mode,

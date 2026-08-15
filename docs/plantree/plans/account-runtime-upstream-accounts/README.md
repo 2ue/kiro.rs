@@ -134,6 +134,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The local-upstream agent mode strategy is now represented by `LocalUpstreamAgentModeStrategy` in Rust config/Admin/protocol code while the existing `kiroAgentModeStrategy` wire/config field remains as a compatibility boundary.
 - Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries until the route-policy schema is migrated.
 - Claude Code tool prompt-cache methods and helper functions now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
+- Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names in handler and account-route execution structs. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
 - Payload guard reports now serialize local-upstream cache-point diagnostic fields (`localUpstreamCachePointsPlanned` / `localUpstreamCachePointsInserted`) while still accepting legacy Kiro-named JSON fields as read aliases.
 - Local body preparation now receives upstream reasoning capability state through an upstream-named alias, and its test request fixtures use local-upstream request aliases instead of importing legacy request config types directly.
 - Converter tool-use/tool-result pairing now imports local-upstream request aliases for local conversation messages and tool results instead of importing legacy request model paths directly.
@@ -364,6 +365,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-test3 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test prompt_cache -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-methods-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-methods-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test prompt_cache -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-fields-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-fields-test1 -- bash -lc 'cargo check && cargo test prompt_cache -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh payload-report-local-upstream-fields-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh payload-report-local-upstream-fields-test2 -- bash -lc 'cargo check && cargo test payload_guard_report_uses_local_upstream_cache_point_fields_with_legacy_aliases -- --nocapture && cargo test cache_point_plan_inserts_markers_in_serialized_kiro_body -- --nocapture && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-body-upstream-alias-fmt2 -- cargo fmt`
