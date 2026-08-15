@@ -4431,7 +4431,7 @@ fn default_high_cache_threshold() -> i32 {
 }
 
 fn default_endpoint() -> String {
-    crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
+    crate::local_upstream::endpoint::LOCAL_UPSTREAM_IDE_ENDPOINT_NAME.to_string()
 }
 
 fn default_expose_proxy_warnings() -> bool {

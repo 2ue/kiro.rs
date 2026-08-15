@@ -24,6 +24,10 @@ pub(crate) mod dispatch {
         crate::kiro::token_manager::LocalPoolRouteStateKind;
 }
 
+pub(crate) mod endpoint {
+    pub(crate) use crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
+}
+
 pub(crate) mod provider {
     pub(crate) type LocalAuxiliaryMcpAttribution = crate::kiro::provider::McpCallAttribution;
     pub(crate) type LocalAuxiliaryMcpFailureKind = crate::kiro::provider::McpCallFailureKind;
