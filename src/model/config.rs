@@ -7279,9 +7279,14 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_disables_legacy_external_pool_prompt_steering_once() {
-        let mut config = Config::default();
-        config.runtime_config_migration_version = 8;
-        config.prompt_steering.apply_to_external_pool = true;
+        let mut config = Config {
+            runtime_config_migration_version: 8,
+            prompt_steering: PromptSteeringConfig {
+                apply_to_external_pool: true,
+                ..PromptSteeringConfig::default()
+            },
+            ..Config::default()
+        };
 
         assert!(config.apply_runtime_config_migrations());
         assert_eq!(
