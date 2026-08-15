@@ -7393,7 +7393,6 @@ async fn external_pool_one_wave_all_pools_transient_502_does_not_blackout_recove
         external_pool_same_pool_retry_count: 0,
         external_pool_server_error_cooldown_secs: 30,
         external_pool_transient_failure_priority_penalty: 20,
-        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 

@@ -2842,9 +2842,9 @@ pub struct ExternalPoolsConfig {
     pub external_pool_transient_failure_priority_penalty: u32,
     /// 连续瞬态失败升级为池级短冷却的阈值。
     ///
-    /// 0 表示关闭升级，只保留短期优先级罚分。默认 3 表示同一个外部池在
-    /// Redis 瞬态失败窗口内连续出现 3 次同类失败后，才按该错误类型的
-    /// 冷却秒数临时避让，避免一次抖动就把流量全部切走。
+    /// 0 表示关闭升级，只保留短期优先级罚分。默认关闭，避免外部服务
+    /// 抖动时把多个池快速推入冷却并造成调度容量不足；需要强保护时可
+    /// 显式配置非 0 阈值。
     #[serde(default = "default_external_pool_transient_failure_cooldown_threshold")]
     pub external_pool_transient_failure_cooldown_threshold: u32,
     #[serde(default)]
@@ -4493,7 +4493,7 @@ fn default_external_pool_transient_failure_priority_penalty() -> u32 {
 }
 
 fn default_external_pool_transient_failure_cooldown_threshold() -> u32 {
-    3
+    0
 }
 
 fn default_external_pool_max_input_tokens() -> i32 {
@@ -5463,7 +5463,7 @@ mod tests {
             config
                 .external_pools
                 .external_pool_transient_failure_cooldown_threshold,
-            3
+            0
         );
         assert_eq!(
             config.external_pools.external_pool_max_input_tokens,
@@ -5536,7 +5536,7 @@ mod tests {
             config
                 .external_pools
                 .external_pool_transient_failure_cooldown_threshold,
-            3
+            0
         );
         assert_eq!(
             config.external_pools.external_pool_dispatch_max_wait_secs,

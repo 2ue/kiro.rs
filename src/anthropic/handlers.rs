@@ -6803,8 +6803,8 @@ fn local_fallback_reason_blocks_local_rescue(
             "local_capacity_full"
             | "local_capacity_exhausted"
             | "local_attempt_reserved_for_fallback",
-        ) => current_local_dispatchable.unwrap_or(0) == 0,
-        None => current_local_dispatchable.unwrap_or(0) == 0,
+        ) => false,
+        None => matches!(current_local_dispatchable, Some(0)),
         _ => false,
     }
 }
