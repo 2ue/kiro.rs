@@ -139,6 +139,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Handler local dispatch policy and request-entry fast-fail code now use local-upstream dispatch/route-state aliases for acquire modes and local route-state kinds instead of importing token-manager types directly.
 - Model capability catalog ingestion now uses local-upstream model catalog aliases for available models, cohort keys and test token-limit fixtures instead of importing legacy available-model types directly.
 - Payload guard production code and local payload fixtures now use local-upstream request aliases for request bodies, images, tools, tool results and native reasoning config instead of importing legacy request model paths directly.
+- Payload guard public entrypoints now use local-upstream names for guarding, serialization, byte breakdown and tool-use diagnostics; the old Kiro-named function API was removed from the module and timing logs use `local_upstream`.
 - Anthropic stream tests now construct local-upstream event fixtures through the `local_upstream` event facade, including metering/code/invalid-state aliases, so `src/anthropic` no longer imports legacy event paths directly.
 - Admin service local model-test request construction and EventStream response parsing now import local-upstream request/event/decoder aliases instead of direct legacy request, event and decoder paths. The old request-module re-exports remain only as legacy compatibility exports.
 - Model capability cohort fencing now exposes `UpstreamReasoningCohortContractMatch`; startup recovery decisions and model capability tests no longer use the old Kiro-named contract-match type for upstream reasoning readiness.
@@ -370,6 +371,8 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh model-catalog-alias-test1 -- bash -lc 'cargo check && cargo test model_capabilities -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh payload-guard-request-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh payload-guard-request-alias-test1 -- bash -lc 'cargo check && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-api-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-api-test1 -- bash -lc 'cargo check && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh stream-event-test-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh stream-event-test-alias-test1 -- bash -lc 'cargo check && cargo test anthropic::stream -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh admin-local-upstream-alias-fmt2 -- cargo fmt`

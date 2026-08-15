@@ -415,7 +415,7 @@ impl std::fmt::Display for PayloadGuardError {
     }
 }
 
-pub fn guard_kiro_request(
+pub fn guard_local_upstream_request(
     request: &mut LocalUpstreamRequest,
     config: PayloadGuardConfig,
 ) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
@@ -651,7 +651,7 @@ pub fn guard_kiro_request(
     report.body_sha256 = Some(sha256_hex(&body));
 
     log_payload_guard_timing(
-        "kiro",
+        "local_upstream",
         guard_started_at.elapsed(),
         serialize_elapsed,
         repair_elapsed,
@@ -665,14 +665,7 @@ pub fn guard_kiro_request(
     Ok((body, report))
 }
 
-pub fn guard_local_upstream_request(
-    request: &mut LocalUpstreamRequest,
-    config: PayloadGuardConfig,
-) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
-    guard_kiro_request(request, config)
-}
-
-pub fn breakdown_kiro_request(
+pub fn breakdown_local_upstream_request(
     request: &LocalUpstreamRequest,
     serialized_body: &str,
 ) -> PayloadByteBreakdown {
@@ -711,14 +704,9 @@ pub fn breakdown_kiro_request(
     }
 }
 
-pub fn breakdown_local_upstream_request(
+pub fn diagnose_local_upstream_tool_use_format(
     request: &LocalUpstreamRequest,
-    serialized_body: &str,
-) -> PayloadByteBreakdown {
-    breakdown_kiro_request(request, serialized_body)
-}
-
-pub fn diagnose_kiro_tool_use_format(request: &LocalUpstreamRequest) -> ToolUseFormatDiagnostics {
+) -> ToolUseFormatDiagnostics {
     let state = &request.conversation_state;
     let current_user = &state.current_message.user_input_message;
     let current_context = &current_user.user_input_message_context;
@@ -894,12 +882,6 @@ pub fn diagnose_kiro_tool_use_format(request: &LocalUpstreamRequest) -> ToolUseF
         non_object_tool_use_inputs,
         history_tool_names_missing_from_tools,
     }
-}
-
-pub fn diagnose_local_upstream_tool_use_format(
-    request: &LocalUpstreamRequest,
-) -> ToolUseFormatDiagnostics {
-    diagnose_kiro_tool_use_format(request)
 }
 
 fn count_invalid_tool_schema_property_keys(
@@ -1413,14 +1395,10 @@ fn sha256_hex(value: &str) -> String {
     sha256_hex_bytes(value.as_bytes())
 }
 
-pub fn serialize_kiro_request(request: &LocalUpstreamRequest) -> Result<String, PayloadGuardError> {
-    serialize_request(request)
-}
-
 pub fn serialize_local_upstream_request(
     request: &LocalUpstreamRequest,
 ) -> Result<String, PayloadGuardError> {
-    serialize_kiro_request(request)
+    serialize_request(request)
 }
 
 fn serialize_request(request: &LocalUpstreamRequest) -> Result<String, PayloadGuardError> {
@@ -4835,8 +4813,8 @@ mod tests {
     }
 
     #[test]
-    fn serialize_kiro_request_normalizes_output_config_with_non_adaptive_thinking_for_five_rounds()
-    {
+    fn serialize_local_upstream_request_normalizes_output_config_with_non_adaptive_thinking_for_five_rounds()
+     {
         for round in 0..5 {
             let mut request = request_with_history(Vec::new());
             request.additional_model_request_fields =
@@ -4851,7 +4829,7 @@ mod tests {
                     reasoning: None,
                 });
 
-            let body = serialize_kiro_request(&request).expect("serialize Kiro request");
+            let body = serialize_local_upstream_request(&request).expect("serialize Kiro request");
             let value: Value = serde_json::from_str(&body).expect("Kiro body JSON");
             assert!(
                 value["additionalModelRequestFields"]
@@ -4951,7 +4929,7 @@ mod tests {
         ))]);
 
         let (body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         let expected_hash = sha256_hex(&body);
         assert_eq!(report.body_sha256.as_deref(), Some(expected_hash.as_str()));
@@ -5036,11 +5014,12 @@ mod tests {
                 .current_message
                 .user_input_message
                 .content = "x".repeat(content_bytes);
-            let expected = serialize_kiro_request(&template).expect("baseline Kiro serialization");
+            let expected =
+                serialize_local_upstream_request(&template).expect("baseline Kiro serialization");
 
             for round in 0..100 {
                 let mut request = template.clone();
-                let (body, report) = guard_kiro_request(
+                let (body, report) = guard_local_upstream_request(
                     &mut request,
                     guard_config(expected.len().saturating_add(1)),
                 )
@@ -5171,7 +5150,7 @@ mod tests {
                     .or_else(|| {
                         kiro_template
                             .as_ref()
-                            .map(|request| serialize_kiro_request(request).unwrap().len())
+                            .map(|request| serialize_local_upstream_request(request).unwrap().len())
                     })
                     .unwrap();
                 let mut latencies_us = Vec::with_capacity(ROUNDS);
@@ -5202,7 +5181,7 @@ mod tests {
                         report
                     } else {
                         let mut request = kiro_template.as_ref().unwrap().clone();
-                        let (body, report) = guard_kiro_request(
+                        let (body, report) = guard_local_upstream_request(
                             &mut request,
                             guard_config(input_bytes.saturating_add(1)),
                         )
@@ -5245,8 +5224,8 @@ mod tests {
             ))));
         }
         let mut request = request_with_history(history);
-        let (body, report) =
-            guard_kiro_request(&mut request, guard_config(5_000)).expect("guard should trim");
+        let (body, report) = guard_local_upstream_request(&mut request, guard_config(5_000))
+            .expect("guard should trim");
 
         assert!(body.len() <= 5_000);
         assert!(report.trimmed_history_entries > 0);
@@ -5361,7 +5340,8 @@ mod tests {
             .user_input_message
             .user_input_message_context =
             UserInputMessageContext::new().with_tool_results(current_results);
-        let (_body, report) = guard_kiro_request(&mut request, guard_config(1)).expect("guard");
+        let (_body, report) =
+            guard_local_upstream_request(&mut request, guard_config(1)).expect("guard");
         assert_eq!(report.trimmed_history_entries, 0);
         assert_eq!(report.removed_orphan_tool_results, 0);
         assert_eq!(report.removed_orphan_tool_uses, 0);
@@ -5555,7 +5535,7 @@ mod tests {
         }
         let mut request = request_with_history(history);
 
-        let (body, report) = guard_kiro_request(&mut request, guard_config(40_000))
+        let (body, report) = guard_local_upstream_request(&mut request, guard_config(40_000))
             .expect("large Kiro history should be trimmed in one batch");
 
         assert!(body.len() <= 40_000);
@@ -5632,7 +5612,7 @@ mod tests {
             Message::User(user),
         ]);
 
-        let (_body, report) = guard_kiro_request(&mut request, guard_config(usize::MAX))
+        let (_body, report) = guard_local_upstream_request(&mut request, guard_config(usize::MAX))
             .expect("guard should repair");
 
         assert_eq!(report.removed_orphan_tool_results, 1);
@@ -5670,7 +5650,7 @@ mod tests {
         ]);
 
         let (body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_orphan_tool_results, 0);
         assert_eq!(report.flattened_history_tool_uses, 0);
@@ -5701,7 +5681,7 @@ mod tests {
         request.conversation_state.current_message = CurrentMessage::new(current);
 
         let (body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_orphan_tool_results, 0);
         assert!(body.contains(EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER));
@@ -5751,7 +5731,7 @@ mod tests {
             .content = "Summarize everything above.".to_string();
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.flattened_history_tool_uses, 0);
         assert_eq!(report.textified_history_tool_results, 0);
@@ -5818,7 +5798,7 @@ mod tests {
         request.conversation_state.current_message = CurrentMessage::new(current);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.flattened_history_tool_uses, 0);
         assert_eq!(report.textified_history_tool_results, 0);
@@ -5918,7 +5898,7 @@ mod tests {
         ]);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.renamed_duplicate_tool_uses, 1);
         assert_eq!(report.removed_orphan_tool_uses, 0);
@@ -5984,7 +5964,7 @@ mod tests {
             .with_tool_results(vec![ToolResult::success("tool-1", "current content")]);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.renamed_duplicate_tool_uses, 1);
         assert_eq!(report.flattened_history_tool_uses, 0);
@@ -6041,7 +6021,7 @@ mod tests {
         ]);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_duplicate_tool_results, 1);
         assert_eq!(report.textified_duplicate_tool_results, 0);
@@ -6076,7 +6056,7 @@ mod tests {
             .with_tool_results(vec![ToolResult::success("", "empty-id secret result")]);
 
         let (body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_orphan_tool_results, 1);
         assert_eq!(report.removed_duplicate_tool_results, 0);
@@ -6104,7 +6084,7 @@ mod tests {
             cache_point_plan_recording_enabled: true,
         };
 
-        let (body, report) = guard_kiro_request(&mut request, guard_config(1_000))
+        let (body, report) = guard_local_upstream_request(&mut request, guard_config(1_000))
             .expect("oversized current message should be passed through to Kiro");
 
         assert!(body.len() > 1_000);
@@ -6132,7 +6112,7 @@ mod tests {
             .user_input_message
             .content = "x".repeat(10_000);
 
-        let (body, report) = guard_kiro_request(
+        let (body, report) = guard_local_upstream_request(
             &mut request,
             PayloadGuardConfig {
                 enabled: true,
@@ -6185,7 +6165,7 @@ mod tests {
             .user_input_message
             .content = "summarize the checks".to_string();
 
-        let (body, report) = guard_kiro_request(
+        let (body, report) = guard_local_upstream_request(
             &mut request,
             PayloadGuardConfig {
                 enabled: true,
@@ -6233,7 +6213,7 @@ mod tests {
             );
         }
 
-        let breakdown = breakdown_kiro_request(&request, &body);
+        let breakdown = breakdown_local_upstream_request(&request, &body);
         assert_eq!(breakdown.history_tool_use_count, TOOL_CYCLES);
         assert_eq!(breakdown.history_tool_result_count, TOOL_CYCLES);
     }
@@ -6311,7 +6291,7 @@ mod tests {
             cache_point_plan_recording_enabled: converted.cache_point_plan_recording_enabled,
         };
 
-        let (body, report) = guard_kiro_request(
+        let (body, report) = guard_local_upstream_request(
             &mut request,
             PayloadGuardConfig {
                 enabled: true,
@@ -6329,7 +6309,7 @@ mod tests {
         assert!(!body.contains("Tool results:"));
         assert!(!body.contains(&format!("{mapped_bash}:")));
         assert!(body.contains(&mapped_bash));
-        let breakdown = breakdown_kiro_request(&request, &body);
+        let breakdown = breakdown_local_upstream_request(&request, &body);
         assert_eq!(breakdown.history_tool_use_count, TOOL_CYCLES);
         assert_eq!(breakdown.history_tool_result_count, TOOL_CYCLES);
 
@@ -6467,7 +6447,7 @@ mod tests {
                 let (mut request, mapped_bash) = build_request(tool_cycles);
                 let original_history_len = request.conversation_state.history.len();
                 let mut baseline_request = request.clone();
-                let (untrimmed_body, baseline_report) = guard_kiro_request(
+                let (untrimmed_body, baseline_report) = guard_local_upstream_request(
                     &mut baseline_request,
                     PayloadGuardConfig {
                         enabled: true,
@@ -6480,7 +6460,7 @@ mod tests {
                 assert_eq!(baseline_report.trimmed_history_entries, 0);
                 let max_bytes = untrimmed_body.len() * 2 / 3;
 
-                let (body, report) = guard_kiro_request(
+                let (body, report) = guard_local_upstream_request(
                     &mut request,
                     PayloadGuardConfig {
                         enabled: true,
@@ -6667,7 +6647,7 @@ mod tests {
             cache_point_plan_recording_enabled: true,
         };
 
-        let diagnostics = diagnose_kiro_tool_use_format(&request);
+        let diagnostics = diagnose_local_upstream_tool_use_format(&request);
 
         assert!(diagnostics.has_tool_payload());
         assert_eq!(diagnostics.tool_items_scanned, 9);
@@ -6719,7 +6699,7 @@ mod tests {
             cache_point_plan_recording_enabled: true,
         };
 
-        let diagnostics = diagnose_kiro_tool_use_format(&request);
+        let diagnostics = diagnose_local_upstream_tool_use_format(&request);
 
         assert_eq!(diagnostics.empty_tool_descriptions, 1);
         assert_eq!(diagnostics.invalid_tool_schema_property_keys, 2);
@@ -6772,7 +6752,7 @@ mod tests {
             cache_point_plan_recording_enabled: true,
         };
 
-        let diagnostics = diagnose_kiro_tool_use_format(&request);
+        let diagnostics = diagnose_local_upstream_tool_use_format(&request);
 
         assert_eq!(
             diagnostics.invalid_tool_schema_property_keys, 3,
@@ -6904,7 +6884,7 @@ mod tests {
         };
 
         let (body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
         let value: Value = serde_json::from_str(&body).expect("body json");
         let tools = value
             .pointer(
@@ -6970,7 +6950,7 @@ mod tests {
         ]);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_empty_tool_uses, 1);
         let Message::Assistant(assistant) = &request.conversation_state.history[1] else {
@@ -6998,7 +6978,7 @@ mod tests {
                 Message::Assistant(assistant),
             ]);
 
-            let (_body, report) = guard_kiro_request(
+            let (_body, report) = guard_local_upstream_request(
                 &mut request,
                 guard_config_with_shaping(
                     usize::MAX,
@@ -7037,7 +7017,7 @@ mod tests {
             request_with_history(vec![Message::Assistant(assistant), Message::User(user)]);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.aligned_leading_entries, 1);
         assert_eq!(report.removed_orphan_tool_results, 1);
@@ -7065,7 +7045,7 @@ mod tests {
             .with_tool_results(vec![ToolResult::success("tool-1", "valid result")]);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_orphan_tool_uses, 0);
         assert_eq!(report.removed_orphan_tool_results, 0);
@@ -7122,7 +7102,7 @@ mod tests {
                 current_result.clone(),
             )]);
 
-        let (_body, report) = guard_kiro_request(
+        let (_body, report) = guard_local_upstream_request(
             &mut request,
             shaping_config(PayloadShapingConfig {
                 historical_tool_result_max_chars: 1_000,
@@ -7191,7 +7171,7 @@ mod tests {
                     "current result\n".repeat(5_000),
                 )]);
 
-            let (body, report) = guard_kiro_request(
+            let (body, report) = guard_local_upstream_request(
                 &mut request,
                 guard_config_with_shaping(
                     6_000,
@@ -7234,7 +7214,7 @@ mod tests {
             .user_input_message
             .content = "current message ".repeat(5_000);
 
-        let (body, report) = guard_kiro_request(
+        let (body, report) = guard_local_upstream_request(
             &mut request,
             guard_config_with_shaping(
                 5_000,
@@ -7278,7 +7258,7 @@ mod tests {
                 "pdf body ".repeat(5_000)
             );
 
-            let (body, report) = guard_kiro_request(
+            let (body, report) = guard_local_upstream_request(
                 &mut request,
                 guard_config_with_shaping(
                     6_000,
@@ -7325,7 +7305,7 @@ mod tests {
             LocalUpstreamImage::from_base64("jpeg", "b".repeat(12_000)),
         ];
 
-        let (body, report) = guard_kiro_request(
+        let (body, report) = guard_local_upstream_request(
             &mut request,
             guard_config_with_shaping(
                 5_000,
@@ -7398,7 +7378,7 @@ mod tests {
                 .current_message
                 .user_input_message
                 .images = vec![LocalUpstreamImage::from_base64("png", encoded.clone())];
-            let kiro_target = serialize_kiro_request(&one_kiro_image)
+            let kiro_target = serialize_local_upstream_request(&one_kiro_image)
                 .unwrap()
                 .len()
                 .saturating_add(4 * 1_024);
@@ -7415,7 +7395,7 @@ mod tests {
                 ..PayloadShapingConfig::default()
             };
 
-            let (kiro_body, kiro_report) = guard_kiro_request(
+            let (kiro_body, kiro_report) = guard_local_upstream_request(
                 &mut kiro_template,
                 guard_config_with_shaping(kiro_target, false, shaping),
             )
@@ -7520,7 +7500,7 @@ mod tests {
                 "current result\n".repeat(5_000),
             )]);
 
-        let (body, report) = guard_kiro_request(
+        let (body, report) = guard_local_upstream_request(
             &mut request,
             guard_config_with_shaping(
                 9_000,
@@ -7579,7 +7559,7 @@ mod tests {
             .user_input_message
             .content = original.clone();
 
-        let (_body, report) = guard_kiro_request(
+        let (_body, report) = guard_local_upstream_request(
             &mut request,
             guard_config_with_shaping(
                 5_000,
@@ -7619,7 +7599,7 @@ mod tests {
             Message::Assistant(assistant),
         ]);
 
-        let (_body, report) = guard_kiro_request(
+        let (_body, report) = guard_local_upstream_request(
             &mut request,
             shaping_config(PayloadShapingConfig {
                 truncate_historical_tool_results: false,
@@ -7669,7 +7649,7 @@ mod tests {
                     .user_input_message_context = UserInputMessageContext::new()
                     .with_tool_results(vec![ToolResult::success("tool-1", "done")]);
 
-                let (body, report) = guard_kiro_request(
+                let (body, report) = guard_local_upstream_request(
                     &mut request,
                     shaping_config(PayloadShapingConfig {
                         truncate_historical_tool_results: false,
@@ -7878,7 +7858,7 @@ mod tests {
                 "png",
                 base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
             )];
-            let (_body, report) = guard_kiro_request(&mut kiro, guard_config(usize::MAX))
+            let (_body, report) = guard_local_upstream_request(&mut kiro, guard_config(usize::MAX))
                 .expect("exact-limit Kiro image");
             assert_eq!(report.dropped_current_images, 0);
             assert_eq!(
@@ -8043,7 +8023,7 @@ mod tests {
             Message::User(user),
         ]);
 
-        let (_body, report) = guard_kiro_request(
+        let (_body, report) = guard_local_upstream_request(
             &mut request,
             shaping_config(PayloadShapingConfig {
                 historical_tool_result_max_chars: 1_000,
@@ -8102,7 +8082,7 @@ mod tests {
             Message::User(user),
         ]);
 
-        let (_body, report) = guard_kiro_request(
+        let (_body, report) = guard_local_upstream_request(
             &mut request,
             shaping_config(PayloadShapingConfig {
                 historical_tool_result_max_chars: 1_000,
@@ -8170,7 +8150,7 @@ mod tests {
                     },
                 }]);
 
-            let (_body, report) = guard_kiro_request(
+            let (_body, report) = guard_local_upstream_request(
                 &mut request,
                 shaping_config(PayloadShapingConfig {
                     truncate_historical_tool_results: false,
@@ -8235,7 +8215,7 @@ mod tests {
                     },
                 }]);
 
-            let (_body, report) = guard_kiro_request(
+            let (_body, report) = guard_local_upstream_request(
                 &mut request,
                 shaping_config(PayloadShapingConfig {
                     truncate_historical_tool_results: false,
@@ -8302,7 +8282,7 @@ mod tests {
             .with_tool_results(vec![ToolResult::success("tool-current", "current result")]);
 
         let body = serde_json::to_string(&request).expect("serialize");
-        let breakdown = breakdown_kiro_request(&request, &body);
+        let breakdown = breakdown_local_upstream_request(&request, &body);
 
         assert_eq!(breakdown.total_bytes, body.len());
         assert_eq!(breakdown.history_entries, 3);
@@ -8392,7 +8372,7 @@ mod tests {
         let mut request = request_with_history(vec![Message::User(user)]);
 
         let (_body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert!(report.original_bytes > 2048);
     }
@@ -8407,7 +8387,7 @@ mod tests {
         let mut request = request_with_history(vec![Message::User(user)]);
 
         let (body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.dropped_historical_images, 1);
         assert_eq!(
@@ -8437,7 +8417,7 @@ mod tests {
         )];
 
         let (body, report) =
-            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+            guard_local_upstream_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.dropped_current_images, 1);
         assert_eq!(
@@ -8475,7 +8455,7 @@ mod tests {
             base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
         )];
 
-        let err = guard_kiro_request(
+        let err = guard_local_upstream_request(
             &mut request,
             guard_config_with_shaping(
                 usize::MAX,
