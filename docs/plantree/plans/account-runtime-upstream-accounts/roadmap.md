@@ -110,6 +110,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Account-route local auxiliary attempt traces now use local-upstream credential-attempt aliases instead of direct legacy call-trace paths.
 - Account-route Redis lease cleanup now uses an account-runtime critical storage-task alias instead of importing the helper from the legacy token-manager module.
 - Main shutdown lifecycle now uses account-runtime storage-task aliases for best-effort storage task stats, drain and shutdown calls.
+- Postgres model-capability persistence now uses local-upstream model catalog aliases for reasoning cohort keys.
 
 ## In Progress
 

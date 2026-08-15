@@ -38,8 +38,8 @@ use crate::external_pool::{
     ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
     UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_model_mapping_rules,
 };
-use crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream::model_catalog::LocalUpstreamModelCapabilityCohortKey;
 use crate::model::config::{
     Config, ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ModelMappingRule,
     normalize_route_rules,
@@ -4565,7 +4565,7 @@ impl PostgresStore {
             Option<String>,
             Option<String>,
             BTreeMap<String, KiroReasoningFieldCapability>,
-            Vec<KiroModelCapabilityCohortKey>,
+            Vec<LocalUpstreamModelCapabilityCohortKey>,
             bool,
             u32,
             Vec<String>,
@@ -15653,7 +15653,7 @@ mod tests {
                     default_effort: Some("high".to_string()),
                 },
             )]),
-            reasoning_capability_cohort_keys: vec![KiroModelCapabilityCohortKey {
+            reasoning_capability_cohort_keys: vec![LocalUpstreamModelCapabilityCohortKey {
                 endpoint_family: "ide".to_string(),
                 auth_method: "social".to_string(),
                 provider: "builderid".to_string(),
