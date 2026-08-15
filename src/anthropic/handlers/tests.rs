@@ -6437,9 +6437,19 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
     for round in 1..=5 {
         assert_eq!(
             local_pool_acquire_mode(&config),
-            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
-            "round {round}: external eligibility was already established, so local capacity races still fail fast for reselect/fallback, while Redis degraded uses the external fallback's bounded wait window"
+            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_millis(
+                LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS
+            )),
+            "round {round}: external eligibility was already established, so local capacity races still fail fast for reselect/fallback, while Redis degraded only consumes a short fallback grace"
         );
+
+        config.fallback_on_scheduler_redis_degraded = false;
+        assert_eq!(
+            local_pool_acquire_mode(&config),
+            AcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
+            "round {round}: disabling Redis degraded fallback keeps the configured local dispatch wait"
+        );
+        config.fallback_on_scheduler_redis_degraded = true;
 
         config.fallback_on_local_capacity_exhausted = false;
         assert_eq!(
@@ -6721,6 +6731,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6824,6 +6835,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6918,6 +6930,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7015,6 +7028,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7127,6 +7141,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7220,6 +7235,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7343,6 +7359,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7680,6 +7697,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7853,6 +7871,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7944,6 +7963,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -8026,6 +8046,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -8585,6 +8606,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -8687,6 +8709,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
+        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -9880,7 +9903,6 @@ fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
 fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
     for reason in [
         "local_capacity_full",
-        "local_scheduler_redis_degraded",
         "local_all_cooling_down",
         "local_pool_risk_circuit_open",
         "local_transient_exhausted",
@@ -9895,6 +9917,7 @@ fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
     }
 
     for reason in [
+        "local_scheduler_redis_degraded",
         "local_no_credentials",
         "local_all_disabled",
         "local_proxy_blocked",
@@ -9904,7 +9927,7 @@ fn local_external_fallback_capacity_gate_reason_matrix_is_explicit() {
     ] {
         assert!(
             !local_route_reason_requires_immediate_external_capacity(reason),
-            "{reason} has no viable local route, so external fallback may use the external pool's own capacity policy"
+            "{reason} may use the external pool's own capacity policy instead of the local preflight immediate-capacity gate"
         );
     }
 }
@@ -10097,7 +10120,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
@@ -10242,7 +10265,7 @@ fn external_local_rescue_classifier_respects_error_type_and_toggles() {
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        None
+        Some("external_error")
     );
 }
 
@@ -10282,7 +10305,7 @@ fn external_local_rescue_is_blocked_after_terminal_local_route_reasons() {
 }
 
 #[test]
-fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fallbacks() {
+fn external_local_rescue_waits_for_capacity_based_local_fallbacks() {
     let config = ExternalPoolsConfig::default();
     let rate_limit = ExternalPoolFinalError {
         status: StatusCode::TOO_MANY_REQUESTS,
@@ -10330,7 +10353,7 @@ fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fall
             Some("local_capacity_full"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
@@ -10339,7 +10362,7 @@ fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fall
             Some("local_capacity_exhausted"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
     assert_eq!(
         local_rescue_reason_after_external_error(
@@ -10348,7 +10371,7 @@ fn external_local_rescue_requires_current_capacity_for_capacity_based_local_fall
             Some("local_attempt_reserved_for_fallback"),
             Some(0),
         ),
-        None
+        Some("external_rate_limit")
     );
 }
 

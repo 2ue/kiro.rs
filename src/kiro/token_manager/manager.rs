@@ -5108,6 +5108,40 @@ impl MultiTokenManager {
         })
     }
 
+    fn has_alternate_dispatchable_credential_for_slot_race(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+        current_priority: u32,
+        request_weight_units: u32,
+    ) -> bool {
+        let priority_mode = self.load_balancing_mode.lock().as_str() == "priority";
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        let config = self.config.lock().clone();
+        let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
+        if self.redis_store.is_none() {
+            refresh_local_selection_windows_locked(&mut entries, now);
+        }
+        let proxy_resources = self.proxy_resources.lock();
+        entries.iter().any(|entry| {
+            entry.id != current_id
+                && !excluded_ids.contains(&entry.id)
+                && (!priority_mode || entry.credentials.priority == current_priority)
+                && credential_is_dispatchable(
+                    &proxy_resources,
+                    entry,
+                    model,
+                    now,
+                    max_concurrent_requests,
+                    global_rpm,
+                    request_weight_units,
+                )
+        })
+    }
+
     fn exclude_credentials_requiring_refresh(&self, excluded_ids: &mut HashSet<u64>) -> usize {
         let entries = self.entries.lock();
         let before = excluded_ids.len();
@@ -5704,6 +5738,9 @@ impl MultiTokenManager {
         // One request uses one stable queue deadline. Runtime config updates apply to later
         // requests instead of changing an already-admitted Redis lease lifetime mid-wait.
         let dispatch_max_wait = self.dispatch_max_wait(acquire_mode);
+        let redis_degraded_max_wait = acquire_mode
+            .redis_degraded_max_wait_override()
+            .or(dispatch_max_wait);
         let mut queue_guard: Option<DispatchQueueGuard> = None;
         let mut local_excluded_ids = excluded_ids.clone();
         let mut slot_race_excluded_count = 0usize;
@@ -6225,7 +6262,7 @@ impl MultiTokenManager {
                         }
                         if queue_guard.is_none() {
                             queue_guard =
-                                self.try_enter_local_only_dispatch_queue(dispatch_max_wait);
+                                self.try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                             if queue_guard.is_none() {
                                 anyhow::bail!(
                                     "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -6236,7 +6273,7 @@ impl MultiTokenManager {
                         }
                         let now = Instant::now();
                         if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
-                            dispatch_max_wait,
+                            redis_degraded_max_wait,
                             dispatch_wait_started_at,
                             now,
                         ) {
@@ -6261,7 +6298,7 @@ impl MultiTokenManager {
                         self.sleep_for_scheduler_redis_recovery(
                             wait_for,
                             self.dispatch_wait_remaining(
-                                dispatch_max_wait,
+                                redis_degraded_max_wait,
                                 dispatch_wait_started_at,
                                 now,
                             ),
@@ -6340,6 +6377,23 @@ impl MultiTokenManager {
                         credential_id = id,
                         excluded_count = local_excluded_ids.len(),
                         "fail-fast 预检选中账号后并发槽已满，本次请求临时排除并重选"
+                    );
+                    continue;
+                }
+                if self.has_alternate_dispatchable_credential_for_slot_race(
+                    model,
+                    &local_excluded_ids,
+                    id,
+                    credentials.priority,
+                    request_weight_units,
+                ) {
+                    local_excluded_ids.insert(id);
+                    attempt_count += 1;
+                    slot_race_excluded_count += 1;
+                    tracing::debug!(
+                        credential_id = id,
+                        excluded_count = local_excluded_ids.len(),
+                        "选中凭据后并发槽已被其他请求占用，本次请求临时排除并重选其他可用凭据"
                     );
                     continue;
                 }
@@ -6432,8 +6486,8 @@ impl MultiTokenManager {
                                 return Err(err);
                             }
                             if queue_guard.is_none() {
-                                queue_guard =
-                                    self.try_enter_local_only_dispatch_queue(dispatch_max_wait);
+                                queue_guard = self
+                                    .try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                                 if queue_guard.is_none() {
                                     anyhow::bail!(
                                         "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -6444,7 +6498,7 @@ impl MultiTokenManager {
                             }
                             let now = Instant::now();
                             if let Some((waited, max_wait)) = self.dispatch_wait_exceeded(
-                                dispatch_max_wait,
+                                redis_degraded_max_wait,
                                 dispatch_wait_started_at,
                                 now,
                             ) {
@@ -6469,7 +6523,7 @@ impl MultiTokenManager {
                             self.sleep_for_scheduler_redis_recovery(
                                 wait_for,
                                 self.dispatch_wait_remaining(
-                                    dispatch_max_wait,
+                                    redis_degraded_max_wait,
                                     dispatch_wait_started_at,
                                     now,
                                 ),

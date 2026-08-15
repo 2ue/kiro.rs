@@ -2840,6 +2840,13 @@ pub struct ExternalPoolsConfig {
     /// 优先级 10/20 的健康池；填 0 会退回只按配置优先级和负载排序。
     #[serde(default = "default_external_pool_transient_failure_priority_penalty")]
     pub external_pool_transient_failure_priority_penalty: u32,
+    /// 连续瞬态失败升级为池级短冷却的阈值。
+    ///
+    /// 0 表示关闭升级，只保留短期优先级罚分。默认 3 表示同一个外部池在
+    /// Redis 瞬态失败窗口内连续出现 3 次同类失败后，才按该错误类型的
+    /// 冷却秒数临时避让，避免一次抖动就把流量全部切走。
+    #[serde(default = "default_external_pool_transient_failure_cooldown_threshold")]
+    pub external_pool_transient_failure_cooldown_threshold: u32,
     #[serde(default)]
     pub external_direct_policy_enabled: bool,
     #[serde(default)]
@@ -2938,12 +2945,26 @@ pub struct ExternalPoolsConfig {
     pub external_pool_auto_disable_on_channel_disabled: bool,
     #[serde(default = "default_external_pool_usage_projection_uplift_percent")]
     pub external_pool_usage_projection_uplift_percent: u32,
+    #[serde(default = "default_true")]
+    pub external_pool_usage_projection_cost_floor_enabled: bool,
+    #[serde(default = "default_external_pool_usage_projection_cost_floor_margin_percent")]
+    pub external_pool_usage_projection_cost_floor_margin_percent: u32,
     #[serde(default)]
     pub external_pool_usage_projection_output_uplift_min_tokens: i32,
     #[serde(default)]
     pub external_pool_usage_projection_output_uplift_percent: u32,
     #[serde(default)]
     pub external_pool_stream_response_mode: ExternalPoolStreamResponseMode,
+    /// 外部池 usage 诊断文件记录。默认关闭，只用于生产临时排查上游原始
+    /// usage/响应形状与本系统解析结果不一致的问题。
+    #[serde(default)]
+    pub external_pool_usage_debug_enabled: bool,
+    #[serde(default = "default_external_pool_usage_debug_dir")]
+    pub external_pool_usage_debug_dir: String,
+    #[serde(default = "default_external_pool_usage_debug_max_body_bytes")]
+    pub external_pool_usage_debug_max_body_bytes: u32,
+    #[serde(default = "default_external_pool_usage_debug_max_files")]
+    pub external_pool_usage_debug_max_files: u32,
 }
 
 impl Default for ExternalPoolsConfig {
@@ -2967,6 +2988,8 @@ impl Default for ExternalPoolsConfig {
             ),
             external_pool_transient_failure_priority_penalty:
                 default_external_pool_transient_failure_priority_penalty(),
+            external_pool_transient_failure_cooldown_threshold:
+                default_external_pool_transient_failure_cooldown_threshold(),
             external_direct_policy_enabled: false,
             direct_external_on_local_maintenance: false,
             direct_external_model_rules: Vec::new(),
@@ -3023,9 +3046,17 @@ impl Default for ExternalPoolsConfig {
             external_pool_auto_disable_on_channel_disabled: true,
             external_pool_usage_projection_uplift_percent:
                 default_external_pool_usage_projection_uplift_percent(),
+            external_pool_usage_projection_cost_floor_enabled: true,
+            external_pool_usage_projection_cost_floor_margin_percent:
+                default_external_pool_usage_projection_cost_floor_margin_percent(),
             external_pool_usage_projection_output_uplift_min_tokens: 0,
             external_pool_usage_projection_output_uplift_percent: 0,
             external_pool_stream_response_mode: ExternalPoolStreamResponseMode::default(),
+            external_pool_usage_debug_enabled: false,
+            external_pool_usage_debug_dir: default_external_pool_usage_debug_dir(),
+            external_pool_usage_debug_max_body_bytes:
+                default_external_pool_usage_debug_max_body_bytes(),
+            external_pool_usage_debug_max_files: default_external_pool_usage_debug_max_files(),
         }
     }
 }
@@ -4461,6 +4492,10 @@ fn default_external_pool_transient_failure_priority_penalty() -> u32 {
     20
 }
 
+fn default_external_pool_transient_failure_cooldown_threshold() -> u32 {
+    3
+}
+
 fn default_external_pool_max_input_tokens() -> i32 {
     1_000_000
 }
@@ -4503,6 +4538,22 @@ fn default_external_pool_stream_pre_output_retry_enabled() -> bool {
 
 fn default_external_pool_usage_projection_uplift_percent() -> u32 {
     25
+}
+
+fn default_external_pool_usage_projection_cost_floor_margin_percent() -> u32 {
+    10
+}
+
+fn default_external_pool_usage_debug_dir() -> String {
+    "/tmp/kiro-rs/external-pool-usage-debug".to_string()
+}
+
+fn default_external_pool_usage_debug_max_body_bytes() -> u32 {
+    8 * 1024
+}
+
+fn default_external_pool_usage_debug_max_files() -> u32 {
+    1_000
 }
 
 fn default_postgres_max_connections() -> u32 {
@@ -5409,6 +5460,12 @@ mod tests {
             20
         );
         assert_eq!(
+            config
+                .external_pools
+                .external_pool_transient_failure_cooldown_threshold,
+            3
+        );
+        assert_eq!(
             config.external_pools.external_pool_max_input_tokens,
             1_000_000
         );
@@ -5474,6 +5531,12 @@ mod tests {
                 .external_pools
                 .external_pool_transient_failure_priority_penalty,
             20
+        );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_transient_failure_cooldown_threshold,
+            3
         );
         assert_eq!(
             config.external_pools.external_pool_dispatch_max_wait_secs,
@@ -5767,6 +5830,12 @@ mod tests {
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
             ExternalPoolStreamResponseMode::EventPassthrough
+        );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_usage_projection_cost_floor_margin_percent,
+            10
         );
         assert_eq!(
             config

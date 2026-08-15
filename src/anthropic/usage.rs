@@ -13,6 +13,7 @@ use tokio::runtime::{Runtime, RuntimeFlavor};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::common::upstream_error::RawUpstreamError;
 use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
 use crate::storage::postgres::PostgresUsageStore;
 use crate::storage::redis_cache::RedisStore;
@@ -89,6 +90,8 @@ pub struct ExternalPoolAttempt {
     pub error_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_upstream_error: Option<RawUpstreamError>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -492,6 +495,8 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_metadata: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_upstream_error: Option<RawUpstreamError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_error_status_code: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_error_type: Option<String>,
@@ -507,6 +512,7 @@ pub struct UsageRecord {
 ///
 /// `observed_count` is the monotonic count observed when the sample was selected. It is not the
 /// exact number of rejected requests represented by this record.
+#[cfg(test)]
 pub(crate) fn sampled_request_rejection_usage_record(
     request_id: &str,
     endpoint: &str,
@@ -516,6 +522,40 @@ pub(crate) fn sampled_request_rejection_usage_record(
     status: http::StatusCode,
     observed_count: u64,
 ) -> UsageRecord {
+    sampled_request_rejection_usage_record_with_metadata(
+        request_id,
+        endpoint,
+        request_api_key_id,
+        reason,
+        stage,
+        status,
+        observed_count,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
+    request_id: &str,
+    endpoint: &str,
+    request_api_key_id: Option<String>,
+    reason: &'static str,
+    stage: &'static str,
+    status: http::StatusCode,
+    observed_count: u64,
+    extra_metadata: Option<serde_json::Value>,
+) -> UsageRecord {
+    let mut error_metadata = serde_json::json!({
+        "sampled": true,
+        "observedCount": observed_count,
+        "observedCountIsExact": false,
+        "stage": stage,
+        "reason": reason,
+    });
+    if let Some(extra_metadata) = extra_metadata {
+        merge_usage_error_metadata(&mut error_metadata, extra_metadata);
+    }
+
     UsageRecord {
         id: request_id.to_string(),
         created_at: Utc::now().to_rfc3339(),
@@ -573,18 +613,24 @@ pub(crate) fn sampled_request_rejection_usage_record(
         error_status_code: Some(status.as_u16()),
         error_source: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
         error_id: Some(request_id.to_string()),
-        error_metadata: Some(serde_json::json!({
-            "sampled": true,
-            "observedCount": observed_count,
-            "observedCountIsExact": false,
-            "stage": stage,
-            "reason": reason,
-        })),
+        error_metadata: Some(error_metadata),
+        raw_upstream_error: None,
         public_error_status_code: None,
         public_error_type: None,
         public_error_message: None,
         payload_breakdown: None,
         payload_guard_report: None,
+    }
+}
+
+fn merge_usage_error_metadata(target: &mut serde_json::Value, extra: serde_json::Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in extra {
+        if !target.contains_key(key) {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -846,6 +892,214 @@ pub struct UsageDashboardExternalPoolBillingResponse {
     pub timezone: String,
     pub window_key: String,
     pub external_pool_billing_by_pool: Vec<UsageExternalPoolBillingByPool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageExternalPoolRiskQuery {
+    pub timezone: String,
+    pub window_key: String,
+    pub window_label: String,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub warning_threshold_tokens: i64,
+    pub critical_threshold_tokens: i64,
+    pub pool_id: Option<u64>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub stream: Option<bool>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UsageExternalPoolRiskCostConfig {
+    pub cost_floor_enabled: bool,
+    pub cost_floor_margin_percent: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub window: UsageExternalPoolRiskWindow,
+    pub thresholds: UsageExternalPoolRiskThresholds,
+    pub filters: UsageExternalPoolRiskFilters,
+    pub totals: UsageExternalPoolRiskTotals,
+    pub raw_cache: UsageExternalPoolRiskCacheStats,
+    pub reported_cache: UsageExternalPoolRiskCacheStats,
+    pub cost: UsageExternalPoolRiskCostStats,
+    pub buckets: Vec<UsageExternalPoolRiskBucket>,
+    pub by_pool: Vec<UsageExternalPoolRiskGroup>,
+    pub by_path: Vec<UsageExternalPoolRiskGroup>,
+    pub by_model: Vec<UsageExternalPoolRiskGroup>,
+    pub samples: Vec<UsageExternalPoolRiskSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskWindow {
+    pub key: String,
+    pub label: String,
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskThresholds {
+    pub warning_tokens: i64,
+    pub critical_tokens: i64,
+    pub cost_floor_enabled: bool,
+    pub cost_floor_margin_percent: u32,
+    pub cost_target_multiplier: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskTotals {
+    pub records: usize,
+    pub success_records: usize,
+    pub error_records: usize,
+    pub stream_records: usize,
+    pub non_stream_records: usize,
+    pub priced_records: usize,
+    pub unpriced_records: usize,
+    pub raw_usage_records: usize,
+    pub reported_usage_records: usize,
+    pub missing_external_pool_billing_records: usize,
+    pub output_zero_records: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskCacheStats {
+    pub min_read_tokens: i64,
+    pub max_read_tokens: i64,
+    pub avg_read_tokens: f64,
+    pub total_read_tokens: i64,
+    pub min_write_tokens: i64,
+    pub max_write_tokens: i64,
+    pub avg_write_tokens: f64,
+    pub total_write_tokens: i64,
+    pub read_warning_count: usize,
+    pub write_warning_count: usize,
+    pub either_warning_count: usize,
+    pub read_critical_count: usize,
+    pub write_critical_count: usize,
+    pub either_critical_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskCostStats {
+    pub raw_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub target_cost_usd: f64,
+    pub profit_usd: f64,
+    pub total_loss_usd: f64,
+    pub total_target_gap_usd: f64,
+    pub max_loss_usd: f64,
+    pub max_target_gap_usd: f64,
+    pub max_raw_cost_usd: f64,
+    pub max_reported_cost_usd: f64,
+    pub below_raw_count: usize,
+    pub below_target_count: usize,
+    pub cost_floor_applied_records: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_cost_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_cost_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskBucket {
+    pub key: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i64>,
+    pub raw_read_count: usize,
+    pub raw_write_count: usize,
+    pub reported_read_count: usize,
+    pub reported_write_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskGroup {
+    pub key: String,
+    pub label: String,
+    pub records: usize,
+    pub success_records: usize,
+    pub warning_records: usize,
+    pub critical_records: usize,
+    pub output_zero_records: usize,
+    pub raw_read_max: i64,
+    pub raw_write_max: i64,
+    pub reported_read_max: i64,
+    pub reported_write_max: i64,
+    pub raw_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub target_cost_usd: f64,
+    pub profit_usd: f64,
+    pub total_loss_usd: f64,
+    pub total_target_gap_usd: f64,
+    pub below_raw_count: usize,
+    pub below_target_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskSample {
+    pub id: String,
+    pub created_at: String,
+    pub endpoint: String,
+    pub stream: bool,
+    pub model: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_pool_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_pool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_projection_mode: Option<String>,
+    pub external_pool_billing_present: bool,
+    pub cost_floor_applied: bool,
+    pub raw_input_tokens: i64,
+    pub raw_output_tokens: i64,
+    pub raw_cache_read_input_tokens: i64,
+    pub raw_cache_creation_input_tokens: i64,
+    pub reported_input_tokens: i64,
+    pub reported_output_tokens: i64,
+    pub reported_cache_read_input_tokens: i64,
+    pub reported_cache_creation_input_tokens: i64,
+    pub raw_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub target_cost_usd: f64,
+    pub loss_usd: f64,
+    pub target_gap_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_ratio: Option<f64>,
+    pub risk_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1362,6 +1616,7 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         && record.error_message.is_none()
         && record.error_detail.is_none()
         && record.error_metadata.is_none()
+        && record.raw_upstream_error.is_none()
         && record.public_error_message.is_none()
     {
         return record;
@@ -1385,6 +1640,22 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         public_message_truncated,
         ERROR_DIAGNOSTIC_MAX_METADATA_BYTES,
     );
+    record.raw_upstream_error = record
+        .raw_upstream_error
+        .take()
+        .map(RawUpstreamError::normalize);
+    for attempt in &mut record.credential_attempts {
+        attempt.raw_upstream_error = attempt
+            .raw_upstream_error
+            .take()
+            .map(RawUpstreamError::normalize);
+    }
+    for attempt in &mut record.external_attempts {
+        attempt.raw_upstream_error = attempt
+            .raw_upstream_error
+            .take()
+            .map(RawUpstreamError::normalize);
+    }
     record
 }
 
@@ -2560,6 +2831,22 @@ impl UsageRecorder {
         anyhow::bail!("usage dashboard external pool billing 的精确窗口人口需要 PgSQL 聚合存储")
     }
 
+    pub fn external_pool_usage_risk(
+        &self,
+        query: UsageExternalPoolRiskQuery,
+        cost_config: UsageExternalPoolRiskCostConfig,
+    ) -> anyhow::Result<UsageExternalPoolRiskResponse> {
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            return self.dashboard_query(
+                "PgSQL external pool usage risk",
+                USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+                async move { store.external_pool_usage_risk(query, cost_config).await },
+            );
+        }
+        anyhow::bail!("外部池 usage 风控需要 PgSQL usage 明细存储")
+    }
+
     fn summary_memory(&self, high_cache_threshold: i32) -> UsageSummary {
         let records = self.records.lock();
         let mut summary = UsageSummary {
@@ -3482,6 +3769,7 @@ mod tests {
             error_source: None,
             error_id: None,
             error_metadata: None,
+            raw_upstream_error: None,
             public_error_status_code: None,
             public_error_type: None,
             public_error_message: None,

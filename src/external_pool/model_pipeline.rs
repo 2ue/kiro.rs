@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::result_large_err)]
 pub(super) fn outbound_model_for_raw(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -18,6 +19,7 @@ pub(super) fn outbound_model_for_raw(
     process_external_pool_model(pool, original_model, processed_model)
 }
 
+#[allow(clippy::result_large_err)]
 fn process_external_pool_model(
     pool: &ExternalPool,
     original_model: Option<&str>,
@@ -93,6 +95,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         },
         ModelProcessingError::MappingMiss { model } => ExternalPoolError {
             status: Some(StatusCode::BAD_GATEWAY),
@@ -104,6 +107,7 @@ fn model_processing_error(pool: &ExternalPool, err: ModelProcessingError) -> Ext
             auto_disable_reason: None,
             cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
             protocol_error: None,
+            raw_upstream_error: None,
         },
     }
 }

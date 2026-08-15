@@ -376,6 +376,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(joinStatusCodeList(draft.externalPools.externalPoolSamePoolRetryStatusCodes)),
       externalPoolSamePoolRetryDelayMs: toWhole(draft.externalPools.externalPoolSamePoolRetryDelayMs),
       externalPoolTransientFailurePriorityPenalty: toWhole(draft.externalPools.externalPoolTransientFailurePriorityPenalty),
+      externalPoolTransientFailureCooldownThreshold: toWhole(draft.externalPools.externalPoolTransientFailureCooldownThreshold),
       externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
       localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
       localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
@@ -396,8 +397,14 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolRouteMode: normalizeExternalPoolRouteMode(draft.externalPools.externalPoolRouteMode),
       externalPoolRouteRules: normalizeRuleList(draft.externalPools.externalPoolRouteRules),
       externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
+      externalPoolUsageProjectionCostFloorEnabled: Boolean(draft.externalPools.externalPoolUsageProjectionCostFloorEnabled),
+      externalPoolUsageProjectionCostFloorMarginPercent: toWhole(draft.externalPools.externalPoolUsageProjectionCostFloorMarginPercent),
       externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
       externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
+      externalPoolUsageDebugEnabled: Boolean(draft.externalPools.externalPoolUsageDebugEnabled),
+      externalPoolUsageDebugDir: String(draft.externalPools.externalPoolUsageDebugDir || '').trim(),
+      externalPoolUsageDebugMaxBodyBytes: toWhole(draft.externalPools.externalPoolUsageDebugMaxBodyBytes),
+      externalPoolUsageDebugMaxFiles: toWhole(draft.externalPools.externalPoolUsageDebugMaxFiles),
     },
   }
   return next
@@ -847,6 +854,49 @@ export function RuntimePage() {
                   />
                 </TwoCol>
 
+                <div className="rounded-lg border border-warning/30 bg-warning/5 p-4">
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <TogField
+                      label="外部池 usage 原始数据诊断"
+                      desc="临时记录外部池上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；默认关闭。"
+                      checked={draft.externalPools.externalPoolUsageDebugEnabled}
+                      onChange={setExternalPools('externalPoolUsageDebugEnabled')}
+                    />
+                    <label className="space-y-1.5 text-sm">
+                      <span className="text-muted-foreground">诊断目录</span>
+                      <Input
+                        className="font-mono text-xs"
+                        value={draft.externalPools.externalPoolUsageDebugDir}
+                        placeholder="/tmp/kiro-rs/external-pool-usage-debug"
+                        onChange={(event) => setExternalPools('externalPoolUsageDebugDir')(event.target.value)}
+                      />
+                      <span className="block text-xs leading-4 text-muted-foreground">
+                        写入容器内路径；记录失败只写服务日志，不影响请求。
+                      </span>
+                    </label>
+                    <NumField
+                      label="单条原始片段上限"
+                      desc="限制原始请求/响应 body 与 SSE 前缀保存大小。"
+                      value={draft.externalPools.externalPoolUsageDebugMaxBodyBytes}
+                      min={0}
+                      max={1024 * 1024}
+                      suffix="Bytes"
+                      disabled={!draft.externalPools.externalPoolUsageDebugEnabled}
+                      onChange={setExternalPools('externalPoolUsageDebugMaxBodyBytes')}
+                    />
+                    <NumField
+                      label="最多诊断文件"
+                      desc="进程启动后最多写入的诊断 JSON 文件数；超出后跳过写入。"
+                      value={draft.externalPools.externalPoolUsageDebugMaxFiles}
+                      min={0}
+                      max={100_000}
+                      suffix="个"
+                      disabled={!draft.externalPools.externalPoolUsageDebugEnabled}
+                      onChange={setExternalPools('externalPoolUsageDebugMaxFiles')}
+                    />
+                  </div>
+                </div>
+
                 <div className="grid gap-4 md:grid-cols-[minmax(16rem,22rem)_1fr]">
                   <div className="space-y-1.5">
                     <div className="text-sm font-semibold">外部池路由模式</div>
@@ -974,6 +1024,15 @@ export function RuntimePage() {
                     max={10_000}
                     suffix="优先级"
                     onChange={setExternalPools('externalPoolTransientFailurePriorityPenalty')}
+                  />
+                  <NumField
+                    label="连续失败冷却阈值"
+                    desc="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；0 表示关闭。"
+                    value={draft.externalPools.externalPoolTransientFailureCooldownThreshold}
+                    min={0}
+                    max={1000}
+                    suffix="次"
+                    onChange={setExternalPools('externalPoolTransientFailureCooldownThreshold')}
                   />
                   <label className="space-y-1.5 text-sm md:col-span-2">
                     <span className="text-muted-foreground">同池重试状态码</span>

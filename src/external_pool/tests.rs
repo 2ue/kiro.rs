@@ -7,7 +7,92 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{AcquireMode, MultiTokenManager};
 use crate::model::config::Config;
 use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
-use base64::Engine as _;
+
+#[test]
+fn external_usage_debug_candidates_collect_raw_usage_from_unusual_paths() {
+    let value = json!({
+        "wrapper": {
+            "nested": {
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        },
+        "choices": [
+            {
+                "message": { "content": "ok" },
+                "provider_usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 4
+                }
+            }
+        ]
+    });
+
+    let candidates = collect_external_pool_usage_debug_candidates(&value);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.wrapper.nested.usage"
+                && candidate.raw_json.contains("\"output_tokens\":5")),
+        "must keep raw Anthropic usage from non-standard wrapper path"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.choices[0].provider_usage"
+                && candidate
+                    .normalized_anthropic_usage
+                    .as_ref()
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(|value| value.as_i64())
+                    == Some(4)),
+        "must normalize OpenAI-style raw usage without losing original raw json"
+    );
+}
+
+#[test]
+fn external_usage_debug_sse_event_keeps_raw_usage_event_sample() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+    plan.usage_debug_enabled = true;
+    plan.usage_debug_max_body_bytes = 128;
+    let event = br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}
+
+"#;
+
+    record_external_usage_debug_sse_event(event, Some(&capture), plan);
+
+    let snapshot = capture.lock().debug_stream.clone();
+    assert_eq!(snapshot.events_seen, 1);
+    assert_eq!(snapshot.usage_events_seen, 1);
+    assert_eq!(snapshot.usage_paths.get("$.usage"), Some(&1));
+    let sample = snapshot
+        .raw_usage_event_samples
+        .first()
+        .expect("usage event sample should be present");
+    assert_eq!(sample.event.as_deref(), Some("message_delta"));
+    assert!(sample.raw_event_utf8.contains("\"output_tokens\":4"));
+    assert!(
+        sample
+            .usage_candidates
+            .iter()
+            .any(|candidate| candidate.path == "$.usage"
+                && candidate.raw_json.contains("\"output_tokens\":4")),
+        "raw SSE usage candidate should be kept for single-request analysis"
+    );
+    let preview = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        snapshot.raw_stream_preview_base64.as_bytes(),
+    )
+    .expect("stream preview should be valid base64");
+    assert_eq!(preview, event);
+}
 
 #[test]
 fn persisted_external_pool_enum_parsers_reject_unknown_values_for_five_rounds() {
@@ -156,8 +241,11 @@ async fn external_pool_local_mutations_keep_all_pools_when_own_event_is_observed
 enum TestRawHttpBody {
     DeclaredOnly(usize),
     Chunked(Vec<u8>),
+    DelayedFixed(Duration, Vec<u8>),
+    StallBeforeHeaders(Duration),
     StallAfterPrefix,
     Fixed(Vec<u8>),
+    GzipJson(Vec<u8>),
 }
 
 async fn spawn_test_raw_http_response(
@@ -199,6 +287,21 @@ async fn spawn_test_raw_http_response(
                     let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
                 }
             }
+            TestRawHttpBody::DelayedFixed(delay, bytes) => {
+                tokio::time::sleep(delay).await;
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&bytes).await;
+                }
+            }
+            TestRawHttpBody::StallBeforeHeaders(delay) => {
+                tokio::time::sleep(delay).await;
+            }
             TestRawHttpBody::StallAfterPrefix => {
                 let headers = format!(
                     "HTTP/1.1 {} {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx",
@@ -211,6 +314,17 @@ async fn spawn_test_raw_http_response(
             TestRawHttpBody::Fixed(bytes) => {
                 let headers = format!(
                     "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status.as_u16(),
+                    reason,
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(&bytes).await;
+                }
+            }
+            TestRawHttpBody::GzipJson(bytes) => {
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     status.as_u16(),
                     reason,
                     bytes.len()
@@ -678,6 +792,178 @@ impl Drop for TurbulentExternalMessagesFakeServer {
     }
 }
 
+#[derive(Clone)]
+enum PatternExternalMessagesBehavior {
+    AlwaysSuccess,
+    AlwaysFail {
+        status: StatusCode,
+        message: String,
+    },
+    FailFirst {
+        count: u64,
+        status: StatusCode,
+        message: String,
+    },
+    Intermittent {
+        fail_percent: u8,
+        seed: u64,
+        statuses: Arc<Vec<(StatusCode, String)>>,
+    },
+}
+
+#[derive(Clone)]
+struct PatternExternalMessagesFakeState {
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    behavior: PatternExternalMessagesBehavior,
+    success_body: serde_json::Value,
+}
+
+struct PatternExternalMessagesFakeServer {
+    base_url: String,
+    hits: Arc<AtomicU64>,
+    failures: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PatternExternalMessagesFakeServer {
+    async fn start(
+        behavior: PatternExternalMessagesBehavior,
+        success_body: serde_json::Value,
+    ) -> Self {
+        async fn messages(
+            axum::extract::State(state): axum::extract::State<PatternExternalMessagesFakeState>,
+        ) -> impl axum::response::IntoResponse {
+            let hit = state.hits.fetch_add(1, Ordering::Relaxed) + 1;
+            let failure = match &state.behavior {
+                PatternExternalMessagesBehavior::AlwaysSuccess => None,
+                PatternExternalMessagesBehavior::AlwaysFail { status, message } => {
+                    Some((*status, message.as_str()))
+                }
+                PatternExternalMessagesBehavior::FailFirst {
+                    count,
+                    status,
+                    message,
+                } if hit <= *count => Some((*status, message.as_str())),
+                PatternExternalMessagesBehavior::FailFirst { .. } => None,
+                PatternExternalMessagesBehavior::Intermittent {
+                    fail_percent,
+                    seed,
+                    statuses,
+                } if deterministic_failure_percent(hit, *seed)
+                    < (*fail_percent).min(100) as u64 =>
+                {
+                    let index = deterministic_failure_percent(hit, *seed ^ 0x0ddc_0ffe) as usize
+                        % statuses.len();
+                    let (status, message) = &statuses[index];
+                    Some((*status, message.as_str()))
+                }
+                PatternExternalMessagesBehavior::Intermittent { .. } => None,
+            };
+            if let Some((status, message)) = failure {
+                state.failures.fetch_add(1, Ordering::Relaxed);
+                return (status, axum::Json(fake_external_error_body(message)));
+            }
+            (StatusCode::OK, axum::Json(state.success_body.clone()))
+        }
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let state = PatternExternalMessagesFakeState {
+            hits: hits.clone(),
+            failures: failures.clone(),
+            behavior,
+            success_body,
+        };
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(messages))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pattern external messages fake server");
+        let address = listener
+            .local_addr()
+            .expect("pattern external messages address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve pattern external messages fake server");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            hits,
+            failures,
+            task,
+        }
+    }
+
+    async fn always_success(text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::AlwaysSuccess,
+            fake_external_success_body(text),
+        )
+        .await
+    }
+
+    async fn always_fail(status: StatusCode, message: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::AlwaysFail {
+                status,
+                message: message.to_string(),
+            },
+            fake_external_success_body("unused"),
+        )
+        .await
+    }
+
+    async fn fail_first(count: u64, status: StatusCode, message: &str, success_text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::FailFirst {
+                count,
+                status,
+                message: message.to_string(),
+            },
+            fake_external_success_body(success_text),
+        )
+        .await
+    }
+
+    async fn intermittent(
+        fail_percent: u8,
+        seed: u64,
+        statuses: Vec<(StatusCode, &str)>,
+        success_text: &str,
+    ) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::Intermittent {
+                fail_percent,
+                seed,
+                statuses: Arc::new(
+                    statuses
+                        .into_iter()
+                        .map(|(status, message)| (status, message.to_string()))
+                        .collect(),
+                ),
+            },
+            fake_external_success_body(success_text),
+        )
+        .await
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Acquire),
+            self.failures.load(Ordering::Acquire),
+        )
+    }
+}
+
+impl Drop for PatternExternalMessagesFakeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 fn deterministic_failure_percent(index: u64, seed: u64) -> u64 {
     let mut mixed = index.wrapping_add(seed).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     mixed ^= mixed >> 33;
@@ -811,8 +1097,32 @@ fn external_stream_config_for_test() -> ExternalPoolsConfig {
         external_pool_protocol_error_cooldown_secs: 1,
         external_pool_network_error_cooldown_secs: 1,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     }
+}
+
+#[test]
+fn external_stream_request_timeout_zero_does_not_inherit_non_stream_timeout() {
+    let config = ExternalPoolsConfig {
+        external_pool_request_timeout_secs: 2,
+        external_pool_stream_request_timeout_secs: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    payload_mut(&mut route).stream = true;
+    refresh_test_route_derived_state(&mut route);
+    let dispatch_deadline = external_dispatch_deadline(&route, &config);
+
+    assert!(
+        dispatch_deadline.is_some(),
+        "overall stream dispatch capacity wait still has a bounded deadline"
+    );
+    assert_eq!(
+        external_request_send_timeout(&route, &config, dispatch_deadline),
+        None,
+        "stream request_timeout=0 must keep long stream semantics and rely on idle timeout"
+    );
 }
 
 fn external_stream_route(
@@ -887,6 +1197,241 @@ async fn create_messages_pool_with_concurrency(
     request.max_concurrent_requests = max_concurrent_requests;
     request.supported_models = vec!["claude-sonnet-4-6".to_string()];
     postgres.create_external_pool(request).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_slow_upstream_status_keeps_status_and_error_body_fragment() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream_status = StatusCode::from_u16(524).expect("test status");
+    let (url, server) = spawn_test_raw_http_response(
+        upstream_status,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(200),
+            br#"{"error":{"message":"cf edge timeout marker"}}"#.to_vec(),
+        ),
+    )
+    .await;
+    let pool = create_messages_pool(&postgres, "slow-upstream-status", 1, &url).await;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 1,
+        external_pool_request_timeout_secs: 2,
+        external_pool_server_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_slow_upstream_status".to_string();
+    route.error_id = "err_slow_upstream_status".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("delayed upstream status should finish");
+    assert!(
+        started.elapsed() >= Duration::from_millis(150),
+        "the fake upstream must really delay before returning the status"
+    );
+    let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
+        panic!("single 524 pool must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 1);
+    let attempt = &error.attempts[0];
+    assert_eq!(attempt.pool_id, pool.id);
+    assert_eq!(attempt.status, Some(524));
+    assert_eq!(attempt.error_type.as_deref(), Some("server_error"));
+    assert!(
+        attempt.duration_ms >= 150 && attempt.duration_ms < 1500,
+        "status attempt duration should reflect upstream delay, got {}ms",
+        attempt.duration_ms
+    );
+    let raw = attempt
+        .raw_upstream_error
+        .as_ref()
+        .expect("HTTP status error should keep bounded upstream error fragment");
+    assert_eq!(raw.status_code, Some(524));
+    assert!(raw.body.contains("cf edge timeout marker"));
+
+    let record = usage_record_for_request(&recorder, "req_slow_upstream_status");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.external_pool_id, Some(pool.id));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].status, Some(524));
+    assert!(record.external_attempts[0].raw_upstream_error.is_some());
+    assert!(record.raw_upstream_error.is_some());
+
+    server.await.expect("delayed status server should exit");
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_no_response_headers_becomes_client_timeout_without_raw_body() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let (url, server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::StallBeforeHeaders(Duration::from_secs(5)),
+    )
+    .await;
+    let pool = create_messages_pool(&postgres, "no-response-headers", 1, &url).await;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 1,
+        external_pool_request_timeout_secs: 1,
+        external_pool_network_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_no_response_headers_timeout".to_string();
+    route.error_id = "err_no_response_headers_timeout".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("client request timeout should finish before fake server wakes up");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(2500),
+        "client timeout should be governed by request timeout, got {elapsed:?}"
+    );
+    let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
+        panic!("single stalled pool must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 1);
+    let attempt = &error.attempts[0];
+    assert_eq!(attempt.pool_id, pool.id);
+    assert_eq!(attempt.status, None);
+    assert_eq!(attempt.error_type.as_deref(), Some("network_error"));
+    assert!(
+        attempt
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("request send failed: timeout")),
+        "timeout attempt should keep system send-timeout error, got {:?}",
+        attempt.error_message
+    );
+    assert!(
+        attempt.raw_upstream_error.is_none(),
+        "no response headers means there is no upstream response body to record"
+    );
+
+    let record = usage_record_for_request(&recorder, "req_no_response_headers_timeout");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.external_pool_id, Some(pool.id));
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].status, None);
+    assert!(record.external_attempts[0].raw_upstream_error.is_none());
+    assert!(record.raw_upstream_error.is_none());
+    assert!(
+        record
+            .error_detail
+            .as_deref()
+            .or(record.error_message.as_deref())
+            .is_some_and(|message| message.contains("request send failed: timeout"))
+    );
+
+    server.abort();
+    let _ = server.await;
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_retry_send_timeout_uses_remaining_dispatch_deadline() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let (slow_502_url, slow_502_server) = spawn_test_raw_http_response(
+        StatusCode::BAD_GATEWAY,
+        TestRawHttpBody::DelayedFixed(
+            Duration::from_millis(1200),
+            br#"{"error":{"message":"upstream returned 502 after edge wait"}}"#.to_vec(),
+        ),
+    )
+    .await;
+    let (stalled_url, stalled_server) = spawn_test_raw_http_response(
+        StatusCode::OK,
+        TestRawHttpBody::StallBeforeHeaders(Duration::from_secs(5)),
+    )
+    .await;
+    let pool_a = create_messages_pool(&postgres, "deadline-slow-502", 1, &slow_502_url).await;
+    let pool_b = create_messages_pool(&postgres, "deadline-stalled-next", 10, &stalled_url).await;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_retry_max_attempts: 2,
+        external_pool_request_timeout_secs: 2,
+        external_pool_server_error_cooldown_secs: 1,
+        external_pool_network_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let recorder = Arc::new(crate::anthropic::usage::UsageRecorder::new(4));
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_retry_uses_remaining_deadline".to_string();
+    route.error_id = "err_retry_uses_remaining_deadline".to_string();
+    route.recorder = recorder.clone();
+
+    let started = Instant::now();
+    let outcome = timeout(
+        Duration::from_secs(4),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("remaining dispatch deadline should cap the second send");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2800),
+        "second attempt must not consume a full extra request timeout; got {elapsed:?}"
+    );
+    let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
+        panic!("both failing pools must return a final error");
+    };
+    assert_eq!(error.attempts.len(), 2);
+    assert_eq!(error.attempts[0].pool_id, pool_a.id);
+    assert_eq!(error.attempts[0].status, Some(502));
+    assert_eq!(
+        error.attempts[0].error_type.as_deref(),
+        Some("server_error")
+    );
+    assert_eq!(error.attempts[1].pool_id, pool_b.id);
+    assert_eq!(error.attempts[1].status, None);
+    assert_eq!(
+        error.attempts[1].error_type.as_deref(),
+        Some("network_error")
+    );
+    assert!(
+        error.attempts[1].duration_ms < 1500,
+        "second send should use the remaining request deadline, got {}ms",
+        error.attempts[1].duration_ms
+    );
+
+    let record = usage_record_for_request(&recorder, "req_retry_uses_remaining_deadline");
+    assert_eq!(record.status, UsageRecordStatus::Error);
+    assert_eq!(record.external_attempts.len(), 2);
+    assert_eq!(record.external_attempts[0].status, Some(502));
+    assert_eq!(record.external_attempts[1].status, None);
+    assert!(record.external_attempts[0].raw_upstream_error.is_some());
+    assert!(record.external_attempts[1].raw_upstream_error.is_none());
+
+    slow_502_server
+        .await
+        .expect("delayed 502 server should exit");
+    stalled_server.abort();
+    let _ = stalled_server.await;
+    postgres.drop_test_schema().await.unwrap();
 }
 
 #[test]
@@ -1020,6 +1565,71 @@ async fn external_pool_stream_pre_output_error_event_fails_over_and_keeps_succes
     assert_eq!(billing.reported_usage.input_tokens, 222);
     assert_eq!(billing.reported_usage.output_tokens, 5);
     assert_ne!(billing.raw_usage.input_tokens, 111);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_keepalive_emits_ping_during_silent_gap_before_output() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_keepalive_a", 111)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("after-gap")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_messages_pool(&postgres, "stream-keepalive-ping", 1, &upstream.base_url).await;
+
+    let request_id = "req_stream_keepalive_ping";
+    let (route, recorder) = external_stream_route(request_id, "err_stream_keepalive_ping");
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("keepalive stream should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("keepalive stream should not fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("msg_keepalive_a"));
+    assert!(body.contains("after-gap"));
+    assert!(body.contains("event: ping"));
+    let message_start_pos = body
+        .find("msg_keepalive_a")
+        .expect("message_start should be present");
+    let ping_pos = body
+        .find("event: ping")
+        .expect("keepalive ping should be present");
+    let text_start_pos = body
+        .find("content_block_start")
+        .expect("delayed content_block_start should be present");
+    assert!(
+        message_start_pos < ping_pos,
+        "ping must come after initial stream output"
+    );
+    assert!(
+        ping_pos < text_start_pos,
+        "ping must arrive before delayed semantic output"
+    );
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.downstream_stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(record.output_tokens, 4);
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(record.external_attempts[0].action, "success");
+    assert_eq!(upstream.snapshot(), 1);
 
     postgres.drop_test_schema().await.unwrap();
 }
@@ -1641,6 +2251,7 @@ fn stream_response_headers_disable_proxy_buffering() {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),
     );
+    upstream_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
 
     let mut builder = Response::builder().status(StatusCode::OK);
     apply_forwarded_response_headers(&mut builder, &upstream_headers, "req_01abc");
@@ -2367,6 +2978,7 @@ fn inference_attempt_rejection_never_creates_pool_cooldown_for_five_rounds() {
                     auto_disable_reason: None,
                     cooldown: None,
                     protocol_error: None,
+                    raw_upstream_error: None,
                 },
                 Some("claude-sonnet-4-5".to_string()),
                 rejection,
@@ -4715,6 +5327,16 @@ async fn external_pool_soft_failure_streak_accumulates_and_requires_manual_clear
         .unwrap()
         .expect("soft failure streak should exist");
     assert_eq!(streak, 2);
+    let reason_streak = manager
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_reason_key(
+            pool_id,
+            "server_error",
+        ))
+        .await
+        .unwrap()
+        .expect("reason-scoped soft failure streak should exist");
+    assert_eq!(reason_streak, 2);
 
     manager.reset_pool_auto_disable_failure_counts(pool_id);
     timeout(Duration::from_secs(2), async {
@@ -4753,6 +5375,18 @@ async fn external_pool_soft_failure_streak_accumulates_and_requires_manual_clear
     assert!(
         after_clear.is_none(),
         "manual clear should reset the soft failure streak"
+    );
+    let after_reason_clear = manager
+        .redis
+        .get_json::<u64>(external_pool_transient_failure_reason_key(
+            pool_id,
+            "server_error",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        after_reason_clear.is_none(),
+        "manual clear should reset reason-scoped soft failure streak"
     );
 
     postgres.drop_test_schema().await.unwrap();
@@ -6129,6 +6763,65 @@ async fn external_pool_same_pool_retry_precedes_cross_pool_failover_for_configur
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_same_pool_retry_is_capped_to_one_before_cross_pool_failover() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("capped-ok"))
+            .await;
+    create_messages_pool(&postgres, "same-pool-capped-primary", 1, &failing.base_url).await;
+    create_messages_pool(
+        &postgres,
+        "same-pool-capped-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_same_pool_retry_capped".to_string();
+    route.error_id = "err_same_pool_retry_capped".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("capped same-pool failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("capped same-pool retry should still fail over: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        2,
+        "same-pool retry must be capped to one even when config allows more"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_same_pool_retry_skips_statuses_not_in_config() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -6375,6 +7068,85 @@ async fn external_pool_retry_after_header_records_soft_failure_without_pool_cool
     postgres.drop_test_schema().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_repeated_soft_failures_escalate_to_short_cooldown() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_GATEWAY,
+        fake_external_error_body("temporary upstream failure"),
+    )
+    .await;
+    let pool =
+        create_messages_pool(&postgres, "repeated-soft-cooldown", 1, &failing.base_url).await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 4,
+        external_pool_retry_max_attempts: 1,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 0,
+        external_pool_server_error_cooldown_secs: 1,
+        external_pool_transient_failure_cooldown_threshold: 3,
+        ..ExternalPoolsConfig::default()
+    };
+
+    for index in 0..3 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_repeated_soft_cooldown_{index}");
+        route.error_id = format!("err_repeated_soft_cooldown_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("repeated failing request should finish");
+        assert!(
+            matches!(outcome, ExternalPoolForwardOutcome::FinalError(_)),
+            "single failing pool should return bounded final errors"
+        );
+    }
+    assert_eq!(failing.snapshot(), 3);
+
+    let runtime = manager
+        .load_pool_runtime_snapshot(pool.id, &[])
+        .await
+        .expect("read runtime after repeated soft failures");
+    assert!(
+        runtime.pool_cooldown_remaining_secs > 0,
+        "third same-reason soft failure should create a short hard cooldown"
+    );
+    assert_eq!(
+        runtime.pool_cooldown_reason.as_deref(),
+        Some("server_error")
+    );
+    assert_eq!(runtime.transient_failure_streak, 3);
+
+    let mut blocked_route = test_route("claude-sonnet-4-6");
+    blocked_route.request_id = "req_repeated_soft_cooldown_blocked".to_string();
+    blocked_route.error_id = "err_repeated_soft_cooldown_blocked".to_string();
+    blocked_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
+    let blocked = timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, blocked_route),
+    )
+    .await
+    .expect("cooldown-blocked request should finish");
+    assert!(
+        matches!(blocked, ExternalPoolForwardOutcome::FinalError(_)),
+        "cooldown should fail fast when no other pool is available"
+    );
+    assert_eq!(
+        failing.snapshot(),
+        3,
+        "active cooldown must prevent immediately hitting the failing upstream again"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_transient_failure_penalty_moves_sustained_traffic_to_healthy_backup() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
@@ -6428,6 +7200,7 @@ async fn external_pool_transient_failure_penalty_moves_sustained_traffic_to_heal
         external_pool_same_pool_retry_count: 0,
         external_pool_server_error_cooldown_secs: 1,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -6620,6 +7393,7 @@ async fn external_pool_one_wave_all_pools_transient_502_does_not_blackout_recove
         external_pool_same_pool_retry_count: 0,
         external_pool_server_error_cooldown_secs: 30,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -6733,6 +7507,7 @@ async fn external_pool_high_concurrency_sustained_primary_502_transfers_to_backu
         external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -6883,6 +7658,7 @@ async fn external_pool_high_concurrency_random_mixed_status_turbulence_transfers
         external_pool_retry_max_attempts: 4,
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -6967,6 +7743,295 @@ async fn external_pool_high_concurrency_random_mixed_status_turbulence_transfers
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn external_pool_mock_error_matrix_limits_repeated_failures_and_preserves_recovery() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let sustained_bad = PatternExternalMessagesFakeServer::always_fail(
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+    )
+    .await;
+    let intermittent = PatternExternalMessagesFakeServer::intermittent(
+        35,
+        0x9bad_f00d,
+        vec![
+            (StatusCode::TOO_MANY_REQUESTS, "rate limit"),
+            (StatusCode::FORBIDDEN, "security precaution"),
+            (
+                StatusCode::from_u16(523).expect("523 is a valid HTTP status"),
+                "origin unreachable",
+            ),
+        ],
+        "intermittent-ok",
+    )
+    .await;
+    let healthy_secondary =
+        PatternExternalMessagesFakeServer::always_success("healthy-secondary-ok").await;
+    let healthy_tertiary =
+        PatternExternalMessagesFakeServer::always_success("healthy-tertiary-ok").await;
+
+    let sustained_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-sustained-502-primary",
+        1,
+        &sustained_bad.base_url,
+        128,
+    )
+    .await;
+    let intermittent_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-intermittent-mixed-secondary",
+        10,
+        &intermittent.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-healthy-tertiary",
+        20,
+        &healthy_secondary.base_url,
+        128,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "matrix-healthy-quaternary",
+        40,
+        &healthy_tertiary.base_url,
+        128,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 512,
+        external_pool_retry_max_attempts: 4,
+        external_pool_retry_status_codes: vec![403, 408, 425, 429, 500, 502, 503, 504, 523],
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![429, 500, 502, 503, 504, 523],
+        external_pool_same_pool_retry_delay_ms: 1,
+        external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let run_wave = |wave: &'static str, size: usize| {
+        let manager = manager.clone();
+        let config = config.clone();
+        async move {
+            futures::future::join_all((0..size).map(|index| {
+                let manager = manager.clone();
+                let config = config.clone();
+                async move {
+                    let mut route = test_route("claude-sonnet-4-6");
+                    route.request_id = format!("req_mock_matrix_{wave}_{index}");
+                    route.error_id = format!("err_mock_matrix_{wave}_{index}");
+                    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(6));
+                    timeout(
+                        Duration::from_secs(5),
+                        manager.forward_with_failover_result(config, route),
+                    )
+                    .await
+                    .expect("mock matrix request should finish")
+                }
+            }))
+            .await
+        }
+    };
+
+    for outcome in run_wave("warmup", 32).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb warmup failures: {error:?}")
+            }
+        }
+    }
+    let (sustained_wave1_hits, sustained_wave1_failures) = sustained_bad.snapshot();
+    let (intermittent_wave1_hits, intermittent_wave1_failures) = intermittent.snapshot();
+    assert!(
+        sustained_wave1_hits > 0 && sustained_wave1_failures == sustained_wave1_hits,
+        "sustained failing pool must be exercised in first wave"
+    );
+    assert!(
+        intermittent_wave1_hits > 0,
+        "intermittent pool must be exercised in first wave"
+    );
+
+    let sustained_runtime = manager
+        .load_pool_runtime_snapshot(sustained_pool.id, &[])
+        .await
+        .expect("read sustained pool runtime");
+    assert_eq!(sustained_runtime.pool_cooldown_remaining_secs, 0);
+    assert!(
+        sustained_runtime.transient_failure_streak >= sustained_wave1_failures as u32,
+        "sustained failures should leave soft scheduling evidence"
+    );
+
+    let intermittent_runtime = manager
+        .load_pool_runtime_snapshot(intermittent_pool.id, &[])
+        .await
+        .expect("read intermittent pool runtime");
+    assert_eq!(intermittent_runtime.pool_cooldown_remaining_secs, 0);
+    assert!(
+        intermittent_runtime.transient_failure_streak >= intermittent_wave1_failures as u32,
+        "intermittent failures should leave soft scheduling evidence without hard blackout"
+    );
+    let healthy_wave1_hits = healthy_secondary
+        .snapshot()
+        .0
+        .saturating_add(healthy_tertiary.snapshot().0);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    for outcome in run_wave("sustained", 128).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("healthy pools should absorb sustained mixed failures: {error:?}")
+            }
+        }
+    }
+    let (sustained_total_hits, _) = sustained_bad.snapshot();
+    let (intermittent_total_hits, _) = intermittent.snapshot();
+    let healthy_total_hits = healthy_secondary
+        .snapshot()
+        .0
+        .saturating_add(healthy_tertiary.snapshot().0);
+    let sustained_wave2_hits = sustained_total_hits.saturating_sub(sustained_wave1_hits);
+    let intermittent_wave2_hits = intermittent_total_hits.saturating_sub(intermittent_wave1_hits);
+    let healthy_wave2_hits = healthy_total_hits.saturating_sub(healthy_wave1_hits);
+    let bad_wave2_hits = sustained_wave2_hits.saturating_add(intermittent_wave2_hits);
+    assert!(
+        sustained_wave2_hits <= 4,
+        "soft penalty plus one same-pool cap should stop repeated hits on sustained bad pool; got {sustained_wave2_hits}"
+    );
+    assert!(
+        intermittent_wave2_hits <= 32,
+        "intermittent error pool should lose most of the next high-concurrency wave; got {intermittent_wave2_hits}"
+    );
+    assert!(
+        healthy_secondary
+            .snapshot()
+            .0
+            .saturating_add(healthy_tertiary.snapshot().0)
+            > bad_wave2_hits,
+        "healthy pools should receive more traffic than failing pools after failures are observed; healthy_wave2_hits={healthy_wave2_hits}, bad_wave2_hits={bad_wave2_hits}"
+    );
+
+    for outcome in run_wave("recovery", 16).await {
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!(
+                    "normal low-concurrency traffic should keep succeeding after burst: {error:?}"
+                )
+            }
+        }
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_pool_mock_sporadic_failures_recover_without_long_blackout() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let sporadic_primary = PatternExternalMessagesFakeServer::fail_first(
+        2,
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+        "sporadic-primary-recovered",
+    )
+    .await;
+    let healthy_backup =
+        PatternExternalMessagesFakeServer::always_success("sporadic-backup-ok").await;
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "sporadic-primary",
+        1,
+        &sporadic_primary.base_url,
+        32,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "sporadic-backup",
+        10,
+        &healthy_backup.base_url,
+        32,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 64,
+        external_pool_retry_max_attempts: 2,
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
+        ..ExternalPoolsConfig::default()
+    };
+
+    for index in 0..4 {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.request_id = format!("req_mock_sporadic_{index}");
+        route.error_id = format!("err_mock_sporadic_{index}");
+        route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+        let outcome = timeout(
+            Duration::from_secs(3),
+            manager.forward_with_failover_result(config.clone(), route),
+        )
+        .await
+        .expect("sporadic request should finish");
+        match outcome {
+            ExternalPoolForwardOutcome::Response(response) => {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            ExternalPoolForwardOutcome::FinalError(error) => {
+                panic!("backup should absorb sporadic failures: {error:?}")
+            }
+        }
+    }
+
+    let (primary_hits, primary_failures) = sporadic_primary.snapshot();
+    assert_eq!(
+        primary_failures, 2,
+        "mock primary should fail only the configured sporadic attempts"
+    );
+    assert!(
+        primary_hits >= 2,
+        "primary should be exercised before being temporarily deprioritized"
+    );
+    let runtime = manager
+        .load_pool_runtime_snapshot(primary_pool.id, &[])
+        .await
+        .expect("read sporadic primary runtime");
+    assert_eq!(
+        runtime.pool_cooldown_remaining_secs, 0,
+        "sporadic 502 must not hard-blackout the recovered pool"
+    );
+    assert!(
+        healthy_backup.snapshot().0 >= 1,
+        "backup should absorb at least one failed primary request"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn external_pool_high_concurrency_network_turbulence_transfers_to_healthy_pools() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -7014,6 +8079,7 @@ async fn external_pool_high_concurrency_network_turbulence_transfers_to_healthy_
         external_pool_retry_on_network_error: true,
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7151,6 +8217,7 @@ async fn external_pool_all_pools_sustained_502_recovers_without_long_blackout() 
         external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
         external_pool_same_pool_retry_count: 0,
         external_pool_transient_failure_priority_penalty: 20,
+        external_pool_transient_failure_cooldown_threshold: 0,
         ..ExternalPoolsConfig::default()
     };
 
@@ -7272,6 +8339,7 @@ async fn external_pool_one_wave_account_capacity_and_quota_errors_soft_recover()
             external_pool_rate_limit_cooldown_secs: 30,
             external_pool_protocol_error_cooldown_secs: 30,
             external_pool_transient_failure_priority_penalty: 20,
+            external_pool_transient_failure_cooldown_threshold: 0,
             ..ExternalPoolsConfig::default()
         };
 
@@ -8849,6 +9917,45 @@ async fn external_pool_error_and_non_stream_bodies_are_bounded_and_recover_for_f
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_client_decodes_gzip_non_stream_usage_before_projection() {
+    let raw_body = br#"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":20,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, raw_body).expect("write gzip body");
+    let gzipped = encoder.finish().expect("finish gzip body");
+    let (url, server) =
+        spawn_test_raw_http_response(StatusCode::OK, TestRawHttpBody::GzipJson(gzipped)).await;
+
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("build external pool client");
+    let response = client.get(url).send().await.expect("send request");
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    let body = response_bytes_with_limit_and_body_timeout(
+        response,
+        2,
+        EXTERNAL_POOL_NON_STREAM_RESPONSE_MAX_BYTES,
+    )
+    .await
+    .expect("read decoded body");
+    server.await.unwrap();
+
+    assert_eq!(body.as_ref(), raw_body);
+    let projected = maybe_project_non_stream_usage(body, None);
+    assert_eq!(
+        projected.usage_capture.raw.map(|usage| usage.output_tokens),
+        Some(7)
+    );
+    assert_eq!(
+        projected
+            .usage_capture
+            .reported
+            .map(|usage| usage.output_tokens),
+        Some(7)
+    );
+    assert!(!projected.usage_capture.usage_estimated);
+}
+
 #[tokio::test]
 async fn external_pool_error_response_masks_raw_error_body_with_trace_id() {
     let mut headers = HeaderMap::new();
@@ -8945,10 +10052,29 @@ fn external_public_error_reports_prompt_too_long_without_raw_pool_message() {
 
     assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
     assert_eq!(public_error.error_type, "invalid_request_error");
-    assert!(public_error.message.contains("Prompt is too long"));
+    assert!(public_error.message.contains("Context window is full"));
     assert!(public_error.message.contains("error ID: req_01long"));
     assert!(!public_error.message.contains("1000000 maximum"));
     assert!(!public_error.message.contains("buy credits"));
+}
+
+#[test]
+fn external_public_error_reports_payload_limit_without_context_window_message() {
+    let public_error = external_public_error_from_parts(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        false,
+        "external upstream rejected the request because the request payload is too large CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        "req_01payload",
+    );
+
+    assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
+    assert_eq!(public_error.error_type, "invalid_request_error");
+    assert!(public_error.message.contains("content length exceeded"));
+    assert!(public_error.message.contains("external upstream threshold"));
+    assert!(public_error.message.contains("error ID: req_01payload"));
+    assert!(!public_error.message.contains("Context window is full"));
+    assert!(!public_error.message.contains("Prompt is too long"));
 }
 
 #[tokio::test]
@@ -9111,7 +10237,7 @@ fn external_error_diagnostics_records_status_and_non_duplicate_metadata() {
 }
 
 #[test]
-fn external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuses() {
+fn external_failure_standard_usage_keeps_diagnostic_input_and_zeroes_billable_fields() {
     let huge_usage = ExternalPoolUsageSnapshot {
         total_input_tokens: 2_648_439,
         input_tokens: 1_100_000,
@@ -9131,7 +10257,10 @@ fn external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuse
     ] {
         let standard_usage =
             external_standard_usage_for_status(status, 2_648_439, Some(huge_usage));
-        assert_eq!(standard_usage.total_input_tokens, 0, "status={status:?}");
+        assert_eq!(
+            standard_usage.total_input_tokens, 2_648_439,
+            "status={status:?}"
+        );
         assert_eq!(standard_usage.input_tokens, 0, "status={status:?}");
         assert_eq!(standard_usage.billable_input_tokens, 0, "status={status:?}");
         assert_eq!(standard_usage.output_tokens, 0, "status={status:?}");
@@ -9158,7 +10287,25 @@ fn external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuse
 }
 
 #[test]
-fn external_error_classification_attempt_usage_and_final_error_never_retain_raw_bodies() {
+fn raw_passthrough_failure_keeps_estimated_total_input_but_zeroes_billable_usage() {
+    let route = raw_test_route(
+        br#"{"model":"claude-sonnet-5","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hello from raw passthrough"}],"system":"You are concise."}"#,
+    );
+    let estimated = estimated_external_request_input_tokens(&route, None);
+    assert!(estimated > 0);
+
+    let standard_usage =
+        external_standard_usage_for_status(UsageRecordStatus::Error, estimated, None);
+    assert_eq!(standard_usage.total_input_tokens, estimated);
+    assert_eq!(standard_usage.input_tokens, 0);
+    assert_eq!(standard_usage.billable_input_tokens, 0);
+    assert_eq!(standard_usage.output_tokens, 0);
+    assert_eq!(standard_usage.cache_creation_input_tokens, 0);
+    assert_eq!(standard_usage.cache_read_input_tokens, 0);
+}
+
+#[test]
+fn external_error_classification_keeps_raw_body_only_in_usage_diagnostics() {
     for round in 0..5 {
         for (status, body) in [
             (
@@ -9207,14 +10354,37 @@ fn external_error_classification_attempt_usage_and_final_error_never_retain_raw_
                     duration_ms: 1,
                     error_type: Some(error_type_for_external_error(&err)),
                     error_message: Some(err.message.clone()),
+                    raw_upstream_error: err.raw_upstream_error.clone(),
                 }],
                 &err,
                 "req_01safe",
             );
-            let retained = format!("{err:?} {record_message} {diagnostics:?} {final_error:?}");
+            assert!(
+                err.raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "classified error must keep upstream raw body for usage detail"
+            );
+            assert!(
+                diagnostics
+                    .raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "usage diagnostics must keep upstream raw body"
+            );
+            assert!(
+                final_error
+                    .attempts
+                    .first()
+                    .and_then(|attempt| attempt.raw_upstream_error.as_ref())
+                    .is_some_and(|raw| raw.body.contains(&marker)),
+                "attempt diagnostics must keep matching upstream raw body"
+            );
+            let public_error = final_error.public_error();
+            let retained = format!("{record_message} {public_error:?}");
             assert!(
                 !retained.contains(&marker),
-                "retained raw marker: {retained}"
+                "system summary or downstream error retained raw marker: {retained}"
             );
         }
     }
@@ -9285,6 +10455,76 @@ fn external_pool_error_classifies_model_unavailable_without_cooldown_when_disabl
     assert!(err.retryable);
     assert_eq!(error_type_for_external_error(&err), "model_unavailable");
     assert!(err.cooldown.is_none());
+}
+
+#[test]
+fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors() {
+    let mut config = ExternalPoolsConfig {
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![401, 403, 429, 500, 502, 503, 504],
+        ..ExternalPoolsConfig::default()
+    };
+
+    let retryable_server_error = ExternalPoolError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "temporary upstream failure".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(10), "server_error".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    let terminal_auth_error = ExternalPoolError {
+        status: Some(StatusCode::FORBIDDEN),
+        message: "security lock".to_string(),
+        retryable: true,
+        auto_disable_reason: Some("security_lock".to_string()),
+        cooldown: Some((Duration::from_secs(10), "security_lock".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    let terminal_quota_error = ExternalPoolError {
+        status: Some(StatusCode::PAYMENT_REQUIRED),
+        message: "quota exhausted".to_string(),
+        retryable: true,
+        auto_disable_reason: Some("quota_exhausted".to_string()),
+        cooldown: Some((Duration::from_secs(10), "quota_exhausted".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &retryable_server_error),
+        1,
+        "server errors must be capped to one same-pool retry"
+    );
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &terminal_auth_error),
+        0,
+        "security lock should not retry the same pool"
+    );
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &terminal_quota_error),
+        0,
+        "quota exhaustion should not retry the same pool"
+    );
+
+    config.external_pool_same_pool_retry_status_codes =
+        vec![StatusCode::TOO_MANY_REQUESTS.as_u16()];
+    let rate_limit_error = ExternalPoolError {
+        status: Some(StatusCode::TOO_MANY_REQUESTS),
+        message: "rate limit".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(4), "rate_limit".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &rate_limit_error),
+        1,
+        "rate limit may retry once on the same pool, not more"
+    );
 }
 
 #[test]
@@ -10173,6 +11413,7 @@ fn forward_headers_preserves_client_anthropic_version() {
         HeaderName::from_static("anthropic-version"),
         HeaderValue::from_static("2024-02-29"),
     );
+    headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
     let pool = test_pool("https://example.com/v1", true);
 
     let forwarded = forward_headers(&headers, &pool).expect("headers");
@@ -10182,6 +11423,7 @@ fn forward_headers_preserves_client_anthropic_version() {
             .and_then(|value| value.to_str().ok()),
         Some("2024-02-29")
     );
+    assert!(forwarded.get(header::ACCEPT_ENCODING).is_none());
 }
 
 fn test_external_pool_outbound_body(route: &ExternalRouteRequest, pool: &ExternalPool) -> Bytes {
@@ -10304,6 +11546,32 @@ fn test_payload(model: &str) -> MessagesRequest {
         metadata: Some(Metadata {
             user_id: Some("user_test_account__session_external-projection-session".to_string()),
         }),
+    }
+}
+
+#[test]
+fn external_route_requested_max_tokens_prefers_payload_and_falls_back_to_raw_body() {
+    let mut route = test_route("claude-sonnet-5");
+    route.effective_raw_body =
+        Bytes::from_static(br#"{"model":"claude-sonnet-5","max_tokens":64}"#);
+    route.raw_body = route.effective_raw_body.clone();
+    assert_eq!(route.requested_max_tokens(), Some(8));
+
+    let route = raw_test_route(br#"{"model":"claude-sonnet-5","max_tokens":64}"#);
+    assert_eq!(route.requested_max_tokens(), Some(64));
+}
+
+#[test]
+fn external_route_requested_max_tokens_ignores_invalid_raw_body_values() {
+    for body in [
+        br#"{"model":"claude-sonnet-5","max_tokens":0}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":-1}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":"64"}"#.as_slice(),
+        br#"{"model":"claude-sonnet-5","max_tokens":2147483648}"#.as_slice(),
+        b"not-json".as_slice(),
+    ] {
+        let route = raw_test_route(body);
+        assert_eq!(route.requested_max_tokens(), None);
     }
 }
 
@@ -10871,8 +12139,10 @@ fn raw_failover_shares_tool_and_usage_projection_parsing_across_pools() {
 
 #[test]
 fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_for_five_rounds() {
-    let jpeg = base64::engine::general_purpose::STANDARD
-        .encode([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00]);
+    let jpeg = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00],
+    );
     let original_value = json!({
         "model": "claude-sonnet-4-5",
         "max_tokens": 128,
@@ -11586,13 +12856,40 @@ fn projection_context(
     pool: &ExternalPool,
     uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
-    projection_context_with_output_uplift(route, pool, uplift_percent, 0, 0)
+    projection_context_with_output_uplift(route, pool, uplift_percent, false, 10, 0, 0)
+}
+
+fn projection_context_with_cost_floor(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    uplift_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    projection_context_with_cost_floor_margin(route, pool, uplift_percent, 10)
+}
+
+fn projection_context_with_cost_floor_margin(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    uplift_percent: u32,
+    cost_floor_margin_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    projection_context_with_output_uplift(
+        route,
+        pool,
+        uplift_percent,
+        true,
+        cost_floor_margin_percent,
+        0,
+        0,
+    )
 }
 
 fn projection_context_with_output_uplift(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     uplift_percent: u32,
+    cost_floor_enabled: bool,
+    cost_floor_margin_percent: u32,
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
@@ -11600,9 +12897,23 @@ fn projection_context_with_output_uplift(
         route,
         pool,
         uplift_percent,
+        cost_floor_enabled,
+        cost_floor_margin_percent,
         output_uplift_min_tokens,
         output_uplift_percent,
     )
+}
+
+fn configure_usage_projection_test_path(
+    route: &mut ExternalRouteRequest,
+    policy: ReportedUsagePathPolicy,
+) {
+    route.endpoint = "/usage-policy/v1/messages".to_string();
+    route
+        .reported_usage
+        .path_overrides
+        .insert("/usage-policy".to_string(), policy);
+    route.reset_preparation_cache();
 }
 
 fn disable_path_output_postprocess(route: &mut ExternalRouteRequest) {
@@ -11822,6 +13133,37 @@ data: {"type":"message_delta","usage":{"prompt_tokens":1234,"completion_tokens":
 }
 
 #[test]
+fn stream_stop_reason_is_captured_for_external_pool_usage_records() {
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+
+    capture_sse_event_usage(
+        br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+    assert_eq!(
+        capture.lock().downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    capture_sse_event_usage(
+        br#"data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}
+
+"#,
+        None,
+        Some(&capture),
+    );
+    assert_eq!(
+        capture.lock().downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+}
+
+#[test]
 fn openai_stream_usage_keeps_local_shaping_separate_from_raw_billing() {
     let route = test_route("claude-opus-4-6");
     let mut pool = test_pool("http://pool.example.com", false);
@@ -11883,6 +13225,37 @@ fn non_stream_missing_usage_injects_estimated_billing_body() {
     );
     assert_eq!(billing.usage_candidate_path, None);
     assert!(billing.reported_usage.input_tokens > 0);
+}
+
+#[test]
+fn non_stream_stop_reason_is_captured_for_external_pool_usage_records() {
+    let route = test_route("claude-opus-4-6");
+
+    let anthropic = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"type":"message","content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens","usage":{"input_tokens":10,"output_tokens":20}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        anthropic.usage_capture.downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
+
+    let openai = process_non_stream_response_usage(
+        Bytes::from_static(
+            br#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#,
+        ),
+        Some(&route),
+        None,
+        std::iter::empty::<String>(),
+    );
+    assert_eq!(
+        openai.usage_capture.downstream_stop_reason.as_deref(),
+        Some("max_tokens")
+    );
 }
 
 #[test]
@@ -12330,8 +13703,8 @@ fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1, 100).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1, 100)
+        .expect("projection");
     let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
 
     assert_ne!(projected.body, body);
@@ -13006,8 +14379,8 @@ fn usage_projection_output_uplift_only_applies_above_threshold() {
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
     let projected = maybe_project_non_stream_usage(body, Some(&projection));
     let shaped = projected.usage_capture.shaped.expect("shaped usage");
     let reported = projected.usage_capture.reported.expect("reported usage");
@@ -13027,8 +14400,8 @@ fn usage_projection_output_uplift_changes_only_final_reported_usage() {
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
     let projected = maybe_project_non_stream_usage(body, Some(&projection));
     let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
     let usage = value.get("usage").expect("usage object");
@@ -13386,6 +14759,723 @@ fn external_pool_billing_tracks_raw_shaped_uplifted_costs() {
 }
 
 #[test]
+fn usage_projection_cost_floor_repairs_reported_usage_before_billing() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(billing.shaped_cost_usd < billing.raw_cost_usd);
+    assert!(
+        billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd * 1.10,
+        "reported cost {} should cover raw cost {} plus margin",
+        billing.reported_cost_usd,
+        billing.raw_cost_usd
+    );
+    assert!(
+        billing.reported_usage.cache_creation_input_tokens
+            > billing.shaped_usage.cache_creation_input_tokens,
+        "cache write evidence should be repaired through cache_creation first"
+    );
+    assert_eq!(
+        usage["input_tokens"].as_i64().expect("final input"),
+        i64::from(billing.reported_usage.input_tokens)
+    );
+    assert!(
+        billing.reported_usage.input_tokens <= input_cap,
+        "cost floor should not bypass the configured path input policy"
+    );
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(billing.reported_usage.cache_read_input_tokens)
+            .saturating_add(billing.reported_usage.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","content":[{"type":"text","text":"hello world from response"}],"usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let route = test_route("claude-sonnet-4-5");
+    assert!(route.request_input_tokens >= 512);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert!(billing.reported_usage.input_tokens > 1);
+    assert!(billing.reported_usage.output_tokens > 0);
+    assert!(usage["input_tokens"].as_i64().expect("input") > 1);
+    assert!(usage["output_tokens"].as_i64().expect("output") > 0);
+    assert!(billing.reported_cost_usd > billing.raw_cost_usd);
+}
+
+#[test]
+fn usage_projection_repairs_tiny_raw_input_from_request_estimate_without_cost_floor() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    let request_input_tokens = route.request_input_tokens;
+    assert!(request_input_tokens >= 512);
+
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.cache_read_input_tokens, 0);
+    assert_eq!(billing.raw_usage.cache_creation_input_tokens, 0);
+    assert_eq!(billing.reported_usage.input_tokens, request_input_tokens);
+    assert_eq!(
+        usage["input_tokens"].as_i64(),
+        Some(i64::from(request_input_tokens))
+    );
+}
+
+#[test]
+fn usage_projection_repairs_raw_output_from_non_stream_answer_estimate_without_cost_floor() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"hello world from response"}],"usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let estimated_output_tokens = projected.usage_capture.estimated_output_tokens;
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(estimated_output_tokens > 0);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert_eq!(
+        billing.reported_usage.output_tokens,
+        estimated_output_tokens
+    );
+    assert_eq!(
+        usage["output_tokens"].as_i64(),
+        Some(i64::from(estimated_output_tokens))
+    );
+}
+
+#[test]
+fn usage_projection_does_not_force_cache_for_small_current_path_request() {
+    let mut route = test_route("claude-opus-4-7");
+    route.request_input_tokens = 1;
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::CurrentHighCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::HighCache;
+    route.prompt_cache_scale_min_input_tokens = 20_000;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(600),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(150_000, 1.5),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let body = Bytes::from_static(
+        br#"{"type":"message","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":4,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert_eq!(billing.raw_usage.input_tokens, 4);
+    assert_eq!(billing.raw_usage.cache_read_input_tokens, 0);
+    assert_eq!(billing.raw_usage.cache_creation_input_tokens, 0);
+    assert_eq!(billing.reported_usage.cache_read_input_tokens, 0);
+    assert_eq!(billing.reported_usage.cache_creation_input_tokens, 0);
+    assert_eq!(usage["cache_read_input_tokens"].as_i64(), Some(0));
+    assert_eq!(usage["cache_creation_input_tokens"].as_i64(), Some(0));
+}
+
+#[test]
+fn usage_projection_cost_floor_keeps_path_shaped_usage_when_cost_already_covers_raw() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::raw(),
+            output: ReportedUsageFieldPolicy::raw(),
+            cache_read: ReportedUsageFieldPolicy::preserve(),
+            cache_creation: ReportedUsageFieldPolicy::preserve(),
+            output_uplift_min_tokens: 1,
+            output_uplift_percent: 50,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let baseline_projection =
+        projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1, 50)
+            .expect("baseline");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, true, 10, 1, 50)
+        .expect("projection");
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":40,"output_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let baseline = maybe_project_non_stream_usage(body.clone(), Some(&baseline_projection));
+    let baseline_billing =
+        external_pool_billing_from_capture(&route, &pool, baseline.usage_capture)
+            .expect("baseline billing");
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+
+    assert!(baseline_billing.reported_cost_usd >= baseline_billing.raw_cost_usd * 1.10);
+    assert_eq!(billing.reported_usage, baseline_billing.reported_usage);
+    assert!((billing.reported_cost_usd - baseline_billing.reported_cost_usd).abs() < 0.000000001);
+    assert_eq!(projected.body, baseline.body);
+}
+
+#[test]
+fn usage_projection_cost_floor_keeps_no_cache_route_cache_free() {
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(64),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000,"cache_creation":{"ephemeral_5m_input_tokens":50000,"ephemeral_1h_input_tokens":0}}}"#,
+        );
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(
+        billing.reported_cost_usd < billing.raw_cost_usd,
+        "no-cache routes must not turn upstream cache cost into local cache or input hard-top"
+    );
+    assert_eq!(usage["cache_creation_input_tokens"].as_i64(), Some(0));
+    assert_eq!(usage["cache_read_input_tokens"].as_i64(), Some(0));
+    assert!(usage.get("cache_creation").is_none());
+    assert_eq!(billing.reported_usage.cache_creation_input_tokens, 0);
+    assert_eq!(billing.reported_usage.cache_read_input_tokens, 0);
+    assert_eq!(
+        billing.reported_usage.input_tokens,
+        count_external_route_input_tokens(payload_ref(&route))
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_margin_percent_sets_target_cost() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":50000,"ephemeral_1h_input_tokens":0}}}"#,
+    );
+    let mut route = test_route("claude-sonnet-4-5");
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(96),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            final_cache_creation_max_tokens: 200_000,
+            final_cache_creation_jitter_min_tokens: 0,
+            final_cache_creation_jitter_max_tokens: 0,
+            final_cache_read_max_tokens: 200_000,
+            final_cache_read_jitter_min_tokens: 0,
+            final_cache_read_jitter_max_tokens: 0,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection =
+        projection_context_with_cost_floor_margin(&route, &pool, 0, 25).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+
+    assert!(billing.pricing_available);
+    assert!(
+        billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd * 1.25,
+        "reported cost {} should cover raw cost {} with configured margin",
+        billing.reported_cost_usd,
+        billing.raw_cost_usd
+    );
+    assert!(
+        billing.reported_usage.cache_creation_input_tokens
+            > billing.shaped_usage.cache_creation_input_tokens
+    );
+}
+
+#[test]
+fn usage_projection_cost_floor_repairs_cache_write_before_cache_read_and_respects_caps() {
+    let body = Bytes::from_static(
+        br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":1000000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":750000,"ephemeral_1h_input_tokens":250000}}}"#,
+    );
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    let cache_creation_cap = 1_000;
+    let cache_read_cap = 2_000;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(10, 1.0),
+            final_cache_creation_max_tokens: cache_creation_cap,
+            final_cache_creation_jitter_min_tokens: 0,
+            final_cache_creation_jitter_max_tokens: 0,
+            final_cache_read_max_tokens: cache_read_cap,
+            final_cache_read_jitter_min_tokens: 0,
+            final_cache_read_jitter_max_tokens: 0,
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = maybe_project_non_stream_usage(body, Some(&projection));
+    let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+        .expect("billing");
+    let value: serde_json::Value = serde_json::from_slice(&projected.body).expect("projected json");
+    let usage = value.get("usage").expect("usage object");
+
+    assert!(billing.pricing_available);
+    assert!(billing.reported_cost_usd < billing.raw_cost_usd);
+    assert!(billing.reported_usage.input_tokens <= input_cap);
+    assert_eq!(
+        billing.reported_usage.cache_creation_input_tokens,
+        cache_creation_cap
+    );
+    assert_eq!(
+        billing.reported_usage.cache_read_input_tokens,
+        cache_read_cap
+    );
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(cache_creation_cap)
+            .saturating_add(cache_read_cap)
+    );
+    assert_eq!(
+        usage["cache_creation_input_tokens"].as_i64(),
+        Some(i64::from(cache_creation_cap))
+    );
+    assert_eq!(
+        usage["cache_read_input_tokens"].as_i64(),
+        Some(i64::from(cache_read_cap))
+    );
+    assert_projected_cache_creation_consistent(usage);
+}
+
+#[test]
+fn usage_projection_sample_rows_stay_within_path_usage_policy_after_cost_floor() {
+    struct Sample {
+        name: &'static str,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_input_tokens: i32,
+        cache_creation_input_tokens: i32,
+        cache_read_cap: i32,
+        cache_creation_cap: i32,
+        output_cap: i32,
+        expect_output_repair: bool,
+    }
+
+    let samples = [
+        Sample {
+            name: "tiny-uncached-user-example",
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_cap: 128,
+            cache_creation_cap: 4_096,
+            output_cap: 256,
+            expect_output_repair: true,
+        },
+        Sample {
+            name: "tiny-cache-read-upstream-row",
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_input_tokens: 16,
+            cache_creation_input_tokens: 0,
+            cache_read_cap: 128,
+            cache_creation_cap: 4_096,
+            output_cap: 256,
+            expect_output_repair: false,
+        },
+        Sample {
+            name: "large-cache-upstream-row",
+            input_tokens: 44,
+            output_tokens: 665,
+            cache_read_input_tokens: 47_778,
+            cache_creation_input_tokens: 48_629,
+            cache_read_cap: 90_000,
+            cache_creation_cap: 40_000,
+            output_cap: 900,
+            expect_output_repair: false,
+        },
+        Sample {
+            name: "huge-cache-and-output-row",
+            input_tokens: 301_153,
+            output_tokens: 7_476,
+            cache_read_input_tokens: 764_772,
+            cache_creation_input_tokens: 764_107,
+            cache_read_cap: 700_000,
+            cache_creation_cap: 400_000,
+            output_cap: 4_096,
+            expect_output_repair: false,
+        },
+    ];
+
+    for sample in samples {
+        let mut route = test_route("claude-sonnet-4-5");
+        let input_cap = 96;
+        configure_usage_projection_test_path(
+            &mut route,
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+                output: ReportedUsageFieldPolicy::raw(),
+                cache_read: ReportedUsageFieldPolicy::preserve(),
+                cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+                final_cache_read_max_tokens: sample.cache_read_cap,
+                final_cache_read_jitter_min_tokens: 0,
+                final_cache_read_jitter_max_tokens: 0,
+                final_cache_creation_max_tokens: sample.cache_creation_cap,
+                final_cache_creation_jitter_min_tokens: 0,
+                final_cache_creation_jitter_max_tokens: 0,
+                final_output_guard_enabled: true,
+                output_uplift_min_tokens: 0,
+                output_uplift_percent: 0,
+                final_output_max_tokens: sample.output_cap,
+                final_output_jitter_min_tokens: 0,
+                final_output_jitter_max_tokens: 0,
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context_with_cost_floor(&route, &pool, 0)
+            .unwrap_or_else(|| panic!("projection for {}", sample.name));
+
+        let nested_cache_creation = if sample.cache_creation_input_tokens > 0 {
+            format!(
+                r#","cache_creation":{{"ephemeral_5m_input_tokens":{},"ephemeral_1h_input_tokens":0}}"#,
+                sample.cache_creation_input_tokens
+            )
+        } else {
+            String::new()
+        };
+        let body = Bytes::from(format!(
+            r#"{{"type":"message","content":[{{"type":"text","text":"sample response body for usage policy regression"}}],"usage":{{"input_tokens":{},"output_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{}{}}}}}"#,
+            sample.input_tokens,
+            sample.output_tokens,
+            sample.cache_creation_input_tokens,
+            sample.cache_read_input_tokens,
+            nested_cache_creation,
+        ));
+
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+            .unwrap_or_else(|| panic!("billing for {}", sample.name));
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+
+        assert_eq!(
+            billing.raw_usage.input_tokens, sample.input_tokens,
+            "{} raw input",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.output_tokens, sample.output_tokens,
+            "{} raw output",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.cache_read_input_tokens, sample.cache_read_input_tokens,
+            "{} raw cache read",
+            sample.name
+        );
+        assert_eq!(
+            billing.raw_usage.cache_creation_input_tokens, sample.cache_creation_input_tokens,
+            "{} raw cache creation",
+            sample.name
+        );
+
+        assert!(
+            billing.reported_usage.input_tokens <= input_cap,
+            "{} final input {} should respect path input sample max",
+            sample.name,
+            billing.reported_usage.input_tokens
+        );
+        assert!(
+            billing.reported_usage.cache_read_input_tokens <= sample.cache_read_cap,
+            "{} final cache read {} should respect path final cache read cap {}",
+            sample.name,
+            billing.reported_usage.cache_read_input_tokens,
+            sample.cache_read_cap
+        );
+        assert!(
+            billing.reported_usage.cache_creation_input_tokens <= sample.cache_creation_cap,
+            "{} final cache creation {} should respect path final cache creation cap {}",
+            sample.name,
+            billing.reported_usage.cache_creation_input_tokens,
+            sample.cache_creation_cap
+        );
+        assert!(
+            billing.reported_usage.output_tokens <= sample.output_cap,
+            "{} final output {} should respect path final output cap {}",
+            sample.name,
+            billing.reported_usage.output_tokens,
+            sample.output_cap
+        );
+        if sample.expect_output_repair {
+            assert!(
+                billing.reported_usage.output_tokens > sample.output_tokens,
+                "{} should use response body output estimate",
+                sample.name
+            );
+        }
+        assert_eq!(
+            billing.reported_usage.total_input_tokens,
+            billing
+                .reported_usage
+                .input_tokens
+                .saturating_add(billing.reported_usage.cache_read_input_tokens)
+                .saturating_add(billing.reported_usage.cache_creation_input_tokens),
+            "{} total input should match final standard fields",
+            sample.name
+        );
+        assert_eq!(
+            usage["input_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.input_tokens)),
+            "{} returned input",
+            sample.name
+        );
+        assert_eq!(
+            usage["output_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.output_tokens)),
+            "{} returned output",
+            sample.name
+        );
+        assert_eq!(
+            usage["cache_read_input_tokens"].as_i64(),
+            Some(i64::from(billing.reported_usage.cache_read_input_tokens)),
+            "{} returned cache read",
+            sample.name
+        );
+        assert_eq!(
+            usage["cache_creation_input_tokens"].as_i64(),
+            Some(i64::from(
+                billing.reported_usage.cache_creation_input_tokens
+            )),
+            "{} returned cache creation",
+            sample.name
+        );
+    }
+}
+
+#[test]
+fn sse_usage_projection_cost_floor_repairs_final_stream_usage() {
+    let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+
+    let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        external_pool_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert!(billing.pricing_available);
+    assert!(billing.reported_cost_usd + 0.000000001 >= billing.raw_cost_usd * 1.10);
+    assert_eq!(
+        event_usage_i64(text, "input_tokens"),
+        i64::from(billing.reported_usage.input_tokens)
+    );
+    assert!(
+        billing.reported_usage.input_tokens <= input_cap,
+        "final stream input should still respect the configured path input policy"
+    );
+    assert_eq!(
+        billing.reported_usage.total_input_tokens,
+        billing
+            .reported_usage
+            .input_tokens
+            .saturating_add(billing.reported_usage.cache_read_input_tokens)
+            .saturating_add(billing.reported_usage.cache_creation_input_tokens)
+    );
+}
+
+#[test]
+fn sse_usage_projection_cost_floor_repairs_zero_output_after_stream_text() {
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world from stream"}}
+
+"#;
+    let usage_event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-sonnet-4-5");
+    let input_cap = 96;
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(input_cap),
+            cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context_with_cost_floor(&route, &pool, 0).expect("projection");
+    let plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+
+    let text_out =
+        process_sse_event_with_plan(text_event, Some(&projection), Some(&capture), None, plan);
+    assert_eq!(text_out, text_event);
+
+    let projected =
+        process_sse_event_with_plan(usage_event, Some(&projection), Some(&capture), None, plan);
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        external_pool_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert_eq!(billing.raw_usage.input_tokens, 1);
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert!(
+        billing.reported_usage.total_input_tokens > billing.raw_usage.total_input_tokens,
+        "tiny stream usage should still be repaired even when input sampling keeps input small"
+    );
+    assert!(
+        billing.reported_usage.input_tokens <= input_cap,
+        "tiny stream repair should still respect the configured path input policy"
+    );
+    assert!(billing.reported_usage.output_tokens > 0);
+    assert!(billing.reported_cost_usd > billing.raw_cost_usd);
+    assert!(event_usage_i64(text, "output_tokens") > 0);
+}
+
+#[test]
+fn sse_usage_projection_repairs_raw_output_from_stream_text_estimate_without_cost_floor() {
+    let text_event = br#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello world from stream"}}
+
+"#;
+    let usage_event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+"#;
+    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let projection = projection_context(&route, &pool, 0).expect("projection");
+    let plan =
+        ExternalStreamProcessingPlan::from_mode(ExternalPoolStreamResponseMode::EventPassthrough);
+
+    let text_out =
+        process_sse_event_with_plan(text_event, Some(&projection), Some(&capture), None, plan);
+    assert_eq!(text_out, text_event);
+
+    let projected =
+        process_sse_event_with_plan(usage_event, Some(&projection), Some(&capture), None, plan);
+    let text = std::str::from_utf8(&projected).expect("projected sse");
+    let billing =
+        external_pool_billing_from_capture_ref(&route, &pool, &capture).expect("stream billing");
+
+    assert_eq!(billing.raw_usage.output_tokens, 0);
+    assert!(capture.lock().estimated_output_tokens > 0);
+    assert_eq!(
+        billing.reported_usage.output_tokens,
+        capture.lock().estimated_output_tokens
+    );
+    assert_eq!(
+        event_usage_i64(text, "output_tokens"),
+        i64::from(billing.reported_usage.output_tokens)
+    );
+}
+
+#[test]
 fn external_pool_billing_uses_output_uplift_as_final_reported_cost() {
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":1200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
@@ -13395,8 +15485,8 @@ fn external_pool_billing_uses_output_uplift_as_final_reported_cost() {
     disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
 
     let projected = maybe_project_non_stream_usage(body, Some(&projection));
     let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
@@ -13760,8 +15850,9 @@ data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role"
         "cache_creation_input_tokens": 50000,
         "cache_read_input_tokens": 0
     });
-    let final_projected = project_usage_value(&mut final_usage, Some(&second_projection), true)
-        .expect("final projected usage");
+    let final_projected =
+        project_usage_value(&mut final_usage, Some(&second_projection), true, None)
+            .expect("final projected usage");
     assert_eq!(final_projected.reported.cache_read_input_tokens, 0);
 }
 
@@ -13974,8 +16065,8 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":120
     disable_path_output_postprocess(&mut route);
     let mut pool = test_pool("http://pool.example.com", false);
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-    let projection =
-        projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+    let projection = projection_context_with_output_uplift(&route, &pool, 0, false, 10, 1_000, 50)
+        .expect("projection");
     let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
     let text = std::str::from_utf8(&projected).expect("projected sse");
     assert!(text.contains(r#""output_tokens":1800"#));

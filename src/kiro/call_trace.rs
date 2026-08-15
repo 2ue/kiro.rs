@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::common::upstream_error::RawUpstreamError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionFailureStage {
@@ -98,6 +100,8 @@ pub struct KiroCredentialAttempt {
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_upstream_error: Option<RawUpstreamError>,
     pub duration_ms: u64,
 }
 
@@ -122,6 +126,7 @@ impl KiroCredentialAttempt {
             model: None,
             error_type: error_type.map(Into::into),
             error_message: error_message.map(Into::into),
+            raw_upstream_error: None,
             duration_ms,
         }
     }

@@ -56,7 +56,8 @@ use crate::anthropic::{
     prompt_cache_creation_control::PromptCacheCreationController,
     request_admission::RequestAdmissionController,
     usage::{
-        UsageDashboardResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
+        UsageDashboardResponse, UsageExternalPoolRiskCostConfig, UsageExternalPoolRiskQuery,
+        UsageExternalPoolRiskResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
         UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
@@ -3833,6 +3834,24 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
+    pub fn get_usage_dashboard_external_pool_risk(
+        &self,
+        query: UsageExternalPoolRiskQuery,
+    ) -> Result<UsageExternalPoolRiskResponse, AdminServiceError> {
+        let config = self.token_manager.runtime_config();
+        let cost_config = UsageExternalPoolRiskCostConfig {
+            cost_floor_enabled: config
+                .external_pools
+                .external_pool_usage_projection_cost_floor_enabled,
+            cost_floor_margin_percent: config
+                .external_pools
+                .external_pool_usage_projection_cost_floor_margin_percent,
+        };
+        self.usage_recorder
+            .external_pool_usage_risk(query, cost_config)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
     /// 获取 usage 持久化 writer 状态。该状态只用于观测，不参与调度。
     pub fn get_usage_writer_stats(&self) -> UsageRecorderStats {
         self.usage_recorder.writer_stats()
@@ -5657,6 +5676,9 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_transient_failure_priority_penalty > 10_000 {
         return Err("externalPoolTransientFailurePriorityPenalty 不能大于 10000".to_string());
     }
+    if config.external_pool_transient_failure_cooldown_threshold > 1_000 {
+        return Err("externalPoolTransientFailureCooldownThreshold 不能大于 1000".to_string());
+    }
     if config.external_pool_local_rescue_max_wait_secs > 300 {
         return Err("externalPoolLocalRescueMaxWaitSecs 不能大于 300".to_string());
     }
@@ -5729,11 +5751,23 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_usage_projection_uplift_percent > 200 {
         return Err("externalPoolUsageProjectionUpliftPercent 不能大于 200".to_string());
     }
+    if config.external_pool_usage_projection_cost_floor_margin_percent > 200 {
+        return Err("externalPoolUsageProjectionCostFloorMarginPercent 不能大于 200".to_string());
+    }
     if config.external_pool_usage_projection_output_uplift_min_tokens < 0 {
         return Err("externalPoolUsageProjectionOutputUpliftMinTokens 不能小于 0".to_string());
     }
     if config.external_pool_usage_projection_output_uplift_percent > 200 {
         return Err("externalPoolUsageProjectionOutputUpliftPercent 不能大于 200".to_string());
+    }
+    if config.external_pool_usage_debug_dir.chars().count() > 512 {
+        return Err("externalPoolUsageDebugDir 不能超过 512 个字符".to_string());
+    }
+    if config.external_pool_usage_debug_max_body_bytes > 1024 * 1024 {
+        return Err("externalPoolUsageDebugMaxBodyBytes 不能大于 1048576".to_string());
+    }
+    if config.external_pool_usage_debug_max_files > 100_000 {
+        return Err("externalPoolUsageDebugMaxFiles 不能大于 100000".to_string());
     }
     Ok(())
 }

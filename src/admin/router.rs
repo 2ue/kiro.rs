@@ -23,9 +23,10 @@ use super::{
         get_model_capabilities, get_model_pricing, get_proxy_resources, get_runtime_config,
         get_system_version, get_usage_cleanup_status, get_usage_dashboard,
         get_usage_dashboard_breakdown, get_usage_dashboard_external_pool_billing,
-        get_usage_dashboard_series, get_usage_dashboard_top, get_usage_dashboard_windows,
-        get_usage_records, get_usage_records_page, get_usage_summary, get_usage_writer_stats,
-        preview_usage_cleanup, refresh_credentials_info, reset_failure_count, resume_usage_cleanup,
+        get_usage_dashboard_external_pool_risk, get_usage_dashboard_series,
+        get_usage_dashboard_top, get_usage_dashboard_windows, get_usage_records,
+        get_usage_records_page, get_usage_summary, get_usage_writer_stats, preview_usage_cleanup,
+        refresh_credentials_info, reset_failure_count, resume_usage_cleanup,
         set_credential_concurrency, set_credential_disabled, set_credential_overage,
         set_credential_priority, set_credential_proxy, set_credential_rate_limit_auto_disable,
         set_credential_regions, set_credential_rpm, set_credential_supported_models,
@@ -209,6 +210,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/usage-dashboard/external-pool-billing",
             get(get_usage_dashboard_external_pool_billing),
+        )
+        .route(
+            "/usage-dashboard/external-pool-risk",
+            get(get_usage_dashboard_external_pool_risk),
         )
         .route("/usage-writer-stats", get(get_usage_writer_stats))
         .route("/audit-logs", get(get_audit_logs))

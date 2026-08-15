@@ -7,7 +7,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 
 use super::{
@@ -28,7 +28,10 @@ use super::{
         ValidateExternalCredentialsRequest,
     },
 };
-use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageRouteKind, UsageSource};
+use crate::anthropic::usage::{
+    UsageExternalPoolRiskQuery, UsageRecordQuery, UsageRecordStatus, UsageRouteKind, UsageSource,
+    usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
+};
 use crate::external_pool::{
     CreateExternalPoolRequest, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
 };
@@ -153,6 +156,22 @@ pub struct UsageDashboardWindowQueryParams {
     pub window_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolRiskQueryParams {
+    pub timezone: Option<String>,
+    pub window_key: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub warning_threshold_tokens: Option<i64>,
+    pub critical_threshold_tokens: Option<i64>,
+    pub external_pool_id: Option<u64>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub stream: Option<bool>,
+    pub limit: Option<usize>,
+}
+
 /// GET /api/admin/system/version
 pub async fn get_system_version() -> Json<SystemVersionResponse> {
     Json(SystemVersionResponse {
@@ -224,6 +243,74 @@ impl UsageRecordsPageQueryParams {
             until: parse_optional_time(self.until)?,
         };
         Ok((query, page, limit))
+    }
+}
+
+impl UsageExternalPoolRiskQueryParams {
+    fn into_query(self) -> Result<UsageExternalPoolRiskQuery, String> {
+        const DEFAULT_WARNING_THRESHOLD_TOKENS: i64 = 800_000;
+        const DEFAULT_CRITICAL_THRESHOLD_TOKENS: i64 = 1_000_000;
+        const DEFAULT_SAMPLE_LIMIT: usize = 50;
+        const MAX_SAMPLE_LIMIT: usize = 200;
+        const MAX_CUSTOM_WINDOW_HOURS: i64 = 24 * 7;
+
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(self.timezone.as_deref());
+        let custom_from = parse_optional_time(self.since)?;
+        let custom_to = parse_optional_time(self.until)?;
+        let window_key_value = non_blank(self.window_key).unwrap_or_else(|| "last24h".to_string());
+        let (window_key, window_label, from, to) =
+            if window_key_value == "custom" || custom_from.is_some() || custom_to.is_some() {
+                let Some(from) = custom_from else {
+                    return Err("自定义时间范围必须同时提供 since 和 until".to_string());
+                };
+                let Some(to) = custom_to else {
+                    return Err("自定义时间范围必须同时提供 since 和 until".to_string());
+                };
+                if from >= to {
+                    return Err("since 必须早于 until".to_string());
+                }
+                let to = to.min(now);
+                if from >= to {
+                    return Err("since 必须早于 until，且 until 不能全部落在未来".to_string());
+                }
+                let max_from = to - ChronoDuration::hours(MAX_CUSTOM_WINDOW_HOURS);
+                if from < max_from {
+                    return Err("自定义时间范围不能超过 7 天".to_string());
+                }
+                ("custom".to_string(), "自定义".to_string(), from, to)
+            } else {
+                let spec = usage_dashboard_window_spec_for_key(now, offset, &window_key_value);
+                (spec.key, spec.label, spec.from, spec.to)
+            };
+
+        let warning_threshold_tokens = self
+            .warning_threshold_tokens
+            .unwrap_or(DEFAULT_WARNING_THRESHOLD_TOKENS)
+            .max(0);
+        let critical_threshold_tokens = self
+            .critical_threshold_tokens
+            .unwrap_or(DEFAULT_CRITICAL_THRESHOLD_TOKENS)
+            .max(warning_threshold_tokens);
+        let limit = self
+            .limit
+            .unwrap_or(DEFAULT_SAMPLE_LIMIT)
+            .clamp(1, MAX_SAMPLE_LIMIT);
+
+        Ok(UsageExternalPoolRiskQuery {
+            timezone,
+            window_key,
+            window_label,
+            from,
+            to,
+            warning_threshold_tokens,
+            critical_threshold_tokens,
+            pool_id: self.external_pool_id,
+            endpoint: non_blank(self.endpoint),
+            model: non_blank(self.model),
+            stream: self.stream,
+            limit,
+        })
     }
 }
 
@@ -1351,6 +1438,25 @@ pub async fn get_usage_dashboard_external_pool_billing(
     {
         Ok(data) => Json(data).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/external-pool-risk
+/// 获取外部池 usage 风控统计。
+pub async fn get_usage_dashboard_external_pool_risk(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageExternalPoolRiskQueryParams>,
+) -> impl IntoResponse {
+    match params.into_query() {
+        Ok(query) => match state.service.get_usage_dashboard_external_pool_risk(query) {
+            Ok(data) => Json(data).into_response(),
+            Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        },
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(message)),
+        )
+            .into_response(),
     }
 }
 

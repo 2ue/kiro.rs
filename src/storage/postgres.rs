@@ -22,7 +22,11 @@ use crate::anthropic::usage::{
     CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem,
     UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop,
     UsageDashboardWindow, UsageDashboardWindowSpec, UsageExternalPoolBillingByPool,
-    UsageExternalPoolBillingSummary, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
+    UsageExternalPoolBillingSummary, UsageExternalPoolRiskBucket, UsageExternalPoolRiskCacheStats,
+    UsageExternalPoolRiskCostConfig, UsageExternalPoolRiskCostStats, UsageExternalPoolRiskFilters,
+    UsageExternalPoolRiskGroup, UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse,
+    UsageExternalPoolRiskSample, UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals,
+    UsageExternalPoolRiskWindow, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
     UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult, UsageRouteKind,
     UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
     usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
@@ -6365,6 +6369,107 @@ impl PostgresUsageStore {
         ))
     }
 
+    pub async fn external_pool_usage_risk(
+        &self,
+        query: UsageExternalPoolRiskQuery,
+        cost_config: UsageExternalPoolRiskCostConfig,
+    ) -> anyhow::Result<UsageExternalPoolRiskResponse> {
+        if query.from >= query.to {
+            anyhow::bail!("外部池 usage 风控查询时间范围无效");
+        }
+
+        let cost_target_multiplier = if cost_config.cost_floor_enabled {
+            1.0 + (cost_config.cost_floor_margin_percent as f64 / 100.0)
+        } else {
+            1.0
+        }
+        .max(1.0);
+
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+
+        let summary_row = external_pool_usage_risk_summary_query(&query, cost_target_multiplier)
+            .build()
+            .fetch_one(&mut *tx)
+            .await?;
+        let totals = external_pool_usage_risk_totals_from_row(&summary_row)?;
+        let raw_cache = external_pool_usage_risk_cache_stats_from_row(&summary_row, "raw")?;
+        let reported_cache =
+            external_pool_usage_risk_cache_stats_from_row(&summary_row, "reported")?;
+        let cost = external_pool_usage_risk_cost_stats_from_row(&summary_row)?;
+
+        let bucket_rows = external_pool_usage_risk_bucket_query(&query, cost_target_multiplier)
+            .build()
+            .fetch_all(&mut *tx)
+            .await?;
+        let buckets = bucket_rows
+            .into_iter()
+            .map(external_pool_usage_risk_bucket_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let group_rows = external_pool_usage_risk_group_query(&query, cost_target_multiplier)
+            .build()
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut by_pool = Vec::new();
+        let mut by_path = Vec::new();
+        let mut by_model = Vec::new();
+        for row in group_rows {
+            let group_kind: String = row.try_get("group_kind")?;
+            let group = external_pool_usage_risk_group_from_row(&row)?;
+            match group_kind.as_str() {
+                "pool" => by_pool.push(group),
+                "path" => by_path.push(group),
+                "model" => by_model.push(group),
+                _ => {}
+            }
+        }
+
+        let sample_rows = external_pool_usage_risk_sample_query(&query, cost_target_multiplier)
+            .build()
+            .fetch_all(&mut *tx)
+            .await?;
+        let samples = sample_rows
+            .into_iter()
+            .map(external_pool_usage_risk_sample_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        tx.commit().await?;
+
+        Ok(UsageExternalPoolRiskResponse {
+            generated_at: Utc::now().to_rfc3339(),
+            timezone: query.timezone.clone(),
+            window: UsageExternalPoolRiskWindow {
+                key: query.window_key.clone(),
+                label: query.window_label.clone(),
+                from: query.from.to_rfc3339(),
+                to: query.to.to_rfc3339(),
+            },
+            thresholds: UsageExternalPoolRiskThresholds {
+                warning_tokens: query.warning_threshold_tokens,
+                critical_tokens: query.critical_threshold_tokens,
+                cost_floor_enabled: cost_config.cost_floor_enabled,
+                cost_floor_margin_percent: cost_config.cost_floor_margin_percent,
+                cost_target_multiplier,
+            },
+            filters: UsageExternalPoolRiskFilters {
+                pool_id: query.pool_id,
+                endpoint: query.endpoint.clone(),
+                model: query.model.clone(),
+                stream: query.stream,
+            },
+            totals,
+            raw_cache,
+            reported_cache,
+            cost,
+            buckets,
+            by_pool,
+            by_path,
+            by_model,
+            samples,
+        })
+    }
+
     async fn dashboard_windows(
         &self,
         specs: &[UsageDashboardWindowSpec],
@@ -7220,6 +7325,782 @@ impl PostgresUsageStore {
         let row = builder.build().fetch_one(self.store.pool()).await?;
         row_i64_to_usize(&row, "count")
     }
+}
+
+fn external_pool_usage_risk_summary_query<'a>(
+    query: &'a UsageExternalPoolRiskQuery,
+    cost_target_multiplier: f64,
+) -> QueryBuilder<'a, Postgres> {
+    let mut builder = QueryBuilder::<Postgres>::new("");
+    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    builder.push(
+        r#"
+        SELECT
+            COUNT(*)::bigint AS records,
+            COUNT(*) FILTER (WHERE status = 'success')::bigint AS success_records,
+            COUNT(*) FILTER (WHERE status <> 'success')::bigint AS error_records,
+            COUNT(*) FILTER (WHERE stream)::bigint AS stream_records,
+            COUNT(*) FILTER (WHERE NOT stream)::bigint AS non_stream_records,
+            COUNT(*) FILTER (WHERE pricing_available)::bigint AS priced_records,
+            COUNT(*) FILTER (WHERE NOT pricing_available)::bigint AS unpriced_records,
+            COUNT(*) FILTER (WHERE raw_usage_present)::bigint AS raw_usage_records,
+            COUNT(*) FILTER (WHERE reported_usage_present)::bigint AS reported_usage_records,
+            COUNT(*) FILTER (WHERE NOT external_pool_billing_present)::bigint
+                AS missing_external_pool_billing_records,
+            COUNT(*) FILTER (WHERE reported_output_tokens = 0)::bigint AS output_zero_records,
+
+            COALESCE(MIN(raw_cache_read_input_tokens), 0)::bigint AS raw_min_read_tokens,
+            COALESCE(MAX(raw_cache_read_input_tokens), 0)::bigint AS raw_max_read_tokens,
+            COALESCE(AVG(raw_cache_read_input_tokens), 0)::double precision
+                AS raw_avg_read_tokens,
+            COALESCE(SUM(raw_cache_read_input_tokens), 0)::bigint AS raw_total_read_tokens,
+            COALESCE(MIN(raw_cache_creation_input_tokens), 0)::bigint AS raw_min_write_tokens,
+            COALESCE(MAX(raw_cache_creation_input_tokens), 0)::bigint AS raw_max_write_tokens,
+            COALESCE(AVG(raw_cache_creation_input_tokens), 0)::double precision
+                AS raw_avg_write_tokens,
+            COALESCE(SUM(raw_cache_creation_input_tokens), 0)::bigint
+                AS raw_total_write_tokens,
+            COUNT(*) FILTER (WHERE raw_cache_read_input_tokens >= warning_threshold)::bigint
+                AS raw_read_warning_count,
+            COUNT(*) FILTER (WHERE raw_cache_creation_input_tokens >= warning_threshold)::bigint
+                AS raw_write_warning_count,
+            COUNT(*) FILTER (
+                WHERE raw_cache_read_input_tokens >= warning_threshold
+                   OR raw_cache_creation_input_tokens >= warning_threshold
+            )::bigint AS raw_either_warning_count,
+            COUNT(*) FILTER (WHERE raw_cache_read_input_tokens >= critical_threshold)::bigint
+                AS raw_read_critical_count,
+            COUNT(*) FILTER (WHERE raw_cache_creation_input_tokens >= critical_threshold)::bigint
+                AS raw_write_critical_count,
+            COUNT(*) FILTER (
+                WHERE raw_cache_read_input_tokens >= critical_threshold
+                   OR raw_cache_creation_input_tokens >= critical_threshold
+            )::bigint AS raw_either_critical_count,
+
+            COALESCE(MIN(reported_cache_read_input_tokens), 0)::bigint
+                AS reported_min_read_tokens,
+            COALESCE(MAX(reported_cache_read_input_tokens), 0)::bigint
+                AS reported_max_read_tokens,
+            COALESCE(AVG(reported_cache_read_input_tokens), 0)::double precision
+                AS reported_avg_read_tokens,
+            COALESCE(SUM(reported_cache_read_input_tokens), 0)::bigint
+                AS reported_total_read_tokens,
+            COALESCE(MIN(reported_cache_creation_input_tokens), 0)::bigint
+                AS reported_min_write_tokens,
+            COALESCE(MAX(reported_cache_creation_input_tokens), 0)::bigint
+                AS reported_max_write_tokens,
+            COALESCE(AVG(reported_cache_creation_input_tokens), 0)::double precision
+                AS reported_avg_write_tokens,
+            COALESCE(SUM(reported_cache_creation_input_tokens), 0)::bigint
+                AS reported_total_write_tokens,
+            COUNT(*) FILTER (WHERE reported_cache_read_input_tokens >= warning_threshold)::bigint
+                AS reported_read_warning_count,
+            COUNT(*) FILTER (
+                WHERE reported_cache_creation_input_tokens >= warning_threshold
+            )::bigint AS reported_write_warning_count,
+            COUNT(*) FILTER (
+                WHERE reported_cache_read_input_tokens >= warning_threshold
+                   OR reported_cache_creation_input_tokens >= warning_threshold
+            )::bigint AS reported_either_warning_count,
+            COUNT(*) FILTER (WHERE reported_cache_read_input_tokens >= critical_threshold)::bigint
+                AS reported_read_critical_count,
+            COUNT(*) FILTER (
+                WHERE reported_cache_creation_input_tokens >= critical_threshold
+            )::bigint AS reported_write_critical_count,
+            COUNT(*) FILTER (
+                WHERE reported_cache_read_input_tokens >= critical_threshold
+                   OR reported_cache_creation_input_tokens >= critical_threshold
+            )::bigint AS reported_either_critical_count,
+
+            COALESCE(SUM(raw_cost_usd), 0)::double precision AS raw_cost_usd,
+            COALESCE(SUM(reported_cost_usd), 0)::double precision AS reported_cost_usd,
+            COALESCE(SUM(target_cost_usd), 0)::double precision AS target_cost_usd,
+            COALESCE(SUM(reported_cost_usd - raw_cost_usd), 0)::double precision AS profit_usd,
+            COALESCE(SUM(loss_usd), 0)::double precision AS total_loss_usd,
+            COALESCE(SUM(target_gap_usd), 0)::double precision AS total_target_gap_usd,
+            COALESCE(MAX(loss_usd), 0)::double precision AS max_loss_usd,
+            COALESCE(MAX(target_gap_usd), 0)::double precision AS max_target_gap_usd,
+            COALESCE(MAX(raw_cost_usd), 0)::double precision AS max_raw_cost_usd,
+            COALESCE(MAX(reported_cost_usd), 0)::double precision AS max_reported_cost_usd,
+            COUNT(*) FILTER (WHERE raw_cost_usd > 0 AND reported_cost_usd < raw_cost_usd)
+                ::bigint AS below_raw_count,
+            COUNT(*) FILTER (WHERE target_cost_usd > 0 AND reported_cost_usd < target_cost_usd)
+                ::bigint AS below_target_count,
+            COUNT(*) FILTER (WHERE cost_floor_applied)::bigint AS cost_floor_applied_records,
+            MIN(cost_ratio) FILTER (WHERE cost_ratio IS NOT NULL) AS min_cost_ratio,
+            AVG(cost_ratio) FILTER (WHERE cost_ratio IS NOT NULL) AS avg_cost_ratio,
+            MAX(cost_ratio) FILTER (WHERE cost_ratio IS NOT NULL) AS max_cost_ratio
+        FROM scored_records
+        "#,
+    );
+    builder
+}
+
+fn external_pool_usage_risk_bucket_query<'a>(
+    query: &'a UsageExternalPoolRiskQuery,
+    cost_target_multiplier: f64,
+) -> QueryBuilder<'a, Postgres> {
+    let mut builder = QueryBuilder::<Postgres>::new("");
+    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    builder.push(
+        r#"
+        , buckets(key, label, min_tokens, max_tokens, ord) AS (
+            VALUES
+                ('zero', '0', 0::bigint, 0::bigint, 1),
+                ('1_10k', '1-10K', 1::bigint, 10000::bigint, 2),
+                ('10_100k', '10K-100K', 10001::bigint, 100000::bigint, 3),
+                ('100_300k', '100K-300K', 100001::bigint, 300000::bigint, 4),
+                ('300_600k', '300K-600K', 300001::bigint, 600000::bigint, 5),
+                ('600_800k', '600K-800K', 600001::bigint, 799999::bigint, 6),
+                ('800k_1m', '800K-1M', 800000::bigint, 999999::bigint, 7),
+                ('gte_1m', '>=1M', 1000000::bigint, NULL::bigint, 8)
+        )
+        SELECT
+            b.key,
+            b.label,
+            b.min_tokens,
+            b.max_tokens,
+            COUNT(*) FILTER (
+                WHERE (b.max_tokens IS NULL AND raw_cache_read_input_tokens >= b.min_tokens)
+                   OR (b.max_tokens IS NOT NULL
+                       AND raw_cache_read_input_tokens >= b.min_tokens
+                       AND raw_cache_read_input_tokens <= b.max_tokens)
+            )::bigint AS raw_read_count,
+            COUNT(*) FILTER (
+                WHERE (b.max_tokens IS NULL AND raw_cache_creation_input_tokens >= b.min_tokens)
+                   OR (b.max_tokens IS NOT NULL
+                       AND raw_cache_creation_input_tokens >= b.min_tokens
+                       AND raw_cache_creation_input_tokens <= b.max_tokens)
+            )::bigint AS raw_write_count,
+            COUNT(*) FILTER (
+                WHERE (b.max_tokens IS NULL AND reported_cache_read_input_tokens >= b.min_tokens)
+                   OR (b.max_tokens IS NOT NULL
+                       AND reported_cache_read_input_tokens >= b.min_tokens
+                       AND reported_cache_read_input_tokens <= b.max_tokens)
+            )::bigint AS reported_read_count,
+            COUNT(*) FILTER (
+                WHERE (b.max_tokens IS NULL AND reported_cache_creation_input_tokens >= b.min_tokens)
+                   OR (b.max_tokens IS NOT NULL
+                       AND reported_cache_creation_input_tokens >= b.min_tokens
+                       AND reported_cache_creation_input_tokens <= b.max_tokens)
+            )::bigint AS reported_write_count
+        FROM buckets b
+        LEFT JOIN scored_records ON true
+        GROUP BY b.key, b.label, b.min_tokens, b.max_tokens, b.ord
+        ORDER BY b.ord
+        "#,
+    );
+    builder
+}
+
+fn external_pool_usage_risk_group_query<'a>(
+    query: &'a UsageExternalPoolRiskQuery,
+    cost_target_multiplier: f64,
+) -> QueryBuilder<'a, Postgres> {
+    let mut builder = QueryBuilder::<Postgres>::new("");
+    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    builder.push(
+        r#"
+        , group_rows AS (
+            SELECT
+                'pool' AS group_kind,
+                COALESCE(external_pool_id_text, 'unknown') AS group_key,
+                COALESCE(
+                    external_pool_name,
+                    CASE
+                        WHEN external_pool_id_text IS NOT NULL THEN '#' || external_pool_id_text
+                        ELSE '未知外部池'
+                    END
+                ) AS group_label,
+                status,
+                has_warning_risk,
+                has_critical_risk,
+                reported_output_tokens,
+                raw_cache_read_input_tokens,
+                raw_cache_creation_input_tokens,
+                reported_cache_read_input_tokens,
+                reported_cache_creation_input_tokens,
+                raw_cost_usd,
+                reported_cost_usd,
+                target_cost_usd,
+                loss_usd,
+                target_gap_usd
+            FROM scored_records
+
+            UNION ALL
+
+            SELECT
+                'path' AS group_kind,
+                endpoint AS group_key,
+                endpoint AS group_label,
+                status,
+                has_warning_risk,
+                has_critical_risk,
+                reported_output_tokens,
+                raw_cache_read_input_tokens,
+                raw_cache_creation_input_tokens,
+                reported_cache_read_input_tokens,
+                reported_cache_creation_input_tokens,
+                raw_cost_usd,
+                reported_cost_usd,
+                target_cost_usd,
+                loss_usd,
+                target_gap_usd
+            FROM scored_records
+
+            UNION ALL
+
+            SELECT
+                'model' AS group_kind,
+                COALESCE(pricing_model, model, 'unknown') AS group_key,
+                COALESCE(pricing_model, model, 'unknown') AS group_label,
+                status,
+                has_warning_risk,
+                has_critical_risk,
+                reported_output_tokens,
+                raw_cache_read_input_tokens,
+                raw_cache_creation_input_tokens,
+                reported_cache_read_input_tokens,
+                reported_cache_creation_input_tokens,
+                raw_cost_usd,
+                reported_cost_usd,
+                target_cost_usd,
+                loss_usd,
+                target_gap_usd
+            FROM scored_records
+        ), grouped AS (
+            SELECT
+                group_kind,
+                group_key,
+                group_label,
+                COUNT(*)::bigint AS records,
+                COUNT(*) FILTER (WHERE status = 'success')::bigint AS success_records,
+                COUNT(*) FILTER (WHERE has_warning_risk)::bigint AS warning_records,
+                COUNT(*) FILTER (WHERE has_critical_risk)::bigint AS critical_records,
+                COUNT(*) FILTER (WHERE reported_output_tokens = 0)::bigint AS output_zero_records,
+                COALESCE(MAX(raw_cache_read_input_tokens), 0)::bigint AS raw_read_max,
+                COALESCE(MAX(raw_cache_creation_input_tokens), 0)::bigint AS raw_write_max,
+                COALESCE(MAX(reported_cache_read_input_tokens), 0)::bigint AS reported_read_max,
+                COALESCE(MAX(reported_cache_creation_input_tokens), 0)::bigint AS reported_write_max,
+                COALESCE(SUM(raw_cost_usd), 0)::double precision AS raw_cost_usd,
+                COALESCE(SUM(reported_cost_usd), 0)::double precision AS reported_cost_usd,
+                COALESCE(SUM(target_cost_usd), 0)::double precision AS target_cost_usd,
+                COALESCE(SUM(reported_cost_usd - raw_cost_usd), 0)::double precision AS profit_usd,
+                COALESCE(SUM(loss_usd), 0)::double precision AS total_loss_usd,
+                COALESCE(SUM(target_gap_usd), 0)::double precision AS total_target_gap_usd,
+                COUNT(*) FILTER (WHERE raw_cost_usd > 0 AND reported_cost_usd < raw_cost_usd)
+                    ::bigint AS below_raw_count,
+                COUNT(*) FILTER (
+                    WHERE target_cost_usd > 0 AND reported_cost_usd < target_cost_usd
+                )::bigint AS below_target_count
+            FROM group_rows
+            GROUP BY group_kind, group_key, group_label
+        ), ranked AS (
+            SELECT
+                *,
+                row_number() OVER (
+                    PARTITION BY group_kind
+                    ORDER BY critical_records DESC,
+                             warning_records DESC,
+                             total_target_gap_usd DESC,
+                             GREATEST(raw_read_max, raw_write_max, reported_read_max, reported_write_max) DESC,
+                             records DESC,
+                             group_key ASC
+                ) AS rn
+            FROM grouped
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn <= 20
+        ORDER BY group_kind, rn
+        "#,
+    );
+    builder
+}
+
+fn external_pool_usage_risk_sample_query<'a>(
+    query: &'a UsageExternalPoolRiskQuery,
+    cost_target_multiplier: f64,
+) -> QueryBuilder<'a, Postgres> {
+    let mut builder = QueryBuilder::<Postgres>::new("");
+    push_external_pool_usage_risk_scored_cte(&mut builder, query, cost_target_multiplier);
+    builder.push(
+        r#"
+        SELECT
+            id,
+            created_at,
+            endpoint,
+            stream,
+            model,
+            status,
+            external_pool_id_text,
+            external_pool_name,
+            pricing_model,
+            usage_projection_mode,
+            external_pool_billing_present,
+            cost_floor_applied,
+            raw_input_tokens,
+            raw_output_tokens,
+            raw_cache_read_input_tokens,
+            raw_cache_creation_input_tokens,
+            reported_input_tokens,
+            reported_output_tokens,
+            reported_cache_read_input_tokens,
+            reported_cache_creation_input_tokens,
+            raw_cost_usd,
+            reported_cost_usd,
+            target_cost_usd,
+            loss_usd,
+            target_gap_usd,
+            cost_ratio,
+            array_remove(ARRAY[
+                CASE WHEN NOT external_pool_billing_present THEN 'missing_external_pool_billing' END,
+                CASE WHEN reported_output_tokens = 0 THEN 'output_zero' END,
+                CASE
+                    WHEN raw_cache_read_input_tokens >= critical_threshold
+                      OR raw_cache_creation_input_tokens >= critical_threshold
+                    THEN 'raw_cache_critical'
+                END,
+                CASE
+                    WHEN reported_cache_read_input_tokens >= critical_threshold
+                      OR reported_cache_creation_input_tokens >= critical_threshold
+                    THEN 'reported_cache_critical'
+                END,
+                CASE
+                    WHEN raw_cache_read_input_tokens >= warning_threshold
+                      OR raw_cache_creation_input_tokens >= warning_threshold
+                    THEN 'raw_cache_warning'
+                END,
+                CASE
+                    WHEN reported_cache_read_input_tokens >= warning_threshold
+                      OR reported_cache_creation_input_tokens >= warning_threshold
+                    THEN 'reported_cache_warning'
+                END,
+                CASE WHEN raw_cost_usd > 0 AND reported_cost_usd < raw_cost_usd THEN 'below_raw_cost' END,
+                CASE
+                    WHEN target_cost_usd > 0 AND reported_cost_usd < target_cost_usd
+                    THEN 'below_target_cost'
+                END
+            ], NULL)::text[] AS risk_reasons
+        FROM scored_records
+        ORDER BY
+            has_critical_risk DESC,
+            has_warning_risk DESC,
+            target_gap_usd DESC,
+            loss_usd DESC,
+            GREATEST(
+                raw_cache_read_input_tokens,
+                raw_cache_creation_input_tokens,
+                reported_cache_read_input_tokens,
+                reported_cache_creation_input_tokens
+            ) DESC,
+            created_at DESC,
+            id DESC
+        LIMIT "#,
+    );
+    builder.push_bind(usize_to_i64(query.limit));
+    builder
+}
+
+fn push_external_pool_usage_risk_scored_cte<'a>(
+    builder: &mut QueryBuilder<'a, Postgres>,
+    query: &'a UsageExternalPoolRiskQuery,
+    cost_target_multiplier: f64,
+) {
+    builder.push(
+        r#"
+        WITH risk_records AS (
+            SELECT
+                records.id,
+                records.created_at,
+                records.endpoint,
+                records.stream,
+                records.model,
+                records.status,
+                records.pricing_available,
+                NULLIF(records.data->>'externalPoolId', '') AS external_pool_id_text,
+                NULLIF(BTRIM(records.data->>'externalPoolName'), '') AS external_pool_name,
+                COALESCE(
+                    NULLIF(BTRIM(records.data #>> '{externalPoolBilling,pricingModel}'), ''),
+                    NULLIF(BTRIM(records.pricing_model), '')
+                ) AS pricing_model,
+                NULLIF(BTRIM(records.data #>> '{externalPoolBilling,usageProjectionMode}'), '')
+                    AS usage_projection_mode,
+                COALESCE(jsonb_typeof(records.data->'externalPoolBilling') = 'object', false)
+                    AS external_pool_billing_present,
+                COALESCE(
+                    jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage}') = 'object',
+                    false
+                )
+                    AS raw_usage_present,
+                COALESCE(
+                    jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage}') = 'object',
+                    false
+                )
+                    AS reported_usage_present,
+                COALESCE(records.data #> '{externalPoolBilling,costFloorApplied}' = 'true'::jsonb, false)
+                    AS cost_floor_applied,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,inputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,rawUsage,inputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE 0::bigint
+                END AS raw_input_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,outputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,rawUsage,outputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE 0::bigint
+                END AS raw_output_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,cacheReadInputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,rawUsage,cacheReadInputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE 0::bigint
+                END AS raw_cache_read_input_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawUsage,cacheCreationInputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,rawUsage,cacheCreationInputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE 0::bigint
+                END AS raw_cache_creation_input_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,inputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,reportedUsage,inputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE GREATEST(records.compat_input_tokens, 0)::bigint
+                END AS reported_input_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,outputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,reportedUsage,outputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE GREATEST(records.output_tokens, 0)::bigint
+                END AS reported_output_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,cacheReadInputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,reportedUsage,cacheReadInputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE GREATEST(records.cache_read_input_tokens, 0)::bigint
+                END AS reported_cache_read_input_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedUsage,cacheCreationInputTokens}') = 'number'
+                    THEN GREATEST(
+                        LEAST(
+                            (records.data #>> '{externalPoolBilling,reportedUsage,cacheCreationInputTokens}')::numeric,
+                            9223372036854775807::numeric
+                        ),
+                        0::numeric
+                    )::bigint
+                    ELSE GREATEST(records.cache_creation_input_tokens, 0)::bigint
+                END AS reported_cache_creation_input_tokens,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,rawCostUsd}') = 'number'
+                    THEN (records.data #>> '{externalPoolBilling,rawCostUsd}')::double precision
+                    WHEN COALESCE(records.original_cost_usd, 0) <> 0
+                    THEN records.original_cost_usd
+                    ELSE 0::double precision
+                END AS raw_cost_usd,
+                CASE
+                    WHEN jsonb_typeof(records.data #> '{externalPoolBilling,reportedCostUsd}') = 'number'
+                    THEN (records.data #>> '{externalPoolBilling,reportedCostUsd}')::double precision
+                    WHEN COALESCE(records.estimated_cost_usd, 0) <> 0
+                    THEN records.estimated_cost_usd
+                    ELSE 0::double precision
+                END AS reported_cost_usd
+            FROM usage_records records
+            WHERE records.deleted_at IS NULL
+              AND records.rollup_active
+              AND records.created_at >= "#,
+    );
+    builder.push_bind(query.from);
+    builder.push(" AND records.created_at < ");
+    builder.push_bind(query.to);
+    builder.push(
+        r#"
+              AND (
+                  records.data->>'routeKind' = 'external_pool'
+                  OR jsonb_typeof(records.data->'externalPoolBilling') = 'object'
+              )
+        "#,
+    );
+
+    if let Some(pool_id) = query.pool_id {
+        builder.push(" AND records.data->>'externalPoolId' = ");
+        builder.push_bind(pool_id.to_string());
+    }
+    if let Some(endpoint) = query.endpoint.as_deref() {
+        builder.push(" AND records.endpoint = ");
+        builder.push_bind(endpoint);
+    }
+    if let Some(model) = query.model.as_deref() {
+        builder.push(
+            r#"
+              AND (
+                  records.model = "#,
+        );
+        builder.push_bind(model);
+        builder.push(" OR records.data->>'externalOutboundModel' = ");
+        builder.push_bind(model);
+        builder.push(" OR records.data #>> '{externalPoolBilling,pricingModel}' = ");
+        builder.push_bind(model);
+        builder.push(")");
+    }
+    if let Some(stream) = query.stream {
+        builder.push(" AND records.stream = ");
+        builder.push_bind(stream);
+    }
+
+    builder.push(
+        r#"
+        ), scored_records AS (
+            SELECT
+                risk_records.*,
+        "#,
+    );
+    builder.push_bind(query.warning_threshold_tokens);
+    builder.push("::bigint AS warning_threshold, ");
+    builder.push_bind(query.critical_threshold_tokens);
+    builder.push("::bigint AS critical_threshold, ");
+    builder.push_bind(cost_target_multiplier);
+    builder.push(
+        r#"::double precision AS cost_target_multiplier,
+                GREATEST(raw_cost_usd, 0::double precision)
+                    * "#,
+    );
+    builder.push_bind(cost_target_multiplier);
+    builder.push(
+        r#"::double precision AS target_cost_usd,
+                GREATEST(raw_cost_usd - reported_cost_usd, 0::double precision) AS loss_usd,
+                GREATEST(
+                    GREATEST(raw_cost_usd, 0::double precision)
+                        * "#,
+    );
+    builder.push_bind(cost_target_multiplier);
+    builder.push(
+        r#"::double precision - reported_cost_usd,
+                    0::double precision
+                ) AS target_gap_usd,
+                CASE
+                    WHEN raw_cost_usd > 0 THEN reported_cost_usd / raw_cost_usd
+                    ELSE NULL
+                END AS cost_ratio,
+                (
+                    raw_cache_read_input_tokens >= "#,
+    );
+    builder.push_bind(query.warning_threshold_tokens);
+    builder.push(" OR raw_cache_creation_input_tokens >= ");
+    builder.push_bind(query.warning_threshold_tokens);
+    builder.push(" OR reported_cache_read_input_tokens >= ");
+    builder.push_bind(query.warning_threshold_tokens);
+    builder.push(" OR reported_cache_creation_input_tokens >= ");
+    builder.push_bind(query.warning_threshold_tokens);
+    builder.push(
+        r#"
+                    OR (GREATEST(raw_cost_usd, 0::double precision) * "#,
+    );
+    builder.push_bind(cost_target_multiplier);
+    builder.push(
+        r#"::double precision) > reported_cost_usd
+                    OR reported_output_tokens = 0
+                    OR NOT external_pool_billing_present
+                ) AS has_warning_risk,
+                (
+                    raw_cache_read_input_tokens >= "#,
+    );
+    builder.push_bind(query.critical_threshold_tokens);
+    builder.push(" OR raw_cache_creation_input_tokens >= ");
+    builder.push_bind(query.critical_threshold_tokens);
+    builder.push(" OR reported_cache_read_input_tokens >= ");
+    builder.push_bind(query.critical_threshold_tokens);
+    builder.push(" OR reported_cache_creation_input_tokens >= ");
+    builder.push_bind(query.critical_threshold_tokens);
+    builder.push(
+        r#"
+                    OR (raw_cost_usd > 0 AND reported_cost_usd < raw_cost_usd)
+                ) AS has_critical_risk
+            FROM risk_records
+        ) "#,
+    );
+}
+
+fn external_pool_usage_risk_totals_from_row(
+    row: &PgRow,
+) -> anyhow::Result<UsageExternalPoolRiskTotals> {
+    Ok(UsageExternalPoolRiskTotals {
+        records: row_i64_to_usize(row, "records")?,
+        success_records: row_i64_to_usize(row, "success_records")?,
+        error_records: row_i64_to_usize(row, "error_records")?,
+        stream_records: row_i64_to_usize(row, "stream_records")?,
+        non_stream_records: row_i64_to_usize(row, "non_stream_records")?,
+        priced_records: row_i64_to_usize(row, "priced_records")?,
+        unpriced_records: row_i64_to_usize(row, "unpriced_records")?,
+        raw_usage_records: row_i64_to_usize(row, "raw_usage_records")?,
+        reported_usage_records: row_i64_to_usize(row, "reported_usage_records")?,
+        missing_external_pool_billing_records: row_i64_to_usize(
+            row,
+            "missing_external_pool_billing_records",
+        )?,
+        output_zero_records: row_i64_to_usize(row, "output_zero_records")?,
+    })
+}
+
+fn external_pool_usage_risk_cache_stats_from_row(
+    row: &PgRow,
+    prefix: &str,
+) -> anyhow::Result<UsageExternalPoolRiskCacheStats> {
+    Ok(UsageExternalPoolRiskCacheStats {
+        min_read_tokens: row.try_get(format!("{}_min_read_tokens", prefix).as_str())?,
+        max_read_tokens: row.try_get(format!("{}_max_read_tokens", prefix).as_str())?,
+        avg_read_tokens: row.try_get(format!("{}_avg_read_tokens", prefix).as_str())?,
+        total_read_tokens: row.try_get(format!("{}_total_read_tokens", prefix).as_str())?,
+        min_write_tokens: row.try_get(format!("{}_min_write_tokens", prefix).as_str())?,
+        max_write_tokens: row.try_get(format!("{}_max_write_tokens", prefix).as_str())?,
+        avg_write_tokens: row.try_get(format!("{}_avg_write_tokens", prefix).as_str())?,
+        total_write_tokens: row.try_get(format!("{}_total_write_tokens", prefix).as_str())?,
+        read_warning_count: row_i64_to_usize(row, &format!("{}_read_warning_count", prefix))?,
+        write_warning_count: row_i64_to_usize(row, &format!("{}_write_warning_count", prefix))?,
+        either_warning_count: row_i64_to_usize(row, &format!("{}_either_warning_count", prefix))?,
+        read_critical_count: row_i64_to_usize(row, &format!("{}_read_critical_count", prefix))?,
+        write_critical_count: row_i64_to_usize(row, &format!("{}_write_critical_count", prefix))?,
+        either_critical_count: row_i64_to_usize(row, &format!("{}_either_critical_count", prefix))?,
+    })
+}
+
+fn external_pool_usage_risk_cost_stats_from_row(
+    row: &PgRow,
+) -> anyhow::Result<UsageExternalPoolRiskCostStats> {
+    Ok(UsageExternalPoolRiskCostStats {
+        raw_cost_usd: row.try_get("raw_cost_usd")?,
+        reported_cost_usd: row.try_get("reported_cost_usd")?,
+        target_cost_usd: row.try_get("target_cost_usd")?,
+        profit_usd: row.try_get("profit_usd")?,
+        total_loss_usd: row.try_get("total_loss_usd")?,
+        total_target_gap_usd: row.try_get("total_target_gap_usd")?,
+        max_loss_usd: row.try_get("max_loss_usd")?,
+        max_target_gap_usd: row.try_get("max_target_gap_usd")?,
+        max_raw_cost_usd: row.try_get("max_raw_cost_usd")?,
+        max_reported_cost_usd: row.try_get("max_reported_cost_usd")?,
+        below_raw_count: row_i64_to_usize(row, "below_raw_count")?,
+        below_target_count: row_i64_to_usize(row, "below_target_count")?,
+        cost_floor_applied_records: row_i64_to_usize(row, "cost_floor_applied_records")?,
+        min_cost_ratio: row.try_get("min_cost_ratio")?,
+        avg_cost_ratio: row.try_get("avg_cost_ratio")?,
+        max_cost_ratio: row.try_get("max_cost_ratio")?,
+    })
+}
+
+fn external_pool_usage_risk_bucket_from_row(
+    row: PgRow,
+) -> anyhow::Result<UsageExternalPoolRiskBucket> {
+    Ok(UsageExternalPoolRiskBucket {
+        key: row.try_get("key")?,
+        label: row.try_get("label")?,
+        min_tokens: row.try_get("min_tokens")?,
+        max_tokens: row.try_get("max_tokens")?,
+        raw_read_count: row_i64_to_usize(&row, "raw_read_count")?,
+        raw_write_count: row_i64_to_usize(&row, "raw_write_count")?,
+        reported_read_count: row_i64_to_usize(&row, "reported_read_count")?,
+        reported_write_count: row_i64_to_usize(&row, "reported_write_count")?,
+    })
+}
+
+fn external_pool_usage_risk_group_from_row(
+    row: &PgRow,
+) -> anyhow::Result<UsageExternalPoolRiskGroup> {
+    Ok(UsageExternalPoolRiskGroup {
+        key: row.try_get("group_key")?,
+        label: row.try_get("group_label")?,
+        records: row_i64_to_usize(row, "records")?,
+        success_records: row_i64_to_usize(row, "success_records")?,
+        warning_records: row_i64_to_usize(row, "warning_records")?,
+        critical_records: row_i64_to_usize(row, "critical_records")?,
+        output_zero_records: row_i64_to_usize(row, "output_zero_records")?,
+        raw_read_max: row.try_get("raw_read_max")?,
+        raw_write_max: row.try_get("raw_write_max")?,
+        reported_read_max: row.try_get("reported_read_max")?,
+        reported_write_max: row.try_get("reported_write_max")?,
+        raw_cost_usd: row.try_get("raw_cost_usd")?,
+        reported_cost_usd: row.try_get("reported_cost_usd")?,
+        target_cost_usd: row.try_get("target_cost_usd")?,
+        profit_usd: row.try_get("profit_usd")?,
+        total_loss_usd: row.try_get("total_loss_usd")?,
+        total_target_gap_usd: row.try_get("total_target_gap_usd")?,
+        below_raw_count: row_i64_to_usize(row, "below_raw_count")?,
+        below_target_count: row_i64_to_usize(row, "below_target_count")?,
+    })
+}
+
+fn external_pool_usage_risk_sample_from_row(
+    row: PgRow,
+) -> anyhow::Result<UsageExternalPoolRiskSample> {
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    Ok(UsageExternalPoolRiskSample {
+        id: row.try_get("id")?,
+        created_at: created_at.to_rfc3339(),
+        endpoint: row.try_get("endpoint")?,
+        stream: row.try_get("stream")?,
+        model: row.try_get("model")?,
+        status: row.try_get("status")?,
+        external_pool_id: row
+            .try_get::<Option<String>, _>("external_pool_id_text")?
+            .and_then(|value| value.parse::<u64>().ok()),
+        external_pool_name: row.try_get("external_pool_name")?,
+        pricing_model: row.try_get("pricing_model")?,
+        usage_projection_mode: row.try_get("usage_projection_mode")?,
+        external_pool_billing_present: row.try_get("external_pool_billing_present")?,
+        cost_floor_applied: row.try_get("cost_floor_applied")?,
+        raw_input_tokens: row.try_get("raw_input_tokens")?,
+        raw_output_tokens: row.try_get("raw_output_tokens")?,
+        raw_cache_read_input_tokens: row.try_get("raw_cache_read_input_tokens")?,
+        raw_cache_creation_input_tokens: row.try_get("raw_cache_creation_input_tokens")?,
+        reported_input_tokens: row.try_get("reported_input_tokens")?,
+        reported_output_tokens: row.try_get("reported_output_tokens")?,
+        reported_cache_read_input_tokens: row.try_get("reported_cache_read_input_tokens")?,
+        reported_cache_creation_input_tokens: row
+            .try_get("reported_cache_creation_input_tokens")?,
+        raw_cost_usd: row.try_get("raw_cost_usd")?,
+        reported_cost_usd: row.try_get("reported_cost_usd")?,
+        target_cost_usd: row.try_get("target_cost_usd")?,
+        loss_usd: row.try_get("loss_usd")?,
+        target_gap_usd: row.try_get("target_gap_usd")?,
+        cost_ratio: row.try_get("cost_ratio")?,
+        risk_reasons: row.try_get("risk_reasons")?,
+    })
 }
 
 fn apply_usage_record_legacy_cost_compatibility(record: &mut UsageRecord) {
@@ -11445,6 +12326,7 @@ mod tests {
             error_source: None,
             error_id: None,
             error_metadata: None,
+            raw_upstream_error: None,
             public_error_status_code: None,
             public_error_type: None,
             public_error_message: None,
@@ -12184,6 +13066,81 @@ mod tests {
             );
             assert_eq!(external_rollup.4, 80, "external round {round}");
         }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_external_pool_usage_risk_reports_cache_and_cost_risks() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        let mut high_cache = external_usage_record("external-risk-high-cache", 0.20, 0.18, 0.19);
+        high_cache.external_pool_billing.as_mut().unwrap().raw_usage =
+            external_usage_snapshot(1_000, 20, 910_000, 120_000);
+        high_cache.raw_usage = high_cache
+            .external_pool_billing
+            .as_ref()
+            .map(|billing| billing.raw_usage);
+        usage_store.record(high_cache).await.unwrap();
+
+        let ok = external_usage_record("external-risk-ok", 0.10, 0.11, 0.12);
+        usage_store.record(ok).await.unwrap();
+
+        let response = usage_store
+            .external_pool_usage_risk(
+                UsageExternalPoolRiskQuery {
+                    timezone: "UTC".to_string(),
+                    window_key: "custom".to_string(),
+                    window_label: "自定义".to_string(),
+                    from: Utc::now() - chrono::Duration::minutes(5),
+                    to: Utc::now() + chrono::Duration::minutes(5),
+                    warning_threshold_tokens: 800_000,
+                    critical_threshold_tokens: 1_000_000,
+                    pool_id: Some(42),
+                    endpoint: None,
+                    model: None,
+                    stream: None,
+                    limit: 10,
+                },
+                UsageExternalPoolRiskCostConfig {
+                    cost_floor_enabled: true,
+                    cost_floor_margin_percent: 10,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.totals.records, 2);
+        assert_eq!(response.raw_cache.read_warning_count, 1);
+        assert_eq!(response.raw_cache.read_critical_count, 0);
+        assert_eq!(response.reported_cache.either_warning_count, 0);
+        assert_eq!(response.cost.below_raw_count, 1);
+        assert_eq!(response.cost.below_target_count, 1);
+        assert!(response.cost.total_target_gap_usd > 0.02);
+        assert!(
+            response
+                .buckets
+                .iter()
+                .any(|bucket| bucket.key == "800k_1m" && bucket.raw_read_count == 1)
+        );
+        assert_eq!(response.by_pool[0].key, "42");
+        assert!(response.samples.iter().any(|sample| {
+            sample.id == "external-risk-high-cache"
+                && sample
+                    .risk_reasons
+                    .iter()
+                    .any(|reason| reason == "raw_cache_warning")
+                && sample
+                    .risk_reasons
+                    .iter()
+                    .any(|reason| reason == "below_target_cost")
+        }));
 
         store.drop_test_schema().await.unwrap();
     }
@@ -14148,6 +15105,7 @@ mod tests {
             error_source: None,
             error_id: None,
             error_metadata: None,
+            raw_upstream_error: None,
             public_error_status_code: None,
             public_error_type: None,
             public_error_message: None,

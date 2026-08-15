@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_ENTRY_ERROR_MESSAGE_CHARS: usize = 512;
+
 pub(super) async fn handle_messages_endpoint(
     state: AppState,
     headers: HeaderMap,
@@ -124,7 +126,8 @@ pub(super) async fn handle_messages_endpoint(
         {
             return response;
         }
-        if let Some(response) = maybe_raw_external_preflight_response(
+        let mut raw_preflight_failure = None;
+        if let Some(decision) = maybe_raw_external_preflight_response(
             &state,
             headers.clone(),
             effective_raw_body.clone(),
@@ -135,9 +138,66 @@ pub(super) async fn handle_messages_endpoint(
         )
         .await
         {
-            return response;
+            match decision {
+                RawExternalPreflightDecision::Response(response) => return response,
+                RawExternalPreflightDecision::ContinueWithLocalRescue(failure) => {
+                    raw_preflight_failure = Some(failure);
+                }
+            }
         }
+        return continue_messages_endpoint_after_raw_external_routes(
+            state,
+            headers,
+            effective_raw_body,
+            effective_raw_probe,
+            raw_body,
+            parsed_raw_probe,
+            endpoint,
+            inference_attempt_budget,
+            request_api_key_id,
+            request_history_contaminated,
+            attribution,
+            raw_preflight_failure,
+        )
+        .await;
     }
+    continue_messages_endpoint_after_raw_external_routes(
+        state,
+        headers,
+        effective_raw_body,
+        effective_raw_probe,
+        raw_body,
+        parsed_raw_probe,
+        endpoint,
+        inference_attempt_budget,
+        request_api_key_id,
+        request_history_contaminated,
+        attribution,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn continue_messages_endpoint_after_raw_external_routes(
+    state: AppState,
+    headers: HeaderMap,
+    effective_raw_body: Bytes,
+    effective_raw_probe: Arc<RawMessagesBodyProbe>,
+    raw_body: Bytes,
+    parsed_raw_probe: Arc<RawMessagesBodyProbe>,
+    endpoint: String,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    request_api_key_id: Option<String>,
+    request_history_contaminated: bool,
+    attribution: Option<RequestRejectionAttribution>,
+    raw_preflight_failure: Option<RawExternalPreflightFailure>,
+) -> Response {
+    let runtime_config = state
+        .kiro_provider
+        .as_ref()
+        .map(|provider| request_runtime_config(&state, provider))
+        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
     if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
         &state,
         &runtime_config,
@@ -168,6 +228,7 @@ pub(super) async fn handle_messages_endpoint(
         request_api_key_id,
         request_history_contaminated,
         attribution,
+        raw_preflight_failure,
     )
     .await
 }
@@ -474,14 +535,25 @@ fn record_entry_request_error(
     error: &EntryRequestError,
 ) {
     if let Some(attribution) = attribution {
-        attribution.record(
+        attribution.record_with_metadata(
             error.rejection_reason(),
             "request_entry",
             error.status,
             request_id,
             endpoint,
+            Some(serde_json::json!({
+                "entryReason": error.reason,
+                "entryMessage": bounded_entry_error_message(&error.message),
+            })),
         );
     }
+}
+
+fn bounded_entry_error_message(message: &str) -> String {
+    message
+        .chars()
+        .take(MAX_ENTRY_ERROR_MESSAGE_CHARS)
+        .collect()
 }
 
 #[cfg(test)]
@@ -674,6 +746,8 @@ mod tests {
                 let metadata = record.error_metadata.as_ref().expect("metadata");
                 assert_eq!(metadata["stage"], "request_entry");
                 assert_eq!(metadata["reason"], "request_entry_invalid");
+                assert_eq!(metadata["entryReason"], "missing_max_tokens");
+                assert_eq!(metadata["entryMessage"], "max_tokens: field is required");
                 assert_eq!(metadata["sampled"], true);
                 assert_eq!(metadata["observedCountIsExact"], false);
                 assert!(!metadata.to_string().contains("secret-body"));
@@ -710,6 +784,22 @@ mod tests {
                     .and_then(|value| value.get("reason"))
                     .and_then(serde_json::Value::as_str)
                     == Some("request_entry_invalid")
+                && record
+                    .error_metadata
+                    .as_ref()
+                    .and_then(|value| value.get("entryReason"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("invalid_json_body")
+                && record
+                    .error_metadata
+                    .as_ref()
+                    .and_then(|value| value.get("entryMessage"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| {
+                        !message.is_empty()
+                            && message.chars().count() <= MAX_ENTRY_ERROR_MESSAGE_CHARS
+                            && !message.contains("claude-sonnet-4-5")
+                    })
         }));
     }
 

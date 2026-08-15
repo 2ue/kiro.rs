@@ -329,6 +329,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolSamePoolRetryStatusCodes: [401, 403, 429, 500, 502, 503, 504],
     externalPoolSamePoolRetryDelayMs: 500,
     externalPoolTransientFailurePriorityPenalty: 20,
+    externalPoolTransientFailureCooldownThreshold: 3,
     externalDirectPolicyEnabled: false,
     directExternalOnLocalMaintenance: false,
     directExternalModelRules: [],
@@ -371,9 +372,15 @@ export function defaultExternalPoolsConfig() {
     externalPoolStreamPreOutputRetryEnabled: true,
     externalPoolAutoDisableOnChannelDisabled: true,
     externalPoolUsageProjectionUpliftPercent: 25,
+    externalPoolUsageProjectionCostFloorEnabled: true,
+    externalPoolUsageProjectionCostFloorMarginPercent: 10,
     externalPoolUsageProjectionOutputUpliftMinTokens: 0,
     externalPoolUsageProjectionOutputUpliftPercent: 0,
     externalPoolStreamResponseMode: 'event_passthrough' as const,
+    externalPoolUsageDebugEnabled: false,
+    externalPoolUsageDebugDir: '/tmp/kiro-rs/external-pool-usage-debug',
+    externalPoolUsageDebugMaxBodyBytes: 8192,
+    externalPoolUsageDebugMaxFiles: 1000,
   }
 }
 

@@ -17,6 +17,7 @@ pub(super) struct NormalizedRequestBase {
     guard_fallback_error: Option<PayloadGuardError>,
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -52,6 +53,7 @@ pub(super) fn prepare_request(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         })?)
     } else {
         None
@@ -119,6 +121,7 @@ pub(super) fn prepare_request(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         })?,
         None => normalized_base.body.clone(),
     };
@@ -383,6 +386,7 @@ fn raw_model_stage_plan(mode: ExternalPoolRawModelMode) -> RawModelStagePlan {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn prepare_raw_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -427,6 +431,7 @@ fn prepare_raw_request(
                 auto_disable_reason: None,
                 cooldown: Some((Duration::ZERO, "model_rewrite_failed".to_string())),
                 protocol_error: None,
+                raw_upstream_error: None,
             })?;
             Ok(PreparedExternalRequest {
                 body,
@@ -436,6 +441,7 @@ fn prepare_raw_request(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn effective_raw_probe<'a>(
     route: &'a ExternalRouteRequest,
     pool: &ExternalPool,
@@ -454,6 +460,7 @@ fn effective_raw_probe<'a>(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         })?;
     if let Some(error) = probe.scan_error() {
         return Err(ExternalPoolError {
@@ -463,6 +470,7 @@ fn effective_raw_probe<'a>(
             auto_disable_reason: None,
             cooldown: None,
             protocol_error: None,
+            raw_upstream_error: None,
         });
     }
     Ok(probe)
@@ -522,5 +530,6 @@ fn payload_guard_error(pool: &ExternalPool, err: PayloadGuardError) -> ExternalP
         auto_disable_reason: None,
         cooldown: None,
         protocol_error: None,
+        raw_upstream_error: None,
     }
 }

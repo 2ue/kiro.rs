@@ -67,6 +67,7 @@ import {
   FormSection,
   NumberBox,
   SelectBox,
+  TextBox,
   TextAreaBox,
   ToggleRow,
 } from './external-pool-components'
@@ -161,6 +162,7 @@ export function ExternalPoolsPage() {
           externalPoolSamePoolRetryStatusCodes: parseStatusCodeList(samePoolRetryStatusCodesText),
           externalPoolSamePoolRetryDelayMs: whole(configDraft.externalPoolSamePoolRetryDelayMs),
           externalPoolTransientFailurePriorityPenalty: whole(configDraft.externalPoolTransientFailurePriorityPenalty),
+          externalPoolTransientFailureCooldownThreshold: whole(configDraft.externalPoolTransientFailureCooldownThreshold),
           externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
@@ -180,8 +182,14 @@ export function ExternalPoolsPage() {
           externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
           externalPoolStreamPreOutputRetryEnabled: Boolean(configDraft.externalPoolStreamPreOutputRetryEnabled),
           externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
+          externalPoolUsageProjectionCostFloorEnabled: Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled),
+          externalPoolUsageProjectionCostFloorMarginPercent: whole(configDraft.externalPoolUsageProjectionCostFloorMarginPercent),
           externalPoolUsageProjectionOutputUpliftMinTokens: whole(configDraft.externalPoolUsageProjectionOutputUpliftMinTokens),
           externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
+          externalPoolUsageDebugEnabled: Boolean(configDraft.externalPoolUsageDebugEnabled),
+          externalPoolUsageDebugDir: String(configDraft.externalPoolUsageDebugDir || '').trim(),
+          externalPoolUsageDebugMaxBodyBytes: whole(configDraft.externalPoolUsageDebugMaxBodyBytes),
+          externalPoolUsageDebugMaxFiles: whole(configDraft.externalPoolUsageDebugMaxFiles),
         },
       })
       toast.success('外部账号策略已保存')
@@ -278,7 +286,10 @@ export function ExternalPoolsPage() {
   const outputUpliftActive = externalEnabled
     && configDraft.externalPoolUsageProjectionOutputUpliftMinTokens > 0
     && configDraft.externalPoolUsageProjectionOutputUpliftPercent > 0
-  const usageCompensationActive = cacheUpliftActive || outputUpliftActive
+  const usageCompensationActive = cacheUpliftActive
+    || outputUpliftActive
+    || configDraft.externalPoolUsageProjectionCostFloorEnabled
+  const usageDebugActive = externalEnabled && configDraft.externalPoolUsageDebugEnabled
 
   const poolStatuses = status.data?.pools ?? []
   const totalPools = pools.data?.pools.length ?? poolStatuses.length
@@ -397,6 +408,7 @@ export function ExternalPoolsPage() {
                   <NumberBox disabled={!externalEnabled} label="同池重试次数" description="命中下面状态码时，先在同一个外部账号上重试；重试耗尽后才冷却并尝试其他外部账号。" suffix="次" value={configDraft.externalPoolSamePoolRetryCount} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryCount: v }))} />
                   <NumberBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试间隔" suffix="毫秒" value={configDraft.externalPoolSamePoolRetryDelayMs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryDelayMs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="失败池临时降权" description="每个瞬态失败窗口内的失败次数都会临时增加有效优先级；默认 20，可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。" suffix="优先级" min={0} value={configDraft.externalPoolTransientFailurePriorityPenalty} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailurePriorityPenalty: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="连续失败冷却阈值" description="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；0 表示关闭。" suffix="次" min={0} value={configDraft.externalPoolTransientFailureCooldownThreshold} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailureCooldownThreshold: v }))} />
                   <TextAreaBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试状态码" value={samePoolRetryStatusCodesText} onChange={setSamePoolRetryStatusCodesText} />
                 </div>
               </FormSection>
@@ -471,6 +483,12 @@ export function ExternalPoolsPage() {
             description={'仅对下游 usage 口径为“按当前入口路径整理 usage”的外部账号生效；选择“透传上游 usage”的账号不受影响。'}
           >
             <div className="space-y-4">
+              <FormSection title="成本底线" description="用最终返回给调用方的 usage 覆盖原始上游成本；有上游缓存证据时优先补缓存字段，并遵守当前路径上限。">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <ToggleRow disabled={!externalEnabled} label="启用成本底线" checked={Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled)} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageProjectionCostFloorEnabled: v }))} />
+                  <NumberBox disabled={!externalEnabled || !configDraft.externalPoolUsageProjectionCostFloorEnabled} label="成本补齐余量" suffix="%" min={0} value={configDraft.externalPoolUsageProjectionCostFloorMarginPercent} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageProjectionCostFloorMarginPercent: v }))} />
+                </div>
+              </FormSection>
               <div className="grid gap-4 lg:grid-cols-2">
                 <FormSection title="缓存读写补偿">
                   <div className="grid gap-3 sm:grid-cols-2">
@@ -486,6 +504,20 @@ export function ExternalPoolsPage() {
                   </div>
                 </FormSection>
               </div>
+            </div>
+          </PolicyBlock>
+
+          <PolicyBlock
+            title="诊断记录"
+            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            active={usageDebugActive}
+            description="临时保存外部池上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；用于排查 output_tokens 为 0 等异常。"
+          >
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <ToggleRow disabled={!externalEnabled} label="启用 usage 原始数据诊断" checked={configDraft.externalPoolUsageDebugEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugEnabled: v }))} />
+              <TextBox className="xl:col-span-3" disabled={!usageDebugActive} label="诊断目录" description="容器内路径；记录失败只写服务日志，不影响请求。" value={configDraft.externalPoolUsageDebugDir} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugDir: v }))} />
+              <NumberBox disabled={!usageDebugActive} label="单条原始片段上限" suffix="Bytes" value={configDraft.externalPoolUsageDebugMaxBodyBytes} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugMaxBodyBytes: v }))} />
+              <NumberBox disabled={!usageDebugActive} label="最多诊断文件" suffix="个" value={configDraft.externalPoolUsageDebugMaxFiles} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugMaxFiles: v }))} />
             </div>
           </PolicyBlock>
         </div>
