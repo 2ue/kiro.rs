@@ -144,6 +144,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Model capability cohort fencing now exposes `UpstreamReasoningCohortContractMatch`; startup recovery decisions and model capability tests no longer use the old Kiro-named contract-match type for upstream reasoning readiness.
 - Main process wiring now constructs and passes the optional local executor as `local_upstream_provider` using the local-upstream provider alias. The remaining Admin `kiro_provider` field is an unmigrated compatibility service boundary, not the process-level provider name.
 - Admin service dependencies and internal provider state now use `local_upstream_provider` and `LocalUpstreamProvider`, removing the old provider field/type name from main/Admin wiring while legacy credential operations remain behind that local-upstream executor.
+- Removed the unmounted `src/test.rs` manual stream caller, which was a Kiro-specific scratch entrypoint and not part of the compiled scheduler/proxy/usage runtime.
 
 Last verified on 2026-08-15:
 
@@ -370,6 +371,7 @@ Last verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh main-local-upstream-provider-name-test1 -- bash -lc 'cargo check && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh admin-provider-field-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh admin-provider-field-alias-test1 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh remove-unused-kiro-scratch-test-check1 -- cargo check`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

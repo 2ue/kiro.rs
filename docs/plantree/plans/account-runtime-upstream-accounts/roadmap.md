@@ -106,6 +106,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Model capability cohort fencing and startup readiness now use upstream reasoning contract-match naming instead of the old Kiro-named type.
 - Main process wiring now uses local-upstream provider naming for the optional local executor and model capability recovery worker.
 - Admin service dependencies and internal provider state now use local-upstream provider naming, leaving legacy credential behavior behind the local executor boundary.
+- The unmounted `src/test.rs` Kiro-specific manual stream caller was removed.
 
 ## In Progress
 
