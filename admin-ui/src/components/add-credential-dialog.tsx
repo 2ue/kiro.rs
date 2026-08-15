@@ -285,7 +285,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     // 验证必填字段
     if (isApiKey) {
       if (!kiroApiKey.trim()) {
-        toast.error('请输入 Kiro API Key')
+        toast.error('请输入上游 API Key')
         return
       }
     } else {
@@ -434,11 +434,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </select>
             </div>
 
-            {/* Kiro API Key (API Key 模式) */}
+            {/* 上游 API Key (API Key 模式) */}
             {isApiKey && (
               <div className="space-y-2">
                 <label htmlFor="kiroApiKey" className="text-sm font-medium">
-                  Kiro API Key <span className="text-red-500">*</span>
+                  上游 API Key <span className="text-red-500">*</span>
                 </label>
                 <Input
                   id="kiroApiKey"
@@ -714,7 +714,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">
-                可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+                可选。决定该凭据走哪套上游 API。留空使用全局 defaultEndpoint
               </p>
             </div>
 

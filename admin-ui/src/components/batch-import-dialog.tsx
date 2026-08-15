@@ -237,7 +237,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               newResults[i] = {
                 ...newResults[i],
                 status: 'failed',
-                error: '缺少 kiroApiKey',
+                error: '缺少 API Key',
               }
               return newResults
             })

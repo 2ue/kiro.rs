@@ -76,7 +76,7 @@ export function LoginPage({ onLogin, initialError = '' }: LoginPageProps) {
                 className="text-center"
               />
               <p className="text-xs leading-5 text-muted-foreground">
-                对应配置字段 <span className="font-mono">{ADMIN_API_KEY_FIELD}</span>，请求时会作为 <span className="font-mono">x-api-key</span> 发送；它不是 Kiro 凭据的 API Key。
+                对应配置字段 <span className="font-mono">{ADMIN_API_KEY_FIELD}</span>，请求时会作为 <span className="font-mono">x-api-key</span> 发送；它不是上游账号凭据的 API Key。
               </p>
             </div>
             {error && (

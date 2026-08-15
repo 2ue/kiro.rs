@@ -436,7 +436,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (isApiKey && !form.kiroApiKey.trim()) return toast.error('请输入 Kiro API Key')
+    if (isApiKey && !form.kiroApiKey.trim()) return toast.error('请输入上游 API Key')
     if (!isApiKey && !form.refreshToken.trim()) return toast.error('请输入 Refresh Token')
     if (form.authMethod === 'idc' && (!form.clientId.trim() || !form.clientSecret.trim())) return toast.error('IdC 认证需要 Client ID 和 Client Secret')
     if (form.authMethod === 'external_idp' && !form.clientId.trim()) return toast.error('External IdP 认证需要 Client ID')
@@ -518,7 +518,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
 
         <FieldGrid>
           {isApiKey ? (
-            <Field label="Kiro API Key" className="col-span-2">
+            <Field label="上游 API Key" className="col-span-2">
               <SecretInput value={form.kiroApiKey} onChange={(v) => update('kiroApiKey', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} placeholder="ksk_... 或 ksk_...|eu-central-1" disabled={add.isPending} />
             </Field>
           ) : (

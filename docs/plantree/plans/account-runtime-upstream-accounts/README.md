@@ -183,9 +183,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Kiro content/wire-facing behavior.
 - Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `kiro.rs` conversation-id hash domain remains unchanged to avoid behavior drift.
 - Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `kiroMeteringUsage` compatibility field assertion remains unchanged.
+- Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Kiro API-key/API wording while keeping `kiroApiKey` as a compatibility field.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro API Key|请输入 Kiro API Key|Kiro 凭据|Kiro API|缺少 kiroApiKey" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "Kiro|kiro" src/anthropic/stream.rs`
 - `feature/tests/run-cargo-scoped.sh stream-local-upstream-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh stream-local-upstream-text-test1 -- cargo test stream -- --nocapture`
