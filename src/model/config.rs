@@ -2055,7 +2055,7 @@ pub struct CacheRoutePolicyPatch {
     pub cache_point: Option<CachePointPolicyPatch>,
     #[serde(default)]
     pub bounds: Option<CacheBoundsPolicyPatch>,
-    #[serde(default, rename = "kiroRsTool", alias = "claudeCodeTool")]
+    #[serde(default, rename = "claudeCodeTool", alias = "kiroRsTool")]
     pub claude_code_tool: Option<ClaudeCodeToolCachePolicyPatch>,
 }
 
@@ -2190,7 +2190,7 @@ pub enum PromptCacheStrategyType {
     NoCache,
     #[default]
     CurrentHighCache,
-    #[serde(rename = "kiro_rs_tool", alias = "claude_code_tool")]
+    #[serde(rename = "claude_code_tool", alias = "kiro_rs_tool")]
     ClaudeCodeTool,
 }
 
@@ -2201,7 +2201,7 @@ pub struct CachePolicyConfig {
     pub default: CacheRoutePolicyPatch,
     #[serde(default)]
     pub current_high_cache: CacheRoutePolicyPatch,
-    #[serde(default, rename = "kiroRsTool", alias = "claudeCodeTool")]
+    #[serde(default, rename = "claudeCodeTool", alias = "kiroRsTool")]
     pub claude_code_tool: CacheRoutePolicyPatch,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
@@ -7007,6 +7007,19 @@ mod tests {
             PromptCacheStrategyType::ClaudeCodeTool
         );
         assert_eq!(new_value.policy.claude_code_tool.coverage_ratio, 0.6);
+
+        let serialized_patch = serde_json::to_value(CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
+            claude_code_tool: Some(ClaudeCodeToolCachePolicyPatch {
+                coverage_ratio: Some(0.4),
+                ..ClaudeCodeToolCachePolicyPatch::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        })
+        .expect("serialize cache route policy patch");
+        assert_eq!(serialized_patch["cacheType"], "claude_code_tool");
+        assert!(serialized_patch.get("claudeCodeTool").is_some());
+        assert!(serialized_patch.get("kiroRsTool").is_none());
     }
 
     #[test]
