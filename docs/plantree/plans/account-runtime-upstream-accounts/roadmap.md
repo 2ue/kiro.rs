@@ -144,6 +144,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Kiro protocol/model/cache wording.
 - Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Kiro content/wire-facing behavior.
 - Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `kiro.rs` conversation-id hash domain remains unchanged to avoid behavior drift.
+- Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `kiroMeteringUsage` compatibility field assertion remains unchanged.
 
 ## In Progress
 

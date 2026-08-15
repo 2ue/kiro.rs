@@ -1860,8 +1860,8 @@ impl StreamContext {
         !self.saw_upstream_completed
     }
 
-    /// A status-bearing response must finish with `COMPLETED`. Some legacy Kiro
-    /// responses do not emit `messageStatus` at all, so absence alone is kept
+    /// A status-bearing response must finish with `COMPLETED`. Some legacy
+    /// local-upstream responses do not emit `messageStatus` at all, so absence alone is kept
     /// backward-compatible and is only recorded as observability data.
     pub fn upstream_status_indicates_incomplete(&self) -> bool {
         self.upstream_message_status
@@ -4492,7 +4492,7 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
         let _ = ctx.generate_initial_events();
 
-        // 模拟 Kiro 返回短名称的 tool_use
+        // 模拟本地上游返回短名称的 tool_use
         let tool_event = Event::ToolUse(ToolUseEvent {
             name: "short_abc12345".to_string(),
             tool_use_id: "toolu_01".to_string(),
@@ -6989,8 +6989,8 @@ mod tests {
 
     #[test]
     fn literal_tool_protocol_wrapped_calls_keep_mapping_repairs_and_multiline_values() {
-        let original = "mcp__very_long_server_name__tool_with_name_that_exceeds_kiro_limit";
-        let short = "mcpVeryLongServerNameToolWithNameThatExceedsKiroLiHash12345678";
+        let original = "mcp__very_long_server_name__tool_with_name_that_exceeds_upstream_limit";
+        let short = "mcpVeryLongServerNameToolWithNameThatExceedsUpstHash12345678";
         let name_map = HashMap::from([(short.to_string(), original.to_string())]);
         let known = HashSet::from([
             short.to_string(),
