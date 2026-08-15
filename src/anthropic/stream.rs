@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::kiro::model::events::{Event, MetadataTokenUsage};
+use crate::local_upstream::event::{
+    LocalUpstreamEvent as Event, LocalUpstreamMetadataTokenUsage as MetadataTokenUsage,
+    LocalUpstreamReasoningContentEvent, LocalUpstreamToolUseEvent,
+};
 use crate::model::config::{PromptCacheSimulationMode, ReportedUsagePathPolicy};
 
 use super::envelope;
@@ -2394,11 +2397,6 @@ impl StreamContext {
 
     /// 处理本地上游事件并转换为 Anthropic SSE 事件
     pub fn process_local_upstream_event(&mut self, event: &Event) -> Vec<SseEvent> {
-        self.process_kiro_event(event)
-    }
-
-    /// 处理 legacy concrete event 并转换为 Anthropic SSE 事件
-    pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         self.record_upstream_event(event);
         match event {
             Event::AssistantResponse(resp) => {
@@ -2666,7 +2664,7 @@ impl StreamContext {
     /// 处理原生 reasoningContentEvent。
     fn process_reasoning_content(
         &mut self,
-        reasoning: &crate::kiro::model::events::ReasoningContentEvent,
+        reasoning: &LocalUpstreamReasoningContentEvent,
     ) -> Vec<SseEvent> {
         if !self.thinking_enabled {
             return Vec::new();
@@ -3409,10 +3407,7 @@ impl StreamContext {
     }
 
     /// 处理工具使用事件
-    fn process_tool_use(
-        &mut self,
-        tool_use: &crate::kiro::model::events::ToolUseEvent,
-    ) -> Vec<SseEvent> {
+    fn process_tool_use(&mut self, tool_use: &LocalUpstreamToolUseEvent) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         self.drop_pending_trivial_text_before_tool_use();
@@ -3923,12 +3918,9 @@ mod tests {
     fn assistant_message_status_marks_upstream_completion_without_changing_sse_shape() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
         let mut events = ctx.generate_initial_events();
-        events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "done",
-                Some("COMPLETED"),
-            ))),
-        );
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("done", Some("COMPLETED")),
+        )));
         events.extend(ctx.generate_final_events());
 
         assert_eq!(ctx.upstream_message_status(), Some("COMPLETED"));
@@ -3949,19 +3941,19 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
         assert!(!ctx.upstream_status_indicates_incomplete());
 
-        ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+        ctx.process_local_upstream_event(&Event::AssistantResponse(assistant_response_event(
             "working",
             Some("IN_PROGRESS"),
         )));
         assert!(ctx.upstream_status_indicates_incomplete());
 
-        ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+        ctx.process_local_upstream_event(&Event::AssistantResponse(assistant_response_event(
             "done",
             Some("COMPLETED"),
         )));
         assert!(!ctx.upstream_status_indicates_incomplete());
 
-        ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+        ctx.process_local_upstream_event(&Event::AssistantResponse(assistant_response_event(
             "unexpected continuation",
             Some("ERROR"),
         )));
@@ -3978,7 +3970,7 @@ mod tests {
         for round in 0..5 {
             let mut unknown =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            unknown.process_kiro_event(&Event::Unknown {});
+            unknown.process_local_upstream_event(&Event::Unknown {});
             assert_eq!(
                 unknown.upstream_terminal_failure_detail(),
                 Some(
@@ -3989,10 +3981,9 @@ mod tests {
 
             let mut missing =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            missing.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "unterminated",
-                None,
-            )));
+            missing.process_local_upstream_event(&Event::AssistantResponse(
+                assistant_response_event("unterminated", None),
+            ));
             assert_eq!(
                 missing.upstream_terminal_failure_detail(),
                 Some("upstream eventstream ended without a trusted completion signal"),
@@ -4001,11 +3992,12 @@ mod tests {
 
             let mut metadata =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            metadata.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "legacy complete",
-                None,
-            )));
-            metadata.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+            metadata.process_local_upstream_event(&Event::AssistantResponse(
+                assistant_response_event("legacy complete", None),
+            ));
+            metadata.process_local_upstream_event(&Event::Metadata(MetadataEvent {
+                token_usage: None,
+            }));
             assert_eq!(
                 metadata.upstream_terminal_failure_detail(),
                 None,
@@ -4014,11 +4006,10 @@ mod tests {
 
             let mut context_usage =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            context_usage.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "legacy context usage complete",
-                None,
-            )));
-            context_usage.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+            context_usage.process_local_upstream_event(&Event::AssistantResponse(
+                assistant_response_event("legacy context usage complete", None),
+            ));
+            context_usage.process_local_upstream_event(&Event::ContextUsage(ContextUsageEvent {
                 context_usage_percentage: 1.25,
             }));
             assert_eq!(
@@ -4029,9 +4020,11 @@ mod tests {
 
             let mut context_usage_only =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            context_usage_only.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
-                context_usage_percentage: 1.25,
-            }));
+            context_usage_only.process_local_upstream_event(&Event::ContextUsage(
+                ContextUsageEvent {
+                    context_usage_percentage: 1.25,
+                },
+            ));
             assert_eq!(
                 context_usage_only.upstream_terminal_failure_detail(),
                 None,
@@ -4040,11 +4033,10 @@ mod tests {
 
             let mut metering =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            metering.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "legacy metering complete",
-                None,
-            )));
-            metering.process_kiro_event(&Event::Metering(MeteringEvent {
+            metering.process_local_upstream_event(&Event::AssistantResponse(
+                assistant_response_event("legacy metering complete", None),
+            ));
+            metering.process_local_upstream_event(&Event::Metering(MeteringEvent {
                 usage: 0.01,
                 ..Default::default()
             }));
@@ -4056,7 +4048,7 @@ mod tests {
 
             let mut metering_only =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            metering_only.process_kiro_event(&Event::Metering(MeteringEvent {
+            metering_only.process_local_upstream_event(&Event::Metering(MeteringEvent {
                 usage: 0.01,
                 input_tokens: 42,
                 ..Default::default()
@@ -4069,7 +4061,7 @@ mod tests {
 
             let mut partial_tool =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            partial_tool.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            partial_tool.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
                 name: "Read".to_string(),
                 tool_use_id: "toolu_partial".to_string(),
                 input: "{".to_string(),
@@ -4084,7 +4076,7 @@ mod tests {
             let mut flushable_tool =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
             flushable_tool.generate_initial_events();
-            flushable_tool.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            flushable_tool.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
                 name: "Read".to_string(),
                 tool_use_id: "toolu_flushable".to_string(),
                 input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
@@ -4098,7 +4090,7 @@ mod tests {
 
             let mut complete_tool =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
-            complete_tool.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            complete_tool.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
                 name: "Read".to_string(),
                 tool_use_id: "toolu_complete".to_string(),
                 input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
@@ -4124,12 +4116,9 @@ mod tests {
             known_tools,
         );
         let mut events = ctx.generate_initial_events();
-        events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "I'll inspect that first.",
-                None,
-            ))),
-        );
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("I'll inspect that first.", None),
+        )));
         events.extend(ctx.generate_final_events());
 
         assert_eq!(ctx.stop_reason_source(), "local_inferred_end_turn");
@@ -4149,14 +4138,11 @@ mod tests {
             HashSet::from(["Read".to_string(), "Bash".to_string()]),
         );
         let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("好问题。让我完整梳理。\n\nuser Tool results pro", None),
+        )));
         events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "好问题。让我完整梳理。\n\nuser Tool results pro",
-                None,
-            ))),
-        );
-        events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+            ctx.process_local_upstream_event(&Event::AssistantResponse(assistant_response_event(
                 &format!(
                     "vided.\n\nTool results:\n\n[readHash9b9a8d05] {}\n</function_results>\n\nLet me look at `_ensure_sso` next.",
                     "x ".repeat(500)
@@ -4211,22 +4197,21 @@ mod tests {
             "inue\n\n",
             "bashHashd1e9567d: hidden output\nsecret",
         ] {
-            events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+            events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
                 assistant_response_event(chunk, None),
             )));
         }
-        events.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
-            name: mapped.to_string(),
-            tool_use_id: "toolu_real".to_string(),
-            input: r#"{"command":"pwd"}"#.to_string(),
-            stop: true,
-        })));
         events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "after tool",
-                Some("COMPLETED"),
-            ))),
+            ctx.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
+                name: mapped.to_string(),
+                tool_use_id: "toolu_real".to_string(),
+                input: r#"{"command":"pwd"}"#.to_string(),
+                stop: true,
+            })),
         );
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("after tool", Some("COMPLETED")),
+        )));
         events.extend(ctx.generate_final_events());
 
         assert_eq!(collect_text_content(&events), "正常前言。\nafter tool");
@@ -4258,12 +4243,12 @@ mod tests {
             HashSet::from(["bashHashd1e9567d".to_string()]),
         );
         let mut events = ctx.generate_initial_events();
-        events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event(
                 "user Continue\n\nbashHashd1e9567d: hidden output",
                 Some("COMPLETED"),
-            ))),
-        );
+            ),
+        )));
         events.extend(ctx.generate_final_events());
 
         assert_eq!(collect_text_content(&events), "");
@@ -4295,11 +4280,10 @@ mod tests {
             HashSet::from(["Read".to_string()]),
         );
         let _ = ctx.generate_initial_events();
-        let _ = ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-            "Tool results provided.",
-            Some("IN_PROGRESS"),
-        )));
-        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+        let _ = ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("Tool results provided.", Some("IN_PROGRESS")),
+        ));
+        let _ = ctx.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
             name: "Read".to_string(),
             tool_use_id: "toolu_read".to_string(),
             input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
@@ -4326,11 +4310,9 @@ mod tests {
             HashSet::from(["Read".to_string()]),
         );
         let mut events = ctx.generate_initial_events();
-        events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "正常", None,
-            ))),
-        );
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("正常", None),
+        )));
         events.extend(ctx.generate_final_events());
 
         assert!(ctx.suspected_intent_preamble_end_turn(true));
@@ -4351,7 +4333,7 @@ mod tests {
         );
         let mut all_events = ctx.generate_initial_events();
 
-        let trivial_events = ctx.process_kiro_event(&Event::AssistantResponse(
+        let trivial_events = ctx.process_local_upstream_event(&Event::AssistantResponse(
             assistant_response_event(".", None),
         ));
         assert!(
@@ -4360,12 +4342,14 @@ mod tests {
         );
         all_events.extend(trivial_events);
 
-        all_events.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
-            name: "Read".to_string(),
-            tool_use_id: "toolu_read".to_string(),
-            input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
-            stop: true,
-        })));
+        all_events.extend(
+            ctx.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "toolu_read".to_string(),
+                input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+                stop: true,
+            })),
+        );
         all_events.extend(ctx.generate_final_events());
 
         assert_eq!(collect_text_content(&all_events), "");
@@ -4385,7 +4369,7 @@ mod tests {
         );
         let mut all_events = ctx.generate_initial_events();
 
-        let trivial_events = ctx.process_kiro_event(&Event::AssistantResponse(
+        let trivial_events = ctx.process_local_upstream_event(&Event::AssistantResponse(
             assistant_response_event(".", None),
         ));
         assert!(collect_text_content(&trivial_events).is_empty());
@@ -4409,10 +4393,10 @@ mod tests {
         );
         let mut all_events = ctx.generate_initial_events();
 
-        all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+        all_events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
             assistant_response_event(".", None),
         )));
-        all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+        all_events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
             assistant_response_event("14", None),
         )));
         all_events.extend(ctx.generate_final_events());
@@ -4435,12 +4419,12 @@ mod tests {
         );
         let _ = ctx.generate_initial_events();
 
-        let _ = ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-            "abc",
-            Some("IN_PROGRESS"),
-        )));
-        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
-        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+        let _ = ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("abc", Some("IN_PROGRESS")),
+        ));
+        let _ =
+            ctx.process_local_upstream_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
             name: "Read".to_string(),
             tool_use_id: "toolu_read".to_string(),
             input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
@@ -4519,7 +4503,7 @@ mod tests {
             stop: true,
         });
 
-        let events = ctx.process_kiro_event(&tool_event);
+        let events = ctx.process_local_upstream_event(&tool_event);
 
         // content_block_start 中的 name 应该是原始长名称
         let start_event = events
@@ -4540,14 +4524,14 @@ mod tests {
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
-        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+        all_events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
             ReasoningContentEvent {
                 text: "hello".to_string(),
                 signature: Some("sig".to_string()),
                 redacted_content: None,
             },
         )));
-        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+        all_events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
             ReasoningContentEvent {
                 text: "hello world".to_string(),
                 signature: Some("sig".to_string()),
@@ -4633,7 +4617,7 @@ mod tests {
                 .skip(1)
                 .chain(std::iter::once((polluted.len(), '\0')))
             {
-                events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
                     ReasoningContentEvent {
                         text: polluted[..end].to_string(),
                         signature: Some("opaque-signature".to_string()),
@@ -4676,7 +4660,7 @@ mod tests {
                 HashSet::from(["Bash".to_string()]),
             );
             let mut events = ctx.generate_initial_events();
-            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
                 ReasoningContentEvent {
                     text: "ordinary reasoning".to_string(),
                     signature: Some("user Continue\n\nBash: hidden".to_string()),
@@ -4708,13 +4692,13 @@ mod tests {
             HashSet::from(["Bash".to_string()]),
         );
         let mut events = ctx.generate_initial_events();
-        events.extend(
-            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+        events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
+            ReasoningContentEvent {
                 text: "x".repeat(MAX_BUFFERED_ATOMIC_THINKING_BYTES + 1),
                 signature: Some("opaque-signature".to_string()),
                 redacted_content: None,
-            })),
-        );
+            },
+        )));
         assert!(ctx.has_stream_error());
         events.extend(ctx.generate_final_events());
         assert_eq!(collect_thinking_content(&events), "");
@@ -4739,7 +4723,7 @@ mod tests {
                 HashSet::from(["Bash".to_string()]),
             );
             let mut events = ctx.generate_initial_events();
-            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
                 ReasoningContentEvent {
                     text: String::new(),
                     signature: None,
@@ -4784,7 +4768,7 @@ mod tests {
                 HashSet::from(["Bash".to_string()]),
             );
             let mut events = ctx.generate_initial_events();
-            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
                 ReasoningContentEvent {
                     text: String::new(),
                     signature: None,
@@ -4846,25 +4830,19 @@ mod tests {
             HashSet::from(["Bash".to_string()]),
         );
         let mut events = ctx.generate_initial_events();
-        events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "user Continue\n\n",
-                None,
-            ))),
-        );
-        events.extend(
-            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("user Continue\n\n", None),
+        )));
+        events.extend(ctx.process_local_upstream_event(&Event::ReasoningContent(
+            ReasoningContentEvent {
                 text: "reasoning".to_string(),
                 signature: Some("sig".to_string()),
                 redacted_content: None,
-            })),
-        );
-        events.extend(
-            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-                "Bash: ordinary visible text",
-                Some("COMPLETED"),
-            ))),
-        );
+            },
+        )));
+        events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("Bash: ordinary visible text", Some("COMPLETED")),
+        )));
         events.extend(ctx.generate_final_events());
 
         assert_eq!(
@@ -4957,15 +4935,17 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("hello"));
-        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
-                uncached_input_tokens: 100,
-                output_tokens: 9,
-                total_tokens: 116,
-                cache_read_input_tokens: 7,
-                cache_write_input_tokens: 3,
-            }),
-        })));
+        all_events.extend(
+            ctx.process_local_upstream_event(&Event::Metadata(MetadataEvent {
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 100,
+                    output_tokens: 9,
+                    total_tokens: 116,
+                    cache_read_input_tokens: 7,
+                    cache_write_input_tokens: 3,
+                }),
+            })),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -4985,14 +4965,16 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("fake response"));
-        all_events.extend(
-            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::ContextUsage(
+            ContextUsageEvent {
                 context_usage_percentage: 0.0,
+            },
+        )));
+        all_events.extend(
+            ctx.process_local_upstream_event(&Event::Metadata(MetadataEvent {
+                token_usage: Some(MetadataTokenUsage::default()),
             })),
         );
-        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage::default()),
-        })));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5020,22 +5002,24 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
         let mut events = ctx.process_assistant_response("hello");
-        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
-                uncached_input_tokens: 21,
-                output_tokens: 13,
-                total_tokens: 377,
-                cache_read_input_tokens: 300,
-                cache_write_input_tokens: 43,
-            }),
-        })));
         events.extend(
-            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+            ctx.process_local_upstream_event(&Event::Metadata(MetadataEvent {
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 21,
+                    output_tokens: 13,
+                    total_tokens: 377,
+                    cache_read_input_tokens: 300,
+                    cache_write_input_tokens: 43,
+                }),
+            })),
+        );
+        events.extend(ctx.process_local_upstream_event(&Event::MessageMetadata(
+            MessageMetadataEvent {
                 conversation_id: Some("conv-1".to_string()),
                 utterance_id: Some("utt-1".to_string()),
                 token_usage: Some(MetadataTokenUsage::default()),
-            })),
-        );
+            },
+        )));
         events.extend(ctx.generate_final_events());
 
         let usage = &events
@@ -5056,14 +5040,16 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
         let mut events = ctx.process_assistant_response("hello");
-        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
-                output_tokens: 13,
-                ..MetadataTokenUsage::default()
-            }),
-        })));
         events.extend(
-            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+            ctx.process_local_upstream_event(&Event::Metadata(MetadataEvent {
+                token_usage: Some(MetadataTokenUsage {
+                    output_tokens: 13,
+                    ..MetadataTokenUsage::default()
+                }),
+            })),
+        );
+        events.extend(ctx.process_local_upstream_event(&Event::MessageMetadata(
+            MessageMetadataEvent {
                 conversation_id: Some("conv-1".to_string()),
                 utterance_id: Some("utt-1".to_string()),
                 token_usage: Some(MetadataTokenUsage {
@@ -5073,8 +5059,8 @@ mod tests {
                     cache_read_input_tokens: 300,
                     cache_write_input_tokens: 43,
                 }),
-            })),
-        );
+            },
+        )));
         events.extend(ctx.generate_final_events());
 
         let usage = &events
@@ -5095,7 +5081,7 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let sse_events = ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+        let sse_events = ctx.process_local_upstream_event(&Event::Metering(MeteringEvent {
             usage: 1.25,
             ..Default::default()
         }));
@@ -5442,8 +5428,8 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("hello"));
-        all_events.extend(
-            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::MessageMetadata(
+            MessageMetadataEvent {
                 conversation_id: Some("conv-1".to_string()),
                 utterance_id: Some("utt-1".to_string()),
                 token_usage: Some(MetadataTokenUsage {
@@ -5453,8 +5439,8 @@ mod tests {
                     cache_read_input_tokens: 300,
                     cache_write_input_tokens: 43,
                 }),
-            })),
-        );
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5488,11 +5474,11 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("ok"));
-        all_events.extend(
-            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::ContextUsage(
+            ContextUsageEvent {
                 context_usage_percentage: 12.5,
-            })),
-        );
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5522,11 +5508,11 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("near limit"));
-        all_events.extend(
-            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::ContextUsage(
+            ContextUsageEvent {
                 context_usage_percentage: 100.0,
-            })),
-        );
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5561,8 +5547,8 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("near token limit"));
-        all_events.extend(
-            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::MessageMetadata(
+            MessageMetadataEvent {
                 conversation_id: Some("conv-max".to_string()),
                 utterance_id: Some("utt-max".to_string()),
                 token_usage: Some(MetadataTokenUsage {
@@ -5572,8 +5558,8 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_write_input_tokens: 0,
                 }),
-            })),
-        );
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5600,8 +5586,8 @@ mod tests {
                 stop: true,
             }),
         );
-        all_events.extend(
-            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::MessageMetadata(
+            MessageMetadataEvent {
                 conversation_id: Some("conv-tool".to_string()),
                 utterance_id: Some("utt-tool".to_string()),
                 token_usage: Some(MetadataTokenUsage {
@@ -5611,8 +5597,8 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_write_input_tokens: 0,
                 }),
-            })),
-        );
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5642,13 +5628,13 @@ mod tests {
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
-        all_events.extend(
-            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::ContextUsage(
+            ContextUsageEvent {
                 context_usage_percentage: 100.0,
-            })),
-        );
-        all_events.extend(
-            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+            },
+        )));
+        all_events.extend(ctx.process_local_upstream_event(&Event::MessageMetadata(
+            MessageMetadataEvent {
                 conversation_id: Some("conv-context".to_string()),
                 utterance_id: Some("utt-context".to_string()),
                 token_usage: Some(MetadataTokenUsage {
@@ -5658,8 +5644,8 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_write_input_tokens: 0,
                 }),
-            })),
-        );
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5679,7 +5665,7 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        let events = ctx.process_kiro_event(&Event::Code(CodeEvent {
+        let events = ctx.process_local_upstream_event(&Event::Code(CodeEvent {
             content: "let value = 1;".to_string(),
         }));
 
@@ -5702,7 +5688,7 @@ mod tests {
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
-        all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+        all_events.extend(ctx.process_local_upstream_event(&Event::AssistantResponse(
             assistant_response_event("I will inspect the file first.", Some("COMPLETED")),
         )));
         all_events.extend(ctx.generate_final_events());
@@ -5742,11 +5728,10 @@ mod tests {
         );
         let _initial_events = ctx.generate_initial_events();
 
-        let _ = ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
-            "I will inspect the file first.",
-            Some("IN_PROGRESS"),
-        )));
-        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+        let _ = ctx.process_local_upstream_event(&Event::AssistantResponse(
+            assistant_response_event("I will inspect the file first.", Some("IN_PROGRESS")),
+        ));
+        let _ = ctx.process_local_upstream_event(&Event::ToolUse(ToolUseEvent {
             name: "Read".to_string(),
             tool_use_id: "toolu_read".to_string(),
             input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
@@ -5768,15 +5753,17 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("hello"));
-        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
-                uncached_input_tokens: 1200,
-                output_tokens: 900,
-                total_tokens: 206100,
-                cache_read_input_tokens: 180000,
-                cache_write_input_tokens: 24000,
-            }),
-        })));
+        all_events.extend(
+            ctx.process_local_upstream_event(&Event::Metadata(MetadataEvent {
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 1200,
+                    output_tokens: 900,
+                    total_tokens: 206100,
+                    cache_read_input_tokens: 180000,
+                    cache_write_input_tokens: 24000,
+                }),
+            })),
+        );
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5796,12 +5783,12 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("partial"));
-        all_events.extend(
-            ctx.process_kiro_event(&Event::InvalidState(InvalidStateEvent {
+        all_events.extend(ctx.process_local_upstream_event(&Event::InvalidState(
+            InvalidStateEvent {
                 reason: "Expired".to_string(),
                 message: "session expired".to_string(),
-            })),
-        );
+            },
+        )));
         all_events.extend(ctx.generate_final_events());
 
         assert!(
@@ -5909,7 +5896,7 @@ mod tests {
             HashSet::from(["bashHashd1e9567d".to_string()]),
         );
         let _initial_events = ctx.generate_initial_events();
-        let mut events = ctx.process_kiro_event(&Event::AssistantResponse(
+        let mut events = ctx.process_local_upstream_event(&Event::AssistantResponse(
             assistant_response_event("user Continue\n\nbashHashd1e9567d: hidden", None),
         ));
         ctx.record_stream_error("api_error", "upstream stream read error");

@@ -90,6 +90,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - `local_upstream` now provides compatibility aliases for the legacy local provider, call-trace, MCP attribution and response types; Anthropic router, middleware, handler and WebSearch boundaries import those aliases instead of legacy provider names.
 - `local_upstream` now provides local request/event aliases used by `payload_guard_runtime`, `tool_format_debug` and `cache`, reducing direct legacy request/event imports in small Anthropic body/diagnostic boundaries.
 - Anthropic handler stream/body code now consumes local-upstream request/event/metadata/decoder aliases from the facade for payload guard retries, stream retry state, EventStream decoding, latency classification and metadata usage, leaving concrete legacy request/event/decoder imports inside the compatibility facade.
+- Anthropic stream conversion and debug helpers now consume local-upstream event aliases from the facade, and stream tests use `process_local_upstream_event` as the primary event processor entrypoint.
 
 ## In Progress
 

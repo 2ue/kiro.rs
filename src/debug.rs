@@ -2,7 +2,7 @@
 //!
 //! 提供 hex 打印和 CRC 调试等功能
 
-use crate::kiro::model::events::Event;
+use crate::local_upstream::event::LocalUpstreamEvent as Event;
 use std::io::Write;
 
 /// 打印 hex 数据 (类似 xxd 格式)

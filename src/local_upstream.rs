@@ -39,6 +39,9 @@ pub(crate) mod event {
     pub(crate) type LocalUpstreamMetadataEvent = crate::kiro::model::events::MetadataEvent;
     pub(crate) type LocalUpstreamMetadataTokenUsage =
         crate::kiro::model::events::MetadataTokenUsage;
+    pub(crate) type LocalUpstreamReasoningContentEvent =
+        crate::kiro::model::events::ReasoningContentEvent;
+    pub(crate) type LocalUpstreamToolUseEvent = crate::kiro::model::events::ToolUseEvent;
 }
 
 pub(crate) mod request {
