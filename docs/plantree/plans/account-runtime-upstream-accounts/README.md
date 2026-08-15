@@ -181,9 +181,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `kiro_*` names.
 - Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Kiro protocol/model/cache wording.
 - Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Kiro content/wire-facing behavior.
+- Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `kiro.rs` conversation-id hash domain remains unchanged to avoid behavior drift.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro|Kiro" src/anthropic/converter.rs`
+- `feature/tests/run-cargo-scoped.sh converter-local-upstream-test-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh converter-local-upstream-test-names-test1 -- cargo test converter -- --nocapture`
+- `git diff --check`
 - `rg -n "Kiro|Kiro-facing|Kiro wire|Kiro content|KiroSixty|Kiro 400" src/anthropic/converter.rs`
 - `feature/tests/run-cargo-scoped.sh converter-upstream-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh converter-upstream-text-test1 -- cargo test converter -- --nocapture`

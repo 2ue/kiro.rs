@@ -881,20 +881,20 @@ mod tests {
                 "source": {
                     "type": "base64",
                     "media_type": "text/plain",
-                    "data": "a2lyby1kb2MtdGVzdA=="
+                    "data": "bG9jYWwtdXBzdHJlYW0tZG9jLXRlc3Q="
                 }
             }
         ]);
 
         let (text, images, _) = process_message_content(&content).unwrap();
         assert!(images.is_empty());
-        assert!(text.contains("kiro-doc-test"));
+        assert!(text.contains("local-upstream-doc-test"));
         assert!(text.contains("media_type=\"text/plain\""));
     }
 
     #[test]
     fn test_process_message_content_extracts_simple_pdf_text() {
-        let pdf = b"%PDF-1.1\nBT /F1 12 Tf 20 100 Td (kiro-pdf-test) Tj ET\n%%EOF";
+        let pdf = b"%PDF-1.1\nBT /F1 12 Tf 20 100 Td (local-upstream-pdf-test) Tj ET\n%%EOF";
         let data = BASE64_STANDARD.encode(pdf);
         let content = serde_json::json!([
             {
@@ -909,7 +909,7 @@ mod tests {
 
         let (text, images, _) = process_message_content(&content).unwrap();
         assert!(images.is_empty());
-        assert!(text.contains("kiro-pdf-test"));
+        assert!(text.contains("local-upstream-pdf-test"));
         assert!(text.contains("media_type=\"application/pdf\""));
     }
 
@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_window_size_for_kiro_auto_and_dash_variants() {
+    fn test_context_window_size_for_auto_and_dash_variants() {
         assert_eq!(get_context_window_size("auto"), 1_000_000);
         assert_eq!(get_context_window_size("sonnet"), 200_000);
         assert_eq!(get_context_window_size("opus"), 200_000);
@@ -1039,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_json_schema_recursively_removes_kiro_rejected_fields() {
+    fn test_normalize_json_schema_recursively_removes_upstream_rejected_fields() {
         let schema = serde_json::json!({
             "type": "object",
             "additionalProperties": true,
@@ -2005,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_declared_tools_are_deduped_before_kiro_request() {
+    fn test_duplicate_declared_tools_are_deduped_before_local_upstream_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
         let mut schema = std::collections::HashMap::new();
@@ -4999,7 +4999,7 @@ mod tests {
     }
 
     #[test]
-    fn test_base64_image_strips_whitespace_before_kiro_conversion() {
+    fn test_base64_image_strips_whitespace_before_local_upstream_conversion() {
         let png = VALID_PNG_1X1_BASE64;
         let spaced_png = png
             .as_bytes()
