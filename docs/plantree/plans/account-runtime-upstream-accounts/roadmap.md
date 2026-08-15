@@ -141,6 +141,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
 - Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Kiro request/body/guard behavior.
 - Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `kiro_*` names.
+- Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Kiro protocol/model/cache wording.
 
 ## In Progress
 

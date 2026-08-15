@@ -136,13 +136,13 @@ pub enum ToolSchemaKeyMappingMode {
 
 /// 本地 Anthropic-compatible body 转换能力开关。
 ///
-/// 这些开关只影响本地凭据路径的 Kiro 协议转换器。外部池 raw body 透传不会进入
-/// 这些转换阶段；外部池 normalized body 仍按外部池自己的 body/model/usage 配置处理。
+/// 这些开关只影响本地凭据路径的本地上游协议转换器。上游账号 raw body 透传不会进入
+/// 这些转换阶段；上游账号 normalized body 仍按账号自己的 body/model/usage 配置处理。
 /// 默认全部开启以保持旧行为。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BodyConversionConfig {
-    /// 规范化工具 input_schema，移除 Kiro/上游容易拒绝的 OpenAPI/Zod/MCP 扩展字段。
+    /// 规范化工具 input_schema，移除上游容易拒绝的 OpenAPI/Zod/MCP 扩展字段。
     #[serde(default = "default_true")]
     pub tool_schema_normalization: bool,
 
@@ -175,11 +175,11 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub thinking_prompt_controls: bool,
 
-    /// 对支持 Kiro 原生 reasoning/outputConfig 的模型上报 additionalModelRequestFields。
+    /// 对支持上游原生 reasoning/outputConfig 的模型上报 additionalModelRequestFields。
     #[serde(default = "default_true")]
     pub native_reasoning_fields: bool,
 
-    /// 修复或文本化不严格配对的 tool_use/tool_result，减少 Kiro 400。
+    /// 修复或文本化不严格配对的 tool_use/tool_result，减少上游 400。
     #[serde(default = "default_true")]
     pub tool_pairing_repair: bool,
 
@@ -2484,7 +2484,7 @@ impl Default for PayloadShapingConfig {
 /// Anthropic compatibility profile.
 ///
 /// `claude-code` keeps the pragmatic rewrites needed by Claude Code CLI and
-/// the Kiro upstream. `anthropic-strict` minimizes synthetic protocol and
+/// the local upstream. `anthropic-strict` minimizes synthetic protocol and
 /// prompt rewrites for detector-style checks. `debug` follows `claude-code`
 /// behavior but exposes proxy warning headers by default.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3709,7 +3709,7 @@ pub struct Config {
     /// 发送本地上游前启用最终 payload 防护。
     ///
     /// 防护在本地上游协议转换之后运行，按真实 JSON 字节数裁剪旧历史，
-    /// 并修复 Kiro 容易返回 `400 Improperly formed request` 的工具配对边界。
+    /// 并修复上游容易返回 `400 Improperly formed request` 的工具配对边界。
     #[serde(default = "default_payload_guard_enabled")]
     pub payload_guard_enabled: bool,
 
@@ -3833,7 +3833,7 @@ pub struct Config {
     /// 请求模型解析策略（默认 compatible）。
     ///
     /// 控制 `sonnet`、`opus`、`default` 等短模型名，以及同 family 自动归一化
-    /// 是否允许在发送上游前映射为当前 Kiro 可用模型。
+    /// 是否允许在发送上游前映射为当前上游模型能力目录中的可用模型。
     #[serde(default = "default_model_resolution_mode")]
     pub model_resolution_mode: ModelResolutionMode,
 
@@ -3862,7 +3862,7 @@ pub struct Config {
 
     /// high-cache 模拟专用的 total input 放大倍数。
     ///
-    /// 只影响本地 high-cache usage 模拟，不影响真实 Kiro metadata cache。
+    /// 只影响本地 high-cache usage 模拟，不影响真实上游 metadata cache。
     #[serde(default = "default_prompt_cache_token_scale")]
     pub prompt_cache_token_scale: f64,
 
