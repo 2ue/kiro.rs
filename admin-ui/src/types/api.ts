@@ -309,7 +309,7 @@ export interface CredentialAccountInfo {
   checkedAt: string
 }
 
-// Kiro 额度响应
+// 上游额度响应
 export interface BalanceResponse {
   id: number
   checkedAt: string

@@ -1577,7 +1577,7 @@ export function UsageRecordsPanel() {
                   <UsageMetric label="内部成本输入" value={formatNumber(selectedRecord.billableInputTokens)} />
                 </div>
                 <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                  内部成本输入 = 上报输入 + 上报缓存写入，仅用于本系统费用估算和历史兼容，不是 Anthropic/Kiro 响应里的独立字段。
+                  内部成本输入 = 上报输入 + 上报缓存写入，仅用于本系统费用估算和历史兼容，不是 Anthropic/上游响应里的独立字段。
                 </div>
               </div>
               {(selectedRecord.accountBilling ?? selectedRecord.externalPoolBilling) && (

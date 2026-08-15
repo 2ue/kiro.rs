@@ -188,9 +188,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `kiroApiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
 - Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `kiroApiKey` remains only as a compatibility fallback when reading older credential/import objects.
 - Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
+- Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro 额度|Anthropic/Kiro|Kiro API|Kiro 上游|Kiro credits|kiroApiKey 的" admin-ui/src/types/api.ts admin-ui/src/components/usage-records-panel.tsx src/admin/types.rs`
+- `feature/tests/run-cargo-scoped.sh admin-upstream-comment-text-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh admin-upstream-comment-text-test1 -- cargo test admin::types -- --nocapture`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "kam-import-dialog|KamImportDialog|kamImport|KAM|Kiro Account Manager|Kiro" admin-ui/src/components admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`

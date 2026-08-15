@@ -386,9 +386,9 @@ pub struct CredentialStatusItem {
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
-    /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
+    /// API Key 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
     pub api_key_hash: Option<String>,
-    /// kiroApiKey 的脱敏展示（仅 API Key 凭据，用于前端显示）
+    /// API Key 的脱敏展示（仅 API Key 凭据，用于前端显示）
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
@@ -428,7 +428,7 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
-    /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
+    /// 端点名称（决定该凭据走哪套上游 API，已回退到默认端点）
     pub endpoint: String,
     /// 是否处于临时冷却。
     pub cooled_down: bool,
@@ -1508,7 +1508,7 @@ pub struct TestCredentialResponse {
     pub credential_id: u64,
     /// 前端选择的 Anthropic 兼容模型名
     pub model: String,
-    /// 发送到 Kiro 上游的模型 ID
+    /// 发送到上游的模型 ID
     pub model_id: String,
     pub prompt: String,
     pub response: String,
@@ -1517,7 +1517,7 @@ pub struct TestCredentialResponse {
 
 // ============ 账号信息查询 ============
 
-/// 账号信息查询响应。字段中的使用量和总额单位是 Kiro credits，不是美元。
+/// 账号信息查询响应。字段中的使用量和总额单位是上游 credits，不是美元。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BalanceResponse {
