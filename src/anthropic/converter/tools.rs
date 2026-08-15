@@ -475,7 +475,8 @@ pub(super) fn convert_tools(
         Err(err) => return Err(ConversionError::UnsupportedContent(err.to_string())),
     };
 
-    if options.kiro_cache_point_enabled && !options.kiro_cache_point_tools_only {
+    if options.local_upstream_cache_point_enabled && !options.local_upstream_cache_point_tools_only
+    {
         tracing::debug!(
             "kiroCachePointToolsOnly is disabled, but this phase only supports tool-level cachePoint insertion"
         );
@@ -525,7 +526,7 @@ pub(super) fn convert_tools(
                 input_schema,
             },
         });
-        if options.kiro_cache_point_enabled && has_cache_control {
+        if options.local_upstream_cache_point_enabled && has_cache_control {
             cache_point_insert_after.push(converted_idx);
         }
     }

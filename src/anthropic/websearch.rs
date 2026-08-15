@@ -938,7 +938,7 @@ async fn call_local_auxiliary_mcp_api(
         response,
         provider
             .runtime_config()
-            .kiro_upstream_response_timeout_secs,
+            .local_upstream_response_timeout_secs(),
         MAX_MCP_RESPONSE_BYTES,
     )
     .await

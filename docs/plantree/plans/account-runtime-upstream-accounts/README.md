@@ -130,6 +130,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic handler stream/body code now imports local-upstream request, event, metadata usage and EventStream decoder aliases from the `local_upstream` facade. Handler-facing retry plans, payload guard retries, non-stream event decoding, stream latency classification and stream retry state use local-upstream names, while concrete legacy request/event/decoder types remain isolated behind the facade.
 - Anthropic stream conversion and debug helpers now import local-upstream event aliases instead of legacy event types, and stream tests call the local-upstream event processor as the primary entrypoint. Concrete event fixture structs in tests still come from the legacy implementation until the event model itself is replaced.
 - Local-provider raw upstream error diagnostics now use neutral `official_upstream` source labels and redacted body metadata for provider status/non-eventstream bodies, preserving body size, content type, status and a short fingerprint without copying provider error messages into attempt/usage diagnostics.
+- `Config` now exposes local-upstream accessors for response timeout, stream retry and cache-point compatibility settings. Anthropic router/AppState/request runtime/converter/Admin model-test/WebSearch call sites use local-upstream field names or accessors while persisted config and Admin runtime DTO compatibility fields remain unchanged.
 
 Last verified on 2026-08-14:
 
@@ -327,6 +328,8 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh provider-raw-error-redaction-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh provider-raw-error-redaction-test1 -- bash -lc 'cargo check && cargo test raw_upstream_error -- --nocapture && cargo test provider_status_and_non_eventstream_matrix_is_private_typed_and_bounded -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh provider-raw-error-redaction-stream-regression -- cargo test stream -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh local-upstream-runtime-config-accessors-fmt3 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-runtime-config-accessors-test3 -- bash -lc 'cargo check && cargo test body_capabilities -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture && cargo test anthropic::converter::tests:: -- --nocapture'`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`

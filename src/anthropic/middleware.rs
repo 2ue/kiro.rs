@@ -103,13 +103,13 @@ pub struct AppState {
     /// 上游账号路由是否复用同一套 payload guard / shaping 配置
     pub payload_guard_account_enabled: bool,
     /// 是否把工具 cache_control 转成本地上游 cachePoint
-    pub kiro_cache_point_enabled: bool,
+    pub local_upstream_cache_point_enabled: bool,
     /// cachePoint 是否仅按工具 cache_control 插入
-    pub kiro_cache_point_tools_only: bool,
+    pub local_upstream_cache_point_tools_only: bool,
     /// 是否记录 cachePoint 插入计划
-    pub kiro_cache_point_record_plan: bool,
+    pub local_upstream_cache_point_record_plan: bool,
     /// 本地上游流式响应正文静默超时秒数
-    pub kiro_upstream_stream_idle_timeout_secs: u64,
+    pub local_upstream_stream_idle_timeout_secs: u64,
     /// 多模态图片/文件预处理配置
     pub image_processing: ImageProcessingConfig,
     /// 本地 Anthropic -> local-upstream 转换能力配置
@@ -173,10 +173,10 @@ impl AppState {
             payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,
             payload_guard_account_enabled: true,
-            kiro_cache_point_enabled: false,
-            kiro_cache_point_tools_only: true,
-            kiro_cache_point_record_plan: true,
-            kiro_upstream_stream_idle_timeout_secs: 180,
+            local_upstream_cache_point_enabled: false,
+            local_upstream_cache_point_tools_only: true,
+            local_upstream_cache_point_record_plan: true,
+            local_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
             prompt_steering: PromptSteeringConfig::default(),
@@ -275,10 +275,10 @@ impl AppState {
         safety_margin_bytes: usize,
         trim_history: bool,
         account_enabled: bool,
-        kiro_cache_point_enabled: bool,
-        kiro_cache_point_tools_only: bool,
-        kiro_cache_point_record_plan: bool,
-        kiro_upstream_stream_idle_timeout_secs: u64,
+        local_upstream_cache_point_enabled: bool,
+        local_upstream_cache_point_tools_only: bool,
+        local_upstream_cache_point_record_plan: bool,
+        local_upstream_stream_idle_timeout_secs: u64,
         image_processing: ImageProcessingConfig,
         body_conversion: BodyConversionConfig,
         prompt_steering: PromptSteeringConfig,
@@ -290,10 +290,10 @@ impl AppState {
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
         self.payload_guard_trim_history = trim_history;
         self.payload_guard_account_enabled = account_enabled;
-        self.kiro_cache_point_enabled = kiro_cache_point_enabled;
-        self.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
-        self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
-        self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
+        self.local_upstream_cache_point_enabled = local_upstream_cache_point_enabled;
+        self.local_upstream_cache_point_tools_only = local_upstream_cache_point_tools_only;
+        self.local_upstream_cache_point_record_plan = local_upstream_cache_point_record_plan;
+        self.local_upstream_stream_idle_timeout_secs = local_upstream_stream_idle_timeout_secs;
         self.image_processing = image_processing.normalized();
         self.body_conversion = body_conversion;
         self.prompt_steering = prompt_steering.normalized();

@@ -113,9 +113,9 @@ pub struct ConverterOptions {
     pub compat_profile: CompatProfile,
     pub conversion: LocalUpstreamConverterPlan,
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
-    pub kiro_cache_point_enabled: bool,
-    pub kiro_cache_point_tools_only: bool,
-    pub kiro_cache_point_record_plan: bool,
+    pub local_upstream_cache_point_enabled: bool,
+    pub local_upstream_cache_point_tools_only: bool,
+    pub local_upstream_cache_point_record_plan: bool,
     pub force_visible_thinking: bool,
     pub(crate) native_reasoning_capability: KiroReasoningCapabilityState,
     pub prompt_steering: PromptSteeringConfig,
@@ -127,9 +127,9 @@ impl Default for ConverterOptions {
             compat_profile: CompatProfile::ClaudeCode,
             conversion: LocalUpstreamConverterPlan::default(),
             prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
-            kiro_cache_point_enabled: false,
-            kiro_cache_point_tools_only: true,
-            kiro_cache_point_record_plan: true,
+            local_upstream_cache_point_enabled: false,
+            local_upstream_cache_point_tools_only: true,
+            local_upstream_cache_point_record_plan: true,
             force_visible_thinking: false,
             native_reasoning_capability: KiroReasoningCapabilityState::LegacyFallback,
             prompt_steering: PromptSteeringConfig::default(),
@@ -618,7 +618,7 @@ fn convert_request_with_model_id(
     Ok(ConversionResult {
         conversation_state,
         tool_cache_point_insert_after: converted_tools.tool_cache_point_insert_after,
-        cache_point_plan_recording_enabled: options.kiro_cache_point_record_plan,
+        cache_point_plan_recording_enabled: options.local_upstream_cache_point_record_plan,
         tool_name_map,
         tool_schema_key_map: converted_tools.tool_schema_key_map,
         known_tool_names,
@@ -4074,7 +4074,7 @@ mod tests {
         let result = convert_request_with_options(
             &req,
             ConverterOptions {
-                kiro_cache_point_enabled: true,
+                local_upstream_cache_point_enabled: true,
                 ..ConverterOptions::default()
             },
         )
@@ -4097,7 +4097,7 @@ mod tests {
         let result = convert_request_with_options(
             &req,
             ConverterOptions {
-                kiro_cache_point_enabled: true,
+                local_upstream_cache_point_enabled: true,
                 ..ConverterOptions::default()
             },
         )

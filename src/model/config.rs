@@ -4909,6 +4909,54 @@ impl Config {
         self.external_pools = account_runtime;
     }
 
+    pub fn local_upstream_response_timeout_secs(&self) -> u64 {
+        self.kiro_upstream_response_timeout_secs
+    }
+
+    pub fn local_upstream_stream_idle_timeout_secs(&self) -> u64 {
+        self.kiro_upstream_stream_idle_timeout_secs
+    }
+
+    pub fn local_upstream_stream_retry_enabled(&self) -> bool {
+        self.kiro_upstream_stream_retry_enabled
+    }
+
+    pub fn local_upstream_stream_retry_max_attempts(&self) -> u32 {
+        self.kiro_upstream_stream_retry_max_attempts
+    }
+
+    pub fn local_upstream_stream_retry_on_idle_timeout(&self) -> bool {
+        self.kiro_upstream_stream_retry_on_idle_timeout
+    }
+
+    pub fn local_upstream_stream_retry_on_read_error(&self) -> bool {
+        self.kiro_upstream_stream_retry_on_read_error
+    }
+
+    pub fn local_upstream_stream_retry_on_status_error(&self) -> bool {
+        self.kiro_upstream_stream_retry_on_status_error
+    }
+
+    pub fn local_upstream_cache_point_policy(&self) -> CachePointPolicy {
+        CachePointPolicy {
+            enabled: self.kiro_cache_point_enabled,
+            tools_only: self.kiro_cache_point_tools_only,
+            record_plan: self.kiro_cache_point_record_plan,
+        }
+    }
+
+    pub fn local_upstream_cache_point_enabled(&self) -> bool {
+        self.kiro_cache_point_enabled
+    }
+
+    pub fn local_upstream_cache_point_tools_only(&self) -> bool {
+        self.kiro_cache_point_tools_only
+    }
+
+    pub fn local_upstream_cache_point_record_plan(&self) -> bool {
+        self.kiro_cache_point_record_plan
+    }
+
     pub fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
         CacheRoutePolicy {
             cache_type: PromptCacheStrategyType::CurrentHighCache,
@@ -4924,11 +4972,7 @@ impl Config {
             .normalized(),
             creation_control: self.prompt_cache_creation_control.normalized(),
             reported_usage: self.reported_usage.default.normalized(),
-            cache_point: CachePointPolicy {
-                enabled: self.kiro_cache_point_enabled,
-                tools_only: self.kiro_cache_point_tools_only,
-                record_plan: self.kiro_cache_point_record_plan,
-            },
+            cache_point: self.local_upstream_cache_point_policy(),
             bounds: CacheBoundsPolicy {
                 max_entries_per_account: self.prompt_cache_max_entries_per_account,
                 max_entries_global: self.prompt_cache_max_entries_global,

@@ -3225,7 +3225,7 @@ impl AdminService {
         let (response, completion) = api_response.into_parts();
         let body_bytes = match response_bytes_with_limit_and_body_timeout(
             response,
-            runtime_config.kiro_upstream_response_timeout_secs,
+            runtime_config.local_upstream_response_timeout_secs(),
             ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES,
         )
         .await
@@ -3273,7 +3273,7 @@ impl AdminService {
         let (response, completion) = api_response.into_parts();
         let body_bytes = match response_bytes_with_limit_and_body_timeout(
             response,
-            runtime_config.kiro_upstream_response_timeout_secs,
+            runtime_config.local_upstream_response_timeout_secs(),
             ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES,
         )
         .await

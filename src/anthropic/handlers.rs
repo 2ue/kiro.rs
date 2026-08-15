@@ -148,11 +148,13 @@ struct LocalStreamRetryConfig {
 impl LocalStreamRetryConfig {
     fn from_runtime_config(config: &RequestRuntimeConfig) -> Self {
         Self {
-            enabled: config.kiro_upstream_stream_retry_enabled,
-            max_attempts: config.kiro_upstream_stream_retry_max_attempts.clamp(1, 100),
-            on_idle_timeout: config.kiro_upstream_stream_retry_on_idle_timeout,
-            on_read_error: config.kiro_upstream_stream_retry_on_read_error,
-            on_status_error: config.kiro_upstream_stream_retry_on_status_error,
+            enabled: config.local_upstream_stream_retry_enabled,
+            max_attempts: config
+                .local_upstream_stream_retry_max_attempts
+                .clamp(1, 100),
+            on_idle_timeout: config.local_upstream_stream_retry_on_idle_timeout,
+            on_read_error: config.local_upstream_stream_retry_on_read_error,
+            on_status_error: config.local_upstream_stream_retry_on_status_error,
         }
     }
 
@@ -857,17 +859,17 @@ struct RequestRuntimeConfig {
     payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
     payload_guard_account_enabled: bool,
-    kiro_cache_point_enabled: bool,
-    kiro_cache_point_tools_only: bool,
-    kiro_cache_point_record_plan: bool,
-    kiro_upstream_stream_idle_timeout_secs: u64,
-    kiro_upstream_stream_retry_enabled: bool,
-    kiro_upstream_stream_retry_max_attempts: u32,
+    local_upstream_cache_point_enabled: bool,
+    local_upstream_cache_point_tools_only: bool,
+    local_upstream_cache_point_record_plan: bool,
+    local_upstream_stream_idle_timeout_secs: u64,
+    local_upstream_stream_retry_enabled: bool,
+    local_upstream_stream_retry_max_attempts: u32,
     inference_upstream_max_attempts: u32,
     auxiliary_upstream_max_attempts: u32,
-    kiro_upstream_stream_retry_on_idle_timeout: bool,
-    kiro_upstream_stream_retry_on_read_error: bool,
-    kiro_upstream_stream_retry_on_status_error: bool,
+    local_upstream_stream_retry_on_idle_timeout: bool,
+    local_upstream_stream_retry_on_read_error: bool,
+    local_upstream_stream_retry_on_status_error: bool,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
     prompt_steering: PromptSteeringConfig,
@@ -903,17 +905,17 @@ impl RequestRuntimeConfig {
             payload_guard_safety_margin_bytes: state.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: state.payload_guard_trim_history,
             payload_guard_account_enabled: state.payload_guard_account_enabled,
-            kiro_cache_point_enabled: state.kiro_cache_point_enabled,
-            kiro_cache_point_tools_only: state.kiro_cache_point_tools_only,
-            kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
-            kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
-            kiro_upstream_stream_retry_enabled: true,
-            kiro_upstream_stream_retry_max_attempts: 2,
+            local_upstream_cache_point_enabled: state.local_upstream_cache_point_enabled,
+            local_upstream_cache_point_tools_only: state.local_upstream_cache_point_tools_only,
+            local_upstream_cache_point_record_plan: state.local_upstream_cache_point_record_plan,
+            local_upstream_stream_idle_timeout_secs: state.local_upstream_stream_idle_timeout_secs,
+            local_upstream_stream_retry_enabled: true,
+            local_upstream_stream_retry_max_attempts: 2,
             inference_upstream_max_attempts: DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
             auxiliary_upstream_max_attempts: DEFAULT_AUXILIARY_UPSTREAM_MAX_ATTEMPTS,
-            kiro_upstream_stream_retry_on_idle_timeout: true,
-            kiro_upstream_stream_retry_on_read_error: true,
-            kiro_upstream_stream_retry_on_status_error: true,
+            local_upstream_stream_retry_on_idle_timeout: true,
+            local_upstream_stream_retry_on_read_error: true,
+            local_upstream_stream_retry_on_status_error: true,
             image_processing: state.image_processing.normalized(),
             body_conversion: state.body_conversion.clone(),
             prompt_steering: state.prompt_steering.clone().normalized(),
@@ -969,22 +971,23 @@ impl RequestRuntimeConfig {
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_guard_account_enabled: config.payload_guard_external_enabled,
-            kiro_cache_point_enabled: config.kiro_cache_point_enabled,
-            kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
-            kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
-            kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
-            kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
-            kiro_upstream_stream_retry_max_attempts: config
-                .kiro_upstream_stream_retry_max_attempts
+            local_upstream_cache_point_enabled: config.local_upstream_cache_point_enabled(),
+            local_upstream_cache_point_tools_only: config.local_upstream_cache_point_tools_only(),
+            local_upstream_cache_point_record_plan: config.local_upstream_cache_point_record_plan(),
+            local_upstream_stream_idle_timeout_secs: config
+                .local_upstream_stream_idle_timeout_secs(),
+            local_upstream_stream_retry_enabled: config.local_upstream_stream_retry_enabled(),
+            local_upstream_stream_retry_max_attempts: config
+                .local_upstream_stream_retry_max_attempts()
                 .clamp(1, 100),
             inference_upstream_max_attempts: config.inference_upstream_max_attempts.clamp(1, 10),
             auxiliary_upstream_max_attempts: config.auxiliary_upstream_max_attempts.clamp(1, 10),
-            kiro_upstream_stream_retry_on_idle_timeout: config
-                .kiro_upstream_stream_retry_on_idle_timeout,
-            kiro_upstream_stream_retry_on_read_error: config
-                .kiro_upstream_stream_retry_on_read_error,
-            kiro_upstream_stream_retry_on_status_error: config
-                .kiro_upstream_stream_retry_on_status_error,
+            local_upstream_stream_retry_on_idle_timeout: config
+                .local_upstream_stream_retry_on_idle_timeout(),
+            local_upstream_stream_retry_on_read_error: config
+                .local_upstream_stream_retry_on_read_error(),
+            local_upstream_stream_retry_on_status_error: config
+                .local_upstream_stream_retry_on_status_error(),
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
             prompt_steering: config.prompt_steering.clone().normalized(),
@@ -1052,9 +1055,9 @@ impl RequestRuntimeConfig {
             creation_control: self.prompt_cache_creation_control.normalized(),
             reported_usage: self.reported_usage.default.normalized(),
             cache_point: CachePointPolicy {
-                enabled: self.kiro_cache_point_enabled,
-                tools_only: self.kiro_cache_point_tools_only,
-                record_plan: self.kiro_cache_point_record_plan,
+                enabled: self.local_upstream_cache_point_enabled,
+                tools_only: self.local_upstream_cache_point_tools_only,
+                record_plan: self.local_upstream_cache_point_record_plan,
             },
             bounds: CacheBoundsPolicy {
                 max_entries_per_account: self.prompt_cache_bounds.max_entries_per_account,
@@ -6428,7 +6431,7 @@ async fn post_messages_inner(
             too_long_retry,
             cache_point_retry,
             account_fallback,
-            runtime_config.kiro_upstream_stream_idle_timeout_secs,
+            runtime_config.local_upstream_stream_idle_timeout_secs,
             LocalStreamRetryConfig::from_runtime_config(&runtime_config),
             capacity_weight_units,
             claude_code_noop_delta_keepalive,
