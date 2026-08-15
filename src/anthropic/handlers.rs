@@ -1238,7 +1238,7 @@ impl CachePointRetryRequest {
             upstream_model = ?self.upstream_model,
             conversation_id = %self.conversation_id,
             planned_cache_points = planned,
-            "Kiro cachePoint payload was rejected; retrying once without cachePoint"
+            "local-upstream cachePoint payload was rejected; retrying once without cachePoint"
         );
         Ok((body, request))
     }
@@ -4186,7 +4186,7 @@ impl CredentialUsageContext {
             slow_stream_gap,
             slow_response,
             many_events_before_output,
-            "Kiro slow interaction diagnostic"
+            "local-upstream slow interaction diagnostic"
         );
     }
 
@@ -4878,7 +4878,7 @@ fn prepare_credential_usage_context(
     )
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
+/// 将 legacy local provider 错误映射为 HTTP 响应
 fn cooldown_retry_after_secs(
     provider: Option<&crate::kiro::provider::KiroProvider>,
     fallback_secs: u64,
@@ -5239,7 +5239,7 @@ fn map_provider_error(
     if is_upstream_improperly_formed_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
-            "请求被拒绝：Kiro payload 形态不合法（不应切换账号重试）",
+            "请求被拒绝：本地上游 payload 形态不合法（不应切换账号重试）",
             error_id,
         );
         return public_error_response(
@@ -5318,7 +5318,7 @@ fn map_provider_error(
         );
     }
 
-    log_provider_error_with_hint(&err_str, "Kiro API 调用失败", error_id);
+    log_provider_error_with_hint(&err_str, "本地上游 API 调用失败", error_id);
     public_error_response(
         StatusCode::BAD_GATEWAY,
         "api_error",
@@ -5470,7 +5470,7 @@ fn attach_and_log_tool_use_format_diagnostics(
         empty_tool_result_ids = diagnostics.empty_tool_result_ids,
         non_object_tool_use_inputs = diagnostics.non_object_tool_use_inputs,
         history_tool_names_missing_from_tools = diagnostics.history_tool_names_missing_from_tools,
-        "Kiro rejected tool-use format; attached redacted request-structure diagnostics"
+        "local upstream rejected tool-use format; attached redacted request-structure diagnostics"
     );
 }
 
@@ -5656,7 +5656,7 @@ fn log_payload_guard_report(
             conversation_id,
             cache_points_planned = report.kiro_cache_points_planned,
             cache_points_inserted = report.kiro_cache_points_inserted,
-            "Kiro cachePoint insertion plan applied"
+            "local-upstream cachePoint insertion plan applied"
         );
     }
     if report.was_modified() || report.still_oversized {
@@ -5700,7 +5700,7 @@ fn log_payload_guard_report(
             dropped_current_images = report.dropped_current_images,
             dropped_current_image_bytes = report.dropped_current_image_bytes,
             still_oversized = report.still_oversized,
-            "Kiro payload guard applied before upstream call"
+            "local-upstream payload guard applied before upstream call"
         );
     } else if report.max_bytes > 0
         && report.original_bytes > report.max_bytes.saturating_mul(80) / 100
@@ -5713,7 +5713,7 @@ fn log_payload_guard_report(
             payload_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
             history_entries = report.final_history_entries,
-            "Kiro payload guard observed large request"
+            "local-upstream payload guard observed large request"
         );
     }
 }
@@ -5741,7 +5741,7 @@ fn log_payload_byte_breakdown(
             total_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
             still_oversized = report.still_oversized,
-            "Kiro payload byte breakdown skipped for small unmodified request"
+            "local-upstream payload byte breakdown skipped for small unmodified request"
         );
         return;
     };
@@ -5771,7 +5771,7 @@ fn log_payload_byte_breakdown(
         history_tool_use_count = breakdown.history_tool_use_count,
         history_tool_result_count = breakdown.history_tool_result_count,
         still_oversized = report.still_oversized,
-        "Kiro payload byte breakdown"
+        "local-upstream payload byte breakdown"
     );
 }
 
@@ -7161,7 +7161,7 @@ async fn handle_stream_request(
     capacity_weight_units: u32,
     claude_code_noop_delta_keepalive: bool,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
+    // 调用本地上游 API（支持多账号故障转移）
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
@@ -7396,7 +7396,7 @@ async fn handle_stream_request(
                 }) {
                     tracing::warn!(
                         request_id,
-                        "Kiro stream request rejected as too long; applying configured payload guard and retrying once"
+                        "local-upstream stream request rejected as too long; applying configured payload guard and retrying once"
                     );
                     retry_attempt_prefix = attempts.clone();
                     let (retry_body, retry_warnings_header, retry_kiro_request) =
@@ -8462,7 +8462,7 @@ async fn retry_stream_before_downstream_commit(
         max_attempts = plan.config.max_attempts,
         reason = reason.as_str(),
         detail = %detail,
-        "本地 Kiro 流式响应在首个下游事件前失败，准备换号重试"
+        "本地上游流式响应在首个下游事件前失败，准备换号重试"
     );
 
     state
@@ -8563,7 +8563,7 @@ async fn retry_stream_before_downstream_commit(
                 request_id = %plan.request_id,
                 reason = reason.as_str(),
                 error = %retry_detail,
-                "本地 Kiro 流式首输出前重试失败"
+                "本地上游流式首输出前重试失败"
             );
             state
                 .ctx
@@ -9404,7 +9404,7 @@ async fn handle_non_stream_request(
     account_fallback: Option<AccountFallbackContext>,
     capacity_weight_units: u32,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
+    // 调用本地上游 API（支持多账号故障转移）
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
@@ -9635,7 +9635,7 @@ async fn handle_non_stream_request(
                 }) {
                     tracing::warn!(
                         request_id,
-                        "Kiro non-stream request rejected as too long; applying configured payload guard and retrying once"
+                        "local-upstream non-stream request rejected as too long; applying configured payload guard and retrying once"
                     );
                     retry_attempt_prefix = attempts.clone();
                     let (retry_body, retry_warnings_header, retry_kiro_request) =

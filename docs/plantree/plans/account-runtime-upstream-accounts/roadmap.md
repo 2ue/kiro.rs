@@ -80,6 +80,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Anthropic handler payload guard call sites now enter local-upstream wrappers for guarding and serialization; cache-point retry and thinking-signature retry no longer call the legacy Kiro-named guard helpers directly.
 - JSON stream error-envelope usage diagnostics now keep provider-message privacy by storing shape/fingerprint metadata for complete JSON error envelopes instead of raw message bodies, and remaining malformed/incomplete raw snippet sources use neutral official-upstream wording.
 - Local-upstream payload diagnostics now use wrapper names for byte breakdown and tool-use format diagnostics at handler/local body pipeline call sites, leaving Kiro-named helpers inside the legacy payload implementation only.
+- Anthropic handler runtime log/comment text for local-upstream cache-point retry, payload guard, tool-format, slow interaction and stream/non-stream retry diagnostics now uses local-upstream/account wording instead of Kiro product wording.
 
 ## In Progress
 

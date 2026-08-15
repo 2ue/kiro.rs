@@ -118,6 +118,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Account runtime facade comments and upstream-account integration-test skip messages no longer present the migrated runtime as an external-pool feature.
 - Proxy warning responses now write `x-account-runtime-warnings` as the primary header while also writing the old `x-kiro-rs-warnings` compatibility copy. Code comments and maintained Admin UI text describe the account-runtime header.
 - JSON stream error-envelope diagnostics now avoid retaining complete provider JSON error messages in usage raw-body fields. Usage keeps shape/fingerprint metadata for these envelopes, and remaining malformed/incomplete raw upstream snippets use the neutral `official_upstream` source label instead of a Kiro-specific source.
+- Anthropic handler runtime log/comment text for local-upstream cache-point retries, payload guard diagnostics, tool-use rejection diagnostics, slow interaction diagnostics and stream/non-stream retry paths now uses local-upstream/account wording rather than Kiro product wording. The remaining handler Kiro names are type/module compatibility boundaries.
 
 Last verified on 2026-08-14:
 
@@ -289,6 +290,9 @@ Last verified on 2026-08-14:
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-diagnostics-wrapper-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-diagnostics-wrapper-test1 -- bash -lc 'cargo check && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-log-text-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-log-text-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-log-text-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
 - `node feature/tests/mcp-attempt-channel-contract.mjs`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
