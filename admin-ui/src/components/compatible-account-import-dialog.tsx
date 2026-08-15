@@ -22,12 +22,12 @@ import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/t
 import { camelizeKeys } from '@/lib/object-keys'
 import type { AddCredentialRequest } from '@/types/api'
 
-interface KamImportDialogProps {
+interface CompatibleAccountImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
-// KAM 导出 JSON 中的账号结构
+// 兼容账号管理器导出 JSON 中的账号结构
 interface KamAccount {
   email?: string
   userId?: string | null
@@ -132,7 +132,7 @@ async function verifyImportedCredential(
   }
 }
 
-// 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
+// 兼容账号管理器新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
 function normalizeKamAccount(item: unknown): unknown {
   const normalized = camelizeKeys(item)
   if (!isObject(normalized)) return normalized
@@ -179,7 +179,7 @@ function normalizedKamAuthMethod(method: unknown): AddCredentialRequest['authMet
   return undefined
 }
 
-// 校验元素是否为有效的 KAM 账号结构
+// 校验元素是否为有效的账号管理器账号结构
 function isValidKamAccount(item: unknown): item is KamAccount {
   if (typeof item !== 'object' || item === null) return false
   const obj = item as Record<string, unknown>
@@ -188,17 +188,17 @@ function isValidKamAccount(item: unknown): item is KamAccount {
   return typeof cred.refreshToken === 'string' && cred.refreshToken.trim().length > 0
 }
 
-// 解析 KAM 导出 JSON，支持单账号和多账号格式
+// 解析账号管理器导出 JSON，支持单账号和多账号格式
 function parseKamJson(raw: string): KamAccount[] {
   const parsed = camelizeKeys(JSON.parse(raw)) as Record<string, unknown>
 
   let rawItems: unknown[]
 
-  // 标准 KAM 导出格式：{ version, accounts: [...] }
+  // 标准账号管理器导出格式：{ version, accounts: [...] }
   if (parsed.accounts && Array.isArray(parsed.accounts)) {
     rawItems = parsed.accounts
   }
-  // 直接数组（含 KAM 1.8.3 新版平铺格式）
+  // 直接数组（含账号管理器新版平铺格式）
   else if (Array.isArray(parsed)) {
     rawItems = parsed
   }
@@ -211,7 +211,7 @@ function parseKamJson(raw: string): KamAccount[] {
     rawItems = [parsed]
   }
   else {
-    throw new Error('无法识别的 KAM JSON 格式')
+    throw new Error('无法识别的账号管理器 JSON 格式')
   }
 
   // 兼容新格式：将平铺账号统一转换为 credentials 嵌套结构
@@ -224,7 +224,7 @@ function parseKamJson(raw: string): KamAccount[] {
 
   if (validAccounts.length < rawItems.length) {
     const skipped = rawItems.length - validAccounts.length
-    console.warn(`KAM 导入：跳过 ${skipped} 条缺少有效 credentials.refreshToken 的记录`)
+    console.warn(`账号管理器导入：跳过 ${skipped} 条缺少有效 credentials.refreshToken 的记录`)
   }
 
   return validAccounts
@@ -250,7 +250,7 @@ async function parseKamFiles(files: File[]): Promise<{ accounts: KamAccount[]; e
   return { accounts, errors }
 }
 
-export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
+export function CompatibleAccountImportDialog({ open, onOpenChange }: CompatibleAccountImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
   const [skipVerification, setSkipVerification] = useState(true)
@@ -621,13 +621,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>KAM 账号导入（默认查询订阅）</DialogTitle>
+          <DialogTitle>兼容账号管理器导入（默认查询订阅）</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <label className="text-sm font-medium">KAM 导出 JSON</label>
+              <label className="text-sm font-medium">账号管理器导出 JSON</label>
               <Button type="button" variant="outline" size="sm" disabled={importing} asChild>
                 <label className="cursor-pointer">
                   <FileUp className="h-4 w-4 mr-2" />
@@ -644,7 +644,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               </Button>
             </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON，或选择一个/多个文件\n\n每个文件可以包含单个账号，也可以包含 accounts 数组或账号数组。\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴账号管理器导出的 JSON，或选择一个/多个文件\n\n每个文件可以包含单个账号，也可以包含 accounts 数组或账号数组。\n\n支持新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
@@ -660,7 +660,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             onChange={setDefaults}
             proxyResources={proxyResourceOptions}
             disabled={importing}
-            title="KAM 导入默认参数"
+            title="账号管理器导入默认参数"
           />
 
           <div className="rounded-md border bg-muted/20 p-3">
@@ -680,7 +680,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             {!skipVerification && (
               <div className="mt-2 space-y-2">
                 <select
-                  id="kamImportVerificationMode"
+                  id="compatibleAccountImportVerificationMode"
                   value={verificationMode}
                   onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
                   disabled={importing}

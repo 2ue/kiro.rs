@@ -292,7 +292,7 @@ export function AccountValidationPanel() {
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <CardTitle>外部 JSON 校验</CardTitle>
-              <CardDescription>粘贴或选择 Kiro Account Manager / 批量导入格式 JSON，不导入系统、不改变调度。</CardDescription>
+              <CardDescription>粘贴或选择账号管理器 / 批量导入格式 JSON，不导入系统、不改变调度。</CardDescription>
             </div>
             <div className="flex flex-wrap gap-2">
               <Button asChild variant="outline" size="sm" disabled={loading}>
@@ -350,7 +350,7 @@ export function AccountValidationPanel() {
             className="min-h-[220px] w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
             value={raw}
             onChange={event => setRaw(event.target.value)}
-            placeholder="粘贴 KAM JSON、credentials 数组或 JSONL"
+            placeholder="粘贴账号管理器 JSON、credentials 数组或 JSONL"
           />
           <div className="flex items-center justify-between text-xs text-muted-foreground">
             <span>已解析 {parsedCount} 条可校验账号</span>

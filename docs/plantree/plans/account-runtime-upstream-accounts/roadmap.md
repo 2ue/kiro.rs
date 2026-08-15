@@ -149,6 +149,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `kiroApiKey` / `kiro_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
 - Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `kiroApiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
 - Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `kiroApiKey` remains only as a compatibility fallback when reading older credential/import objects.
+- Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
 
 ## In Progress
 

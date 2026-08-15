@@ -11,7 +11,7 @@ import { CredentialCard } from '@/components/credential-card'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { BatchEditCredentialsDialog } from '@/components/batch-edit-credentials-dialog'
-import { KamImportDialog } from '@/components/kam-import-dialog'
+import { CompatibleAccountImportDialog } from '@/components/compatible-account-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { CredentialTestDialog } from '@/components/credential-test-dialog'
 import { UsageRecordsPanel } from '@/components/usage-records-panel'
@@ -140,7 +140,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false)
-  const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [compatibleAccountImportDialogOpen, setCompatibleAccountImportDialogOpen] = useState(false)
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
@@ -1260,9 +1260,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   {deleteDisabled.isPending ? '清除中...' : '清除已禁用'}
                 </Button>
               )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
+              <Button onClick={() => setCompatibleAccountImportDialogOpen(true)} size="sm" variant="outline">
                 <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
+                兼容账号管理器导入
               </Button>
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
@@ -1499,10 +1499,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
         }}
       />
 
-      {/* KAM 账号导入对话框 */}
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
+      {/* 兼容账号管理器导入对话框 */}
+      <CompatibleAccountImportDialog
+        open={compatibleAccountImportDialogOpen}
+        onOpenChange={setCompatibleAccountImportDialogOpen}
       />
 
       <CredentialExportDialog

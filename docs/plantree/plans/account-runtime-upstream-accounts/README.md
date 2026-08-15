@@ -187,9 +187,13 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `kiroApiKey` / `kiro_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
 - Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `kiroApiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
 - Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `kiroApiKey` remains only as a compatibility fallback when reading older credential/import objects.
+- Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kam-import-dialog|KamImportDialog|kamImport|KAM|Kiro Account Manager|Kiro" admin-ui/src/components admin-ui/src --glob '!**/node_modules/**'`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "kiroApiKey|KiroApiKey|setKiroApiKey|handleKiroApiKey|splitKiroApiKey" ui/src/features/credentials/credential-dialogs.tsx admin-ui/src/components/add-credential-dialog.tsx`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
