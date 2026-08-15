@@ -101,6 +101,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Handler local dispatch policy, account fallback preflight and request-entry fast-fail code now use local-upstream dispatch aliases instead of direct token-manager route-state/acquire-mode imports.
 - Model capability catalog ingestion now uses local-upstream model catalog aliases for available models, cohort keys and token-limit fixtures.
 - Payload guard production code and local payload fixtures now use local-upstream request aliases instead of direct legacy request model imports.
+- Anthropic stream tests now use local-upstream event facade aliases, removing direct legacy event imports from `src/anthropic`.
 
 ## In Progress
 

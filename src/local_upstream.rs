@@ -38,8 +38,12 @@ pub(crate) mod event {
     pub(crate) type LocalUpstreamAssistantResponseEvent =
         crate::kiro::model::events::AssistantResponseEvent;
     #[cfg(test)]
+    pub(crate) type LocalUpstreamCodeEvent = crate::kiro::model::events::CodeEvent;
+    #[cfg(test)]
     pub(crate) type LocalUpstreamContextUsageEvent = crate::kiro::model::events::ContextUsageEvent;
     pub(crate) type LocalUpstreamEvent = crate::kiro::model::events::Event;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamInvalidStateEvent = crate::kiro::model::events::InvalidStateEvent;
     #[cfg(test)]
     pub(crate) type LocalUpstreamMessageMetadataEvent =
         crate::kiro::model::events::MessageMetadataEvent;
@@ -47,6 +51,8 @@ pub(crate) mod event {
     pub(crate) type LocalUpstreamMetadataEvent = crate::kiro::model::events::MetadataEvent;
     pub(crate) type LocalUpstreamMetadataTokenUsage =
         crate::kiro::model::events::MetadataTokenUsage;
+    #[cfg(test)]
+    pub(crate) type LocalUpstreamMeteringEvent = crate::kiro::model::events::MeteringEvent;
     pub(crate) type LocalUpstreamReasoningContentEvent =
         crate::kiro::model::events::ReasoningContentEvent;
     pub(crate) type LocalUpstreamToolUseEvent = crate::kiro::model::events::ToolUseEvent;

@@ -3891,12 +3891,23 @@ fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_upstream::event::{
+        LocalUpstreamAssistantResponseEvent as AssistantResponseEvent,
+        LocalUpstreamCodeEvent as CodeEvent, LocalUpstreamContextUsageEvent as ContextUsageEvent,
+        LocalUpstreamInvalidStateEvent as InvalidStateEvent,
+        LocalUpstreamMessageMetadataEvent as MessageMetadataEvent,
+        LocalUpstreamMetadataEvent as MetadataEvent,
+        LocalUpstreamMetadataTokenUsage as MetadataTokenUsage,
+        LocalUpstreamMeteringEvent as MeteringEvent,
+        LocalUpstreamReasoningContentEvent as ReasoningContentEvent,
+        LocalUpstreamToolUseEvent as ToolUseEvent,
+    };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     fn assistant_response_event(
         content: &str,
         message_status: Option<&str>,
-    ) -> crate::kiro::model::events::AssistantResponseEvent {
+    ) -> AssistantResponseEvent {
         let mut value = json!({ "content": content });
         if let Some(status) = message_status {
             value["messageStatus"] = json!(status);
@@ -3963,10 +3974,6 @@ mod tests {
 
     #[test]
     fn trusted_terminal_contract_rejects_silent_eof_and_keeps_legacy_terminals_for_five_rounds() {
-        use crate::kiro::model::events::{
-            ContextUsageEvent, MetadataEvent, MeteringEvent, ToolUseEvent,
-        };
-
         for round in 0..5 {
             let mut unknown =
                 StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
@@ -4181,8 +4188,6 @@ mod tests {
 
     #[test]
     fn stream_suppresses_continue_transcript_and_keeps_structured_tool_boundary() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mapped = "bashHashd1e9567d";
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
@@ -4270,8 +4275,6 @@ mod tests {
 
     #[test]
     fn tool_context_leak_markers_do_not_flag_normal_tool_use_turn() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             8,
@@ -4322,8 +4325,6 @@ mod tests {
 
     #[test]
     fn tool_use_drops_initial_trivial_text_preamble() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             8,
@@ -4408,8 +4409,6 @@ mod tests {
 
     #[test]
     fn stream_context_records_last_upstream_events() {
-        use crate::kiro::model::events::{MetadataEvent, ToolUseEvent};
-
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             8,
@@ -4484,8 +4483,6 @@ mod tests {
 
     #[test]
     fn test_tool_name_reverse_mapping_in_stream() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mut map = HashMap::new();
         map.insert(
             "short_abc12345".to_string(),
@@ -4518,8 +4515,6 @@ mod tests {
 
     #[test]
     fn test_native_reasoning_content_uses_cumulative_deltas() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -4600,8 +4595,6 @@ mod tests {
 
     #[test]
     fn signed_native_reasoning_leak_is_suppressed_atomically_across_snapshots() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
         let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
         for _round in 0..5 {
             let mut ctx = StreamContext::new_with_thinking_with_known_tools(
@@ -4649,8 +4642,6 @@ mod tests {
 
     #[test]
     fn polluted_native_signature_drops_clean_signed_reasoning() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
         for _round in 0..5 {
             let mut ctx = StreamContext::new_with_thinking_with_known_tools(
                 "test-model",
@@ -4682,8 +4673,6 @@ mod tests {
 
     #[test]
     fn native_atomic_thinking_buffer_overflow_fails_closed() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             1,
@@ -4712,8 +4701,6 @@ mod tests {
 
     #[test]
     fn invalid_plaintext_redacted_reasoning_is_rejected_for_five_rounds() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
         for _round in 0..5 {
             let mut ctx = StreamContext::new_with_thinking_with_known_tools(
                 "test-model",
@@ -4756,8 +4743,6 @@ mod tests {
 
     #[test]
     fn opaque_redacted_reasoning_blob_round_trips_without_text_sanitizing_for_five_rounds() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
         let redacted = BASE64_STANDARD.encode(b"opaque-redacted-reasoning");
         for round in 0..5 {
             let mut ctx = StreamContext::new_with_thinking_with_known_tools(
@@ -4820,8 +4805,6 @@ mod tests {
 
     #[test]
     fn native_reasoning_event_ends_unconfirmed_visible_transcript_candidate() {
-        use crate::kiro::model::events::ReasoningContentEvent;
-
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             1,
@@ -4928,8 +4911,6 @@ mod tests {
 
     #[test]
     fn test_metadata_usage_overrides_final_usage() {
-        use crate::kiro::model::events::{MetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -4958,8 +4939,6 @@ mod tests {
 
     #[test]
     fn test_all_zero_metadata_and_context_fall_back_to_local_usage() {
-        use crate::kiro::model::events::{ContextUsageEvent, MetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 4_096, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -4997,8 +4976,6 @@ mod tests {
 
     #[test]
     fn test_later_zero_message_metadata_does_not_erase_usage() {
-        use crate::kiro::model::events::{MessageMetadataEvent, MetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
         let mut events = ctx.process_assistant_response("hello");
@@ -5035,8 +5012,6 @@ mod tests {
 
     #[test]
     fn test_metadata_events_merge_complementary_positive_fields() {
-        use crate::kiro::model::events::{MessageMetadataEvent, MetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
         let mut events = ctx.process_assistant_response("hello");
@@ -5076,8 +5051,6 @@ mod tests {
 
     #[test]
     fn test_metering_event_is_recorded_but_not_emitted_downstream() {
-        use crate::kiro::model::events::MeteringEvent;
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -5421,8 +5394,6 @@ mod tests {
 
     #[test]
     fn test_message_metadata_usage_overrides_final_usage() {
-        use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -5458,8 +5429,6 @@ mod tests {
 
     #[test]
     fn test_context_usage_percentage_uses_catalog_window_for_final_usage() {
-        use crate::kiro::model::events::ContextUsageEvent;
-
         let mut ctx = StreamContext::new_with_simulation(
             "claude-sonnet-4.5",
             1_000,
@@ -5492,8 +5461,6 @@ mod tests {
 
     #[test]
     fn test_context_usage_100_percent_reports_context_window_exceeded() {
-        use crate::kiro::model::events::ContextUsageEvent;
-
         let mut ctx = StreamContext::new_with_simulation(
             "claude-sonnet-4.6",
             1_000,
@@ -5539,8 +5506,6 @@ mod tests {
 
     #[test]
     fn test_requested_max_tokens_infers_max_tokens_stop_reason() {
-        use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         ctx.set_requested_max_tokens(100);
         let _initial_events = ctx.generate_initial_events();
@@ -5571,21 +5536,17 @@ mod tests {
 
     #[test]
     fn test_requested_max_tokens_does_not_override_tool_use_stop_reason() {
-        use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         ctx.set_requested_max_tokens(100);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
-        all_events.extend(
-            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-                name: "test_tool".to_string(),
-                tool_use_id: "tool_1".to_string(),
-                input: "{}".to_string(),
-                stop: true,
-            }),
-        );
+        all_events.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "test_tool".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
         all_events.extend(ctx.process_local_upstream_event(&Event::MessageMetadata(
             MessageMetadataEvent {
                 conversation_id: Some("conv-tool".to_string()),
@@ -5610,10 +5571,6 @@ mod tests {
 
     #[test]
     fn test_requested_max_tokens_does_not_override_context_window_stop_reason() {
-        use crate::kiro::model::events::{
-            ContextUsageEvent, MessageMetadataEvent, MetadataTokenUsage,
-        };
-
         let mut ctx = StreamContext::new_with_simulation(
             "claude-sonnet-4.6",
             1_000,
@@ -5660,8 +5617,6 @@ mod tests {
 
     #[test]
     fn test_code_event_is_forwarded_as_text_content() {
-        use crate::kiro::model::events::CodeEvent;
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -5717,8 +5672,6 @@ mod tests {
 
     #[test]
     fn test_intent_preamble_diagnostic_does_not_flag_tool_use() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             1_000,
@@ -5746,8 +5699,6 @@ mod tests {
 
     #[test]
     fn test_high_cache_metadata_usage_is_preserved_in_final_usage() {
-        use crate::kiro::model::events::{MetadataEvent, MetadataTokenUsage};
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -5776,8 +5727,6 @@ mod tests {
 
     #[test]
     fn test_invalid_state_finishes_with_error_not_message_stop() {
-        use crate::kiro::model::events::InvalidStateEvent;
-
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -5919,7 +5868,7 @@ mod tests {
         assert_eq!(text_keepalive.data["delta"]["type"], "text_delta");
         assert_eq!(text_keepalive.data["delta"]["text"], "");
 
-        let _tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let _tool_events = ctx.process_tool_use(&ToolUseEvent {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
@@ -5949,7 +5898,7 @@ mod tests {
             .expect("initial text block index should exist");
 
         // tool_use 开始会自动关闭现有 text block
-        let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let tool_events = ctx.process_tool_use(&ToolUseEvent {
             name: "test_tool".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
@@ -6052,7 +6001,7 @@ mod tests {
         });
         assert!(text_start_index.is_some(), "should start a text block");
 
-        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let events = ctx.process_tool_use(&ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
@@ -6232,7 +6181,7 @@ mod tests {
         // thinking 内容以 `</thinking>` 结尾，但后面没有 `\n\n`（模拟紧跟 tool_use 的场景）
         all_events.extend(ctx.process_assistant_response("<thinking>abc</thinking>"));
 
-        let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+        let tool_events = ctx.process_tool_use(&ToolUseEvent {
             name: "Write".to_string(),
             tool_use_id: "tool_1".to_string(),
             input: "{}".to_string(),
@@ -6472,14 +6421,12 @@ mod tests {
 
         let mut all = Vec::new();
         all.extend(ctx.process_assistant_response("<think>abc</think>"));
-        all.extend(
-            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-                name: "Write".to_string(),
-                tool_use_id: "tool_1".to_string(),
-                input: "{}".to_string(),
-                stop: false,
-            }),
-        );
+        all.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: false,
+        }));
         all.extend(ctx.generate_final_events());
 
         assert_eq!(collect_thinking_content(&all), "abc");
@@ -6637,8 +6584,6 @@ mod tests {
 
     #[test]
     fn test_stream_buffers_and_repairs_ask_user_question_input() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             1,
@@ -6682,8 +6627,6 @@ mod tests {
 
     #[test]
     fn test_stream_buffers_and_reverse_maps_sanitized_schema_keys() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         let mut schema_key_map = ToolSchemaKeyMap::default();
         schema_key_map.insert_tool_mapping(
             "probe".to_string(),
@@ -7021,8 +6964,6 @@ mod tests {
 
     #[test]
     fn literal_tool_protocol_dedupes_later_structured_tool_use_for_five_rounds() {
-        use crate::kiro::model::events::ToolUseEvent;
-
         for round in 0..5 {
             let mut ctx = StreamContext::new_with_thinking_with_known_tools(
                 "test-model",
@@ -7409,14 +7350,12 @@ mod tests {
             let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
             let mut events = ctx.generate_initial_events();
             for (index, chunk) in chunks.iter().enumerate() {
-                events.extend(
-                    ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-                        name: "test_tool".to_string(),
-                        tool_use_id: "tool_chunk_invariant".to_string(),
-                        input: chunk.clone(),
-                        stop: index + 1 == chunks.len(),
-                    }),
-                );
+                events.extend(ctx.process_tool_use(&ToolUseEvent {
+                    name: "test_tool".to_string(),
+                    tool_use_id: "tool_chunk_invariant".to_string(),
+                    input: chunk.clone(),
+                    stop: index + 1 == chunks.len(),
+                }));
             }
             events.extend(ctx.generate_final_events());
             events
@@ -7452,14 +7391,12 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(
-            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
-                name: "test_tool".to_string(),
-                tool_use_id: "tool_1".to_string(),
-                input: "{}".to_string(),
-                stop: true,
-            }),
-        );
+        all_events.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "test_tool".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
