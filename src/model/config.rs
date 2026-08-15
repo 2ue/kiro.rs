@@ -2055,8 +2055,8 @@ pub struct CacheRoutePolicyPatch {
     pub cache_point: Option<CachePointPolicyPatch>,
     #[serde(default)]
     pub bounds: Option<CacheBoundsPolicyPatch>,
-    #[serde(default)]
-    pub kiro_rs_tool: Option<ClaudeCodeToolCachePolicyPatch>,
+    #[serde(default, rename = "kiroRsTool", alias = "claudeCodeTool")]
+    pub claude_code_tool: Option<ClaudeCodeToolCachePolicyPatch>,
 }
 
 impl CacheRoutePolicyPatch {
@@ -2084,8 +2084,8 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
-        if let Some(patch) = self.kiro_rs_tool {
-            policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
+        if let Some(patch) = self.claude_code_tool {
+            policy.claude_code_tool = patch.apply_to(policy.claude_code_tool);
         }
         policy.normalized()
     }
@@ -2108,8 +2108,8 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = &self.bounds {
             patch.validate_raw(&format!("{label}.bounds"))?;
         }
-        if let Some(patch) = &self.kiro_rs_tool {
-            patch.validate_raw(&format!("{label}.kiroRsTool"))?;
+        if let Some(patch) = &self.claude_code_tool {
+            patch.validate_raw(&format!("{label}.claudeCodeTool"))?;
         }
         let policy = self.apply_route_to(base);
         policy.validate(label)
@@ -2143,8 +2143,8 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
-        if let Some(patch) = self.kiro_rs_tool {
-            policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
+        if let Some(patch) = self.claude_code_tool {
+            policy.claude_code_tool = patch.apply_to(policy.claude_code_tool);
         }
         policy.normalized()
     }
@@ -2157,7 +2157,7 @@ impl CacheRoutePolicyPatch {
             || self.creation_control.is_some()
             || self.cache_point.is_some()
             || self.bounds.is_some()
-            || self.kiro_rs_tool.is_some()
+            || self.claude_code_tool.is_some()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2178,7 +2178,7 @@ impl CacheRoutePolicyPatch {
                 .as_ref()
                 .is_none_or(CacheBoundsPolicyPatch::is_empty)
             && self
-                .kiro_rs_tool
+                .claude_code_tool
                 .as_ref()
                 .is_none_or(ClaudeCodeToolCachePolicyPatch::is_empty)
     }
@@ -2201,8 +2201,8 @@ pub struct CachePolicyConfig {
     pub default: CacheRoutePolicyPatch,
     #[serde(default)]
     pub current_high_cache: CacheRoutePolicyPatch,
-    #[serde(default)]
-    pub kiro_rs_tool: CacheRoutePolicyPatch,
+    #[serde(default, rename = "kiroRsTool", alias = "claudeCodeTool")]
+    pub claude_code_tool: CacheRoutePolicyPatch,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
 }
@@ -2257,7 +2257,7 @@ impl CachePolicyConfig {
         Self {
             default: self.default.clone(),
             current_high_cache: self.current_high_cache.clone(),
-            kiro_rs_tool: self.kiro_rs_tool.clone(),
+            claude_code_tool: self.claude_code_tool.clone(),
             path_overrides,
         }
     }
@@ -2267,7 +2267,7 @@ impl CachePolicyConfig {
             .validate("当前本地模拟策略兼容参数", base.clone())?;
         self.current_high_cache
             .validate("当前本地模拟策略模板", base.clone())?;
-        self.kiro_rs_tool
+        self.claude_code_tool
             .validate("Claude Code Tool 缓存策略模板", base.clone())?;
         for (prefix, policy) in &self.path_overrides {
             let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
@@ -2304,9 +2304,10 @@ impl CachePolicyConfig {
             reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
             cache_point: CachePointPolicy::default(),
             bounds: base.bounds,
-            kiro_rs_tool: ClaudeCodeToolCachePolicy::default(),
+            claude_code_tool: ClaudeCodeToolCachePolicy::default(),
         };
-        self.kiro_rs_tool.apply_claude_code_tool_fields_to(neutral)
+        self.claude_code_tool
+            .apply_claude_code_tool_fields_to(neutral)
     }
 
     fn no_cache_policy(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
@@ -2328,7 +2329,7 @@ impl CachePolicyConfig {
                 ..base.cache_point
             },
             bounds: base.bounds,
-            kiro_rs_tool: base.kiro_rs_tool,
+            claude_code_tool: base.claude_code_tool,
         }
         .normalized()
     }
@@ -2362,7 +2363,7 @@ pub struct CacheRoutePolicy {
     pub reported_usage: ReportedUsagePathPolicy,
     pub cache_point: CachePointPolicy,
     pub bounds: CacheBoundsPolicy,
-    pub kiro_rs_tool: ClaudeCodeToolCachePolicy,
+    pub claude_code_tool: ClaudeCodeToolCachePolicy,
 }
 
 impl CacheRoutePolicy {
@@ -2370,7 +2371,7 @@ impl CacheRoutePolicy {
         self.simulation = self.simulation.normalized();
         self.creation_control = self.creation_control.normalized();
         self.reported_usage = self.reported_usage.normalized();
-        self.kiro_rs_tool = self.kiro_rs_tool.normalized();
+        self.claude_code_tool = self.claude_code_tool.normalized();
         self
     }
 
@@ -2382,7 +2383,8 @@ impl CacheRoutePolicy {
         self.reported_usage
             .validate(&format!("{label}.reportedUsage"))?;
         self.bounds.validate(&format!("{label}.bounds"))?;
-        self.kiro_rs_tool.validate(&format!("{label}.kiroRsTool"))?;
+        self.claude_code_tool
+            .validate(&format!("{label}.claudeCodeTool"))?;
         Ok(())
     }
 }
@@ -4982,7 +4984,7 @@ impl Config {
                 entry_ttl_secs: self.prompt_cache_entry_ttl_secs,
                 estimated_bytes_limit: self.prompt_cache_estimated_bytes_limit,
             },
-            kiro_rs_tool: ClaudeCodeToolCachePolicy::default(),
+            claude_code_tool: ClaudeCodeToolCachePolicy::default(),
         }
         .normalized()
     }
@@ -6536,7 +6538,7 @@ mod tests {
                     entry_ttl_secs: Some(700),
                     estimated_bytes_limit: Some(7_000),
                 }),
-                kiro_rs_tool: Some(ClaudeCodeToolCachePolicyPatch {
+                claude_code_tool: Some(ClaudeCodeToolCachePolicyPatch {
                     coverage_ratio: Some(0.7),
                     max_coverage_tokens: Some(70_000),
                     incremental_create_enabled: Some(false),
@@ -6575,7 +6577,7 @@ mod tests {
                     entry_ttl_secs: Some(200),
                     estimated_bytes_limit: Some(2_000),
                 }),
-                kiro_rs_tool: Some(ClaudeCodeToolCachePolicyPatch {
+                claude_code_tool: Some(ClaudeCodeToolCachePolicyPatch {
                     coverage_ratio: Some(0.2),
                     ..ClaudeCodeToolCachePolicyPatch::default()
                 }),
@@ -6607,7 +6609,7 @@ mod tests {
                     entry_ttl_secs: Some(500),
                     estimated_bytes_limit: Some(5_000),
                 }),
-                kiro_rs_tool: Some(ClaudeCodeToolCachePolicyPatch {
+                claude_code_tool: Some(ClaudeCodeToolCachePolicyPatch {
                     coverage_ratio: Some(0.5),
                     max_coverage_tokens: Some(50_000),
                     incremental_create_enabled: Some(false),
@@ -6693,17 +6695,23 @@ mod tests {
         assert_eq!(high.policy.bounds.max_entries_global, 70);
         assert_eq!(high.policy.bounds.entry_ttl_secs, 700);
         assert_eq!(high.policy.bounds.estimated_bytes_limit, 7_000);
-        assert_eq!(high.policy.kiro_rs_tool.coverage_ratio, 0.7);
-        assert_eq!(high.policy.kiro_rs_tool.max_coverage_tokens, 70_000);
-        assert!(!high.policy.kiro_rs_tool.incremental_create_enabled);
-        assert_eq!(
-            high.policy.kiro_rs_tool.max_new_creation_tokens_per_request,
-            7_000
-        );
-        assert!(high.policy.kiro_rs_tool.cache_current_user_stable_prefix);
+        assert_eq!(high.policy.claude_code_tool.coverage_ratio, 0.7);
+        assert_eq!(high.policy.claude_code_tool.max_coverage_tokens, 70_000);
+        assert!(!high.policy.claude_code_tool.incremental_create_enabled);
         assert_eq!(
             high.policy
-                .kiro_rs_tool
+                .claude_code_tool
+                .max_new_creation_tokens_per_request,
+            7_000
+        );
+        assert!(
+            high.policy
+                .claude_code_tool
+                .cache_current_user_stable_prefix
+        );
+        assert_eq!(
+            high.policy
+                .claude_code_tool
                 .current_user_stable_prefix_max_tokens,
             700
         );
@@ -6725,7 +6733,7 @@ mod tests {
             ReportedUsageFieldMode::Raw
         );
         assert_ne!(plain.policy.bounds.max_entries_per_account, 2);
-        assert_ne!(plain.policy.kiro_rs_tool.coverage_ratio, 0.2);
+        assert_ne!(plain.policy.claude_code_tool.coverage_ratio, 0.2);
 
         let tool = config.cache_policy_for_path("/tool-matrix/v1/messages");
         assert_eq!(tool.namespace.as_deref(), Some("/tool-matrix"));
@@ -6745,17 +6753,23 @@ mod tests {
         assert_eq!(tool.policy.bounds.max_entries_global, 50);
         assert_eq!(tool.policy.bounds.entry_ttl_secs, 500);
         assert_eq!(tool.policy.bounds.estimated_bytes_limit, 5_000);
-        assert_eq!(tool.policy.kiro_rs_tool.coverage_ratio, 0.5);
-        assert_eq!(tool.policy.kiro_rs_tool.max_coverage_tokens, 50_000);
-        assert!(!tool.policy.kiro_rs_tool.incremental_create_enabled);
-        assert_eq!(
-            tool.policy.kiro_rs_tool.max_new_creation_tokens_per_request,
-            5_000
-        );
-        assert!(tool.policy.kiro_rs_tool.cache_current_user_stable_prefix);
+        assert_eq!(tool.policy.claude_code_tool.coverage_ratio, 0.5);
+        assert_eq!(tool.policy.claude_code_tool.max_coverage_tokens, 50_000);
+        assert!(!tool.policy.claude_code_tool.incremental_create_enabled);
         assert_eq!(
             tool.policy
-                .kiro_rs_tool
+                .claude_code_tool
+                .max_new_creation_tokens_per_request,
+            5_000
+        );
+        assert!(
+            tool.policy
+                .claude_code_tool
+                .cache_current_user_stable_prefix
+        );
+        assert_eq!(
+            tool.policy
+                .claude_code_tool
                 .current_user_stable_prefix_max_tokens,
             500
         );
@@ -6924,7 +6938,7 @@ mod tests {
                     },
                     "/dfcache/claude-code-tool-param": {
                         "cacheType": "claude_code_tool",
-                        "kiroRsTool": {
+                        "claudeCodeTool": {
                             "coverageRatio": 0.6
                         }
                     }
@@ -6956,31 +6970,34 @@ mod tests {
                 .reported_usage
                 .skip_non_stream_usage_projection
         );
-        assert_eq!(resolved.policy.kiro_rs_tool.coverage_ratio, 0.5);
-        assert_eq!(resolved.policy.kiro_rs_tool.max_coverage_tokens, 12_000);
+        assert_eq!(resolved.policy.claude_code_tool.coverage_ratio, 0.5);
+        assert_eq!(resolved.policy.claude_code_tool.max_coverage_tokens, 12_000);
         assert_eq!(
             resolved
                 .policy
-                .kiro_rs_tool
+                .claude_code_tool
                 .max_new_creation_tokens_per_request,
             1_000
         );
         assert!(
             resolved
                 .policy
-                .kiro_rs_tool
+                .claude_code_tool
                 .cache_current_user_stable_prefix
         );
         assert_eq!(
             resolved
                 .policy
-                .kiro_rs_tool
+                .claude_code_tool
                 .current_user_stable_prefix_max_tokens,
             1_500
         );
-        assert_eq!(resolved.policy.kiro_rs_tool.reported_input_min_tokens, 128);
         assert_eq!(
-            resolved.policy.kiro_rs_tool.reported_input_max_tokens,
+            resolved.policy.claude_code_tool.reported_input_min_tokens,
+            128
+        );
+        assert_eq!(
+            resolved.policy.claude_code_tool.reported_input_max_tokens,
             2_048
         );
 
@@ -6989,7 +7006,7 @@ mod tests {
             new_value.policy.cache_type,
             PromptCacheStrategyType::ClaudeCodeTool
         );
-        assert_eq!(new_value.policy.kiro_rs_tool.coverage_ratio, 0.6);
+        assert_eq!(new_value.policy.claude_code_tool.coverage_ratio, 0.6);
     }
 
     #[test]
