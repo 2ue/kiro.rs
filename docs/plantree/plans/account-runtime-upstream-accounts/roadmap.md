@@ -187,6 +187,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Payload-guard local-upstream image tests now use local-upstream variable names while preserving image-budget shaping and exact-limit behavior.
 - Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording; remaining provider Kiro strings are compatibility fields or upstream wire literals.
 - Local-upstream protocol profile ARN constants and machineId diagnostics/comments now use generic local-upstream and compatibility wording while preserving stable hash domains and upstream wire/header literals.
+- Local-upstream endpoint comments and ignored body-performance probes now use local-upstream wording and `LOCAL_UPSTREAM_*` environment variables, and the CLI origin literal is isolated as a wire-value constant.
 
 ## In Progress
 

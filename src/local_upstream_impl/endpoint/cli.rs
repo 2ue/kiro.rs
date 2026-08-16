@@ -1,10 +1,10 @@
-//! Kiro CLI endpoint.
+//! Local-upstream CLI-compatible endpoint.
 //!
-//! This matches the Amazon Q/Kiro CLI runtime protocol:
+//! This matches the current CLI-compatible local-upstream runtime protocol:
 //! - API: `https://runtime.{api_region}.kiro.dev/`
 //! - content type: `application/x-amz-json-1.0`
 //! - target header: `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
-//! - request body origin: `KIRO_CLI`
+//! - request body origin: the upstream-required CLI wire value
 
 use reqwest::{Method, RequestBuilder};
 use serde_json::json;
@@ -20,6 +20,7 @@ use crate::local_upstream_impl::protocol::{
 };
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
+const CLI_REQUEST_ORIGIN_WIRE_VALUE: &str = "KIRO_CLI";
 
 pub struct CliEndpoint;
 
@@ -107,7 +108,7 @@ impl LocalUpstreamEndpoint for CliEndpoint {
     }
 
     fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String {
-        let mut params = vec!["origin=KIRO_CLI".to_string()];
+        let mut params = vec![format!("origin={CLI_REQUEST_ORIGIN_WIRE_VALUE}")];
         if let Some(profile_arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
             params.push(format!("profileArn={}", urlencoding::encode(&profile_arn)));
         }
@@ -129,7 +130,7 @@ impl LocalUpstreamEndpoint for CliEndpoint {
         next_token: Option<&str>,
     ) -> Option<serde_json::Value> {
         let mut body = serde_json::Map::new();
-        body.insert("origin".to_string(), json!("KIRO_CLI"));
+        body.insert("origin".to_string(), json!(CLI_REQUEST_ORIGIN_WIRE_VALUE));
         if let Some(profile_arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
             body.insert("profileArn".to_string(), json!(profile_arn));
         }
@@ -281,11 +282,11 @@ fn set_user_input_for_cli(uim: &mut serde_json::Value) -> bool {
     };
     match obj.get("origin") {
         None => false,
-        Some(serde_json::Value::String(origin)) if origin == "KIRO_CLI" => false,
+        Some(serde_json::Value::String(origin)) if origin == CLI_REQUEST_ORIGIN_WIRE_VALUE => false,
         Some(_) => {
             obj.insert(
                 "origin".to_string(),
-                serde_json::Value::String("KIRO_CLI".to_string()),
+                serde_json::Value::String(CLI_REQUEST_ORIGIN_WIRE_VALUE.to_string()),
             );
             true
         }
@@ -362,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_api_url_uses_runtime_kiro_dev() {
+    fn cli_api_url_uses_runtime_wire_host() {
         let endpoint = CliEndpoint::new();
         let config = Config::default();
         let credentials = LocalUpstreamCredentials::default();
@@ -398,7 +399,7 @@ mod tests {
         );
         assert_eq!(
             endpoint.models_url(&rctx, None),
-            "http://127.0.0.1:39091/aws-lifecycle/?origin=KIRO_CLI"
+            format!("http://127.0.0.1:39091/aws-lifecycle/?origin={CLI_REQUEST_ORIGIN_WIRE_VALUE}")
         );
 
         let api = endpoint
@@ -460,12 +461,14 @@ mod tests {
         let url = endpoint.models_url(&rctx, Some("next-token"));
         assert_eq!(
             url,
-            "https://management.us-east-1.kiro.dev/?origin=KIRO_CLI&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123%3Aprofile%2FABC&nextToken=next-token"
+            format!(
+                "https://management.us-east-1.kiro.dev/?origin={CLI_REQUEST_ORIGIN_WIRE_VALUE}&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123%3Aprofile%2FABC&nextToken=next-token"
+            )
         );
         assert_eq!(endpoint.models_method(&rctx), Method::POST);
 
         let body = endpoint.models_body(&rctx, Some("next-token")).unwrap();
-        assert_eq!(body["origin"], "KIRO_CLI");
+        assert_eq!(body["origin"], CLI_REQUEST_ORIGIN_WIRE_VALUE);
         assert_eq!(
             body["profileArn"],
             "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
@@ -544,11 +547,11 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["conversationState"]["agentContinuationId"], "keep-me");
         let uim = &json["conversationState"]["currentMessage"]["userInputMessage"];
-        assert_eq!(uim["origin"], "KIRO_CLI");
+        assert_eq!(uim["origin"], CLI_REQUEST_ORIGIN_WIRE_VALUE);
         assert_eq!(uim["modelId"], "claude-opus-4.8");
         assert_eq!(
             json["conversationState"]["history"][0]["userInputMessage"]["origin"],
-            "KIRO_CLI"
+            CLI_REQUEST_ORIGIN_WIRE_VALUE
         );
         let props = &uim["userInputMessageContext"]["tools"][0]["toolSpecification"]["inputSchema"]
             ["json"]["properties"];
@@ -572,11 +575,14 @@ mod tests {
     #[test]
     fn cli_already_normalized_origin_and_profile_are_byte_identical_for_five_rounds() {
         let profile = "arn:test:profile/already-normalized";
-        let body = " {\n  \"conversationState\" : {\n    \"currentMessage\" : {\"userInputMessage\" : {\"origin\" : \"KIRO_CLI\", \"content\" : \"keep  spaces\\n\\u00e9\"}}\n  },\n  \"profileArn\" : \"arn:test:profile/already-normalized\",\n  \"unknown\" : {\"z\" : 1.0, \"a\" : 1e+02}\n} \n";
+        let body = format!(
+            " {{\n  \"conversationState\" : {{\n    \"currentMessage\" : {{\"userInputMessage\" : {{\"origin\" : \"{}\", \"content\" : \"keep  spaces\\n\\u00e9\"}}}}\n  }},\n  \"profileArn\" : \"arn:test:profile/already-normalized\",\n  \"unknown\" : {{\"z\" : 1.0, \"a\" : 1e+02}}\n}} \n",
+            CLI_REQUEST_ORIGIN_WIRE_VALUE
+        );
 
         for round in 0..5 {
             assert_eq!(
-                transform_cli_api_body(body, &Some(profile.to_string())),
+                transform_cli_api_body(&body, &Some(profile.to_string())),
                 body,
                 "round {round}: already-normalized origin/profile must not trigger reserialization"
             );
@@ -610,7 +616,7 @@ mod tests {
             let json: serde_json::Value = serde_json::from_str(&result).unwrap();
             assert_eq!(
                 json["conversationState"]["currentMessage"]["userInputMessage"]["origin"],
-                "KIRO_CLI",
+                CLI_REQUEST_ORIGIN_WIRE_VALUE,
                 "round {round}: escaped semantic origin key must not bypass the transform"
             );
             assert_eq!(
@@ -655,7 +661,7 @@ mod tests {
                 serde_json::from_str(&transform_cli_api_body(recovery, &None)).unwrap();
             assert_eq!(
                 recovered["conversationState"]["currentMessage"]["userInputMessage"]["origin"],
-                "KIRO_CLI",
+                CLI_REQUEST_ORIGIN_WIRE_VALUE,
                 "round {round}: a rejected body must not poison the next transform"
             );
         }
@@ -664,15 +670,15 @@ mod tests {
     #[test]
     #[ignore = "run in release as an isolated endpoint allocation/latency/RSS probe"]
     fn cli_transform_release_perf_probe() {
-        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+        let target_size = std::env::var("LOCAL_UPSTREAM_BODY_PERF_SIZE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1 << 20);
-        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+        let rounds = std::env::var("LOCAL_UPSTREAM_BODY_PERF_ROUNDS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(5);
-        let mode = std::env::var("KIRO_ENDPOINT_BODY_PERF_MODE")
+        let mode = std::env::var("LOCAL_UPSTREAM_ENDPOINT_BODY_PERF_MODE")
             .unwrap_or_else(|_| "escaped-no-marker".to_string());
         assert!(rounds >= 5);
         let body = cli_perf_body(target_size, &mode);
@@ -692,7 +698,7 @@ mod tests {
                 let json: serde_json::Value = serde_json::from_str(&output).unwrap();
                 assert_eq!(
                     json["conversationState"]["currentMessage"]["userInputMessage"]["origin"],
-                    "KIRO_CLI",
+                    CLI_REQUEST_ORIGIN_WIRE_VALUE,
                     "round {round}"
                 );
             } else {
@@ -705,7 +711,7 @@ mod tests {
         }
         latencies_us.sort_unstable();
         println!(
-            "CLI_ENDPOINT_BODY_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} allocation_ops={:?} allocated_bytes={:?} peak_live_bytes={:?} end_live_bytes={:?}",
+            "LOCAL_UPSTREAM_CLI_ENDPOINT_BODY_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} allocation_ops={:?} allocated_bytes={:?} peak_live_bytes={:?} end_live_bytes={:?}",
             mode,
             body.len(),
             rounds,
@@ -792,7 +798,7 @@ mod tests {
         }"#;
         let mut expected: serde_json::Value = serde_json::from_str(body).unwrap();
         expected["conversationState"]["currentMessage"]["userInputMessage"]["origin"] =
-            serde_json::json!("KIRO_CLI");
+            serde_json::json!(CLI_REQUEST_ORIGIN_WIRE_VALUE);
         expected["profileArn"] = serde_json::json!("arn:test:profile/combined");
 
         for round in 0..5 {

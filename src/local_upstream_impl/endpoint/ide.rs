@@ -1,10 +1,12 @@
-//! Kiro IDE 端点
+//! Local-upstream IDE-compatible endpoint.
 //!
-//! 对应 Kiro IDE 客户端目前使用的 AWS CodeWhisperer 端点：
+//! Matches the IDE-compatible AWS CodeWhisperer endpoints currently used by the
+//! local upstream protocol:
 //! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
 //! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
 //!
-//! 请求头使用 aws-sdk-js User-Agent 标识。请求体会在根对象上注入 `profileArn`。
+//! Request headers use the aws-sdk-js User-Agent shape. The request body may
+//! receive a root-level `profileArn`.
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -18,10 +20,10 @@ use crate::local_upstream_impl::protocol::{
     resolve_streaming_profile_arn,
 };
 
-/// Kiro IDE 端点名称
+/// Local-upstream IDE-compatible endpoint name.
 pub const IDE_ENDPOINT_NAME: &str = "ide";
 
-/// Kiro IDE 端点
+/// Local-upstream IDE-compatible endpoint.
 pub struct IdeEndpoint;
 
 impl IdeEndpoint {
@@ -464,15 +466,15 @@ mod tests {
     #[test]
     #[ignore = "run in release as an isolated endpoint allocation/latency/RSS probe"]
     fn ide_transform_release_perf_probe() {
-        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+        let target_size = std::env::var("LOCAL_UPSTREAM_BODY_PERF_SIZE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1 << 20);
-        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+        let rounds = std::env::var("LOCAL_UPSTREAM_BODY_PERF_ROUNDS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(5);
-        let mode = std::env::var("KIRO_ENDPOINT_BODY_PERF_MODE")
+        let mode = std::env::var("LOCAL_UPSTREAM_ENDPOINT_BODY_PERF_MODE")
             .unwrap_or_else(|_| "escaped-no-marker".to_string());
         assert!(rounds >= 5);
         let body = ide_perf_body(target_size, &mode);
@@ -496,7 +498,7 @@ mod tests {
         }
         latencies_us.sort_unstable();
         println!(
-            "IDE_ENDPOINT_BODY_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} allocation_ops={:?} allocated_bytes={:?} peak_live_bytes={:?} end_live_bytes={:?}",
+            "LOCAL_UPSTREAM_IDE_ENDPOINT_BODY_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} allocation_ops={:?} allocated_bytes={:?} peak_live_bytes={:?} end_live_bytes={:?}",
             mode,
             body.len(),
             rounds,

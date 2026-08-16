@@ -707,15 +707,16 @@ mod tests {
     #[test]
     #[ignore = "run in release as an isolated allocation/latency/RSS body-size probe"]
     fn json_whitespace_compression_release_perf_probe() {
-        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+        let target_size = std::env::var("LOCAL_UPSTREAM_BODY_PERF_SIZE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1 << 20);
-        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+        let rounds = std::env::var("LOCAL_UPSTREAM_BODY_PERF_ROUNDS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(5);
-        let mode = std::env::var("KIRO_BODY_PERF_MODE").unwrap_or_else(|_| "valid".to_string());
+        let mode =
+            std::env::var("LOCAL_UPSTREAM_BODY_PERF_MODE").unwrap_or_else(|_| "valid".to_string());
         assert!(matches!(
             mode.as_str(),
             "valid" | "invalid" | "disabled" | "compact"
@@ -760,7 +761,7 @@ mod tests {
         }
         latencies_us.sort_unstable();
         println!(
-            "BODY_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} allocation_ops={:?} allocated_bytes={:?} peak_live_bytes={:?}",
+            "LOCAL_UPSTREAM_BODY_PERF mode={} input_bytes={} rounds={} latency_us_p50={} latency_us_p95={} latency_us_p99={} allocation_ops={:?} allocated_bytes={:?} peak_live_bytes={:?}",
             mode,
             body.len(),
             rounds,
@@ -776,15 +777,15 @@ mod tests {
     #[test]
     #[ignore = "run in release as an isolated concurrent body transform/RSS probe"]
     fn json_whitespace_compression_burst_and_recovery_probe() {
-        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+        let target_size = std::env::var("LOCAL_UPSTREAM_BODY_PERF_SIZE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(5 << 20);
-        let concurrency = std::env::var("KIRO_BODY_PERF_CONCURRENCY")
+        let concurrency = std::env::var("LOCAL_UPSTREAM_BODY_PERF_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(8);
-        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+        let rounds = std::env::var("LOCAL_UPSTREAM_BODY_PERF_ROUNDS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(5);
@@ -818,7 +819,7 @@ mod tests {
             );
         }
         println!(
-            "BODY_BURST input_bytes={} concurrency={} rounds={} calls={} total_ms={}",
+            "LOCAL_UPSTREAM_BODY_BURST input_bytes={} concurrency={} rounds={} calls={} total_ms={}",
             body.len(),
             concurrency,
             rounds,
@@ -830,11 +831,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "run in isolation to characterize abort latency of the synchronous CPU transform"]
     async fn json_whitespace_compression_abort_and_recovery_probe() {
-        let target_size = std::env::var("KIRO_BODY_PERF_SIZE_BYTES")
+        let target_size = std::env::var("LOCAL_UPSTREAM_BODY_PERF_SIZE_BYTES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(5 << 20);
-        let rounds = std::env::var("KIRO_BODY_PERF_ROUNDS")
+        let rounds = std::env::var("LOCAL_UPSTREAM_BODY_PERF_ROUNDS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(5);
@@ -884,7 +885,7 @@ mod tests {
         }
         abort_latencies_us.sort_unstable();
         println!(
-            "BODY_ABORT input_bytes={} rounds={} completed_before_abort_observed={} cancelled_after_cpu_poll={} abort_latency_us_p50={} abort_latency_us_p95={} abort_latency_us_p99={}",
+            "LOCAL_UPSTREAM_BODY_ABORT input_bytes={} rounds={} completed_before_abort_observed={} cancelled_after_cpu_poll={} abort_latency_us_p50={} abort_latency_us_p95={} abort_latency_us_p99={}",
             target_size,
             rounds,
             completed_before_abort_observed,
