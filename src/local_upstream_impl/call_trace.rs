@@ -79,12 +79,12 @@ pub struct SelectionFailureSummary {
     pub global_in_flight: u32,
 }
 
-/// 单个下游请求在 Kiro provider 内部的一次凭据尝试。
+/// 单个下游请求在本地上游 provider 内部的一次凭据尝试。
 ///
 /// 该结构只用于观测，不参与调度、计费或缓存计算。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroCredentialAttempt {
+pub struct LocalUpstreamCredentialAttempt {
     pub attempt: u32,
     pub credential_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,7 +105,7 @@ pub struct KiroCredentialAttempt {
     pub duration_ms: u64,
 }
 
-impl KiroCredentialAttempt {
+impl LocalUpstreamCredentialAttempt {
     pub fn new(
         attempt: usize,
         credential_id: u64,
@@ -151,7 +151,7 @@ impl KiroCredentialAttempt {
 pub struct McpCallAttributionSnapshot {
     pub credential_id: Option<u64>,
     pub credential_label: Option<String>,
-    pub attempts: Vec<KiroCredentialAttempt>,
+    pub attempts: Vec<LocalUpstreamCredentialAttempt>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,7 +164,7 @@ impl McpCallAttributionSink {
         let mut state = self.state.lock();
         state.credential_id = Some(credential_id);
         state.credential_label = Some(credential_label.to_string());
-        let pending = KiroCredentialAttempt::new(
+        let pending = LocalUpstreamCredentialAttempt::new(
             attempt,
             credential_id,
             Some(credential_label.to_string()),
@@ -190,7 +190,7 @@ impl McpCallAttributionSink {
         &self,
         credential_id: Option<u64>,
         credential_label: Option<String>,
-        attempts: Vec<KiroCredentialAttempt>,
+        attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) {
         *self.state.lock() = McpCallAttributionSnapshot {
             credential_id,
@@ -216,26 +216,26 @@ impl McpCallAttributionSink {
     }
 }
 
-pub fn summarize_attempts(attempts: &[KiroCredentialAttempt]) -> String {
+pub fn summarize_attempts(attempts: &[LocalUpstreamCredentialAttempt]) -> String {
     attempts
         .iter()
-        .map(KiroCredentialAttempt::compact)
+        .map(LocalUpstreamCredentialAttempt::compact)
         .collect::<Vec<_>>()
         .join(">")
 }
 
 #[derive(Debug, Clone)]
-pub struct KiroCallError {
+pub struct LocalUpstreamCallError {
     message: String,
-    attempts: Vec<KiroCredentialAttempt>,
+    attempts: Vec<LocalUpstreamCredentialAttempt>,
     selection_failure: Option<SelectionFailureSummary>,
-    failure_kind: Option<KiroCallFailureKind>,
+    failure_kind: Option<LocalUpstreamCallFailureKind>,
     error_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum KiroCallFailureKind {
+pub enum LocalUpstreamCallFailureKind {
     InferenceAttemptsExhausted,
     InferenceAttemptReservedForFallback,
     DownstreamCommitted,
@@ -246,8 +246,8 @@ pub enum KiroCallFailureKind {
     ThinkingSignatureRetryFailed,
 }
 
-impl KiroCallError {
-    pub fn new(message: impl Into<String>, attempts: Vec<KiroCredentialAttempt>) -> Self {
+impl LocalUpstreamCallError {
+    pub fn new(message: impl Into<String>, attempts: Vec<LocalUpstreamCredentialAttempt>) -> Self {
         Self {
             message: message.into(),
             attempts,
@@ -257,7 +257,7 @@ impl KiroCallError {
         }
     }
 
-    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+    pub fn attempts(&self) -> &[LocalUpstreamCredentialAttempt] {
         &self.attempts
     }
 
@@ -270,12 +270,12 @@ impl KiroCallError {
         self.selection_failure.as_ref()
     }
 
-    pub fn with_failure_kind(mut self, failure_kind: KiroCallFailureKind) -> Self {
+    pub fn with_failure_kind(mut self, failure_kind: LocalUpstreamCallFailureKind) -> Self {
         self.failure_kind = Some(failure_kind);
         self
     }
 
-    pub fn failure_kind(&self) -> Option<KiroCallFailureKind> {
+    pub fn failure_kind(&self) -> Option<LocalUpstreamCallFailureKind> {
         self.failure_kind
     }
 
@@ -289,13 +289,13 @@ impl KiroCallError {
     }
 }
 
-impl fmt::Display for KiroCallError {
+impl fmt::Display for LocalUpstreamCallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for KiroCallError {}
+impl std::error::Error for LocalUpstreamCallError {}
 
 #[cfg(test)]
 mod tests {

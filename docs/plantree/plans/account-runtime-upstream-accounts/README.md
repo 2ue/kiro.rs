@@ -214,9 +214,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The legacy local upstream implementation directory moved from `src/kiro` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::kiro` module paths were removed, and the concrete request submodule moved from `model::requests::kiro` to `model::requests::upstream`.
 - Concrete local-upstream request payload structs now use `LocalUpstreamRequest`, `LocalUpstreamAdditionalModelRequestFields`, `LocalUpstreamThinkingConfig`, `LocalUpstreamOutputConfig` and `LocalUpstreamReasoningConfig`; `model/requests` comments now use local-upstream wording while compatibility wire fields and payload behavior remain unchanged.
 - Concrete local-upstream provider and endpoint types now use `LocalUpstreamProvider`, `LocalUpstreamEndpoint`, `LocalUpstreamApiResponse`, `LocalUpstreamApiCompletion`, `LocalUpstreamStreamResponse` and `LocalUpstreamStreamCompletion`; provider diagnostics and endpoint comments now use local-upstream wording while existing transport, retry and completion behavior stays unchanged.
+- Local-upstream call-trace types now use `LocalUpstreamCredentialAttempt`, `LocalUpstreamCallError` and `LocalUpstreamCallFailureKind`; MCP attribution, provider downcast helpers and serialized attempt fields are unchanged.
 
 Last verified on 2026-08-16:
 
+- `rg -n "\bKiroCredentialAttempt\b|\bKiroCallFailureKind\b|\bKiroCallError\b|Kiro provider 内部" src --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-test1 -- bash -lc 'cargo test mcp_attribution_sink_finalizes_pending_send_on_client_drop_for_five_rounds -- --nocapture && cargo test mcp_completion -- --nocapture && cargo test provider_status_and_non_eventstream_matrix_is_private_typed_and_bounded -- --nocapture && cargo test auxiliary_and_manual_provider_errors_never_persist_raw_bodies_for_five_rounds -- --nocapture'`
 - `rg -n "\bKiroProvider\b|\bKiroEndpoint\b|\bKiroApiResponse\b|\bKiroApiCompletion\b|\bKiroStreamResponse\b|\bKiroStreamCompletion\b" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint src/local_upstream.rs --glob '!target/**'`
 - `rg -n "Kiro API Provider|Kiro API|Kiro model discovery|Kiro model capability|Kiro 端点|不同 Kiro|AWS/Kiro host|Kiro CLI management" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint/mod.rs src/local_upstream_impl/mod.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-types-fmt1 -- cargo fmt`

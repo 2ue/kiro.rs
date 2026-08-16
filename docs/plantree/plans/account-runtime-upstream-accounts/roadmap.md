@@ -176,6 +176,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - The legacy local upstream implementation directory moved from `src/kiro` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::kiro` module paths were removed, and the concrete request submodule moved from `model::requests::kiro` to `model::requests::upstream`.
 - Concrete local-upstream request payload structs now use `LocalUpstream*` type names, the request module re-export no longer exposes `KiroRequest`, and `model/requests` comments use local-upstream wording while wire fields and body behavior stay unchanged.
 - Concrete local-upstream provider, endpoint trait, API response and stream completion types now use `LocalUpstream*` names. Provider diagnostics and endpoint comments use local-upstream wording while existing transport, retry, completion and body-send behavior stays unchanged.
+- Local-upstream call-trace attempt, call-error and failure-kind types now use `LocalUpstream*` names while preserving serialized attempt fields, provider downcast helpers and MCP attribution behavior.
 
 ## In Progress
 
@@ -184,7 +185,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 
 ## Next
 
-- Rename concrete local-upstream credential, call-trace, available-model and event model types so Kiro-specific runtime names shrink toward explicit compatibility-only fields.
+- Rename concrete local-upstream credential, available-model and event model types so Kiro-specific runtime names shrink toward explicit compatibility-only fields.
 - Split scheduler primitives from legacy credential/provider dependencies before deleting local Kiro auth, endpoint and EventStream paths.
 - Convert body and protocol paths to canonical/upstream-account logic with no legacy Kiro envelope or Kiro event dependency.
 

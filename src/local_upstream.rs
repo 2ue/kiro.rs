@@ -12,11 +12,12 @@ pub(crate) mod call_trace {
         AccountRejectReason, SelectionFailureStage,
     };
     #[cfg(test)]
-    pub(crate) type LocalUpstreamCallError = crate::local_upstream_impl::call_trace::KiroCallError;
+    pub(crate) type LocalUpstreamCallError =
+        crate::local_upstream_impl::call_trace::LocalUpstreamCallError;
     pub(crate) type LocalUpstreamCallFailureKind =
-        crate::local_upstream_impl::call_trace::KiroCallFailureKind;
+        crate::local_upstream_impl::call_trace::LocalUpstreamCallFailureKind;
     pub(crate) type LocalUpstreamCredentialAttempt =
-        crate::local_upstream_impl::call_trace::KiroCredentialAttempt;
+        crate::local_upstream_impl::call_trace::LocalUpstreamCredentialAttempt;
     pub(crate) type LocalAuxiliaryMcpAttributionSink =
         crate::local_upstream_impl::call_trace::McpCallAttributionSink;
 }

@@ -48,6 +48,7 @@ Current-state facts and target-state decisions answer different questions and mu
 
 - 2026-08-16: In [Account Runtime Upstream Accounts](plans/account-runtime-upstream-accounts/README.md), concrete local-upstream request payload structs now use `LocalUpstream*` names and `model/requests` comments use local-upstream wording. The compatibility wire fields are intentionally unchanged.
 - 2026-08-16: The same plan also renamed the concrete local-upstream provider, endpoint trait, API response and stream completion types to `LocalUpstream*` names; provider diagnostics now use local-upstream wording while preserving transport behavior.
+- 2026-08-16: The local-upstream call-trace attempt/error/failure-kind types now use `LocalUpstream*` names while keeping the existing attempt JSON shape and MCP attribution behavior unchanged.
 
 ## Baseline
 

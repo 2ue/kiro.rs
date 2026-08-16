@@ -32,8 +32,8 @@ use crate::http_client::{
     send_with_response_header_timeout,
 };
 use crate::local_upstream_impl::call_trace::{
-    KiroCallError, KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink,
-    SelectionFailureSummary, summarize_attempts,
+    LocalUpstreamCallError, LocalUpstreamCallFailureKind, LocalUpstreamCredentialAttempt,
+    McpCallAttributionSink, SelectionFailureSummary, summarize_attempts,
 };
 use crate::local_upstream_impl::endpoint::{
     LocalUpstreamEndpoint, RequestContext, configured_upstream_url,
@@ -326,7 +326,7 @@ impl McpCallFailureKind {
 pub struct McpCallAttribution {
     pub credential_id: Option<u64>,
     pub credential_label: Option<String>,
-    pub attempts: Vec<KiroCredentialAttempt>,
+    pub attempts: Vec<LocalUpstreamCredentialAttempt>,
     pub selection_failure: Option<SelectionFailureSummary>,
 }
 
@@ -570,7 +570,7 @@ pub struct McpCallCompletion {
     credential_id: u64,
     credential_label: String,
     in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
-    attempts: Mutex<Vec<KiroCredentialAttempt>>,
+    attempts: Mutex<Vec<LocalUpstreamCredentialAttempt>>,
     attempt: usize,
     status: reqwest::StatusCode,
     reported: AtomicBool,
@@ -585,7 +585,7 @@ impl McpCallCompletion {
         credential_id: u64,
         credential_label: String,
         in_flight_lease: Option<InFlightLeaseGuard>,
-        attempts: Vec<KiroCredentialAttempt>,
+        attempts: Vec<LocalUpstreamCredentialAttempt>,
         attempt: usize,
         status: reqwest::StatusCode,
         started_at: Instant,
@@ -608,7 +608,7 @@ impl McpCallCompletion {
         credential_id: u64,
         credential_label: String,
         in_flight_lease: Option<InFlightLeaseGuard>,
-        attempts: Vec<KiroCredentialAttempt>,
+        attempts: Vec<LocalUpstreamCredentialAttempt>,
         attempt: usize,
         status: reqwest::StatusCode,
         started_at: Instant,
@@ -707,7 +707,7 @@ impl McpCallCompletion {
         }
     }
 
-    pub fn attempts(&self) -> Vec<KiroCredentialAttempt> {
+    pub fn attempts(&self) -> Vec<LocalUpstreamCredentialAttempt> {
         self.attempts.lock().clone()
     }
 }
@@ -735,7 +735,7 @@ struct ApiCallResponse {
     model: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
-    attempts: Vec<KiroCredentialAttempt>,
+    attempts: Vec<LocalUpstreamCredentialAttempt>,
     started_at: Instant,
 }
 
@@ -758,7 +758,7 @@ pub struct LocalUpstreamApiCompletion {
     model: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
-    attempts: Vec<KiroCredentialAttempt>,
+    attempts: Vec<LocalUpstreamCredentialAttempt>,
     reported: AtomicBool,
     started_at: Instant,
 }
@@ -772,7 +772,7 @@ impl LocalUpstreamApiCompletion {
         model: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
-        attempts: Vec<KiroCredentialAttempt>,
+        attempts: Vec<LocalUpstreamCredentialAttempt>,
         started_at: Instant,
     ) -> Self {
         Self {
@@ -823,7 +823,7 @@ impl LocalUpstreamApiCompletion {
         self.fallback_from_sticky
     }
 
-    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+    pub fn attempts(&self) -> &[LocalUpstreamCredentialAttempt] {
         &self.attempts
     }
 }
@@ -850,7 +850,7 @@ impl LocalUpstreamApiResponse {
         self.completion.fallback_from_sticky()
     }
 
-    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+    pub fn attempts(&self) -> &[LocalUpstreamCredentialAttempt] {
         self.completion.attempts()
     }
 
@@ -871,7 +871,7 @@ pub struct LocalUpstreamStreamCompletion {
     model: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
-    attempts: Vec<KiroCredentialAttempt>,
+    attempts: Vec<LocalUpstreamCredentialAttempt>,
     reported: AtomicBool,
     started_at: Instant,
 }
@@ -885,7 +885,7 @@ impl LocalUpstreamStreamCompletion {
         model: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
-        attempts: Vec<KiroCredentialAttempt>,
+        attempts: Vec<LocalUpstreamCredentialAttempt>,
         started_at: Instant,
     ) -> Self {
         Self {
@@ -975,7 +975,7 @@ impl LocalUpstreamStreamCompletion {
         self.fallback_from_sticky
     }
 
-    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+    pub fn attempts(&self) -> &[LocalUpstreamCredentialAttempt] {
         &self.attempts
     }
 }
@@ -1033,7 +1033,7 @@ mod tests {
     };
     use crate::http_client::ProxyConfig;
     use crate::local_upstream_impl::call_trace::{
-        AccountRejectReason, KiroCallFailureKind, SelectionFailureStage,
+        AccountRejectReason, LocalUpstreamCallFailureKind, SelectionFailureStage,
     };
     use crate::local_upstream_impl::endpoint::{CliEndpoint, IdeEndpoint, LocalUpstreamEndpoint};
     use crate::local_upstream_impl::model::credentials::KiroCredentials;
@@ -3741,7 +3741,7 @@ mod tests {
         prompt_logic_retry_enabled: bool,
     ) -> (
         usize,
-        Vec<crate::local_upstream_impl::call_trace::KiroCredentialAttempt>,
+        Vec<crate::local_upstream_impl::call_trace::LocalUpstreamCredentialAttempt>,
     ) {
         let hits_before = server.state.scenario_hits(scenario);
         let total_hits_before = server.state.total_hits.load(Ordering::Relaxed);
@@ -3901,7 +3901,7 @@ mod tests {
         retry_body_builder: F,
     ) -> anyhow::Result<(
         u64,
-        Vec<crate::local_upstream_impl::call_trace::KiroCredentialAttempt>,
+        Vec<crate::local_upstream_impl::call_trace::LocalUpstreamCredentialAttempt>,
     )>
     where
         F: FnOnce() -> anyhow::Result<String> + Send,
@@ -3965,7 +3965,7 @@ mod tests {
     struct ProviderFailureOutcome {
         marker: String,
         error_text: String,
-        attempts: Vec<crate::local_upstream_impl::call_trace::KiroCredentialAttempt>,
+        attempts: Vec<crate::local_upstream_impl::call_trace::LocalUpstreamCredentialAttempt>,
         consumed_sends: usize,
         scheduler_snapshot: String,
         cooldown_kinds: Vec<Option<String>>,
@@ -4637,8 +4637,8 @@ mod tests {
                     assert!(!matches!(
                         LocalUpstreamProvider::call_failure_kind_from_error(&error),
                         Some(
-                            KiroCallFailureKind::ThinkingSignatureInvalid
-                                | KiroCallFailureKind::ThinkingSignatureRetryFailed
+                            LocalUpstreamCallFailureKind::ThinkingSignatureInvalid
+                                | LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed
                         )
                     ));
                     assert_signature_retry_did_not_cool_down(
@@ -4698,8 +4698,8 @@ mod tests {
                 assert!(!matches!(
                     LocalUpstreamProvider::call_failure_kind_from_error(&error),
                     Some(
-                        KiroCallFailureKind::ThinkingSignatureInvalid
-                            | KiroCallFailureKind::ThinkingSignatureRetryFailed
+                        LocalUpstreamCallFailureKind::ThinkingSignatureInvalid
+                            | LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed
                     )
                 ));
                 assert_signature_retry_did_not_cool_down(
@@ -4716,15 +4716,15 @@ mod tests {
         for (scenario, expected_kind) in [
             (
                 "thinking_signature_repeat",
-                KiroCallFailureKind::ThinkingSignatureInvalid,
+                LocalUpstreamCallFailureKind::ThinkingSignatureInvalid,
             ),
             (
                 "thinking_signature_nested_repeat",
-                KiroCallFailureKind::ThinkingSignatureInvalid,
+                LocalUpstreamCallFailureKind::ThinkingSignatureInvalid,
             ),
             (
                 "thinking_signature_read_failure",
-                KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
             ),
         ] {
             for is_stream in [false, true] {
@@ -4938,7 +4938,7 @@ mod tests {
                     assert_eq!(budget.snapshot().consumed, 1);
                     assert_eq!(
                         LocalUpstreamProvider::call_failure_kind_from_error(&error),
-                        Some(KiroCallFailureKind::ThinkingSignatureRetryFailed)
+                        Some(LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed)
                     );
                     assert_eq!(LocalUpstreamProvider::attempts_from_error(&error).len(), 1);
                     assert!(!error.to_string().contains(&private_builder_marker));
@@ -4983,7 +4983,7 @@ mod tests {
                 assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
                 assert_eq!(
                     LocalUpstreamProvider::call_failure_kind_from_error(&error),
-                    Some(KiroCallFailureKind::ThinkingSignatureRetryFailed)
+                    Some(LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed)
                 );
                 let attempts = LocalUpstreamProvider::attempts_from_error(&error);
                 assert_eq!(attempts.len(), 2);
@@ -6854,38 +6854,40 @@ impl LocalUpstreamProvider {
         }
     }
 
-    pub fn attempts_from_error(err: &anyhow::Error) -> Vec<KiroCredentialAttempt> {
-        err.downcast_ref::<KiroCallError>()
+    pub fn attempts_from_error(err: &anyhow::Error) -> Vec<LocalUpstreamCredentialAttempt> {
+        err.downcast_ref::<LocalUpstreamCallError>()
             .map(|err| err.attempts().to_vec())
             .unwrap_or_default()
     }
 
     pub fn selection_failure_from_error(err: &anyhow::Error) -> Option<SelectionFailureSummary> {
-        err.downcast_ref::<KiroCallError>()
+        err.downcast_ref::<LocalUpstreamCallError>()
             .and_then(|err| err.selection_failure().cloned())
     }
 
-    pub fn call_failure_kind_from_error(err: &anyhow::Error) -> Option<KiroCallFailureKind> {
-        err.downcast_ref::<KiroCallError>()
-            .and_then(KiroCallError::failure_kind)
+    pub fn call_failure_kind_from_error(
+        err: &anyhow::Error,
+    ) -> Option<LocalUpstreamCallFailureKind> {
+        err.downcast_ref::<LocalUpstreamCallError>()
+            .and_then(LocalUpstreamCallError::failure_kind)
     }
 
     pub fn error_metadata_from_error(err: &anyhow::Error) -> Option<serde_json::Value> {
-        err.downcast_ref::<KiroCallError>()
+        err.downcast_ref::<LocalUpstreamCallError>()
             .and_then(|err| err.error_metadata().cloned())
     }
 
-    fn auxiliary_call_failure_kind(err: &anyhow::Error) -> Option<KiroCallFailureKind> {
+    fn auxiliary_call_failure_kind(err: &anyhow::Error) -> Option<LocalUpstreamCallFailureKind> {
         if err
             .downcast_ref::<AuxiliaryAttemptBudgetExhausted>()
             .is_some()
         {
-            Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted)
+            Some(LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted)
         } else if err
             .downcast_ref::<AuxiliaryConcurrencySaturated>()
             .is_some()
         {
-            Some(KiroCallFailureKind::AuxiliaryConcurrencySaturated)
+            Some(LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated)
         } else {
             None
         }
@@ -6909,61 +6911,61 @@ impl LocalUpstreamProvider {
 
     fn inference_attempt_rejected_error(
         rejection: InferenceAttemptRejection,
-        attempts: &[KiroCredentialAttempt],
+        attempts: &[LocalUpstreamCredentialAttempt],
     ) -> anyhow::Error {
         let (message, failure_kind) = match rejection {
             InferenceAttemptRejection::Exhausted => (
                 "local inference routing limit reached",
-                KiroCallFailureKind::InferenceAttemptsExhausted,
+                LocalUpstreamCallFailureKind::InferenceAttemptsExhausted,
             ),
             InferenceAttemptRejection::ReservedForFallback => (
                 "local inference attempt reserved for fallback",
-                KiroCallFailureKind::InferenceAttemptReservedForFallback,
+                LocalUpstreamCallFailureKind::InferenceAttemptReservedForFallback,
             ),
             InferenceAttemptRejection::DownstreamCommitted => (
                 "downstream response already committed",
-                KiroCallFailureKind::DownstreamCommitted,
+                LocalUpstreamCallFailureKind::DownstreamCommitted,
             ),
         };
-        KiroCallError::new(message, attempts.to_vec())
+        LocalUpstreamCallError::new(message, attempts.to_vec())
             .with_failure_kind(failure_kind)
             .into()
     }
 
     fn traced_error(
         message: impl Into<String>,
-        attempts: &[KiroCredentialAttempt],
+        attempts: &[LocalUpstreamCredentialAttempt],
     ) -> anyhow::Error {
-        KiroCallError::new(message, attempts.to_vec()).into()
+        LocalUpstreamCallError::new(message, attempts.to_vec()).into()
     }
 
     fn traced_error_with_metadata(
         message: impl Into<String>,
-        attempts: &[KiroCredentialAttempt],
+        attempts: &[LocalUpstreamCredentialAttempt],
         error_metadata: Option<serde_json::Value>,
     ) -> anyhow::Error {
-        KiroCallError::new(message, attempts.to_vec())
+        LocalUpstreamCallError::new(message, attempts.to_vec())
             .with_error_metadata(error_metadata)
             .into()
     }
 
     fn traced_error_with_failure_kind(
         message: impl Into<String>,
-        attempts: &[KiroCredentialAttempt],
-        failure_kind: KiroCallFailureKind,
+        attempts: &[LocalUpstreamCredentialAttempt],
+        failure_kind: LocalUpstreamCallFailureKind,
     ) -> anyhow::Error {
-        KiroCallError::new(message, attempts.to_vec())
+        LocalUpstreamCallError::new(message, attempts.to_vec())
             .with_failure_kind(failure_kind)
             .into()
     }
 
     fn traced_error_with_selection_failure(
         message: impl Into<String>,
-        attempts: &[KiroCredentialAttempt],
+        attempts: &[LocalUpstreamCredentialAttempt],
         selection_failure: Option<SelectionFailureSummary>,
-        failure_kind: Option<KiroCallFailureKind>,
+        failure_kind: Option<LocalUpstreamCallFailureKind>,
     ) -> anyhow::Error {
-        let mut error = KiroCallError::new(message, attempts.to_vec())
+        let mut error = LocalUpstreamCallError::new(message, attempts.to_vec())
             .with_selection_failure(selection_failure);
         if let Some(failure_kind) = failure_kind {
             error = error.with_failure_kind(failure_kind);
@@ -7293,7 +7295,7 @@ impl LocalUpstreamProvider {
     }
 
     fn push_attempt(
-        attempts: &mut Vec<KiroCredentialAttempt>,
+        attempts: &mut Vec<LocalUpstreamCredentialAttempt>,
         attempt: usize,
         credential_id: u64,
         credential_label: &str,
@@ -7305,7 +7307,7 @@ impl LocalUpstreamProvider {
         model: Option<&str>,
     ) {
         attempts.push(
-            KiroCredentialAttempt::new(
+            LocalUpstreamCredentialAttempt::new(
                 attempt,
                 credential_id,
                 Some(credential_label.to_string()),
@@ -7320,7 +7322,7 @@ impl LocalUpstreamProvider {
     }
 
     fn attach_last_attempt_raw_upstream_error(
-        attempts: &mut [KiroCredentialAttempt],
+        attempts: &mut [LocalUpstreamCredentialAttempt],
         raw_upstream_error: &RawUpstreamError,
     ) {
         if let Some(attempt) = attempts.last_mut() {
@@ -7330,7 +7332,7 @@ impl LocalUpstreamProvider {
 
     fn push_mcp_attempt(
         attribution_sink: &McpCallAttributionSink,
-        attempts: &mut Vec<KiroCredentialAttempt>,
+        attempts: &mut Vec<LocalUpstreamCredentialAttempt>,
         attempt: usize,
         credential_id: u64,
         credential_label: &str,
@@ -7363,7 +7365,7 @@ impl LocalUpstreamProvider {
     fn log_attempt_chain(
         request_id: Option<&str>,
         api_type: &str,
-        attempts: &[KiroCredentialAttempt],
+        attempts: &[LocalUpstreamCredentialAttempt],
         outcome: &str,
     ) {
         if attempts.is_empty() {
@@ -9189,7 +9191,7 @@ impl LocalUpstreamProvider {
         message: impl Into<String>,
         credential_id: Option<u64>,
         credential_label: Option<String>,
-        attempts: Vec<KiroCredentialAttempt>,
+        attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> anyhow::Error {
         McpCallError {
             kind,
@@ -10237,11 +10239,11 @@ impl LocalUpstreamProvider {
         }
         let mut last_error: Option<anyhow::Error> = None;
         let mut last_selection_failure: Option<SelectionFailureSummary> = None;
-        let mut last_call_failure_kind: Option<KiroCallFailureKind> = None;
+        let mut last_call_failure_kind: Option<LocalUpstreamCallFailureKind> = None;
         let mut automatic_recovery_attempted: HashSet<u64> = HashSet::new();
         let mut automatic_recovery_allowed = true;
         let api_type = if is_stream { "流式" } else { "非流式" };
-        let mut attempts: Vec<KiroCredentialAttempt> = Vec::new();
+        let mut attempts: Vec<LocalUpstreamCredentialAttempt> = Vec::new();
 
         let model = dispatch_model_filter
             .map(str::to_string)
@@ -10932,7 +10934,7 @@ impl LocalUpstreamProvider {
                         Err(Self::traced_error_with_failure_kind(
                             final_message,
                             &attempts,
-                            KiroCallFailureKind::LocalPoolRiskCircuitOpen,
+                            LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen,
                         ))
                     } else {
                         Err(Self::traced_error(final_message, &attempts))
@@ -11128,7 +11130,7 @@ impl LocalUpstreamProvider {
                     return Err(Self::traced_error_with_failure_kind(
                         message,
                         &attempts,
-                        KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                        LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                     ));
                 }
 
@@ -11165,7 +11167,7 @@ impl LocalUpstreamProvider {
                         return Err(Self::traced_error_with_failure_kind(
                             message,
                             &attempts,
-                            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                         ));
                     }
                 }
@@ -11183,7 +11185,7 @@ impl LocalUpstreamProvider {
                         return Err(Self::traced_error_with_failure_kind(
                             message,
                             &attempts,
-                            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                         ));
                     }
                 };
@@ -11209,7 +11211,7 @@ impl LocalUpstreamProvider {
                         return Err(Self::traced_error_with_failure_kind(
                             message,
                             &attempts,
-                            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                         ));
                     }
                 };
@@ -11240,7 +11242,7 @@ impl LocalUpstreamProvider {
                         return Err(Self::traced_error_with_failure_kind(
                             message,
                             &attempts,
-                            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                         ));
                     }
                 }
@@ -11298,7 +11300,7 @@ impl LocalUpstreamProvider {
                         return Err(Self::traced_error_with_failure_kind(
                             message,
                             &attempts,
-                            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                         ));
                     }
                 };
@@ -11378,7 +11380,7 @@ impl LocalUpstreamProvider {
                         return Err(Self::traced_error_with_failure_kind(
                             message,
                             &attempts,
-                            KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                            LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                         ));
                     }
                 };
@@ -11422,7 +11424,7 @@ impl LocalUpstreamProvider {
                     return Err(Self::traced_error_with_failure_kind(
                         message,
                         &attempts,
-                        KiroCallFailureKind::ThinkingSignatureInvalid,
+                        LocalUpstreamCallFailureKind::ThinkingSignatureInvalid,
                     ));
                 }
 
@@ -11562,7 +11564,7 @@ impl LocalUpstreamProvider {
                 return Err(Self::traced_error_with_failure_kind(
                     message,
                     &attempts,
-                    KiroCallFailureKind::ThinkingSignatureRetryFailed,
+                    LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
                 ));
             }
 
