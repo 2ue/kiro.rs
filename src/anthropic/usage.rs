@@ -4335,7 +4335,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_metering_fields_serialize_upstream_with_kiro_compatibility() {
+    fn usage_metering_fields_serialize_upstream_with_legacy_compatibility() {
         let mut record = record("req_upstream_metering", 0, UsageSource::UpstreamMetadata);
         record.upstream_metering_units = 1.25;
         record.ensure_upstream_metering_compatibility();
@@ -5451,7 +5451,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_cost_summary_includes_kiro_metering_usage() {
+    fn credential_cost_summary_includes_upstream_metering_units() {
         let recorder = UsageRecorder::new(10);
         let mut first = record("metering-1", 0, UsageSource::ContextEstimate);
         first.credential_id = Some(7);
@@ -5860,7 +5860,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_cost_summary_aggregates_kiro_metering_usage() {
+    fn credential_cost_summary_aggregates_upstream_metering_units() {
         let recorder = UsageRecorder::new(10);
         let mut first = record("1", 5, UsageSource::UpstreamMetadata);
         first.credential_id = Some(7);

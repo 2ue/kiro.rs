@@ -828,7 +828,7 @@ fn extracts_model_ids_from_anthropic_and_openai_models_response() {
 }
 
 #[test]
-fn extracts_model_ids_from_kiro_compatible_models_response() {
+fn extracts_model_ids_from_upstream_model_catalog_response() {
     let body = r#"{
             "defaultModel": {"modelId": "auto"},
             "models": [

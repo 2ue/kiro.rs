@@ -195,9 +195,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic handler and external-pool test helpers now construct local upstream credentials, endpoints, managers, provider fixtures and EventStream CRC frames through the `local_upstream` facade instead of importing legacy local-provider modules directly.
 - Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording. New mock/doc variables use `ACCOUNT_RUNTIME_*` names while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
 - The maintained UI HTML document title now uses Account Runtime Console wording; the Admin HTML title already uses Account Runtime Admin.
+- Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Kiro-named semantic test names while preserving the existing compatibility fields.
 
 Last verified on 2026-08-16:
 
+- `rg -n "fn .*kiro|includes_kiro|aggregates_kiro|with_kiro_compatibility|kiro compatible|Kiro compatible" src/admin/service_tests.rs src/anthropic/usage.rs`
+- `feature/tests/run-cargo-scoped.sh upstream-test-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh upstream-test-names-test1 -- bash -lc 'cargo test extracts_model_ids_from_upstream_model_catalog_response -- --nocapture && cargo test usage_metering_fields_serialize_upstream_with_legacy_compatibility -- --nocapture && cargo test credential_cost_summary_includes_upstream_metering_units -- --nocapture && cargo test credential_cost_summary_aggregates_upstream_metering_units -- --nocapture'`
+- `git diff --check`
 - `rg -n "<title>|Kiro Console|Kiro Admin|Kiro 控制台" ui/index.html admin-ui/index.html ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `git diff --check`
