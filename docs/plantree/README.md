@@ -54,6 +54,7 @@ Current-state facts and target-state decisions answer different questions and mu
 - 2026-08-16: Admin account-info credit snapshots and validation grouping no longer use built-in subscription label tables or rank ordering. Usage/credit fields drive credit values, and subscription titles are treated as unordered labels.
 - 2026-08-16: Maintained credential UIs no longer hard-code subscription label badges or filter values. They display upstream subscription titles as unordered metadata, and model-capability cohort tests use neutral account cohort fixtures.
 - 2026-08-16: Local-upstream image request payload types now use `LocalUpstreamImage` / `LocalUpstreamImageSource` as real Rust types while preserving image JSON shape and payload-guard behavior.
+- 2026-08-16: Local-upstream event model comments and examples now use local-upstream/upstream wording; event names, parser behavior and typed DTOs are unchanged.
 
 ## Baseline
 

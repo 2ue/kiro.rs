@@ -1,8 +1,8 @@
-//! Additional Kiro event payloads.
+//! Additional local-upstream event payloads.
 //!
-//! These events are emitted by newer Kiro runtimes but were not part of the
-//! original minimal parser. Keeping them typed lets the Anthropic adapter use
-//! authoritative token usage, native thinking, and upstream invalid-state
+//! These events are emitted by newer upstream runtimes but were not part of
+//! the original minimal parser. Keeping them typed lets the Anthropic adapter
+//! use authoritative token usage, native thinking, and upstream invalid-state
 //! failures instead of treating them as opaque unknown frames.
 
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,7 @@ impl EventPayload for MessageMetadataEvent {
     }
 }
 
-/// Metering event emitted by Kiro with credit usage information.
+/// Metering event emitted by the upstream with credit usage information.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MeteringEvent {

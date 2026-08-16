@@ -221,9 +221,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin account-info credit snapshots no longer use built-in subscription label tables or legacy rank parsing. Credit base/bonus now comes from upstream usage fields or persisted credit fields, and validation grouping treats subscription titles as unordered labels.
 - Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. Subscription title display now uses the upstream title directly as unordered metadata, and model-capability cohort tests use neutral account cohort fixtures.
 - Local-upstream image request payload types now use `LocalUpstreamImage` and `LocalUpstreamImageSource` as real Rust types. The facade points at those concrete types, image JSON shape is unchanged, and payload-guard image byte accounting uses local-upstream naming.
+- Local-upstream event model comments and examples now use local-upstream/upstream wording. Event names, parser behavior and typed DTOs are unchanged.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/model/events --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-test1 -- cargo test local_upstream_impl::model::events -- --nocapture`
+- `git diff --check`
 - `rg -n "\bKiroImage\b|\bKiroImageSource\b|Kiro 图片|assistant_reasoning_content_serializes_as_exact_kiro_union|let kiro\b" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs src/anthropic/payload_guard.rs src/anthropic/converter/content.rs --glob '!target/**'`
 - `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-image-types-fmt1 -- cargo fmt`

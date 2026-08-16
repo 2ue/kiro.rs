@@ -21,7 +21,7 @@ use super::base::EventPayload;
 /// # 示例
 ///
 /// ```rust
-/// use kiro_rs::local_upstream_impl::model::events::AssistantResponseEvent;
+/// use crate::local_upstream_impl::model::events::AssistantResponseEvent;
 ///
 /// let json = r#"{"content":"Hello, world!"}"#;
 /// let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();
