@@ -171,6 +171,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming while stable hash domains remain unchanged.
 - Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
 - New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
+- Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Kiro-specific header name.
 
 ## In Progress
 

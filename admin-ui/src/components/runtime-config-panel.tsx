@@ -1254,7 +1254,7 @@ function LocalUpstreamAgentModeSelectField({ value, onChange }: LocalUpstreamAge
       <div className="mb-3">
         <div className="text-sm font-medium">Local Upstream Agent Mode</div>
         <div className="mt-1 text-xs leading-5 text-muted-foreground">
-          控制发往旧 IDE 上游的 x-amzn-kiro-agent-mode。vibe 保持当前 Claude Code 成功链路；spec 强制规格模式；auto 会按账号协议自动选择。
+          控制发往本地上游的 agent-mode 标记。vibe 保持当前 Claude Code 成功链路；spec 强制规格模式；auto 会按账号协议自动选择。
         </div>
       </div>
       <select

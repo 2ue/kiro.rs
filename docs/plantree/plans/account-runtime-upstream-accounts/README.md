@@ -209,9 +209,12 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming; stable hash domains remain unchanged to avoid behavior drift.
 - Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
 - New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
+- Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Kiro-specific header name.
 
 Last verified on 2026-08-16:
 
+- `rg -n "x-amzn-kiro|旧 IDE|Kiro API|Kiro 上游|Kiro 账号|Kiro credits|Kiro Console|Kiro Admin" ui/src admin-ui/src --glob '!**/dist/**' --glob '!**/node_modules/**'`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "/tmp/kiro-rs/external-pool-usage-debug|kiro_rs:local|kiro_rs:observability|sk-kiro-rs-qaz" src ui admin-ui README.md docs/ai-docker-compose-deployment.md --glob '!target/**' --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh config-default-artifacts-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh config-default-artifacts-test1 -- bash -lc 'cargo test model::config -- --nocapture && cargo check'`
