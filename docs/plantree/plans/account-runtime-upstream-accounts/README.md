@@ -191,9 +191,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
 - Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
 - Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving the generic tier parsing behavior.
+- The load/chaos helper now presents account-runtime/upstream wording for its command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and test names. New flags use `--fake-upstream-usage` and `--fake-local-upstream-eventstream`; old Kiro-named flags, env and error-header inputs remain only as compatibility aliases/fallbacks.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro|kiro|KIRO|fake_kiro|FakeKiro|normal_kiro|kiro_loadtest|kiro_event|mcpKiro" src/bin/kiro_loadtest.rs`
+- `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-check1 -- cargo check --bin kiro_loadtest`
+- `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-test1 -- cargo test --bin kiro_loadtest -- --nocapture`
+- `git diff --check`
 - `rg -n "Kiro Pro|Kiro Power|KIRO FREE|KIRO PRO|Kiro Pro\\+|Kiro Pro Max" src/admin/service_tests.rs src/storage/postgres.rs`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-test1 -- bash -lc 'cargo test subscription_ -- --nocapture && cargo test credit_snapshot -- --nocapture && cargo test account_info -- --nocapture'`

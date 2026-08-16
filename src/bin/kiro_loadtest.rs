@@ -32,10 +32,12 @@ use tracing_subscriber::EnvFilter;
 
 const LOADTEST_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const LOADTEST_SSE_EVENT_MAX_BYTES: usize = 1024 * 1024;
+const REAL_UPSTREAM_ALLOW_ENV: &str = "ACCOUNT_RUNTIME_LOADTEST_ALLOW_REAL_UPSTREAM";
+const LEGACY_REAL_UPSTREAM_ALLOW_ENV: &str = "KIRO_LOADTEST_ALLOW_REAL_UPSTREAM";
 
 #[derive(Debug, Parser)]
-#[command(name = "kiro_loadtest")]
-#[command(about = "Kiro proxy load/chaos test helper")]
+#[command(name = "account_runtime_loadtest")]
+#[command(about = "Account runtime load/chaos test helper")]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:9022")]
     base_url: String,
@@ -93,10 +95,21 @@ struct Args {
     fake_listen: Option<SocketAddr>,
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     fake_only: bool,
-    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
-    fake_kiro_eventstream: bool,
-    #[arg(long, value_enum, default_value_t = FakeKiroUsageMode::Reported)]
-    fake_kiro_usage: FakeKiroUsageMode,
+    #[arg(
+        long = "fake-local-upstream-eventstream",
+        alias = "fake-kiro-eventstream",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    fake_local_upstream_eventstream: bool,
+    #[arg(
+        long = "fake-upstream-usage",
+        alias = "fake-kiro-usage",
+        value_enum,
+        default_value_t = FakeUpstreamUsageMode::Reported
+    )]
+    fake_upstream_usage: FakeUpstreamUsageMode,
     #[arg(long, default_value_t = 1500)]
     fake_delay_ms: u64,
     #[arg(long, default_value_t = 10)]
@@ -136,7 +149,7 @@ enum Scenario {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum FakeKiroUsageMode {
+enum FakeUpstreamUsageMode {
     Reported,
     AllZero,
     MetadataThenZero,
@@ -275,8 +288,8 @@ struct FakeServerState {
     stream_chunks: usize,
     stream_chunk_delay: Duration,
     fake_tool_input_chars: usize,
-    kiro_eventstream: bool,
-    kiro_usage: FakeKiroUsageMode,
+    local_upstream_eventstream: bool,
+    upstream_usage: FakeUpstreamUsageMode,
     capture_dir: Option<PathBuf>,
     counter: Arc<AtomicU64>,
 }
@@ -300,13 +313,13 @@ async fn main() -> anyhow::Result<()> {
             stream_chunks: args.fake_stream_chunks.max(1),
             stream_chunk_delay: Duration::from_millis(args.fake_stream_chunk_delay_ms),
             fake_tool_input_chars: args.fake_tool_input_chars,
-            kiro_eventstream: args.fake_kiro_eventstream,
-            kiro_usage: args.fake_kiro_usage,
+            local_upstream_eventstream: args.fake_local_upstream_eventstream,
+            upstream_usage: args.fake_upstream_usage,
             capture_dir: args.fake_capture_dir,
             counter: Arc::new(AtomicU64::new(0)),
         };
         let server = tokio::spawn(run_fake_server(addr, state));
-        tracing::info!("fake Kiro server listening on http://{}", addr);
+        tracing::info!("fake upstream server listening on http://{}", addr);
         if args.fake_only {
             return server.await.context("fake server task failed")?;
         }
@@ -367,12 +380,18 @@ fn ensure_real_upstream_guard(real_upstream: bool) -> anyhow::Result<()> {
     if !real_upstream {
         return Ok(());
     }
-    match std::env::var("KIRO_LOADTEST_ALLOW_REAL_UPSTREAM") {
-        Ok(value) if value == "1" => Ok(()),
-        _ => bail!(
-            "--real-upstream requires KIRO_LOADTEST_ALLOW_REAL_UPSTREAM=1 to avoid accidental production traffic"
-        ),
+    if loadtest_env_enabled(REAL_UPSTREAM_ALLOW_ENV)
+        || loadtest_env_enabled(LEGACY_REAL_UPSTREAM_ALLOW_ENV)
+    {
+        return Ok(());
     }
+    bail!(
+        "--real-upstream requires {REAL_UPSTREAM_ALLOW_ENV}=1 to avoid accidental production traffic"
+    )
+}
+
+fn loadtest_env_enabled(name: &str) -> bool {
+    matches!(std::env::var(name), Ok(value) if value == "1")
 }
 
 async fn run_loadtest(config: RunConfig) -> anyhow::Result<LoadtestReport> {
@@ -1493,15 +1512,15 @@ async fn fake_handler(
     let sequence = state.counter.fetch_add(1, Ordering::Relaxed) + 1;
     let request_id = format!("fake_req_{}", sequence);
     let request = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| json!({}));
-    if is_kiro_model_discovery_request(&uri, &headers) {
+    if is_local_upstream_model_discovery_request(&uri, &headers) {
         capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
-        return fake_kiro_model_discovery_message(&request_id);
+        return fake_upstream_model_discovery_message(&request_id);
     }
     let stream = request
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| {
-            wants_stream(&headers) || wants_kiro_eventstream(&state, &uri, &headers)
+            wants_stream(&headers) || wants_local_upstream_eventstream(&state, &uri, &headers)
         });
     let scenario = effective_fake_scenario(&state, sequence);
     capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
@@ -1535,10 +1554,14 @@ async fn fake_handler(
                     "Invalid tool use format.",
                 )
             } else if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
+                        normal_local_upstream_events(
+                            Duration::ZERO,
+                            thinking,
+                            state.upstream_usage,
+                        ),
                     )
                 } else {
                     sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
@@ -1568,12 +1591,12 @@ async fn fake_handler(
         ),
         Scenario::StreamIdleTimeout => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
                         vec![(
                             state.delay,
-                            kiro_event_frame(
+                            local_upstream_event_frame(
                                 "assistantResponseEvent",
                                 json!({"content":"partial response"}),
                             ),
@@ -1595,10 +1618,10 @@ async fn fake_handler(
         }
         Scenario::SlowFirstByte => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        normal_kiro_events(state.delay, false, state.kiro_usage),
+                        normal_local_upstream_events(state.delay, false, state.upstream_usage),
                     )
                 } else {
                     sse_response(request_id, normal_sse_events(state.delay, false))
@@ -1611,10 +1634,10 @@ async fn fake_handler(
         Scenario::RandomSlowFirstByte => {
             let delay = random_slow_first_byte_delay(state.delay, sequence);
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        normal_kiro_events(delay, thinking, state.kiro_usage),
+                        normal_local_upstream_events(delay, thinking, state.upstream_usage),
                     )
                 } else {
                     sse_response(request_id, normal_sse_events(delay, thinking))
@@ -1627,10 +1650,10 @@ async fn fake_handler(
         Scenario::DenseSlowFirstByte => {
             let delay = dense_slow_first_byte_delay(state.delay, sequence);
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        normal_kiro_events(delay, thinking, state.kiro_usage),
+                        normal_local_upstream_events(delay, thinking, state.upstream_usage),
                     )
                 } else {
                     sse_response(request_id, normal_sse_events(delay, thinking))
@@ -1643,10 +1666,10 @@ async fn fake_handler(
         Scenario::TieredSlowFirstByte => {
             let delay = tiered_slow_first_byte_delay(sequence);
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        normal_kiro_events(delay, thinking, state.kiro_usage),
+                        normal_local_upstream_events(delay, thinking, state.upstream_usage),
                     )
                 } else {
                     sse_response(request_id, normal_sse_events(delay, thinking))
@@ -1658,10 +1681,10 @@ async fn fake_handler(
         }
         Scenario::SlowThinkingThenText => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        thinking_kiro_events(state.delay, state.kiro_usage),
+                        thinking_local_upstream_events(state.delay, state.upstream_usage),
                     )
                 } else {
                     sse_response(request_id, thinking_sse_events(state.delay))
@@ -1673,19 +1696,23 @@ async fn fake_handler(
         }
         Scenario::ToolUseStream => {
             if stream {
-                if state.kiro_eventstream {
+                if state.local_upstream_eventstream {
                     if body_contains_tool_result(&request) || !body_contains_tools(&request) {
-                        kiro_eventstream_response(
+                        local_upstream_eventstream_response(
                             request_id,
-                            normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
+                            normal_local_upstream_events(
+                                Duration::ZERO,
+                                thinking,
+                                state.upstream_usage,
+                            ),
                         )
                     } else {
-                        kiro_eventstream_response(
+                        local_upstream_eventstream_response(
                             request_id,
-                            tool_use_kiro_events(
+                            tool_use_local_upstream_events(
                                 select_fake_tool_name(&request),
                                 &request,
-                                state.kiro_usage,
+                                state.upstream_usage,
                                 state.fake_tool_input_chars,
                             ),
                         )
@@ -1708,14 +1735,14 @@ async fn fake_handler(
         }
         Scenario::LongStream => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        long_stream_kiro_events(
+                        long_stream_local_upstream_events(
                             state.delay,
                             state.stream_chunks,
                             state.stream_chunk_delay,
-                            state.kiro_usage,
+                            state.upstream_usage,
                         ),
                     )
                 } else {
@@ -1740,10 +1767,14 @@ async fn fake_handler(
         }
         Scenario::NormalNonStream => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
+                        normal_local_upstream_events(
+                            Duration::ZERO,
+                            thinking,
+                            state.upstream_usage,
+                        ),
                     )
                 } else {
                     sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
@@ -1754,10 +1785,14 @@ async fn fake_handler(
         }
         Scenario::NormalStream | Scenario::ClientDrop | Scenario::RecoveryAfterBurst => {
             if stream {
-                if state.kiro_eventstream {
-                    kiro_eventstream_response(
+                if state.local_upstream_eventstream {
+                    local_upstream_eventstream_response(
                         request_id,
-                        normal_kiro_events(Duration::ZERO, thinking, state.kiro_usage),
+                        normal_local_upstream_events(
+                            Duration::ZERO,
+                            thinking,
+                            state.upstream_usage,
+                        ),
                     )
                 } else {
                     sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
@@ -1834,8 +1869,12 @@ fn wants_stream(headers: &HeaderMap) -> bool {
         })
 }
 
-fn wants_kiro_eventstream(state: &FakeServerState, uri: &Uri, headers: &HeaderMap) -> bool {
-    if !state.kiro_eventstream {
+fn wants_local_upstream_eventstream(
+    state: &FakeServerState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> bool {
+    if !state.local_upstream_eventstream {
         return false;
     }
     if uri.path().contains("generateAssistantResponse") {
@@ -1847,7 +1886,7 @@ fn wants_kiro_eventstream(state: &FakeServerState, uri: &Uri, headers: &HeaderMa
         .is_some_and(|target| target.ends_with(".GenerateAssistantResponse"))
 }
 
-fn is_kiro_model_discovery_request(uri: &Uri, headers: &HeaderMap) -> bool {
+fn is_local_upstream_model_discovery_request(uri: &Uri, headers: &HeaderMap) -> bool {
     if uri.path().ends_with("/ListAvailableModels") {
         return true;
     }
@@ -2086,15 +2125,15 @@ fn fake_json_message(request_id: &str) -> Response {
         .into_response()
 }
 
-fn fake_kiro_model_discovery_message(request_id: &str) -> Response {
+fn fake_upstream_model_discovery_message(request_id: &str) -> Response {
     (
         StatusCode::OK,
         [("request-id", request_id), ("x-amzn-requestid", request_id)],
         Json(json!({
             "models": [
-                fake_kiro_model("claude-sonnet-4"),
-                fake_kiro_model("claude-sonnet-4-20250514"),
-                fake_kiro_model("claude-sonnet-4.6")
+                fake_upstream_model("claude-sonnet-4"),
+                fake_upstream_model("claude-sonnet-4-20250514"),
+                fake_upstream_model("claude-sonnet-4.6")
             ],
             "nextToken": null
         })),
@@ -2102,10 +2141,10 @@ fn fake_kiro_model_discovery_message(request_id: &str) -> Response {
         .into_response()
 }
 
-fn fake_kiro_model(model_id: &str) -> Value {
+fn fake_upstream_model(model_id: &str) -> Value {
     json!({
         "modelId": model_id,
-        "modelName": format!("Kiro loadtest fixture {model_id}"),
+        "modelName": format!("Upstream loadtest fixture {model_id}"),
         "supportedInputTypes": ["TEXT", "IMAGE"],
         "tokenLimits": {
             "maxInputTokens": 1000000,
@@ -2141,7 +2180,10 @@ fn sse_response(request_id: String, events: Vec<(Duration, String)>) -> Response
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn kiro_eventstream_response(request_id: String, events: Vec<(Duration, Vec<u8>)>) -> Response {
+fn local_upstream_eventstream_response(
+    request_id: String,
+    events: Vec<(Duration, Vec<u8>)>,
+) -> Response {
     let body_stream = delayed_byte_stream(events);
     Response::builder()
         .status(StatusCode::OK)
@@ -2215,8 +2257,8 @@ fn normal_sse_events(first_delay: Duration, thinking: bool) -> Vec<(Duration, St
     events
 }
 
-fn fake_kiro_token_usage(
-    mode: FakeKiroUsageMode,
+fn fake_upstream_token_usage(
+    mode: FakeUpstreamUsageMode,
     uncached_input_tokens: u64,
     cache_read_input_tokens: u64,
     cache_write_input_tokens: u64,
@@ -2224,15 +2266,15 @@ fn fake_kiro_token_usage(
 ) -> Value {
     let (uncached_input_tokens, cache_read_input_tokens, cache_write_input_tokens, output_tokens) =
         match mode {
-            FakeKiroUsageMode::Reported
-            | FakeKiroUsageMode::MetadataThenZero
-            | FakeKiroUsageMode::Split => (
+            FakeUpstreamUsageMode::Reported
+            | FakeUpstreamUsageMode::MetadataThenZero
+            | FakeUpstreamUsageMode::Split => (
                 uncached_input_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
                 output_tokens,
             ),
-            FakeKiroUsageMode::AllZero => (0, 0, 0, 0),
+            FakeUpstreamUsageMode::AllZero => (0, 0, 0, 0),
         };
     let total_tokens = uncached_input_tokens
         .saturating_add(cache_read_input_tokens)
@@ -2248,36 +2290,36 @@ fn fake_kiro_token_usage(
     })
 }
 
-fn fake_kiro_token_usage_pair(
-    mode: FakeKiroUsageMode,
+fn fake_upstream_token_usage_pair(
+    mode: FakeUpstreamUsageMode,
     uncached_input_tokens: u64,
     cache_read_input_tokens: u64,
     cache_write_input_tokens: u64,
     output_tokens: u64,
 ) -> (Value, Value) {
     let reported = || {
-        fake_kiro_token_usage(
-            FakeKiroUsageMode::Reported,
+        fake_upstream_token_usage(
+            FakeUpstreamUsageMode::Reported,
             uncached_input_tokens,
             cache_read_input_tokens,
             cache_write_input_tokens,
             output_tokens,
         )
     };
-    let zero = || fake_kiro_token_usage(FakeKiroUsageMode::AllZero, 0, 0, 0, 0);
+    let zero = || fake_upstream_token_usage(FakeUpstreamUsageMode::AllZero, 0, 0, 0, 0);
 
     match mode {
-        FakeKiroUsageMode::Reported => {
+        FakeUpstreamUsageMode::Reported => {
             let usage = reported();
             (usage.clone(), usage)
         }
-        FakeKiroUsageMode::AllZero => {
+        FakeUpstreamUsageMode::AllZero => {
             let usage = zero();
             (usage.clone(), usage)
         }
-        FakeKiroUsageMode::MetadataThenZero => {
-            let usage = fake_kiro_token_usage(
-                FakeKiroUsageMode::Reported,
+        FakeUpstreamUsageMode::MetadataThenZero => {
+            let usage = fake_upstream_token_usage(
+                FakeUpstreamUsageMode::Reported,
                 uncached_input_tokens,
                 cache_read_input_tokens.max(2),
                 cache_write_input_tokens.max(3),
@@ -2285,7 +2327,7 @@ fn fake_kiro_token_usage_pair(
             );
             (usage, zero())
         }
-        FakeKiroUsageMode::Split => {
+        FakeUpstreamUsageMode::Split => {
             let cache_read_input_tokens = cache_read_input_tokens.max(2);
             let cache_write_input_tokens = cache_write_input_tokens.max(3);
             let total_tokens = uncached_input_tokens
@@ -2312,18 +2354,18 @@ fn fake_kiro_token_usage_pair(
     }
 }
 
-fn normal_kiro_events(
+fn normal_local_upstream_events(
     first_delay: Duration,
     thinking: bool,
-    usage_mode: FakeKiroUsageMode,
+    usage_mode: FakeUpstreamUsageMode,
 ) -> Vec<(Duration, Vec<u8>)> {
     let mut events = Vec::new();
     let (metadata_usage, message_metadata_usage) =
-        fake_kiro_token_usage_pair(usage_mode, 10, 0, 0, if thinking { 9 } else { 3 });
+        fake_upstream_token_usage_pair(usage_mode, 10, 0, 0, if thinking { 9 } else { 3 });
     if thinking {
         events.push((
             Duration::ZERO,
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "reasoningContentEvent",
                 json!({"text":"thinking through the loadtest path","signature":"fake-signature"}),
             ),
@@ -2332,11 +2374,14 @@ fn normal_kiro_events(
     events.extend([
         (
             first_delay,
-            kiro_event_frame("assistantResponseEvent", json!({"content":"fake response"})),
+            local_upstream_event_frame(
+                "assistantResponseEvent",
+                json!({"content":"fake response"}),
+            ),
         ),
         (
             Duration::ZERO,
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "metadataEvent",
                 json!({
                     "tokenUsage": metadata_usage
@@ -2345,7 +2390,7 @@ fn normal_kiro_events(
         ),
         (
             Duration::ZERO,
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "messageMetadataEvent",
                 json!({
                     "conversationId": "fake-conversation",
@@ -2400,20 +2445,20 @@ fn long_stream_sse_events(
     events
 }
 
-fn long_stream_kiro_events(
+fn long_stream_local_upstream_events(
     first_delay: Duration,
     chunks: usize,
     chunk_delay: Duration,
-    usage_mode: FakeKiroUsageMode,
+    usage_mode: FakeUpstreamUsageMode,
 ) -> Vec<(Duration, Vec<u8>)> {
     let chunks = chunks.max(1);
     let mut events = Vec::with_capacity(chunks.saturating_add(2));
     let (metadata_usage, message_metadata_usage) =
-        fake_kiro_token_usage_pair(usage_mode, 10, 0, 0, 64);
+        fake_upstream_token_usage_pair(usage_mode, 10, 0, 0, 64);
     for index in 0..chunks {
         events.push((
             if index == 0 { first_delay } else { chunk_delay },
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "assistantResponseEvent",
                 json!({"content": format!("stream chunk {index}; ")}),
             ),
@@ -2421,7 +2466,7 @@ fn long_stream_kiro_events(
     }
     events.push((
         Duration::ZERO,
-        kiro_event_frame(
+        local_upstream_event_frame(
             "metadataEvent",
             json!({
                 "tokenUsage": metadata_usage
@@ -2430,7 +2475,7 @@ fn long_stream_kiro_events(
     ));
     events.push((
         Duration::ZERO,
-        kiro_event_frame(
+        local_upstream_event_frame(
             "messageMetadataEvent",
             json!({
                 "conversationId": "fake-conversation",
@@ -2463,28 +2508,28 @@ fn thinking_sse_events(text_delay: Duration) -> Vec<(Duration, String)> {
     ]
 }
 
-fn thinking_kiro_events(
+fn thinking_local_upstream_events(
     text_delay: Duration,
-    usage_mode: FakeKiroUsageMode,
+    usage_mode: FakeUpstreamUsageMode,
 ) -> Vec<(Duration, Vec<u8>)> {
     vec![
         (
             Duration::ZERO,
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "reasoningContentEvent",
                 json!({"text":"real thinking chunk","signature":"fake-signature"}),
             ),
         ),
         (
             text_delay,
-            kiro_event_frame("assistantResponseEvent", json!({"content":"visible text"})),
+            local_upstream_event_frame("assistantResponseEvent", json!({"content":"visible text"})),
         ),
         (
             Duration::ZERO,
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "metadataEvent",
                 json!({
-                    "tokenUsage": fake_kiro_token_usage(usage_mode, 10, 0, 0, 8)
+                    "tokenUsage": fake_upstream_token_usage(usage_mode, 10, 0, 0, 8)
                 }),
             ),
         ),
@@ -2605,17 +2650,17 @@ fn fake_tool_use_input_for(name: &str, request: &Value, target_chars: usize) -> 
     tool_use_input_for(name)
 }
 
-fn tool_use_kiro_events(
+fn tool_use_local_upstream_events(
     name: String,
     request: &Value,
-    usage_mode: FakeKiroUsageMode,
+    usage_mode: FakeUpstreamUsageMode,
     target_chars: usize,
 ) -> Vec<(Duration, Vec<u8>)> {
     let input = fake_tool_use_input_for(&name, request, target_chars).to_string();
     vec![
         (
             Duration::ZERO,
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "toolUseEvent",
                 json!({
                     "name": name,
@@ -2627,10 +2672,10 @@ fn tool_use_kiro_events(
         ),
         (
             Duration::ZERO,
-            kiro_event_frame(
+            local_upstream_event_frame(
                 "metadataEvent",
                 json!({
-                    "tokenUsage": fake_kiro_token_usage(usage_mode, 10, 0, 0, 6)
+                    "tokenUsage": fake_upstream_token_usage(usage_mode, 10, 0, 0, 6)
                 }),
             ),
         ),
@@ -2693,9 +2738,9 @@ fn tool_use_sse_events(
     ]
 }
 
-fn kiro_event_frame(event_type: &str, payload: Value) -> Vec<u8> {
+fn local_upstream_event_frame(event_type: &str, payload: Value) -> Vec<u8> {
     let payload = serde_json::to_vec(&payload).expect("fake event payload serializes");
-    let headers = kiro_event_headers(event_type);
+    let headers = local_upstream_event_headers(event_type);
     let total_length = 12usize + headers.len() + payload.len() + 4usize;
     let header_length = headers.len();
 
@@ -2711,7 +2756,7 @@ fn kiro_event_frame(event_type: &str, payload: Value) -> Vec<u8> {
     frame
 }
 
-fn kiro_event_headers(event_type: &str) -> Vec<u8> {
+fn local_upstream_event_headers(event_type: &str) -> Vec<u8> {
     let mut headers = Vec::new();
     push_eventstream_string_header(&mut headers, ":message-type", "event");
     push_eventstream_string_header(&mut headers, ":event-type", event_type);
@@ -2782,7 +2827,7 @@ mod tests {
         }
     }
 
-    fn kiro_event_payload(frame: &[u8]) -> Value {
+    fn local_upstream_event_payload(frame: &[u8]) -> Value {
         let header_length = u32::from_be_bytes(
             frame[4..8]
                 .try_into()
@@ -2793,29 +2838,64 @@ mod tests {
     }
 
     #[test]
-    fn fake_kiro_usage_cli_accepts_all_modes() {
-        let default_args = Args::try_parse_from(["kiro_loadtest"]).expect("parse default args");
-        assert_eq!(default_args.fake_kiro_usage, FakeKiroUsageMode::Reported);
-
-        let zero_args = Args::try_parse_from(["kiro_loadtest", "--fake-kiro-usage", "all-zero"])
-            .expect("parse all-zero fake usage mode");
-        assert_eq!(zero_args.fake_kiro_usage, FakeKiroUsageMode::AllZero);
-
-        let later_zero_args =
-            Args::try_parse_from(["kiro_loadtest", "--fake-kiro-usage", "metadata-then-zero"])
-                .expect("parse metadata-then-zero fake usage mode");
+    fn fake_upstream_usage_cli_accepts_all_modes_and_legacy_alias() {
+        let default_args =
+            Args::try_parse_from(["account_runtime_loadtest"]).expect("parse default args");
         assert_eq!(
-            later_zero_args.fake_kiro_usage,
-            FakeKiroUsageMode::MetadataThenZero
+            default_args.fake_upstream_usage,
+            FakeUpstreamUsageMode::Reported
         );
 
-        let split_args = Args::try_parse_from(["kiro_loadtest", "--fake-kiro-usage", "split"])
-            .expect("parse split fake usage mode");
-        assert_eq!(split_args.fake_kiro_usage, FakeKiroUsageMode::Split);
+        let zero_args = Args::try_parse_from([
+            "account_runtime_loadtest",
+            "--fake-upstream-usage",
+            "all-zero",
+        ])
+        .expect("parse all-zero fake usage mode");
+        assert_eq!(
+            zero_args.fake_upstream_usage,
+            FakeUpstreamUsageMode::AllZero
+        );
+
+        let later_zero_args = Args::try_parse_from([
+            "account_runtime_loadtest",
+            "--fake-upstream-usage",
+            "metadata-then-zero",
+        ])
+        .expect("parse metadata-then-zero fake usage mode");
+        assert_eq!(
+            later_zero_args.fake_upstream_usage,
+            FakeUpstreamUsageMode::MetadataThenZero
+        );
+
+        let split_args =
+            Args::try_parse_from(["account_runtime_loadtest", "--fake-upstream-usage", "split"])
+                .expect("parse split fake usage mode");
+        assert_eq!(split_args.fake_upstream_usage, FakeUpstreamUsageMode::Split);
+
+        let legacy_args =
+            Args::try_parse_from(["account_runtime_loadtest", "--fake-kiro-usage", "reported"])
+                .expect("parse legacy fake usage mode alias");
+        assert_eq!(
+            legacy_args.fake_upstream_usage,
+            FakeUpstreamUsageMode::Reported
+        );
     }
 
     #[test]
-    fn fake_kiro_server_detects_cli_eventstream_by_accept_and_target() {
+    fn fake_server_detects_local_upstream_eventstream_by_accept_and_target() {
+        let new_flag_args = Args::try_parse_from([
+            "account_runtime_loadtest",
+            "--fake-local-upstream-eventstream",
+        ])
+        .expect("parse local-upstream eventstream flag");
+        assert!(new_flag_args.fake_local_upstream_eventstream);
+
+        let legacy_flag_args =
+            Args::try_parse_from(["account_runtime_loadtest", "--fake-kiro-eventstream"])
+                .expect("parse legacy eventstream flag alias");
+        assert!(legacy_flag_args.fake_local_upstream_eventstream);
+
         let mut headers = HeaderMap::new();
         headers.insert(
             header::ACCEPT,
@@ -2831,8 +2911,8 @@ mod tests {
             stream_chunks: 1,
             stream_chunk_delay: Duration::ZERO,
             fake_tool_input_chars: 0,
-            kiro_eventstream: true,
-            kiro_usage: FakeKiroUsageMode::Reported,
+            local_upstream_eventstream: true,
+            upstream_usage: FakeUpstreamUsageMode::Reported,
             capture_dir: None,
         };
         let uri: Uri = "/fixture/".parse().unwrap();
@@ -2844,12 +2924,16 @@ mod tests {
                 .unwrap(),
         );
 
-        assert!(wants_kiro_eventstream(&state, &uri, &target_headers));
+        assert!(wants_local_upstream_eventstream(
+            &state,
+            &uri,
+            &target_headers
+        ));
     }
 
     #[test]
-    fn fake_kiro_server_detects_model_discovery_and_reports_reasoning_schema() {
-        let cli_uri: Uri = "/fixture/?origin=KIRO_CLI".parse().unwrap();
+    fn fake_server_detects_model_discovery_and_reports_reasoning_schema() {
+        let cli_uri: Uri = "/fixture/?origin=LOCAL_UPSTREAM_CLI".parse().unwrap();
         let mut cli_headers = HeaderMap::new();
         cli_headers.insert(
             "x-amz-target",
@@ -2857,14 +2941,20 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        assert!(is_kiro_model_discovery_request(&cli_uri, &cli_headers));
+        assert!(is_local_upstream_model_discovery_request(
+            &cli_uri,
+            &cli_headers
+        ));
 
         let ide_uri: Uri = "/fixture/ListAvailableModels?origin=AI_EDITOR"
             .parse()
             .unwrap();
-        assert!(is_kiro_model_discovery_request(&ide_uri, &HeaderMap::new()));
+        assert!(is_local_upstream_model_discovery_request(
+            &ide_uri,
+            &HeaderMap::new()
+        ));
 
-        let model = fake_kiro_model("claude-sonnet-4.6");
+        let model = fake_upstream_model("claude-sonnet-4.6");
         assert_eq!(model["modelId"], "claude-sonnet-4.6");
         assert_eq!(
             model["additionalModelRequestFieldsSchema"]["properties"]["output_config"]["properties"]
@@ -2892,11 +2982,12 @@ mod tests {
 
     #[test]
     fn all_zero_usage_mode_zeroes_metadata_and_message_metadata() {
-        let events = normal_kiro_events(Duration::ZERO, false, FakeKiroUsageMode::AllZero);
+        let events =
+            normal_local_upstream_events(Duration::ZERO, false, FakeUpstreamUsageMode::AllZero);
         assert_eq!(events.len(), 3);
 
-        let metadata = kiro_event_payload(&events[1].1);
-        let message_metadata = kiro_event_payload(&events[2].1);
+        let metadata = local_upstream_event_payload(&events[1].1);
+        let message_metadata = local_upstream_event_payload(&events[2].1);
         let zero_usage = json!({
             "uncachedInputTokens": 0,
             "cacheReadInputTokens": 0,
@@ -2916,7 +3007,7 @@ mod tests {
     #[test]
     fn reported_usage_mode_preserves_counts() {
         assert_eq!(
-            fake_kiro_token_usage(FakeKiroUsageMode::Reported, 10, 2, 3, 4),
+            fake_upstream_token_usage(FakeUpstreamUsageMode::Reported, 10, 2, 3, 4),
             json!({
                 "uncachedInputTokens": 10,
                 "cacheReadInputTokens": 2,
@@ -2929,9 +3020,13 @@ mod tests {
 
     #[test]
     fn metadata_then_zero_mode_emits_later_zero_usage() {
-        let events = normal_kiro_events(Duration::ZERO, false, FakeKiroUsageMode::MetadataThenZero);
-        let metadata = kiro_event_payload(&events[1].1);
-        let message_metadata = kiro_event_payload(&events[2].1);
+        let events = normal_local_upstream_events(
+            Duration::ZERO,
+            false,
+            FakeUpstreamUsageMode::MetadataThenZero,
+        );
+        let metadata = local_upstream_event_payload(&events[1].1);
+        let message_metadata = local_upstream_event_payload(&events[2].1);
 
         assert_eq!(metadata["tokenUsage"]["uncachedInputTokens"], 10);
         assert_eq!(metadata["tokenUsage"]["cacheReadInputTokens"], 2);
@@ -2942,9 +3037,10 @@ mod tests {
 
     #[test]
     fn split_mode_distributes_usage_across_metadata_events() {
-        let events = normal_kiro_events(Duration::ZERO, false, FakeKiroUsageMode::Split);
-        let metadata = kiro_event_payload(&events[1].1);
-        let message_metadata = kiro_event_payload(&events[2].1);
+        let events =
+            normal_local_upstream_events(Duration::ZERO, false, FakeUpstreamUsageMode::Split);
+        let metadata = local_upstream_event_payload(&events[1].1);
+        let message_metadata = local_upstream_event_payload(&events[2].1);
 
         assert_eq!(metadata["tokenUsage"]["uncachedInputTokens"], 10);
         assert_eq!(metadata["tokenUsage"]["cacheReadInputTokens"], 2);
@@ -2968,7 +3064,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_server_detects_kiro_history_thinking_tags() {
+    fn fake_server_detects_local_upstream_history_thinking_tags() {
         let request = json!({
             "conversationState": {
                 "history": [{
@@ -2983,7 +3079,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_server_detects_native_kiro_reasoning_fields() {
+    fn fake_server_detects_native_upstream_reasoning_fields() {
         let output_config_request = json!({
             "additionalModelRequestFields": {
                 "output_config": {
@@ -3183,8 +3279,8 @@ mod tests {
                     "userInputMessage": {
                         "userInputMessageContext": {
                             "tools": [
-                                {"toolSpecification": {"name": "mcp__kiro-local-test__fail"}},
-                                {"toolSpecification": {"name": "mcp__kiro-local-test__ping"}}
+                                {"toolSpecification": {"name": "mcp__local-upstream-test__fail"}},
+                                {"toolSpecification": {"name": "mcp__local-upstream-test__ping"}}
                             ]
                         }
                     }
@@ -3194,7 +3290,7 @@ mod tests {
 
         assert_eq!(
             select_fake_tool_name(&request),
-            "mcp__kiro-local-test__ping"
+            "mcp__local-upstream-test__ping"
         );
     }
 
@@ -3206,8 +3302,8 @@ mod tests {
                     "userInputMessage": {
                         "userInputMessageContext": {
                             "tools": [
-                                {"toolSpecification": {"name": "mcpKiroLocalTestFailHash29c36f63"}},
-                                {"toolSpecification": {"name": "mcpKiroLocalTestPingHash62ce4ea1"}}
+                                {"toolSpecification": {"name": "mcpLocalUpstreamTestFailHash29c36f63"}},
+                                {"toolSpecification": {"name": "mcpLocalUpstreamTestPingHash62ce4ea1"}}
                             ]
                         }
                     }
@@ -3217,17 +3313,30 @@ mod tests {
 
         assert_eq!(
             select_fake_tool_name(&request),
-            "mcpKiroLocalTestPingHash62ce4ea1"
+            "mcpLocalUpstreamTestPingHash62ce4ea1"
         );
     }
 
     #[test]
-    fn real_upstream_guard_requires_env() {
+    fn real_upstream_guard_accepts_primary_env_and_legacy_alias() {
         unsafe {
-            std::env::remove_var("KIRO_LOADTEST_ALLOW_REAL_UPSTREAM");
+            std::env::remove_var(REAL_UPSTREAM_ALLOW_ENV);
+            std::env::remove_var(LEGACY_REAL_UPSTREAM_ALLOW_ENV);
         }
         assert!(ensure_real_upstream_guard(true).is_err());
         assert!(ensure_real_upstream_guard(false).is_ok());
+        unsafe {
+            std::env::set_var(REAL_UPSTREAM_ALLOW_ENV, "1");
+        }
+        assert!(ensure_real_upstream_guard(true).is_ok());
+        unsafe {
+            std::env::remove_var(REAL_UPSTREAM_ALLOW_ENV);
+            std::env::set_var(LEGACY_REAL_UPSTREAM_ALLOW_ENV, "1");
+        }
+        assert!(ensure_real_upstream_guard(true).is_ok());
+        unsafe {
+            std::env::remove_var(LEGACY_REAL_UPSTREAM_ALLOW_ENV);
+        }
     }
 
     #[test]

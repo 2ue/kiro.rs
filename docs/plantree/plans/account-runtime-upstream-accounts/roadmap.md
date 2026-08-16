@@ -153,6 +153,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
 - Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
 - Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving the generic tier parsing behavior.
+- The load/chaos helper now presents account-runtime/upstream wording for command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and tests while keeping old Kiro-named CLI/env/header inputs only as compatibility aliases/fallbacks.
 
 ## In Progress
 
