@@ -33,11 +33,11 @@ pub(crate) mod dispatch {
 }
 
 pub(crate) mod endpoint {
+    pub(crate) use crate::kiro::endpoint::IdeEndpoint as LocalUpstreamIdeEndpoint;
     pub(crate) use crate::kiro::endpoint::KiroEndpoint as LocalUpstreamEndpointTrait;
     pub(crate) use crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
     pub(crate) type LocalUpstreamCliEndpoint = crate::kiro::endpoint::CliEndpoint;
     pub(crate) type LocalUpstreamEndpoint = dyn LocalUpstreamEndpointTrait;
-    pub(crate) type LocalUpstreamIdeEndpoint = crate::kiro::endpoint::IdeEndpoint;
 }
 
 pub(crate) mod provider {
@@ -141,6 +141,8 @@ pub(crate) mod request {
 }
 
 pub(crate) mod stream {
+    #[cfg(test)]
+    pub(crate) use crate::kiro::parser::crc::crc32 as local_upstream_eventstream_crc32;
     pub(crate) type LocalUpstreamEventStreamDecoder =
         crate::kiro::parser::decoder::EventStreamDecoder;
 }

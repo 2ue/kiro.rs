@@ -1,10 +1,11 @@
 use super::*;
 use crate::anthropic::types::{Message, Metadata, OutputConfig, SystemMessage, Thinking};
 use crate::anthropic::usage::UsageRecordQuery;
-use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
-use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::{AcquireMode, MultiTokenManager};
+use crate::local_upstream::credentials::LocalUpstreamCredentials;
+use crate::local_upstream::dispatch::LocalUpstreamAcquireMode;
+use crate::local_upstream::endpoint::{LocalUpstreamEndpoint, LocalUpstreamIdeEndpoint};
+use crate::local_upstream::manager::LocalUpstreamCredentialManager;
+use crate::local_upstream::provider::LocalUpstreamProvider;
 use crate::model::config::Config;
 use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
 
@@ -1931,13 +1932,16 @@ async fn unused_loopback_base_url() -> String {
     format!("http://{address}")
 }
 
-fn auxiliary_fallback_local_provider(base_url: &str, expired_for_refresh: bool) -> KiroProvider {
+fn auxiliary_fallback_local_provider(
+    base_url: &str,
+    expired_for_refresh: bool,
+) -> LocalUpstreamProvider {
     let mut config = Config::default();
     config.local_upstream_base_url = Some(base_url.to_string());
     config.local_upstream_response_timeout_secs = 2;
     config.credential_retry_max_attempts = 1;
     config.credential_prompt_logic_retry_enabled = false;
-    let credentials = KiroCredentials {
+    let credentials = LocalUpstreamCredentials {
         id: Some(1),
         access_token: Some("fake-local-access-token".to_string()),
         refresh_token: Some(format!("refresh-{}", "x".repeat(256))),
@@ -1955,12 +1959,12 @@ fn auxiliary_fallback_local_provider(base_url: &str, expired_for_refresh: bool) 
         ..Default::default()
     };
     let manager = Arc::new(
-        MultiTokenManager::new(config, vec![credentials], None, None, false)
+        LocalUpstreamCredentialManager::new(config, vec![credentials], None, None, false)
             .expect("construct auxiliary fallback local manager"),
     );
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-    KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string())
+    let mut endpoints: HashMap<String, Arc<LocalUpstreamEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(LocalUpstreamIdeEndpoint));
+    LocalUpstreamProvider::with_proxy(manager, None, endpoints, "ide".to_string())
 }
 
 async fn assert_external_bounded_body_recovery(
@@ -11067,7 +11071,7 @@ async fn external_fallback_usage_matches_real_refresh_profile_and_inference_hits
                 .call_api_with_context_with_request_id_and_attempt_budget_max_sends(
                     &local_request,
                     Some(&format!("req_local_{case}_{round}")),
-                    AcquireMode::FailFastOnCapacity,
+                    LocalUpstreamAcquireMode::FailFastOnCapacity,
                     1,
                     Some("claude-sonnet-4"),
                     budget.clone(),

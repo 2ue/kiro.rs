@@ -192,9 +192,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
 - Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving the generic tier parsing behavior.
 - The load/chaos helper now presents account-runtime/upstream wording for its command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and test names. New flags use `--fake-upstream-usage` and `--fake-local-upstream-eventstream`; old Kiro-named flags, env and error-header inputs remain only as compatibility aliases/fallbacks.
+- Anthropic handler and external-pool test helpers now construct local upstream credentials, endpoints, managers, provider fixtures and EventStream CRC frames through the `local_upstream` facade instead of importing legacy local-provider modules directly.
 
 Last verified on 2026-08-16:
 
+- `rg -n "crate::kiro|kiro::|KiroCredentials|KiroProvider|MultiTokenManager|KiroEndpoint|IdeEndpoint|AcquireMode" src/anthropic/handlers/tests.rs src/external_pool/tests.rs`
+- `feature/tests/run-cargo-scoped.sh facade-test-imports-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh facade-test-imports-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh facade-test-imports-test2 -- bash -lc 'cargo test local_acquire_mode_is_clamped_to_shared_request_deadline -- --nocapture && cargo test persisted_external_pool_enum_parsers_reject_unknown_values_for_five_rounds -- --nocapture'`
+- `git diff --check`
 - `rg -n "Kiro|kiro|KIRO|fake_kiro|FakeKiro|normal_kiro|kiro_loadtest|kiro_event|mcpKiro" src/bin/kiro_loadtest.rs`
 - `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-check1 -- cargo check --bin kiro_loadtest`

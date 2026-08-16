@@ -18,16 +18,17 @@ use crate::external_pool::{
     ExternalPoolManager, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
     ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
 };
-use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
-use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
 use crate::local_upstream::call_trace::{
     AccountRejectReason, LocalUpstreamCallError, SelectionFailureStage, SelectionFailureSummary,
 };
+use crate::local_upstream::credentials::LocalUpstreamCredentials;
+use crate::local_upstream::endpoint::{LocalUpstreamEndpoint, LocalUpstreamIdeEndpoint};
 use crate::local_upstream::event::{
     LocalUpstreamAssistantResponseEvent, LocalUpstreamContextUsageEvent,
     LocalUpstreamMessageMetadataEvent, LocalUpstreamMetadataEvent, LocalUpstreamMetadataTokenUsage,
 };
+use crate::local_upstream::manager::LocalUpstreamCredentialManager;
+use crate::local_upstream::stream::local_upstream_eventstream_crc32;
 use crate::model::config::{
     CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch, CacheSimulationPolicyPatch,
     PromptCacheCreationControlConfig, PromptSteeringRouteMode, PromptSteeringScope,
@@ -67,11 +68,11 @@ fn eventstream_test_frame(event_type: &str, payload: serde_json::Value) -> Vec<u
     let mut frame = Vec::with_capacity(total_length);
     frame.extend_from_slice(&(total_length as u32).to_be_bytes());
     frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-    let prelude_crc = crate::kiro::parser::crc::crc32(&frame[..8]);
+    let prelude_crc = local_upstream_eventstream_crc32(&frame[..8]);
     frame.extend_from_slice(&prelude_crc.to_be_bytes());
     frame.extend_from_slice(&headers);
     frame.extend_from_slice(&payload);
-    let message_crc = crate::kiro::parser::crc::crc32(&frame);
+    let message_crc = local_upstream_eventstream_crc32(&frame);
     frame.extend_from_slice(&message_crc.to_be_bytes());
     frame
 }
@@ -623,7 +624,7 @@ async fn multimodal_handler_upstream(
 }
 
 fn multimodal_handler_test_provider(config: Config) -> Arc<LocalUpstreamProvider> {
-    let credentials = vec![KiroCredentials {
+    let credentials = vec![LocalUpstreamCredentials {
         id: Some(1),
         access_token: Some("multimodal-handler-test-token".to_string()),
         profile_arn: Some(
@@ -635,11 +636,11 @@ fn multimodal_handler_test_provider(config: Config) -> Arc<LocalUpstreamProvider
         ..Default::default()
     }];
     let manager = Arc::new(
-        MultiTokenManager::new(config, credentials, None, None, false)
+        LocalUpstreamCredentialManager::new(config, credentials, None, None, false)
             .expect("build multimodal handler token manager"),
     );
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    let mut endpoints: HashMap<String, Arc<LocalUpstreamEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(LocalUpstreamIdeEndpoint));
     Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
@@ -862,7 +863,7 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
     config.credential_cooldown_jitter_percent = 0;
     config.credential_max_cooldown_secs = 0;
     let credentials = (1..=80)
-        .map(|id| KiroCredentials {
+        .map(|id| LocalUpstreamCredentials {
             id: Some(id),
             access_token: Some(format!("websearch-handler-test-token-{id}")),
             profile_arn: Some(
@@ -875,11 +876,11 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
         })
         .collect();
     let manager = Arc::new(
-        MultiTokenManager::new(config.clone(), credentials, None, None, false)
+        LocalUpstreamCredentialManager::new(config.clone(), credentials, None, None, false)
             .expect("build WebSearch handler token manager"),
     );
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    let mut endpoints: HashMap<String, Arc<LocalUpstreamEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(LocalUpstreamIdeEndpoint));
     let provider = Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
@@ -972,11 +973,11 @@ async fn test_external_pool_manager_for_handlers(
 }
 
 fn websearch_handler_test_router_with_external(
-    kiro_base_url: &str,
+    local_upstream_base_url: &str,
     external_pool_manager: Arc<ExternalPoolManager>,
 ) -> (Router, Arc<UsageRecorder>) {
     websearch_handler_test_router_with_external_options(
-        kiro_base_url,
+        local_upstream_base_url,
         external_pool_manager,
         Vec::new(),
         true,
@@ -985,14 +986,14 @@ fn websearch_handler_test_router_with_external(
 }
 
 fn websearch_handler_test_router_with_external_options(
-    kiro_base_url: &str,
+    local_upstream_base_url: &str,
     external_pool_manager: Arc<ExternalPoolManager>,
-    credentials: Vec<KiroCredentials>,
+    credentials: Vec<LocalUpstreamCredentials>,
     local_pool_preflight_enabled: bool,
     external_direct_policy_enabled: bool,
 ) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
-    config.local_upstream_base_url = Some(kiro_base_url.to_string());
+    config.local_upstream_base_url = Some(local_upstream_base_url.to_string());
     config.local_upstream_response_timeout_secs = 1;
     config.credential_retry_max_attempts = 0;
     {
@@ -1013,11 +1014,11 @@ fn websearch_handler_test_router_with_external_options(
     }
 
     let manager = Arc::new(
-        MultiTokenManager::new(config.clone(), credentials, None, None, false)
+        LocalUpstreamCredentialManager::new(config.clone(), credentials, None, None, false)
             .expect("build WebSearch account fallback token manager"),
     );
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    let mut endpoints: HashMap<String, Arc<LocalUpstreamEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(LocalUpstreamIdeEndpoint));
     let provider = Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
@@ -3533,7 +3534,7 @@ fn handler_eventstream_fault_router_with_limits(
     config.credential_retry_max_attempts = credential_retry_max_attempts;
     config.inference_upstream_max_attempts = 4;
     let credentials = (1..=credential_count)
-        .map(|id| KiroCredentials {
+        .map(|id| LocalUpstreamCredentials {
             id: Some(id),
             access_token: Some(format!("handler-eventstream-fault-token-{id}")),
             profile_arn: Some(format!(
@@ -3546,11 +3547,11 @@ fn handler_eventstream_fault_router_with_limits(
         })
         .collect();
     let manager = Arc::new(
-        MultiTokenManager::new(config.clone(), credentials, None, None, false)
+        LocalUpstreamCredentialManager::new(config.clone(), credentials, None, None, false)
             .expect("build EventStream fault token manager"),
     );
-    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-    endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+    let mut endpoints: HashMap<String, Arc<LocalUpstreamEndpoint>> = HashMap::new();
+    endpoints.insert("ide".to_string(), Arc::new(LocalUpstreamIdeEndpoint));
     let provider = Arc::new(LocalUpstreamProvider::with_proxy(
         manager,
         None,
