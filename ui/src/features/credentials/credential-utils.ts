@@ -30,14 +30,7 @@ export function subscriptionBadgeMeta(
   balance?: BalanceResponse
 ): { label: string; tone: BadgeTone; title?: string } {
   const raw = balance?.subscriptionTitle || cred.accountInfo?.subscriptionTitle || cred.subscriptionTitle || ''
-  if (!raw) return { label: '未知套餐', tone: 'secondary' }
-  const normalized = raw.toLowerCase().replace(/[_\s-]+/g, ' ')
-  if (normalized.includes('power')) return { label: 'Power', tone: 'primary', title: raw }
-  if (normalized.includes('pro max')) return { label: 'Pro Max', tone: 'primary', title: raw }
-  if (normalized.includes('pro plus') || normalized.includes('pro+')) return { label: 'Pro+', tone: 'primary', title: raw }
-  if (normalized.includes('pro')) return { label: 'Pro', tone: 'primary', title: raw }
-  if (normalized.includes('free')) return { label: 'Free', tone: 'secondary', title: raw }
-  if (normalized.includes('trial') || normalized.includes('试用')) return { label: 'Trial', tone: 'info', title: raw }
+  if (!raw) return { label: '未知订阅', tone: 'secondary' }
   return { label: raw.length > 12 ? raw.slice(0, 12) + '…' : raw, tone: 'neutral', title: raw }
 }
 
@@ -50,7 +43,6 @@ export function endpointLabel(endpoint?: string | null): string {
   if (lower === 'ide') return 'IDE'
   if (lower === 'idc') return 'IDC'
   if (lower === 'api_key') return 'API Key'
-  if (lower.includes('power')) return 'Power'
   return v.replace(/_/g, ' ').toUpperCase().slice(0, 10)
 }
 

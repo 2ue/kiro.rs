@@ -152,7 +152,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
 - Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
 - Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
-- Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving the generic tier parsing behavior.
+- Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving generic label parsing behavior.
 - The load/chaos helper now presents account-runtime/upstream wording for command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and tests while keeping old Kiro-named CLI/env/header inputs only as compatibility aliases/fallbacks.
 - Anthropic handler and external-pool test helpers now construct local upstream credential, endpoint, manager, provider and EventStream CRC fixtures through the `local_upstream` facade instead of importing legacy local-provider modules directly.
 - Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
@@ -180,7 +180,8 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream available-model catalog, available-model item, model-capability cohort and token-limit/prompt-cache helper types now use `LocalUpstream*` names while preserving ListAvailableModels parsing and reasoning cohort checks.
 - Local-upstream credential type, API-key endpoint constant and API-key parsing helpers now use local-upstream names while preserving legacy credential wire/storage field compatibility.
 - Opus/model dispatch no longer derives account capability from legacy subscription labels. Subscription labels remain account-info metadata only; scheduler tests now use explicit `supported_models` capability fixtures.
-- Admin account-info credit snapshots no longer derive base/bonus or validation ordering from legacy subscription tiers. Subscription titles are now unordered labels for display/filtering, while credit values come from usage or persisted fields.
+- Admin account-info credit snapshots no longer derive base/bonus or validation ordering from built-in subscription labels. Subscription titles are now unordered labels for display/filtering, while credit values come from usage or persisted fields.
+- Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. They display upstream subscription titles as unordered metadata, and model-capability cohort tests now use neutral account cohort fixtures.
 
 ## In Progress
 

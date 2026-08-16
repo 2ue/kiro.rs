@@ -1387,12 +1387,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
               value={subscriptionFilter}
               onChange={event => setSubscriptionFilter(event.target.value)}
             >
-              <option value="all">全部订阅</option>
-              <option value="pro_plus">Pro+</option>
-              <option value="pro">Pro</option>
-              <option value="trial">试用</option>
-              <option value="free">Free</option>
-              <option value="unknown">未知</option>
+              <option value="all">全部订阅标签</option>
+              <option value="unknown">未知订阅</option>
             </select>
             <select
               className="h-10 rounded-md border bg-background px-3 text-sm"

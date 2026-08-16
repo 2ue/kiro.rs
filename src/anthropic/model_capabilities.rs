@@ -1945,7 +1945,7 @@ mod tests {
     #[test]
     fn catalog_reasoning_state_is_authoritative_and_cohort_fenced_for_five_rounds() {
         for round in 0..5 {
-            let key = capability_cohort_key("pro");
+            let key = capability_cohort_key("cohort-alpha");
             let catalog = ModelCapabilitiesCatalog::new();
             catalog.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
                 models: vec![LocalUpstreamAvailableModel {
@@ -1972,7 +1972,7 @@ mod tests {
             assert_eq!(
                 catalog.reasoning_capability_state_for(
                     "claude-cohort-state",
-                    &[key.clone(), capability_cohort_key("free")]
+                    &[key.clone(), capability_cohort_key("cohort-beta")]
                 ),
                 UpstreamReasoningCapabilityState::Unknown,
                 "round {round}: a new capability cohort invalidates the old contract"
@@ -2083,8 +2083,10 @@ mod tests {
     #[test]
     fn persisted_reasoning_contract_accepts_only_exact_or_current_subset_for_five_rounds() {
         for round in 0..5 {
-            let mut verified_keys =
-                vec![capability_cohort_key("pro"), capability_cohort_key("free")];
+            let mut verified_keys = vec![
+                capability_cohort_key("cohort-alpha"),
+                capability_cohort_key("cohort-beta"),
+            ];
             verified_keys.sort();
             let source = ModelCapabilitiesCatalog::new();
             source.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
@@ -2115,7 +2117,7 @@ mod tests {
                 UpstreamReasoningCapabilityState::Supported(_)
             ));
 
-            let current_subset = vec![capability_cohort_key("pro")];
+            let current_subset = vec![capability_cohort_key("cohort-alpha")];
             assert_eq!(
                 restored.reasoning_capability_cohort_contract_match(&current_subset),
                 UpstreamReasoningCohortContractMatch::ConservativeSubset,
@@ -2127,7 +2129,7 @@ mod tests {
             ));
 
             let mut current_with_addition = verified_keys.clone();
-            current_with_addition.push(capability_cohort_key("enterprise"));
+            current_with_addition.push(capability_cohort_key("cohort-gamma"));
             current_with_addition.sort();
             assert_eq!(
                 restored.reasoning_capability_cohort_contract_match(&current_with_addition),
@@ -2177,7 +2179,7 @@ mod tests {
     #[test]
     fn persisted_reasoning_cohort_survives_restart_and_old_rows_fail_closed_five_rounds() {
         for round in 0..5 {
-            let key = capability_cohort_key("pro");
+            let key = capability_cohort_key("cohort-alpha");
             let source = ModelCapabilitiesCatalog::new();
             source.sync_from_upstream_catalog(LocalUpstreamAvailableModelCatalog {
                 models: vec![LocalUpstreamAvailableModel {

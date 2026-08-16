@@ -190,7 +190,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
 - Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
 - Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
-- Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving the generic tier parsing behavior.
+- Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving generic label parsing behavior.
 - The load/chaos helper now presents account-runtime/upstream wording for its command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and test names. New flags use `--fake-upstream-usage` and `--fake-local-upstream-eventstream`; old Kiro-named flags, env and error-header inputs remain only as compatibility aliases/fallbacks.
 - Anthropic handler and external-pool test helpers now construct local upstream credentials, endpoints, managers, provider fixtures and EventStream CRC frames through the `local_upstream` facade instead of importing legacy local-provider modules directly.
 - Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording. New mock/doc variables use `ACCOUNT_RUNTIME_*` names while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
@@ -218,14 +218,23 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-upstream available-model catalog types now use `LocalUpstreamAvailableModelCatalog`, `LocalUpstreamAvailableModel`, `LocalUpstreamAvailableModelsResponse`, `LocalUpstreamModelCapabilityCohortKey`, `LocalUpstreamModelCapabilityCohort`, `LocalUpstreamModelTokenLimits` and `LocalUpstreamModelPromptCaching`; ListAvailableModels wire parsing and reasoning cohort behavior are unchanged.
 - Local-upstream credential types now use `LocalUpstreamCredentials`, `LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT` and local-upstream API-key parsing helper names. Compatibility fields such as `kiroApiKey` / `kiro_api_key` remain unchanged.
 - Scheduler model eligibility no longer derives Opus capability from legacy subscription labels. Subscription labels are retained only as account-info metadata; dispatch uses explicit `supported_models` capability data.
-- Admin account-info credit snapshots no longer use built-in subscription tier tables or legacy rank parsing. Credit base/bonus now comes from upstream usage fields or persisted credit fields, and validation grouping treats subscription titles as unordered labels.
+- Admin account-info credit snapshots no longer use built-in subscription label tables or legacy rank parsing. Credit base/bonus now comes from upstream usage fields or persisted credit fields, and validation grouping treats subscription titles as unordered labels.
+- Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. Subscription title display now uses the upstream title directly as unordered metadata, and model-capability cohort tests use neutral account cohort fixtures.
 
 Last verified on 2026-08-16:
 
-- `rg -n "CredentialCreditTier|credential_credit_tier|credential_credit_base|has_overage_credit_from_usage_limit|subscription_rank|credit_snapshot_for_subscription|UPSTREAM F[R]EE|Upstream P[R]o|K[I]RO P[R]O|K[I]RO F[R]EE|\bF[r]ee\b|\bP[r]o\b|\bp[r]o_plus\b|\bp[r]o_max\b|\bf[r]ee\b|\bp[r]o\b|升级|掉级" src/admin src/storage/postgres.rs ui/src/features/validation admin-ui/src/components/account-validation-panel.tsx --glob '!target/**'`
+- Residual scan for old built-in subscription label names in maintained credential UI, model-capability tests and active plan files returned no target-scope matches.
+- `rg -n "credential_credit_tier|credential_credit_base|has_overage_credit_from_usage_limit|subscription_rank|credit_snapshot_for_subscription|升级|掉级" src/admin src/storage/postgres.rs ui/src/features/validation admin-ui/src/components/account-validation-panel.tsx --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh account-labels-no-builtins-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-labels-no-builtins-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-labels-no-builtins-test1 -- bash -lc 'cargo test credit_snapshot_uses_upstream_usage_values_without_subscription_label_inference -- --nocapture && cargo test subscription_key_and_change_are_label_based_without_ordering -- --nocapture && cargo test persisted_credit_snapshot_uses_usage_limit_and_stored_bonus_without_title_inference -- --nocapture && cargo test catalog_reasoning_state_is_authoritative_and_cohort_fenced_for_five_rounds -- --nocapture && cargo test persisted_reasoning_contract_accepts_only_exact_or_current_subset_for_five_rounds -- --nocapture && cargo test persisted_reasoning_cohort_survives_restart_and_old_rows_fail_closed_five_rounds -- --nocapture'`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
+- `rg -n "CredentialCreditTier|credential_credit_tier|credential_credit_base|has_overage_credit_from_usage_limit|subscription_rank|credit_snapshot_for_subscription|升级|掉级" src/admin src/storage/postgres.rs ui/src/features/validation admin-ui/src/components/account-validation-panel.tsx --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh admin-subscription-labels-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh admin-subscription-labels-check1 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh admin-subscription-labels-test2 -- bash -lc 'cargo test credit_snapshot_uses_upstream_usage_values_without_subscription_tiers -- --nocapture && cargo test subscription_key_and_change_are_label_based_without_tier_rank -- --nocapture && cargo test persisted_credit_snapshot_uses_usage_limit_and_stored_bonus_without_title_inference -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh admin-subscription-labels-test2 -- bash -lc 'cargo test credit_snapshot_uses_upstream_usage_values_without_subscription_label_inference -- --nocapture && cargo test subscription_key_and_change_are_label_based_without_ordering -- --nocapture && cargo test persisted_credit_snapshot_uses_usage_limit_and_stored_bonus_without_title_inference -- --nocapture'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "\bKiroCredentials\b|\bKIRO_API_KEY_DEFAULT_ENDPOINT\b|\bsplit_kiro_api_key_and_region\b|\bvalidate_kiro_api_key_pipe_format\b|\blooks_like_kiro_api_key_text\b|\bvalidate_kiro_region_host_label\b" src --glob '!target/**'`
@@ -323,7 +332,7 @@ Last verified on 2026-08-16:
 - `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-check1 -- cargo check --bin kiro_loadtest`
 - `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-test1 -- cargo test --bin kiro_loadtest -- --nocapture`
 - `git diff --check`
-- `rg -n "Kiro P[r]o|Kiro Power|K[I]RO F[R]EE|K[I]RO P[R]O|Kiro P[r]o\\+|Kiro P[r]o Max" src/admin/service_tests.rs src/storage/postgres.rs`
+- `rg -n "built-in subscription label|subscription_rank|credit_snapshot_for_subscription" src/admin/service_tests.rs src/storage/postgres.rs`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-test1 -- bash -lc 'cargo test subscription_ -- --nocapture && cargo test credit_snapshot -- --nocapture && cargo test account_info -- --nocapture'`
 - `git diff --check`

@@ -232,7 +232,7 @@ fn credential_admin_list_options_include_account_info_snapshot() {
 }
 
 #[test]
-fn credit_snapshot_uses_upstream_usage_values_without_subscription_tiers() {
+fn credit_snapshot_uses_upstream_usage_values_without_subscription_label_inference() {
     let without_bonus = credit_snapshot_for_account_usage(34.52, 50.0, 0.0);
     assert_eq!(without_bonus.limit, 50.0);
     assert!((without_bonus.remaining - 15.48).abs() < 1e-9);
@@ -253,7 +253,7 @@ fn credit_snapshot_uses_upstream_usage_values_without_subscription_tiers() {
 }
 
 #[test]
-fn subscription_key_and_change_are_label_based_without_tier_rank() {
+fn subscription_key_and_change_are_label_based_without_ordering() {
     assert_eq!(
         subscription_key(Some("Plan Alpha")),
         "subscription_label_plan_alpha"

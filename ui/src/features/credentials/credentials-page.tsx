@@ -940,14 +940,8 @@ export function CredentialsPage() {
               <Select value={subscriptionFilter} onValueChange={setSubscriptionFilter}>
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__all__">全部订阅</SelectItem>
-                  <SelectItem value="power">Power</SelectItem>
-                  <SelectItem value="pro_max">Pro Max</SelectItem>
-                  <SelectItem value="pro_plus">Pro+</SelectItem>
-                  <SelectItem value="pro">Pro</SelectItem>
-                  <SelectItem value="trial">试用</SelectItem>
-                  <SelectItem value="free">Free</SelectItem>
-                  <SelectItem value="unknown">未知</SelectItem>
+                  <SelectItem value="__all__">全部订阅标签</SelectItem>
+                  <SelectItem value="unknown">未知订阅</SelectItem>
                 </SelectContent>
               </Select>
               <Select value={proxyFilter} onValueChange={setProxyFilter}>
